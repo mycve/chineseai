@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-device", default="auto")
     parser.add_argument("--train-batch-size", type=int, default=4096)
     parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--torch-threads", type=int)
 
     parser.add_argument("--match-games", type=int, default=40)
     parser.add_argument("--match-movetime-ms", type=int, default=2)
@@ -203,6 +204,8 @@ def main() -> int:
             "--torch-optimizer",
             args.torch_optimizer,
         ]
+        if args.torch_threads is not None:
+            train_cmd.extend(["--torch-threads", str(args.torch_threads)])
         if previous_model is not None:
             train_cmd.extend(["--resume", str(previous_model)])
         run(train_cmd, root, "train")

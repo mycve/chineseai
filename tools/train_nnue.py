@@ -310,6 +310,7 @@ def train_torch(
     batch_size: int,
     device_arg: str,
     optimizer_name: str,
+    torch_threads: int | None,
 ):
     try:
         import torch
@@ -317,6 +318,10 @@ def train_torch(
         raise SystemExit(
             "PyTorch is not installed. Install a CUDA build of torch, or use --backend cpu."
         ) from exc
+
+    if torch_threads is not None and torch_threads > 0:
+        torch.set_num_threads(torch_threads)
+        torch.set_num_interop_threads(max(1, min(torch_threads, 8)))
 
     rng = random.Random(seed)
     random.seed(seed)
@@ -335,7 +340,8 @@ def train_torch(
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
     print(
-        f"torch backend: device={device} batch_size={batch_size} optimizer={optimizer_name}"
+        f"torch backend: device={device} batch_size={batch_size} "
+        f"optimizer={optimizer_name} threads={torch.get_num_threads()}"
     )
     batch_size = max(1, batch_size)
     for epoch in range(epochs):
@@ -436,6 +442,11 @@ def main():
     parser.add_argument("--device", default="auto", help="torch device: auto, cuda, cuda:0, mps, or cpu")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        help="CPU threads for PyTorch backend; useful with --backend torch --device cpu",
+    )
     args = parser.parse_args()
 
     samples, min_input_size = load_samples(args.input)
@@ -472,6 +483,7 @@ def main():
             args.batch_size,
             args.device,
             args.torch_optimizer,
+            args.torch_threads,
         )
     else:
         if args.backend == "auto":

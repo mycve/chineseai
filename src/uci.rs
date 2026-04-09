@@ -17,6 +17,7 @@ use crate::xiangqi::{Color, Position};
 const ENGINE_NAME: &str = "ChineseAI";
 const ENGINE_AUTHOR: &str = "OpenAI Codex";
 const DEFAULT_HASH_MB: usize = 16;
+const UCI_INFINITE_DEPTH: u8 = 127;
 
 pub fn run_loop() -> io::Result<()> {
     let (command_tx, command_rx) = mpsc::channel::<String>();
@@ -310,7 +311,15 @@ impl UciSession {
         } else {
             self.time_budget_from_clock(wtime_ms, btime_ms, winc_ms, binc_ms, moves_to_go)
         };
-        let depth = depth.unwrap_or(if time_budget.is_some() || nodes.is_some() {
+        let unconstrained = infinite
+            || (depth.is_none()
+                && time_budget.is_none()
+                && nodes.is_none()
+                && wtime_ms.is_none()
+                && btime_ms.is_none());
+        let depth = depth.unwrap_or(if unconstrained {
+            UCI_INFINITE_DEPTH
+        } else if time_budget.is_some() || nodes.is_some() {
             64
         } else {
             5
