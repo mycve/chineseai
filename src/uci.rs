@@ -17,6 +17,7 @@ use crate::xiangqi::{Color, Position};
 const ENGINE_NAME: &str = "ChineseAI";
 const ENGINE_AUTHOR: &str = "OpenAI Codex";
 const DEFAULT_HASH_MB: usize = 16;
+const DEFAULT_EVAL_FILE: &str = "chineseai.nnue.txt";
 const UCI_INFINITE_DEPTH: u8 = 127;
 
 pub fn run_loop() -> io::Result<()> {
@@ -75,6 +76,7 @@ struct UciSession {
     history_hashes: Vec<u64>,
     move_records: Vec<MoveRecord>,
     hash_mb: usize,
+    default_eval_load: Result<Arc<NnueModel>, String>,
 }
 
 struct ActiveSearch {
@@ -109,6 +111,13 @@ impl UciSession {
     fn new(search_tx: mpsc::Sender<SearchEvent>) -> Self {
         let mut engine = Engine::default();
         engine.resize_hash_mb(DEFAULT_HASH_MB);
+        let default_eval_load = NnueModel::load_text(DEFAULT_EVAL_FILE)
+            .map(Arc::new)
+            .map_err(|err| err.to_string());
+        match &default_eval_load {
+            Ok(model) => engine.set_nnue_model(Some(Arc::clone(model))),
+            Err(_) => engine.set_nnue_model(None),
+        }
         Self {
             engine: Arc::new(Mutex::new(engine)),
             search_tx,
@@ -118,6 +127,7 @@ impl UciSession {
             history_hashes: Vec::new(),
             move_records: Vec::new(),
             hash_mb: DEFAULT_HASH_MB,
+            default_eval_load,
         }
     }
 
@@ -134,6 +144,11 @@ impl UciSession {
             "uci" => {
                 self.print_id()?;
                 self.print_options()?;
+                if let Err(err) = &self.default_eval_load {
+                    self.out(&format!(
+                        "info string default EvalFile {DEFAULT_EVAL_FILE} not loaded: {err}"
+                    ))?;
+                }
                 self.out("uciok")?;
             }
             "isready" => {
@@ -610,7 +625,9 @@ impl UciSession {
             "option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 1024"
         ))?;
         self.out("option name Clear Hash type button")?;
-        self.out("option name EvalFile type string default <empty>")
+        self.out(&format!(
+            "option name EvalFile type string default {DEFAULT_EVAL_FILE}"
+        ))
     }
 
     fn out(&self, text: &str) -> io::Result<()> {

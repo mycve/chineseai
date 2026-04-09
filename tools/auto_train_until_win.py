@@ -73,9 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260409)
     parser.add_argument("--train-backend", choices=["auto", "cpu", "torch"], default="auto")
     parser.add_argument("--train-device", default="auto")
-    parser.add_argument("--train-batch-size", type=int, default=4096)
+    parser.add_argument("--train-batch-size", type=int, default=1024)
     parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
     parser.add_argument("--torch-weight-decay", type=float, default=0.0)
+    parser.add_argument("--torch-lr", type=float, default=0.001)
+    parser.add_argument("--torch-min-steps-per-epoch", type=int, default=300)
     parser.add_argument("--torch-threads", type=int)
 
     parser.add_argument("--match-games", type=int, default=40)
@@ -206,6 +208,10 @@ def main() -> int:
             args.torch_optimizer,
             "--torch-weight-decay",
             str(args.torch_weight_decay),
+            "--torch-lr",
+            str(args.torch_lr),
+            "--torch-min-steps-per-epoch",
+            str(args.torch_min_steps_per_epoch),
         ]
         if args.torch_threads is not None:
             train_cmd.extend(["--torch-threads", str(args.torch_threads)])

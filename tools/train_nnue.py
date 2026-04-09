@@ -295,6 +295,15 @@ def evaluate_loss_torch(torch, model, samples, batch_size: int, device, target_c
     return loss_sum / max(count, 1)
 
 
+def torch_epoch_batches(samples, batch_size: int, min_steps: int):
+    natural_steps = math.ceil(len(samples) / max(batch_size, 1))
+    target_steps = max(natural_steps, min_steps)
+    target_count = target_steps * batch_size
+    for start in range(0, target_count, batch_size):
+        end = min(start + batch_size, target_count)
+        yield [samples[index % len(samples)] for index in range(start, end)]
+
+
 def train_torch(
     samples,
     hidden_size: int,
@@ -312,6 +321,8 @@ def train_torch(
     optimizer_name: str,
     torch_threads: int | None,
     torch_weight_decay: float,
+    torch_lr: float | None,
+    torch_min_steps_per_epoch: int,
 ):
     try:
         import torch
@@ -335,28 +346,36 @@ def train_torch(
     model = make_torch_model(
         torch, hidden_size, input_size, init_scale, resume_model, device
     )
+    effective_lr = torch_lr if torch_lr is not None else learning_rate
     if optimizer_name == "sgd":
-        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.SGD(model.parameters(), lr=effective_lr)
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=learning_rate,
+            lr=effective_lr,
             weight_decay=torch_weight_decay,
         )
 
+    batch_size = max(1, batch_size)
+    steps_per_epoch = max(
+        math.ceil(len(train_samples) / batch_size),
+        max(0, torch_min_steps_per_epoch),
+    )
     print(
         f"torch backend: device={device} batch_size={batch_size} "
+        f"steps_per_epoch={steps_per_epoch} lr={effective_lr} "
         f"optimizer={optimizer_name} weight_decay={torch_weight_decay} "
         f"threads={torch.get_num_threads()}"
     )
-    batch_size = max(1, batch_size)
     for epoch in range(epochs):
         rng.shuffle(train_samples)
         model.train()
         loss_sum = 0.0
+        trained_count = 0
         skipped = 0
-        for start in range(0, len(train_samples), batch_size):
-            batch = train_samples[start : start + batch_size]
+        for batch in torch_epoch_batches(
+            train_samples, batch_size, max(0, torch_min_steps_per_epoch)
+        ):
             flat_features, offsets, targets = torch_batch_tensors(
                 torch, batch, device, target_clamp
             )
@@ -371,8 +390,9 @@ def train_torch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             loss_sum += float(loss.detach().cpu()) * len(batch)
+            trained_count += len(batch)
 
-        mean_loss = loss_sum / len(train_samples)
+        mean_loss = loss_sum / max(trained_count, 1)
         if valid_samples:
             valid_loss = evaluate_loss_torch(
                 torch, model, valid_samples, batch_size, device, target_clamp
@@ -449,6 +469,13 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
     parser.add_argument("--torch-weight-decay", type=float, default=0.0)
+    parser.add_argument("--torch-lr", type=float, help="override --lr for the PyTorch backend")
+    parser.add_argument(
+        "--torch-min-steps-per-epoch",
+        type=int,
+        default=0,
+        help="repeat shuffled samples so each torch epoch has at least this many optimizer steps",
+    )
     parser.add_argument(
         "--torch-threads",
         type=int,
@@ -492,6 +519,8 @@ def main():
             args.torch_optimizer,
             args.torch_threads,
             args.torch_weight_decay,
+            args.torch_lr,
+            args.torch_min_steps_per_epoch,
         )
     else:
         if args.backend == "auto":
