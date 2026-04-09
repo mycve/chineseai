@@ -654,4 +654,23 @@ mod tests {
         session.stop_search();
         assert!(stop.load(Ordering::Relaxed));
     }
+
+    #[test]
+    fn clock_time_budget_is_some_for_side_to_move() {
+        let (tx, _rx) = mpsc::channel();
+        let session = UciSession::new(tx);
+
+        let budget = session.time_budget_from_clock(Some(10_000), Some(10_000), 0, 0, None);
+
+        assert!(budget.is_some());
+        assert!(budget.unwrap() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn missing_clock_time_budget_is_none() {
+        let (tx, _rx) = mpsc::channel();
+        let session = UciSession::new(tx);
+
+        assert_eq!(session.time_budget_from_clock(None, None, 0, 0, None), None);
+    }
 }

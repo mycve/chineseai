@@ -311,6 +311,7 @@ def train_torch(
     device_arg: str,
     optimizer_name: str,
     torch_threads: int | None,
+    torch_weight_decay: float,
 ):
     try:
         import torch
@@ -337,11 +338,16 @@ def train_torch(
     if optimizer_name == "sgd":
         optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=torch_weight_decay,
+        )
 
     print(
         f"torch backend: device={device} batch_size={batch_size} "
-        f"optimizer={optimizer_name} threads={torch.get_num_threads()}"
+        f"optimizer={optimizer_name} weight_decay={torch_weight_decay} "
+        f"threads={torch.get_num_threads()}"
     )
     batch_size = max(1, batch_size)
     for epoch in range(epochs):
@@ -442,6 +448,7 @@ def main():
     parser.add_argument("--device", default="auto", help="torch device: auto, cuda, cuda:0, mps, or cpu")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--torch-weight-decay", type=float, default=0.0)
     parser.add_argument(
         "--torch-threads",
         type=int,
@@ -484,6 +491,7 @@ def main():
             args.device,
             args.torch_optimizer,
             args.torch_threads,
+            args.torch_weight_decay,
         )
     else:
         if args.backend == "auto":
