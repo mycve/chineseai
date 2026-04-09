@@ -8,9 +8,12 @@ import sys
 import time
 
 
-def run(command: list[str], cwd: pathlib.Path) -> None:
+def run(command: list[str], cwd: pathlib.Path, label: str) -> None:
+    started = time.monotonic()
+    print(f"\n>>> {label} start", flush=True)
     print("+", " ".join(command), flush=True)
     subprocess.run(command, cwd=cwd, check=True)
+    print(f">>> {label} done elapsed={time.monotonic() - started:.1f}s", flush=True)
 
 
 def require_path(path: pathlib.Path, label: str) -> pathlib.Path:
@@ -57,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-depth", type=int)
     parser.add_argument("--distill-workers", default="auto")
     parser.add_argument("--chunk-size", type=int, default=256)
+    parser.add_argument("--distill-progress-interval-seconds", type=float, default=5.0)
     parser.add_argument("--auto-worker-reserve", type=int, default=4)
     parser.add_argument("--max-workers", type=int, default=96)
     parser.add_argument("--dedup", action=argparse.BooleanOptionalAction, default=True)
@@ -67,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.0002)
     parser.add_argument("--validation-split", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=20260409)
+    parser.add_argument("--train-backend", choices=["auto", "cpu", "torch"], default="auto")
+    parser.add_argument("--train-device", default="auto")
+    parser.add_argument("--train-batch-size", type=int, default=4096)
+    parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
 
     parser.add_argument("--match-games", type=int, default=40)
     parser.add_argument("--match-movetime-ms", type=int, default=2)
@@ -80,6 +88,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.match_games < 1:
+        raise SystemExit("--match-games must be >= 1")
     root = pathlib.Path(__file__).resolve().parents[1]
     engine = require_path(args.engine, "ChineseAI engine")
     pikafish = require_path(args.pikafish, "Pikafish engine")
@@ -135,7 +145,7 @@ def main() -> int:
         ]
         if args.max_workers is not None:
             selfplay_cmd.extend(["--max-workers", str(args.max_workers)])
-        run(selfplay_cmd, root)
+        run(selfplay_cmd, root, "selfplay")
 
         distill_cmd = [
             "python3",
@@ -148,6 +158,8 @@ def main() -> int:
             str(args.distill_workers),
             "--chunk-size",
             str(args.chunk_size),
+            "--progress-interval-seconds",
+            str(args.distill_progress_interval_seconds),
             "--auto-worker-reserve",
             str(args.auto_worker_reserve),
             "--pikafish",
@@ -163,7 +175,7 @@ def main() -> int:
             distill_cmd.extend(["--movetime-ms", str(args.teacher_movetime_ms)])
         if args.dedup:
             distill_cmd.append("--dedup")
-        run(distill_cmd, root)
+        run(distill_cmd, root, "distill")
 
         train_cmd = [
             "python3",
@@ -182,10 +194,18 @@ def main() -> int:
             str(args.validation_split),
             "--seed",
             str(args.seed + iteration),
+            "--backend",
+            args.train_backend,
+            "--device",
+            args.train_device,
+            "--batch-size",
+            str(args.train_batch_size),
+            "--torch-optimizer",
+            args.torch_optimizer,
         ]
         if previous_model is not None:
             train_cmd.extend(["--resume", str(previous_model)])
-        run(train_cmd, root)
+        run(train_cmd, root, "train")
 
         match_cmd = [
             "python3",
@@ -219,7 +239,7 @@ def main() -> int:
             match_cmd.extend(["--max-workers", str(args.match_max_workers)])
         if args.match_quiet:
             match_cmd.append("--quiet")
-        run(match_cmd, root)
+        run(match_cmd, root, "evaluate")
 
         score_rate, games = score_from_report(report_path, "candidate")
         previous_model = model_path

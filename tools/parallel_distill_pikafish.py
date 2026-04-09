@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import pathlib
 import sys
+import time
 from dataclasses import dataclass
 
 from distill_pikafish import (
@@ -99,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         help="cap auto-selected workers",
     )
     parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=5.0,
+        help="print distillation progress at most once per N seconds; use 0 to print every chunk",
+    )
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--movetime-ms", type=int)
     parser.add_argument("--feature-set", choices=["v1", "v2"], default="v2")
@@ -157,6 +164,7 @@ def main() -> int:
         flush=True,
     )
     with args.output.open("w", encoding="utf-8") as out:
+        last_progress = time.monotonic()
         if workers <= 1:
             iterator = map(distill_chunk, jobs)
         else:
@@ -167,7 +175,18 @@ def main() -> int:
                 out.writelines(rows)
                 out.flush()
                 distilled += len(rows)
-                print(f"distilled {distilled}/{len(fens)} positions -> {args.output}", flush=True)
+                now = time.monotonic()
+                should_print = (
+                    args.progress_interval_seconds <= 0
+                    or distilled == len(fens)
+                    or now - last_progress >= args.progress_interval_seconds
+                )
+                if should_print:
+                    print(
+                        f"distilled {distilled}/{len(fens)} positions -> {args.output}",
+                        flush=True,
+                    )
+                    last_progress = now
         finally:
             if workers > 1:
                 pool.close()

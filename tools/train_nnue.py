@@ -190,6 +190,189 @@ def train(
     return input_hidden, hidden_bias, hidden_output, output_bias, len(train_samples), len(valid_samples)
 
 
+def resolve_torch_device(torch, device_arg: str):
+    if device_arg != "auto":
+        return torch.device(device_arg)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def make_torch_model(
+    torch,
+    hidden_size: int,
+    input_size: int,
+    init_scale: float,
+    resume_model: Path | None,
+    device,
+):
+    class SparseNnueModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_hidden = torch.nn.EmbeddingBag(
+                input_size,
+                hidden_size,
+                mode="sum",
+                include_last_offset=True,
+                sparse=False,
+            )
+            self.hidden_bias = torch.nn.Parameter(torch.zeros(hidden_size))
+            self.hidden_output = torch.nn.Parameter(torch.empty(hidden_size))
+            self.output_bias = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, flat_features, offsets):
+            hidden = self.input_hidden(flat_features, offsets) + self.hidden_bias
+            activated = torch.relu(hidden)
+            return activated.matmul(self.hidden_output) + self.output_bias
+
+    if resume_model is not None:
+        loaded_input_size, _, loaded_hidden_size, input_hidden, hidden_bias, hidden_output, output_bias = load_model(
+            resume_model
+        )
+        if loaded_input_size != input_size:
+            raise SystemExit(
+                f"resume model input size {loaded_input_size} != requested {input_size}"
+            )
+        if loaded_hidden_size != hidden_size:
+            raise SystemExit(
+                f"resume model hidden size {loaded_hidden_size} != requested {hidden_size}"
+            )
+    else:
+        input_hidden, hidden_bias, hidden_output, output_bias = init_model(
+            hidden_size, input_size, init_scale
+        )
+
+    model = SparseNnueModel().to(device)
+    with torch.no_grad():
+        model.input_hidden.weight.copy_(
+            torch.tensor(input_hidden, dtype=torch.float32, device=device)
+        )
+        model.hidden_bias.copy_(torch.tensor(hidden_bias, dtype=torch.float32, device=device))
+        model.hidden_output.copy_(torch.tensor(hidden_output, dtype=torch.float32, device=device))
+        model.output_bias.copy_(torch.tensor(output_bias, dtype=torch.float32, device=device))
+    return model
+
+
+def torch_batch_tensors(torch, batch, device, target_clamp: float):
+    targets = [clamp(target, -target_clamp, target_clamp) for target, _ in batch]
+    flat_features = []
+    offsets = [0]
+    for _, features in batch:
+        flat_features.extend(features)
+        offsets.append(len(flat_features))
+    return (
+        torch.tensor(flat_features, dtype=torch.long, device=device),
+        torch.tensor(offsets, dtype=torch.long, device=device),
+        torch.tensor(targets, dtype=torch.float32, device=device),
+    )
+
+
+def evaluate_loss_torch(torch, model, samples, batch_size: int, device, target_clamp: float):
+    if not samples:
+        return 0.0
+    model.eval()
+    loss_sum = 0.0
+    count = 0
+    with torch.no_grad():
+        for start in range(0, len(samples), batch_size):
+            batch = samples[start : start + batch_size]
+            flat_features, offsets, targets = torch_batch_tensors(
+                torch, batch, device, target_clamp
+            )
+            output = model(flat_features, offsets)
+            error = output - targets
+            loss_sum += float((error * error).sum().detach().cpu())
+            count += len(batch)
+    model.train()
+    return loss_sum / max(count, 1)
+
+
+def train_torch(
+    samples,
+    hidden_size: int,
+    epochs: int,
+    learning_rate: float,
+    validation_split: float,
+    seed: int,
+    resume_model: Path | None,
+    input_size: int,
+    target_clamp: float,
+    grad_clip: float,
+    init_scale: float,
+    batch_size: int,
+    device_arg: str,
+    optimizer_name: str,
+):
+    try:
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "PyTorch is not installed. Install a CUDA build of torch, or use --backend cpu."
+        ) from exc
+
+    rng = random.Random(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    rng.shuffle(samples)
+    validation_count = int(len(samples) * validation_split)
+    valid_samples = samples[:validation_count]
+    train_samples = samples[validation_count:] or samples
+    device = resolve_torch_device(torch, device_arg)
+    model = make_torch_model(
+        torch, hidden_size, input_size, init_scale, resume_model, device
+    )
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    print(
+        f"torch backend: device={device} batch_size={batch_size} optimizer={optimizer_name}"
+    )
+    batch_size = max(1, batch_size)
+    for epoch in range(epochs):
+        rng.shuffle(train_samples)
+        model.train()
+        loss_sum = 0.0
+        skipped = 0
+        for start in range(0, len(train_samples), batch_size):
+            batch = train_samples[start : start + batch_size]
+            flat_features, offsets, targets = torch_batch_tensors(
+                torch, batch, device, target_clamp
+            )
+            optimizer.zero_grad(set_to_none=True)
+            output = model(flat_features, offsets)
+            loss = torch.mean((output - targets) ** 2)
+            if not torch.isfinite(loss):
+                skipped += len(batch)
+                continue
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            loss_sum += float(loss.detach().cpu()) * len(batch)
+
+        mean_loss = loss_sum / len(train_samples)
+        if valid_samples:
+            valid_loss = evaluate_loss_torch(
+                torch, model, valid_samples, batch_size, device, target_clamp
+            )
+            print(
+                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} valid_mse={valid_loss:.4f} skipped={skipped}"
+            )
+        else:
+            print(f"epoch {epoch + 1}: train_mse={mean_loss:.4f} skipped={skipped}")
+
+    with torch.no_grad():
+        input_hidden = model.input_hidden.weight.detach().cpu().tolist()
+        hidden_bias = model.hidden_bias.detach().cpu().tolist()
+        hidden_output = model.hidden_output.detach().cpu().tolist()
+        output_bias = float(model.output_bias.detach().cpu())
+    return input_hidden, hidden_bias, hidden_output, output_bias, len(train_samples), len(valid_samples)
+
+
 def flatten(matrix):
     return [value for row in matrix for value in row]
 
@@ -237,6 +420,10 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=64.0)
     parser.add_argument("--hidden-grad-clip", type=float, default=16.0)
     parser.add_argument("--init-scale", type=float, default=0.001)
+    parser.add_argument("--backend", choices=["auto", "cpu", "torch"], default="auto")
+    parser.add_argument("--device", default="auto", help="torch device: auto, cuda, cuda:0, mps, or cpu")
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--torch-optimizer", choices=["adamw", "sgd"], default="adamw")
     args = parser.parse_args()
 
     samples, min_input_size = load_samples(args.input)
@@ -247,20 +434,50 @@ def main():
             f"samples require input size at least {min_input_size}, got {input_size}; "
             "pass --feature-set v2 or --input-size"
         )
-    model = train(
-        samples,
-        args.hidden_size,
-        args.epochs,
-        args.lr,
-        args.validation_split,
-        args.seed,
-        args.resume,
-        input_size,
-        args.target_clamp,
-        args.grad_clip,
-        args.hidden_grad_clip,
-        args.init_scale,
-    )
+    use_torch = args.backend == "torch"
+    if args.backend == "auto":
+        try:
+            import torch
+
+            device = resolve_torch_device(torch, args.device)
+            use_torch = device.type != "cpu"
+        except Exception:
+            use_torch = False
+
+    if use_torch:
+        model = train_torch(
+            samples,
+            args.hidden_size,
+            args.epochs,
+            args.lr,
+            args.validation_split,
+            args.seed,
+            args.resume,
+            input_size,
+            args.target_clamp,
+            args.grad_clip,
+            args.init_scale,
+            args.batch_size,
+            args.device,
+            args.torch_optimizer,
+        )
+    else:
+        if args.backend == "auto":
+            print("cpu backend: torch GPU not available")
+        model = train(
+            samples,
+            args.hidden_size,
+            args.epochs,
+            args.lr,
+            args.validation_split,
+            args.seed,
+            args.resume,
+            input_size,
+            args.target_clamp,
+            args.grad_clip,
+            args.hidden_grad_clip,
+            args.init_scale,
+        )
     input_hidden, hidden_bias, hidden_output, output_bias, train_count, valid_count = model
     save_model(
         args.output,
