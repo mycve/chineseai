@@ -251,17 +251,6 @@ def parse_args() -> argparse.Namespace:
         help="write a JSON match report to this path",
     )
     parser.add_argument(
-        "--fen-out",
-        type=pathlib.Path,
-        help="write positions reached during the match to this FEN text file",
-    )
-    parser.add_argument(
-        "--fen-out-every",
-        type=int,
-        default=1,
-        help="write one FEN every N plies when --fen-out is set",
-    )
-    parser.add_argument(
         "--progress-every",
         type=int,
         default=10,
@@ -291,7 +280,6 @@ def main() -> int:
 
     results = {args.label: 0, "pikafish": 0, "draw": 0}
     game_reports = []
-    captured_fens: list[str] = []
     match_started = time.monotonic()
 
     print(
@@ -318,8 +306,6 @@ def main() -> int:
 
             referee.set_position(opening, moves)
             current_fen = referee.current_fen()
-            if args.fen_out:
-                captured_fens.append(current_fen)
             repetition = {current_fen: 1}
             result = "draw"
             reason = "max plies"
@@ -340,8 +326,6 @@ def main() -> int:
                 moves.append(bestmove)
                 referee.set_position(opening, moves)
                 current_fen = referee.current_fen()
-                if args.fen_out and args.fen_out_every > 0 and (ply + 1) % args.fen_out_every == 0:
-                    captured_fens.append(current_fen)
                 legal_moves = referee.legal_move_count()
                 repetition[current_fen] = repetition.get(current_fen, 0) + 1
 
@@ -414,10 +398,6 @@ def main() -> int:
         }
         args.report_out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         print(f"report   {args.report_out}")
-    if args.fen_out:
-        args.fen_out.parent.mkdir(parents=True, exist_ok=True)
-        args.fen_out.write_text("\n".join(captured_fens) + "\n", encoding="utf-8")
-        print(f"fens     {args.fen_out} ({len(captured_fens)} positions)")
 
     return 0
 

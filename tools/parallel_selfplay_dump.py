@@ -11,18 +11,40 @@ import tempfile
 from multiprocessing import Pool
 
 
-def run_chunk(job: tuple[int, int, int, int, str, bool, str, str | None]) -> tuple[int, pathlib.Path, int]:
-    index, games, depth, max_plies, root_text, release, temp_dir_text, engine_text = job
+def run_chunk(job: tuple[int, int, int, int, int, int, int, str, bool, str, str | None]) -> tuple[int, pathlib.Path, int]:
+    index, games, depth, max_plies, nodes, random_plies, start_game_index, root_text, release, temp_dir_text, engine_text = job
     root = pathlib.Path(root_text)
     temp_dir = pathlib.Path(temp_dir_text)
     output = temp_dir / f"selfplay_chunk_{index:04}.txt"
     if engine_text is not None:
-        command = [engine_text, "selfplay-dump", str(games), str(depth), str(output), str(max_plies)]
+        command = [
+            engine_text,
+            "selfplay-dump",
+            str(games),
+            str(depth),
+            str(output),
+            str(max_plies),
+            str(nodes),
+            str(random_plies),
+            str(start_game_index),
+        ]
     else:
         command = ["cargo", "run"]
         if release:
             command.append("--release")
-        command.extend(["--", "selfplay-dump", str(games), str(depth), str(output), str(max_plies)])
+        command.extend(
+            [
+                "--",
+                "selfplay-dump",
+                str(games),
+                str(depth),
+                str(output),
+                str(max_plies),
+                str(nodes),
+                str(random_plies),
+                str(start_game_index),
+            ]
+        )
     subprocess.run(command, cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     line_count = sum(1 for _ in output.open("r", encoding="utf-8"))
     return index, output, line_count
@@ -49,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=int, default=1000)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--max-plies", type=int, default=160)
+    parser.add_argument("--nodes", type=int, default=4_000)
+    parser.add_argument("--random-plies", type=int, default=6)
     parser.add_argument("--workers", default="auto")
     parser.add_argument("--auto-worker-reserve", type=int, default=2)
     parser.add_argument("--max-workers", type=int)
@@ -80,11 +104,27 @@ def main() -> int:
             if games <= 0:
                 break
             remaining -= games
-            jobs.append((index, games, args.depth, args.max_plies, str(root), args.release, temp_dir, engine))
+            start_game_index = sum(job[1] for job in jobs)
+            jobs.append(
+                (
+                    index,
+                    games,
+                    args.depth,
+                    args.max_plies,
+                    args.nodes,
+                    args.random_plies,
+                    start_game_index,
+                    str(root),
+                    args.release,
+                    temp_dir,
+                    engine,
+                )
+            )
 
         print(
             f"parallel selfplay: games={args.games} workers={len(jobs)} "
             f"depth={args.depth} max_plies={args.max_plies} "
+            f"nodes={args.nodes} random_plies={args.random_plies} "
             f"runner={engine or 'cargo run'}",
             flush=True,
         )

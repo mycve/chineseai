@@ -173,11 +173,24 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(160);
+            let nodes = args
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(4_000);
+            let random_plies = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(6);
+            let start_game_index = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
 
             let mut rows = Vec::new();
             let mut engine = Engine::default();
 
             for game in 0..games {
+                let global_game = start_game_index + game;
                 let mut position = Position::startpos();
                 let mut history_hashes = Vec::new();
                 let mut records: Vec<MoveRecord> = Vec::new();
@@ -190,7 +203,7 @@ fn main() {
                         SearchLimits {
                             depth,
                             movetime: None,
-                            nodes: Some(4_000),
+                            nodes: Some(nodes),
                         },
                     );
 
@@ -201,8 +214,8 @@ fn main() {
                         break;
                     }
 
-                    let chosen = if ply < 6 {
-                        let index = ((position.hash() as usize) ^ (game * 17 + ply * 31))
+                    let chosen = if ply < random_plies {
+                        let index = ((position.hash() as usize) ^ (global_game * 17 + ply * 31))
                             % legal_moves.len();
                         legal_moves[index]
                     } else {
@@ -225,6 +238,9 @@ fn main() {
             });
             println!("games    : {games}");
             println!("depth    : {depth}");
+            println!("nodes    : {nodes}");
+            println!("random   : {random_plies}");
+            println!("startidx : {start_game_index}");
             println!("samples  : {}", rows.len());
             println!("output   : {output}");
         }

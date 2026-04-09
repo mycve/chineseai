@@ -33,19 +33,6 @@ def score_from_report(report_path: pathlib.Path, label: str) -> tuple[float, int
     return score / max(games, 1), games
 
 
-def merge_position_files(inputs: list[pathlib.Path], output: pathlib.Path) -> None:
-    rows = 0
-    with output.open("w", encoding="utf-8") as out:
-        for path in inputs:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                out.write(line + "\n")
-                rows += 1
-    print(f"merged position files: rows={rows} -> {output}", flush=True)
-
-
 def parse_args() -> argparse.Namespace:
     root = pathlib.Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
@@ -61,22 +48,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--games", type=int, default=2000, help="self-play games per iteration")
     parser.add_argument("--selfplay-depth", type=int, default=1)
+    parser.add_argument("--selfplay-nodes", type=int, default=4_000)
+    parser.add_argument("--selfplay-random-plies", type=int, default=6)
     parser.add_argument("--max-plies", type=int, default=120)
     parser.add_argument("--selfplay-workers", default="auto")
-    parser.add_argument(
-        "--teacher-match-games",
-        type=int,
-        default=0,
-        help="extra candidate-vs-Pikafish games per iteration whose positions are added to distillation data",
-    )
-    parser.add_argument("--teacher-match-movetime-ms", type=int, default=2)
-    parser.add_argument("--teacher-match-max-plies", type=int, default=120)
-    parser.add_argument(
-        "--teacher-match-fen-every",
-        type=int,
-        default=1,
-        help="save one candidate-vs-Pikafish position every N plies",
-    )
 
     parser.add_argument("--teacher-movetime-ms", type=int, default=2)
     parser.add_argument("--teacher-depth", type=int)
@@ -128,8 +103,6 @@ def main() -> int:
     for iteration in range(1, args.max_iters + 1):
         prefix = f"iter_{iteration:04}"
         fen_path = args.work_dir / "data" / f"{prefix}.fens.txt"
-        match_fen_path = args.work_dir / "data" / f"{prefix}.match.fens.txt"
-        mixed_fen_path = args.work_dir / "data" / f"{prefix}.mixed.fens.txt"
         sample_path = args.work_dir / "data" / f"{prefix}.samples.txt"
         model_path = args.work_dir / "models" / f"{prefix}.nnue.txt"
         report_path = args.work_dir / "reports" / f"{prefix}.match.json"
@@ -146,6 +119,10 @@ def main() -> int:
             str(args.selfplay_depth),
             "--max-plies",
             str(args.max_plies),
+            "--nodes",
+            str(args.selfplay_nodes),
+            "--random-plies",
+            str(args.selfplay_random_plies),
             "--workers",
             str(args.selfplay_workers),
             "--auto-worker-reserve",
@@ -157,42 +134,10 @@ def main() -> int:
             selfplay_cmd.extend(["--max-workers", str(args.max_workers)])
         run(selfplay_cmd, root)
 
-        distill_input_path = fen_path
-        if args.teacher_match_games > 0:
-            teacher_match_cmd = [
-                "python3",
-                "tools/run_matches.py",
-                "--games",
-                str(args.teacher_match_games),
-                "--movetime-ms",
-                str(args.teacher_match_movetime_ms),
-                "--max-plies",
-                str(args.teacher_match_max_plies),
-                "--progress-every",
-                str(args.progress_every),
-                "--ours",
-                str(engine),
-                "--pikafish",
-                str(pikafish),
-                "--pikafish-nnue",
-                str(pikafish_nnue),
-                "--fen-out",
-                str(match_fen_path),
-                "--fen-out-every",
-                str(args.teacher_match_fen_every),
-                "--label",
-                "candidate",
-            ]
-            if previous_model is not None:
-                teacher_match_cmd.extend(["--ours-eval", str(previous_model)])
-            run(teacher_match_cmd, root)
-            merge_position_files([fen_path, match_fen_path], mixed_fen_path)
-            distill_input_path = mixed_fen_path
-
         distill_cmd = [
             "python3",
             "tools/parallel_distill_pikafish.py",
-            str(distill_input_path),
+            str(fen_path),
             str(sample_path),
             "--feature-set",
             args.feature_set,
