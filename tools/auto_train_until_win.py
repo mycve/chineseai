@@ -71,7 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--match-games", type=int, default=40)
     parser.add_argument("--match-movetime-ms", type=int, default=2)
     parser.add_argument("--match-max-plies", type=int, default=120)
+    parser.add_argument("--match-workers", default="auto")
+    parser.add_argument("--match-max-workers", type=int, default=32)
     parser.add_argument("--progress-every", type=int, default=20)
+    parser.add_argument("--match-quiet", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -193,6 +196,10 @@ def main() -> int:
             str(args.match_movetime_ms),
             "--max-plies",
             str(args.match_max_plies),
+            "--workers",
+            str(args.match_workers),
+            "--auto-worker-reserve",
+            str(args.auto_worker_reserve),
             "--progress-every",
             str(args.progress_every),
             "--ours",
@@ -208,6 +215,10 @@ def main() -> int:
             "--label",
             "candidate",
         ]
+        if args.match_max_workers is not None:
+            match_cmd.extend(["--max-workers", str(args.match_max_workers)])
+        if args.match_quiet:
+            match_cmd.append("--quiet")
         run(match_cmd, root)
 
         score_rate, games = score_from_report(report_path, "candidate")

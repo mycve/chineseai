@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import multiprocessing as mp
+import os
 import pathlib
 import subprocess
 import sys
@@ -25,6 +27,23 @@ class SearchSummary:
     nps: int = 0
     pv: str = ""
     bestmove: str = "0000"
+
+
+@dataclass(frozen=True)
+class MatchJob:
+    worker_id: int
+    game_indices: list[int]
+    openings: list[str]
+    root: str
+    ours: str
+    pikafish: str
+    pikafish_nnue: str
+    ours_eval: str | None
+    label: str
+    movetime_ms: int
+    max_plies: int
+    progress_every: int
+    quiet: bool
 
 
 def parse_info_line(line: str) -> SearchSummary | None:
@@ -198,6 +217,134 @@ def engine_name(label: str, swap: bool, side: str) -> str:
     return label if swap else "pikafish"
 
 
+def resolve_worker_count(workers: str, reserve: int, max_workers: int | None, games: int) -> int:
+    if workers == "auto":
+        count = max(1, (os.cpu_count() or mp.cpu_count()) - max(0, reserve))
+        if max_workers is not None:
+            count = min(count, max_workers)
+        return min(count, max(1, games))
+    try:
+        return min(max(1, int(workers)), max(1, games))
+    except ValueError as exc:
+        raise SystemExit("--workers must be an integer or 'auto'") from exc
+
+
+def split_indices(count: int, workers: int) -> list[list[int]]:
+    chunks = [[] for _ in range(workers)]
+    for game_index in range(count):
+        chunks[game_index % workers].append(game_index)
+    return [chunk for chunk in chunks if chunk]
+
+
+def play_game(
+    job: MatchJob,
+    game_index: int,
+    our_engine: UciEngine,
+    pikafish_engine: UciEngine,
+    referee: UciEngine,
+) -> tuple[str, dict]:
+    game_started = time.monotonic()
+    opening = job.openings[game_index % len(job.openings)]
+    swap_colors = game_index % 2 == 1
+    moves: list[str] = []
+
+    if not job.quiet:
+        print(
+            f"game {game_index + 1:>2} start: opening={opening} "
+            f"red={engine_name(job.label, swap_colors, 'w')} "
+            f"black={engine_name(job.label, swap_colors, 'b')}",
+            flush=True,
+        )
+
+    referee.set_position(opening, moves)
+    current_fen = referee.current_fen()
+    repetition = {current_fen: 1}
+    result = "draw"
+    reason = "max plies"
+
+    for ply in range(job.max_plies):
+        side = side_from_fen(current_fen)
+        engine = pikafish_engine if (swap_colors == (side == "w")) else our_engine
+        mover_name = engine_name(job.label, swap_colors, side)
+        summary = engine.search(opening, moves, job.movetime_ms)
+        bestmove = summary.bestmove
+        if bestmove == "0000":
+            result = "pikafish" if mover_name == job.label else job.label
+            reason = f"{mover_name} has no legal move"
+            break
+
+        moves.append(bestmove)
+        referee.set_position(opening, moves)
+        current_fen = referee.current_fen()
+        legal_moves = referee.legal_move_count()
+        repetition[current_fen] = repetition.get(current_fen, 0) + 1
+
+        if repetition[current_fen] >= 3:
+            result = "draw"
+            reason = "threefold repetition"
+            break
+        if legal_moves == 0:
+            result = mover_name
+            reason = "opponent has no legal move"
+            break
+
+        if (
+            not job.quiet
+            and job.progress_every > 0
+            and (ply + 1) % job.progress_every == 0
+        ):
+            print(
+                f"game {game_index + 1:>2} progress: ply={ply + 1} "
+                f"last={mover_name}:{bestmove} depth={summary.depth} "
+                f"nodes={summary.nodes} elapsed={time.monotonic() - game_started:.1f}s",
+                flush=True,
+            )
+
+        if ply == job.max_plies - 1:
+            result = "draw"
+            reason = "max plies"
+
+    report = {
+        "game": game_index + 1,
+        "opening": opening,
+        "red": engine_name(job.label, swap_colors, "w"),
+        "black": engine_name(job.label, swap_colors, "b"),
+        "result": result,
+        "reason": reason,
+        "plies": len(moves),
+        "moves": moves,
+    }
+    if not job.quiet:
+        print(
+            f"game {game_index + 1:>2}: opening={opening} "
+            f"red={engine_name(job.label, swap_colors, 'w')} "
+            f"black={engine_name(job.label, swap_colors, 'b')} "
+            f"result={result} reason={reason} plies={len(moves)} "
+            f"elapsed={time.monotonic() - game_started:.1f}s",
+            flush=True,
+        )
+    return result, report
+
+
+def run_match_job(job: MatchJob) -> tuple[dict[str, int], list[dict]]:
+    root = pathlib.Path(job.root)
+    ours_cmd = [job.ours, "uci"]
+    ours_init = [f"setoption name EvalFile value {job.ours_eval}"] if job.ours_eval else []
+    pikafish_cmd = [job.pikafish]
+    pikafish_init = [f"setoption name EvalFile value {job.pikafish_nnue}"]
+
+    results = {job.label: 0, "pikafish": 0, "draw": 0}
+    game_reports = []
+    with UciEngine(ours_cmd, root, ours_init) as our_engine, UciEngine(
+        pikafish_cmd, root, pikafish_init
+    ) as pikafish_engine, UciEngine(ours_cmd, root) as referee:
+        for game_index in job.game_indices:
+            result, report = play_game(job, game_index, our_engine, pikafish_engine, referee)
+            results[result] += 1
+            game_reports.append(report)
+    return results, game_reports
+
+
 def parse_args() -> argparse.Namespace:
     root = pathlib.Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
@@ -257,6 +404,23 @@ def parse_args() -> argparse.Namespace:
         help="print one progress line every N plies; use 0 to disable",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress per-game validation logs and only print the final scoreboard/report",
+    )
+    parser.add_argument(
+        "--workers",
+        default="1",
+        help="parallel match workers, or 'auto'; each worker starts its own engines",
+    )
+    parser.add_argument(
+        "--auto-worker-reserve",
+        type=int,
+        default=2,
+        help="cores to leave idle when --workers auto is used",
+    )
+    parser.add_argument("--max-workers", type=int, help="cap auto-selected workers")
+    parser.add_argument(
         "--label",
         default="ours",
         help="label to print for the first engine",
@@ -266,111 +430,57 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.games < 1:
+        raise SystemExit("--games must be >= 1")
     root = pathlib.Path(__file__).resolve().parents[1]
     ours = ensure_exists(args.ours, "our engine")
     pikafish = ensure_exists(args.pikafish, "Pikafish")
     pikafish_nnue = ensure_exists(args.pikafish_nnue, "Pikafish NNUE")
     ours_eval = ensure_exists(args.ours_eval, "our EvalFile") if args.ours_eval else None
     openings = load_openings(args.openings_file, args.opening)
-
-    ours_cmd = [str(ours), "uci"]
-    ours_init = [f"setoption name EvalFile value {ours_eval}"] if ours_eval else []
-    pikafish_cmd = [str(pikafish)]
-    pikafish_init = [f"setoption name EvalFile value {pikafish_nnue}"]
+    workers = resolve_worker_count(args.workers, args.auto_worker_reserve, args.max_workers, args.games)
 
     results = {args.label: 0, "pikafish": 0, "draw": 0}
     game_reports = []
     match_started = time.monotonic()
 
-    print(
-        f"match start: games={args.games} movetime_ms={args.movetime_ms} "
-        f"max_plies={args.max_plies} openings={len(openings)} ours_eval={ours_eval or '(none)'}",
-        flush=True,
-    )
+    if not args.quiet:
+        print(
+            f"match start: games={args.games} movetime_ms={args.movetime_ms} "
+            f"max_plies={args.max_plies} openings={len(openings)} workers={workers} "
+            f"ours_eval={ours_eval or '(none)'}",
+            flush=True,
+        )
 
-    with UciEngine(ours_cmd, root, ours_init) as our_engine, UciEngine(
-        pikafish_cmd, root, pikafish_init
-    ) as pikafish_engine, UciEngine(ours_cmd, root) as referee:
-        for game_index in range(args.games):
-            game_started = time.monotonic()
-            opening = openings[game_index % len(openings)]
-            swap_colors = game_index % 2 == 1
-            moves: list[str] = []
+    jobs = [
+        MatchJob(
+            worker_id=index,
+            game_indices=chunk,
+            openings=openings,
+            root=str(root),
+            ours=str(ours),
+            pikafish=str(pikafish),
+            pikafish_nnue=str(pikafish_nnue),
+            ours_eval=str(ours_eval) if ours_eval else None,
+            label=args.label,
+            movetime_ms=args.movetime_ms,
+            max_plies=args.max_plies,
+            progress_every=args.progress_every,
+            quiet=args.quiet,
+        )
+        for index, chunk in enumerate(split_indices(args.games, workers))
+    ]
+    if workers <= 1:
+        job_results = [run_match_job(jobs[0])]
+    else:
+        with mp.Pool(processes=len(jobs)) as pool:
+            job_results = list(pool.imap_unordered(run_match_job, jobs))
 
-            print(
-                f"game {game_index + 1:>2} start: opening={opening} "
-                f"red={engine_name(args.label, swap_colors, 'w')} "
-                f"black={engine_name(args.label, swap_colors, 'b')}",
-                flush=True,
-            )
-
-            referee.set_position(opening, moves)
-            current_fen = referee.current_fen()
-            repetition = {current_fen: 1}
-            result = "draw"
-            reason = "max plies"
-
-            for ply in range(args.max_plies):
-                side = side_from_fen(current_fen)
-                engine = (
-                    pikafish_engine if (swap_colors == (side == "w")) else our_engine
-                )
-                mover_name = engine_name(args.label, swap_colors, side)
-                summary = engine.search(opening, moves, args.movetime_ms)
-                bestmove = summary.bestmove
-                if bestmove == "0000":
-                    result = "pikafish" if mover_name == args.label else args.label
-                    reason = f"{mover_name} has no legal move"
-                    break
-
-                moves.append(bestmove)
-                referee.set_position(opening, moves)
-                current_fen = referee.current_fen()
-                legal_moves = referee.legal_move_count()
-                repetition[current_fen] = repetition.get(current_fen, 0) + 1
-
-                if repetition[current_fen] >= 3:
-                    result = "draw"
-                    reason = "threefold repetition"
-                    break
-                if legal_moves == 0:
-                    result = mover_name
-                    reason = "opponent has no legal move"
-                    break
-
-                if args.progress_every > 0 and (ply + 1) % args.progress_every == 0:
-                    print(
-                        f"game {game_index + 1:>2} progress: ply={ply + 1} "
-                        f"last={mover_name}:{bestmove} depth={summary.depth} "
-                        f"nodes={summary.nodes} elapsed={time.monotonic() - game_started:.1f}s",
-                        flush=True,
-                    )
-
-                if ply == args.max_plies - 1:
-                    result = "draw"
-                    reason = "max plies"
-
-            results[result] += 1
-            game_reports.append(
-                {
-                    "game": game_index + 1,
-                    "opening": opening,
-                    "red": engine_name(args.label, swap_colors, "w"),
-                    "black": engine_name(args.label, swap_colors, "b"),
-                    "result": result,
-                    "reason": reason,
-                    "plies": len(moves),
-                    "moves": moves,
-                }
-            )
-            print(
-                f"game {game_index + 1:>2}: opening={opening} "
-                f"red={engine_name(args.label, swap_colors, 'w')} "
-                f"black={engine_name(args.label, swap_colors, 'b')} "
-                f"result={result} reason={reason} plies={len(moves)} "
-                f"elapsed={time.monotonic() - game_started:.1f}s",
-                flush=True,
-            )
+    for partial_results, partial_reports in job_results:
+        for key, value in partial_results.items():
+            results[key] += value
+        game_reports.extend(partial_reports)
+    game_reports.sort(key=lambda report: report["game"])
 
     total = sum(results.values())
     print("\nscoreboard")
