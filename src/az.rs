@@ -15,8 +15,11 @@ const COMPLETED_Q_MAXVISIT_INIT: f32 = 50.0;
 #[derive(Clone, Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
+    pub trunk_depth: usize,
     pub input_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
+    pub trunk_weights: Vec<f32>,
+    pub trunk_biases: Vec<f32>,
     pub value_hidden: Vec<f32>,
     pub value_bias: f32,
     pub policy_move_hidden: Vec<f32>,
@@ -117,11 +120,19 @@ struct AzSelfplayData {
 
 impl AzNnue {
     pub fn random(hidden_size: usize, seed: u64) -> Self {
+        Self::random_with_depth(hidden_size, 2, seed)
+    }
+
+    pub fn random_with_depth(hidden_size: usize, trunk_depth: usize, seed: u64) -> Self {
         let mut rng = SplitMix64::new(seed);
         let input_hidden = (0..V3_INPUT_SIZE * hidden_size)
             .map(|_| rng.weight(0.015))
             .collect();
         let hidden_bias = vec![0.0; hidden_size];
+        let trunk_weights = (0..trunk_depth * hidden_size * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
+            .collect();
+        let trunk_biases = vec![0.0; trunk_depth * hidden_size];
         let value_hidden = (0..hidden_size).map(|_| rng.weight(0.05)).collect();
         let policy_move_hidden = (0..MOVE_SPACE * hidden_size)
             .map(|_| rng.weight(0.01))
@@ -129,8 +140,11 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; MOVE_SPACE];
         Self {
             hidden_size,
+            trunk_depth,
             input_hidden,
             hidden_bias,
+            trunk_weights,
+            trunk_biases,
             value_hidden,
             value_bias: 0.0,
             policy_move_hidden,
@@ -140,10 +154,13 @@ impl AzNnue {
 
     pub fn save_text(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let text = format!(
-            "format: aznnue-v2\ninput_size: {V3_INPUT_SIZE}\nhidden_size: {}\ninput_hidden: {}\nhidden_bias: {}\nvalue_hidden: {}\nvalue_bias: {}\npolicy_move_hidden: {}\npolicy_move_bias: {}\n",
+            "format: aznnue-v3\ninput_size: {V3_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\nvalue_hidden: {}\nvalue_bias: {}\npolicy_move_hidden: {}\npolicy_move_bias: {}\n",
             self.hidden_size,
+            self.trunk_depth,
             format_floats(&self.input_hidden),
             format_floats(&self.hidden_bias),
+            format_floats(&self.trunk_weights),
+            format_floats(&self.trunk_biases),
             format_floats(&self.value_hidden),
             self.value_bias,
             format_floats(&self.policy_move_hidden),
@@ -156,8 +173,11 @@ impl AzNnue {
         let text = fs::read_to_string(path)?;
         let mut input_size = None;
         let mut hidden_size = None;
+        let mut trunk_depth = None;
         let mut input_hidden = None;
         let mut hidden_bias = None;
+        let mut trunk_weights = None;
+        let mut trunk_biases = None;
         let mut value_hidden = None;
         let mut value_bias = None;
         let mut policy_move_hidden = None;
@@ -171,8 +191,11 @@ impl AzNnue {
             match key.trim() {
                 "input_size" => input_size = value.parse::<usize>().ok(),
                 "hidden_size" => hidden_size = value.parse::<usize>().ok(),
+                "trunk_depth" => trunk_depth = value.parse::<usize>().ok(),
                 "input_hidden" => input_hidden = Some(parse_floats(value)?),
                 "hidden_bias" => hidden_bias = Some(parse_floats(value)?),
+                "trunk_weights" => trunk_weights = Some(parse_floats(value)?),
+                "trunk_biases" => trunk_biases = Some(parse_floats(value)?),
                 "value_hidden" => value_hidden = Some(parse_floats(value)?),
                 "value_bias" => value_bias = value.parse::<f32>().ok(),
                 "policy_move_hidden" => policy_move_hidden = Some(parse_floats(value)?),
@@ -184,18 +207,27 @@ impl AzNnue {
         if input_size != Some(V3_INPUT_SIZE) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "aznnue-v2 requires fixed v3 input_size",
+                "aznnue-v3 requires fixed v3 input_size",
             ));
         }
         let hidden_size = hidden_size
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hidden_size"))?;
+        let trunk_depth = trunk_depth
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing trunk_depth"))?;
         let model = Self {
             hidden_size,
+            trunk_depth,
             input_hidden: input_hidden.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing input_hidden")
             })?,
             hidden_bias: hidden_bias
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hidden_bias"))?,
+            trunk_weights: trunk_weights.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing trunk_weights")
+            })?,
+            trunk_biases: trunk_biases.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing trunk_biases")
+            })?,
             value_hidden: value_hidden.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing value_hidden")
             })?,
@@ -218,7 +250,7 @@ impl AzNnue {
         history: &[HistoryMove],
         moves: &[Move],
     ) -> (f32, Vec<f32>) {
-        let hidden = self.hidden(position, history);
+        let hidden = self.embedding(position, history);
         let value = self.value_from_hidden(&hidden);
         let logits = moves
             .iter()
@@ -230,6 +262,8 @@ impl AzNnue {
     fn validate(&self) -> io::Result<()> {
         if self.input_hidden.len() != V3_INPUT_SIZE * self.hidden_size
             || self.hidden_bias.len() != self.hidden_size
+            || self.trunk_weights.len() != self.trunk_depth * self.hidden_size * self.hidden_size
+            || self.trunk_biases.len() != self.trunk_depth * self.hidden_size
             || self.value_hidden.len() != self.hidden_size
             || self.policy_move_hidden.len() != MOVE_SPACE * self.hidden_size
             || self.policy_move_bias.len() != MOVE_SPACE
@@ -242,9 +276,13 @@ impl AzNnue {
         Ok(())
     }
 
-    fn hidden(&self, position: &Position, history: &[HistoryMove]) -> Vec<f32> {
+    fn embedding(&self, position: &Position, history: &[HistoryMove]) -> Vec<f32> {
+        self.embedding_from_features(&extract_sparse_features_v3(position, history))
+    }
+
+    fn embedding_from_features(&self, features: &[usize]) -> Vec<f32> {
         let mut hidden = self.hidden_bias.clone();
-        for feature in extract_sparse_features_v3(position, history) {
+        for &feature in features {
             let row =
                 &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size];
             for idx in 0..self.hidden_size {
@@ -253,6 +291,25 @@ impl AzNnue {
         }
         for value in &mut hidden {
             *value = value.max(0.0);
+        }
+        self.forward_trunk(hidden)
+    }
+
+    fn forward_trunk(&self, mut hidden: Vec<f32>) -> Vec<f32> {
+        let mut next = vec![0.0; self.hidden_size];
+        for layer in 0..self.trunk_depth {
+            let weight_offset = layer * self.hidden_size * self.hidden_size;
+            let bias_offset = layer * self.hidden_size;
+            for out in 0..self.hidden_size {
+                let mut value = self.trunk_biases[bias_offset + out];
+                let row = &self.trunk_weights[weight_offset + out * self.hidden_size
+                    ..weight_offset + (out + 1) * self.hidden_size];
+                for idx in 0..self.hidden_size {
+                    value += row[idx] * hidden[idx];
+                }
+                next[out] = value.max(0.0);
+            }
+            std::mem::swap(&mut hidden, &mut next);
         }
         hidden
     }
@@ -405,7 +462,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         plies_total += plies;
 
         for sample in &mut game_samples {
-            sample.value *= result;
+            sample.value = result * sample.value;
         }
         samples.extend(game_samples);
     }
@@ -1036,18 +1093,10 @@ fn train_samples(
 }
 
 fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainStats {
-    let mut hidden = model.hidden_bias.clone();
-    for &feature in &sample.features {
-        let row =
-            &model.input_hidden[feature * model.hidden_size..(feature + 1) * model.hidden_size];
-        for idx in 0..model.hidden_size {
-            hidden[idx] += row[idx];
-        }
-    }
-    let relu_mask = hidden.iter().map(|value| *value > 0.0).collect::<Vec<_>>();
-    for value in &mut hidden {
-        *value = value.max(0.0);
-    }
+    let activations = train_forward_activations(model, &sample.features);
+    let hidden = activations
+        .last()
+        .expect("at least input activation exists");
 
     let value = model.value_from_hidden(&hidden);
     let value_error = value - sample.value;
@@ -1066,16 +1115,16 @@ fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainS
         .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
         .sum::<f32>();
 
-    let mut hidden_grad = vec![0.0; model.hidden_size];
+    let mut activation_grad = vec![0.0; model.hidden_size];
     for idx in 0..model.hidden_size {
-        hidden_grad[idx] += value_grad * model.value_hidden[idx];
+        activation_grad[idx] += value_grad * model.value_hidden[idx];
     }
     for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
         let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
         let policy_grad = (predicted - target).clamp(-4.0, 4.0);
         let offset = move_index * model.hidden_size;
         for idx in 0..model.hidden_size {
-            hidden_grad[idx] += policy_grad * model.policy_move_hidden[offset + idx];
+            activation_grad[idx] += policy_grad * model.policy_move_hidden[offset + idx];
         }
     }
 
@@ -1094,12 +1143,34 @@ fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainS
         model.policy_move_bias[move_index] -= lr * policy_grad;
     }
 
+    let mut input_grad = activation_grad;
+    for layer in (0..model.trunk_depth).rev() {
+        let output = &activations[layer + 1];
+        let input = &activations[layer];
+        let mut previous_grad = vec![0.0; model.hidden_size];
+        let weight_offset = layer * model.hidden_size * model.hidden_size;
+        let bias_offset = layer * model.hidden_size;
+        for out in 0..model.hidden_size {
+            if output[out] <= 0.0 {
+                continue;
+            }
+            let grad = input_grad[out].clamp(-4.0, 4.0);
+            for idx in 0..model.hidden_size {
+                let weight_index = weight_offset + out * model.hidden_size + idx;
+                previous_grad[idx] += grad * model.trunk_weights[weight_index];
+                model.trunk_weights[weight_index] -= lr * grad * input[idx];
+            }
+            model.trunk_biases[bias_offset + out] -= lr * grad;
+        }
+        input_grad = previous_grad;
+    }
+
     let input_lr = lr / (sample.features.len() as f32).sqrt().max(1.0);
     for idx in 0..model.hidden_size {
-        if !relu_mask[idx] {
+        if activations[0][idx] <= 0.0 {
             continue;
         }
-        let grad = hidden_grad[idx].clamp(-4.0, 4.0);
+        let grad = input_grad[idx].clamp(-4.0, 4.0);
         model.hidden_bias[idx] -= input_lr * grad;
         for &feature in &sample.features {
             model.input_hidden[feature * model.hidden_size + idx] -= input_lr * grad;
@@ -1112,6 +1183,40 @@ fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainS
         policy_ce,
         samples: 1,
     }
+}
+
+fn train_forward_activations(model: &AzNnue, features: &[usize]) -> Vec<Vec<f32>> {
+    let mut hidden = model.hidden_bias.clone();
+    for &feature in features {
+        let row =
+            &model.input_hidden[feature * model.hidden_size..(feature + 1) * model.hidden_size];
+        for idx in 0..model.hidden_size {
+            hidden[idx] += row[idx];
+        }
+    }
+    for value in &mut hidden {
+        *value = value.max(0.0);
+    }
+
+    let mut activations = Vec::with_capacity(model.trunk_depth + 1);
+    activations.push(hidden);
+    for layer in 0..model.trunk_depth {
+        let previous = activations.last().expect("previous activation exists");
+        let mut next = vec![0.0; model.hidden_size];
+        let weight_offset = layer * model.hidden_size * model.hidden_size;
+        let bias_offset = layer * model.hidden_size;
+        for out in 0..model.hidden_size {
+            let mut value = model.trunk_biases[bias_offset + out];
+            let row = &model.trunk_weights[weight_offset + out * model.hidden_size
+                ..weight_offset + (out + 1) * model.hidden_size];
+            for idx in 0..model.hidden_size {
+                value += row[idx] * previous[idx];
+            }
+            next[out] = value.max(0.0);
+        }
+        activations.push(next);
+    }
+    activations
 }
 
 fn shuffle(values: &mut [usize], rng: &mut SplitMix64) {

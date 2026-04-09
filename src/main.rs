@@ -15,19 +15,24 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(128);
-            let output = args.next().unwrap_or_else(|| "az.nnue.txt".into());
+            let output = args.next().unwrap_or_else(|| "chineseai.nnue.txt".into());
             let seed = args
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(20260409);
-            let model = AzNnue::random(hidden, seed);
+            let trunk_depth = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(2);
+            let model = AzNnue::random_with_depth(hidden, trunk_depth, seed);
             model.save_text(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
             println!("aznnue   : initialized");
             println!("hidden   : {hidden}");
+            println!("depth    : {trunk_depth}");
             println!("seed     : {seed}");
-            println!("format   : aznnue-v2");
+            println!("format   : aznnue-v3");
             println!("output   : {output}");
         }
         Some("az-gumbel") => {
@@ -78,7 +83,7 @@ fn main() {
             }
         }
         Some("az-loop") => {
-            let model_path = args.next().unwrap_or_else(|| "az.nnue.txt".into());
+            let model_path = args.next().unwrap_or_else(|| "chineseai.nnue.txt".into());
             let iterations = parse_next(&mut args, 100usize);
             let games = parse_next(&mut args, 16usize);
             let simulations = parse_next(&mut args, 256usize);
@@ -93,6 +98,7 @@ fn main() {
             let temperature_end = parse_next(&mut args, 0.2f32);
             let temperature_decay_plies = parse_next(&mut args, 40usize);
             let gumbel_scale = parse_next(&mut args, 1.0f32);
+            let trunk_depth = parse_next(&mut args, 2usize);
 
             let mut model = if std::path::Path::new(&model_path).exists() {
                 println!("model    : load {model_path}");
@@ -101,11 +107,11 @@ fn main() {
                 })
             } else {
                 println!("model    : init {model_path}");
-                AzNnue::random(hidden, seed)
+                AzNnue::random_with_depth(hidden, trunk_depth, seed)
             };
 
             println!(
-                "loop     : iterations={iterations} games={games} sims={simulations} top_k={top_k} epochs={epochs} lr={lr} max_plies={max_plies} workers={workers} temp={temperature_start}->{temperature_end}/{temperature_decay_plies}ply gumbel_scale={gumbel_scale}"
+                "loop     : iterations={iterations} games={games} sims={simulations} top_k={top_k} epochs={epochs} lr={lr} max_plies={max_plies} workers={workers} temp={temperature_start}->{temperature_end}/{temperature_decay_plies}ply gumbel_scale={gumbel_scale} depth={trunk_depth}"
             );
             for iteration in 1..=iterations {
                 let started = std::time::Instant::now();
@@ -165,11 +171,11 @@ fn print_help() {
     println!("ChineseAI AZ-NNUE Gumbel core");
     println!("start : {STARTPOS_FEN}");
     println!("moves : {}", position.legal_moves().len());
-    println!("hint  : cargo run --release -- az-init 128 az.nnue.txt");
+    println!("hint  : cargo run --release -- az-init 128 chineseai.nnue.txt 20260409 2");
     println!("hint  : cargo run --release -- uci");
-    println!("hint  : cargo run --release -- az-gumbel az.nnue.txt 10000 32 startpos");
+    println!("hint  : cargo run --release -- az-gumbel chineseai.nnue.txt 10000 32 startpos");
     println!(
-        "hint  : cargo run --release -- az-loop az.nnue.txt 100 16 256 16 1 0.001 160 128 20260409 4 1.0 0.2 40 1.0"
+        "hint  : cargo run --release -- az-loop chineseai.nnue.txt 100 16 256 16 1 0.001 160 128 20260409 4 1.0 0.2 40 1.0 2"
     );
 }
 
