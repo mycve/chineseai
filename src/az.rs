@@ -1,12 +1,17 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use crate::nnue::{HistoryMove, V3_INPUT_SIZE, extract_sparse_features_v3};
+use crate::nnue::{
+    HistoryMove, V3_INPUT_SIZE, extract_sparse_features_v3, mirror_file_move,
+    mirror_sparse_features_file, orient_move,
+};
 use crate::xiangqi::{BOARD_SIZE, Color, Move, Position};
 
+pub const AZNNUE_FORMAT: &str = "aznnue-v5";
 const MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 const VALUE_SCALE_CP: f32 = 800.0;
 const COMPLETED_Q_VALUE_SCALE: f32 = 0.1;
@@ -78,6 +83,10 @@ pub struct AzLoopConfig {
     pub temperature_end: f32,
     pub temperature_decay_plies: usize,
     pub gumbel_scale: f32,
+    pub td_lambda: f32,
+    pub replay_games: usize,
+    pub replay_samples: usize,
+    pub mirror_probability: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +100,9 @@ pub struct AzLoopReport {
     pub loss: f32,
     pub value_mse: f32,
     pub policy_ce: f32,
+    pub train_samples: usize,
+    pub pool_games: usize,
+    pub pool_samples: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +111,7 @@ struct AzTrainingSample {
     moves: Vec<Move>,
     policy: Vec<f32>,
     value: f32,
+    bootstrap_value: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -112,10 +125,68 @@ struct AzTrainStats {
 #[derive(Clone, Debug, Default)]
 struct AzSelfplayData {
     samples: Vec<AzTrainingSample>,
+    games: Vec<Vec<AzTrainingSample>>,
     red_wins: usize,
     black_wins: usize,
     draws: usize,
     plies_total: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AzExperiencePool {
+    game_capacity: usize,
+    games: VecDeque<Vec<AzTrainingSample>>,
+    samples: usize,
+}
+
+impl AzExperiencePool {
+    pub fn new(game_capacity: usize) -> Self {
+        Self {
+            game_capacity,
+            games: VecDeque::new(),
+            samples: 0,
+        }
+    }
+
+    pub fn game_count(&self) -> usize {
+        self.games.len()
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.samples
+    }
+
+    fn add_games(&mut self, games: Vec<Vec<AzTrainingSample>>) {
+        if self.game_capacity == 0 {
+            return;
+        }
+        for game in games.into_iter().filter(|game| !game.is_empty()) {
+            self.samples += game.len();
+            self.games.push_back(game);
+            while self.games.len() > self.game_capacity {
+                if let Some(removed) = self.games.pop_front() {
+                    self.samples = self.samples.saturating_sub(removed.len());
+                }
+            }
+        }
+    }
+
+    fn sample_uniform_games(&self, count: usize, rng: &mut SplitMix64) -> Vec<AzTrainingSample> {
+        if self.games.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut samples = Vec::with_capacity(count);
+        for _ in 0..count {
+            let game_index = (rng.next() as usize) % self.games.len();
+            let game = &self.games[game_index];
+            if game.is_empty() {
+                continue;
+            }
+            let sample_index = (rng.next() as usize) % game.len();
+            samples.push(game[sample_index].clone());
+        }
+        samples
+    }
 }
 
 impl AzNnue {
@@ -154,7 +225,7 @@ impl AzNnue {
 
     pub fn save_text(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let text = format!(
-            "format: aznnue-v3\ninput_size: {V3_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\nvalue_hidden: {}\nvalue_bias: {}\npolicy_move_hidden: {}\npolicy_move_bias: {}\n",
+            "format: {AZNNUE_FORMAT}\ninput_size: {V3_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\nvalue_hidden: {}\nvalue_bias: {}\npolicy_move_hidden: {}\npolicy_move_bias: {}\n",
             self.hidden_size,
             self.trunk_depth,
             format_floats(&self.input_hidden),
@@ -171,6 +242,7 @@ impl AzNnue {
 
     pub fn load_text(path: impl AsRef<Path>) -> io::Result<Self> {
         let text = fs::read_to_string(path)?;
+        let mut model_format = None;
         let mut input_size = None;
         let mut hidden_size = None;
         let mut trunk_depth = None;
@@ -189,6 +261,7 @@ impl AzNnue {
             };
             let value = value.trim();
             match key.trim() {
+                "format" => model_format = Some(value.to_string()),
                 "input_size" => input_size = value.parse::<usize>().ok(),
                 "hidden_size" => hidden_size = value.parse::<usize>().ok(),
                 "trunk_depth" => trunk_depth = value.parse::<usize>().ok(),
@@ -204,10 +277,16 @@ impl AzNnue {
             }
         }
 
+        if model_format.as_deref() != Some(AZNNUE_FORMAT) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{AZNNUE_FORMAT} model format required"),
+            ));
+        }
         if input_size != Some(V3_INPUT_SIZE) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "aznnue-v3 requires fixed v3 input_size",
+                format!("{AZNNUE_FORMAT} requires fixed relative-view v3 input_size"),
             ));
         }
         let hidden_size = hidden_size
@@ -252,9 +331,10 @@ impl AzNnue {
     ) -> (f32, Vec<f32>) {
         let hidden = self.embedding(position, history);
         let value = self.value_from_hidden(&hidden);
+        let side = position.side_to_move();
         let logits = moves
             .iter()
-            .map(|mv| self.policy_logit_from_hidden(&hidden, *mv))
+            .map(|mv| self.policy_logit_from_hidden(&hidden, orient_move(side, *mv)))
             .collect();
         (value, logits)
     }
@@ -335,12 +415,36 @@ impl AzNnue {
 }
 
 pub fn selfplay_train_iteration(model: &mut AzNnue, config: &AzLoopConfig) -> AzLoopReport {
+    selfplay_train_iteration_with_pool(model, config, None)
+}
+
+pub fn selfplay_train_iteration_with_pool(
+    model: &mut AzNnue,
+    config: &AzLoopConfig,
+    pool: Option<&mut AzExperiencePool>,
+) -> AzLoopReport {
     let data = generate_selfplay_data(model, config);
     let mut rng = SplitMix64::new(config.seed ^ 0xA5A5_5A5A_D3C3_B4B4);
-    let stats = train_samples(model, &data.samples, config.epochs, config.lr, &mut rng);
+    let generated_samples = data.samples.len();
+    let (train_data, pool_games, pool_samples) = if let Some(pool) = pool {
+        pool.add_games(data.games.clone());
+        let train_count = if config.replay_samples == 0 {
+            generated_samples
+        } else {
+            config.replay_samples
+        };
+        (
+            pool.sample_uniform_games(train_count, &mut rng),
+            pool.game_count(),
+            pool.sample_count(),
+        )
+    } else {
+        (data.samples.clone(), 0, 0)
+    };
+    let stats = train_samples(model, &train_data, config.epochs, config.lr, &mut rng);
     AzLoopReport {
         games: config.games,
-        samples: data.samples.len(),
+        samples: generated_samples,
         red_wins: data.red_wins,
         black_wins: data.black_wins,
         draws: data.draws,
@@ -352,6 +456,9 @@ pub fn selfplay_train_iteration(model: &mut AzNnue, config: &AzLoopConfig) -> Az
         loss: stats.loss,
         value_mse: stats.value_mse,
         policy_ce: stats.policy_ce,
+        train_samples: train_data.len(),
+        pool_games,
+        pool_samples,
     }
 }
 
@@ -383,6 +490,7 @@ fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayDa
     for handle in handles {
         let chunk = handle.join().expect("selfplay worker panicked");
         merged.samples.extend(chunk.samples);
+        merged.games.extend(chunk.games);
         merged.red_wins += chunk.red_wins;
         merged.black_wins += chunk.black_wins;
         merged.draws += chunk.draws;
@@ -398,6 +506,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut black_wins = 0usize;
     let mut draws = 0usize;
     let mut plies_total = 0usize;
+    let mut games = Vec::with_capacity(config.games);
 
     for game_index in 0..config.games {
         let mut position = Position::startpos();
@@ -439,6 +548,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &position,
                 &history,
                 &search.candidates,
+                search.value_cp,
+                rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
             append_history(&mut history, &position, mv);
             position.make_move(mv);
@@ -461,14 +572,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        for sample in &mut game_samples {
-            sample.value = result * sample.value;
-        }
-        samples.extend(game_samples);
+        assign_lambda_targets(&mut game_samples, result, config.td_lambda);
+        samples.extend(game_samples.clone());
+        games.push(game_samples);
     }
 
     AzSelfplayData {
         samples,
+        games,
         red_wins,
         black_wins,
         draws,
@@ -968,15 +1079,29 @@ fn make_training_sample(
     position: &Position,
     history: &[HistoryMove],
     candidates: &[AzCandidate],
+    value_cp: i32,
+    mirror_file: bool,
 ) -> AzTrainingSample {
     let total_policy = candidates
         .iter()
         .map(|candidate| candidate.policy.max(0.0))
         .sum::<f32>()
         .max(1.0);
+    let side = position.side_to_move();
+    let mut features = extract_sparse_features_v3(position, history);
+    let mut moves = candidates
+        .iter()
+        .map(|candidate| orient_move(side, candidate.mv))
+        .collect::<Vec<_>>();
+    if mirror_file {
+        mirror_sparse_features_file(&mut features);
+        for mv in &mut moves {
+            *mv = mirror_file_move(*mv);
+        }
+    }
     AzTrainingSample {
-        features: extract_sparse_features_v3(position, history),
-        moves: candidates.iter().map(|candidate| candidate.mv).collect(),
+        features,
+        moves,
         policy: candidates
             .iter()
             .map(|candidate| candidate.policy.max(0.0) / total_policy)
@@ -986,6 +1111,21 @@ fn make_training_sample(
         } else {
             -1.0
         },
+        bootstrap_value: (value_cp as f32 / VALUE_SCALE_CP).clamp(-1.0, 1.0),
+    }
+}
+
+fn assign_lambda_targets(samples: &mut [AzTrainingSample], game_result: f32, td_lambda: f32) {
+    let lambda = td_lambda.clamp(0.0, 1.0);
+    let mut next_return = None;
+    for sample in samples.iter_mut().rev() {
+        let terminal_target = game_result * sample.value;
+        let continuation = next_return
+            .map(|value: f32| -value)
+            .unwrap_or(terminal_target);
+        sample.value =
+            ((1.0 - lambda) * sample.bootstrap_value + lambda * continuation).clamp(-1.0, 1.0);
+        next_return = Some(sample.value);
     }
 }
 

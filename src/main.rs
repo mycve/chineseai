@@ -1,9 +1,18 @@
 use chineseai::{
-    az::{AzLoopConfig, AzNnue, AzSearchLimits, gumbel_search, selfplay_train_iteration},
+    az::{
+        AZNNUE_FORMAT, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits, gumbel_search,
+        selfplay_train_iteration_with_pool,
+    },
     nnue::{HISTORY_PLIES, HistoryMove},
     xiangqi::{Position, STARTPOS_FEN},
 };
-use std::io::{self, BufRead, Write};
+use std::{
+    fs,
+    io::{self, BufRead, Write},
+    path::Path,
+};
+
+const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.conf";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -32,7 +41,7 @@ fn main() {
             println!("hidden   : {hidden}");
             println!("depth    : {trunk_depth}");
             println!("seed     : {seed}");
-            println!("format   : aznnue-v3");
+            println!("format   : {AZNNUE_FORMAT}");
             println!("output   : {output}");
         }
         Some("az-gumbel") => {
@@ -83,62 +92,89 @@ fn main() {
             }
         }
         Some("az-loop") => {
-            let model_path = args.next().unwrap_or_else(|| "chineseai.nnue.txt".into());
-            let iterations = parse_next(&mut args, 100usize);
-            let games = parse_next(&mut args, 16usize);
-            let simulations = parse_next(&mut args, 256usize);
-            let top_k = parse_next(&mut args, 16usize);
-            let epochs = parse_next(&mut args, 1usize);
-            let lr = parse_next(&mut args, 0.001f32);
-            let max_plies = parse_next(&mut args, 160usize);
-            let hidden = parse_next(&mut args, 128usize);
-            let seed = parse_next(&mut args, 20260409u64);
-            let workers = parse_next(&mut args, 1usize).max(1);
-            let temperature_start = parse_next(&mut args, 1.0f32);
-            let temperature_end = parse_next(&mut args, 0.2f32);
-            let temperature_decay_plies = parse_next(&mut args, 40usize);
-            let gumbel_scale = parse_next(&mut args, 1.0f32);
-            let trunk_depth = parse_next(&mut args, 2usize);
-
-            let mut model = if std::path::Path::new(&model_path).exists() {
-                println!("model    : load {model_path}");
-                AzNnue::load_text(&model_path).unwrap_or_else(|err| {
-                    panic!("failed to load `{model_path}`: {err}");
-                })
-            } else {
-                println!("model    : init {model_path}");
-                AzNnue::random_with_depth(hidden, trunk_depth, seed)
+            let config_path = args.next().unwrap_or_else(|| DEFAULT_AZ_LOOP_CONFIG.into());
+            let Some(config) = load_or_create_az_loop_config(&config_path) else {
+                return;
             };
 
+            let mut model = if Path::new(&config.model_path).exists() {
+                println!("model    : load {}", config.model_path);
+                match AzNnue::load_text(&config.model_path) {
+                    Ok(model) => model,
+                    Err(err) => {
+                        println!(
+                            "model    : reinit {} as {AZNNUE_FORMAT} ({err})",
+                            config.model_path
+                        );
+                        AzNnue::random_with_depth(
+                            config.hidden_size,
+                            config.trunk_depth,
+                            config.seed,
+                        )
+                    }
+                }
+            } else {
+                println!("model    : init {}", config.model_path);
+                AzNnue::random_with_depth(config.hidden_size, config.trunk_depth, config.seed)
+            };
+            let mut replay_pool =
+                (config.replay_games > 0).then(|| AzExperiencePool::new(config.replay_games));
+
             println!(
-                "loop     : iterations={iterations} games={games} sims={simulations} top_k={top_k} epochs={epochs} lr={lr} max_plies={max_plies} workers={workers} temp={temperature_start}->{temperature_end}/{temperature_decay_plies}ply gumbel_scale={gumbel_scale} depth={trunk_depth}"
+                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={}",
+                config_path,
+                config.iterations,
+                config.games,
+                config.simulations,
+                config.top_k,
+                config.epochs,
+                config.lr,
+                config.max_plies,
+                config.workers,
+                config.temperature_start,
+                config.temperature_end,
+                config.temperature_decay_plies,
+                config.gumbel_scale,
+                config.trunk_depth,
+                config.td_lambda,
+                config.replay_games,
+                config.replay_samples,
+                config.mirror_probability
             );
-            for iteration in 1..=iterations {
+            for iteration in 1..=config.iterations {
                 let started = std::time::Instant::now();
-                let report = selfplay_train_iteration(
+                let report = selfplay_train_iteration_with_pool(
                     &mut model,
                     &AzLoopConfig {
-                        games,
-                        max_plies,
-                        simulations,
-                        top_k,
-                        epochs,
-                        lr,
-                        seed: seed ^ iteration as u64,
-                        workers,
-                        temperature_start,
-                        temperature_end,
-                        temperature_decay_plies,
-                        gumbel_scale,
+                        games: config.games,
+                        max_plies: config.max_plies,
+                        simulations: config.simulations,
+                        top_k: config.top_k,
+                        epochs: config.epochs,
+                        lr: config.lr,
+                        seed: config.seed ^ iteration as u64,
+                        workers: config.workers,
+                        temperature_start: config.temperature_start,
+                        temperature_end: config.temperature_end,
+                        temperature_decay_plies: config.temperature_decay_plies,
+                        gumbel_scale: config.gumbel_scale,
+                        td_lambda: config.td_lambda,
+                        replay_games: config.replay_games,
+                        replay_samples: config.replay_samples,
+                        mirror_probability: config.mirror_probability,
                     },
+                    replay_pool.as_mut(),
                 );
-                model.save_text(&model_path).unwrap_or_else(|err| {
-                    panic!("failed to write `{model_path}`: {err}");
+                model.save_text(&config.model_path).unwrap_or_else(|err| {
+                    panic!("failed to write `{}`: {err}", config.model_path);
                 });
                 println!(
-                    "iter {iteration:04}: games={} samples={} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} elapsed={:.1}s saved={}",
+                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} elapsed={:.1}s saved={}",
                     report.games,
                     report.samples,
+                    report.train_samples,
+                    report.pool_games,
+                    report.pool_samples,
                     report.red_wins,
                     report.black_wins,
                     report.draws,
@@ -147,7 +183,7 @@ fn main() {
                     report.value_mse,
                     report.policy_ce,
                     started.elapsed().as_secs_f32(),
-                    model_path
+                    config.model_path
                 );
             }
         }
@@ -174,9 +210,212 @@ fn print_help() {
     println!("hint  : cargo run --release -- az-init 128 chineseai.nnue.txt 20260409 2");
     println!("hint  : cargo run --release -- uci");
     println!("hint  : cargo run --release -- az-gumbel chineseai.nnue.txt 10000 32 startpos");
-    println!(
-        "hint  : cargo run --release -- az-loop chineseai.nnue.txt 100 16 256 16 1 0.001 160 128 20260409 4 1.0 0.2 40 1.0 2"
-    );
+    println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
+}
+
+#[derive(Clone, Debug)]
+struct AzLoopFileConfig {
+    model_path: String,
+    iterations: usize,
+    games: usize,
+    simulations: usize,
+    top_k: usize,
+    epochs: usize,
+    lr: f32,
+    max_plies: usize,
+    hidden_size: usize,
+    trunk_depth: usize,
+    seed: u64,
+    workers: usize,
+    temperature_start: f32,
+    temperature_end: f32,
+    temperature_decay_plies: usize,
+    gumbel_scale: f32,
+    td_lambda: f32,
+    replay_games: usize,
+    replay_samples: usize,
+    mirror_probability: f32,
+}
+
+impl Default for AzLoopFileConfig {
+    fn default() -> Self {
+        Self {
+            model_path: "chineseai.nnue.txt".into(),
+            iterations: 100,
+            games: 400,
+            simulations: 512,
+            top_k: 16,
+            epochs: 2,
+            lr: 0.001,
+            max_plies: 300,
+            hidden_size: 128,
+            trunk_depth: 2,
+            seed: 20260409,
+            workers: 96,
+            temperature_start: 1.0,
+            temperature_end: 0.2,
+            temperature_decay_plies: 40,
+            gumbel_scale: 1.0,
+            td_lambda: 0.8,
+            replay_games: 5000,
+            replay_samples: 0,
+            mirror_probability: 0.3,
+        }
+    }
+}
+
+impl AzLoopFileConfig {
+    fn to_file_text(&self) -> String {
+        format!(
+            r#"# ChineseAI AZ self-play training config.
+# Run: ./target/release/chineseai az-loop {DEFAULT_AZ_LOOP_CONFIG}
+#
+# TD(lambda):
+#   1.0 = pure final game result, least bootstrap bias but slow value learning.
+#   0.8 = default mix of search bootstrap and final result, usually faster for long games.
+#   0.0 = pure search bootstrap, fastest but most biased by current weak model.
+#
+# Replay:
+#   replay_games keeps the most recent N complete games in memory.
+#   replay_samples=0 trains on about the same number of positions as newly generated this iteration.
+#   set replay_samples larger, e.g. 200000, to train more from the pool per iteration.
+#
+# Augmentation:
+#   mirror_probability mirrors board files a<->i for this fraction of training samples.
+#   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
+
+model_path = {model_path}
+iterations = {iterations}
+games = {games}
+simulations = {simulations}
+top_k = {top_k}
+epochs = {epochs}
+lr = {lr}
+max_plies = {max_plies}
+hidden_size = {hidden_size}
+trunk_depth = {trunk_depth}
+seed = {seed}
+workers = {workers}
+temperature_start = {temperature_start}
+temperature_end = {temperature_end}
+temperature_decay_plies = {temperature_decay_plies}
+gumbel_scale = {gumbel_scale}
+td_lambda = {td_lambda}
+replay_games = {replay_games}
+replay_samples = {replay_samples}
+mirror_probability = {mirror_probability}
+"#,
+            model_path = self.model_path,
+            iterations = self.iterations,
+            games = self.games,
+            simulations = self.simulations,
+            top_k = self.top_k,
+            epochs = self.epochs,
+            lr = self.lr,
+            max_plies = self.max_plies,
+            hidden_size = self.hidden_size,
+            trunk_depth = self.trunk_depth,
+            seed = self.seed,
+            workers = self.workers,
+            temperature_start = self.temperature_start,
+            temperature_end = self.temperature_end,
+            temperature_decay_plies = self.temperature_decay_plies,
+            gumbel_scale = self.gumbel_scale,
+            td_lambda = self.td_lambda,
+            replay_games = self.replay_games,
+            replay_samples = self.replay_samples,
+            mirror_probability = self.mirror_probability,
+        )
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut config = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            config.set(key.trim(), value.trim());
+        }
+        config.normalize()
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        match key {
+            "model_path" => self.model_path = value.to_string(),
+            "iterations" => self.iterations = parse_config_value(value, self.iterations),
+            "games" => self.games = parse_config_value(value, self.games),
+            "simulations" => self.simulations = parse_config_value(value, self.simulations),
+            "top_k" => self.top_k = parse_config_value(value, self.top_k),
+            "epochs" => self.epochs = parse_config_value(value, self.epochs),
+            "lr" => self.lr = parse_config_value(value, self.lr),
+            "max_plies" => self.max_plies = parse_config_value(value, self.max_plies),
+            "hidden_size" => self.hidden_size = parse_config_value(value, self.hidden_size),
+            "trunk_depth" => self.trunk_depth = parse_config_value(value, self.trunk_depth),
+            "seed" => self.seed = parse_config_value(value, self.seed),
+            "workers" => self.workers = parse_config_value(value, self.workers),
+            "temperature_start" => {
+                self.temperature_start = parse_config_value(value, self.temperature_start)
+            }
+            "temperature_end" => {
+                self.temperature_end = parse_config_value(value, self.temperature_end)
+            }
+            "temperature_decay_plies" => {
+                self.temperature_decay_plies =
+                    parse_config_value(value, self.temperature_decay_plies)
+            }
+            "gumbel_scale" => self.gumbel_scale = parse_config_value(value, self.gumbel_scale),
+            "td_lambda" => self.td_lambda = parse_config_value(value, self.td_lambda),
+            "replay_games" => self.replay_games = parse_config_value(value, self.replay_games),
+            "replay_samples" => {
+                self.replay_samples = parse_config_value(value, self.replay_samples)
+            }
+            "mirror_probability" => {
+                self.mirror_probability = parse_config_value(value, self.mirror_probability)
+            }
+            _ => {}
+        }
+    }
+
+    fn normalize(mut self) -> Self {
+        self.iterations = self.iterations.max(1);
+        self.games = self.games.max(1);
+        self.simulations = self.simulations.max(1);
+        self.top_k = self.top_k.max(1);
+        self.epochs = self.epochs.max(1);
+        self.max_plies = self.max_plies.max(1);
+        self.hidden_size = self.hidden_size.max(1);
+        self.workers = self.workers.max(1);
+        self.temperature_start = self.temperature_start.max(0.0);
+        self.temperature_end = self.temperature_end.max(0.0);
+        self.gumbel_scale = self.gumbel_scale.max(0.0);
+        self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
+        self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
+        self
+    }
+}
+
+fn load_or_create_az_loop_config(path: &str) -> Option<AzLoopFileConfig> {
+    if !Path::new(path).exists() {
+        let config = AzLoopFileConfig::default();
+        fs::write(path, config.to_file_text()).unwrap_or_else(|err| {
+            panic!("failed to create `{path}`: {err}");
+        });
+        println!("created config: {path}");
+        println!("edit it, then run: ./target/release/chineseai az-loop {path}");
+        return None;
+    }
+    let text = fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("failed to read `{path}`: {err}");
+    });
+    Some(AzLoopFileConfig::parse(&text))
+}
+
+fn parse_config_value<T: std::str::FromStr>(text: &str, default: T) -> T {
+    text.parse::<T>().unwrap_or(default)
 }
 
 #[derive(Clone, Debug)]
@@ -425,10 +664,4 @@ fn parse_position(text: &str) -> Position {
             panic!("invalid FEN `{text}`: {err}");
         })
     }
-}
-
-fn parse_next<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, default: T) -> T {
-    args.next()
-        .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default)
 }
