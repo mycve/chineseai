@@ -282,6 +282,7 @@ impl Position {
         format!("{board_part} {side}")
     }
 
+    #[inline(always)]
     pub fn side_to_move(&self) -> Color {
         self.side_to_move
     }
@@ -294,6 +295,11 @@ impl Position {
     #[inline(always)]
     pub fn has_general(&self, color: Color) -> bool {
         self.general_squares[color_hash_index(color)].is_some()
+    }
+
+    #[inline(always)]
+    pub fn general_square(&self, color: Color) -> Option<usize> {
+        self.general_squares[color_hash_index(color)]
     }
 
     #[inline(always)]
@@ -415,9 +421,38 @@ impl Position {
 
     pub fn parse_uci_move(&self, uci: &str) -> Option<Move> {
         let candidate = Move::from_uci(uci)?;
-        self.legal_moves()
-            .into_iter()
-            .find(|mv| mv.from == candidate.from && mv.to == candidate.to)
+        self.is_legal_move(candidate).then_some(candidate)
+    }
+
+    pub fn is_legal_move(&self, mv: Move) -> bool {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        let Some(piece) = self.board.get(from).and_then(|piece| *piece) else {
+            return false;
+        };
+        if piece.color != self.side_to_move {
+            return false;
+        }
+        if self
+            .board
+            .get(to)
+            .and_then(|target| *target)
+            .is_some_and(|target| target.color == self.side_to_move)
+        {
+            return false;
+        }
+
+        let mut pseudo = Vec::with_capacity(16);
+        self.gen_piece_moves(from, piece, MoveGenMode::All, &mut pseudo);
+        if !pseudo.contains(&mv) {
+            return false;
+        }
+
+        let mut work = self.clone();
+        let undo = work.make_move(mv);
+        let legal = !work.in_check(self.side_to_move);
+        work.unmake_move(mv, undo);
+        legal
     }
 
     pub fn perft(&self, depth: u32) -> u64 {
@@ -634,25 +669,29 @@ impl Position {
     }
 
     fn collect_legal_moves(&self, captures_only: bool, in_check: bool) -> Vec<Move> {
-        let pseudo_moves = if in_check {
+        let mut moves = if in_check {
             self.pseudo_legal_evasions()
         } else if captures_only {
             self.pseudo_legal_capture_moves()
         } else {
             self.pseudo_legal_moves()
         };
-        let mut legal = Vec::with_capacity(pseudo_moves.len());
         let mut work = self.clone();
+        let needs_capture_filter = captures_only && in_check;
+        let mut legal_len = 0usize;
 
-        for mv in pseudo_moves {
+        for read_index in 0..moves.len() {
+            let mv = moves[read_index];
             let undo = work.make_move(mv);
-            if !work.in_check(self.side_to_move) && (!captures_only || self.is_capture(mv)) {
-                legal.push(mv);
+            if !work.in_check(self.side_to_move) && (!needs_capture_filter || self.is_capture(mv)) {
+                moves[legal_len] = mv;
+                legal_len += 1;
             }
             work.unmake_move(mv, undo);
         }
 
-        legal
+        moves.truncate(legal_len);
+        moves
     }
 
     fn pseudo_legal_evasions(&self) -> Vec<Move> {
@@ -677,6 +716,7 @@ impl Position {
             allow_to[sq] = true;
         }
 
+        let mut piece_moves = Vec::with_capacity(16);
         for sq in 0..BOARD_SIZE {
             let Some(piece) = self.board[sq] else {
                 continue;
@@ -685,9 +725,9 @@ impl Position {
                 continue;
             }
 
-            let mut piece_moves = Vec::with_capacity(16);
+            piece_moves.clear();
             self.gen_piece_moves(sq, piece, MoveGenMode::All, &mut piece_moves);
-            for mv in piece_moves {
+            for &mv in &piece_moves {
                 let from = mv.from as usize;
                 let to = mv.to as usize;
                 if allow_to[to] || checker.screen_square == Some(from) {
@@ -1658,11 +1698,6 @@ fn signed_piece_contrib(piece: Piece, sq: usize) -> i32 {
 #[inline(always)]
 pub(crate) fn piece_base_value(kind: PieceKind) -> i32 {
     PIECE_BASE_VALUES[piece_kind_index(kind)]
-}
-
-#[inline(always)]
-pub(crate) fn piece_square_bonus(piece: Piece, sq: usize) -> i32 {
-    PIECE_SQUARE_TABLE[color_index_const(piece.color)][piece_kind_index(piece.kind)][sq]
 }
 
 const PIECE_BASE_VALUES: [i32; 7] = [0, 110, 110, 420, 900, 460, 110];
