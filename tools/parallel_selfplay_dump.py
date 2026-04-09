@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", default="auto")
     parser.add_argument("--auto-worker-reserve", type=int, default=2)
     parser.add_argument("--max-workers", type=int)
+    parser.add_argument(
+        "--verbose-merge",
+        action="store_true",
+        help="print one merge line per worker chunk",
+    )
     parser.add_argument("--release", action="store_true")
     parser.add_argument(
         "--engine",
@@ -139,10 +144,12 @@ def main() -> int:
             for index, chunk_path, line_count in sorted(results):
                 out.write(chunk_path.read_text(encoding="utf-8"))
                 rows += line_count
-                print(
-                    f"merged chunk={index} rows={line_count} total_rows={rows} -> {args.output}",
-                    flush=True,
-                )
+                if args.verbose_merge:
+                    print(
+                        f"merged chunk={index} rows={line_count} total_rows={rows} -> {args.output}",
+                        flush=True,
+                    )
+        print(f"merged {len(results)} chunks rows={rows} -> {args.output}", flush=True)
     return 0
 
 

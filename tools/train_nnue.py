@@ -182,10 +182,16 @@ def train(
                 valid_samples, input_hidden, hidden_bias, hidden_output, output_bias
             )
             print(
-                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} valid_mse={valid_loss:.4f} skipped={skipped}"
+                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} "
+                f"train_rmse_cp={math.sqrt(mean_loss):.2f} "
+                f"valid_mse={valid_loss:.4f} valid_rmse_cp={math.sqrt(valid_loss):.2f} "
+                f"skipped={skipped}"
             )
         else:
-            print(f"epoch {epoch + 1}: train_mse={mean_loss:.4f} skipped={skipped}")
+            print(
+                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} "
+                f"train_rmse_cp={math.sqrt(mean_loss):.2f} skipped={skipped}"
+            )
 
     return input_hidden, hidden_bias, hidden_output, output_bias, len(train_samples), len(valid_samples)
 
@@ -360,10 +366,16 @@ def train_torch(
                 torch, model, valid_samples, batch_size, device, target_clamp
             )
             print(
-                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} valid_mse={valid_loss:.4f} skipped={skipped}"
+                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} "
+                f"train_rmse_cp={math.sqrt(mean_loss):.2f} "
+                f"valid_mse={valid_loss:.4f} valid_rmse_cp={math.sqrt(valid_loss):.2f} "
+                f"skipped={skipped}"
             )
         else:
-            print(f"epoch {epoch + 1}: train_mse={mean_loss:.4f} skipped={skipped}")
+            print(
+                f"epoch {epoch + 1}: train_mse={mean_loss:.4f} "
+                f"train_rmse_cp={math.sqrt(mean_loss):.2f} skipped={skipped}"
+            )
 
     with torch.no_grad():
         input_hidden = model.input_hidden.weight.detach().cpu().tolist()
