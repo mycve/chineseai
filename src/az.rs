@@ -114,6 +114,7 @@ pub struct AzLoopConfig {
     pub batch_size: usize,
     pub seed: u64,
     pub workers: usize,
+    pub train_workers: usize,
     pub temperature_start: f32,
     pub temperature_end: f32,
     pub temperature_decay_plies: usize,
@@ -215,6 +216,34 @@ impl AzGrad {
         self.policy_move_hidden.fill(0.0);
         self.policy_move_global.fill(0.0);
         self.policy_move_bias.fill(0.0);
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        add_assign_slice(&mut self.input_hidden, &other.input_hidden);
+        add_assign_slice(&mut self.hidden_bias, &other.hidden_bias);
+        add_assign_slice(&mut self.trunk_weights, &other.trunk_weights);
+        add_assign_slice(&mut self.trunk_biases, &other.trunk_biases);
+        add_assign_slice(&mut self.global_hidden, &other.global_hidden);
+        add_assign_slice(&mut self.global_bias, &other.global_bias);
+        add_assign_slice(&mut self.value_logits_hidden, &other.value_logits_hidden);
+        add_assign_slice(&mut self.value_logits_global, &other.value_logits_global);
+        add_assign_slice(&mut self.value_logits_bias, &other.value_logits_bias);
+        add_assign_slice(&mut self.policy_move_hidden, &other.policy_move_hidden);
+        add_assign_slice(&mut self.policy_move_global, &other.policy_move_global);
+        add_assign_slice(&mut self.policy_move_bias, &other.policy_move_bias);
+    }
+}
+
+impl AzTrainStats {
+    fn add_assign(&mut self, other: &Self) {
+        self.loss += other.loss;
+        self.value_mse += other.value_mse;
+        self.policy_ce += other.policy_ce;
+        self.value_pred_sum += other.value_pred_sum;
+        self.value_pred_sq_sum += other.value_pred_sq_sum;
+        self.value_target_sum += other.value_target_sum;
+        self.value_target_sq_sum += other.value_target_sq_sum;
+        self.samples += other.samples;
     }
 }
 
@@ -723,6 +752,7 @@ pub fn selfplay_train_iteration_with_pool(
         config.epochs,
         config.lr,
         config.batch_size,
+        config.train_workers,
         &mut rng,
     );
     AzLoopReport {
@@ -1542,6 +1572,7 @@ fn train_samples(
     epochs: usize,
     lr: f32,
     batch_size: usize,
+    train_workers: usize,
     rng: &mut SplitMix64,
 ) -> AzTrainStats {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
@@ -1560,11 +1591,16 @@ fn train_samples(
         shuffle(&mut order, rng);
         stats = AzTrainStats::default();
         for batch in order.chunks(batch_size) {
-            let batch_stats = train_batch(model, &mut optimizer, &mut gradient, samples, batch, lr);
-            stats.loss += batch_stats.loss;
-            stats.value_mse += batch_stats.value_mse;
-            stats.policy_ce += batch_stats.policy_ce;
-            stats.samples += batch_stats.samples;
+            let batch_stats = train_batch(
+                model,
+                &mut optimizer,
+                &mut gradient,
+                samples,
+                batch,
+                lr,
+                train_workers,
+            );
+            stats.add_assign(&batch_stats);
         }
     }
     model.optimizer = Some(optimizer);
@@ -1584,16 +1620,51 @@ fn train_batch(
     samples: &[AzTrainingSample],
     batch: &[usize],
     lr: f32,
+    train_workers: usize,
 ) -> AzTrainStats {
-    gradient.clear();
-    let mut stats = AzTrainStats::default();
-    for &index in batch {
-        let sample_stats = accumulate_one(model, gradient, &samples[index]);
-        stats.loss += sample_stats.loss;
-        stats.value_mse += sample_stats.value_mse;
-        stats.policy_ce += sample_stats.policy_ce;
-        stats.samples += 1;
-    }
+    let worker_count = train_workers.max(1).min(batch.len().max(1));
+    let stats = if worker_count == 1 || batch.len() <= 1 {
+        gradient.clear();
+        let mut stats = AzTrainStats::default();
+        for &index in batch {
+            let sample_stats = accumulate_one(model, gradient, &samples[index]);
+            stats.add_assign(&sample_stats);
+        }
+        stats
+    } else {
+        gradient.clear();
+        let chunk_size = (batch.len() + worker_count - 1) / worker_count;
+        let model_ref: &AzNnue = &*model;
+        let samples_ref = samples;
+        let partials = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in batch.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let mut local_gradient = AzGrad::new(model_ref);
+                    let mut local_stats = AzTrainStats::default();
+                    for &index in chunk {
+                        let sample_stats =
+                            accumulate_one(model_ref, &mut local_gradient, &samples_ref[index]);
+                        local_stats.add_assign(&sample_stats);
+                    }
+                    (local_gradient, local_stats)
+                }));
+            }
+
+            let mut partials = Vec::with_capacity(handles.len());
+            for handle in handles {
+                partials.push(handle.join().expect("training worker panicked"));
+            }
+            partials
+        });
+
+        let mut stats = AzTrainStats::default();
+        for (local_gradient, local_stats) in partials {
+            gradient.add_assign(&local_gradient);
+            stats.add_assign(&local_stats);
+        }
+        stats
+    };
     if stats.samples > 0 {
         apply_adamw_gradient(model, optimizer, gradient, lr, stats.samples as f32);
     }
@@ -2001,6 +2072,12 @@ fn variance_to_std(sum: f32, sq_sum: f32, count: usize) -> f32 {
     variance.max(0.0).sqrt()
 }
 
+fn add_assign_slice(dst: &mut [f32], src: &[f32]) {
+    for (left, right) in dst.iter_mut().zip(src) {
+        *left += *right;
+    }
+}
+
 fn parse_floats(text: &str) -> io::Result<Vec<f32>> {
     text.split_whitespace()
         .map(|value| {
@@ -2138,5 +2215,130 @@ mod tests {
 
         assert!((samples[1].value - 1.0).abs() < 1e-6);
         assert!((samples[0].value + 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn value_head_can_overfit_tiny_fixed_dataset() {
+        let mut model = AzNnue::random_with_depth(16, 1, 7);
+        model.hidden_bias.fill(0.1);
+        model.trunk_biases.fill(0.1);
+        model.global_bias.fill(0.1);
+
+        let samples = vec![
+            AzTrainingSample {
+                features: vec![0],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: 1.0,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+            AzTrainingSample {
+                features: vec![1],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: -1.0,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+            AzTrainingSample {
+                features: vec![2],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: 0.75,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+            AzTrainingSample {
+                features: vec![3],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: -0.75,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+        ];
+
+        let mut rng = SplitMix64::new(17);
+        let before = train_samples(&mut model, &samples, 1, 0.003, 4, 1, &mut rng).value_mse;
+        let after = train_samples(&mut model, &samples, 300, 0.003, 4, 1, &mut rng).value_mse;
+
+        assert!(after < before * 0.2, "before={before} after={after}");
+        assert!(after < 0.05, "after={after}");
+    }
+
+    #[test]
+    fn synchronized_parallel_training_matches_single_thread() {
+        let samples = vec![
+            AzTrainingSample {
+                features: vec![0, 4, 8],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: 1.0,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+            AzTrainingSample {
+                features: vec![1, 5, 9],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: -1.0,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+            AzTrainingSample {
+                features: vec![2, 6, 10],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: 0.5,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+            AzTrainingSample {
+                features: vec![3, 7, 11],
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: -0.5,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: 0.0,
+                bootstrap_value: 0.0,
+            },
+        ];
+        let mut single = AzNnue::random_with_depth(16, 1, 23);
+        single.hidden_bias.fill(0.1);
+        single.trunk_biases.fill(0.1);
+        single.global_bias.fill(0.1);
+        let mut parallel = single.clone();
+
+        let mut rng_single = SplitMix64::new(99);
+        let mut rng_parallel = SplitMix64::new(99);
+        let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, 1, &mut rng_single);
+        let parallel_stats =
+            train_samples(&mut parallel, &samples, 5, 0.003, 4, 4, &mut rng_parallel);
+
+        assert!((single_stats.loss - parallel_stats.loss).abs() < 1e-5);
+        assert!((single_stats.value_mse - parallel_stats.value_mse).abs() < 1e-5);
+        assert!((single_stats.value_pred_sum - parallel_stats.value_pred_sum).abs() < 1e-4);
+        assert!((single_stats.value_target_sum - parallel_stats.value_target_sum).abs() < 1e-6);
+        assert!(single
+            .value_logits_bias
+            .iter()
+            .zip(&parallel.value_logits_bias)
+            .all(|(left, right)| (*left - *right).abs() < 1e-5));
     }
 }

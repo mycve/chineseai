@@ -234,7 +234,7 @@ fn main() {
                 (config.replay_games > 0).then(|| AzExperiencePool::new(config.replay_games));
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={}",
+                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} train_workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={}",
                 config_path,
                 config.iterations,
                 config.games,
@@ -245,6 +245,7 @@ fn main() {
                 config.batch_size,
                 config.max_plies,
                 config.workers,
+                config.train_workers,
                 config.temperature_start,
                 config.temperature_end,
                 config.temperature_decay_plies,
@@ -269,6 +270,7 @@ fn main() {
                         batch_size: config.batch_size,
                         seed: config.seed ^ iteration as u64,
                         workers: config.workers,
+                        train_workers: config.train_workers,
                         temperature_start: config.temperature_start,
                         temperature_end: config.temperature_end,
                         temperature_decay_plies: config.temperature_decay_plies,
@@ -348,6 +350,7 @@ struct AzLoopFileConfig {
     trunk_depth: usize,
     seed: u64,
     workers: usize,
+    train_workers: usize,
     temperature_start: f32,
     temperature_end: f32,
     temperature_decay_plies: usize,
@@ -374,11 +377,12 @@ impl Default for AzLoopFileConfig {
             trunk_depth: 2,
             seed: 20260409,
             workers: 8,
+            train_workers: 4,
             temperature_start: 1.0,
             temperature_end: 0.2,
             temperature_decay_plies: 40,
             gumbel_scale: 1.0,
-            td_lambda: 0.8,
+            td_lambda: 0.95,
             replay_games: 5000,
             replay_samples: 0,
             mirror_probability: 0.3,
@@ -393,8 +397,9 @@ impl AzLoopFileConfig {
 # Run: ./target/release/chineseai az-loop {DEFAULT_AZ_LOOP_CONFIG}
 #
 # TD(lambda):
-#   1.0 = pure final game result, least bootstrap bias but slow value learning.
-#   0.8 = default mix of search bootstrap and final result, usually faster for long games.
+#   1.0 = pure final game result, least bootstrap bias but slowest target propagation.
+#   0.95 = better default for long Xiangqi games; keeps terminal signal alive much longer.
+#   0.8 = leans heavily on bootstrap and can collapse early-ply targets toward 0 in 70+ ply games.
 #   0.0 = pure search bootstrap, fastest but most biased by current weak model.
 #
 # Replay:
@@ -405,6 +410,7 @@ impl AzLoopFileConfig {
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
 #   batch_size=256 is the default; lower it if memory is tight, raise it if loss is noisy.
+#   train_workers splits each training batch across CPU threads and synchronizes gradients once.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
 # Augmentation:
@@ -424,6 +430,7 @@ hidden_size = {hidden_size}
 trunk_depth = {trunk_depth}
 seed = {seed}
 workers = {workers}
+train_workers = {train_workers}
 temperature_start = {temperature_start}
 temperature_end = {temperature_end}
 temperature_decay_plies = {temperature_decay_plies}
@@ -446,6 +453,7 @@ mirror_probability = {mirror_probability}
             trunk_depth = self.trunk_depth,
             seed = self.seed,
             workers = self.workers,
+            train_workers = self.train_workers,
             temperature_start = self.temperature_start,
             temperature_end = self.temperature_end,
             temperature_decay_plies = self.temperature_decay_plies,
@@ -487,6 +495,9 @@ mirror_probability = {mirror_probability}
             "trunk_depth" => self.trunk_depth = parse_config_value(value, self.trunk_depth),
             "seed" => self.seed = parse_config_value(value, self.seed),
             "workers" => self.workers = parse_config_value(value, self.workers),
+            "train_workers" => {
+                self.train_workers = parse_config_value(value, self.train_workers)
+            }
             "temperature_start" => {
                 self.temperature_start = parse_config_value(value, self.temperature_start)
             }
@@ -520,6 +531,7 @@ mirror_probability = {mirror_probability}
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
+        self.train_workers = self.train_workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);
         self.gumbel_scale = self.gumbel_scale.max(0.0);
