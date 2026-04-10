@@ -1,10 +1,10 @@
 use chineseai::{
     az::{
         AZNNUE_FORMAT, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits, gumbel_search,
-        selfplay_train_iteration_with_pool,
+        gumbel_search_with_history_and_rules, selfplay_train_iteration_with_pool,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
-    xiangqi::{Position, STARTPOS_FEN},
+    xiangqi::{Position, RuleHistoryEntry, STARTPOS_FEN},
 };
 use std::{
     fs,
@@ -549,6 +549,7 @@ fn parse_config_value<T: std::str::FromStr>(text: &str, default: T) -> T {
 struct UciState {
     position: Position,
     history: Vec<HistoryMove>,
+    rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
     model: Option<AzNnue>,
     simulations: usize,
@@ -565,6 +566,7 @@ impl Default for UciState {
         Self {
             position: Position::startpos(),
             history: Vec::new(),
+            rule_history: Position::startpos().initial_rule_history(),
             eval_file: "chineseai.nnue.txt".into(),
             model: None,
             simulations: 10_000,
@@ -599,6 +601,7 @@ fn run_uci() {
             Some("ucinewgame") => {
                 state.position = Position::startpos();
                 state.history.clear();
+                state.rule_history = state.position.initial_rule_history();
             }
             Some("setoption") => handle_setoption(line, &mut state),
             Some("position") => handle_position(line, &mut state),
@@ -691,10 +694,12 @@ fn handle_position(line: &str, state: &mut UciState) {
     if tokens.get(1) == Some(&"startpos") {
         state.position = Position::startpos();
         state.history.clear();
+        state.rule_history = state.position.initial_rule_history();
         if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
             apply_uci_moves(
                 &mut state.position,
                 &mut state.history,
+                &mut state.rule_history,
                 &tokens[moves_index + 1..],
             );
         }
@@ -708,10 +713,12 @@ fn handle_position(line: &str, state: &mut UciState) {
         if let Ok(position) = Position::from_fen(&fen) {
             state.position = position;
             state.history.clear();
+            state.rule_history = state.position.initial_rule_history();
             if let Some(moves_index) = moves_index {
                 apply_uci_moves(
                     &mut state.position,
                     &mut state.history,
+                    &mut state.rule_history,
                     &tokens[moves_index + 1..],
                 );
             }
@@ -721,7 +728,12 @@ fn handle_position(line: &str, state: &mut UciState) {
     }
 }
 
-fn apply_uci_moves(position: &mut Position, history: &mut Vec<HistoryMove>, moves: &[&str]) {
+fn apply_uci_moves(
+    position: &mut Position,
+    history: &mut Vec<HistoryMove>,
+    rule_history: &mut Vec<RuleHistoryEntry>,
+    moves: &[&str],
+) {
     for text in moves {
         let Some(mv) = position.parse_uci_move(text) else {
             eprintln!("info string illegal move ignored: {text}");
@@ -734,6 +746,7 @@ fn apply_uci_moves(position: &mut Position, history: &mut Vec<HistoryMove>, move
                 history.drain(0..overflow);
             }
         }
+        rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
 }
@@ -742,10 +755,19 @@ fn handle_go(_line: &str, state: &mut UciState) {
     ensure_uci_model(state);
     let simulations = state.simulations.max(1);
     let model = state.model.as_ref().expect("model was loaded");
+    let legal = state.position.legal_moves_with_rules(&state.rule_history);
+    if legal.is_empty() {
+        println!("info depth 1 nodes 0 time 0 score cp -32000 pv 0000");
+        println!("bestmove 0000");
+        uci_flush();
+        return;
+    }
     let started = std::time::Instant::now();
-    let result = chineseai::az::gumbel_search_with_history(
+    let result = gumbel_search_with_history_and_rules(
         &state.position,
         &state.history,
+        Some(state.rule_history.clone()),
+        Some(legal),
         model,
         AzSearchLimits {
             simulations,

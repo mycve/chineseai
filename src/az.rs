@@ -9,7 +9,7 @@ use crate::nnue::{
     HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, mirror_file_move,
     mirror_sparse_features_file, orient_move,
 };
-use crate::xiangqi::{BOARD_SIZE, Color, Move, Position};
+use crate::xiangqi::{BOARD_SIZE, Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 pub const AZNNUE_FORMAT: &str = "aznnue-v11";
 const MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -786,13 +786,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     for game_index in 0..config.games {
         let mut position = Position::startpos();
         let mut history = Vec::new();
+        let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            let legal = position.legal_moves();
+            let legal = position.legal_moves_with_rules(&rule_history);
             if legal.is_empty() {
                 result = Some(if position.side_to_move() == Color::Red {
                     -1.0
@@ -803,9 +804,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search = gumbel_search_with_history(
+            let search = gumbel_search_with_history_and_rules(
                 &position,
                 &history,
+                Some(rule_history.clone()),
+                Some(legal),
                 model,
                 AzSearchLimits {
                     simulations: config.simulations,
@@ -828,6 +831,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
             append_history(&mut history, &position, mv);
+            rule_history.push(position.rule_history_entry_after_move(mv));
             position.make_move(mv);
 
             if !position.has_general(Color::Red) {
@@ -838,6 +842,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             if !position.has_general(Color::Black) {
                 result = Some(1.0);
                 finalize_last_transition(&mut game_samples, 1.0);
+                break;
+            }
+            if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
+                result = Some(match rule_outcome {
+                    RuleOutcome::Draw => 0.0,
+                    RuleOutcome::Win(Color::Red) => 1.0,
+                    RuleOutcome::Win(Color::Black) => -1.0,
+                });
+                finalize_last_transition(&mut game_samples, result.unwrap_or(0.0));
                 break;
             }
         }
@@ -887,7 +900,34 @@ pub fn gumbel_search_with_history(
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    let mut tree = AzTree::new(position.clone(), truncate_history(history), model);
+    gumbel_search_with_history_and_rules(position, history, None, None, model, limits)
+}
+
+pub fn gumbel_search_with_history_and_root_moves(
+    position: &Position,
+    history: &[HistoryMove],
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+) -> AzSearchResult {
+    gumbel_search_with_history_and_rules(position, history, None, root_moves, model, limits)
+}
+
+pub fn gumbel_search_with_history_and_rules(
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+) -> AzSearchResult {
+    let mut tree = AzTree::new(
+        position.clone(),
+        truncate_history(history),
+        rule_history,
+        root_moves,
+        model,
+    );
     let root = tree.root;
     tree.expand(root);
     if tree.nodes[root].children.is_empty() {
@@ -950,12 +990,15 @@ pub fn gumbel_search_with_history(
 struct AzTree<'a> {
     nodes: Vec<AzNode>,
     model: &'a AzNnue,
+    root_rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
     root: usize,
 }
 
 struct AzNode {
     position: Position,
     history: Vec<HistoryMove>,
+    rule_history: Option<Vec<RuleHistoryEntry>>,
     children: Vec<AzChild>,
     visits: u32,
     value_sum: f32,
@@ -983,11 +1026,18 @@ impl AzChild {
 }
 
 impl<'a> AzTree<'a> {
-    fn new(position: Position, history: Vec<HistoryMove>, model: &'a AzNnue) -> Self {
+    fn new(
+        position: Position,
+        history: Vec<HistoryMove>,
+        rule_history: Option<Vec<RuleHistoryEntry>>,
+        root_moves: Option<Vec<Move>>,
+        model: &'a AzNnue,
+    ) -> Self {
         Self {
             nodes: vec![AzNode {
                 position,
                 history,
+                rule_history: rule_history.clone(),
                 children: Vec::new(),
                 visits: 0,
                 value_sum: 0.0,
@@ -995,6 +1045,8 @@ impl<'a> AzTree<'a> {
                 expanded: false,
             }],
             model,
+            root_rule_history: rule_history,
+            root_moves,
             root: 0,
         }
     }
@@ -1009,7 +1061,24 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].expanded = true;
             return value;
         }
-        let moves = self.nodes[node_index].position.legal_moves();
+        let moves = if node_index == self.root {
+            self.root_moves.clone().unwrap_or_else(|| {
+                self.root_rule_history.as_ref().map_or_else(
+                    || self.nodes[node_index].position.legal_moves(),
+                    |history| {
+                        self.nodes[node_index]
+                            .position
+                            .legal_moves_with_rules(history)
+                    },
+                )
+            })
+        } else if let Some(history) = self.nodes[node_index].rule_history.as_ref() {
+            self.nodes[node_index]
+                .position
+                .legal_moves_with_rules(history)
+        } else {
+            self.nodes[node_index].position.legal_moves()
+        };
         if moves.is_empty() {
             self.nodes[node_index].children.clear();
             self.nodes[node_index].value = -1.0;
@@ -1064,12 +1133,17 @@ impl<'a> AzTree<'a> {
                 let mv = self.nodes[node_index].children[child_index].mv;
                 let mut child_position = self.nodes[node_index].position.clone();
                 let mut child_history = self.nodes[node_index].history.clone();
+                let mut child_rule_history = self.nodes[node_index].rule_history.clone();
                 append_history(&mut child_history, &child_position, mv);
+                if let Some(rule_history) = child_rule_history.as_mut() {
+                    rule_history.push(child_position.rule_history_entry_after_move(mv));
+                }
                 child_position.make_move(mv);
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
                     history: child_history,
+                    rule_history: child_rule_history,
                     children: Vec::new(),
                     visits: 0,
                     value_sum: 0.0,
