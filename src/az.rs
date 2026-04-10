@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
+use matrixmultiply::sgemm;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -29,6 +30,31 @@ const ADAMW_BETA1: f32 = 0.9;
 const ADAMW_BETA2: f32 = 0.999;
 const ADAMW_EPSILON: f32 = 1e-8;
 const ADAMW_WEIGHT_DECAY: f32 = 1e-4;
+
+/// 单次 NN 前向复用的临时张量，由 [`AzTree`] 持有，避免每步模拟反复 `Vec` 分配。
+struct AzEvalScratch {
+    hidden: Vec<f32>,
+    next: Vec<f32>,
+    global: Vec<f32>,
+    value_intermediate: Vec<f32>,
+    value_logits: Vec<f32>,
+    logits: Vec<f32>,
+    priors: Vec<f32>,
+}
+
+impl AzEvalScratch {
+    fn new(hidden_size: usize) -> Self {
+        Self {
+            hidden: vec![0.0; hidden_size],
+            next: vec![0.0; hidden_size],
+            global: vec![0.0; GLOBAL_CONTEXT_SIZE],
+            value_intermediate: vec![0.0; VALUE_HIDDEN_SIZE],
+            value_logits: vec![0.0; VALUE_LOGITS],
+            logits: Vec::with_capacity(192),
+            priors: Vec::with_capacity(192),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AzNnue {
@@ -126,7 +152,6 @@ pub struct AzLoopConfig {
     pub batch_size: usize,
     pub seed: u64,
     pub workers: usize,
-    pub train_workers: usize,
     pub temperature_start: f32,
     pub temperature_end: f32,
     pub temperature_decay_plies: usize,
@@ -155,6 +180,7 @@ pub struct AzLoopReport {
     pub total_seconds: f32,
     pub games_per_second: f32,
     pub samples_per_second: f32,
+    pub train_samples_per_second: f32,
     pub train_samples: usize,
     pub pool_games: usize,
     pub pool_samples: usize,
@@ -233,10 +259,17 @@ impl AzArenaReport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzTrainBenchmark {
+    pub loss: f32,
+    pub value_loss: f32,
+    pub policy_ce: f32,
+}
+
 #[derive(Clone, Debug)]
 struct AzTrainingSample {
     features: Vec<usize>,
-    moves: Vec<Move>,
+    move_indices: Vec<usize>,
     policy: Vec<f32>,
     value: f32,
     side_sign: f32,
@@ -314,23 +347,6 @@ impl AzGrad {
         self.policy_move_bias.fill(0.0);
     }
 
-    fn add_assign(&mut self, other: &Self) {
-        add_assign_slice(&mut self.input_hidden, &other.input_hidden);
-        add_assign_slice(&mut self.hidden_bias, &other.hidden_bias);
-        add_assign_slice(&mut self.trunk_weights, &other.trunk_weights);
-        add_assign_slice(&mut self.trunk_biases, &other.trunk_biases);
-        add_assign_slice(&mut self.trunk_global_weights, &other.trunk_global_weights);
-        add_assign_slice(&mut self.global_hidden, &other.global_hidden);
-        add_assign_slice(&mut self.global_bias, &other.global_bias);
-        add_assign_slice(&mut self.value_intermediate_hidden, &other.value_intermediate_hidden);
-        add_assign_slice(&mut self.value_intermediate_global, &other.value_intermediate_global);
-        add_assign_slice(&mut self.value_intermediate_bias, &other.value_intermediate_bias);
-        add_assign_slice(&mut self.value_logits_weights, &other.value_logits_weights);
-        add_assign_slice(&mut self.value_logits_bias, &other.value_logits_bias);
-        add_assign_slice(&mut self.policy_move_hidden, &other.policy_move_hidden);
-        add_assign_slice(&mut self.policy_move_global, &other.policy_move_global);
-        add_assign_slice(&mut self.policy_move_bias, &other.policy_move_bias);
-    }
 }
 
 impl AzTrainStats {
@@ -746,17 +762,119 @@ impl AzNnue {
         history: &[HistoryMove],
         moves: &[Move],
     ) -> (f32, Vec<f32>) {
-        let features = extract_sparse_features_v4(position, history);
-        let initial_hidden = self.input_embedding_from_features(&features);
-        let global = self.global_from_hidden(&initial_hidden);
-        let hidden = self.forward_trunk(initial_hidden, &global);
-        let value = self.value_from_hidden(&hidden, &global);
-        let side = position.side_to_move();
-        let logits = moves
-            .iter()
-            .map(|mv| self.policy_logit_from_hidden(&hidden, &global, orient_move(side, *mv)))
-            .collect();
+        let mut scratch = AzEvalScratch::new(self.hidden_size);
+        let value = self.evaluate_with_scratch(position, history, moves, &mut scratch);
+        let logits = std::mem::take(&mut scratch.logits);
         (value, logits)
+    }
+
+    fn evaluate_with_scratch(
+        &self,
+        position: &Position,
+        history: &[HistoryMove],
+        moves: &[Move],
+        scratch: &mut AzEvalScratch,
+    ) -> f32 {
+        let features = extract_sparse_features_v4(position, history);
+        self.input_embedding_into(&features, &mut scratch.hidden);
+        self.global_from_hidden_into(&scratch.hidden, &mut scratch.global);
+        self.forward_trunk_into(&mut scratch.hidden, &mut scratch.next, &scratch.global);
+        let value = self.value_from_hidden_scratch(scratch);
+        let side = position.side_to_move();
+        scratch.logits.resize(moves.len(), 0.0);
+        for (index, mv) in moves.iter().enumerate() {
+            scratch.logits[index] = self.policy_logit_from_hidden_index(
+                &scratch.hidden,
+                &scratch.global,
+                dense_move_index(orient_move(side, *mv)),
+            );
+        }
+        value
+    }
+
+    fn input_embedding_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
+        hidden.resize(self.hidden_size, 0.0);
+        hidden.copy_from_slice(&self.hidden_bias);
+        for &feature in features {
+            let row =
+                &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            for idx in 0..self.hidden_size {
+                hidden[idx] += row[idx];
+            }
+        }
+        for value in hidden.iter_mut() {
+            *value = value.max(0.0);
+        }
+    }
+
+    fn global_from_hidden_into(&self, hidden: &[f32], global: &mut Vec<f32>) {
+        global.resize(GLOBAL_CONTEXT_SIZE, 0.0);
+        global.copy_from_slice(&self.global_bias);
+        for out in 0..GLOBAL_CONTEXT_SIZE {
+            let row = &self.global_hidden[out * self.hidden_size..(out + 1) * self.hidden_size];
+            for idx in 0..self.hidden_size {
+                global[out] += hidden[idx] * row[idx];
+            }
+            global[out] = global[out].max(0.0);
+        }
+    }
+
+    fn forward_trunk_into(
+        &self,
+        hidden: &mut Vec<f32>,
+        next: &mut Vec<f32>,
+        global: &[f32],
+    ) {
+        next.resize(self.hidden_size, 0.0);
+        for layer in 0..self.trunk_depth {
+            let weight_offset = layer * self.hidden_size * self.hidden_size;
+            let global_weight_offset = layer * self.hidden_size * GLOBAL_CONTEXT_SIZE;
+            let bias_offset = layer * self.hidden_size;
+            for out in 0..self.hidden_size {
+                let mut value = self.trunk_biases[bias_offset + out];
+                let row = &self.trunk_weights[weight_offset + out * self.hidden_size
+                    ..weight_offset + (out + 1) * self.hidden_size];
+                for idx in 0..self.hidden_size {
+                    value += row[idx] * hidden[idx];
+                }
+                let grow = &self.trunk_global_weights
+                    [global_weight_offset + out * GLOBAL_CONTEXT_SIZE
+                        ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
+                for k in 0..GLOBAL_CONTEXT_SIZE {
+                    value += grow[k] * global[k];
+                }
+                next[out] = hidden[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
+            }
+            std::mem::swap(hidden, next);
+        }
+    }
+
+    fn value_from_hidden_scratch(&self, scratch: &mut AzEvalScratch) -> f32 {
+        scratch
+            .value_intermediate
+            .copy_from_slice(&self.value_intermediate_bias);
+        for j in 0..VALUE_HIDDEN_SIZE {
+            let h_row = &self.value_intermediate_hidden
+                [j * self.hidden_size..(j + 1) * self.hidden_size];
+            for i in 0..self.hidden_size {
+                scratch.value_intermediate[j] += scratch.hidden[i] * h_row[i];
+            }
+            let g_row = &self.value_intermediate_global
+                [j * GLOBAL_CONTEXT_SIZE..(j + 1) * GLOBAL_CONTEXT_SIZE];
+            for k in 0..GLOBAL_CONTEXT_SIZE {
+                scratch.value_intermediate[j] += scratch.global[k] * g_row[k];
+            }
+            scratch.value_intermediate[j] = scratch.value_intermediate[j].max(0.0);
+        }
+        scratch.value_logits.copy_from_slice(&self.value_logits_bias);
+        for out in 0..VALUE_LOGITS {
+            let row = &self.value_logits_weights
+                [out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
+            for j in 0..VALUE_HIDDEN_SIZE {
+                scratch.value_logits[out] += scratch.value_intermediate[j] * row[j];
+            }
+        }
+        scalar_value_from_logits(&scratch.value_logits).0
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -785,115 +903,82 @@ impl AzNnue {
         Ok(())
     }
 
-    fn input_embedding_from_features(&self, features: &[usize]) -> Vec<f32> {
-        let mut hidden = self.hidden_bias.clone();
-        for &feature in features {
-            let row =
-                &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            for idx in 0..self.hidden_size {
-                hidden[idx] += row[idx];
-            }
-        }
-        for value in &mut hidden {
-            *value = value.max(0.0);
-        }
-        hidden
-    }
-
-    fn forward_trunk(&self, mut hidden: Vec<f32>, global: &[f32]) -> Vec<f32> {
-        let mut next = vec![0.0; self.hidden_size];
-        for layer in 0..self.trunk_depth {
-            let weight_offset = layer * self.hidden_size * self.hidden_size;
-            let global_weight_offset = layer * self.hidden_size * GLOBAL_CONTEXT_SIZE;
-            let bias_offset = layer * self.hidden_size;
-            for out in 0..self.hidden_size {
-                let mut value = self.trunk_biases[bias_offset + out];
-                let row = &self.trunk_weights[weight_offset + out * self.hidden_size
-                    ..weight_offset + (out + 1) * self.hidden_size];
-                for idx in 0..self.hidden_size {
-                    value += row[idx] * hidden[idx];
-                }
-                let grow = &self.trunk_global_weights
-                    [global_weight_offset + out * GLOBAL_CONTEXT_SIZE
-                        ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
-                for k in 0..GLOBAL_CONTEXT_SIZE {
-                    value += grow[k] * global[k];
-                }
-                next[out] = hidden[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
-            }
-            std::mem::swap(&mut hidden, &mut next);
-        }
-        hidden
-    }
-
-    fn global_from_hidden(&self, hidden: &[f32]) -> Vec<f32> {
-        let mut global = self.global_bias.clone();
-        for out in 0..GLOBAL_CONTEXT_SIZE {
-            let row = &self.global_hidden[out * self.hidden_size..(out + 1) * self.hidden_size];
-            for idx in 0..self.hidden_size {
-                global[out] += hidden[idx] * row[idx];
-            }
-            global[out] = global[out].max(0.0);
-        }
-        global
-    }
-
-    fn value_intermediate_from_hidden(&self, hidden: &[f32], global: &[f32]) -> Vec<f32> {
-        let mut intermediate = self.value_intermediate_bias.clone();
-        for j in 0..VALUE_HIDDEN_SIZE {
-            let h_row = &self.value_intermediate_hidden
-                [j * self.hidden_size..(j + 1) * self.hidden_size];
-            for i in 0..self.hidden_size {
-                intermediate[j] += hidden[i] * h_row[i];
-            }
-            let g_row = &self.value_intermediate_global
-                [j * GLOBAL_CONTEXT_SIZE..(j + 1) * GLOBAL_CONTEXT_SIZE];
-            for k in 0..GLOBAL_CONTEXT_SIZE {
-                intermediate[j] += global[k] * g_row[k];
-            }
-            intermediate[j] = intermediate[j].max(0.0);
-        }
-        intermediate
-    }
-
-    fn value_logits_from_hidden(&self, hidden: &[f32], global: &[f32]) -> Vec<f32> {
-        let intermediate = self.value_intermediate_from_hidden(hidden, global);
-        let mut logits = self.value_logits_bias.clone();
-        for out in 0..VALUE_LOGITS {
-            let row = &self.value_logits_weights
-                [out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
-            for j in 0..VALUE_HIDDEN_SIZE {
-                logits[out] += intermediate[j] * row[j];
-            }
-        }
-        logits
-    }
-
-    fn value_from_hidden(&self, hidden: &[f32], global: &[f32]) -> f32 {
-        let logits = self.value_logits_from_hidden(hidden, global);
-        scalar_value_from_logits(&logits).0
-    }
-
-    fn policy_logit_from_hidden(&self, hidden: &[f32], global: &[f32], mv: Move) -> f32 {
-        let move_index = dense_move_index(mv);
+    fn policy_logit_from_hidden_index(
+        &self,
+        hidden: &[f32],
+        global: &[f32],
+        move_index: usize,
+    ) -> f32 {
         let hidden_offset = move_index * self.hidden_size;
         let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
         let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
         let global_row =
             &self.policy_move_global[global_offset..global_offset + GLOBAL_CONTEXT_SIZE];
-        let mut logit = self.policy_move_bias[move_index];
-        for (idx, hidden_value) in hidden.iter().enumerate() {
-            logit += hidden_value * hidden_row[idx];
-        }
-        for (idx, global_value) in global.iter().enumerate() {
-            logit += global_value * global_row[idx];
-        }
-        logit
+        self.policy_move_bias[move_index]
+            + dot_product(hidden, hidden_row)
+            + dot_product(global, global_row)
     }
 }
 
 pub fn selfplay_train_iteration(model: &mut AzNnue, config: &AzLoopConfig) -> AzLoopReport {
     selfplay_train_iteration_with_pool(model, config, None)
+}
+
+pub fn benchmark_training(
+    model: &mut AzNnue,
+    sample_count: usize,
+    epochs: usize,
+    batch_size: usize,
+    lr: f32,
+    seed: u64,
+) -> AzTrainBenchmark {
+    let mut rng = SplitMix64::new(seed);
+    let mut samples = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let feature_count = 24 + (rng.next() as usize % 16);
+        let mut features = Vec::with_capacity(feature_count);
+        for _ in 0..feature_count {
+            features.push((rng.next() as usize) % V4_INPUT_SIZE);
+        }
+        features.sort_unstable();
+        features.dedup();
+
+        let value = rng.unit_f32() * 2.0 - 1.0;
+        let move_count = 12 + (rng.next() as usize % 24);
+        let mut move_indices = Vec::with_capacity(move_count);
+        while move_indices.len() < move_count {
+            let candidate = (rng.next() as usize) % DENSE_MOVE_SPACE;
+            if !move_indices.contains(&candidate) {
+                move_indices.push(candidate);
+            }
+        }
+        let mut policy = (0..move_count)
+            .map(|_| rng.unit_f32().max(1e-6))
+            .collect::<Vec<_>>();
+        let policy_sum = policy.iter().sum::<f32>().max(1e-6);
+        for value in &mut policy {
+            *value /= policy_sum;
+        }
+        samples.push(AzTrainingSample {
+            features,
+            move_indices,
+            policy,
+            value,
+            side_sign: 1.0,
+            reward: 0.0,
+            discount: 0.0,
+            bootstrap_value: 0.0,
+        });
+        if index + 1 == sample_count {
+            break;
+        }
+    }
+    let stats = train_samples(model, &samples, epochs, lr, batch_size, &mut rng);
+    AzTrainBenchmark {
+        loss: stats.loss,
+        value_loss: stats.value_loss,
+        policy_ce: stats.policy_ce,
+    }
 }
 
 pub fn selfplay_train_iteration_with_pool(
@@ -929,7 +1014,6 @@ pub fn selfplay_train_iteration_with_pool(
         config.epochs,
         config.lr,
         config.batch_size,
-        config.train_workers,
         &mut rng,
     );
     let train_seconds = train_started.elapsed().as_secs_f32();
@@ -957,6 +1041,7 @@ pub fn selfplay_train_iteration_with_pool(
         total_seconds,
         games_per_second: config.games as f32 / selfplay_seconds.max(1e-6),
         samples_per_second: generated_samples as f32 / selfplay_seconds.max(1e-6),
+        train_samples_per_second: (train_data.len() * config.epochs) as f32 / train_seconds.max(1e-6),
         train_samples: train_data.len(),
         pool_games,
         pool_samples,
@@ -1277,6 +1362,7 @@ struct AzTree<'a> {
     root_rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
     root: usize,
+    eval_scratch: AzEvalScratch,
 }
 
 struct AzNode {
@@ -1317,11 +1403,12 @@ impl<'a> AzTree<'a> {
         root_moves: Option<Vec<Move>>,
         model: &'a AzNnue,
     ) -> Self {
+        let eval_scratch = AzEvalScratch::new(model.hidden_size);
         Self {
             nodes: vec![AzNode {
                 position,
                 history,
-                rule_history: rule_history.clone(),
+                rule_history: None,
                 children: Vec::new(),
                 visits: 0,
                 value_sum: 0.0,
@@ -1332,6 +1419,15 @@ impl<'a> AzTree<'a> {
             root_rule_history: rule_history,
             root_moves,
             root: 0,
+            eval_scratch,
+        }
+    }
+
+    fn effective_rule_history(&self, node_index: usize) -> Option<&Vec<RuleHistoryEntry>> {
+        if node_index == self.root {
+            self.root_rule_history.as_ref()
+        } else {
+            self.nodes[node_index].rule_history.as_ref()
         }
     }
 
@@ -1345,7 +1441,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].expanded = true;
             return value;
         }
-        if let Some(rule_history) = self.nodes[node_index].rule_history.as_ref() {
+        if let Some(rule_history) = self.effective_rule_history(node_index) {
             if let Some(outcome) = self.nodes[node_index]
                 .position
                 .rule_outcome_with_history(rule_history)
@@ -1389,25 +1485,32 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].expanded = true;
             return -1.0;
         }
-        let (value, logits) = self.model.evaluate(
+        let n = moves.len();
+        let value = self.model.evaluate_with_scratch(
             &self.nodes[node_index].position,
             &self.nodes[node_index].history,
             &moves,
+            &mut self.eval_scratch,
         );
-        let priors = softmax(&logits);
-        self.nodes[node_index].children = moves
-            .into_iter()
-            .zip(logits)
-            .zip(priors)
-            .map(|((mv, prior_logit), prior)| AzChild {
-                mv,
-                prior,
-                prior_logit,
-                visits: 0,
-                value_sum: 0.0,
-                child: None,
-            })
-            .collect();
+        let children: Vec<AzChild> = {
+            let scratch = &mut self.eval_scratch;
+            softmax_into(&scratch.logits[..n], &mut scratch.priors);
+            let logits = &scratch.logits[..n];
+            let priors = &scratch.priors[..n];
+            moves
+                .into_iter()
+                .enumerate()
+                .map(|(i, mv)| AzChild {
+                    mv,
+                    prior: priors[i],
+                    prior_logit: logits[i],
+                    visits: 0,
+                    value_sum: 0.0,
+                    child: None,
+                })
+                .collect()
+        };
+        self.nodes[node_index].children = children;
         self.nodes[node_index].value = value;
         self.nodes[node_index].expanded = true;
         value
@@ -1437,7 +1540,11 @@ impl<'a> AzTree<'a> {
                 let mv = self.nodes[node_index].children[child_index].mv;
                 let mut child_position = self.nodes[node_index].position.clone();
                 let mut child_history = self.nodes[node_index].history.clone();
-                let mut child_rule_history = self.nodes[node_index].rule_history.clone();
+                let mut child_rule_history = if node_index == self.root {
+                    self.root_rule_history.clone()
+                } else {
+                    self.nodes[node_index].rule_history.clone()
+                };
                 append_history(&mut child_history, &child_position, mv);
                 if let Some(rule_history) = child_rule_history.as_mut() {
                     rule_history.push(child_position.rule_history_entry_after_move(mv));
@@ -1689,9 +1796,10 @@ fn make_training_sample(
             *mv = mirror_file_move(*mv);
         }
     }
+    let move_indices = moves.iter().copied().map(dense_move_index).collect();
     AzTrainingSample {
         features,
-        moves,
+        move_indices,
         policy: candidates
             .iter()
             .map(|candidate| candidate.policy.max(0.0) / total_policy)
@@ -1930,7 +2038,6 @@ fn train_samples(
     epochs: usize,
     lr: f32,
     batch_size: usize,
-    train_workers: usize,
     rng: &mut SplitMix64,
 ) -> AzTrainStats {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
@@ -1956,7 +2063,6 @@ fn train_samples(
                 samples,
                 batch,
                 lr,
-                train_workers,
             );
             stats.add_assign(&batch_stats);
         }
@@ -1978,291 +2084,651 @@ fn train_batch(
     samples: &[AzTrainingSample],
     batch: &[usize],
     lr: f32,
-    train_workers: usize,
 ) -> AzTrainStats {
-    let worker_count = train_workers.max(1).min(batch.len().max(1));
-    let stats = if worker_count == 1 || batch.len() <= 1 {
-        gradient.clear();
-        let mut stats = AzTrainStats::default();
-        for &index in batch {
-            let sample_stats = accumulate_one(model, gradient, &samples[index]);
-            stats.add_assign(&sample_stats);
-        }
-        stats
-    } else {
-        gradient.clear();
-        let chunk_size = (batch.len() + worker_count - 1) / worker_count;
-        let model_ref: &AzNnue = &*model;
-        let samples_ref = samples;
-        let partials = thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk in batch.chunks(chunk_size) {
-                handles.push(scope.spawn(move || {
-                    let mut local_gradient = AzGrad::new(model_ref);
-                    let mut local_stats = AzTrainStats::default();
-                    for &index in chunk {
-                        let sample_stats =
-                            accumulate_one(model_ref, &mut local_gradient, &samples_ref[index]);
-                        local_stats.add_assign(&sample_stats);
-                    }
-                    (local_gradient, local_stats)
-                }));
-            }
-
-            let mut partials = Vec::with_capacity(handles.len());
-            for handle in handles {
-                partials.push(handle.join().expect("training worker panicked"));
-            }
-            partials
-        });
-
-        let mut stats = AzTrainStats::default();
-        for (local_gradient, local_stats) in partials {
-            gradient.add_assign(&local_gradient);
-            stats.add_assign(&local_stats);
-        }
-        stats
-    };
+    gradient.clear();
+    let cache = train_batch_forward_cache(model, samples, batch);
+    let stats = accumulate_batch_cached(model, gradient, samples, batch, &cache);
     if stats.samples > 0 {
         apply_adamw_gradient(model, optimizer, gradient, lr, stats.samples as f32);
     }
     stats
 }
 
-fn accumulate_one(
+fn accumulate_batch_cached(
     model: &AzNnue,
     gradient: &mut AzGrad,
-    sample: &AzTrainingSample,
+    samples: &[AzTrainingSample],
+    batch: &[usize],
+    cache: &TrainBatchCache,
 ) -> AzTrainStats {
-    let (activations, global) = train_forward_activations(model, &sample.features);
-    let hidden = activations
+    let batch_size = batch.len();
+    let mut stats = AzTrainStats::default();
+    let hidden_all = cache
+        .activations
         .last()
-        .expect("at least input activation exists");
+        .expect("at least one activation exists");
+    let global_all = &cache.global;
+    let mut activation_grads = vec![0.0; batch_size * model.hidden_size];
+    let mut global_grads = vec![0.0; batch_size * GLOBAL_CONTEXT_SIZE];
+    let mut value_logit_grads = vec![0.0; batch_size * VALUE_LOGITS];
+    let policy_layout = build_policy_batch_layout(samples, batch);
+    let mut policy_logits = vec![0.0; policy_layout.move_indices.len()];
+    let mut policy_probs = vec![0.0; policy_layout.move_indices.len()];
 
-    let mut value_intermediate_pre = model.value_intermediate_bias.clone();
-    for j in 0..VALUE_HIDDEN_SIZE {
-        let h_row = &model.value_intermediate_hidden
-            [j * model.hidden_size..(j + 1) * model.hidden_size];
-        for i in 0..model.hidden_size {
-            value_intermediate_pre[j] += hidden[i] * h_row[i];
-        }
-        let g_row = &model.value_intermediate_global
-            [j * GLOBAL_CONTEXT_SIZE..(j + 1) * GLOBAL_CONTEXT_SIZE];
-        for k in 0..GLOBAL_CONTEXT_SIZE {
-            value_intermediate_pre[j] += global[k] * g_row[k];
-        }
-    }
-    let value_intermediate: Vec<f32> = value_intermediate_pre
-        .iter()
-        .map(|v| v.max(0.0))
-        .collect();
+    for (row, &sample_index) in batch.iter().enumerate() {
+        let sample = &samples[sample_index];
+        let value_probs: [f32; VALUE_LOGITS] = softmax_fixed(cache.row_value_logits(row));
+        let value = if value_probs.len() >= VALUE_LOGITS {
+            value_probs[0] - value_probs[2]
+        } else {
+            0.0
+        };
+        let value_target = scalar_to_wdl_target(sample.value);
+        let value_error = value - sample.value;
+        let value_loss = value_error * value_error;
+        let value_train_loss = value_probs
+            .iter()
+            .zip(value_target.iter())
+            .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
+            .sum::<f32>();
 
-    let mut value_logits = model.value_logits_bias.clone();
-    for out in 0..VALUE_LOGITS {
-        let row = &model.value_logits_weights
-            [out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
-        for j in 0..VALUE_HIDDEN_SIZE {
-            value_logits[out] += value_intermediate[j] * row[j];
-        }
-    }
-    let value_probs = softmax(&value_logits);
-    let value = if value_probs.len() >= VALUE_LOGITS {
-        value_probs[0] - value_probs[2]
-    } else {
-        0.0
-    };
-    let value_target = scalar_to_wdl_target(sample.value);
-    let value_error = value - sample.value;
-    let value_loss = value_error * value_error;
-    let value_train_loss = value_probs
-        .iter()
-        .zip(value_target.iter())
-        .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
-        .sum::<f32>();
+        stats.loss += value_train_loss;
+        stats.value_loss += value_loss;
+        stats.value_pred_sum += value;
+        stats.value_pred_sq_sum += value * value;
+        stats.value_target_sum += sample.value;
+        stats.value_target_sq_sum += sample.value * sample.value;
+        stats.samples += 1;
 
-    let logits = sample
-        .moves
-        .iter()
-        .map(|mv| model.policy_logit_from_hidden(hidden, &global, *mv))
-        .collect::<Vec<_>>();
-    let prediction = softmax(&logits);
-    let policy_ce = prediction
-        .iter()
-        .zip(&sample.policy)
-        .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
-        .sum::<f32>();
-
-    let mut activation_grad = vec![0.0; model.hidden_size];
-    let mut global_grad = vec![0.0; GLOBAL_CONTEXT_SIZE];
-
-    let mut intermediate_grad = vec![0.0; VALUE_HIDDEN_SIZE];
-    for out in 0..VALUE_LOGITS {
-        let logit_grad = value_probs[out] - value_target[out];
-        let row_offset = out * VALUE_HIDDEN_SIZE;
-        for j in 0..VALUE_HIDDEN_SIZE {
-            intermediate_grad[j] += logit_grad * model.value_logits_weights[row_offset + j];
-            gradient.value_logits_weights[row_offset + j] += logit_grad * value_intermediate[j];
-        }
-        gradient.value_logits_bias[out] += logit_grad;
-    }
-    for j in 0..VALUE_HIDDEN_SIZE {
-        if value_intermediate_pre[j] <= 0.0 {
-            continue;
-        }
-        let grad = intermediate_grad[j].clamp(-4.0, 4.0);
-        let h_offset = j * model.hidden_size;
-        for i in 0..model.hidden_size {
-            activation_grad[i] += grad * model.value_intermediate_hidden[h_offset + i];
-            gradient.value_intermediate_hidden[h_offset + i] += grad * hidden[i];
-        }
-        let g_offset = j * GLOBAL_CONTEXT_SIZE;
-        for k in 0..GLOBAL_CONTEXT_SIZE {
-            global_grad[k] += grad * model.value_intermediate_global[g_offset + k];
-            gradient.value_intermediate_global[g_offset + k] += grad * global[k];
-        }
-        gradient.value_intermediate_bias[j] += grad;
-    }
-    for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
-        let move_index = dense_move_index(*mv);
-        let policy_grad = (predicted - target).clamp(-4.0, 4.0);
-        let hidden_offset = move_index * model.hidden_size;
-        for idx in 0..model.hidden_size {
-            activation_grad[idx] += policy_grad * model.policy_move_hidden[hidden_offset + idx];
-        }
-        let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
-        for idx in 0..GLOBAL_CONTEXT_SIZE {
-            global_grad[idx] += policy_grad * model.policy_move_global[global_offset + idx];
+        for out in 0..VALUE_LOGITS {
+            value_logit_grads[row * VALUE_LOGITS + out] = value_probs[out] - value_target[out];
         }
     }
 
-    for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
-        let move_index = dense_move_index(*mv);
-        let policy_grad = (predicted - target).clamp(-4.0, 4.0);
-        let hidden_offset = move_index * model.hidden_size;
-        for idx in 0..model.hidden_size {
-            let weight_index = hidden_offset + idx;
-            gradient.policy_move_hidden[weight_index] += policy_grad * hidden[idx];
+    grad_weights_batch(
+        &mut gradient.value_logits_weights,
+        &value_logit_grads,
+        VALUE_LOGITS,
+        &cache.value_intermediate,
+        VALUE_HIDDEN_SIZE,
+        batch_size,
+    );
+    add_bias_grad(
+        &mut gradient.value_logits_bias,
+        &value_logit_grads,
+        batch_size,
+        VALUE_LOGITS,
+    );
+
+    let mut intermediate_grads = batch_times_weights(
+        &value_logit_grads,
+        batch_size,
+        VALUE_LOGITS,
+        &model.value_logits_weights,
+        VALUE_HIDDEN_SIZE,
+    );
+    apply_relu_mask_and_clamp(
+        &mut intermediate_grads,
+        &cache.value_intermediate_pre,
+        -4.0,
+        4.0,
+    );
+
+    grad_weights_batch(
+        &mut gradient.value_intermediate_hidden,
+        &intermediate_grads,
+        VALUE_HIDDEN_SIZE,
+        hidden_all,
+        model.hidden_size,
+        batch_size,
+    );
+    grad_weights_batch(
+        &mut gradient.value_intermediate_global,
+        &intermediate_grads,
+        VALUE_HIDDEN_SIZE,
+        global_all,
+        GLOBAL_CONTEXT_SIZE,
+        batch_size,
+    );
+    add_bias_grad(
+        &mut gradient.value_intermediate_bias,
+        &intermediate_grads,
+        batch_size,
+        VALUE_HIDDEN_SIZE,
+    );
+    add_batch_times_weights(
+        &mut activation_grads,
+        &intermediate_grads,
+        batch_size,
+        VALUE_HIDDEN_SIZE,
+        &model.value_intermediate_hidden,
+        model.hidden_size,
+    );
+    add_batch_times_weights(
+        &mut global_grads,
+        &intermediate_grads,
+        batch_size,
+        VALUE_HIDDEN_SIZE,
+        &model.value_intermediate_global,
+        GLOBAL_CONTEXT_SIZE,
+    );
+
+    compute_policy_batch_logits(
+        model,
+        hidden_all,
+        global_all,
+        &policy_layout,
+        &mut policy_logits,
+    );
+    compute_policy_batch_probs(&policy_layout, &policy_logits, &mut policy_probs);
+
+    for row in 0..batch_size {
+        let policy_range = policy_layout.sample_range(row);
+        let policy_ce = policy_probs[policy_range.clone()]
+            .iter()
+            .zip(policy_layout.targets[policy_range.clone()].iter())
+            .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
+            .sum::<f32>();
+        stats.loss += policy_ce;
+        stats.policy_ce += policy_ce;
+
+        let activation_grad = row_slice_mut(&mut activation_grads, row, model.hidden_size);
+        let global_grad = row_slice_mut(&mut global_grads, row, GLOBAL_CONTEXT_SIZE);
+        let hidden = row_slice(hidden_all, row, model.hidden_size);
+        let global = row_slice(global_all, row, GLOBAL_CONTEXT_SIZE);
+        for flat_index in policy_range {
+            let move_index = policy_layout.move_indices[flat_index];
+            let policy_grad = (policy_probs[flat_index] - policy_layout.targets[flat_index])
+                .clamp(-4.0, 4.0);
+            let hidden_offset = move_index * model.hidden_size;
+            let hidden_row =
+                &model.policy_move_hidden[hidden_offset..hidden_offset + model.hidden_size];
+            let hidden_grad_row = &mut gradient.policy_move_hidden
+                [hidden_offset..hidden_offset + model.hidden_size];
+            add_scaled(activation_grad, hidden_row, policy_grad);
+            add_scaled(hidden_grad_row, hidden, policy_grad);
+            let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
+            let global_row =
+                &model.policy_move_global[global_offset..global_offset + GLOBAL_CONTEXT_SIZE];
+            let global_grad_row = &mut gradient.policy_move_global
+                [global_offset..global_offset + GLOBAL_CONTEXT_SIZE];
+            add_scaled(global_grad, global_row, policy_grad);
+            add_scaled(global_grad_row, global, policy_grad);
+            gradient.policy_move_bias[move_index] += policy_grad;
         }
-        let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
-        for idx in 0..GLOBAL_CONTEXT_SIZE {
-            let weight_index = global_offset + idx;
-            gradient.policy_move_global[weight_index] += policy_grad * global[idx];
-        }
-        gradient.policy_move_bias[move_index] += policy_grad;
     }
 
-    let mut input_grad = activation_grad;
+    let mut input_grads = activation_grads;
     for layer in (0..model.trunk_depth).rev() {
-        let output = &activations[layer + 1];
-        let input = &activations[layer];
-        let mut previous_grad = vec![0.0; model.hidden_size];
+        let input = &cache.activations[layer];
+        let output = &cache.activations[layer + 1];
         let weight_offset = layer * model.hidden_size * model.hidden_size;
         let global_weight_offset = layer * model.hidden_size * GLOBAL_CONTEXT_SIZE;
         let bias_offset = layer * model.hidden_size;
-        for out in 0..model.hidden_size {
-            let grad = input_grad[out].clamp(-4.0, 4.0);
-            previous_grad[out] += grad;
-            if output[out] <= input[out] {
+
+        clamp_inplace(&mut input_grads, -4.0, 4.0);
+        let mut residual_grads = vec![0.0; batch_size * model.hidden_size];
+        for idx in 0..residual_grads.len() {
+            if output[idx] > input[idx] {
+                residual_grads[idx] = input_grads[idx] * RESIDUAL_TRUNK_SCALE;
+            }
+        }
+        let mut previous_grads = input_grads.clone();
+        grad_weights_batch(
+            &mut gradient.trunk_weights
+                [weight_offset..weight_offset + model.hidden_size * model.hidden_size],
+            &residual_grads,
+            model.hidden_size,
+            input,
+            model.hidden_size,
+            batch_size,
+        );
+        grad_weights_batch(
+            &mut gradient.trunk_global_weights[global_weight_offset
+                ..global_weight_offset + model.hidden_size * GLOBAL_CONTEXT_SIZE],
+            &residual_grads,
+            model.hidden_size,
+            global_all,
+            GLOBAL_CONTEXT_SIZE,
+            batch_size,
+        );
+        add_bias_grad(
+            &mut gradient.trunk_biases[bias_offset..bias_offset + model.hidden_size],
+            &residual_grads,
+            batch_size,
+            model.hidden_size,
+        );
+        add_batch_times_weights(
+            &mut previous_grads,
+            &residual_grads,
+            batch_size,
+            model.hidden_size,
+            &model.trunk_weights[weight_offset..weight_offset + model.hidden_size * model.hidden_size],
+            model.hidden_size,
+        );
+        add_batch_times_weights(
+            &mut global_grads,
+            &residual_grads,
+            batch_size,
+            model.hidden_size,
+            &model.trunk_global_weights[global_weight_offset
+                ..global_weight_offset + model.hidden_size * GLOBAL_CONTEXT_SIZE],
+            GLOBAL_CONTEXT_SIZE,
+        );
+        input_grads = previous_grads;
+    }
+
+    let initial_hidden = &cache.activations[0];
+    apply_relu_mask_and_clamp(&mut global_grads, global_all, -4.0, 4.0);
+    grad_weights_batch(
+        &mut gradient.global_hidden,
+        &global_grads,
+        GLOBAL_CONTEXT_SIZE,
+        initial_hidden,
+        model.hidden_size,
+        batch_size,
+    );
+    add_bias_grad(
+        &mut gradient.global_bias,
+        &global_grads,
+        batch_size,
+        GLOBAL_CONTEXT_SIZE,
+    );
+    add_batch_times_weights(
+        &mut input_grads,
+        &global_grads,
+        batch_size,
+        GLOBAL_CONTEXT_SIZE,
+        &model.global_hidden,
+        model.hidden_size,
+    );
+
+    for (row, &sample_index) in batch.iter().enumerate() {
+        let sample = &samples[sample_index];
+        let initial_hidden_row = row_slice(initial_hidden, row, model.hidden_size);
+        let input_grad_row = row_slice(&input_grads, row, model.hidden_size);
+        let input_scale = 1.0 / (sample.features.len() as f32).sqrt().max(1.0);
+        for idx in 0..model.hidden_size {
+            if initial_hidden_row[idx] <= 0.0 {
                 continue;
             }
-            let residual_grad = grad * RESIDUAL_TRUNK_SCALE;
-            for idx in 0..model.hidden_size {
-                let weight_index = weight_offset + out * model.hidden_size + idx;
-                previous_grad[idx] += residual_grad * model.trunk_weights[weight_index];
-                gradient.trunk_weights[weight_index] += residual_grad * input[idx];
+            let grad = input_grad_row[idx].clamp(-4.0, 4.0);
+            gradient.hidden_bias[idx] += grad;
+            for &feature in &sample.features {
+                gradient.input_hidden[feature * model.hidden_size + idx] += grad * input_scale;
             }
-            let gw_offset = global_weight_offset + out * GLOBAL_CONTEXT_SIZE;
-            for k in 0..GLOBAL_CONTEXT_SIZE {
-                let weight_index = gw_offset + k;
-                global_grad[k] += residual_grad * model.trunk_global_weights[weight_index];
-                gradient.trunk_global_weights[weight_index] += residual_grad * global[k];
-            }
-            gradient.trunk_biases[bias_offset + out] += residual_grad;
-        }
-        input_grad = previous_grad;
-    }
-
-    let initial_hidden = &activations[0];
-    for out in 0..GLOBAL_CONTEXT_SIZE {
-        if global[out] <= 0.0 {
-            continue;
-        }
-        let grad = global_grad[out].clamp(-4.0, 4.0);
-        let weight_offset = out * model.hidden_size;
-        for idx in 0..model.hidden_size {
-            let weight_index = weight_offset + idx;
-            input_grad[idx] += grad * model.global_hidden[weight_index];
-            gradient.global_hidden[weight_index] += grad * initial_hidden[idx];
-        }
-        gradient.global_bias[out] += grad;
-    }
-
-    let input_scale = 1.0 / (sample.features.len() as f32).sqrt().max(1.0);
-    for idx in 0..model.hidden_size {
-        if initial_hidden[idx] <= 0.0 {
-            continue;
-        }
-        let grad = input_grad[idx].clamp(-4.0, 4.0);
-        gradient.hidden_bias[idx] += grad;
-        for &feature in &sample.features {
-            let weight_index = feature * model.hidden_size + idx;
-            gradient.input_hidden[weight_index] += grad * input_scale;
         }
     }
 
-    AzTrainStats {
-        loss: value_train_loss + policy_ce,
-        value_loss,
-        policy_ce,
-        value_pred_sum: value,
-        value_pred_sq_sum: value * value,
-        value_target_sum: sample.value,
-        value_target_sq_sum: sample.value * sample.value,
-        samples: 1,
+    stats
+}
+
+struct TrainBatchCache {
+    activations: Vec<Vec<f32>>,
+    global: Vec<f32>,
+    value_intermediate_pre: Vec<f32>,
+    value_intermediate: Vec<f32>,
+    value_logits: Vec<f32>,
+}
+
+struct PolicyBatchLayout {
+    sample_offsets: Vec<usize>,
+    move_indices: Vec<usize>,
+    targets: Vec<f32>,
+}
+
+impl TrainBatchCache {
+    fn row_value_logits(&self, row: usize) -> &[f32] {
+        row_slice(&self.value_logits, row, VALUE_LOGITS)
     }
 }
 
-fn train_forward_activations(model: &AzNnue, features: &[usize]) -> (Vec<Vec<f32>>, Vec<f32>) {
-    let mut hidden = model.hidden_bias.clone();
-    for &feature in features {
-        let row =
-            &model.input_hidden[feature * model.hidden_size..(feature + 1) * model.hidden_size];
-        for idx in 0..model.hidden_size {
-            hidden[idx] += row[idx];
+impl PolicyBatchLayout {
+    fn sample_range(&self, row: usize) -> std::ops::Range<usize> {
+        self.sample_offsets[row]..self.sample_offsets[row + 1]
+    }
+}
+
+fn row_slice(values: &[f32], row: usize, width: usize) -> &[f32] {
+    let start = row * width;
+    &values[start..start + width]
+}
+
+fn row_slice_mut(values: &mut [f32], row: usize, width: usize) -> &mut [f32] {
+    let start = row * width;
+    &mut values[start..start + width]
+}
+
+fn build_policy_batch_layout(samples: &[AzTrainingSample], batch: &[usize]) -> PolicyBatchLayout {
+    let total_moves = batch
+        .iter()
+        .map(|&sample_index| samples[sample_index].move_indices.len())
+        .sum();
+    let mut sample_offsets = Vec::with_capacity(batch.len() + 1);
+    let mut move_indices = Vec::with_capacity(total_moves);
+    let mut targets = Vec::with_capacity(total_moves);
+    sample_offsets.push(0);
+    for &sample_index in batch {
+        let sample = &samples[sample_index];
+        move_indices.extend(sample.move_indices.iter().copied());
+        targets.extend(sample.policy.iter().copied());
+        sample_offsets.push(move_indices.len());
+    }
+    PolicyBatchLayout {
+        sample_offsets,
+        move_indices,
+        targets,
+    }
+}
+
+fn compute_policy_batch_logits(
+    model: &AzNnue,
+    hidden_all: &[f32],
+    global_all: &[f32],
+    layout: &PolicyBatchLayout,
+    logits: &mut [f32],
+) {
+    for row in 0..(layout.sample_offsets.len() - 1) {
+        let range = layout.sample_range(row);
+        let hidden = row_slice(hidden_all, row, model.hidden_size);
+        let global = row_slice(global_all, row, GLOBAL_CONTEXT_SIZE);
+        for (slot, &move_index) in logits[range.clone()]
+            .iter_mut()
+            .zip(layout.move_indices[range].iter())
+        {
+            *slot = model.policy_logit_from_hidden_index(hidden, global, move_index);
         }
     }
-    for value in &mut hidden {
-        *value = value.max(0.0);
-    }
+}
 
-    let global = model.global_from_hidden(&hidden);
+fn compute_policy_batch_probs(layout: &PolicyBatchLayout, logits: &[f32], probs: &mut [f32]) {
+    for row in 0..(layout.sample_offsets.len() - 1) {
+        let range = layout.sample_range(row);
+        softmax_slice(logits, probs, range);
+    }
+}
+
+
+fn clamp_inplace(values: &mut [f32], min: f32, max: f32) {
+    for value in values {
+        *value = value.clamp(min, max);
+    }
+}
+
+fn apply_relu_mask_and_clamp(grads: &mut [f32], pre_activation: &[f32], min: f32, max: f32) {
+    for idx in 0..grads.len() {
+        if pre_activation[idx] <= 0.0 {
+            grads[idx] = 0.0;
+        } else {
+            grads[idx] = grads[idx].clamp(min, max);
+        }
+    }
+}
+
+fn add_bias_grad(dst: &mut [f32], grads: &[f32], batch_size: usize, width: usize) {
+    for row in 0..batch_size {
+        for col in 0..width {
+            dst[col] += grads[row * width + col];
+        }
+    }
+}
+
+fn grad_weights_batch(
+    dst_out_in: &mut [f32],
+    grads_b_out: &[f32],
+    out_dim: usize,
+    input_b_in: &[f32],
+    in_dim: usize,
+    batch_size: usize,
+) {
+    unsafe {
+        sgemm(
+            out_dim,
+            batch_size,
+            in_dim,
+            1.0,
+            grads_b_out.as_ptr(),
+            1,
+            out_dim as isize,
+            input_b_in.as_ptr(),
+            in_dim as isize,
+            1,
+            1.0,
+            dst_out_in.as_mut_ptr(),
+            in_dim as isize,
+            1,
+        );
+    }
+}
+
+fn batch_times_weights(
+    input_b_in: &[f32],
+    batch_size: usize,
+    in_dim: usize,
+    weights_out_in: &[f32],
+    out_dim: usize,
+) -> Vec<f32> {
+    let mut output = vec![0.0; batch_size * out_dim];
+    add_batch_times_weights(
+        &mut output,
+        input_b_in,
+        batch_size,
+        in_dim,
+        weights_out_in,
+        out_dim,
+    );
+    output
+}
+
+fn add_batch_times_weights(
+    output_b_out: &mut [f32],
+    input_b_in: &[f32],
+    batch_size: usize,
+    in_dim: usize,
+    weights_out_in: &[f32],
+    out_dim: usize,
+) {
+    unsafe {
+        sgemm(
+            batch_size,
+            in_dim,
+            out_dim,
+            1.0,
+            input_b_in.as_ptr(),
+            in_dim as isize,
+            1,
+            weights_out_in.as_ptr(),
+            1,
+            in_dim as isize,
+            1.0,
+            output_b_out.as_mut_ptr(),
+            out_dim as isize,
+            1,
+        );
+    }
+}
+
+fn train_batch_forward_cache(
+    model: &AzNnue,
+    samples: &[AzTrainingSample],
+    batch: &[usize],
+) -> TrainBatchCache {
+    let batch_size = batch.len();
+    let mut hidden = vec![0.0; batch_size * model.hidden_size];
+    for row in 0..batch_size {
+        let start = row * model.hidden_size;
+        hidden[start..start + model.hidden_size].copy_from_slice(&model.hidden_bias);
+    }
+    for (row, &index) in batch.iter().enumerate() {
+        let sample = &samples[index];
+        let row_offset = row * model.hidden_size;
+        for &feature in &sample.features {
+            let weight_row = &model.input_hidden
+                [feature * model.hidden_size..(feature + 1) * model.hidden_size];
+            for idx in 0..model.hidden_size {
+                hidden[row_offset + idx] += weight_row[idx];
+            }
+        }
+    }
+    relu_inplace(&mut hidden);
+
+    let global = affine_relu_batch(
+        &hidden,
+        batch_size,
+        model.hidden_size,
+        &model.global_hidden,
+        GLOBAL_CONTEXT_SIZE,
+        &model.global_bias,
+    );
 
     let mut activations = Vec::with_capacity(model.trunk_depth + 1);
     activations.push(hidden);
     for layer in 0..model.trunk_depth {
         let previous = activations.last().expect("previous activation exists");
-        let mut next = vec![0.0; model.hidden_size];
         let weight_offset = layer * model.hidden_size * model.hidden_size;
         let global_weight_offset = layer * model.hidden_size * GLOBAL_CONTEXT_SIZE;
         let bias_offset = layer * model.hidden_size;
-        for out in 0..model.hidden_size {
-            let mut value = model.trunk_biases[bias_offset + out];
-            let row = &model.trunk_weights[weight_offset + out * model.hidden_size
-                ..weight_offset + (out + 1) * model.hidden_size];
-            for idx in 0..model.hidden_size {
-                value += row[idx] * previous[idx];
-            }
-            let grow = &model.trunk_global_weights
-                [global_weight_offset + out * GLOBAL_CONTEXT_SIZE
-                    ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
-            for k in 0..GLOBAL_CONTEXT_SIZE {
-                value += grow[k] * global[k];
-            }
-            next[out] = previous[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
+        let mut next = affine_batch(
+            previous,
+            batch_size,
+            model.hidden_size,
+            &model.trunk_weights[weight_offset..weight_offset + model.hidden_size * model.hidden_size],
+            model.hidden_size,
+            &model.trunk_biases[bias_offset..bias_offset + model.hidden_size],
+        );
+        add_affine_batch(
+            &mut next,
+            &global,
+            batch_size,
+            GLOBAL_CONTEXT_SIZE,
+            &model.trunk_global_weights
+                [global_weight_offset..global_weight_offset + model.hidden_size * GLOBAL_CONTEXT_SIZE],
+            model.hidden_size,
+        );
+        relu_inplace(&mut next);
+        for idx in 0..next.len() {
+            next[idx] = previous[idx] + RESIDUAL_TRUNK_SCALE * next[idx];
         }
         activations.push(next);
     }
-    (activations, global)
+
+    let hidden = activations
+        .last()
+        .expect("at least one activation exists");
+    let mut value_intermediate_pre = affine_batch(
+        hidden,
+        batch_size,
+        model.hidden_size,
+        &model.value_intermediate_hidden,
+        VALUE_HIDDEN_SIZE,
+        &model.value_intermediate_bias,
+    );
+    add_affine_batch(
+        &mut value_intermediate_pre,
+        &global,
+        batch_size,
+        GLOBAL_CONTEXT_SIZE,
+        &model.value_intermediate_global,
+        VALUE_HIDDEN_SIZE,
+    );
+    let mut value_intermediate = value_intermediate_pre.clone();
+    relu_inplace(&mut value_intermediate);
+    let value_logits = affine_batch(
+        &value_intermediate,
+        batch_size,
+        VALUE_HIDDEN_SIZE,
+        &model.value_logits_weights,
+        VALUE_LOGITS,
+        &model.value_logits_bias,
+    );
+
+    TrainBatchCache {
+        activations,
+        global,
+        value_intermediate_pre,
+        value_intermediate,
+        value_logits,
+    }
+}
+
+fn relu_inplace(values: &mut [f32]) {
+    for value in values {
+        *value = value.max(0.0);
+    }
+}
+
+fn affine_relu_batch(
+    input: &[f32],
+    batch_size: usize,
+    in_dim: usize,
+    weights_out_in: &[f32],
+    out_dim: usize,
+    bias: &[f32],
+) -> Vec<f32> {
+    let mut output = affine_batch(input, batch_size, in_dim, weights_out_in, out_dim, bias);
+    relu_inplace(&mut output);
+    output
+}
+
+fn affine_batch(
+    input: &[f32],
+    batch_size: usize,
+    in_dim: usize,
+    weights_out_in: &[f32],
+    out_dim: usize,
+    bias: &[f32],
+) -> Vec<f32> {
+    let mut output = vec![0.0; batch_size * out_dim];
+    for row in 0..batch_size {
+        output[row * out_dim..(row + 1) * out_dim].copy_from_slice(bias);
+    }
+    unsafe {
+        sgemm(
+            batch_size,
+            in_dim,
+            out_dim,
+            1.0,
+            input.as_ptr(),
+            in_dim as isize,
+            1,
+            weights_out_in.as_ptr(),
+            1,
+            in_dim as isize,
+            1.0,
+            output.as_mut_ptr(),
+            out_dim as isize,
+            1,
+        );
+    }
+    output
+}
+
+fn add_affine_batch(
+    output: &mut [f32],
+    input: &[f32],
+    batch_size: usize,
+    in_dim: usize,
+    weights_out_in: &[f32],
+    out_dim: usize,
+) {
+    unsafe {
+        sgemm(
+            batch_size,
+            in_dim,
+            out_dim,
+            1.0,
+            input.as_ptr(),
+            in_dim as isize,
+            1,
+            weights_out_in.as_ptr(),
+            1,
+            in_dim as isize,
+            1.0,
+            output.as_mut_ptr(),
+            out_dim as isize,
+            1,
+        );
+    }
 }
 
 fn apply_adamw_gradient(
@@ -2492,18 +2958,98 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
         return Vec::new();
     }
+    let mut values = Vec::with_capacity(logits.len());
+    softmax_into(logits, &mut values);
+    values
+}
+
+fn softmax_into(logits: &[f32], output: &mut Vec<f32>) {
+    output.clear();
+    if logits.is_empty() {
+        return;
+    }
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
-    let mut values = Vec::with_capacity(logits.len());
-    for logit in logits {
-        let value = (*logit - max_logit).exp();
+    output.reserve(logits.len());
+    for &logit in logits {
+        let value = (logit - max_logit).exp();
         sum += value;
-        values.push(value);
+        output.push(value);
     }
-    for value in &mut values {
-        *value /= sum.max(1e-12);
+    let inv_sum = sum.max(1e-12).recip();
+    for value in output {
+        *value *= inv_sum;
     }
-    values
+}
+
+fn softmax_slice(input: &[f32], output: &mut [f32], range: std::ops::Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    let max_logit = input[range.clone()]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    for index in range.clone() {
+        let value = (input[index] - max_logit).exp();
+        output[index] = value;
+        sum += value;
+    }
+    let inv_sum = sum.max(1e-12).recip();
+    for index in range {
+        output[index] *= inv_sum;
+    }
+}
+
+fn softmax_fixed<const N: usize>(logits: &[f32]) -> [f32; N] {
+    let mut output = [0.0; N];
+    if logits.len() < N {
+        return output;
+    }
+    let max_logit = logits[..N]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    for index in 0..N {
+        let value = (logits[index] - max_logit).exp();
+        output[index] = value;
+        sum += value;
+    }
+    let inv_sum = sum.max(1e-12).recip();
+    for value in &mut output {
+        *value *= inv_sum;
+    }
+    output
+}
+
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    let mut sum0 = 0.0;
+    let mut sum1 = 0.0;
+    let mut sum2 = 0.0;
+    let mut sum3 = 0.0;
+    let chunks = left.len() / 4;
+    for chunk in 0..chunks {
+        let index = chunk * 4;
+        sum0 += left[index] * right[index];
+        sum1 += left[index + 1] * right[index + 1];
+        sum2 += left[index + 2] * right[index + 2];
+        sum3 += left[index + 3] * right[index + 3];
+    }
+    let mut sum = (sum0 + sum1) + (sum2 + sum3);
+    for index in (chunks * 4)..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+
+fn add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (dst_value, src_value) in dst.iter_mut().zip(src.iter()) {
+        *dst_value += scale * *src_value;
+    }
 }
 
 fn scalar_value_from_logits(logits: &[f32]) -> (f32, Vec<f32>) {
@@ -2521,12 +3067,6 @@ fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
         [v, 1.0 - v, 0.0]
     } else {
         [0.0, 1.0 + v, -v]
-    }
-}
-
-fn add_assign_slice(dst: &mut [f32], src: &[f32]) {
-    for (left, right) in dst.iter_mut().zip(src) {
-        *left += *right;
     }
 }
 
@@ -2761,7 +3301,7 @@ mod tests {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
                 side_sign: 1.0,
@@ -2771,7 +3311,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: Vec::new(),
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
                 side_sign: -1.0,
@@ -2797,7 +3337,7 @@ mod tests {
         let samples = vec![
             AzTrainingSample {
                 features: vec![0],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
                 side_sign: 1.0,
@@ -2807,7 +3347,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![1],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
                 side_sign: 1.0,
@@ -2817,7 +3357,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![2],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.75,
                 side_sign: 1.0,
@@ -2827,7 +3367,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![3],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.75,
                 side_sign: 1.0,
@@ -2838,19 +3378,19 @@ mod tests {
         ];
 
         let mut rng = SplitMix64::new(17);
-        let before = train_samples(&mut model, &samples, 1, 0.003, 4, 1, &mut rng).value_loss;
-        let after = train_samples(&mut model, &samples, 300, 0.003, 4, 1, &mut rng).value_loss;
+        let before = train_samples(&mut model, &samples, 1, 0.003, 4, &mut rng).value_loss;
+        let after = train_samples(&mut model, &samples, 300, 0.003, 4, &mut rng).value_loss;
 
         assert!(after < before * 0.5, "before={before} after={after}");
         assert!(after < 0.35, "after={after}");
     }
 
     #[test]
-    fn synchronized_parallel_training_matches_single_thread() {
+    fn batched_training_is_deterministic() {
         let samples = vec![
             AzTrainingSample {
                 features: vec![0, 4, 8],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
                 side_sign: 1.0,
@@ -2860,7 +3400,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![1, 5, 9],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
                 side_sign: 1.0,
@@ -2870,7 +3410,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![2, 6, 10],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.5,
                 side_sign: 1.0,
@@ -2880,7 +3420,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![3, 7, 11],
-                moves: Vec::new(),
+                move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.5,
                 side_sign: 1.0,
@@ -2893,22 +3433,22 @@ mod tests {
         single.hidden_bias.fill(0.1);
         single.trunk_biases.fill(0.1);
         single.global_bias.fill(0.1);
-        let mut parallel = single.clone();
+        let mut repeated = single.clone();
 
         let mut rng_single = SplitMix64::new(99);
-        let mut rng_parallel = SplitMix64::new(99);
-        let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, 1, &mut rng_single);
-        let parallel_stats =
-            train_samples(&mut parallel, &samples, 5, 0.003, 4, 4, &mut rng_parallel);
+        let mut rng_repeated = SplitMix64::new(99);
+        let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single);
+        let repeated_stats =
+            train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated);
 
-        assert!((single_stats.loss - parallel_stats.loss).abs() < 1e-5);
-        assert!((single_stats.value_loss - parallel_stats.value_loss).abs() < 1e-5);
-        assert!((single_stats.value_pred_sum - parallel_stats.value_pred_sum).abs() < 1e-4);
-        assert!((single_stats.value_target_sum - parallel_stats.value_target_sum).abs() < 1e-6);
+        assert!((single_stats.loss - repeated_stats.loss).abs() < 1e-5);
+        assert!((single_stats.value_loss - repeated_stats.value_loss).abs() < 1e-5);
+        assert!((single_stats.value_pred_sum - repeated_stats.value_pred_sum).abs() < 1e-4);
+        assert!((single_stats.value_target_sum - repeated_stats.value_target_sum).abs() < 1e-6);
         assert!(single
             .value_logits_bias
             .iter()
-            .zip(&parallel.value_logits_bias)
+            .zip(&repeated.value_logits_bias)
             .all(|(left, right)| (*left - *right).abs() < 1e-5));
     }
 }

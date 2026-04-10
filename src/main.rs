@@ -1,7 +1,11 @@
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use chineseai::{
     az::{
         AZNNUE_FORMAT, AzArenaReport, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits,
-        gumbel_search, gumbel_search_with_history_and_rules, play_arena_games,
+        benchmark_training, gumbel_search, gumbel_search_with_history_and_rules, play_arena_games,
         selfplay_train_iteration_with_pool,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
@@ -390,6 +394,56 @@ fn main() {
                     .unwrap_or_else(|| "(none)".into())
             );
         }
+        Some("az-train-bench") => {
+            let model_path = args.next().unwrap_or_else(|| {
+                panic!(
+                    "usage: az-train-bench <model> [samples] [epochs] [batch_size] [lr] [seed]"
+                )
+            });
+            let sample_count = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(8192)
+                .max(1);
+            let epochs = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(2)
+                .max(1);
+            let batch_size = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(256)
+                .max(1);
+            let lr = args
+                .next()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.0003)
+                .max(0.0);
+            let seed = args
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(20260411);
+            let mut model = AzNnue::load_text(&model_path).unwrap_or_else(|err| {
+                panic!("failed to load `{model_path}`: {err}");
+            });
+            let started = std::time::Instant::now();
+            let stats = benchmark_training(&mut model, sample_count, epochs, batch_size, lr, seed);
+            let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
+            let processed = (sample_count * epochs) as f64;
+            println!("bench        : training");
+            println!("model        : {model_path}");
+            println!("samples      : {sample_count}");
+            println!("epochs       : {epochs}");
+            println!("batch_size   : {batch_size}");
+            println!("lr           : {lr}");
+            println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
+            println!("processed    : {}", sample_count * epochs);
+            println!("samples/sec  : {:.0}", processed / elapsed);
+            println!("loss         : {:.4}", stats.loss);
+            println!("value_mse    : {:.4}", stats.value_loss);
+            println!("policy_ce    : {:.4}", stats.policy_ce);
+        }
         Some("az-loop") => {
             let config_path = args.next().unwrap_or_else(|| DEFAULT_AZ_LOOP_CONFIG.into());
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
@@ -428,7 +482,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&config.tensorboard_logdir);
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} train_workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_processes={} tb={}",
+                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_processes={} tb={}",
                 config_path,
                 config.iterations,
                 config.games,
@@ -439,7 +493,6 @@ fn main() {
                 config.batch_size,
                 config.max_plies,
                 config.workers,
-                config.train_workers,
                 config.temperature_start,
                 config.temperature_end,
                 config.temperature_decay_plies,
@@ -470,7 +523,6 @@ fn main() {
                         batch_size: config.batch_size,
                         seed: config.seed ^ iteration as u64,
                         workers: config.workers,
-                        train_workers: config.train_workers,
                         temperature_start: config.temperature_start,
                         temperature_end: config.temperature_end,
                         temperature_decay_plies: config.temperature_decay_plies,
@@ -518,7 +570,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} drawR[120/rep/lchk/lchs]={}/{}/{}/{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} elapsed={:.1}s saved={}{}",
+                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} drawR[120/rep/lchk/lchs]={}/{}/{}/{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s saved={}{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -542,6 +594,7 @@ fn main() {
                     report.train_seconds,
                     report.games_per_second,
                     report.samples_per_second,
+                    report.train_samples_per_second,
                     started.elapsed().as_secs_f32(),
                     config.model_path,
                     checkpoint_saved.as_ref().map_or_else(
@@ -560,6 +613,7 @@ fn main() {
                 log_scalar(&mut tb, "selfplay/temp_entropy_mid", iteration, report.temperature_mid_entropy);
                 log_scalar(&mut tb, "selfplay/games_per_second", iteration, report.games_per_second);
                 log_scalar(&mut tb, "selfplay/samples_per_second", iteration, report.samples_per_second);
+                log_scalar(&mut tb, "train/samples_per_second", iteration, report.train_samples_per_second);
                 log_scalar(&mut tb, "timing/selfplay_seconds", iteration, report.selfplay_seconds);
                 log_scalar(&mut tb, "timing/train_seconds", iteration, report.train_seconds);
                 log_scalar(&mut tb, "timing/iteration_seconds", iteration, report.total_seconds);
@@ -713,6 +767,7 @@ fn print_help() {
     println!("hint  : cargo run --release -- uci");
     println!("hint  : cargo run --release -- az-gumbel chineseai.nnue.txt 10000 32 0.0 startpos");
     println!("hint  : cargo run --release -- az-bench chineseai.nnue.txt 512 32 100 0.0 startpos");
+    println!("hint  : cargo run --release -- az-train-bench chineseai.nnue.txt 8192 2 256 0.0003");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
 }
 
@@ -731,7 +786,6 @@ struct AzLoopFileConfig {
     trunk_depth: usize,
     seed: u64,
     workers: usize,
-    train_workers: usize,
     temperature_start: f32,
     temperature_end: f32,
     temperature_decay_plies: usize,
@@ -766,7 +820,6 @@ impl Default for AzLoopFileConfig {
             trunk_depth: 2,
             seed: 20260409,
             workers: default_workers,
-            train_workers: default_workers,
             temperature_start: 1.0,
             temperature_end: 0.2,
             temperature_decay_plies: 40,
@@ -806,8 +859,7 @@ impl AzLoopFileConfig {
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
 #   batch_size=256 is the default; lower it if memory is tight, raise it if loss is noisy.
-#   workers/train_workers default to about all logical CPUs minus one.
-#   train_workers splits each training batch across CPU threads and synchronizes gradients once.
+#   workers defaults to about all logical CPUs minus one.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
 # Augmentation:
@@ -834,7 +886,6 @@ hidden_size = {hidden_size}
 trunk_depth = {trunk_depth}
 seed = {seed}
 workers = {workers}
-train_workers = {train_workers}
 temperature_start = {temperature_start}
 temperature_end = {temperature_end}
 temperature_decay_plies = {temperature_decay_plies}
@@ -864,7 +915,6 @@ tensorboard_logdir = {tensorboard_logdir}
             trunk_depth = self.trunk_depth,
             seed = self.seed,
             workers = self.workers,
-            train_workers = self.train_workers,
             temperature_start = self.temperature_start,
             temperature_end = self.temperature_end,
             temperature_decay_plies = self.temperature_decay_plies,
@@ -913,9 +963,6 @@ tensorboard_logdir = {tensorboard_logdir}
             "trunk_depth" => self.trunk_depth = parse_config_value(value, self.trunk_depth),
             "seed" => self.seed = parse_config_value(value, self.seed),
             "workers" => self.workers = parse_config_value(value, self.workers),
-            "train_workers" => {
-                self.train_workers = parse_config_value(value, self.train_workers)
-            }
             "temperature_start" => {
                 self.temperature_start = parse_config_value(value, self.temperature_start)
             }
@@ -964,7 +1011,6 @@ tensorboard_logdir = {tensorboard_logdir}
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
-        self.train_workers = self.train_workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);
         self.gumbel_scale = self.gumbel_scale.max(0.0);
