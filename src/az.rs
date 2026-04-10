@@ -135,6 +135,10 @@ pub struct AzLoopReport {
     pub loss: f32,
     pub value_mse: f32,
     pub policy_ce: f32,
+    pub value_pred_mean: f32,
+    pub value_pred_std: f32,
+    pub value_target_mean: f32,
+    pub value_target_std: f32,
     pub train_samples: usize,
     pub pool_games: usize,
     pub pool_samples: usize,
@@ -157,6 +161,10 @@ struct AzTrainStats {
     loss: f32,
     value_mse: f32,
     policy_ce: f32,
+    value_pred_sum: f32,
+    value_pred_sq_sum: f32,
+    value_target_sum: f32,
+    value_target_sq_sum: f32,
     samples: usize,
 }
 
@@ -731,6 +739,18 @@ pub fn selfplay_train_iteration_with_pool(
         loss: stats.loss,
         value_mse: stats.value_mse,
         policy_ce: stats.policy_ce,
+        value_pred_mean: stats.value_pred_sum / stats.samples.max(1) as f32,
+        value_pred_std: variance_to_std(
+            stats.value_pred_sum,
+            stats.value_pred_sq_sum,
+            stats.samples,
+        ),
+        value_target_mean: stats.value_target_sum / stats.samples.max(1) as f32,
+        value_target_std: variance_to_std(
+            stats.value_target_sum,
+            stats.value_target_sq_sum,
+            stats.samples,
+        ),
         train_samples: train_data.len(),
         pool_games,
         pool_samples,
@@ -1060,6 +1080,26 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = value;
             self.nodes[node_index].expanded = true;
             return value;
+        }
+        if let Some(rule_history) = self.nodes[node_index].rule_history.as_ref() {
+            if let Some(outcome) = self.nodes[node_index]
+                .position
+                .rule_outcome_with_history(rule_history)
+            {
+                self.nodes[node_index].children.clear();
+                self.nodes[node_index].value = match outcome {
+                    RuleOutcome::Draw => 0.0,
+                    RuleOutcome::Win(color) => {
+                        if color == self.nodes[node_index].position.side_to_move() {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    }
+                };
+                self.nodes[node_index].expanded = true;
+                return self.nodes[node_index].value;
+            }
         }
         let moves = if node_index == self.root {
             self.root_moves.clone().unwrap_or_else(|| {
@@ -1697,6 +1737,10 @@ fn accumulate_one(
         loss: value_mse + policy_ce,
         value_mse,
         policy_ce,
+        value_pred_sum: value,
+        value_pred_sq_sum: value * value,
+        value_target_sum: sample.value,
+        value_target_sq_sum: sample.value * sample.value,
         samples: 1,
     }
 }
@@ -1946,6 +1990,15 @@ fn scalar_value_from_logits(logits: &[f32]) -> (f32, Vec<f32>) {
         return (0.0, probs);
     }
     (probs[0] - probs[2], probs)
+}
+
+fn variance_to_std(sum: f32, sq_sum: f32, count: usize) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    let mean = sum / count as f32;
+    let variance = (sq_sum / count as f32) - mean * mean;
+    variance.max(0.0).sqrt()
 }
 
 fn parse_floats(text: &str) -> io::Result<Vec<f32>> {

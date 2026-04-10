@@ -284,7 +284,7 @@ fn main() {
                     panic!("failed to write `{}`: {err}", config.model_path);
                 });
                 println!(
-                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} elapsed={:.1}s saved={}",
+                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} vpred={:.3}/{:.3} vtgt={:.3}/{:.3} elapsed={:.1}s saved={}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -297,6 +297,10 @@ fn main() {
                     report.loss,
                     report.value_mse,
                     report.policy_ce,
+                    report.value_pred_mean,
+                    report.value_pred_std,
+                    report.value_target_mean,
+                    report.value_target_std,
                     started.elapsed().as_secs_f32(),
                     config.model_path
                 );
