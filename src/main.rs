@@ -8,9 +8,54 @@ use chineseai::{
 };
 use std::{
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, BufWriter, Write},
     path::Path,
 };
+
+// ---------------------------------------------------------------------------
+// UCI 磁盘日志（写入程序所在目录的 chineseai-uci.log）
+// ---------------------------------------------------------------------------
+
+struct UciLogger {
+    file: Option<BufWriter<fs::File>>,
+    elapsed: std::time::Instant,
+}
+
+impl UciLogger {
+    fn new() -> Self {
+        let path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("chineseai-uci.log")));
+
+        let file = path.and_then(|p| {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+                .map(BufWriter::new)
+        });
+
+        let logger = Self {
+            file,
+            elapsed: std::time::Instant::now(),
+        };
+        logger
+    }
+
+    fn log(&mut self, msg: &str) {
+        let Some(f) = self.file.as_mut() else { return };
+        let ms = self.elapsed.elapsed().as_millis();
+        let _ = writeln!(f, "[{ms:>8}ms] {msg}");
+        let _ = f.flush();
+    }
+}
+
+macro_rules! ulog {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.log(&format!($($arg)*))
+    };
+}
 
 const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.conf";
 
@@ -297,7 +342,7 @@ fn main() {
                     report.draws,
                     report.avg_plies,
                     report.loss,
-                    report.value_mse,
+                    report.value_loss,
                     report.policy_ce,
                     report.value_pred_mean,
                     report.value_pred_std,
@@ -374,7 +419,7 @@ impl Default for AzLoopFileConfig {
             batch_size: 256,
             max_plies: 300,
             hidden_size: 128,
-            trunk_depth: 2,
+            trunk_depth: 6,
             seed: 20260409,
             workers: 8,
             train_workers: 4,
@@ -382,7 +427,7 @@ impl Default for AzLoopFileConfig {
             temperature_end: 0.2,
             temperature_decay_plies: 40,
             gumbel_scale: 1.0,
-            td_lambda: 0.95,
+            td_lambda: 0.75,
             replay_games: 5000,
             replay_samples: 0,
             mirror_probability: 0.3,
@@ -599,6 +644,8 @@ impl Default for UciState {
 fn run_uci() {
     let stdin = io::stdin();
     let mut state = UciState::default();
+    let mut logger = UciLogger::new();
+    ulog!(logger, "=== UCI session started ===");
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
             break;
@@ -607,6 +654,7 @@ fn run_uci() {
         if line.is_empty() {
             continue;
         }
+        ulog!(logger, ">> {line}");
         match line.split_whitespace().next() {
             Some("uci") => print_uci_id(),
             Some("isready") => {
@@ -618,15 +666,19 @@ fn run_uci() {
                 state.position = Position::startpos();
                 state.history.clear();
                 state.rule_history = state.position.initial_rule_history();
+                ulog!(logger, "[ucinewgame] reset to startpos");
             }
             Some("setoption") => handle_setoption(line, &mut state),
-            Some("position") => handle_position(line, &mut state),
-            Some("go") => handle_go(line, &mut state),
+            Some("position") => handle_position(line, &mut state, &mut logger),
+            Some("go") => handle_go(line, &mut state, &mut logger),
             Some("stop") => {
                 println!("bestmove 0000");
                 uci_flush();
             }
-            Some("quit") => break,
+            Some("quit") => {
+                ulog!(logger, "=== UCI session ended ===");
+                break;
+            }
             _ => {}
         }
     }
@@ -705,20 +757,31 @@ fn handle_setoption(line: &str, state: &mut UciState) {
     }
 }
 
-fn handle_position(line: &str, state: &mut UciState) {
+fn handle_position(line: &str, state: &mut UciState, logger: &mut UciLogger) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     if tokens.get(1) == Some(&"startpos") {
         state.position = Position::startpos();
         state.history.clear();
         state.rule_history = state.position.initial_rule_history();
         if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
+            let move_list = &tokens[moves_index + 1..];
+            ulog!(logger, "[position] startpos moves={}", move_list.join(" "));
             apply_uci_moves(
                 &mut state.position,
                 &mut state.history,
                 &mut state.rule_history,
-                &tokens[moves_index + 1..],
+                move_list,
+                logger,
             );
+        } else {
+            ulog!(logger, "[position] startpos (no moves)");
         }
+        ulog!(
+            logger,
+            "[position] result fen={} halfmove_clock={}",
+            state.position.to_fen(),
+            state.position.halfmove_clock()
+        );
         return;
     }
 
@@ -731,15 +794,27 @@ fn handle_position(line: &str, state: &mut UciState) {
             state.history.clear();
             state.rule_history = state.position.initial_rule_history();
             if let Some(moves_index) = moves_index {
+                let move_list = &tokens[moves_index + 1..];
+                ulog!(logger, "[position] fen={fen} moves={}", move_list.join(" "));
                 apply_uci_moves(
                     &mut state.position,
                     &mut state.history,
                     &mut state.rule_history,
-                    &tokens[moves_index + 1..],
+                    move_list,
+                    logger,
                 );
+            } else {
+                ulog!(logger, "[position] fen={fen} (no moves)");
             }
+            ulog!(
+                logger,
+                "[position] result fen={} halfmove_clock={}",
+                state.position.to_fen(),
+                state.position.halfmove_clock()
+            );
         } else {
             eprintln!("info string invalid fen: {fen}");
+            ulog!(logger, "[position] ERROR invalid fen={fen}");
         }
     }
 }
@@ -749,10 +824,17 @@ fn apply_uci_moves(
     history: &mut Vec<HistoryMove>,
     rule_history: &mut Vec<RuleHistoryEntry>,
     moves: &[&str],
+    logger: &mut UciLogger,
 ) {
-    for text in moves {
+    for (i, text) in moves.iter().enumerate() {
         let Some(mv) = position.parse_uci_move(text) else {
             eprintln!("info string illegal move ignored: {text}");
+            ulog!(
+                logger,
+                "[apply_move] #{i} {text} ILLEGAL — fen={} halfmove_clock={}",
+                position.to_fen(),
+                position.halfmove_clock()
+            );
             break;
         };
         if let Some(piece) = position.piece_at(mv.from as usize) {
@@ -764,15 +846,57 @@ fn apply_uci_moves(
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
+        ulog!(logger, "[apply_move] #{i} {text} ok → fen={}", position.to_fen());
     }
 }
 
-fn handle_go(_line: &str, state: &mut UciState) {
+fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
     ensure_uci_model(state);
     let simulations = state.simulations.max(1);
     let model = state.model.as_ref().expect("model was loaded");
+
+    let fen = state.position.to_fen();
+    let raw_legal = state.position.legal_moves();
     let legal = state.position.legal_moves_with_rules(&state.rule_history);
+
+    ulog!(
+        logger,
+        "[go] fen={fen} halfmove_clock={} rule_history_len={} raw_legal={} filtered_legal={}",
+        state.position.halfmove_clock(),
+        state.rule_history.len(),
+        raw_legal.len(),
+        legal.len()
+    );
+
     if legal.is_empty() {
+        // 写入完整诊断以便排查"有走法却判无合法走法"的问题
+        ulog!(logger, "[no_legal_moves] fen={fen}");
+        ulog!(
+            logger,
+            "[no_legal_moves] raw_legal_moves({})={}",
+            raw_legal.len(),
+            raw_legal
+                .iter()
+                .map(|mv| mv.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        ulog!(
+            logger,
+            "[no_legal_moves] rule_history ({} entries):",
+            state.rule_history.len()
+        );
+        for (i, entry) in state.rule_history.iter().enumerate() {
+            ulog!(
+                logger,
+                "[no_legal_moves]   [{i:>3}] hash={:#018x} side={:?} mover={:?} check={} chase_mask={:#034x}",
+                entry.hash,
+                entry.side_to_move,
+                entry.mover,
+                entry.gives_check,
+                entry.chased_mask
+            );
+        }
         println!("info depth 1 nodes 0 time 0 score cp -32000 pv 0000");
         println!("bestmove 0000");
         uci_flush();

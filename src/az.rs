@@ -9,11 +9,15 @@ use crate::nnue::{
     HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, mirror_file_move,
     mirror_sparse_features_file, orient_move,
 };
-use crate::xiangqi::{BOARD_SIZE, Color, Move, Position, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{
+    BOARD_FILES, BOARD_SIZE, Color, Move, Position, RuleHistoryEntry, RuleOutcome,
+};
 
-pub const AZNNUE_FORMAT: &str = "aznnue-v11";
-const MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
-const GLOBAL_CONTEXT_SIZE: usize = 8;
+pub const AZNNUE_FORMAT: &str = "aznnue-v14";
+const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
+const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
+const GLOBAL_CONTEXT_SIZE: usize = 32;
+const VALUE_HIDDEN_SIZE: usize = 64;
 const VALUE_LOGITS: usize = 3;
 const VALUE_SCALE_CP: f32 = 800.0;
 const COMPLETED_Q_VALUE_SCALE: f32 = 0.1;
@@ -32,10 +36,13 @@ pub struct AzNnue {
     pub hidden_bias: Vec<f32>,
     pub trunk_weights: Vec<f32>,
     pub trunk_biases: Vec<f32>,
+    pub trunk_global_weights: Vec<f32>,
     pub global_hidden: Vec<f32>,
     pub global_bias: Vec<f32>,
-    pub value_logits_hidden: Vec<f32>,
-    pub value_logits_global: Vec<f32>,
+    pub value_intermediate_hidden: Vec<f32>,
+    pub value_intermediate_global: Vec<f32>,
+    pub value_intermediate_bias: Vec<f32>,
+    pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
     pub policy_move_hidden: Vec<f32>,
     pub policy_move_global: Vec<f32>,
@@ -52,10 +59,13 @@ impl Clone for AzNnue {
             hidden_bias: self.hidden_bias.clone(),
             trunk_weights: self.trunk_weights.clone(),
             trunk_biases: self.trunk_biases.clone(),
+            trunk_global_weights: self.trunk_global_weights.clone(),
             global_hidden: self.global_hidden.clone(),
             global_bias: self.global_bias.clone(),
-            value_logits_hidden: self.value_logits_hidden.clone(),
-            value_logits_global: self.value_logits_global.clone(),
+            value_intermediate_hidden: self.value_intermediate_hidden.clone(),
+            value_intermediate_global: self.value_intermediate_global.clone(),
+            value_intermediate_bias: self.value_intermediate_bias.clone(),
+            value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
             policy_move_hidden: self.policy_move_hidden.clone(),
             policy_move_global: self.policy_move_global.clone(),
@@ -134,7 +144,7 @@ pub struct AzLoopReport {
     pub draws: usize,
     pub avg_plies: f32,
     pub loss: f32,
-    pub value_mse: f32,
+    pub value_loss: f32,
     pub policy_ce: f32,
     pub value_pred_mean: f32,
     pub value_pred_std: f32,
@@ -160,7 +170,7 @@ struct AzTrainingSample {
 #[derive(Clone, Copy, Debug, Default)]
 struct AzTrainStats {
     loss: f32,
-    value_mse: f32,
+    value_loss: f32,
     policy_ce: f32,
     value_pred_sum: f32,
     value_pred_sq_sum: f32,
@@ -175,10 +185,13 @@ struct AzGrad {
     hidden_bias: Vec<f32>,
     trunk_weights: Vec<f32>,
     trunk_biases: Vec<f32>,
+    trunk_global_weights: Vec<f32>,
     global_hidden: Vec<f32>,
     global_bias: Vec<f32>,
-    value_logits_hidden: Vec<f32>,
-    value_logits_global: Vec<f32>,
+    value_intermediate_hidden: Vec<f32>,
+    value_intermediate_global: Vec<f32>,
+    value_intermediate_bias: Vec<f32>,
+    value_logits_weights: Vec<f32>,
     value_logits_bias: Vec<f32>,
     policy_move_hidden: Vec<f32>,
     policy_move_global: Vec<f32>,
@@ -192,10 +205,13 @@ impl AzGrad {
             hidden_bias: vec![0.0; model.hidden_bias.len()],
             trunk_weights: vec![0.0; model.trunk_weights.len()],
             trunk_biases: vec![0.0; model.trunk_biases.len()],
+            trunk_global_weights: vec![0.0; model.trunk_global_weights.len()],
             global_hidden: vec![0.0; model.global_hidden.len()],
             global_bias: vec![0.0; model.global_bias.len()],
-            value_logits_hidden: vec![0.0; model.value_logits_hidden.len()],
-            value_logits_global: vec![0.0; model.value_logits_global.len()],
+            value_intermediate_hidden: vec![0.0; model.value_intermediate_hidden.len()],
+            value_intermediate_global: vec![0.0; model.value_intermediate_global.len()],
+            value_intermediate_bias: vec![0.0; model.value_intermediate_bias.len()],
+            value_logits_weights: vec![0.0; model.value_logits_weights.len()],
             value_logits_bias: vec![0.0; model.value_logits_bias.len()],
             policy_move_hidden: vec![0.0; model.policy_move_hidden.len()],
             policy_move_global: vec![0.0; model.policy_move_global.len()],
@@ -210,8 +226,10 @@ impl AzGrad {
         self.trunk_biases.fill(0.0);
         self.global_hidden.fill(0.0);
         self.global_bias.fill(0.0);
-        self.value_logits_hidden.fill(0.0);
-        self.value_logits_global.fill(0.0);
+        self.value_intermediate_hidden.fill(0.0);
+        self.value_intermediate_global.fill(0.0);
+        self.value_intermediate_bias.fill(0.0);
+        self.value_logits_weights.fill(0.0);
         self.value_logits_bias.fill(0.0);
         self.policy_move_hidden.fill(0.0);
         self.policy_move_global.fill(0.0);
@@ -223,10 +241,13 @@ impl AzGrad {
         add_assign_slice(&mut self.hidden_bias, &other.hidden_bias);
         add_assign_slice(&mut self.trunk_weights, &other.trunk_weights);
         add_assign_slice(&mut self.trunk_biases, &other.trunk_biases);
+        add_assign_slice(&mut self.trunk_global_weights, &other.trunk_global_weights);
         add_assign_slice(&mut self.global_hidden, &other.global_hidden);
         add_assign_slice(&mut self.global_bias, &other.global_bias);
-        add_assign_slice(&mut self.value_logits_hidden, &other.value_logits_hidden);
-        add_assign_slice(&mut self.value_logits_global, &other.value_logits_global);
+        add_assign_slice(&mut self.value_intermediate_hidden, &other.value_intermediate_hidden);
+        add_assign_slice(&mut self.value_intermediate_global, &other.value_intermediate_global);
+        add_assign_slice(&mut self.value_intermediate_bias, &other.value_intermediate_bias);
+        add_assign_slice(&mut self.value_logits_weights, &other.value_logits_weights);
         add_assign_slice(&mut self.value_logits_bias, &other.value_logits_bias);
         add_assign_slice(&mut self.policy_move_hidden, &other.policy_move_hidden);
         add_assign_slice(&mut self.policy_move_global, &other.policy_move_global);
@@ -237,7 +258,7 @@ impl AzGrad {
 impl AzTrainStats {
     fn add_assign(&mut self, other: &Self) {
         self.loss += other.loss;
-        self.value_mse += other.value_mse;
+        self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
@@ -260,14 +281,20 @@ struct AdamWState {
     trunk_weights_v: Vec<f32>,
     trunk_biases_m: Vec<f32>,
     trunk_biases_v: Vec<f32>,
+    trunk_global_weights_m: Vec<f32>,
+    trunk_global_weights_v: Vec<f32>,
     global_hidden_m: Vec<f32>,
     global_hidden_v: Vec<f32>,
     global_bias_m: Vec<f32>,
     global_bias_v: Vec<f32>,
-    value_logits_hidden_m: Vec<f32>,
-    value_logits_hidden_v: Vec<f32>,
-    value_logits_global_m: Vec<f32>,
-    value_logits_global_v: Vec<f32>,
+    value_intermediate_hidden_m: Vec<f32>,
+    value_intermediate_hidden_v: Vec<f32>,
+    value_intermediate_global_m: Vec<f32>,
+    value_intermediate_global_v: Vec<f32>,
+    value_intermediate_bias_m: Vec<f32>,
+    value_intermediate_bias_v: Vec<f32>,
+    value_logits_weights_m: Vec<f32>,
+    value_logits_weights_v: Vec<f32>,
     value_logits_bias_m: Vec<f32>,
     value_logits_bias_v: Vec<f32>,
     policy_move_hidden_m: Vec<f32>,
@@ -292,14 +319,20 @@ impl AdamWState {
             trunk_weights_v: vec![0.0; model.trunk_weights.len()],
             trunk_biases_m: vec![0.0; model.trunk_biases.len()],
             trunk_biases_v: vec![0.0; model.trunk_biases.len()],
+            trunk_global_weights_m: vec![0.0; model.trunk_global_weights.len()],
+            trunk_global_weights_v: vec![0.0; model.trunk_global_weights.len()],
             global_hidden_m: vec![0.0; model.global_hidden.len()],
             global_hidden_v: vec![0.0; model.global_hidden.len()],
             global_bias_m: vec![0.0; model.global_bias.len()],
             global_bias_v: vec![0.0; model.global_bias.len()],
-            value_logits_hidden_m: vec![0.0; model.value_logits_hidden.len()],
-            value_logits_hidden_v: vec![0.0; model.value_logits_hidden.len()],
-            value_logits_global_m: vec![0.0; model.value_logits_global.len()],
-            value_logits_global_v: vec![0.0; model.value_logits_global.len()],
+            value_intermediate_hidden_m: vec![0.0; model.value_intermediate_hidden.len()],
+            value_intermediate_hidden_v: vec![0.0; model.value_intermediate_hidden.len()],
+            value_intermediate_global_m: vec![0.0; model.value_intermediate_global.len()],
+            value_intermediate_global_v: vec![0.0; model.value_intermediate_global.len()],
+            value_intermediate_bias_m: vec![0.0; model.value_intermediate_bias.len()],
+            value_intermediate_bias_v: vec![0.0; model.value_intermediate_bias.len()],
+            value_logits_weights_m: vec![0.0; model.value_logits_weights.len()],
+            value_logits_weights_v: vec![0.0; model.value_logits_weights.len()],
             value_logits_bias_m: vec![0.0; model.value_logits_bias.len()],
             value_logits_bias_v: vec![0.0; model.value_logits_bias.len()],
             policy_move_hidden_m: vec![0.0; model.policy_move_hidden.len()],
@@ -320,14 +353,20 @@ impl AdamWState {
             && self.trunk_weights_v.len() == model.trunk_weights.len()
             && self.trunk_biases_m.len() == model.trunk_biases.len()
             && self.trunk_biases_v.len() == model.trunk_biases.len()
+            && self.trunk_global_weights_m.len() == model.trunk_global_weights.len()
+            && self.trunk_global_weights_v.len() == model.trunk_global_weights.len()
             && self.global_hidden_m.len() == model.global_hidden.len()
             && self.global_hidden_v.len() == model.global_hidden.len()
             && self.global_bias_m.len() == model.global_bias.len()
             && self.global_bias_v.len() == model.global_bias.len()
-            && self.value_logits_hidden_m.len() == model.value_logits_hidden.len()
-            && self.value_logits_hidden_v.len() == model.value_logits_hidden.len()
-            && self.value_logits_global_m.len() == model.value_logits_global.len()
-            && self.value_logits_global_v.len() == model.value_logits_global.len()
+            && self.value_intermediate_hidden_m.len() == model.value_intermediate_hidden.len()
+            && self.value_intermediate_hidden_v.len() == model.value_intermediate_hidden.len()
+            && self.value_intermediate_global_m.len() == model.value_intermediate_global.len()
+            && self.value_intermediate_global_v.len() == model.value_intermediate_global.len()
+            && self.value_intermediate_bias_m.len() == model.value_intermediate_bias.len()
+            && self.value_intermediate_bias_v.len() == model.value_intermediate_bias.len()
+            && self.value_logits_weights_m.len() == model.value_logits_weights.len()
+            && self.value_logits_weights_v.len() == model.value_logits_weights.len()
             && self.value_logits_bias_m.len() == model.value_logits_bias.len()
             && self.value_logits_bias_v.len() == model.value_logits_bias.len()
             && self.policy_move_hidden_m.len() == model.policy_move_hidden.len()
@@ -428,24 +467,31 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
         let trunk_biases = vec![0.0; trunk_depth * hidden_size];
+        let trunk_global_weights = (0..trunk_depth * hidden_size * GLOBAL_CONTEXT_SIZE)
+            .map(|_| rng.weight((2.0 / GLOBAL_CONTEXT_SIZE as f32).sqrt()))
+            .collect();
         let global_hidden = (0..GLOBAL_CONTEXT_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
         let global_bias = vec![0.0; GLOBAL_CONTEXT_SIZE];
-        let value_logits_hidden = (0..VALUE_LOGITS * hidden_size)
-            .map(|_| rng.weight(0.05))
+        let value_intermediate_hidden = (0..VALUE_HIDDEN_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
-        let value_logits_global = (0..VALUE_LOGITS * GLOBAL_CONTEXT_SIZE)
-            .map(|_| rng.weight(0.05))
+        let value_intermediate_global = (0..VALUE_HIDDEN_SIZE * GLOBAL_CONTEXT_SIZE)
+            .map(|_| rng.weight((2.0 / GLOBAL_CONTEXT_SIZE as f32).sqrt()))
+            .collect();
+        let value_intermediate_bias = vec![0.0; VALUE_HIDDEN_SIZE];
+        let value_logits_weights = (0..VALUE_LOGITS * VALUE_HIDDEN_SIZE)
+            .map(|_| rng.weight((2.0 / VALUE_HIDDEN_SIZE as f32).sqrt()))
             .collect();
         let value_logits_bias = vec![0.0; VALUE_LOGITS];
-        let policy_move_hidden = (0..MOVE_SPACE * hidden_size)
+        let policy_move_hidden = (0..DENSE_MOVE_SPACE * hidden_size)
             .map(|_| rng.weight(0.01))
             .collect();
-        let policy_move_global = (0..MOVE_SPACE * GLOBAL_CONTEXT_SIZE)
+        let policy_move_global = (0..DENSE_MOVE_SPACE * GLOBAL_CONTEXT_SIZE)
             .map(|_| rng.weight(0.01))
             .collect();
-        let policy_move_bias = vec![0.0; MOVE_SPACE];
+        let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         Self {
             hidden_size,
             trunk_depth,
@@ -453,10 +499,13 @@ impl AzNnue {
             hidden_bias,
             trunk_weights,
             trunk_biases,
+            trunk_global_weights,
             global_hidden,
             global_bias,
-            value_logits_hidden,
-            value_logits_global,
+            value_intermediate_hidden,
+            value_intermediate_global,
+            value_intermediate_bias,
+            value_logits_weights,
             value_logits_bias,
             policy_move_hidden,
             policy_move_global,
@@ -467,17 +516,20 @@ impl AzNnue {
 
     pub fn save_text(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let text = format!(
-            "format: {AZNNUE_FORMAT}\ninput_size: {V4_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\nglobal_hidden: {}\nglobal_bias: {}\nvalue_logits_hidden: {}\nvalue_logits_global: {}\nvalue_logits_bias: {}\npolicy_move_hidden: {}\npolicy_move_global: {}\npolicy_move_bias: {}\n",
+            "format: {AZNNUE_FORMAT}\ninput_size: {V4_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\ntrunk_global_weights: {}\nglobal_hidden: {}\nglobal_bias: {}\nvalue_intermediate_hidden: {}\nvalue_intermediate_global: {}\nvalue_intermediate_bias: {}\nvalue_logits_weights: {}\nvalue_logits_bias: {}\npolicy_move_hidden: {}\npolicy_move_global: {}\npolicy_move_bias: {}\n",
             self.hidden_size,
             self.trunk_depth,
             format_floats(&self.input_hidden),
             format_floats(&self.hidden_bias),
             format_floats(&self.trunk_weights),
             format_floats(&self.trunk_biases),
+            format_floats(&self.trunk_global_weights),
             format_floats(&self.global_hidden),
             format_floats(&self.global_bias),
-            format_floats(&self.value_logits_hidden),
-            format_floats(&self.value_logits_global),
+            format_floats(&self.value_intermediate_hidden),
+            format_floats(&self.value_intermediate_global),
+            format_floats(&self.value_intermediate_bias),
+            format_floats(&self.value_logits_weights),
             format_floats(&self.value_logits_bias),
             format_floats(&self.policy_move_hidden),
             format_floats(&self.policy_move_global),
@@ -496,10 +548,13 @@ impl AzNnue {
         let mut hidden_bias = None;
         let mut trunk_weights = None;
         let mut trunk_biases = None;
+        let mut trunk_global_weights = None;
         let mut global_hidden = None;
         let mut global_bias = None;
-        let mut value_logits_hidden = None;
-        let mut value_logits_global = None;
+        let mut value_intermediate_hidden = None;
+        let mut value_intermediate_global = None;
+        let mut value_intermediate_bias = None;
+        let mut value_logits_weights = None;
         let mut value_logits_bias = None;
         let mut policy_move_hidden = None;
         let mut policy_move_global = None;
@@ -519,10 +574,13 @@ impl AzNnue {
                 "hidden_bias" => hidden_bias = Some(parse_floats(value)?),
                 "trunk_weights" => trunk_weights = Some(parse_floats(value)?),
                 "trunk_biases" => trunk_biases = Some(parse_floats(value)?),
+                "trunk_global_weights" => trunk_global_weights = Some(parse_floats(value)?),
                 "global_hidden" => global_hidden = Some(parse_floats(value)?),
                 "global_bias" => global_bias = Some(parse_floats(value)?),
-                "value_logits_hidden" => value_logits_hidden = Some(parse_floats(value)?),
-                "value_logits_global" => value_logits_global = Some(parse_floats(value)?),
+                "value_intermediate_hidden" => value_intermediate_hidden = Some(parse_floats(value)?),
+                "value_intermediate_global" => value_intermediate_global = Some(parse_floats(value)?),
+                "value_intermediate_bias" => value_intermediate_bias = Some(parse_floats(value)?),
+                "value_logits_weights" => value_logits_weights = Some(parse_floats(value)?),
                 "value_logits_bias" => value_logits_bias = Some(parse_floats(value)?),
                 "policy_move_hidden" => policy_move_hidden = Some(parse_floats(value)?),
                 "policy_move_global" => policy_move_global = Some(parse_floats(value)?),
@@ -561,16 +619,25 @@ impl AzNnue {
             trunk_biases: trunk_biases.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing trunk_biases")
             })?,
+            trunk_global_weights: trunk_global_weights.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing trunk_global_weights")
+            })?,
             global_hidden: global_hidden.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing global_hidden")
             })?,
             global_bias: global_bias
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing global_bias"))?,
-            value_logits_hidden: value_logits_hidden.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_hidden")
+            value_intermediate_hidden: value_intermediate_hidden.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_intermediate_hidden")
             })?,
-            value_logits_global: value_logits_global.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_global")
+            value_intermediate_global: value_intermediate_global.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_intermediate_global")
+            })?,
+            value_intermediate_bias: value_intermediate_bias.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_intermediate_bias")
+            })?,
+            value_logits_weights: value_logits_weights.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_weights")
             })?,
             value_logits_bias: value_logits_bias.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_bias")
@@ -596,8 +663,10 @@ impl AzNnue {
         history: &[HistoryMove],
         moves: &[Move],
     ) -> (f32, Vec<f32>) {
-        let hidden = self.embedding(position, history);
-        let global = self.global_from_hidden(&hidden);
+        let features = extract_sparse_features_v4(position, history);
+        let initial_hidden = self.input_embedding_from_features(&features);
+        let global = self.global_from_hidden(&initial_hidden);
+        let hidden = self.forward_trunk(initial_hidden, &global);
         let value = self.value_from_hidden(&hidden, &global);
         let side = position.side_to_move();
         let logits = moves
@@ -612,14 +681,18 @@ impl AzNnue {
             || self.hidden_bias.len() != self.hidden_size
             || self.trunk_weights.len() != self.trunk_depth * self.hidden_size * self.hidden_size
             || self.trunk_biases.len() != self.trunk_depth * self.hidden_size
+            || self.trunk_global_weights.len()
+                != self.trunk_depth * self.hidden_size * GLOBAL_CONTEXT_SIZE
             || self.global_hidden.len() != GLOBAL_CONTEXT_SIZE * self.hidden_size
             || self.global_bias.len() != GLOBAL_CONTEXT_SIZE
-            || self.value_logits_hidden.len() != VALUE_LOGITS * self.hidden_size
-            || self.value_logits_global.len() != VALUE_LOGITS * GLOBAL_CONTEXT_SIZE
+            || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * self.hidden_size
+            || self.value_intermediate_global.len() != VALUE_HIDDEN_SIZE * GLOBAL_CONTEXT_SIZE
+            || self.value_intermediate_bias.len() != VALUE_HIDDEN_SIZE
+            || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
             || self.value_logits_bias.len() != VALUE_LOGITS
-            || self.policy_move_hidden.len() != MOVE_SPACE * self.hidden_size
-            || self.policy_move_global.len() != MOVE_SPACE * GLOBAL_CONTEXT_SIZE
-            || self.policy_move_bias.len() != MOVE_SPACE
+            || self.policy_move_hidden.len() != DENSE_MOVE_SPACE * self.hidden_size
+            || self.policy_move_global.len() != DENSE_MOVE_SPACE * GLOBAL_CONTEXT_SIZE
+            || self.policy_move_bias.len() != DENSE_MOVE_SPACE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -629,11 +702,7 @@ impl AzNnue {
         Ok(())
     }
 
-    fn embedding(&self, position: &Position, history: &[HistoryMove]) -> Vec<f32> {
-        self.embedding_from_features(&extract_sparse_features_v4(position, history))
-    }
-
-    fn embedding_from_features(&self, features: &[usize]) -> Vec<f32> {
+    fn input_embedding_from_features(&self, features: &[usize]) -> Vec<f32> {
         let mut hidden = self.hidden_bias.clone();
         for &feature in features {
             let row =
@@ -645,13 +714,14 @@ impl AzNnue {
         for value in &mut hidden {
             *value = value.max(0.0);
         }
-        self.forward_trunk(hidden)
+        hidden
     }
 
-    fn forward_trunk(&self, mut hidden: Vec<f32>) -> Vec<f32> {
+    fn forward_trunk(&self, mut hidden: Vec<f32>, global: &[f32]) -> Vec<f32> {
         let mut next = vec![0.0; self.hidden_size];
         for layer in 0..self.trunk_depth {
             let weight_offset = layer * self.hidden_size * self.hidden_size;
+            let global_weight_offset = layer * self.hidden_size * GLOBAL_CONTEXT_SIZE;
             let bias_offset = layer * self.hidden_size;
             for out in 0..self.hidden_size {
                 let mut value = self.trunk_biases[bias_offset + out];
@@ -659,6 +729,12 @@ impl AzNnue {
                     ..weight_offset + (out + 1) * self.hidden_size];
                 for idx in 0..self.hidden_size {
                     value += row[idx] * hidden[idx];
+                }
+                let grow = &self.trunk_global_weights
+                    [global_weight_offset + out * GLOBAL_CONTEXT_SIZE
+                        ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
+                for k in 0..GLOBAL_CONTEXT_SIZE {
+                    value += grow[k] * global[k];
                 }
                 next[out] = hidden[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
             }
@@ -679,18 +755,32 @@ impl AzNnue {
         global
     }
 
+    fn value_intermediate_from_hidden(&self, hidden: &[f32], global: &[f32]) -> Vec<f32> {
+        let mut intermediate = self.value_intermediate_bias.clone();
+        for j in 0..VALUE_HIDDEN_SIZE {
+            let h_row = &self.value_intermediate_hidden
+                [j * self.hidden_size..(j + 1) * self.hidden_size];
+            for i in 0..self.hidden_size {
+                intermediate[j] += hidden[i] * h_row[i];
+            }
+            let g_row = &self.value_intermediate_global
+                [j * GLOBAL_CONTEXT_SIZE..(j + 1) * GLOBAL_CONTEXT_SIZE];
+            for k in 0..GLOBAL_CONTEXT_SIZE {
+                intermediate[j] += global[k] * g_row[k];
+            }
+            intermediate[j] = intermediate[j].max(0.0);
+        }
+        intermediate
+    }
+
     fn value_logits_from_hidden(&self, hidden: &[f32], global: &[f32]) -> Vec<f32> {
+        let intermediate = self.value_intermediate_from_hidden(hidden, global);
         let mut logits = self.value_logits_bias.clone();
         for out in 0..VALUE_LOGITS {
-            let hidden_row =
-                &self.value_logits_hidden[out * self.hidden_size..(out + 1) * self.hidden_size];
-            for idx in 0..self.hidden_size {
-                logits[out] += hidden[idx] * hidden_row[idx];
-            }
-            let global_row = &self.value_logits_global
-                [out * GLOBAL_CONTEXT_SIZE..(out + 1) * GLOBAL_CONTEXT_SIZE];
-            for idx in 0..GLOBAL_CONTEXT_SIZE {
-                logits[out] += global[idx] * global_row[idx];
+            let row = &self.value_logits_weights
+                [out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
+            for j in 0..VALUE_HIDDEN_SIZE {
+                logits[out] += intermediate[j] * row[j];
             }
         }
         logits
@@ -702,7 +792,7 @@ impl AzNnue {
     }
 
     fn policy_logit_from_hidden(&self, hidden: &[f32], global: &[f32], mv: Move) -> f32 {
-        let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
+        let move_index = dense_move_index(mv);
         let hidden_offset = move_index * self.hidden_size;
         let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
         let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
@@ -767,7 +857,7 @@ pub fn selfplay_train_iteration_with_pool(
             data.plies_total as f32 / config.games as f32
         },
         loss: stats.loss,
-        value_mse: stats.value_mse,
+        value_loss: stats.value_loss,
         policy_ce: stats.policy_ce,
         value_pred_mean: stats.value_pred_sum / stats.samples.max(1) as f32,
         value_pred_std: variance_to_std(
@@ -1607,7 +1697,7 @@ fn train_samples(
     if stats.samples > 0 {
         let denom = stats.samples as f32;
         stats.loss /= denom;
-        stats.value_mse /= denom;
+        stats.value_loss /= denom;
         stats.policy_ce /= denom;
     }
     stats
@@ -1676,17 +1766,45 @@ fn accumulate_one(
     gradient: &mut AzGrad,
     sample: &AzTrainingSample,
 ) -> AzTrainStats {
-    let activations = train_forward_activations(model, &sample.features);
+    let (activations, global) = train_forward_activations(model, &sample.features);
     let hidden = activations
         .last()
         .expect("at least input activation exists");
-    let global = model.global_from_hidden(hidden);
 
-    let value_logits = model.value_logits_from_hidden(hidden, &global);
-    let (value, value_probs) = scalar_value_from_logits(&value_logits);
+    let mut value_intermediate_pre = model.value_intermediate_bias.clone();
+    for j in 0..VALUE_HIDDEN_SIZE {
+        let h_row = &model.value_intermediate_hidden
+            [j * model.hidden_size..(j + 1) * model.hidden_size];
+        for i in 0..model.hidden_size {
+            value_intermediate_pre[j] += hidden[i] * h_row[i];
+        }
+        let g_row = &model.value_intermediate_global
+            [j * GLOBAL_CONTEXT_SIZE..(j + 1) * GLOBAL_CONTEXT_SIZE];
+        for k in 0..GLOBAL_CONTEXT_SIZE {
+            value_intermediate_pre[j] += global[k] * g_row[k];
+        }
+    }
+    let value_intermediate: Vec<f32> = value_intermediate_pre
+        .iter()
+        .map(|v| v.max(0.0))
+        .collect();
+
+    let mut value_logits = model.value_logits_bias.clone();
+    for out in 0..VALUE_LOGITS {
+        let row = &model.value_logits_weights
+            [out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
+        for j in 0..VALUE_HIDDEN_SIZE {
+            value_logits[out] += value_intermediate[j] * row[j];
+        }
+    }
+    let value_probs = softmax(&value_logits);
+    let value = if value_probs.len() >= VALUE_LOGITS {
+        value_probs[0] - value_probs[2]
+    } else {
+        0.0
+    };
     let value_error = value - sample.value;
-    let value_mse = value_error * value_error;
-    let value_grad_scale = 2.0 * value_error;
+    let value_loss = value_error * value_error;
 
     let logits = sample
         .moves
@@ -1702,6 +1820,9 @@ fn accumulate_one(
 
     let mut activation_grad = vec![0.0; model.hidden_size];
     let mut global_grad = vec![0.0; GLOBAL_CONTEXT_SIZE];
+
+    let value_grad_scale = 2.0 * value_error;
+    let mut intermediate_grad = vec![0.0; VALUE_HIDDEN_SIZE];
     for out in 0..VALUE_LOGITS {
         let target_sign = match out {
             0 => 1.0,
@@ -1710,20 +1831,32 @@ fn accumulate_one(
         };
         let logit_grad =
             (value_grad_scale * value_probs[out] * (target_sign - value)).clamp(-4.0, 4.0);
-        let hidden_offset = out * model.hidden_size;
-        for idx in 0..model.hidden_size {
-            activation_grad[idx] += logit_grad * model.value_logits_hidden[hidden_offset + idx];
-            gradient.value_logits_hidden[hidden_offset + idx] += logit_grad * hidden[idx];
-        }
-        let global_offset = out * GLOBAL_CONTEXT_SIZE;
-        for idx in 0..GLOBAL_CONTEXT_SIZE {
-            global_grad[idx] += logit_grad * model.value_logits_global[global_offset + idx];
-            gradient.value_logits_global[global_offset + idx] += logit_grad * global[idx];
+        let row_offset = out * VALUE_HIDDEN_SIZE;
+        for j in 0..VALUE_HIDDEN_SIZE {
+            intermediate_grad[j] += logit_grad * model.value_logits_weights[row_offset + j];
+            gradient.value_logits_weights[row_offset + j] += logit_grad * value_intermediate[j];
         }
         gradient.value_logits_bias[out] += logit_grad;
     }
+    for j in 0..VALUE_HIDDEN_SIZE {
+        if value_intermediate_pre[j] <= 0.0 {
+            continue;
+        }
+        let grad = intermediate_grad[j].clamp(-4.0, 4.0);
+        let h_offset = j * model.hidden_size;
+        for i in 0..model.hidden_size {
+            activation_grad[i] += grad * model.value_intermediate_hidden[h_offset + i];
+            gradient.value_intermediate_hidden[h_offset + i] += grad * hidden[i];
+        }
+        let g_offset = j * GLOBAL_CONTEXT_SIZE;
+        for k in 0..GLOBAL_CONTEXT_SIZE {
+            global_grad[k] += grad * model.value_intermediate_global[g_offset + k];
+            gradient.value_intermediate_global[g_offset + k] += grad * global[k];
+        }
+        gradient.value_intermediate_bias[j] += grad;
+    }
     for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
-        let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
+        let move_index = dense_move_index(*mv);
         let policy_grad = (predicted - target).clamp(-4.0, 4.0);
         let hidden_offset = move_index * model.hidden_size;
         for idx in 0..model.hidden_size {
@@ -1736,7 +1869,7 @@ fn accumulate_one(
     }
 
     for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
-        let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
+        let move_index = dense_move_index(*mv);
         let policy_grad = (predicted - target).clamp(-4.0, 4.0);
         let hidden_offset = move_index * model.hidden_size;
         for idx in 0..model.hidden_size {
@@ -1751,26 +1884,13 @@ fn accumulate_one(
         gradient.policy_move_bias[move_index] += policy_grad;
     }
 
-    for out in 0..GLOBAL_CONTEXT_SIZE {
-        if global[out] <= 0.0 {
-            continue;
-        }
-        let grad = global_grad[out].clamp(-4.0, 4.0);
-        let weight_offset = out * model.hidden_size;
-        for idx in 0..model.hidden_size {
-            let weight_index = weight_offset + idx;
-            activation_grad[idx] += grad * model.global_hidden[weight_index];
-            gradient.global_hidden[weight_index] += grad * hidden[idx];
-        }
-        gradient.global_bias[out] += grad;
-    }
-
     let mut input_grad = activation_grad;
     for layer in (0..model.trunk_depth).rev() {
         let output = &activations[layer + 1];
         let input = &activations[layer];
         let mut previous_grad = vec![0.0; model.hidden_size];
         let weight_offset = layer * model.hidden_size * model.hidden_size;
+        let global_weight_offset = layer * model.hidden_size * GLOBAL_CONTEXT_SIZE;
         let bias_offset = layer * model.hidden_size;
         for out in 0..model.hidden_size {
             let grad = input_grad[out].clamp(-4.0, 4.0);
@@ -1781,19 +1901,38 @@ fn accumulate_one(
             let residual_grad = grad * RESIDUAL_TRUNK_SCALE;
             for idx in 0..model.hidden_size {
                 let weight_index = weight_offset + out * model.hidden_size + idx;
-                let old_weight = model.trunk_weights[weight_index];
-                previous_grad[idx] += residual_grad * old_weight;
+                previous_grad[idx] += residual_grad * model.trunk_weights[weight_index];
                 gradient.trunk_weights[weight_index] += residual_grad * input[idx];
             }
-            let bias_index = bias_offset + out;
-            gradient.trunk_biases[bias_index] += residual_grad;
+            let gw_offset = global_weight_offset + out * GLOBAL_CONTEXT_SIZE;
+            for k in 0..GLOBAL_CONTEXT_SIZE {
+                let weight_index = gw_offset + k;
+                global_grad[k] += residual_grad * model.trunk_global_weights[weight_index];
+                gradient.trunk_global_weights[weight_index] += residual_grad * global[k];
+            }
+            gradient.trunk_biases[bias_offset + out] += residual_grad;
         }
         input_grad = previous_grad;
     }
 
+    let initial_hidden = &activations[0];
+    for out in 0..GLOBAL_CONTEXT_SIZE {
+        if global[out] <= 0.0 {
+            continue;
+        }
+        let grad = global_grad[out].clamp(-4.0, 4.0);
+        let weight_offset = out * model.hidden_size;
+        for idx in 0..model.hidden_size {
+            let weight_index = weight_offset + idx;
+            input_grad[idx] += grad * model.global_hidden[weight_index];
+            gradient.global_hidden[weight_index] += grad * initial_hidden[idx];
+        }
+        gradient.global_bias[out] += grad;
+    }
+
     let input_scale = 1.0 / (sample.features.len() as f32).sqrt().max(1.0);
     for idx in 0..model.hidden_size {
-        if activations[0][idx] <= 0.0 {
+        if initial_hidden[idx] <= 0.0 {
             continue;
         }
         let grad = input_grad[idx].clamp(-4.0, 4.0);
@@ -1805,8 +1944,8 @@ fn accumulate_one(
     }
 
     AzTrainStats {
-        loss: value_mse + policy_ce,
-        value_mse,
+        loss: value_loss + policy_ce,
+        value_loss,
         policy_ce,
         value_pred_sum: value,
         value_pred_sq_sum: value * value,
@@ -1816,7 +1955,7 @@ fn accumulate_one(
     }
 }
 
-fn train_forward_activations(model: &AzNnue, features: &[usize]) -> Vec<Vec<f32>> {
+fn train_forward_activations(model: &AzNnue, features: &[usize]) -> (Vec<Vec<f32>>, Vec<f32>) {
     let mut hidden = model.hidden_bias.clone();
     for &feature in features {
         let row =
@@ -1829,12 +1968,15 @@ fn train_forward_activations(model: &AzNnue, features: &[usize]) -> Vec<Vec<f32>
         *value = value.max(0.0);
     }
 
+    let global = model.global_from_hidden(&hidden);
+
     let mut activations = Vec::with_capacity(model.trunk_depth + 1);
     activations.push(hidden);
     for layer in 0..model.trunk_depth {
         let previous = activations.last().expect("previous activation exists");
         let mut next = vec![0.0; model.hidden_size];
         let weight_offset = layer * model.hidden_size * model.hidden_size;
+        let global_weight_offset = layer * model.hidden_size * GLOBAL_CONTEXT_SIZE;
         let bias_offset = layer * model.hidden_size;
         for out in 0..model.hidden_size {
             let mut value = model.trunk_biases[bias_offset + out];
@@ -1843,11 +1985,17 @@ fn train_forward_activations(model: &AzNnue, features: &[usize]) -> Vec<Vec<f32>
             for idx in 0..model.hidden_size {
                 value += row[idx] * previous[idx];
             }
+            let grow = &model.trunk_global_weights
+                [global_weight_offset + out * GLOBAL_CONTEXT_SIZE
+                    ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
+            for k in 0..GLOBAL_CONTEXT_SIZE {
+                value += grow[k] * global[k];
+            }
             next[out] = previous[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
         }
         activations.push(next);
     }
-    activations
+    (activations, global)
 }
 
 fn apply_adamw_gradient(
@@ -1884,24 +2032,48 @@ fn apply_adamw_gradient(
             0.0,
         );
     }
-    for idx in 0..model.value_logits_hidden.len() {
+    for idx in 0..model.value_intermediate_hidden.len() {
         adamw_update(
-            &mut model.value_logits_hidden[idx],
-            &mut optimizer.value_logits_hidden_m[idx],
-            &mut optimizer.value_logits_hidden_v[idx],
-            gradient.value_logits_hidden[idx] * inv_batch,
+            &mut model.value_intermediate_hidden[idx],
+            &mut optimizer.value_intermediate_hidden_m[idx],
+            &mut optimizer.value_intermediate_hidden_v[idx],
+            gradient.value_intermediate_hidden[idx] * inv_batch,
             lr,
             bias_correction1,
             bias_correction2,
             ADAMW_WEIGHT_DECAY,
         );
     }
-    for idx in 0..model.value_logits_global.len() {
+    for idx in 0..model.value_intermediate_global.len() {
         adamw_update(
-            &mut model.value_logits_global[idx],
-            &mut optimizer.value_logits_global_m[idx],
-            &mut optimizer.value_logits_global_v[idx],
-            gradient.value_logits_global[idx] * inv_batch,
+            &mut model.value_intermediate_global[idx],
+            &mut optimizer.value_intermediate_global_m[idx],
+            &mut optimizer.value_intermediate_global_v[idx],
+            gradient.value_intermediate_global[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.value_intermediate_bias.len() {
+        adamw_update(
+            &mut model.value_intermediate_bias[idx],
+            &mut optimizer.value_intermediate_bias_m[idx],
+            &mut optimizer.value_intermediate_bias_v[idx],
+            gradient.value_intermediate_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+    for idx in 0..model.value_logits_weights.len() {
+        adamw_update(
+            &mut model.value_logits_weights[idx],
+            &mut optimizer.value_logits_weights_m[idx],
+            &mut optimizer.value_logits_weights_v[idx],
+            gradient.value_logits_weights[idx] * inv_batch,
             lr,
             bias_correction1,
             bias_correction2,
@@ -1980,6 +2152,18 @@ fn apply_adamw_gradient(
             bias_correction1,
             bias_correction2,
             0.0,
+        );
+    }
+    for idx in 0..model.trunk_global_weights.len() {
+        adamw_update(
+            &mut model.trunk_global_weights[idx],
+            &mut optimizer.trunk_global_weights_m[idx],
+            &mut optimizer.trunk_global_weights_v[idx],
+            gradient.trunk_global_weights[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
         );
     }
 
@@ -2063,6 +2247,16 @@ fn scalar_value_from_logits(logits: &[f32]) -> (f32, Vec<f32>) {
     (probs[0] - probs[2], probs)
 }
 
+#[allow(dead_code)]
+fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
+    let v = value.clamp(-1.0, 1.0);
+    if v >= 0.0 {
+        [v, 1.0 - v, 0.0]
+    } else {
+        [0.0, 1.0 + v, -v]
+    }
+}
+
 fn variance_to_std(sum: f32, sq_sum: f32, count: usize) -> f32 {
     if count == 0 {
         return 0.0;
@@ -2141,6 +2335,114 @@ fn splitmix64(mut value: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
+const fn is_advisor_pos(rank: usize, file: usize) -> bool {
+    (rank == 7 && file == 3)
+        || (rank == 7 && file == 5)
+        || (rank == 8 && file == 4)
+        || (rank == 9 && file == 3)
+        || (rank == 9 && file == 5)
+}
+
+const fn is_elephant_pos(rank: usize, file: usize) -> bool {
+    (rank == 5 && file == 2)
+        || (rank == 5 && file == 6)
+        || (rank == 7 && file == 0)
+        || (rank == 7 && file == 4)
+        || (rank == 7 && file == 8)
+        || (rank == 9 && file == 2)
+        || (rank == 9 && file == 6)
+}
+
+const fn is_valid_policy_move(from: usize, to: usize) -> bool {
+    let from_file = from % BOARD_FILES;
+    let from_rank = from / BOARD_FILES;
+    let to_file = to % BOARD_FILES;
+    let to_rank = to / BOARD_FILES;
+
+    let df_signed = to_file as i32 - from_file as i32;
+    let dr_signed = to_rank as i32 - from_rank as i32;
+    let df = if df_signed < 0 { -df_signed } else { df_signed };
+    let dr = if dr_signed < 0 { -dr_signed } else { dr_signed };
+
+    if df == 0 || dr == 0 {
+        return true;
+    }
+    if (df == 1 && dr == 2) || (df == 2 && dr == 1) {
+        return true;
+    }
+    if df == 1 && dr == 1 && is_advisor_pos(from_rank, from_file) && is_advisor_pos(to_rank, to_file)
+    {
+        return true;
+    }
+    if df == 2
+        && dr == 2
+        && is_elephant_pos(from_rank, from_file)
+        && is_elephant_pos(to_rank, to_file)
+    {
+        return true;
+    }
+    false
+}
+
+const fn compute_dense_move_count() -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while from < BOARD_SIZE {
+        let mut to = 0;
+        while to < BOARD_SIZE {
+            if from != to && is_valid_policy_move(from, to) {
+                count += 1;
+            }
+            to += 1;
+        }
+        from += 1;
+    }
+    count
+}
+
+struct MoveMap {
+    sparse_to_dense: [u16; SPARSE_MOVE_SPACE],
+    #[allow(dead_code)]
+    dense_to_sparse: [u16; DENSE_MOVE_SPACE],
+}
+
+fn move_map() -> &'static MoveMap {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<MoveMap> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut sparse_to_dense = [u16::MAX; SPARSE_MOVE_SPACE];
+        let mut dense_to_sparse = [0u16; DENSE_MOVE_SPACE];
+        let mut idx = 0usize;
+        for from in 0..BOARD_SIZE {
+            for to in 0..BOARD_SIZE {
+                if from != to && is_valid_policy_move(from, to) {
+                    let sparse = from * BOARD_SIZE + to;
+                    sparse_to_dense[sparse] = idx as u16;
+                    dense_to_sparse[idx] = sparse as u16;
+                    idx += 1;
+                }
+            }
+        }
+        assert_eq!(idx, DENSE_MOVE_SPACE);
+        MoveMap {
+            sparse_to_dense,
+            dense_to_sparse,
+        }
+    })
+}
+
+fn dense_move_index(mv: Move) -> usize {
+    let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
+    let dense = move_map().sparse_to_dense[sparse];
+    debug_assert!(
+        dense != u16::MAX,
+        "invalid policy move {}->{}",
+        mv.from,
+        mv.to
+    );
+    dense as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2153,6 +2455,16 @@ mod tests {
         );
         assert_eq!(considered_visit_sequence(1, 5), vec![0, 1, 2, 3, 4]);
         assert_eq!(considered_visit_sequence(0, 5), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn dense_move_space_matches_enumeration() {
+        let map = move_map();
+        assert_eq!(DENSE_MOVE_SPACE, 2062);
+        for i in 0..DENSE_MOVE_SPACE {
+            let sparse = map.dense_to_sparse[i] as usize;
+            assert_eq!(map.sparse_to_dense[sparse], i as u16);
+        }
     }
 
     #[test]
@@ -2268,11 +2580,11 @@ mod tests {
         ];
 
         let mut rng = SplitMix64::new(17);
-        let before = train_samples(&mut model, &samples, 1, 0.003, 4, 1, &mut rng).value_mse;
-        let after = train_samples(&mut model, &samples, 300, 0.003, 4, 1, &mut rng).value_mse;
+        let before = train_samples(&mut model, &samples, 1, 0.003, 4, 1, &mut rng).value_loss;
+        let after = train_samples(&mut model, &samples, 300, 0.003, 4, 1, &mut rng).value_loss;
 
-        assert!(after < before * 0.2, "before={before} after={after}");
-        assert!(after < 0.05, "after={after}");
+        assert!(after < before * 0.5, "before={before} after={after}");
+        assert!(after < 0.35, "after={after}");
     }
 
     #[test]
@@ -2332,7 +2644,7 @@ mod tests {
             train_samples(&mut parallel, &samples, 5, 0.003, 4, 4, &mut rng_parallel);
 
         assert!((single_stats.loss - parallel_stats.loss).abs() < 1e-5);
-        assert!((single_stats.value_mse - parallel_stats.value_mse).abs() < 1e-5);
+        assert!((single_stats.value_loss - parallel_stats.value_loss).abs() < 1e-5);
         assert!((single_stats.value_pred_sum - parallel_stats.value_pred_sum).abs() < 1e-4);
         assert!((single_stats.value_target_sum - parallel_stats.value_target_sum).abs() < 1e-6);
         assert!(single
