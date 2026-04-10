@@ -45,9 +45,9 @@ fn main() {
             println!("output   : {output}");
         }
         Some("az-gumbel") => {
-            let model_path = args
-                .next()
-                .unwrap_or_else(|| panic!("usage: az-gumbel <model> [simulations] [top_k] [fen]"));
+            let model_path = args.next().unwrap_or_else(|| {
+                panic!("usage: az-gumbel <model> [simulations] [top_k] [gumbel_scale] [fen]")
+            });
             let simulations = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -56,6 +56,11 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(32);
+            let gumbel_scale = args
+                .next()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .max(0.0);
             let fen = args.collect::<Vec<_>>().join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load_text(&model_path).unwrap_or_else(|err| {
@@ -68,7 +73,7 @@ fn main() {
                     simulations,
                     top_k,
                     seed: 0,
-                    gumbel_scale: 1.0,
+                    gumbel_scale,
                     workers: 1,
                 },
             );
@@ -76,6 +81,7 @@ fn main() {
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
             println!("top_k    : {top_k}");
+            println!("gumbel   : {gumbel_scale}");
             println!("value_cp : {}", result.value_cp);
             println!(
                 "bestmove : {}",
@@ -84,12 +90,119 @@ fn main() {
                     .map(|mv| mv.to_string())
                     .unwrap_or_else(|| "(none)".into())
             );
+            println!(
+                "visited_actions: {}",
+                result
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.visits > 0)
+                    .count()
+            );
+            println!("by_policy:");
             for candidate in result.candidates.iter().take(top_k) {
                 println!(
                     "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
                     candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
                 );
             }
+            println!("by_visits:");
+            let mut by_visits = result.candidates.clone();
+            by_visits.sort_by(|left, right| {
+                right
+                    .visits
+                    .cmp(&left.visits)
+                    .then_with(|| right.policy.total_cmp(&left.policy))
+                    .then_with(|| right.q.total_cmp(&left.q))
+            });
+            for candidate in by_visits.iter().take(top_k) {
+                println!(
+                    "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
+                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
+                );
+            }
+        }
+        Some("az-bench") => {
+            let model_path = args.next().unwrap_or_else(|| {
+                panic!(
+                    "usage: az-bench <model> [simulations] [top_k] [repeat] [gumbel_scale] [fen]"
+                )
+            });
+            let simulations = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(512);
+            let top_k = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(32);
+            let repeat = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100)
+                .max(1);
+            let gumbel_scale = args
+                .next()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .max(0.0);
+            let fen = args.collect::<Vec<_>>().join(" ");
+            let position = parse_position(&fen);
+            let model = AzNnue::load_text(&model_path).unwrap_or_else(|err| {
+                panic!("failed to load `{model_path}`: {err}");
+            });
+
+            let _ = gumbel_search(
+                &position,
+                &model,
+                AzSearchLimits {
+                    simulations,
+                    top_k,
+                    seed: 0,
+                    gumbel_scale,
+                    workers: 1,
+                },
+            );
+
+            let started = std::time::Instant::now();
+            let mut total_sims = 0usize;
+            let mut best_move = None;
+            for iteration in 0..repeat {
+                let result = gumbel_search(
+                    &position,
+                    &model,
+                    AzSearchLimits {
+                        simulations,
+                        top_k,
+                        seed: iteration as u64,
+                        gumbel_scale,
+                        workers: 1,
+                    },
+                );
+                total_sims += result.simulations;
+                best_move = result.best_move;
+            }
+            let elapsed = started.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
+            println!("bench        : fixed-search");
+            println!("model        : {model_path}");
+            println!("fen          : {}", position.to_fen());
+            println!("sims/search  : {simulations}");
+            println!("top_k        : {top_k}");
+            println!("repeat       : {repeat}");
+            println!("gumbel       : {gumbel_scale}");
+            println!("total_sims   : {total_sims}");
+            println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
+            println!(
+                "ms/search    : {:.3}",
+                elapsed.as_secs_f64() * 1000.0 / repeat as f64
+            );
+            println!("sims/sec     : {:.0}", total_sims as f64 / elapsed_secs);
+            println!(
+                "last_bestmove: {}",
+                best_move
+                    .map(|mv| mv.to_string())
+                    .unwrap_or_else(|| "(none)".into())
+            );
         }
         Some("az-loop") => {
             let config_path = args.next().unwrap_or_else(|| DEFAULT_AZ_LOOP_CONFIG.into());
@@ -121,7 +234,7 @@ fn main() {
                 (config.replay_games > 0).then(|| AzExperiencePool::new(config.replay_games));
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={}",
+                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={}",
                 config_path,
                 config.iterations,
                 config.games,
@@ -129,6 +242,7 @@ fn main() {
                 config.top_k,
                 config.epochs,
                 config.lr,
+                config.batch_size,
                 config.max_plies,
                 config.workers,
                 config.temperature_start,
@@ -152,6 +266,7 @@ fn main() {
                         top_k: config.top_k,
                         epochs: config.epochs,
                         lr: config.lr,
+                        batch_size: config.batch_size,
                         seed: config.seed ^ iteration as u64,
                         workers: config.workers,
                         temperature_start: config.temperature_start,
@@ -209,7 +324,8 @@ fn print_help() {
     println!("moves : {}", position.legal_moves().len());
     println!("hint  : cargo run --release -- az-init 128 chineseai.nnue.txt 20260409 2");
     println!("hint  : cargo run --release -- uci");
-    println!("hint  : cargo run --release -- az-gumbel chineseai.nnue.txt 10000 32 startpos");
+    println!("hint  : cargo run --release -- az-gumbel chineseai.nnue.txt 10000 32 0.0 startpos");
+    println!("hint  : cargo run --release -- az-bench chineseai.nnue.txt 512 32 100 0.0 startpos");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
 }
 
@@ -222,6 +338,7 @@ struct AzLoopFileConfig {
     top_k: usize,
     epochs: usize,
     lr: f32,
+    batch_size: usize,
     max_plies: usize,
     hidden_size: usize,
     trunk_depth: usize,
@@ -246,12 +363,13 @@ impl Default for AzLoopFileConfig {
             simulations: 512,
             top_k: 16,
             epochs: 2,
-            lr: 0.001,
+            lr: 0.0003,
+            batch_size: 256,
             max_plies: 300,
             hidden_size: 128,
             trunk_depth: 2,
             seed: 20260409,
-            workers: 96,
+            workers: 8,
             temperature_start: 1.0,
             temperature_end: 0.2,
             temperature_decay_plies: 40,
@@ -280,6 +398,11 @@ impl AzLoopFileConfig {
 #   replay_samples=0 trains on about the same number of positions as newly generated this iteration.
 #   set replay_samples larger, e.g. 200000, to train more from the pool per iteration.
 #
+# Optimizer:
+#   AdamW is used with mini-batch gradient accumulation.
+#   batch_size=256 is the default; lower it if memory is tight, raise it if loss is noisy.
+#   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
+#
 # Augmentation:
 #   mirror_probability mirrors board files a<->i for this fraction of training samples.
 #   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
@@ -291,6 +414,7 @@ simulations = {simulations}
 top_k = {top_k}
 epochs = {epochs}
 lr = {lr}
+batch_size = {batch_size}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
 trunk_depth = {trunk_depth}
@@ -312,6 +436,7 @@ mirror_probability = {mirror_probability}
             top_k = self.top_k,
             epochs = self.epochs,
             lr = self.lr,
+            batch_size = self.batch_size,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
             trunk_depth = self.trunk_depth,
@@ -352,6 +477,7 @@ mirror_probability = {mirror_probability}
             "top_k" => self.top_k = parse_config_value(value, self.top_k),
             "epochs" => self.epochs = parse_config_value(value, self.epochs),
             "lr" => self.lr = parse_config_value(value, self.lr),
+            "batch_size" => self.batch_size = parse_config_value(value, self.batch_size),
             "max_plies" => self.max_plies = parse_config_value(value, self.max_plies),
             "hidden_size" => self.hidden_size = parse_config_value(value, self.hidden_size),
             "trunk_depth" => self.trunk_depth = parse_config_value(value, self.trunk_depth),
@@ -386,6 +512,7 @@ mirror_probability = {mirror_probability}
         self.simulations = self.simulations.max(1);
         self.top_k = self.top_k.max(1);
         self.epochs = self.epochs.max(1);
+        self.batch_size = self.batch_size.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
@@ -428,6 +555,8 @@ struct UciState {
     top_k: usize,
     threads: usize,
     gumbel_scale: f32,
+    policy_debug: bool,
+    policy_debug_limit: usize,
     seed: u64,
 }
 
@@ -442,6 +571,8 @@ impl Default for UciState {
             top_k: 32,
             threads: 1,
             gumbel_scale: 0.0,
+            policy_debug: false,
+            policy_debug_limit: 16,
             seed: 20260409,
         }
     }
@@ -488,8 +619,10 @@ fn print_uci_id() {
     println!("option name EvalFile type string default chineseai.nnue.txt");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name TopK type spin default 32 min 1 max 256");
-    println!("option name Threads type spin default 1 min 1 max 1024");
+    println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name GumbelScale type string default 0.0");
+    println!("option name PolicyDebug type check default false");
+    println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
     uci_flush();
 }
@@ -534,10 +667,20 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.top_k = value.parse::<usize>().unwrap_or(state.top_k).max(1);
         }
         "threads" => {
-            state.threads = value.parse::<usize>().unwrap_or(state.threads).max(1);
+            let _ = value;
+            state.threads = 1;
         }
         "gumbelscale" => {
             state.gumbel_scale = value.parse::<f32>().unwrap_or(state.gumbel_scale).max(0.0);
+        }
+        "policydebug" => {
+            state.policy_debug = matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on");
+        }
+        "policydebuglimit" => {
+            state.policy_debug_limit = value
+                .parse::<usize>()
+                .unwrap_or(state.policy_debug_limit)
+                .clamp(1, 256);
         }
         _ => {}
     }
@@ -595,9 +738,9 @@ fn apply_uci_moves(position: &mut Position, history: &mut Vec<HistoryMove>, move
     }
 }
 
-fn handle_go(line: &str, state: &mut UciState) {
+fn handle_go(_line: &str, state: &mut UciState) {
     ensure_uci_model(state);
-    let simulations = go_simulations(line, state.simulations);
+    let simulations = state.simulations.max(1);
     let model = state.model.as_ref().expect("model was loaded");
     let started = std::time::Instant::now();
     let result = chineseai::az::gumbel_search_with_history(
@@ -609,10 +752,13 @@ fn handle_go(line: &str, state: &mut UciState) {
             top_k: state.top_k,
             seed: state.seed,
             gumbel_scale: state.gumbel_scale,
-            workers: state.threads,
+            workers: 1,
         },
     );
     state.seed = state.seed.wrapping_add(1);
+    if state.policy_debug {
+        print_policy_debug(&result, state.policy_debug_limit);
+    }
     println!(
         "info depth 1 nodes {} time {} score cp {} pv {}",
         result.simulations,
@@ -633,23 +779,35 @@ fn handle_go(line: &str, state: &mut UciState) {
     uci_flush();
 }
 
-fn go_simulations(line: &str, default_simulations: usize) -> usize {
-    let tokens = line.split_whitespace().collect::<Vec<_>>();
-    if let Some(nodes_index) = tokens.iter().position(|token| *token == "nodes") {
-        return tokens
-            .get(nodes_index + 1)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(default_simulations)
-            .max(1);
+fn print_policy_debug(result: &chineseai::az::AzSearchResult, limit: usize) {
+    let visited_actions = result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.visits > 0)
+        .count();
+    println!("info string policy_debug visited_actions {visited_actions}");
+    println!("info string policy_debug columns move visits q raw_policy searched_policy");
+    for candidate in result.candidates.iter().take(limit) {
+        println!(
+            "info string policy_debug {} {} {:.4} {:.6} {:.6}",
+            candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
+        );
     }
-    if let Some(movetime_index) = tokens.iter().position(|token| *token == "movetime") {
-        let movetime = tokens
-            .get(movetime_index + 1)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1000);
-        return default_simulations.max((movetime * 64).max(1));
+    println!("info string policy_debug_by_visits columns move visits q raw_policy searched_policy");
+    let mut by_visits = result.candidates.clone();
+    by_visits.sort_by(|left, right| {
+        right
+            .visits
+            .cmp(&left.visits)
+            .then_with(|| right.policy.total_cmp(&left.policy))
+            .then_with(|| right.q.total_cmp(&left.q))
+    });
+    for candidate in by_visits.iter().take(limit) {
+        println!(
+            "info string policy_debug_by_visits {} {} {:.4} {:.6} {:.6}",
+            candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
+        );
     }
-    default_simulations.max(1)
 }
 
 fn uci_flush() {

@@ -6,18 +6,25 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::nnue::{
-    HistoryMove, V3_INPUT_SIZE, extract_sparse_features_v3, mirror_file_move,
+    HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, mirror_file_move,
     mirror_sparse_features_file, orient_move,
 };
 use crate::xiangqi::{BOARD_SIZE, Color, Move, Position};
 
-pub const AZNNUE_FORMAT: &str = "aznnue-v5";
+pub const AZNNUE_FORMAT: &str = "aznnue-v11";
 const MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
+const GLOBAL_CONTEXT_SIZE: usize = 8;
+const VALUE_LOGITS: usize = 3;
 const VALUE_SCALE_CP: f32 = 800.0;
 const COMPLETED_Q_VALUE_SCALE: f32 = 0.1;
 const COMPLETED_Q_MAXVISIT_INIT: f32 = 50.0;
+const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
+const ADAMW_BETA1: f32 = 0.9;
+const ADAMW_BETA2: f32 = 0.999;
+const ADAMW_EPSILON: f32 = 1e-8;
+const ADAMW_WEIGHT_DECAY: f32 = 1e-4;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
     pub trunk_depth: usize,
@@ -25,10 +32,37 @@ pub struct AzNnue {
     pub hidden_bias: Vec<f32>,
     pub trunk_weights: Vec<f32>,
     pub trunk_biases: Vec<f32>,
-    pub value_hidden: Vec<f32>,
-    pub value_bias: f32,
+    pub global_hidden: Vec<f32>,
+    pub global_bias: Vec<f32>,
+    pub value_logits_hidden: Vec<f32>,
+    pub value_logits_global: Vec<f32>,
+    pub value_logits_bias: Vec<f32>,
     pub policy_move_hidden: Vec<f32>,
+    pub policy_move_global: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
+    optimizer: Option<Box<AdamWState>>,
+}
+
+impl Clone for AzNnue {
+    fn clone(&self) -> Self {
+        Self {
+            hidden_size: self.hidden_size,
+            trunk_depth: self.trunk_depth,
+            input_hidden: self.input_hidden.clone(),
+            hidden_bias: self.hidden_bias.clone(),
+            trunk_weights: self.trunk_weights.clone(),
+            trunk_biases: self.trunk_biases.clone(),
+            global_hidden: self.global_hidden.clone(),
+            global_bias: self.global_bias.clone(),
+            value_logits_hidden: self.value_logits_hidden.clone(),
+            value_logits_global: self.value_logits_global.clone(),
+            value_logits_bias: self.value_logits_bias.clone(),
+            policy_move_hidden: self.policy_move_hidden.clone(),
+            policy_move_global: self.policy_move_global.clone(),
+            policy_move_bias: self.policy_move_bias.clone(),
+            optimizer: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +111,7 @@ pub struct AzLoopConfig {
     pub top_k: usize,
     pub epochs: usize,
     pub lr: f32,
+    pub batch_size: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -111,6 +146,9 @@ struct AzTrainingSample {
     moves: Vec<Move>,
     policy: Vec<f32>,
     value: f32,
+    side_sign: f32,
+    reward: f32,
+    discount: f32,
     bootstrap_value: f32,
 }
 
@@ -120,6 +158,155 @@ struct AzTrainStats {
     value_mse: f32,
     policy_ce: f32,
     samples: usize,
+}
+
+#[derive(Debug)]
+struct AzGrad {
+    input_hidden: Vec<f32>,
+    hidden_bias: Vec<f32>,
+    trunk_weights: Vec<f32>,
+    trunk_biases: Vec<f32>,
+    global_hidden: Vec<f32>,
+    global_bias: Vec<f32>,
+    value_logits_hidden: Vec<f32>,
+    value_logits_global: Vec<f32>,
+    value_logits_bias: Vec<f32>,
+    policy_move_hidden: Vec<f32>,
+    policy_move_global: Vec<f32>,
+    policy_move_bias: Vec<f32>,
+}
+
+impl AzGrad {
+    fn new(model: &AzNnue) -> Self {
+        Self {
+            input_hidden: vec![0.0; model.input_hidden.len()],
+            hidden_bias: vec![0.0; model.hidden_bias.len()],
+            trunk_weights: vec![0.0; model.trunk_weights.len()],
+            trunk_biases: vec![0.0; model.trunk_biases.len()],
+            global_hidden: vec![0.0; model.global_hidden.len()],
+            global_bias: vec![0.0; model.global_bias.len()],
+            value_logits_hidden: vec![0.0; model.value_logits_hidden.len()],
+            value_logits_global: vec![0.0; model.value_logits_global.len()],
+            value_logits_bias: vec![0.0; model.value_logits_bias.len()],
+            policy_move_hidden: vec![0.0; model.policy_move_hidden.len()],
+            policy_move_global: vec![0.0; model.policy_move_global.len()],
+            policy_move_bias: vec![0.0; model.policy_move_bias.len()],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.input_hidden.fill(0.0);
+        self.hidden_bias.fill(0.0);
+        self.trunk_weights.fill(0.0);
+        self.trunk_biases.fill(0.0);
+        self.global_hidden.fill(0.0);
+        self.global_bias.fill(0.0);
+        self.value_logits_hidden.fill(0.0);
+        self.value_logits_global.fill(0.0);
+        self.value_logits_bias.fill(0.0);
+        self.policy_move_hidden.fill(0.0);
+        self.policy_move_global.fill(0.0);
+        self.policy_move_bias.fill(0.0);
+    }
+}
+
+#[derive(Debug)]
+struct AdamWState {
+    step: u64,
+    beta1_power: f32,
+    beta2_power: f32,
+    input_hidden_m: Vec<f32>,
+    input_hidden_v: Vec<f32>,
+    hidden_bias_m: Vec<f32>,
+    hidden_bias_v: Vec<f32>,
+    trunk_weights_m: Vec<f32>,
+    trunk_weights_v: Vec<f32>,
+    trunk_biases_m: Vec<f32>,
+    trunk_biases_v: Vec<f32>,
+    global_hidden_m: Vec<f32>,
+    global_hidden_v: Vec<f32>,
+    global_bias_m: Vec<f32>,
+    global_bias_v: Vec<f32>,
+    value_logits_hidden_m: Vec<f32>,
+    value_logits_hidden_v: Vec<f32>,
+    value_logits_global_m: Vec<f32>,
+    value_logits_global_v: Vec<f32>,
+    value_logits_bias_m: Vec<f32>,
+    value_logits_bias_v: Vec<f32>,
+    policy_move_hidden_m: Vec<f32>,
+    policy_move_hidden_v: Vec<f32>,
+    policy_move_global_m: Vec<f32>,
+    policy_move_global_v: Vec<f32>,
+    policy_move_bias_m: Vec<f32>,
+    policy_move_bias_v: Vec<f32>,
+}
+
+impl AdamWState {
+    fn new(model: &AzNnue) -> Self {
+        Self {
+            step: 0,
+            beta1_power: 1.0,
+            beta2_power: 1.0,
+            input_hidden_m: vec![0.0; model.input_hidden.len()],
+            input_hidden_v: vec![0.0; model.input_hidden.len()],
+            hidden_bias_m: vec![0.0; model.hidden_bias.len()],
+            hidden_bias_v: vec![0.0; model.hidden_bias.len()],
+            trunk_weights_m: vec![0.0; model.trunk_weights.len()],
+            trunk_weights_v: vec![0.0; model.trunk_weights.len()],
+            trunk_biases_m: vec![0.0; model.trunk_biases.len()],
+            trunk_biases_v: vec![0.0; model.trunk_biases.len()],
+            global_hidden_m: vec![0.0; model.global_hidden.len()],
+            global_hidden_v: vec![0.0; model.global_hidden.len()],
+            global_bias_m: vec![0.0; model.global_bias.len()],
+            global_bias_v: vec![0.0; model.global_bias.len()],
+            value_logits_hidden_m: vec![0.0; model.value_logits_hidden.len()],
+            value_logits_hidden_v: vec![0.0; model.value_logits_hidden.len()],
+            value_logits_global_m: vec![0.0; model.value_logits_global.len()],
+            value_logits_global_v: vec![0.0; model.value_logits_global.len()],
+            value_logits_bias_m: vec![0.0; model.value_logits_bias.len()],
+            value_logits_bias_v: vec![0.0; model.value_logits_bias.len()],
+            policy_move_hidden_m: vec![0.0; model.policy_move_hidden.len()],
+            policy_move_hidden_v: vec![0.0; model.policy_move_hidden.len()],
+            policy_move_global_m: vec![0.0; model.policy_move_global.len()],
+            policy_move_global_v: vec![0.0; model.policy_move_global.len()],
+            policy_move_bias_m: vec![0.0; model.policy_move_bias.len()],
+            policy_move_bias_v: vec![0.0; model.policy_move_bias.len()],
+        }
+    }
+
+    fn matches(&self, model: &AzNnue) -> bool {
+        self.input_hidden_m.len() == model.input_hidden.len()
+            && self.input_hidden_v.len() == model.input_hidden.len()
+            && self.hidden_bias_m.len() == model.hidden_bias.len()
+            && self.hidden_bias_v.len() == model.hidden_bias.len()
+            && self.trunk_weights_m.len() == model.trunk_weights.len()
+            && self.trunk_weights_v.len() == model.trunk_weights.len()
+            && self.trunk_biases_m.len() == model.trunk_biases.len()
+            && self.trunk_biases_v.len() == model.trunk_biases.len()
+            && self.global_hidden_m.len() == model.global_hidden.len()
+            && self.global_hidden_v.len() == model.global_hidden.len()
+            && self.global_bias_m.len() == model.global_bias.len()
+            && self.global_bias_v.len() == model.global_bias.len()
+            && self.value_logits_hidden_m.len() == model.value_logits_hidden.len()
+            && self.value_logits_hidden_v.len() == model.value_logits_hidden.len()
+            && self.value_logits_global_m.len() == model.value_logits_global.len()
+            && self.value_logits_global_v.len() == model.value_logits_global.len()
+            && self.value_logits_bias_m.len() == model.value_logits_bias.len()
+            && self.value_logits_bias_v.len() == model.value_logits_bias.len()
+            && self.policy_move_hidden_m.len() == model.policy_move_hidden.len()
+            && self.policy_move_hidden_v.len() == model.policy_move_hidden.len()
+            && self.policy_move_global_m.len() == model.policy_move_global.len()
+            && self.policy_move_global_v.len() == model.policy_move_global.len()
+            && self.policy_move_bias_m.len() == model.policy_move_bias.len()
+            && self.policy_move_bias_v.len() == model.policy_move_bias.len()
+    }
+
+    fn advance(&mut self) -> (f32, f32) {
+        self.step += 1;
+        self.beta1_power *= ADAMW_BETA1;
+        self.beta2_power *= ADAMW_BETA2;
+        (1.0 - self.beta1_power, 1.0 - self.beta2_power)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,7 +383,7 @@ impl AzNnue {
 
     pub fn random_with_depth(hidden_size: usize, trunk_depth: usize, seed: u64) -> Self {
         let mut rng = SplitMix64::new(seed);
-        let input_hidden = (0..V3_INPUT_SIZE * hidden_size)
+        let input_hidden = (0..V4_INPUT_SIZE * hidden_size)
             .map(|_| rng.weight(0.015))
             .collect();
         let hidden_bias = vec![0.0; hidden_size];
@@ -204,8 +391,21 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
         let trunk_biases = vec![0.0; trunk_depth * hidden_size];
-        let value_hidden = (0..hidden_size).map(|_| rng.weight(0.05)).collect();
+        let global_hidden = (0..GLOBAL_CONTEXT_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
+            .collect();
+        let global_bias = vec![0.0; GLOBAL_CONTEXT_SIZE];
+        let value_logits_hidden = (0..VALUE_LOGITS * hidden_size)
+            .map(|_| rng.weight(0.05))
+            .collect();
+        let value_logits_global = (0..VALUE_LOGITS * GLOBAL_CONTEXT_SIZE)
+            .map(|_| rng.weight(0.05))
+            .collect();
+        let value_logits_bias = vec![0.0; VALUE_LOGITS];
         let policy_move_hidden = (0..MOVE_SPACE * hidden_size)
+            .map(|_| rng.weight(0.01))
+            .collect();
+        let policy_move_global = (0..MOVE_SPACE * GLOBAL_CONTEXT_SIZE)
             .map(|_| rng.weight(0.01))
             .collect();
         let policy_move_bias = vec![0.0; MOVE_SPACE];
@@ -216,25 +416,34 @@ impl AzNnue {
             hidden_bias,
             trunk_weights,
             trunk_biases,
-            value_hidden,
-            value_bias: 0.0,
+            global_hidden,
+            global_bias,
+            value_logits_hidden,
+            value_logits_global,
+            value_logits_bias,
             policy_move_hidden,
+            policy_move_global,
             policy_move_bias,
+            optimizer: None,
         }
     }
 
     pub fn save_text(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let text = format!(
-            "format: {AZNNUE_FORMAT}\ninput_size: {V3_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\nvalue_hidden: {}\nvalue_bias: {}\npolicy_move_hidden: {}\npolicy_move_bias: {}\n",
+            "format: {AZNNUE_FORMAT}\ninput_size: {V4_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\nglobal_hidden: {}\nglobal_bias: {}\nvalue_logits_hidden: {}\nvalue_logits_global: {}\nvalue_logits_bias: {}\npolicy_move_hidden: {}\npolicy_move_global: {}\npolicy_move_bias: {}\n",
             self.hidden_size,
             self.trunk_depth,
             format_floats(&self.input_hidden),
             format_floats(&self.hidden_bias),
             format_floats(&self.trunk_weights),
             format_floats(&self.trunk_biases),
-            format_floats(&self.value_hidden),
-            self.value_bias,
+            format_floats(&self.global_hidden),
+            format_floats(&self.global_bias),
+            format_floats(&self.value_logits_hidden),
+            format_floats(&self.value_logits_global),
+            format_floats(&self.value_logits_bias),
             format_floats(&self.policy_move_hidden),
+            format_floats(&self.policy_move_global),
             format_floats(&self.policy_move_bias),
         );
         fs::write(path, text)
@@ -250,9 +459,13 @@ impl AzNnue {
         let mut hidden_bias = None;
         let mut trunk_weights = None;
         let mut trunk_biases = None;
-        let mut value_hidden = None;
-        let mut value_bias = None;
+        let mut global_hidden = None;
+        let mut global_bias = None;
+        let mut value_logits_hidden = None;
+        let mut value_logits_global = None;
+        let mut value_logits_bias = None;
         let mut policy_move_hidden = None;
+        let mut policy_move_global = None;
         let mut policy_move_bias = None;
 
         for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -269,9 +482,13 @@ impl AzNnue {
                 "hidden_bias" => hidden_bias = Some(parse_floats(value)?),
                 "trunk_weights" => trunk_weights = Some(parse_floats(value)?),
                 "trunk_biases" => trunk_biases = Some(parse_floats(value)?),
-                "value_hidden" => value_hidden = Some(parse_floats(value)?),
-                "value_bias" => value_bias = value.parse::<f32>().ok(),
+                "global_hidden" => global_hidden = Some(parse_floats(value)?),
+                "global_bias" => global_bias = Some(parse_floats(value)?),
+                "value_logits_hidden" => value_logits_hidden = Some(parse_floats(value)?),
+                "value_logits_global" => value_logits_global = Some(parse_floats(value)?),
+                "value_logits_bias" => value_logits_bias = Some(parse_floats(value)?),
                 "policy_move_hidden" => policy_move_hidden = Some(parse_floats(value)?),
+                "policy_move_global" => policy_move_global = Some(parse_floats(value)?),
                 "policy_move_bias" => policy_move_bias = Some(parse_floats(value)?),
                 _ => {}
             }
@@ -283,10 +500,10 @@ impl AzNnue {
                 format!("{AZNNUE_FORMAT} model format required"),
             ));
         }
-        if input_size != Some(V3_INPUT_SIZE) {
+        if input_size != Some(V4_INPUT_SIZE) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{AZNNUE_FORMAT} requires fixed relative-view v3 input_size"),
+                format!("{AZNNUE_FORMAT} requires fixed relative-view v4 input_size"),
             ));
         }
         let hidden_size = hidden_size
@@ -307,17 +524,30 @@ impl AzNnue {
             trunk_biases: trunk_biases.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing trunk_biases")
             })?,
-            value_hidden: value_hidden.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_hidden")
+            global_hidden: global_hidden.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing global_hidden")
             })?,
-            value_bias: value_bias
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing value_bias"))?,
+            global_bias: global_bias
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing global_bias"))?,
+            value_logits_hidden: value_logits_hidden.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_hidden")
+            })?,
+            value_logits_global: value_logits_global.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_global")
+            })?,
+            value_logits_bias: value_logits_bias.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_bias")
+            })?,
             policy_move_hidden: policy_move_hidden.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing policy_move_hidden")
+            })?,
+            policy_move_global: policy_move_global.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing policy_move_global")
             })?,
             policy_move_bias: policy_move_bias.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing policy_move_bias")
             })?,
+            optimizer: None,
         };
         model.validate()?;
         Ok(model)
@@ -330,22 +560,28 @@ impl AzNnue {
         moves: &[Move],
     ) -> (f32, Vec<f32>) {
         let hidden = self.embedding(position, history);
-        let value = self.value_from_hidden(&hidden);
+        let global = self.global_from_hidden(&hidden);
+        let value = self.value_from_hidden(&hidden, &global);
         let side = position.side_to_move();
         let logits = moves
             .iter()
-            .map(|mv| self.policy_logit_from_hidden(&hidden, orient_move(side, *mv)))
+            .map(|mv| self.policy_logit_from_hidden(&hidden, &global, orient_move(side, *mv)))
             .collect();
         (value, logits)
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.input_hidden.len() != V3_INPUT_SIZE * self.hidden_size
+        if self.input_hidden.len() != V4_INPUT_SIZE * self.hidden_size
             || self.hidden_bias.len() != self.hidden_size
             || self.trunk_weights.len() != self.trunk_depth * self.hidden_size * self.hidden_size
             || self.trunk_biases.len() != self.trunk_depth * self.hidden_size
-            || self.value_hidden.len() != self.hidden_size
+            || self.global_hidden.len() != GLOBAL_CONTEXT_SIZE * self.hidden_size
+            || self.global_bias.len() != GLOBAL_CONTEXT_SIZE
+            || self.value_logits_hidden.len() != VALUE_LOGITS * self.hidden_size
+            || self.value_logits_global.len() != VALUE_LOGITS * GLOBAL_CONTEXT_SIZE
+            || self.value_logits_bias.len() != VALUE_LOGITS
             || self.policy_move_hidden.len() != MOVE_SPACE * self.hidden_size
+            || self.policy_move_global.len() != MOVE_SPACE * GLOBAL_CONTEXT_SIZE
             || self.policy_move_bias.len() != MOVE_SPACE
         {
             return Err(io::Error::new(
@@ -357,7 +593,7 @@ impl AzNnue {
     }
 
     fn embedding(&self, position: &Position, history: &[HistoryMove]) -> Vec<f32> {
-        self.embedding_from_features(&extract_sparse_features_v3(position, history))
+        self.embedding_from_features(&extract_sparse_features_v4(position, history))
     }
 
     fn embedding_from_features(&self, features: &[usize]) -> Vec<f32> {
@@ -387,28 +623,60 @@ impl AzNnue {
                 for idx in 0..self.hidden_size {
                     value += row[idx] * hidden[idx];
                 }
-                next[out] = value.max(0.0);
+                next[out] = hidden[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
             }
             std::mem::swap(&mut hidden, &mut next);
         }
         hidden
     }
 
-    fn value_from_hidden(&self, hidden: &[f32]) -> f32 {
-        let mut value = self.value_bias;
-        for (idx, hidden_value) in hidden.iter().enumerate() {
-            value += hidden_value * self.value_hidden[idx];
+    fn global_from_hidden(&self, hidden: &[f32]) -> Vec<f32> {
+        let mut global = self.global_bias.clone();
+        for out in 0..GLOBAL_CONTEXT_SIZE {
+            let row = &self.global_hidden[out * self.hidden_size..(out + 1) * self.hidden_size];
+            for idx in 0..self.hidden_size {
+                global[out] += hidden[idx] * row[idx];
+            }
+            global[out] = global[out].max(0.0);
         }
-        value.tanh()
+        global
     }
 
-    fn policy_logit_from_hidden(&self, hidden: &[f32], mv: Move) -> f32 {
+    fn value_logits_from_hidden(&self, hidden: &[f32], global: &[f32]) -> Vec<f32> {
+        let mut logits = self.value_logits_bias.clone();
+        for out in 0..VALUE_LOGITS {
+            let hidden_row =
+                &self.value_logits_hidden[out * self.hidden_size..(out + 1) * self.hidden_size];
+            for idx in 0..self.hidden_size {
+                logits[out] += hidden[idx] * hidden_row[idx];
+            }
+            let global_row = &self.value_logits_global
+                [out * GLOBAL_CONTEXT_SIZE..(out + 1) * GLOBAL_CONTEXT_SIZE];
+            for idx in 0..GLOBAL_CONTEXT_SIZE {
+                logits[out] += global[idx] * global_row[idx];
+            }
+        }
+        logits
+    }
+
+    fn value_from_hidden(&self, hidden: &[f32], global: &[f32]) -> f32 {
+        let logits = self.value_logits_from_hidden(hidden, global);
+        scalar_value_from_logits(&logits).0
+    }
+
+    fn policy_logit_from_hidden(&self, hidden: &[f32], global: &[f32], mv: Move) -> f32 {
         let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
-        let offset = move_index * self.hidden_size;
-        let row = &self.policy_move_hidden[offset..offset + self.hidden_size];
+        let hidden_offset = move_index * self.hidden_size;
+        let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
+        let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
+        let global_row =
+            &self.policy_move_global[global_offset..global_offset + GLOBAL_CONTEXT_SIZE];
         let mut logit = self.policy_move_bias[move_index];
         for (idx, hidden_value) in hidden.iter().enumerate() {
-            logit += hidden_value * row[idx];
+            logit += hidden_value * hidden_row[idx];
+        }
+        for (idx, global_value) in global.iter().enumerate() {
+            logit += global_value * global_row[idx];
         }
         logit
     }
@@ -441,7 +709,14 @@ pub fn selfplay_train_iteration_with_pool(
     } else {
         (data.samples.clone(), 0, 0)
     };
-    let stats = train_samples(model, &train_data, config.epochs, config.lr, &mut rng);
+    let stats = train_samples(
+        model,
+        &train_data,
+        config.epochs,
+        config.lr,
+        config.batch_size,
+        &mut rng,
+    );
     AzLoopReport {
         games: config.games,
         samples: generated_samples,
@@ -524,6 +799,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 } else {
                     1.0
                 });
+                finalize_last_transition(&mut game_samples, result.unwrap_or(0.0));
                 break;
             }
 
@@ -556,10 +832,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
+                finalize_last_transition(&mut game_samples, -1.0);
                 break;
             }
             if !position.has_general(Color::Black) {
                 result = Some(1.0);
+                finalize_last_transition(&mut game_samples, 1.0);
                 break;
             }
         }
@@ -587,6 +865,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     }
 }
 
+fn finalize_last_transition(game_samples: &mut [AzTrainingSample], game_result: f32) {
+    let Some(last) = game_samples.last_mut() else {
+        return;
+    };
+    last.reward = game_result * last.side_sign;
+    last.discount = 0.0;
+}
+
 pub fn gumbel_search(
     position: &Position,
     model: &AzNnue,
@@ -601,9 +887,6 @@ pub fn gumbel_search_with_history(
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    if limits.workers > 1 && limits.simulations > 1 {
-        return gumbel_search_parallel(position, history, model, limits);
-    }
     let mut tree = AzTree::new(position.clone(), truncate_history(history), model);
     let root = tree.root;
     tree.expand(root);
@@ -616,32 +899,21 @@ pub fn gumbel_search_with_history(
         };
     }
 
-    let mut active = tree.gumbel_top_k(root, limits.top_k.max(1), limits.seed, limits.gumbel_scale);
+    let num_considered = limits.top_k.max(1).min(tree.nodes[root].children.len());
+    let considered_visits = considered_visit_sequence(num_considered, limits.simulations);
     let mut used = 0usize;
-    while active.len() > 1 && used < limits.simulations {
-        let rounds_left = active.len().ilog2().max(1) as usize;
-        let per_candidate = ((limits.simulations - used) / (active.len() * rounds_left)).max(1);
-        for &child_index in &active {
-            for _ in 0..per_candidate {
-                tree.simulate_child(root, child_index);
-                used += 1;
-                if used >= limits.simulations {
-                    break;
-                }
-            }
-        }
-        let scores = tree.gumbel_scores(root, limits.seed, limits.gumbel_scale);
-        active.sort_by(|left, right| scores[*right].total_cmp(&scores[*left]));
-        active.truncate(active.len().div_ceil(2));
-    }
-    while used < limits.simulations {
-        let child_index = active
-            .first()
-            .copied()
-            .unwrap_or_else(|| tree.select_child(root));
+    for considered_visit in considered_visits {
+        let child_index =
+            tree.select_root_child(root, limits.seed, limits.gumbel_scale, considered_visit);
         tree.simulate_child(root, child_index);
         used += 1;
     }
+
+    let searched_value = if tree.nodes[root].visits > 0 {
+        tree.nodes[root].value_sum / tree.nodes[root].visits as f32
+    } else {
+        tree.nodes[root].value
+    };
 
     let policy = tree.improved_policy(root);
     let mut candidates = tree.nodes[root]
@@ -663,126 +935,15 @@ pub fn gumbel_search_with_history(
             .then_with(|| right.visits.cmp(&left.visits))
             .then_with(|| right.q.total_cmp(&left.q))
     });
-    let best_move = candidates.first().map(|candidate| candidate.mv);
+    let best_move = tree
+        .select_root_action(root, limits.seed, limits.gumbel_scale)
+        .map(|child_index| tree.nodes[root].children[child_index].mv)
+        .or_else(|| candidates.first().map(|candidate| candidate.mv));
     AzSearchResult {
         best_move,
-        value_cp: (tree.nodes[root].value * VALUE_SCALE_CP) as i32,
+        value_cp: (searched_value * VALUE_SCALE_CP) as i32,
         simulations: used,
         candidates,
-    }
-}
-
-fn gumbel_search_parallel(
-    position: &Position,
-    history: &[HistoryMove],
-    model: &AzNnue,
-    limits: AzSearchLimits,
-) -> AzSearchResult {
-    let workers = limits.workers.max(1).min(limits.simulations.max(1));
-    if workers <= 1 {
-        return gumbel_search_with_history(
-            position,
-            history,
-            model,
-            AzSearchLimits {
-                workers: 1,
-                ..limits
-            },
-        );
-    }
-
-    let shared_model = Arc::new(model.clone());
-    let shared_history = Arc::new(truncate_history(history));
-    let mut handles = Vec::with_capacity(workers);
-    for worker in 0..workers {
-        let simulations =
-            limits.simulations / workers + usize::from(worker < limits.simulations % workers);
-        if simulations == 0 {
-            continue;
-        }
-        let worker_position = position.clone();
-        let worker_history = Arc::clone(&shared_history);
-        let worker_model = Arc::clone(&shared_model);
-        let worker_limits = AzSearchLimits {
-            simulations,
-            seed: limits.seed ^ (worker as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
-            workers: 1,
-            ..limits
-        };
-        handles.push(thread::spawn(move || {
-            gumbel_search_with_history(
-                &worker_position,
-                worker_history.as_slice(),
-                &worker_model,
-                worker_limits,
-            )
-        }));
-    }
-
-    let mut partials = Vec::new();
-    for handle in handles {
-        partials.push(handle.join().expect("search worker panicked"));
-    }
-    merge_search_results(partials)
-}
-
-fn merge_search_results(results: Vec<AzSearchResult>) -> AzSearchResult {
-    let mut merged = Vec::<AzCandidate>::new();
-    let mut simulations = 0usize;
-    let mut value_weight_sum = 0.0;
-    let mut value_visit_sum = 0.0;
-
-    for result in results {
-        simulations += result.simulations;
-        for candidate in result.candidates {
-            let visits = candidate.visits.max(1) as f32;
-            value_weight_sum += candidate.q * visits;
-            value_visit_sum += visits;
-            if let Some(existing) = merged
-                .iter_mut()
-                .find(|existing| existing.mv == candidate.mv)
-            {
-                let old_visits = existing.visits as f32;
-                let new_visits = candidate.visits as f32;
-                let total_visits = old_visits + new_visits;
-                if total_visits > 0.0 {
-                    existing.q =
-                        (existing.q * old_visits + candidate.q * new_visits) / total_visits;
-                }
-                existing.visits += candidate.visits;
-                existing.prior = existing.prior.max(candidate.prior);
-                existing.policy += candidate.policy;
-            } else {
-                merged.push(candidate);
-            }
-        }
-    }
-
-    let total_policy = merged
-        .iter()
-        .map(|candidate| candidate.policy.max(0.0))
-        .sum::<f32>()
-        .max(1e-9);
-    for candidate in &mut merged {
-        candidate.policy = candidate.policy.max(0.0) / total_policy;
-    }
-    merged.sort_by(|left, right| {
-        right
-            .policy
-            .total_cmp(&left.policy)
-            .then_with(|| right.visits.cmp(&left.visits))
-            .then_with(|| right.q.total_cmp(&left.q))
-    });
-    let best_move = merged.first().map(|candidate| candidate.mv);
-    AzSearchResult {
-        best_move,
-        value_cp: if value_visit_sum > 0.0 {
-            ((value_weight_sum / value_visit_sum) * VALUE_SCALE_CP) as i32
-        } else {
-            0
-        },
-        simulations,
-        candidates: merged,
     }
 }
 
@@ -948,40 +1109,61 @@ impl<'a> AzTree<'a> {
         best
     }
 
-    fn gumbel_top_k(
+    fn select_root_child(
         &self,
         node_index: usize,
-        top_k: usize,
         seed: u64,
         gumbel_scale: f32,
-    ) -> Vec<usize> {
-        let scores = self.gumbel_scores(node_index, seed, gumbel_scale);
-        let mut scored = scores
-            .into_iter()
-            .enumerate()
-            .map(|(index, score)| (score, index))
-            .collect::<Vec<_>>();
-        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
-        scored
-            .into_iter()
-            .take(top_k)
-            .map(|(_, index)| index)
-            .collect()
+        considered_visit: u32,
+    ) -> usize {
+        self.best_scored_child(node_index, seed, gumbel_scale, |child| {
+            child.visits == considered_visit
+        })
+        .unwrap_or_else(|| self.select_child(node_index))
     }
 
-    fn gumbel_scores(&self, node_index: usize, seed: u64, gumbel_scale: f32) -> Vec<f32> {
+    fn select_root_action(&self, node_index: usize, seed: u64, gumbel_scale: f32) -> Option<usize> {
+        let considered_visit = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.visits)
+            .max()?;
+        self.best_scored_child(node_index, seed, gumbel_scale, |child| {
+            child.visits == considered_visit
+        })
+    }
+
+    fn best_scored_child(
+        &self,
+        node_index: usize,
+        seed: u64,
+        gumbel_scale: f32,
+        mut is_considered: impl FnMut(&AzChild) -> bool,
+    ) -> Option<usize> {
         let completed_q = self.completed_qvalues(node_index);
         let hash = self.nodes[node_index].position.hash() ^ seed;
+        let max_prior_logit = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.prior_logit)
+            .fold(f32::NEG_INFINITY, f32::max);
         self.nodes[node_index]
             .children
             .iter()
             .enumerate()
+            .filter(|(_, child)| is_considered(child))
             .map(|(child_index, child)| {
-                child.prior_logit
+                let score = (child.prior_logit - max_prior_logit).max(-1e9)
                     + completed_q[child_index]
-                    + gumbel_scale * deterministic_gumbel(hash, child.mv, child_index as u64)
+                    + gumbel_scale * deterministic_gumbel(hash, child.mv, child_index as u64);
+                (score, child_index)
             })
-            .collect()
+            .max_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| right.1.cmp(&left.1))
+            })
+            .map(|(_, child_index)| child_index)
     }
 
     fn improved_policy(&self, node_index: usize) -> Vec<f32> {
@@ -1043,11 +1225,9 @@ impl<'a> AzTree<'a> {
 fn normalize_completed_q(qvalues: &mut [f32], total_visits: u32) {
     let min_value = qvalues.iter().copied().fold(f32::INFINITY, f32::min);
     let max_value = qvalues.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let range = max_value - min_value;
-    if range > 1e-6 {
-        for value in qvalues.iter_mut() {
-            *value = (*value - min_value) / range;
-        }
+    let denominator = (max_value - min_value).max(1e-8);
+    for value in qvalues.iter_mut() {
+        *value = (*value - min_value) / denominator;
     }
 
     let maxvisit_scale =
@@ -1055,6 +1235,38 @@ fn normalize_completed_q(qvalues: &mut [f32], total_visits: u32) {
     for value in qvalues.iter_mut() {
         *value *= maxvisit_scale;
     }
+}
+
+fn considered_visit_sequence(
+    max_num_considered_actions: usize,
+    num_simulations: usize,
+) -> Vec<u32> {
+    if max_num_considered_actions == 0 || num_simulations == 0 {
+        return Vec::new();
+    }
+    if max_num_considered_actions <= 1 {
+        return (0..num_simulations as u32).collect();
+    }
+
+    let log2max = (max_num_considered_actions as f32).log2().ceil() as usize;
+    let mut sequence = Vec::with_capacity(num_simulations);
+    let mut visits = vec![0u32; max_num_considered_actions];
+    let mut num_considered = max_num_considered_actions;
+    while sequence.len() < num_simulations {
+        let extra_visits = (num_simulations / (log2max * num_considered)).max(1);
+        for _ in 0..extra_visits {
+            sequence.extend_from_slice(&visits[..num_considered]);
+            for visit in &mut visits[..num_considered] {
+                *visit += 1;
+            }
+            if sequence.len() >= num_simulations {
+                break;
+            }
+        }
+        num_considered = (num_considered / 2).max(2);
+    }
+    sequence.truncate(num_simulations);
+    sequence
 }
 
 fn terminal_value(position: &Position) -> Option<f32> {
@@ -1088,7 +1300,7 @@ fn make_training_sample(
         .sum::<f32>()
         .max(1.0);
     let side = position.side_to_move();
-    let mut features = extract_sparse_features_v3(position, history);
+    let mut features = extract_sparse_features_v4(position, history);
     let mut moves = candidates
         .iter()
         .map(|candidate| orient_move(side, candidate.mv))
@@ -1106,26 +1318,37 @@ fn make_training_sample(
             .iter()
             .map(|candidate| candidate.policy.max(0.0) / total_policy)
             .collect(),
-        value: if position.side_to_move() == Color::Red {
+        value: 0.0,
+        side_sign: if position.side_to_move() == Color::Red {
             1.0
         } else {
             -1.0
         },
+        reward: 0.0,
+        discount: -1.0,
         bootstrap_value: (value_cp as f32 / VALUE_SCALE_CP).clamp(-1.0, 1.0),
     }
 }
 
 fn assign_lambda_targets(samples: &mut [AzTrainingSample], game_result: f32, td_lambda: f32) {
     let lambda = td_lambda.clamp(0.0, 1.0);
-    let mut next_return = None;
-    for sample in samples.iter_mut().rev() {
-        let terminal_target = game_result * sample.value;
-        let continuation = next_return
-            .map(|value: f32| -value)
-            .unwrap_or(terminal_target);
-        sample.value =
-            ((1.0 - lambda) * sample.bootstrap_value + lambda * continuation).clamp(-1.0, 1.0);
-        next_return = Some(sample.value);
+    if let Some(last) = samples.last_mut() {
+        if last.discount < 0.0 && game_result == 0.0 {
+            last.discount = 0.0;
+            last.reward = 0.0;
+        }
+    }
+
+    let mut carry = 0.0f32;
+    for index in (0..samples.len()).rev() {
+        let next_bootstrap = samples
+            .get(index + 1)
+            .map(|sample| sample.bootstrap_value)
+            .unwrap_or(0.0);
+        let blended = (1.0 - lambda) * next_bootstrap + lambda * carry;
+        let target = samples[index].reward + samples[index].discount * blended;
+        samples[index].value = target.clamp(-1.0, 1.0);
+        carry = samples[index].value;
     }
 }
 
@@ -1204,25 +1427,33 @@ fn train_samples(
     samples: &[AzTrainingSample],
     epochs: usize,
     lr: f32,
+    batch_size: usize,
     rng: &mut SplitMix64,
 ) -> AzTrainStats {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
         return AzTrainStats::default();
     }
 
+    let mut optimizer = match model.optimizer.take() {
+        Some(optimizer) if optimizer.matches(model) => optimizer,
+        _ => Box::new(AdamWState::new(model)),
+    };
+    let mut gradient = AzGrad::new(model);
     let mut order = (0..samples.len()).collect::<Vec<_>>();
     let mut stats = AzTrainStats::default();
+    let batch_size = batch_size.max(1);
     for _ in 0..epochs {
         shuffle(&mut order, rng);
         stats = AzTrainStats::default();
-        for &index in &order {
-            let sample_stats = train_one(model, &samples[index], lr);
-            stats.loss += sample_stats.loss;
-            stats.value_mse += sample_stats.value_mse;
-            stats.policy_ce += sample_stats.policy_ce;
-            stats.samples += 1;
+        for batch in order.chunks(batch_size) {
+            let batch_stats = train_batch(model, &mut optimizer, &mut gradient, samples, batch, lr);
+            stats.loss += batch_stats.loss;
+            stats.value_mse += batch_stats.value_mse;
+            stats.policy_ce += batch_stats.policy_ce;
+            stats.samples += batch_stats.samples;
         }
     }
+    model.optimizer = Some(optimizer);
     if stats.samples > 0 {
         let denom = stats.samples as f32;
         stats.loss /= denom;
@@ -1232,21 +1463,50 @@ fn train_samples(
     stats
 }
 
-fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainStats {
+fn train_batch(
+    model: &mut AzNnue,
+    optimizer: &mut AdamWState,
+    gradient: &mut AzGrad,
+    samples: &[AzTrainingSample],
+    batch: &[usize],
+    lr: f32,
+) -> AzTrainStats {
+    gradient.clear();
+    let mut stats = AzTrainStats::default();
+    for &index in batch {
+        let sample_stats = accumulate_one(model, gradient, &samples[index]);
+        stats.loss += sample_stats.loss;
+        stats.value_mse += sample_stats.value_mse;
+        stats.policy_ce += sample_stats.policy_ce;
+        stats.samples += 1;
+    }
+    if stats.samples > 0 {
+        apply_adamw_gradient(model, optimizer, gradient, lr, stats.samples as f32);
+    }
+    stats
+}
+
+fn accumulate_one(
+    model: &AzNnue,
+    gradient: &mut AzGrad,
+    sample: &AzTrainingSample,
+) -> AzTrainStats {
     let activations = train_forward_activations(model, &sample.features);
     let hidden = activations
         .last()
         .expect("at least input activation exists");
+    let global = model.global_from_hidden(hidden);
 
-    let value = model.value_from_hidden(&hidden);
+    let value_logits = model.value_logits_from_hidden(hidden, &global);
+    let (value, value_probs) = scalar_value_from_logits(&value_logits);
     let value_error = value - sample.value;
     let value_mse = value_error * value_error;
-    let value_grad = (2.0 * value_error * (1.0 - value * value)).clamp(-4.0, 4.0);
+    let value_grad_scale = 2.0 * value_error;
 
     let logits = sample
         .moves
         .iter()
-        .map(|mv| model.policy_logit_from_hidden(&hidden, *mv))
+        .map(|mv| model.policy_logit_from_hidden(hidden, &global, *mv))
         .collect::<Vec<_>>();
     let prediction = softmax(&logits);
     let policy_ce = prediction
@@ -1256,31 +1516,68 @@ fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainS
         .sum::<f32>();
 
     let mut activation_grad = vec![0.0; model.hidden_size];
-    for idx in 0..model.hidden_size {
-        activation_grad[idx] += value_grad * model.value_hidden[idx];
+    let mut global_grad = vec![0.0; GLOBAL_CONTEXT_SIZE];
+    for out in 0..VALUE_LOGITS {
+        let target_sign = match out {
+            0 => 1.0,
+            1 => 0.0,
+            _ => -1.0,
+        };
+        let logit_grad =
+            (value_grad_scale * value_probs[out] * (target_sign - value)).clamp(-4.0, 4.0);
+        let hidden_offset = out * model.hidden_size;
+        for idx in 0..model.hidden_size {
+            activation_grad[idx] += logit_grad * model.value_logits_hidden[hidden_offset + idx];
+            gradient.value_logits_hidden[hidden_offset + idx] += logit_grad * hidden[idx];
+        }
+        let global_offset = out * GLOBAL_CONTEXT_SIZE;
+        for idx in 0..GLOBAL_CONTEXT_SIZE {
+            global_grad[idx] += logit_grad * model.value_logits_global[global_offset + idx];
+            gradient.value_logits_global[global_offset + idx] += logit_grad * global[idx];
+        }
+        gradient.value_logits_bias[out] += logit_grad;
     }
     for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
         let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
         let policy_grad = (predicted - target).clamp(-4.0, 4.0);
-        let offset = move_index * model.hidden_size;
+        let hidden_offset = move_index * model.hidden_size;
         for idx in 0..model.hidden_size {
-            activation_grad[idx] += policy_grad * model.policy_move_hidden[offset + idx];
+            activation_grad[idx] += policy_grad * model.policy_move_hidden[hidden_offset + idx];
+        }
+        let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
+        for idx in 0..GLOBAL_CONTEXT_SIZE {
+            global_grad[idx] += policy_grad * model.policy_move_global[global_offset + idx];
         }
     }
-
-    for idx in 0..model.hidden_size {
-        model.value_hidden[idx] -= lr * value_grad * hidden[idx];
-    }
-    model.value_bias -= lr * value_grad;
 
     for ((mv, predicted), target) in sample.moves.iter().zip(&prediction).zip(&sample.policy) {
         let move_index = mv.from as usize * BOARD_SIZE + mv.to as usize;
         let policy_grad = (predicted - target).clamp(-4.0, 4.0);
-        let offset = move_index * model.hidden_size;
+        let hidden_offset = move_index * model.hidden_size;
         for idx in 0..model.hidden_size {
-            model.policy_move_hidden[offset + idx] -= lr * policy_grad * hidden[idx];
+            let weight_index = hidden_offset + idx;
+            gradient.policy_move_hidden[weight_index] += policy_grad * hidden[idx];
         }
-        model.policy_move_bias[move_index] -= lr * policy_grad;
+        let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
+        for idx in 0..GLOBAL_CONTEXT_SIZE {
+            let weight_index = global_offset + idx;
+            gradient.policy_move_global[weight_index] += policy_grad * global[idx];
+        }
+        gradient.policy_move_bias[move_index] += policy_grad;
+    }
+
+    for out in 0..GLOBAL_CONTEXT_SIZE {
+        if global[out] <= 0.0 {
+            continue;
+        }
+        let grad = global_grad[out].clamp(-4.0, 4.0);
+        let weight_offset = out * model.hidden_size;
+        for idx in 0..model.hidden_size {
+            let weight_index = weight_offset + idx;
+            activation_grad[idx] += grad * model.global_hidden[weight_index];
+            gradient.global_hidden[weight_index] += grad * hidden[idx];
+        }
+        gradient.global_bias[out] += grad;
     }
 
     let mut input_grad = activation_grad;
@@ -1291,29 +1588,34 @@ fn train_one(model: &mut AzNnue, sample: &AzTrainingSample, lr: f32) -> AzTrainS
         let weight_offset = layer * model.hidden_size * model.hidden_size;
         let bias_offset = layer * model.hidden_size;
         for out in 0..model.hidden_size {
-            if output[out] <= 0.0 {
+            let grad = input_grad[out].clamp(-4.0, 4.0);
+            previous_grad[out] += grad;
+            if output[out] <= input[out] {
                 continue;
             }
-            let grad = input_grad[out].clamp(-4.0, 4.0);
+            let residual_grad = grad * RESIDUAL_TRUNK_SCALE;
             for idx in 0..model.hidden_size {
                 let weight_index = weight_offset + out * model.hidden_size + idx;
-                previous_grad[idx] += grad * model.trunk_weights[weight_index];
-                model.trunk_weights[weight_index] -= lr * grad * input[idx];
+                let old_weight = model.trunk_weights[weight_index];
+                previous_grad[idx] += residual_grad * old_weight;
+                gradient.trunk_weights[weight_index] += residual_grad * input[idx];
             }
-            model.trunk_biases[bias_offset + out] -= lr * grad;
+            let bias_index = bias_offset + out;
+            gradient.trunk_biases[bias_index] += residual_grad;
         }
         input_grad = previous_grad;
     }
 
-    let input_lr = lr / (sample.features.len() as f32).sqrt().max(1.0);
+    let input_scale = 1.0 / (sample.features.len() as f32).sqrt().max(1.0);
     for idx in 0..model.hidden_size {
         if activations[0][idx] <= 0.0 {
             continue;
         }
         let grad = input_grad[idx].clamp(-4.0, 4.0);
-        model.hidden_bias[idx] -= input_lr * grad;
+        gradient.hidden_bias[idx] += grad;
         for &feature in &sample.features {
-            model.input_hidden[feature * model.hidden_size + idx] -= input_lr * grad;
+            let weight_index = feature * model.hidden_size + idx;
+            gradient.input_hidden[weight_index] += grad * input_scale;
         }
     }
 
@@ -1352,11 +1654,191 @@ fn train_forward_activations(model: &AzNnue, features: &[usize]) -> Vec<Vec<f32>
             for idx in 0..model.hidden_size {
                 value += row[idx] * previous[idx];
             }
-            next[out] = value.max(0.0);
+            next[out] = previous[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
         }
         activations.push(next);
     }
     activations
+}
+
+fn apply_adamw_gradient(
+    model: &mut AzNnue,
+    optimizer: &mut AdamWState,
+    gradient: &AzGrad,
+    lr: f32,
+    batch_len: f32,
+) {
+    let inv_batch = 1.0 / batch_len.max(1.0);
+    let (bias_correction1, bias_correction2) = optimizer.advance();
+
+    for idx in 0..model.global_hidden.len() {
+        adamw_update(
+            &mut model.global_hidden[idx],
+            &mut optimizer.global_hidden_m[idx],
+            &mut optimizer.global_hidden_v[idx],
+            gradient.global_hidden[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.global_bias.len() {
+        adamw_update(
+            &mut model.global_bias[idx],
+            &mut optimizer.global_bias_m[idx],
+            &mut optimizer.global_bias_v[idx],
+            gradient.global_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+    for idx in 0..model.value_logits_hidden.len() {
+        adamw_update(
+            &mut model.value_logits_hidden[idx],
+            &mut optimizer.value_logits_hidden_m[idx],
+            &mut optimizer.value_logits_hidden_v[idx],
+            gradient.value_logits_hidden[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.value_logits_global.len() {
+        adamw_update(
+            &mut model.value_logits_global[idx],
+            &mut optimizer.value_logits_global_m[idx],
+            &mut optimizer.value_logits_global_v[idx],
+            gradient.value_logits_global[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.value_logits_bias.len() {
+        adamw_update(
+            &mut model.value_logits_bias[idx],
+            &mut optimizer.value_logits_bias_m[idx],
+            &mut optimizer.value_logits_bias_v[idx],
+            gradient.value_logits_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+
+    for idx in 0..model.policy_move_hidden.len() {
+        adamw_update(
+            &mut model.policy_move_hidden[idx],
+            &mut optimizer.policy_move_hidden_m[idx],
+            &mut optimizer.policy_move_hidden_v[idx],
+            gradient.policy_move_hidden[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.policy_move_global.len() {
+        adamw_update(
+            &mut model.policy_move_global[idx],
+            &mut optimizer.policy_move_global_m[idx],
+            &mut optimizer.policy_move_global_v[idx],
+            gradient.policy_move_global[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.policy_move_bias.len() {
+        adamw_update(
+            &mut model.policy_move_bias[idx],
+            &mut optimizer.policy_move_bias_m[idx],
+            &mut optimizer.policy_move_bias_v[idx],
+            gradient.policy_move_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+
+    for idx in 0..model.trunk_weights.len() {
+        adamw_update(
+            &mut model.trunk_weights[idx],
+            &mut optimizer.trunk_weights_m[idx],
+            &mut optimizer.trunk_weights_v[idx],
+            gradient.trunk_weights[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.trunk_biases.len() {
+        adamw_update(
+            &mut model.trunk_biases[idx],
+            &mut optimizer.trunk_biases_m[idx],
+            &mut optimizer.trunk_biases_v[idx],
+            gradient.trunk_biases[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+
+    for idx in 0..model.hidden_bias.len() {
+        adamw_update(
+            &mut model.hidden_bias[idx],
+            &mut optimizer.hidden_bias_m[idx],
+            &mut optimizer.hidden_bias_v[idx],
+            gradient.hidden_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+    for idx in 0..model.input_hidden.len() {
+        adamw_update(
+            &mut model.input_hidden[idx],
+            &mut optimizer.input_hidden_m[idx],
+            &mut optimizer.input_hidden_v[idx],
+            gradient.input_hidden[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+}
+
+fn adamw_update(
+    parameter: &mut f32,
+    first_moment: &mut f32,
+    second_moment: &mut f32,
+    gradient: f32,
+    lr: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+    weight_decay: f32,
+) {
+    let gradient = gradient.clamp(-4.0, 4.0);
+    *first_moment = ADAMW_BETA1 * *first_moment + (1.0 - ADAMW_BETA1) * gradient;
+    *second_moment = ADAMW_BETA2 * *second_moment + (1.0 - ADAMW_BETA2) * gradient * gradient;
+    let first_unbiased = *first_moment / bias_correction1.max(1e-12);
+    let second_unbiased = *second_moment / bias_correction2.max(1e-12);
+    if weight_decay > 0.0 {
+        *parameter -= lr * weight_decay * *parameter;
+    }
+    *parameter -= lr * first_unbiased / (second_unbiased.sqrt() + ADAMW_EPSILON);
 }
 
 fn shuffle(values: &mut [usize], rng: &mut SplitMix64) {
@@ -1382,6 +1864,14 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
         *value /= sum.max(1e-12);
     }
     values
+}
+
+fn scalar_value_from_logits(logits: &[f32]) -> (f32, Vec<f32>) {
+    let probs = softmax(logits);
+    if probs.len() < VALUE_LOGITS {
+        return (0.0, probs);
+    }
+    (probs[0] - probs[2], probs)
 }
 
 fn parse_floats(text: &str) -> io::Result<Vec<f32>> {
@@ -1445,4 +1935,81 @@ fn splitmix64(mut value: u64) -> u64 {
     mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     mixed ^ (mixed >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn considered_visit_sequence_matches_sequential_halving_schedule() {
+        assert_eq!(
+            considered_visit_sequence(4, 16),
+            vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+        );
+        assert_eq!(considered_visit_sequence(1, 5), vec![0, 1, 2, 3, 4]);
+        assert_eq!(considered_visit_sequence(0, 5), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn completed_q_normalization_turns_equal_values_into_zero_bonus() {
+        let mut qvalues = vec![0.5, 0.5, 0.5];
+        normalize_completed_q(&mut qvalues, 0);
+        assert_eq!(qvalues, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn gumbel_search_visits_initial_considered_actions() {
+        let model = AzNnue::random_with_depth(4, 1, 7);
+        let result = gumbel_search(
+            &Position::startpos(),
+            &model,
+            AzSearchLimits {
+                simulations: 512,
+                top_k: 16,
+                seed: 11,
+                gumbel_scale: 1.0,
+                workers: 1,
+            },
+        );
+        let visited_actions = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.visits > 0)
+            .count();
+
+        assert_eq!(result.simulations, 512);
+        assert!(visited_actions >= 16);
+    }
+
+    #[test]
+    fn lambda_targets_use_next_root_bootstrap() {
+        let mut samples = vec![
+            AzTrainingSample {
+                features: Vec::new(),
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: 0.0,
+                side_sign: 1.0,
+                reward: 0.0,
+                discount: -1.0,
+                bootstrap_value: 0.2,
+            },
+            AzTrainingSample {
+                features: Vec::new(),
+                moves: Vec::new(),
+                policy: Vec::new(),
+                value: 0.0,
+                side_sign: -1.0,
+                reward: 1.0,
+                discount: 0.0,
+                bootstrap_value: -0.4,
+            },
+        ];
+
+        assign_lambda_targets(&mut samples, 1.0, 0.5);
+
+        assert!((samples[1].value - 1.0).abs() < 1e-6);
+        assert!((samples[0].value + 0.3).abs() < 1e-6);
+    }
 }

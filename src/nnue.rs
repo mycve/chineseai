@@ -1,4 +1,6 @@
-use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, Piece, PieceKind, Position};
+use crate::xiangqi::{
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
+};
 
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
 pub const V2_KING_BUCKETS: usize = 9;
@@ -7,7 +9,22 @@ pub const HISTORY_PLIES: usize = 8;
 const HISTORY_EVENT_TYPES: usize = 2;
 const HISTORY_INPUT_SIZE: usize = HISTORY_PLIES * HISTORY_EVENT_TYPES * 14 * BOARD_SIZE;
 pub const V3_INPUT_SIZE: usize = V2_INPUT_SIZE + HISTORY_INPUT_SIZE;
-
+const ROW_INPUT_SIZE: usize = 14 * BOARD_RANKS;
+const COL_INPUT_SIZE: usize = 14 * BOARD_FILES;
+const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+const NEIGHBOR_STATE_COUNT: usize = 14;
+const NEIGHBOR_INPUT_SIZE: usize = 14 * NEIGHBOR_OFFSETS.len() * NEIGHBOR_STATE_COUNT;
+pub const V4_INPUT_SIZE: usize =
+    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + NEIGHBOR_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -75,6 +92,43 @@ pub fn extract_sparse_features_v3(position: &Position, history: &[HistoryMove]) 
     features
 }
 
+pub fn extract_sparse_features_v4(position: &Position, history: &[HistoryMove]) -> Vec<usize> {
+    let side = position.side_to_move();
+    let mut features = extract_sparse_features_v3(position, history);
+    features.reserve(32 * (2 + NEIGHBOR_OFFSETS.len()));
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let piece_index = relative_piece_index(side, piece.color, piece.kind);
+        let oriented_sq = orient_square(side, sq);
+        let center_file = file_of(oriented_sq) as i32;
+        let center_rank = rank_of(oriented_sq) as i32;
+        features.push(row_feature_index(piece_index, center_rank as usize));
+        features.push(col_feature_index(piece_index, center_file as usize));
+
+        for (offset_index, (df, dr)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+            let target_file = center_file + df;
+            let target_rank = center_rank + dr;
+            if !inside_board(target_file, target_rank) {
+                continue;
+            }
+            let oriented_target = index(target_file as usize, target_rank as usize);
+            let target = orient_square(side, oriented_target);
+            let Some(target_piece) = position.piece_at(target) else {
+                continue;
+            };
+            features.push(neighbor_feature_index(
+                piece_index,
+                offset_index,
+                relative_piece_index(side, target_piece.color, target_piece.kind),
+            ));
+        }
+    }
+    features.sort_unstable();
+    features
+}
+
 pub fn orient_move(side: Color, mv: Move) -> Move {
     Move::new(
         orient_square(side, mv.from as usize),
@@ -136,6 +190,30 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
         let age = partial / HISTORY_EVENT_TYPES;
         return history_feature_index(age, event, piece_index, mirror_file_square(sq));
     }
+    if feature < V4_INPUT_SIZE {
+        let offset = feature - V3_INPUT_SIZE;
+        if offset < ROW_INPUT_SIZE {
+            let piece_index = offset / BOARD_RANKS;
+            let rank = offset % BOARD_RANKS;
+            return row_feature_index(piece_index, rank);
+        }
+        let offset = offset - ROW_INPUT_SIZE;
+        if offset < COL_INPUT_SIZE {
+            let piece_index = offset / BOARD_FILES;
+            let file = offset % BOARD_FILES;
+            return col_feature_index(piece_index, BOARD_FILES - 1 - file);
+        }
+        let offset = offset - COL_INPUT_SIZE;
+        let neighbor_state = offset % NEIGHBOR_STATE_COUNT;
+        let partial = offset / NEIGHBOR_STATE_COUNT;
+        let offset_index = partial % NEIGHBOR_OFFSETS.len();
+        let piece_index = partial / NEIGHBOR_OFFSETS.len();
+        return neighbor_feature_index(
+            piece_index,
+            mirror_neighbor_offset_index(offset_index),
+            neighbor_state,
+        );
+    }
     feature
 }
 
@@ -151,6 +229,27 @@ fn king_aware_feature_index(
 
 fn history_feature_index(age: usize, event: usize, piece_index: usize, sq: usize) -> usize {
     V2_INPUT_SIZE + (((age * HISTORY_EVENT_TYPES + event) * 14 + piece_index) * BOARD_SIZE + sq)
+}
+
+fn row_feature_index(piece_index: usize, rank: usize) -> usize {
+    V3_INPUT_SIZE + piece_index * BOARD_RANKS + rank
+}
+
+fn col_feature_index(piece_index: usize, file: usize) -> usize {
+    V3_INPUT_SIZE + ROW_INPUT_SIZE + piece_index * BOARD_FILES + file
+}
+
+fn neighbor_feature_index(piece_index: usize, offset_index: usize, neighbor_state: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + ((piece_index * NEIGHBOR_OFFSETS.len() + offset_index) * NEIGHBOR_STATE_COUNT
+            + neighbor_state)
+}
+
+fn mirror_neighbor_offset_index(offset_index: usize) -> usize {
+    let (df, dr) = NEIGHBOR_OFFSETS[offset_index];
+    neighbor_offset_index(-df, dr).expect("mirrored offset must exist")
 }
 
 fn palace_bucket(sq: usize) -> usize {
@@ -185,6 +284,32 @@ fn orient_square(side: Color, sq: usize) -> usize {
     }
 }
 
+#[inline(always)]
+fn index(file: usize, rank: usize) -> usize {
+    rank * BOARD_FILES + file
+}
+
+#[inline(always)]
+fn file_of(sq: usize) -> usize {
+    sq % BOARD_FILES
+}
+
+#[inline(always)]
+fn rank_of(sq: usize) -> usize {
+    sq / BOARD_FILES
+}
+
+#[inline(always)]
+fn inside_board(file: i32, rank: i32) -> bool {
+    (0..BOARD_FILES as i32).contains(&file) && (0..BOARD_RANKS as i32).contains(&rank)
+}
+
+fn neighbor_offset_index(df: i32, dr: i32) -> Option<usize> {
+    NEIGHBOR_OFFSETS
+        .iter()
+        .position(|&(offset_df, offset_dr)| offset_df == df && offset_dr == dr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +331,20 @@ mod tests {
     }
 
     #[test]
+    fn v4_features_include_row_file_and_neighbor_context() {
+        let position = Position::from_fen("4k4/9/9/9/4p4/4R4/9/9/9/4K4 w").unwrap();
+        let features = extract_sparse_features_v4(&position, &[]);
+
+        assert!(features.iter().all(|feature| *feature < V4_INPUT_SIZE));
+        assert!(features.iter().any(|feature| *feature >= V3_INPUT_SIZE));
+        assert!(
+            features
+                .iter()
+                .any(|feature| *feature >= V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE)
+        );
+    }
+
+    #[test]
     fn features_are_relative_to_side_to_move() {
         let red_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 w").unwrap();
         let black_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 b").unwrap();
@@ -213,6 +352,10 @@ mod tests {
         assert_eq!(
             extract_sparse_features_v3(&red_to_move, &[]),
             extract_sparse_features_v3(&black_to_move, &[])
+        );
+        assert_eq!(
+            extract_sparse_features_v4(&red_to_move, &[]),
+            extract_sparse_features_v4(&black_to_move, &[])
         );
     }
 
@@ -258,6 +401,13 @@ mod tests {
         assert_eq!(
             mirrored_left,
             extract_sparse_features_v3(&right, &right_history)
+        );
+
+        let mut mirrored_left_v4 = extract_sparse_features_v4(&left, &left_history);
+        mirror_sparse_features_file(&mut mirrored_left_v4);
+        assert_eq!(
+            mirrored_left_v4,
+            extract_sparse_features_v4(&right, &right_history)
         );
     }
 }
