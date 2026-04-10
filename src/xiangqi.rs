@@ -161,8 +161,16 @@ pub struct RuleHistoryEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleDrawReason {
+    Halfmove120,
+    Repetition,
+    MutualLongCheck,
+    MutualLongChase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuleOutcome {
-    Draw,
+    Draw(RuleDrawReason),
     Win(Color),
 }
 
@@ -457,7 +465,7 @@ impl Position {
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         if self.halfmove_clock >= 120 {
-            return Some(RuleOutcome::Draw);
+            return Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120));
         }
         Self::rule_outcome(history)
     }
@@ -484,7 +492,7 @@ impl Position {
             }
         }
 
-        (repeated_indices.len() >= 2).then_some(RuleOutcome::Draw)
+        (repeated_indices.len() >= 2).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -828,7 +836,7 @@ impl Position {
         match (long_check[0], long_check[1]) {
             (true, false) => return Some(RuleOutcome::Win(Color::Black)),
             (false, true) => return Some(RuleOutcome::Win(Color::Red)),
-            (true, true) => return Some(RuleOutcome::Draw),
+            (true, true) => return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck)),
             (false, false) => {}
         }
 
@@ -839,7 +847,7 @@ impl Position {
         match (long_chase[0], long_chase[1]) {
             (true, false) => Some(RuleOutcome::Win(Color::Black)),
             (false, true) => Some(RuleOutcome::Win(Color::Red)),
-            (true, true) => Some(RuleOutcome::Draw),
+            (true, true) => Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase)),
             (false, false) => None,
         }
     }
@@ -2290,6 +2298,9 @@ mod tests {
             test_rule_entry(23, Color::Red, Some(Color::Black), false, 0),
             test_rule_entry(21, Color::Red, Some(Color::Black), false, 0),
         ];
-        assert_eq!(Position::rule_outcome(&history), Some(RuleOutcome::Draw));
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        );
     }
 }

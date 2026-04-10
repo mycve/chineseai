@@ -4,13 +4,15 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use crate::nnue::{
     HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, mirror_file_move,
     mirror_sparse_features_file, orient_move,
 };
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_SIZE, Color, Move, Position, RuleHistoryEntry, RuleOutcome,
+    BOARD_FILES, BOARD_SIZE, Color, Move, Position, RuleDrawReason, RuleHistoryEntry,
+    RuleOutcome,
 };
 
 pub const AZNNUE_FORMAT: &str = "aznnue-v14";
@@ -146,13 +148,89 @@ pub struct AzLoopReport {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
-    pub value_pred_mean: f32,
-    pub value_pred_std: f32,
-    pub value_target_mean: f32,
-    pub value_target_std: f32,
+    pub temperature_early_entropy: f32,
+    pub temperature_mid_entropy: f32,
+    pub selfplay_seconds: f32,
+    pub train_seconds: f32,
+    pub total_seconds: f32,
+    pub games_per_second: f32,
+    pub samples_per_second: f32,
     pub train_samples: usize,
     pub pool_games: usize,
     pub pool_samples: usize,
+    pub terminal_no_legal_moves: usize,
+    pub terminal_red_general_missing: usize,
+    pub terminal_black_general_missing: usize,
+    pub terminal_rule_draw: usize,
+    pub terminal_rule_draw_halfmove120: usize,
+    pub terminal_rule_draw_repetition: usize,
+    pub terminal_rule_draw_mutual_long_check: usize,
+    pub terminal_rule_draw_mutual_long_chase: usize,
+    pub terminal_rule_win_red: usize,
+    pub terminal_rule_win_black: usize,
+    pub terminal_max_plies: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AzTerminalStats {
+    no_legal_moves: usize,
+    red_general_missing: usize,
+    black_general_missing: usize,
+    rule_draw: usize,
+    rule_draw_halfmove120: usize,
+    rule_draw_repetition: usize,
+    rule_draw_mutual_long_check: usize,
+    rule_draw_mutual_long_chase: usize,
+    rule_win_red: usize,
+    rule_win_black: usize,
+    max_plies: usize,
+}
+
+impl AzTerminalStats {
+    fn add_assign(&mut self, other: &Self) {
+        self.no_legal_moves += other.no_legal_moves;
+        self.red_general_missing += other.red_general_missing;
+        self.black_general_missing += other.black_general_missing;
+        self.rule_draw += other.rule_draw;
+        self.rule_draw_halfmove120 += other.rule_draw_halfmove120;
+        self.rule_draw_repetition += other.rule_draw_repetition;
+        self.rule_draw_mutual_long_check += other.rule_draw_mutual_long_check;
+        self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
+        self.rule_win_red += other.rule_win_red;
+        self.rule_win_black += other.rule_win_black;
+        self.max_plies += other.max_plies;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzArenaReport {
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+    pub wins_as_red: usize,
+    pub losses_as_red: usize,
+    pub wins_as_black: usize,
+    pub losses_as_black: usize,
+}
+
+impl AzArenaReport {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.wins += other.wins;
+        self.losses += other.losses;
+        self.draws += other.draws;
+        self.wins_as_red += other.wins_as_red;
+        self.losses_as_red += other.losses_as_red;
+        self.wins_as_black += other.wins_as_black;
+        self.losses_as_black += other.losses_as_black;
+    }
+
+    pub fn total_games(&self) -> usize {
+        self.wins + self.losses + self.draws
+    }
+
+    pub fn score(&self) -> f32 {
+        self.wins as f32 + 0.5 * self.draws as f32
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -393,6 +471,11 @@ struct AzSelfplayData {
     black_wins: usize,
     draws: usize,
     plies_total: usize,
+    temperature_early_entropy_sum: f32,
+    temperature_early_entropy_count: usize,
+    temperature_mid_entropy_sum: f32,
+    temperature_mid_entropy_count: usize,
+    terminal: AzTerminalStats,
 }
 
 #[derive(Clone, Debug)]
@@ -818,7 +901,10 @@ pub fn selfplay_train_iteration_with_pool(
     config: &AzLoopConfig,
     pool: Option<&mut AzExperiencePool>,
 ) -> AzLoopReport {
+    let started = Instant::now();
+    let selfplay_started = Instant::now();
     let data = generate_selfplay_data(model, config);
+    let selfplay_seconds = selfplay_started.elapsed().as_secs_f32();
     let mut rng = SplitMix64::new(config.seed ^ 0xA5A5_5A5A_D3C3_B4B4);
     let generated_samples = data.samples.len();
     let (train_data, pool_games, pool_samples) = if let Some(pool) = pool {
@@ -836,6 +922,7 @@ pub fn selfplay_train_iteration_with_pool(
     } else {
         (data.samples.clone(), 0, 0)
     };
+    let train_started = Instant::now();
     let stats = train_samples(
         model,
         &train_data,
@@ -845,6 +932,8 @@ pub fn selfplay_train_iteration_with_pool(
         config.train_workers,
         &mut rng,
     );
+    let train_seconds = train_started.elapsed().as_secs_f32();
+    let total_seconds = started.elapsed().as_secs_f32();
     AzLoopReport {
         games: config.games,
         samples: generated_samples,
@@ -859,21 +948,29 @@ pub fn selfplay_train_iteration_with_pool(
         loss: stats.loss,
         value_loss: stats.value_loss,
         policy_ce: stats.policy_ce,
-        value_pred_mean: stats.value_pred_sum / stats.samples.max(1) as f32,
-        value_pred_std: variance_to_std(
-            stats.value_pred_sum,
-            stats.value_pred_sq_sum,
-            stats.samples,
-        ),
-        value_target_mean: stats.value_target_sum / stats.samples.max(1) as f32,
-        value_target_std: variance_to_std(
-            stats.value_target_sum,
-            stats.value_target_sq_sum,
-            stats.samples,
-        ),
+        temperature_early_entropy: data.temperature_early_entropy_sum
+            / data.temperature_early_entropy_count.max(1) as f32,
+        temperature_mid_entropy: data.temperature_mid_entropy_sum
+            / data.temperature_mid_entropy_count.max(1) as f32,
+        selfplay_seconds,
+        train_seconds,
+        total_seconds,
+        games_per_second: config.games as f32 / selfplay_seconds.max(1e-6),
+        samples_per_second: generated_samples as f32 / selfplay_seconds.max(1e-6),
         train_samples: train_data.len(),
         pool_games,
         pool_samples,
+        terminal_no_legal_moves: data.terminal.no_legal_moves,
+        terminal_red_general_missing: data.terminal.red_general_missing,
+        terminal_black_general_missing: data.terminal.black_general_missing,
+        terminal_rule_draw: data.terminal.rule_draw,
+        terminal_rule_draw_halfmove120: data.terminal.rule_draw_halfmove120,
+        terminal_rule_draw_repetition: data.terminal.rule_draw_repetition,
+        terminal_rule_draw_mutual_long_check: data.terminal.rule_draw_mutual_long_check,
+        terminal_rule_draw_mutual_long_chase: data.terminal.rule_draw_mutual_long_chase,
+        terminal_rule_win_red: data.terminal.rule_win_red,
+        terminal_rule_win_black: data.terminal.rule_win_black,
+        terminal_max_plies: data.terminal.max_plies,
     }
 }
 
@@ -910,6 +1007,11 @@ fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayDa
         merged.black_wins += chunk.black_wins;
         merged.draws += chunk.draws;
         merged.plies_total += chunk.plies_total;
+        merged.temperature_early_entropy_sum += chunk.temperature_early_entropy_sum;
+        merged.temperature_early_entropy_count += chunk.temperature_early_entropy_count;
+        merged.temperature_mid_entropy_sum += chunk.temperature_mid_entropy_sum;
+        merged.temperature_mid_entropy_count += chunk.temperature_mid_entropy_count;
+        merged.terminal.add_assign(&chunk.terminal);
     }
     merged
 }
@@ -922,6 +1024,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut draws = 0usize;
     let mut plies_total = 0usize;
     let mut games = Vec::with_capacity(config.games);
+    let mut temperature_early_entropy_sum = 0.0f32;
+    let mut temperature_early_entropy_count = 0usize;
+    let mut temperature_mid_entropy_sum = 0.0f32;
+    let mut temperature_mid_entropy_count = 0usize;
+    let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
         let mut position = Position::startpos();
@@ -940,6 +1047,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 } else {
                     1.0
                 });
+                terminal.no_legal_moves += 1;
                 finalize_last_transition(&mut game_samples, result.unwrap_or(0.0));
                 break;
             }
@@ -958,6 +1066,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     workers: 1,
                 },
             );
+            let entropy = policy_entropy(&search.candidates);
+            let split = config.temperature_decay_plies.max(2).div_ceil(2);
+            if ply < split {
+                temperature_early_entropy_sum += entropy;
+                temperature_early_entropy_count += 1;
+            } else if ply < config.temperature_decay_plies.max(split + 1) {
+                temperature_mid_entropy_sum += entropy;
+                temperature_mid_entropy_count += 1;
+            }
             let temperature = temperature_for_ply(config, ply);
             let Some(mv) = choose_selfplay_move(&search.candidates, temperature, &mut rng) else {
                 result = Some(0.0);
@@ -976,23 +1093,45 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
+                terminal.red_general_missing += 1;
                 finalize_last_transition(&mut game_samples, -1.0);
                 break;
             }
             if !position.has_general(Color::Black) {
                 result = Some(1.0);
+                terminal.black_general_missing += 1;
                 finalize_last_transition(&mut game_samples, 1.0);
                 break;
             }
             if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
                 result = Some(match rule_outcome {
-                    RuleOutcome::Draw => 0.0,
+                    RuleOutcome::Draw(_) => 0.0,
                     RuleOutcome::Win(Color::Red) => 1.0,
                     RuleOutcome::Win(Color::Black) => -1.0,
                 });
+                match rule_outcome {
+                    RuleOutcome::Draw(reason) => {
+                        terminal.rule_draw += 1;
+                        match reason {
+                            RuleDrawReason::Halfmove120 => terminal.rule_draw_halfmove120 += 1,
+                            RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
+                            RuleDrawReason::MutualLongCheck => {
+                                terminal.rule_draw_mutual_long_check += 1
+                            }
+                            RuleDrawReason::MutualLongChase => {
+                                terminal.rule_draw_mutual_long_chase += 1
+                            }
+                        }
+                    }
+                    RuleOutcome::Win(Color::Red) => terminal.rule_win_red += 1,
+                    RuleOutcome::Win(Color::Black) => terminal.rule_win_black += 1,
+                }
                 finalize_last_transition(&mut game_samples, result.unwrap_or(0.0));
                 break;
             }
+        }
+        if result.is_none() {
+            terminal.max_plies += 1;
         }
 
         let result: f32 = result.unwrap_or(0.0);
@@ -1015,6 +1154,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         black_wins,
         draws,
         plies_total,
+        temperature_early_entropy_sum,
+        temperature_early_entropy_count,
+        temperature_mid_entropy_sum,
+        temperature_mid_entropy_count,
+        terminal,
     }
 }
 
@@ -1208,7 +1352,7 @@ impl<'a> AzTree<'a> {
             {
                 self.nodes[node_index].children.clear();
                 self.nodes[node_index].value = match outcome {
-                    RuleOutcome::Draw => 0.0,
+                    RuleOutcome::Draw(_) => 0.0,
                     RuleOutcome::Win(color) => {
                         if color == self.nodes[node_index].position.side_to_move() {
                             1.0
@@ -1656,6 +1800,130 @@ fn choose_selfplay_move(
     candidates.first().map(|candidate| candidate.mv)
 }
 
+fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
+    let total = candidates
+        .iter()
+        .map(|candidate| candidate.policy.max(0.0))
+        .sum::<f32>();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    candidates
+        .iter()
+        .map(|candidate| candidate.policy.max(0.0) / total)
+        .filter(|probability| *probability > 1e-9)
+        .map(|probability| -probability * probability.ln())
+        .sum()
+}
+
+pub fn play_arena_games(
+    candidate: &AzNnue,
+    baseline: &AzNnue,
+    simulations: usize,
+    top_k: usize,
+    max_plies: usize,
+    games_as_red: usize,
+    games_as_black: usize,
+    seed: u64,
+) -> AzArenaReport {
+    let mut report = AzArenaReport::default();
+    let mut game_seed = seed;
+    for _ in 0..games_as_red {
+        let outcome = play_arena_game(candidate, baseline, simulations, top_k, max_plies, game_seed);
+        match outcome.total_cmp(&0.0) {
+            std::cmp::Ordering::Greater => {
+                report.wins += 1;
+                report.wins_as_red += 1;
+            }
+            std::cmp::Ordering::Less => {
+                report.losses += 1;
+                report.losses_as_red += 1;
+            }
+            std::cmp::Ordering::Equal => report.draws += 1,
+        }
+        game_seed = game_seed.wrapping_add(1);
+    }
+    for _ in 0..games_as_black {
+        let outcome = play_arena_game(baseline, candidate, simulations, top_k, max_plies, game_seed);
+        match outcome.total_cmp(&0.0) {
+            std::cmp::Ordering::Greater => {
+                report.losses += 1;
+                report.losses_as_black += 1;
+            }
+            std::cmp::Ordering::Less => {
+                report.wins += 1;
+                report.wins_as_black += 1;
+            }
+            std::cmp::Ordering::Equal => report.draws += 1,
+        }
+        game_seed = game_seed.wrapping_add(1);
+    }
+    report
+}
+
+fn play_arena_game(
+    red_model: &AzNnue,
+    black_model: &AzNnue,
+    simulations: usize,
+    top_k: usize,
+    max_plies: usize,
+    seed: u64,
+) -> f32 {
+    let mut position = Position::startpos();
+    let mut history = Vec::new();
+    let mut rule_history = position.initial_rule_history();
+    for ply in 0..max_plies {
+        let legal = position.legal_moves_with_rules(&rule_history);
+        if legal.is_empty() {
+            return if position.side_to_move() == Color::Red {
+                -1.0
+            } else {
+                1.0
+            };
+        }
+        let model = if position.side_to_move() == Color::Red {
+            red_model
+        } else {
+            black_model
+        };
+        let result = gumbel_search_with_history_and_rules(
+            &position,
+            &history,
+            Some(rule_history.clone()),
+            Some(legal),
+            model,
+            AzSearchLimits {
+                simulations,
+                top_k,
+                seed: seed ^ ((ply as u64) << 32),
+                gumbel_scale: 0.0,
+                workers: 1,
+            },
+        );
+        let Some(mv) = result.best_move else {
+            return 0.0;
+        };
+        append_history(&mut history, &position, mv);
+        rule_history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+
+        if !position.has_general(Color::Red) {
+            return -1.0;
+        }
+        if !position.has_general(Color::Black) {
+            return 1.0;
+        }
+        if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
+            return match rule_outcome {
+                RuleOutcome::Draw(_) => 0.0,
+                RuleOutcome::Win(Color::Red) => 1.0,
+                RuleOutcome::Win(Color::Black) => -1.0,
+            };
+        }
+    }
+    0.0
+}
+
 fn train_samples(
     model: &mut AzNnue,
     samples: &[AzTrainingSample],
@@ -1803,8 +2071,14 @@ fn accumulate_one(
     } else {
         0.0
     };
+    let value_target = scalar_to_wdl_target(sample.value);
     let value_error = value - sample.value;
     let value_loss = value_error * value_error;
+    let value_train_loss = value_probs
+        .iter()
+        .zip(value_target.iter())
+        .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
+        .sum::<f32>();
 
     let logits = sample
         .moves
@@ -1821,16 +2095,9 @@ fn accumulate_one(
     let mut activation_grad = vec![0.0; model.hidden_size];
     let mut global_grad = vec![0.0; GLOBAL_CONTEXT_SIZE];
 
-    let value_grad_scale = 2.0 * value_error;
     let mut intermediate_grad = vec![0.0; VALUE_HIDDEN_SIZE];
     for out in 0..VALUE_LOGITS {
-        let target_sign = match out {
-            0 => 1.0,
-            1 => 0.0,
-            _ => -1.0,
-        };
-        let logit_grad =
-            (value_grad_scale * value_probs[out] * (target_sign - value)).clamp(-4.0, 4.0);
+        let logit_grad = value_probs[out] - value_target[out];
         let row_offset = out * VALUE_HIDDEN_SIZE;
         for j in 0..VALUE_HIDDEN_SIZE {
             intermediate_grad[j] += logit_grad * model.value_logits_weights[row_offset + j];
@@ -1944,7 +2211,7 @@ fn accumulate_one(
     }
 
     AzTrainStats {
-        loss: value_loss + policy_ce,
+        loss: value_train_loss + policy_ce,
         value_loss,
         policy_ce,
         value_pred_sum: value,
@@ -2255,15 +2522,6 @@ fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
     } else {
         [0.0, 1.0 + v, -v]
     }
-}
-
-fn variance_to_std(sum: f32, sq_sum: f32, count: usize) -> f32 {
-    if count == 0 {
-        return 0.0;
-    }
-    let mean = sum / count as f32;
-    let variance = (sq_sum / count as f32) - mean * mean;
-    variance.max(0.0).sqrt()
 }
 
 fn add_assign_slice(dst: &mut [f32], src: &[f32]) {

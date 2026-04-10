@@ -1,7 +1,8 @@
 use chineseai::{
     az::{
-        AZNNUE_FORMAT, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits, gumbel_search,
-        gumbel_search_with_history_and_rules, selfplay_train_iteration_with_pool,
+        AZNNUE_FORMAT, AzArenaReport, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits,
+        gumbel_search, gumbel_search_with_history_and_rules, play_arena_games,
+        selfplay_train_iteration_with_pool,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
     xiangqi::{Position, RuleHistoryEntry, STARTPOS_FEN},
@@ -9,8 +10,10 @@ use chineseai::{
 use std::{
     fs,
     io::{self, BufRead, BufWriter, Write},
-    path::Path,
-};
+    path::{Path, PathBuf},
+    process::Command,
+    };
+use tensorboard_rs::summary_writer::SummaryWriter;
 
 // ---------------------------------------------------------------------------
 // UCI 磁盘日志（写入程序所在目录的 chineseai-uci.log）
@@ -58,6 +61,144 @@ macro_rules! ulog {
 }
 
 const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.conf";
+
+fn default_parallel_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).max(1))
+        .unwrap_or(8)
+}
+
+fn best_model_path(model_path: &str) -> PathBuf {
+    PathBuf::from(format!("{model_path}.best"))
+}
+
+fn checkpoint_path(model_path: &str, checkpoint_dir: &str, iteration: usize) -> PathBuf {
+    let base = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model.nnue.txt");
+    Path::new(checkpoint_dir).join(format!("iter-{iteration:04}-{base}"))
+}
+
+fn save_checkpoint_copy(model_path: &str, checkpoint_dir: &str, iteration: usize) -> PathBuf {
+    fs::create_dir_all(checkpoint_dir).unwrap_or_else(|err| {
+        panic!("failed to create checkpoint dir `{checkpoint_dir}`: {err}");
+    });
+    let path = checkpoint_path(model_path, checkpoint_dir, iteration);
+    fs::copy(model_path, &path).unwrap_or_else(|err| {
+        panic!("failed to copy `{model_path}` to `{}`: {err}", path.display());
+    });
+    path
+}
+
+fn prune_old_checkpoints(
+    model_path: &str,
+    checkpoint_dir: &str,
+    max_checkpoints: usize,
+) -> io::Result<()> {
+    if max_checkpoints == 0 {
+        return Ok(());
+    }
+    let base = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model.nnue.txt")
+        .to_string();
+    let prefix = "iter-";
+    let suffix = format!("-{base}");
+    let mut entries = fs::read_dir(checkpoint_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            (name.starts_with(prefix) && name.ends_with(&suffix)).then_some((name.to_string(), path))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let to_remove = entries.len().saturating_sub(max_checkpoints);
+    for (_, path) in entries.into_iter().take(to_remove) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn run_arena_processes(
+    candidate_path: &str,
+    baseline_path: &str,
+    games_per_side: usize,
+    simulations: usize,
+    top_k: usize,
+    max_plies: usize,
+    process_count: usize,
+    seed: u64,
+) -> AzArenaReport {
+    let process_count = process_count.max(1).min(games_per_side.max(1));
+    let exe = std::env::current_exe().unwrap_or_else(|err| {
+        panic!("failed to locate current executable: {err}");
+    });
+    let mut merged = AzArenaReport::default();
+    let mut children = Vec::new();
+    for index in 0..process_count {
+        let red_games = games_per_side / process_count + usize::from(index < games_per_side % process_count);
+        let black_games =
+            games_per_side / process_count + usize::from(index < games_per_side % process_count);
+        if red_games == 0 && black_games == 0 {
+            continue;
+        }
+        let output = Command::new(&exe)
+            .arg("az-arena-worker")
+            .arg(candidate_path)
+            .arg(baseline_path)
+            .arg(red_games.to_string())
+            .arg(black_games.to_string())
+            .arg(simulations.to_string())
+            .arg(top_k.to_string())
+            .arg(max_plies.to_string())
+            .arg((seed ^ index as u64).to_string())
+            .output()
+            .unwrap_or_else(|err| {
+                panic!("failed to spawn arena worker process: {err}");
+            });
+        if !output.status.success() {
+            panic!(
+                "arena worker failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        children.push(output);
+    }
+
+    for output in children {
+        let text = String::from_utf8_lossy(&output.stdout);
+        merged.add_assign(&parse_arena_report(&text));
+    }
+    merged
+}
+
+fn parse_arena_report(text: &str) -> AzArenaReport {
+    let mut report = AzArenaReport::default();
+    for token in text.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let parsed = value.parse::<usize>().unwrap_or(0);
+        match key {
+            "wins" => report.wins = parsed,
+            "losses" => report.losses = parsed,
+            "draws" => report.draws = parsed,
+            "wins_as_red" => report.wins_as_red = parsed,
+            "losses_as_red" => report.losses_as_red = parsed,
+            "wins_as_black" => report.wins_as_black = parsed,
+            "losses_as_black" => report.losses_as_black = parsed,
+            _ => {}
+        }
+    }
+    report
+}
+
+fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
+    writer.add_scalar(tag, value, step);
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -254,6 +395,7 @@ fn main() {
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
+            let best_path = best_model_path(&config.model_path);
 
             let mut model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
@@ -277,9 +419,16 @@ fn main() {
             };
             let mut replay_pool =
                 (config.replay_games > 0).then(|| AzExperiencePool::new(config.replay_games));
+            fs::create_dir_all(&config.tensorboard_logdir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to create tensorboard log dir `{}`: {err}",
+                    config.tensorboard_logdir
+                );
+            });
+            let mut tb = SummaryWriter::new(&config.tensorboard_logdir);
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} train_workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={}",
+                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} train_workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_processes={} tb={}",
                 config_path,
                 config.iterations,
                 config.games,
@@ -299,7 +448,13 @@ fn main() {
                 config.td_lambda,
                 config.replay_games,
                 config.replay_samples,
-                config.mirror_probability
+                config.mirror_probability,
+                config.checkpoint_interval,
+                config.max_checkpoints,
+                config.arena_interval,
+                config.arena_games_per_side,
+                config.arena_processes,
+                config.tensorboard_logdir
             );
             for iteration in 1..=config.iterations {
                 let started = std::time::Instant::now();
@@ -330,8 +485,40 @@ fn main() {
                 model.save_text(&config.model_path).unwrap_or_else(|err| {
                     panic!("failed to write `{}`: {err}", config.model_path);
                 });
+                if !best_path.exists() {
+                    fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
+                        panic!(
+                            "failed to initialize best model `{}` from `{}`: {err}",
+                            best_path.display(),
+                            config.model_path
+                        );
+                    });
+                }
+                let checkpoint_saved = if config.checkpoint_interval > 0
+                    && iteration % config.checkpoint_interval == 0
+                {
+                    let path = save_checkpoint_copy(
+                        &config.model_path,
+                        &config.checkpoint_dir,
+                        iteration,
+                    );
+                    prune_old_checkpoints(
+                        &config.model_path,
+                        &config.checkpoint_dir,
+                        config.max_checkpoints,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to prune checkpoints in `{}`: {err}",
+                            config.checkpoint_dir
+                        );
+                    });
+                    Some(path)
+                } else {
+                    None
+                };
                 println!(
-                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} vpred={:.3}/{:.3} vtgt={:.3}/{:.3} elapsed={:.1}s saved={}",
+                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} drawR[120/rep/lchk/lchs]={}/{}/{}/{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} elapsed={:.1}s saved={}{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -344,14 +531,163 @@ fn main() {
                     report.loss,
                     report.value_loss,
                     report.policy_ce,
-                    report.value_pred_mean,
-                    report.value_pred_std,
-                    report.value_target_mean,
-                    report.value_target_std,
+                    config.lr,
+                    report.temperature_early_entropy,
+                    report.temperature_mid_entropy,
+                    report.terminal_rule_draw_halfmove120,
+                    report.terminal_rule_draw_repetition,
+                    report.terminal_rule_draw_mutual_long_check,
+                    report.terminal_rule_draw_mutual_long_chase,
+                    report.selfplay_seconds,
+                    report.train_seconds,
+                    report.games_per_second,
+                    report.samples_per_second,
                     started.elapsed().as_secs_f32(),
-                    config.model_path
+                    config.model_path,
+                    checkpoint_saved.as_ref().map_or_else(
+                        String::new,
+                        |path| format!(" checkpoint={}", path.display())
+                    )
                 );
+                log_scalar(&mut tb, "train/loss", iteration, report.loss);
+                log_scalar(&mut tb, "train/value_mse", iteration, report.value_loss);
+                log_scalar(&mut tb, "train/policy_ce", iteration, report.policy_ce);
+                log_scalar(&mut tb, "train/lr", iteration, config.lr);
+                log_scalar(&mut tb, "selfplay/games", iteration, report.games as f32);
+                log_scalar(&mut tb, "selfplay/samples", iteration, report.samples as f32);
+                log_scalar(&mut tb, "selfplay/avg_plies", iteration, report.avg_plies);
+                log_scalar(&mut tb, "selfplay/temp_entropy_early", iteration, report.temperature_early_entropy);
+                log_scalar(&mut tb, "selfplay/temp_entropy_mid", iteration, report.temperature_mid_entropy);
+                log_scalar(&mut tb, "selfplay/games_per_second", iteration, report.games_per_second);
+                log_scalar(&mut tb, "selfplay/samples_per_second", iteration, report.samples_per_second);
+                log_scalar(&mut tb, "timing/selfplay_seconds", iteration, report.selfplay_seconds);
+                log_scalar(&mut tb, "timing/train_seconds", iteration, report.train_seconds);
+                log_scalar(&mut tb, "timing/iteration_seconds", iteration, report.total_seconds);
+                log_scalar(&mut tb, "outcome/red_wins", iteration, report.red_wins as f32);
+                log_scalar(&mut tb, "outcome/black_wins", iteration, report.black_wins as f32);
+                log_scalar(&mut tb, "outcome/draws", iteration, report.draws as f32);
+                log_scalar(&mut tb, "terminal/no_legal_moves", iteration, report.terminal_no_legal_moves as f32);
+                log_scalar(&mut tb, "terminal/red_general_missing", iteration, report.terminal_red_general_missing as f32);
+                log_scalar(&mut tb, "terminal/black_general_missing", iteration, report.terminal_black_general_missing as f32);
+                log_scalar(&mut tb, "terminal/rule_draw", iteration, report.terminal_rule_draw as f32);
+                log_scalar(&mut tb, "terminal/rule_draw_halfmove120", iteration, report.terminal_rule_draw_halfmove120 as f32);
+                log_scalar(&mut tb, "terminal/rule_draw_repetition", iteration, report.terminal_rule_draw_repetition as f32);
+                log_scalar(&mut tb, "terminal/rule_draw_mutual_long_check", iteration, report.terminal_rule_draw_mutual_long_check as f32);
+                log_scalar(&mut tb, "terminal/rule_draw_mutual_long_chase", iteration, report.terminal_rule_draw_mutual_long_chase as f32);
+                log_scalar(&mut tb, "terminal/rule_win_red", iteration, report.terminal_rule_win_red as f32);
+                log_scalar(&mut tb, "terminal/rule_win_black", iteration, report.terminal_rule_win_black as f32);
+                log_scalar(&mut tb, "terminal/max_plies", iteration, report.terminal_max_plies as f32);
+                if config.arena_interval > 0 && iteration % config.arena_interval == 0 {
+                    let arena = run_arena_processes(
+                        &config.model_path,
+                        best_path.to_str().unwrap_or_else(|| {
+                            panic!("best model path is not valid UTF-8")
+                        }),
+                        config.arena_games_per_side,
+                        config.simulations,
+                        config.top_k,
+                        config.max_plies,
+                        config.arena_processes,
+                        config.seed ^ (iteration as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    );
+                    let promoted = arena.score()
+                        > config.arena_games_per_side as f32;
+                    if promoted {
+                        fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
+                            panic!(
+                                "failed to promote `{}` to `{}`: {err}",
+                                config.model_path,
+                                best_path.display()
+                            );
+                        });
+                    }
+                    println!(
+                        "arena {iteration:04}: total={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} best={}{}",
+                        arena.total_games(),
+                        arena.wins,
+                        arena.losses,
+                        arena.draws,
+                        arena.wins_as_red,
+                        arena.losses_as_red,
+                        arena.wins_as_black,
+                        arena.losses_as_black,
+                        arena.score(),
+                        best_path.display(),
+                        if promoted { " promoted=current" } else { "" }
+                    );
+                    log_scalar(&mut tb, "arena/wins", iteration, arena.wins as f32);
+                    log_scalar(&mut tb, "arena/losses", iteration, arena.losses as f32);
+                    log_scalar(&mut tb, "arena/draws", iteration, arena.draws as f32);
+                    log_scalar(&mut tb, "arena/score", iteration, arena.score());
+                    log_scalar(&mut tb, "arena/win_rate", iteration, arena.wins as f32 / arena.total_games().max(1) as f32);
+                    log_scalar(&mut tb, "arena/wins_as_red", iteration, arena.wins_as_red as f32);
+                    log_scalar(&mut tb, "arena/losses_as_red", iteration, arena.losses_as_red as f32);
+                    log_scalar(&mut tb, "arena/wins_as_black", iteration, arena.wins_as_black as f32);
+                    log_scalar(&mut tb, "arena/losses_as_black", iteration, arena.losses_as_black as f32);
+                    log_scalar(&mut tb, "arena/promoted", iteration, if promoted { 1.0 } else { 0.0 });
+                }
             }
+        }
+        Some("az-arena-worker") => {
+            let candidate_path = args.next().unwrap_or_else(|| {
+                panic!("usage: az-arena-worker <candidate> <baseline> <red_games> <black_games> <simulations> <top_k> <max_plies> <seed>")
+            });
+            let baseline_path = args.next().unwrap_or_else(|| {
+                panic!("usage: az-arena-worker <candidate> <baseline> <red_games> <black_games> <simulations> <top_k> <max_plies> <seed>")
+            });
+            let red_games = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let black_games = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let simulations = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(512)
+                .max(1);
+            let top_k = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(16)
+                .max(1);
+            let max_plies = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(300)
+                .max(1);
+            let seed = args
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let candidate = AzNnue::load_text(&candidate_path).unwrap_or_else(|err| {
+                panic!("failed to load `{candidate_path}`: {err}");
+            });
+            let baseline = AzNnue::load_text(&baseline_path).unwrap_or_else(|err| {
+                panic!("failed to load `{baseline_path}`: {err}");
+            });
+            let report = play_arena_games(
+                &candidate,
+                &baseline,
+                simulations,
+                top_k,
+                max_plies,
+                red_games,
+                black_games,
+                seed,
+            );
+            println!(
+                "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={}",
+                report.wins,
+                report.losses,
+                report.draws,
+                report.wins_as_red,
+                report.losses_as_red,
+                report.wins_as_black,
+                report.losses_as_black
+            );
         }
         Some("perft") => {
             let depth = args
@@ -404,10 +740,18 @@ struct AzLoopFileConfig {
     replay_games: usize,
     replay_samples: usize,
     mirror_probability: f32,
+    checkpoint_interval: usize,
+    checkpoint_dir: String,
+    max_checkpoints: usize,
+    arena_interval: usize,
+    arena_games_per_side: usize,
+    arena_processes: usize,
+    tensorboard_logdir: String,
 }
 
 impl Default for AzLoopFileConfig {
     fn default() -> Self {
+        let default_workers = default_parallel_workers();
         Self {
             model_path: "chineseai.nnue.txt".into(),
             iterations: 100,
@@ -419,10 +763,10 @@ impl Default for AzLoopFileConfig {
             batch_size: 256,
             max_plies: 300,
             hidden_size: 128,
-            trunk_depth: 6,
+            trunk_depth: 2,
             seed: 20260409,
-            workers: 8,
-            train_workers: 4,
+            workers: default_workers,
+            train_workers: default_workers,
             temperature_start: 1.0,
             temperature_end: 0.2,
             temperature_decay_plies: 40,
@@ -431,6 +775,13 @@ impl Default for AzLoopFileConfig {
             replay_games: 5000,
             replay_samples: 0,
             mirror_probability: 0.3,
+            checkpoint_interval: 20,
+            checkpoint_dir: "checkpoints".into(),
+            max_checkpoints: 50,
+            arena_interval: 20,
+            arena_games_per_side: 50,
+            arena_processes: default_workers,
+            tensorboard_logdir: "runs/chineseai".into(),
         }
     }
 }
@@ -455,12 +806,20 @@ impl AzLoopFileConfig {
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
 #   batch_size=256 is the default; lower it if memory is tight, raise it if loss is noisy.
+#   workers/train_workers default to about all logical CPUs minus one.
 #   train_workers splits each training batch across CPU threads and synchronizes gradients once.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
 # Augmentation:
 #   mirror_probability mirrors board files a<->i for this fraction of training samples.
 #   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
+#
+# Checkpoints & Arena:
+#   checkpoint_interval saves a timestamp-free numbered copy every N iterations.
+#   max_checkpoints keeps only the newest N checkpoint files in checkpoint_dir.
+#   arena_interval runs current-vs-best evaluation every N iterations.
+#   arena_games_per_side=50 means 50 games as Red and 50 as Black.
+#   tensorboard_logdir stores TensorBoard event files for training and arena metrics.
 
 model_path = {model_path}
 iterations = {iterations}
@@ -484,6 +843,13 @@ td_lambda = {td_lambda}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
+checkpoint_interval = {checkpoint_interval}
+checkpoint_dir = {checkpoint_dir}
+max_checkpoints = {max_checkpoints}
+arena_interval = {arena_interval}
+arena_games_per_side = {arena_games_per_side}
+arena_processes = {arena_processes}
+tensorboard_logdir = {tensorboard_logdir}
 "#,
             model_path = self.model_path,
             iterations = self.iterations,
@@ -507,6 +873,13 @@ mirror_probability = {mirror_probability}
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
+            checkpoint_interval = self.checkpoint_interval,
+            checkpoint_dir = self.checkpoint_dir,
+            max_checkpoints = self.max_checkpoints,
+            arena_interval = self.arena_interval,
+            arena_games_per_side = self.arena_games_per_side,
+            arena_processes = self.arena_processes,
+            tensorboard_logdir = self.tensorboard_logdir,
         )
     }
 
@@ -562,6 +935,21 @@ mirror_probability = {mirror_probability}
             "mirror_probability" => {
                 self.mirror_probability = parse_config_value(value, self.mirror_probability)
             }
+            "checkpoint_interval" => {
+                self.checkpoint_interval = parse_config_value(value, self.checkpoint_interval)
+            }
+            "checkpoint_dir" => self.checkpoint_dir = value.to_string(),
+            "max_checkpoints" => {
+                self.max_checkpoints = parse_config_value(value, self.max_checkpoints)
+            }
+            "arena_interval" => self.arena_interval = parse_config_value(value, self.arena_interval),
+            "arena_games_per_side" => {
+                self.arena_games_per_side = parse_config_value(value, self.arena_games_per_side)
+            }
+            "arena_processes" => {
+                self.arena_processes = parse_config_value(value, self.arena_processes)
+            }
+            "tensorboard_logdir" => self.tensorboard_logdir = value.to_string(),
             _ => {}
         }
     }
@@ -582,6 +970,9 @@ mirror_probability = {mirror_probability}
         self.gumbel_scale = self.gumbel_scale.max(0.0);
         self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
+        self.max_checkpoints = self.max_checkpoints.max(1);
+        self.arena_games_per_side = self.arena_games_per_side.max(1);
+        self.arena_processes = self.arena_processes.max(1);
         self
     }
 }
@@ -666,15 +1057,13 @@ fn run_uci() {
                 state.position = Position::startpos();
                 state.history.clear();
                 state.rule_history = state.position.initial_rule_history();
+                state.seed = 20260409;
                 ulog!(logger, "[ucinewgame] reset to startpos");
             }
             Some("setoption") => handle_setoption(line, &mut state),
             Some("position") => handle_position(line, &mut state, &mut logger),
             Some("go") => handle_go(line, &mut state, &mut logger),
-            Some("stop") => {
-                println!("bestmove 0000");
-                uci_flush();
-            }
+            Some("stop") => {}
             Some("quit") => {
                 ulog!(logger, "=== UCI session ended ===");
                 break;
