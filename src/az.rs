@@ -1830,23 +1830,20 @@ impl<'a> AzTree<'a> {
     }
 
     fn select_child(&self, node_index: usize) -> usize {
-        let policy = self.improved_policy(node_index);
-        let total_visits = self.nodes[node_index]
+        let completed_q = self.completed_qvalues(node_index);
+        self.nodes[node_index]
             .children
             .iter()
-            .map(|child| child.visits)
-            .sum::<u32>() as f32;
-        let mut best = 0usize;
-        let mut best_score = f32::NEG_INFINITY;
-        for (index, child) in self.nodes[node_index].children.iter().enumerate() {
-            let visited_fraction = child.visits as f32 / (1.0 + total_visits);
-            let score = policy[index] - visited_fraction;
-            if score > best_score {
-                best_score = score;
-                best = index;
-            }
-        }
-        best
+            .enumerate()
+            .max_by(|(left_index, left_child), (right_index, right_child)| {
+                let left_score = left_child.prior_logit + completed_q[*left_index];
+                let right_score = right_child.prior_logit + completed_q[*right_index];
+                left_score
+                    .total_cmp(&right_score)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0)
     }
 
     fn select_root_child(
@@ -3539,6 +3536,35 @@ mod tests {
         let mut qvalues = vec![0.5, 0.5, 0.5];
         rescale_completed_qvalues_mctx(&mut qvalues);
         assert_eq!(qvalues, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn non_root_selection_uses_logits_plus_q_without_visit_penalty() {
+        let model = AzNnue::random_with_depth(4, 1, 19);
+        let mut tree = AzTree::new(Position::startpos(), Vec::new(), None, None, &model);
+        tree.nodes[0].expanded = true;
+        tree.nodes[0].value = 0.5;
+        tree.nodes[0].children = vec![
+            AzChild {
+                mv: Move::new(0, 9),
+                prior: 0.5,
+                prior_logit: 0.0,
+                visits: 5,
+                value_sum: 2.5,
+                child: None,
+            },
+            AzChild {
+                mv: Move::new(1, 10),
+                prior: 0.5,
+                prior_logit: -0.1,
+                visits: 0,
+                value_sum: 0.0,
+                child: None,
+            },
+        ];
+
+        assert_eq!(tree.completed_qvalues(0), vec![0.0, 0.0]);
+        assert_eq!(tree.select_child(0), 0);
     }
 
     #[test]
