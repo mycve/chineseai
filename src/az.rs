@@ -265,6 +265,7 @@ impl AzGrad {
         self.hidden_bias.fill(0.0);
         self.trunk_weights.fill(0.0);
         self.trunk_biases.fill(0.0);
+        self.trunk_global_weights.fill(0.0);
         self.global_hidden.fill(0.0);
         self.global_bias.fill(0.0);
         self.value_intermediate_hidden.fill(0.0);
@@ -1239,5 +1240,14 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.game_count(), pool.game_count());
         assert_eq!(loaded.sample_count(), pool.sample_count());
+    }
+
+    #[test]
+    fn az_grad_clear_resets_trunk_global_weights() {
+        let model = AzNnue::random_with_depth(16, 2, 7);
+        let mut grad = AzGrad::new(&model);
+        grad.trunk_global_weights.fill(1.0);
+        grad.clear();
+        assert!(grad.trunk_global_weights.iter().all(|value| *value == 0.0));
     }
 }

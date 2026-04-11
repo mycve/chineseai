@@ -369,14 +369,21 @@ impl<'a> AzTree<'a> {
     }
 
     fn select_child(&self, node_index: usize) -> usize {
-        let completed_q = self.completed_qvalues(node_index);
+        let improved_policy = self.improved_policy(node_index);
+        let total_visits = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.visits)
+            .sum::<u32>() as f32;
         self.nodes[node_index]
             .children
             .iter()
             .enumerate()
             .max_by(|(left_index, left_child), (right_index, right_child)| {
-                let left_score = left_child.prior_logit + completed_q[*left_index];
-                let right_score = right_child.prior_logit + completed_q[*right_index];
+                let left_score = improved_policy[*left_index]
+                    - left_child.visits as f32 / (1.0 + total_visits);
+                let right_score = improved_policy[*right_index]
+                    - right_child.visits as f32 / (1.0 + total_visits);
                 left_score
                     .total_cmp(&right_score)
                     .then_with(|| right_index.cmp(left_index))
@@ -613,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn non_root_selection_uses_logits_plus_q_without_visit_penalty() {
+    fn non_root_selection_uses_mctx_visit_penalty() {
         let model = AzNnue::random_with_depth(4, 1, 19);
         let mut tree = AzTree::new(Position::startpos(), Vec::new(), None, None, &model);
         tree.nodes[0].expanded = true;
@@ -630,7 +637,7 @@ mod tests {
             AzChild {
                 mv: Move::new(1, 10),
                 prior: 0.5,
-                prior_logit: -0.1,
+                prior_logit: 0.0,
                 visits: 0,
                 value_sum: 0.0,
                 child: None,
@@ -638,7 +645,8 @@ mod tests {
         ];
 
         assert_eq!(tree.completed_qvalues(0), vec![0.0, 0.0]);
-        assert_eq!(tree.select_child(0), 0);
+        assert_eq!(tree.improved_policy(0), vec![0.5, 0.5]);
+        assert_eq!(tree.select_child(0), 1);
     }
 
     #[test]
