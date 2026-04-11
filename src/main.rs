@@ -16,7 +16,7 @@ use std::{
     fs,
     io::{self, BufRead, BufWriter, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -237,15 +237,16 @@ fn run_arena_processes(
         panic!("failed to locate current executable: {err}");
     });
     let mut merged = AzArenaReport::default();
-    let mut children = Vec::new();
+    let mut children: Vec<(usize, Child)> = Vec::new();
     for index in 0..process_count {
-        let red_games = games_per_side / process_count + usize::from(index < games_per_side % process_count);
+        let red_games =
+            games_per_side / process_count + usize::from(index < games_per_side % process_count);
         let black_games =
             games_per_side / process_count + usize::from(index < games_per_side % process_count);
         if red_games == 0 && black_games == 0 {
             continue;
         }
-        let output = Command::new(&exe)
+        let child = Command::new(&exe)
             .arg("az-arena-worker")
             .arg(candidate_path)
             .arg(baseline_path)
@@ -257,20 +258,25 @@ fn run_arena_processes(
             .arg(arena_gumbel_scale.to_string())
             .arg(arena_gumbel_plies.to_string())
             .arg((seed ^ index as u64).to_string())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap_or_else(|err| {
                 panic!("failed to spawn arena worker process: {err}");
             });
+        children.push((index, child));
+    }
+
+    for (index, child) in children {
+        let output = child.wait_with_output().unwrap_or_else(|err| {
+            panic!("failed to wait for arena worker {index}: {err}");
+        });
         if !output.status.success() {
             panic!(
-                "arena worker failed: {}",
+                "arena worker {index} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        children.push(output);
-    }
-
-    for output in children {
         let text = String::from_utf8_lossy(&output.stdout);
         merged.add_assign(&parse_arena_report(&text));
     }
