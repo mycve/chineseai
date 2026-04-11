@@ -4,11 +4,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use chineseai::{
     az::{
-        AZNNUE_FORMAT, AzArenaReport, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits,
+        AzArenaReport, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits,
         benchmark_training, gumbel_search, gumbel_search_with_history_and_rules, play_arena_games,
         selfplay_train_iteration_with_pool,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
+    pikafish_match::run_vs_pikafish,
     xiangqi::{Position, RuleHistoryEntry, STARTPOS_FEN},
 };
 use std::{
@@ -16,7 +17,11 @@ use std::{
     io::{self, BufRead, BufWriter, Write},
     path::{Path, PathBuf},
     process::Command,
-    };
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 // ---------------------------------------------------------------------------
@@ -76,11 +81,100 @@ fn best_model_path(model_path: &str) -> PathBuf {
     PathBuf::from(format!("{model_path}.best"))
 }
 
+/// `{config_path}.progress` — 记录下一轮应使用的全局 `iteration`（TensorBoard / checkpoint / 日志连续）。
+fn az_loop_progress_path(config_path: &str) -> PathBuf {
+    PathBuf::from(format!("{config_path}.progress"))
+}
+
+fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
+    PathBuf::from(format!("{config_path}.replay.lz4"))
+}
+
+fn read_az_loop_next_iteration(config_path: &str) -> Option<usize> {
+    let path = az_loop_progress_path(config_path);
+    let text = fs::read_to_string(&path).ok()?;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "next_iteration" {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn write_az_loop_next_iteration(config_path: &str, next: usize) {
+    let path = az_loop_progress_path(config_path);
+    fs::write(&path, format!("next_iteration={next}\n")).unwrap_or_else(|err| {
+        panic!(
+            "failed to write resume cursor `{}`: {err}",
+            path.display()
+        );
+    });
+}
+
+/// 将 `tensorboard_logdir` 作为**根目录**，其下追加由训练超参编码的子目录名（仅 `a-z0-9_`，`p`/`m` 代替 `.`/`-`），便于 Web 对照实验。
+fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
+    fn f32_slug(x: f32) -> String {
+        if x == 0.0 {
+            return "0".to_string();
+        }
+        let s = format!("{:.8}", x)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+        if s.is_empty() || s == "-" {
+            return "0".to_string();
+        }
+        s.replace('.', "p").replace('-', "m")
+    }
+
+    format!(
+        concat!(
+            "it{}_g{}_sim{}_tk{}_bs{}_lr{}_ep{}_h{}_d{}_mxp{}_wk{}_",
+            "gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_cpi{}_",
+            "ai{}_ags{}_agp{}_sd{}"
+        ),
+        config.iterations,
+        config.games,
+        config.simulations,
+        config.top_k,
+        config.batch_size,
+        f32_slug(config.lr),
+        config.epochs,
+        config.hidden_size,
+        config.trunk_depth,
+        config.max_plies,
+        config.workers,
+        f32_slug(config.gumbel_scale),
+        f32_slug(config.temperature_start),
+        f32_slug(config.temperature_end),
+        config.temperature_decay_plies,
+        config.replay_games,
+        config.replay_samples,
+        f32_slug(config.mirror_probability),
+        config.checkpoint_interval,
+        config.arena_interval,
+        f32_slug(config.arena_gumbel_scale),
+        config.arena_gumbel_plies,
+        config.seed,
+    )
+}
+
+fn tensorboard_effective_logdir(config: &AzLoopFileConfig) -> PathBuf {
+    Path::new(&config.tensorboard_logdir).join(tensorboard_encoded_subdir(config))
+}
+
 fn checkpoint_path(model_path: &str, checkpoint_dir: &str, iteration: usize) -> PathBuf {
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue.txt");
+        .unwrap_or("model.nnue");
     Path::new(checkpoint_dir).join(format!("iter-{iteration:04}-{base}"))
 }
 
@@ -106,7 +200,7 @@ fn prune_old_checkpoints(
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue.txt")
+        .unwrap_or("model.nnue")
         .to_string();
     let prefix = "iter-";
     let suffix = format!("-{base}");
@@ -133,6 +227,8 @@ fn run_arena_processes(
     simulations: usize,
     top_k: usize,
     max_plies: usize,
+    arena_gumbel_scale: f32,
+    arena_gumbel_plies: usize,
     process_count: usize,
     seed: u64,
 ) -> AzArenaReport {
@@ -158,6 +254,8 @@ fn run_arena_processes(
             .arg(simulations.to_string())
             .arg(top_k.to_string())
             .arg(max_plies.to_string())
+            .arg(arena_gumbel_scale.to_string())
+            .arg(arena_gumbel_plies.to_string())
             .arg((seed ^ index as u64).to_string())
             .output()
             .unwrap_or_else(|err| {
@@ -204,6 +302,36 @@ fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
 
+fn az_arena_worker_next_usize(
+    args: &mut impl Iterator<Item = String>,
+    field: &'static str,
+) -> usize {
+    let text = args.next().unwrap_or_else(|| {
+        panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
+    });
+    text.parse().unwrap_or_else(|_| {
+        panic!("az-arena-worker: `{field}` must be usize, got {text:?}")
+    })
+}
+
+fn az_arena_worker_next_f32(args: &mut impl Iterator<Item = String>, field: &'static str) -> f32 {
+    let text = args.next().unwrap_or_else(|| {
+        panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
+    });
+    text.parse().unwrap_or_else(|_| {
+        panic!("az-arena-worker: `{field}` must be f32, got {text:?}")
+    })
+}
+
+fn az_arena_worker_next_u64(args: &mut impl Iterator<Item = String>, field: &'static str) -> u64 {
+    let text = args.next().unwrap_or_else(|| {
+        panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
+    });
+    text.parse().unwrap_or_else(|_| {
+        panic!("az-arena-worker: `{field}` must be u64, got {text:?}")
+    })
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -214,7 +342,7 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(128);
-            let output = args.next().unwrap_or_else(|| "chineseai.nnue.txt".into());
+            let output = args.next().unwrap_or_else(|| "chineseai.nnue".into());
             let seed = args
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -224,14 +352,13 @@ fn main() {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(2);
             let model = AzNnue::random_with_depth(hidden, trunk_depth, seed);
-            model.save_text(&output).unwrap_or_else(|err| {
+            model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
-            println!("aznnue   : initialized");
+            println!("aznnue   : initialized (nnue binary, magic AZB1)");
             println!("hidden   : {hidden}");
             println!("depth    : {trunk_depth}");
             println!("seed     : {seed}");
-            println!("format   : {AZNNUE_FORMAT}");
             println!("output   : {output}");
         }
         Some("az-gumbel") => {
@@ -253,7 +380,7 @@ fn main() {
                 .max(0.0);
             let fen = args.collect::<Vec<_>>().join(" ");
             let position = parse_position(&fen);
-            let model = AzNnue::load_text(&model_path).unwrap_or_else(|err| {
+            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
             let result = gumbel_search(
@@ -337,7 +464,7 @@ fn main() {
                 .max(0.0);
             let fen = args.collect::<Vec<_>>().join(" ");
             let position = parse_position(&fen);
-            let model = AzNnue::load_text(&model_path).unwrap_or_else(|err| {
+            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
 
@@ -413,7 +540,7 @@ fn main() {
             let batch_size = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(256)
+                .unwrap_or(1024)
                 .max(1);
             let lr = args
                 .next()
@@ -424,7 +551,7 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(20260411);
-            let mut model = AzNnue::load_text(&model_path).unwrap_or_else(|err| {
+            let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
             let started = std::time::Instant::now();
@@ -449,15 +576,25 @@ fn main() {
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
+            let start_iteration = read_az_loop_next_iteration(&config_path)
+                .unwrap_or(1)
+                .max(1);
+            if start_iteration > 1 {
+                println!(
+                    "resume   : global_iteration starts at {} (from `{}`)",
+                    start_iteration,
+                    az_loop_progress_path(&config_path).display()
+                );
+            }
             let best_path = best_model_path(&config.model_path);
 
             let mut model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
-                match AzNnue::load_text(&config.model_path) {
+                match AzNnue::load(&config.model_path) {
                     Ok(model) => model,
                     Err(err) => {
                         println!(
-                            "model    : reinit {} as {AZNNUE_FORMAT} ({err})",
+                            "model    : reinit {} as random nnue ({err})",
                             config.model_path
                         );
                         AzNnue::random_with_depth(
@@ -471,18 +608,53 @@ fn main() {
                 println!("model    : init {}", config.model_path);
                 AzNnue::random_with_depth(config.hidden_size, config.trunk_depth, config.seed)
             };
+            let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_games > 0).then(|| AzExperiencePool::new(config.replay_games));
-            fs::create_dir_all(&config.tensorboard_logdir).unwrap_or_else(|err| {
+            if config.replay_games > 0 && replay_snapshot_path.exists() {
+                match AzExperiencePool::load_snapshot_lz4(&replay_snapshot_path, config.replay_games)
+                {
+                    Ok(pool) => {
+                        fs::remove_file(&replay_snapshot_path).unwrap_or_else(|err| {
+                            panic!(
+                                "failed to remove replay snapshot `{}`: {err}",
+                                replay_snapshot_path.display()
+                            );
+                        });
+                        println!(
+                            "replay   : restored {} games / {} samples from `{}` (file removed)",
+                            pool.game_count(),
+                            pool.sample_count(),
+                            replay_snapshot_path.display()
+                        );
+                        replay_pool = Some(pool);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "replay   : corrupt snapshot `{}`: {err}; removing",
+                            replay_snapshot_path.display()
+                        );
+                        let _ = fs::remove_file(&replay_snapshot_path);
+                    }
+                }
+            }
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let interrupted_flag = interrupted.clone();
+            ctrlc::set_handler(move || {
+                interrupted_flag.store(true, Ordering::SeqCst);
+            })
+            .unwrap_or_else(|err| panic!("failed to register Ctrl+C handler: {err}"));
+            let tb_dir = tensorboard_effective_logdir(&config);
+            fs::create_dir_all(&tb_dir).unwrap_or_else(|err| {
                 panic!(
                     "failed to create tensorboard log dir `{}`: {err}",
-                    config.tensorboard_logdir
+                    tb_dir.display()
                 );
             });
-            let mut tb = SummaryWriter::new(&config.tensorboard_logdir);
+            let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_processes={} tb={}",
+                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_gumbel_scale={} arena_gumbel_plies={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.iterations,
                 config.games,
@@ -498,7 +670,6 @@ fn main() {
                 config.temperature_decay_plies,
                 config.gumbel_scale,
                 config.trunk_depth,
-                config.td_lambda,
                 config.replay_games,
                 config.replay_samples,
                 config.mirror_probability,
@@ -506,10 +677,33 @@ fn main() {
                 config.max_checkpoints,
                 config.arena_interval,
                 config.arena_games_per_side,
+                config.arena_gumbel_scale,
+                config.arena_gumbel_plies,
                 config.arena_processes,
-                config.tensorboard_logdir
+                config.tensorboard_logdir,
+                tensorboard_encoded_subdir(&config)
             );
-            for iteration in 1..=config.iterations {
+            let mut exited_after_ctrl_c = false;
+            for offset in 0..config.iterations {
+                if interrupted.load(Ordering::SeqCst) {
+                    if let Some(ref pool) = replay_pool {
+                        match pool.save_snapshot_lz4(&replay_snapshot_path) {
+                            Ok(()) => {
+                                if pool.game_count() > 0 {
+                                    println!(
+                                        "replay   : interrupt snapshot `{}` ({} games)",
+                                        replay_snapshot_path.display(),
+                                        pool.game_count()
+                                    );
+                                }
+                            }
+                            Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
+                        }
+                    }
+                    exited_after_ctrl_c = true;
+                    break;
+                }
+                let iteration = start_iteration + offset;
                 let started = std::time::Instant::now();
                 let report = selfplay_train_iteration_with_pool(
                     &mut model,
@@ -527,16 +721,16 @@ fn main() {
                         temperature_end: config.temperature_end,
                         temperature_decay_plies: config.temperature_decay_plies,
                         gumbel_scale: config.gumbel_scale,
-                        td_lambda: config.td_lambda,
                         replay_games: config.replay_games,
                         replay_samples: config.replay_samples,
                         mirror_probability: config.mirror_probability,
                     },
                     replay_pool.as_mut(),
                 );
-                model.save_text(&config.model_path).unwrap_or_else(|err| {
+                model.save(&config.model_path).unwrap_or_else(|err| {
                     panic!("failed to write `{}`: {err}", config.model_path);
                 });
+                write_az_loop_next_iteration(&config_path, iteration.saturating_add(1));
                 if !best_path.exists() {
                     fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
                         panic!(
@@ -641,6 +835,8 @@ fn main() {
                         config.simulations,
                         config.top_k,
                         config.max_plies,
+                        config.arena_gumbel_scale,
+                        config.arena_gumbel_plies,
                         config.arena_processes,
                         config.seed ^ (iteration as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     );
@@ -680,46 +876,51 @@ fn main() {
                     log_scalar(&mut tb, "arena/losses_as_black", iteration, arena.losses_as_black as f32);
                     log_scalar(&mut tb, "arena/promoted", iteration, if promoted { 1.0 } else { 0.0 });
                 }
+                if interrupted.load(Ordering::SeqCst) {
+                    if let Some(ref pool) = replay_pool {
+                        match pool.save_snapshot_lz4(&replay_snapshot_path) {
+                            Ok(()) => {
+                                if pool.game_count() > 0 {
+                                    println!(
+                                        "replay   : interrupt snapshot `{}` ({} games)",
+                                        replay_snapshot_path.display(),
+                                        pool.game_count()
+                                    );
+                                }
+                            }
+                            Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
+                        }
+                    }
+                    exited_after_ctrl_c = true;
+                    break;
+                }
+            }
+            if !exited_after_ctrl_c {
+                let _ = fs::remove_file(&replay_snapshot_path);
             }
         }
         Some("az-arena-worker") => {
             let candidate_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-arena-worker <candidate> <baseline> <red_games> <black_games> <simulations> <top_k> <max_plies> <seed>")
+                panic!("az-arena-worker: missing <candidate> (see help)")
             });
             let baseline_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-arena-worker <candidate> <baseline> <red_games> <black_games> <simulations> <top_k> <max_plies> <seed>")
+                panic!("az-arena-worker: missing <baseline>")
             });
-            let red_games = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            let black_games = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            let simulations = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(512)
-                .max(1);
-            let top_k = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(16)
-                .max(1);
-            let max_plies = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(300)
-                .max(1);
-            let seed = args
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0);
-            let candidate = AzNnue::load_text(&candidate_path).unwrap_or_else(|err| {
+            let red_games = az_arena_worker_next_usize(&mut args, "red_games");
+            let black_games = az_arena_worker_next_usize(&mut args, "black_games");
+            let simulations = az_arena_worker_next_usize(&mut args, "simulations").max(1);
+            let top_k = az_arena_worker_next_usize(&mut args, "top_k").max(1);
+            let max_plies = az_arena_worker_next_usize(&mut args, "max_plies").max(1);
+            let arena_gumbel_scale = az_arena_worker_next_f32(&mut args, "arena_gumbel_scale").max(0.0);
+            let arena_gumbel_plies = az_arena_worker_next_usize(&mut args, "arena_gumbel_plies");
+            let seed = az_arena_worker_next_u64(&mut args, "seed");
+            if args.next().is_some() {
+                panic!("az-arena-worker: trailing arguments (expected exactly 10 after candidate and baseline)");
+            }
+            let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
                 panic!("failed to load `{candidate_path}`: {err}");
             });
-            let baseline = AzNnue::load_text(&baseline_path).unwrap_or_else(|err| {
+            let baseline = AzNnue::load(&baseline_path).unwrap_or_else(|err| {
                 panic!("failed to load `{baseline_path}`: {err}");
             });
             let report = play_arena_games(
@@ -731,6 +932,8 @@ fn main() {
                 red_games,
                 black_games,
                 seed,
+                arena_gumbel_scale,
+                arena_gumbel_plies,
             );
             println!(
                 "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={}",
@@ -754,6 +957,71 @@ fn main() {
             println!("depth : {depth}");
             println!("nodes : {}", position.perft(depth));
         }
+        Some("vs-pikafish") => {
+            let pikafish_exe = args.next().unwrap_or_else(|| {
+                panic!(
+                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [movetime_ms] [games] [max_plies] [simulations] [top_k] [parallel_games]"
+                )
+            });
+            let model_path = args.next().unwrap_or_else(|| "chineseai.nnue".into());
+            let movetime_ms = args
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(10)
+                .max(1);
+            let games = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(20)
+                .max(1);
+            let max_plies = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(300)
+                .max(1);
+            let simulations = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(10_000)
+                .max(1);
+            let top_k = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(32)
+                .max(1);
+            let parallel_games = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(5)
+                .max(1);
+            let seed = 20260411_u64;
+            let summary = run_vs_pikafish(
+                Path::new(&pikafish_exe),
+                Path::new(&model_path),
+                movetime_ms,
+                games,
+                max_plies,
+                simulations,
+                top_k,
+                seed,
+                parallel_games,
+            )
+            .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
+            println!(
+                "vs-pikafish: games={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish movetime={}ms max_plies={} sims={} top_k={}",
+                summary.total_games,
+                parallel_games.min(games),
+                summary.chinese_wins,
+                summary.chinese_losses,
+                summary.draws,
+                summary.chinese_wins_as_red,
+                summary.chinese_wins_as_black,
+                movetime_ms,
+                max_plies,
+                simulations,
+                top_k
+            );
+        }
         Some("help") | _ => print_help(),
     }
 }
@@ -763,12 +1031,14 @@ fn print_help() {
     println!("ChineseAI AZ-NNUE Gumbel core");
     println!("start : {STARTPOS_FEN}");
     println!("moves : {}", position.legal_moves().len());
-    println!("hint  : cargo run --release -- az-init 128 chineseai.nnue.txt 20260409 2");
+    println!("hint  : cargo run --release -- az-init 128 chineseai.nnue 20260409 2");
     println!("hint  : cargo run --release -- uci");
-    println!("hint  : cargo run --release -- az-gumbel chineseai.nnue.txt 10000 32 0.0 startpos");
-    println!("hint  : cargo run --release -- az-bench chineseai.nnue.txt 512 32 100 0.0 startpos");
-    println!("hint  : cargo run --release -- az-train-bench chineseai.nnue.txt 8192 2 256 0.0003");
+    println!("hint  : cargo run --release -- az-gumbel chineseai.nnue 10000 32 0.0 startpos");
+    println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 32 100 0.0 startpos");
+    println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
+    println!("hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <top_k> <max_plies> <arena_gumbel_scale> <arena_gumbel_plies> <seed>");
+    println!("hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 32 5");
 }
 
 #[derive(Clone, Debug)]
@@ -790,7 +1060,6 @@ struct AzLoopFileConfig {
     temperature_end: f32,
     temperature_decay_plies: usize,
     gumbel_scale: f32,
-    td_lambda: f32,
     replay_games: usize,
     replay_samples: usize,
     mirror_probability: f32,
@@ -799,6 +1068,8 @@ struct AzLoopFileConfig {
     max_checkpoints: usize,
     arena_interval: usize,
     arena_games_per_side: usize,
+    arena_gumbel_scale: f32,
+    arena_gumbel_plies: usize,
     arena_processes: usize,
     tensorboard_logdir: String,
 }
@@ -807,24 +1078,23 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         let default_workers = default_parallel_workers();
         Self {
-            model_path: "chineseai.nnue.txt".into(),
+            model_path: "chineseai.nnue".into(),
             iterations: 100,
             games: 400,
             simulations: 512,
             top_k: 16,
             epochs: 2,
             lr: 0.0003,
-            batch_size: 256,
+            batch_size: 1024,
             max_plies: 300,
             hidden_size: 128,
             trunk_depth: 2,
             seed: 20260409,
             workers: default_workers,
             temperature_start: 1.0,
-            temperature_end: 0.2,
-            temperature_decay_plies: 40,
+            temperature_end: 0.1,
+            temperature_decay_plies: 30,
             gumbel_scale: 1.0,
-            td_lambda: 0.75,
             replay_games: 5000,
             replay_samples: 0,
             mirror_probability: 0.3,
@@ -833,6 +1103,8 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 20,
             arena_games_per_side: 50,
+            arena_gumbel_scale: 1.0,
+            arena_gumbel_plies: 8,
             arena_processes: default_workers,
             tensorboard_logdir: "runs/chineseai".into(),
         }
@@ -845,20 +1117,27 @@ impl AzLoopFileConfig {
             r#"# ChineseAI AZ self-play training config.
 # Run: ./target/release/chineseai az-loop {DEFAULT_AZ_LOOP_CONFIG}
 #
-# TD(lambda):
-#   1.0 = pure final game result, least bootstrap bias but slowest target propagation.
-#   0.95 = better default for long Xiangqi games; keeps terminal signal alive much longer.
-#   0.8 = leans heavily on bootstrap and can collapse early-ply targets toward 0 in 70+ ply games.
-#   0.0 = pure search bootstrap, fastest but most biased by current weak model.
+# model_path: AzNnue binary (magic AZB1, little-endian f32), e.g. chineseai.nnue
+#
+# Value targets (AlphaZero-style): each training position uses only the final game outcome,
+# encoded from the side-to-move at that position (via side_sign × game_result). MCTS root
+# is not mixed into the value label.
+#
+# Self-play policy temperature (linear in ply index, 0-based before each search):
+#   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
+#   Defaults: 1.0 -> 0.1 by ply 30 (sharper sampling than 0.2@40); raise decay_plies if openings collapse.
 #
 # Replay:
 #   replay_games keeps the most recent N complete games in memory.
 #   replay_samples=0 trains on about the same number of positions as newly generated this iteration.
 #   set replay_samples larger, e.g. 200000, to train more from the pool per iteration.
+#   Ctrl+C writes "<this_conf_filename>.replay.lz4" (LZ4); next az-loop loads it into the pool then
+#   deletes the file. A full run without interrupt removes any leftover snapshot at exit.
+#   Replay snapshot format is versioned; older .replay.lz4 files from previous formats are rejected.
 #
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
-#   batch_size=256 is the default; lower it if memory is tight, raise it if loss is noisy.
+#   batch_size=1024 is the default; lower it if memory is tight, raise it if loss is noisy.
 #   workers defaults to about all logical CPUs minus one.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
@@ -867,11 +1146,16 @@ impl AzLoopFileConfig {
 #   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
 #
 # Checkpoints & Arena:
+#   Training appends "<this_conf_filename>.progress" with next_iteration=... after each global iter.
+#   Delete that file to reset the global iteration counter to 1 (TensorBoard/checkpoint numbering).
 #   checkpoint_interval saves a timestamp-free numbered copy every N iterations.
 #   max_checkpoints keeps only the newest N checkpoint files in checkpoint_dir.
 #   arena_interval runs current-vs-best evaluation every N iterations.
 #   arena_games_per_side=50 means 50 games as Red and 50 as Black.
-#   tensorboard_logdir stores TensorBoard event files for training and arena metrics.
+#   arena_gumbel_scale: root Gumbel noise for the first arena_gumbel_plies half-moves only (then 0).
+#   arena_gumbel_plies=0 means no opening noise (fully deterministic).
+#   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*, g_*,
+#   sim_*, bs_*, lr_*, … so TensorBoard Web can compare experiments side by side.
 
 model_path = {model_path}
 iterations = {iterations}
@@ -890,7 +1174,6 @@ temperature_start = {temperature_start}
 temperature_end = {temperature_end}
 temperature_decay_plies = {temperature_decay_plies}
 gumbel_scale = {gumbel_scale}
-td_lambda = {td_lambda}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
@@ -899,6 +1182,8 @@ checkpoint_dir = {checkpoint_dir}
 max_checkpoints = {max_checkpoints}
 arena_interval = {arena_interval}
 arena_games_per_side = {arena_games_per_side}
+arena_gumbel_scale = {arena_gumbel_scale}
+arena_gumbel_plies = {arena_gumbel_plies}
 arena_processes = {arena_processes}
 tensorboard_logdir = {tensorboard_logdir}
 "#,
@@ -919,7 +1204,6 @@ tensorboard_logdir = {tensorboard_logdir}
             temperature_end = self.temperature_end,
             temperature_decay_plies = self.temperature_decay_plies,
             gumbel_scale = self.gumbel_scale,
-            td_lambda = self.td_lambda,
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
@@ -928,6 +1212,8 @@ tensorboard_logdir = {tensorboard_logdir}
             max_checkpoints = self.max_checkpoints,
             arena_interval = self.arena_interval,
             arena_games_per_side = self.arena_games_per_side,
+            arena_gumbel_scale = self.arena_gumbel_scale,
+            arena_gumbel_plies = self.arena_gumbel_plies,
             arena_processes = self.arena_processes,
             tensorboard_logdir = self.tensorboard_logdir,
         )
@@ -974,7 +1260,6 @@ tensorboard_logdir = {tensorboard_logdir}
                     parse_config_value(value, self.temperature_decay_plies)
             }
             "gumbel_scale" => self.gumbel_scale = parse_config_value(value, self.gumbel_scale),
-            "td_lambda" => self.td_lambda = parse_config_value(value, self.td_lambda),
             "replay_games" => self.replay_games = parse_config_value(value, self.replay_games),
             "replay_samples" => {
                 self.replay_samples = parse_config_value(value, self.replay_samples)
@@ -992,6 +1277,12 @@ tensorboard_logdir = {tensorboard_logdir}
             "arena_interval" => self.arena_interval = parse_config_value(value, self.arena_interval),
             "arena_games_per_side" => {
                 self.arena_games_per_side = parse_config_value(value, self.arena_games_per_side)
+            }
+            "arena_gumbel_scale" => {
+                self.arena_gumbel_scale = parse_config_value(value, self.arena_gumbel_scale)
+            }
+            "arena_gumbel_plies" => {
+                self.arena_gumbel_plies = parse_config_value(value, self.arena_gumbel_plies)
             }
             "arena_processes" => {
                 self.arena_processes = parse_config_value(value, self.arena_processes)
@@ -1014,7 +1305,8 @@ tensorboard_logdir = {tensorboard_logdir}
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);
         self.gumbel_scale = self.gumbel_scale.max(0.0);
-        self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
+        self.arena_gumbel_scale = self.arena_gumbel_scale.max(0.0);
+        self.arena_gumbel_plies = self.arena_gumbel_plies.max(0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_games_per_side = self.arena_games_per_side.max(1);
@@ -1065,7 +1357,7 @@ impl Default for UciState {
             position: Position::startpos(),
             history: Vec::new(),
             rule_history: Position::startpos().initial_rule_history(),
-            eval_file: "chineseai.nnue.txt".into(),
+            eval_file: "chineseai.nnue".into(),
             model: None,
             simulations: 10_000,
             top_k: 32,
@@ -1122,7 +1414,7 @@ fn run_uci() {
 fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
-    println!("option name EvalFile type string default chineseai.nnue.txt");
+    println!("option name EvalFile type string default chineseai.nnue");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name TopK type spin default 32 min 1 max 256");
     println!("option name Threads type spin default 1 min 1 max 1");
@@ -1137,7 +1429,7 @@ fn ensure_uci_model(state: &mut UciState) {
     if state.model.is_some() {
         return;
     }
-    state.model = Some(AzNnue::load_text(&state.eval_file).unwrap_or_else(|err| {
+    state.model = Some(AzNnue::load(&state.eval_file).unwrap_or_else(|err| {
         println!(
             "info string failed to load {}, using random model: {}",
             state.eval_file, err

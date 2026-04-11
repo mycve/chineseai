@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Cursor, Read, Write};
+use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 use matrixmultiply::sgemm;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -16,15 +17,48 @@ use crate::xiangqi::{
     RuleOutcome,
 };
 
-pub const AZNNUE_FORMAT: &str = "aznnue-v14";
+/// 二进制权重文件头魔数（小端 `f32` 载荷，见 `save` / `load`）。
+pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
+const AZNNUE_BINARY_VERSION: u32 = 1;
+/// 魔数 4 + version/input/hidden/depth/reserved 各 4 字节。
+const AZNNUE_BINARY_HEADER_LEN: usize = 24;
+
+fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
+    for &value in slice {
+        writer.write_all(&value.to_bits().to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_u32_le(reader: &mut impl Read) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_f32_vec_le(reader: &mut impl Read, len: usize) -> io::Result<Vec<f32>> {
+    let mut out = vec![0.0f32; len];
+    let mut buf = [0u8; 4];
+    for slot in &mut out {
+        reader.read_exact(&mut buf)?;
+        *slot = f32::from_bits(u32::from_le_bytes(buf));
+    }
+    Ok(out)
+}
+
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 const GLOBAL_CONTEXT_SIZE: usize = 32;
 const VALUE_HIDDEN_SIZE: usize = 64;
 const VALUE_LOGITS: usize = 3;
-const VALUE_SCALE_CP: f32 = 800.0;
+const VALUE_SCALE_CP: f32 = 1000.0;
+/// `mctx.qtransforms.qtransform_completed_by_mix_value` 默认 `value_scale`。
 const COMPLETED_Q_VALUE_SCALE: f32 = 0.1;
+/// 同上默认 `maxvisit_init`。
 const COMPLETED_Q_MAXVISIT_INIT: f32 = 50.0;
+const COMPLETED_Q_RESCALE_EPSILON: f32 = 1e-8;
+/// `mctx.seq_halving.score_considered` 中的 `low_logit`。
+const SCORE_CONSIDERED_LOW_LOGIT: f32 = -1e9;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 const ADAMW_BETA1: f32 = 0.9;
 const ADAMW_BETA2: f32 = 0.999;
@@ -156,7 +190,6 @@ pub struct AzLoopConfig {
     pub temperature_end: f32,
     pub temperature_decay_plies: usize,
     pub gumbel_scale: f32,
-    pub td_lambda: f32,
     pub replay_games: usize,
     pub replay_samples: usize,
     pub mirror_probability: f32,
@@ -273,9 +306,6 @@ struct AzTrainingSample {
     policy: Vec<f32>,
     value: f32,
     side_sign: f32,
-    reward: f32,
-    discount: f32,
-    bootstrap_value: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -494,6 +524,114 @@ struct AzSelfplayData {
     terminal: AzTerminalStats,
 }
 
+/// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
+const REPLAY_MAGIC: &[u8] = b"AZRP";
+/// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
+const REPLAY_FILE_VERSION: u32 = 2;
+/// 解压后体积极限（防恶意或损坏文件占满内存）。
+const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
+const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
+const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
+
+fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn replay_push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn replay_push_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+fn replay_read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn replay_read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn replay_read_f32<R: Read>(reader: &mut R) -> io::Result<f32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(f32::from_bits(u32::from_le_bytes(buf)))
+}
+
+fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io::Result<()> {
+    if sample.features.len() > REPLAY_MAX_FEATURES_PER_SAMPLE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay encode: too many features",
+        ));
+    }
+    if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
+        || sample.policy.len() != sample.move_indices.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay encode: move_indices/policy mismatch or too long",
+        ));
+    }
+    replay_push_u32(out, sample.features.len() as u32);
+    for &f in &sample.features {
+        replay_push_u32(out, f as u32);
+    }
+    replay_push_u32(out, sample.move_indices.len() as u32);
+    for &m in &sample.move_indices {
+        replay_push_u32(out, m as u32);
+    }
+    for &p in &sample.policy {
+        replay_push_f32(out, p);
+    }
+    replay_push_f32(out, sample.value);
+    replay_push_f32(out, sample.side_sign);
+    Ok(())
+}
+
+fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
+    let nf = replay_read_u32(reader)?;
+    if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay decode: feature count out of range",
+        ));
+    }
+    let mut features = Vec::with_capacity(nf as usize);
+    for _ in 0..nf {
+        features.push(replay_read_u32(reader)? as usize);
+    }
+    let nm = replay_read_u32(reader)?;
+    if nm > REPLAY_MAX_MOVES_PER_SAMPLE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay decode: move count out of range",
+        ));
+    }
+    let mut move_indices = Vec::with_capacity(nm as usize);
+    for _ in 0..nm {
+        move_indices.push(replay_read_u32(reader)? as usize);
+    }
+    let mut policy = Vec::with_capacity(nm as usize);
+    for _ in 0..nm {
+        policy.push(replay_read_f32(reader)?);
+    }
+    let value = replay_read_f32(reader)?;
+    let side_sign = replay_read_f32(reader)?;
+    Ok(AzTrainingSample {
+        features,
+        move_indices,
+        policy,
+        value,
+        side_sign,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct AzExperiencePool {
     game_capacity: usize,
@@ -548,6 +686,129 @@ impl AzExperiencePool {
             samples.push(game[sample_index].clone());
         }
         samples
+    }
+
+    fn encode_replay_payload(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        replay_push_u64(&mut out, self.game_capacity as u64);
+        replay_push_u64(&mut out, self.games.len() as u64);
+        for game in &self.games {
+            replay_push_u64(&mut out, game.len() as u64);
+            for sample in game {
+                encode_az_training_sample(&mut out, sample)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn decode_replay_payload(data: &[u8], game_capacity: usize) -> io::Result<Self> {
+        let mut reader = Cursor::new(data);
+        let _stored_capacity = replay_read_u64(&mut reader)? as usize;
+        let n_games = replay_read_u64(&mut reader)? as usize;
+        if n_games > 10_000_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay decode: absurd game count",
+            ));
+        }
+        let mut games = VecDeque::with_capacity(n_games.min(game_capacity.max(1)));
+        let mut samples = 0usize;
+        for _ in 0..n_games {
+            let n_s = replay_read_u64(&mut reader)? as usize;
+            if n_s > 50_000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "replay decode: absurd samples per game",
+                ));
+            }
+            let mut game = Vec::with_capacity(n_s);
+            for _ in 0..n_s {
+                game.push(decode_az_training_sample(&mut reader)?);
+            }
+            samples += game.len();
+            games.push_back(game);
+        }
+        let mut pool = Self {
+            game_capacity,
+            games,
+            samples,
+        };
+        while pool.games.len() > pool.game_capacity {
+            if let Some(removed) = pool.games.pop_front() {
+                pool.samples = pool.samples.saturating_sub(removed.len());
+            }
+        }
+        Ok(pool)
+    }
+
+    /// 将当前池压缩为 LZ4 写入 `path`（先写临时文件再 rename）。池为空则删除 `path`。
+    pub fn save_snapshot_lz4(&self, path: &Path) -> io::Result<()> {
+        if self.game_capacity == 0 || self.games.is_empty() {
+            let _ = fs::remove_file(path);
+            return Ok(());
+        }
+        let inner = self.encode_replay_payload()?;
+        if inner.len() > REPLAY_MAX_DECOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "replay snapshot raw size {} exceeds {}",
+                    inner.len(),
+                    REPLAY_MAX_DECOMPRESSED_BYTES
+                ),
+            ));
+        }
+        let compressed = compress_prepend_size(&inner);
+        let mut file_blob = Vec::with_capacity(8 + compressed.len());
+        file_blob.extend_from_slice(REPLAY_MAGIC);
+        replay_push_u32(&mut file_blob, REPLAY_FILE_VERSION);
+        file_blob.extend_from_slice(&compressed);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        fs::write(&tmp, &file_blob)?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// 从 LZ4 快照恢复；调用方应在成功后删除文件。
+    pub fn load_snapshot_lz4(path: &Path, game_capacity: usize) -> io::Result<Self> {
+        let file_blob = fs::read(path)?;
+        if file_blob.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay file too small",
+            ));
+        }
+        if &file_blob[0..4] != REPLAY_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay bad magic",
+            ));
+        }
+        let ver = u32::from_le_bytes(file_blob[4..8].try_into().unwrap());
+        if ver != REPLAY_FILE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay unsupported version {ver} (only v{REPLAY_FILE_VERSION} is supported)"
+                ),
+            ));
+        }
+        let inner = decompress_size_prepended(&file_blob[8..]).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("replay lz4 decompress: {err:?}"),
+            )
+        })?;
+        if inner.len() > REPLAY_MAX_DECOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay decompressed size over cap",
+            ));
+        }
+        Self::decode_replay_payload(&inner, game_capacity)
     }
 }
 
@@ -613,143 +874,140 @@ impl AzNnue {
         }
     }
 
-    pub fn save_text(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let text = format!(
-            "format: {AZNNUE_FORMAT}\ninput_size: {V4_INPUT_SIZE}\nhidden_size: {}\ntrunk_depth: {}\ninput_hidden: {}\nhidden_bias: {}\ntrunk_weights: {}\ntrunk_biases: {}\ntrunk_global_weights: {}\nglobal_hidden: {}\nglobal_bias: {}\nvalue_intermediate_hidden: {}\nvalue_intermediate_global: {}\nvalue_intermediate_bias: {}\nvalue_logits_weights: {}\nvalue_logits_bias: {}\npolicy_move_hidden: {}\npolicy_move_global: {}\npolicy_move_bias: {}\n",
-            self.hidden_size,
-            self.trunk_depth,
-            format_floats(&self.input_hidden),
-            format_floats(&self.hidden_bias),
-            format_floats(&self.trunk_weights),
-            format_floats(&self.trunk_biases),
-            format_floats(&self.trunk_global_weights),
-            format_floats(&self.global_hidden),
-            format_floats(&self.global_bias),
-            format_floats(&self.value_intermediate_hidden),
-            format_floats(&self.value_intermediate_global),
-            format_floats(&self.value_intermediate_bias),
-            format_floats(&self.value_logits_weights),
-            format_floats(&self.value_logits_bias),
-            format_floats(&self.policy_move_hidden),
-            format_floats(&self.policy_move_global),
-            format_floats(&self.policy_move_bias),
-        );
-        fs::write(path, text)
+    /// 小端 `f32` 二进制（魔数 `AZB1`，约 **4×参数量** 字节）。
+    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let file = fs::File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(AZNNUE_BINARY_MAGIC)?;
+        writer.write_all(&AZNNUE_BINARY_VERSION.to_le_bytes())?;
+        writer.write_all(&(V4_INPUT_SIZE as u32).to_le_bytes())?;
+        writer.write_all(&(self.hidden_size as u32).to_le_bytes())?;
+        writer.write_all(&(self.trunk_depth as u32).to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?;
+        write_f32_slice_le(&mut writer, &self.input_hidden)?;
+        write_f32_slice_le(&mut writer, &self.hidden_bias)?;
+        write_f32_slice_le(&mut writer, &self.trunk_weights)?;
+        write_f32_slice_le(&mut writer, &self.trunk_biases)?;
+        write_f32_slice_le(&mut writer, &self.trunk_global_weights)?;
+        write_f32_slice_le(&mut writer, &self.global_hidden)?;
+        write_f32_slice_le(&mut writer, &self.global_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
+        write_f32_slice_le(&mut writer, &self.value_intermediate_global)?;
+        write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_move_hidden)?;
+        write_f32_slice_le(&mut writer, &self.policy_move_global)?;
+        write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
+        writer.flush()?;
+        Ok(())
     }
 
-    pub fn load_text(path: impl AsRef<Path>) -> io::Result<Self> {
-        let text = fs::read_to_string(path)?;
-        let mut model_format = None;
-        let mut input_size = None;
-        let mut hidden_size = None;
-        let mut trunk_depth = None;
-        let mut input_hidden = None;
-        let mut hidden_bias = None;
-        let mut trunk_weights = None;
-        let mut trunk_biases = None;
-        let mut trunk_global_weights = None;
-        let mut global_hidden = None;
-        let mut global_bias = None;
-        let mut value_intermediate_hidden = None;
-        let mut value_intermediate_global = None;
-        let mut value_intermediate_bias = None;
-        let mut value_logits_weights = None;
-        let mut value_logits_bias = None;
-        let mut policy_move_hidden = None;
-        let mut policy_move_global = None;
-        let mut policy_move_bias = None;
+    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        let bytes = fs::read(path.as_ref())?;
+        Self::decode_binary(&bytes)
+    }
 
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            let value = value.trim();
-            match key.trim() {
-                "format" => model_format = Some(value.to_string()),
-                "input_size" => input_size = value.parse::<usize>().ok(),
-                "hidden_size" => hidden_size = value.parse::<usize>().ok(),
-                "trunk_depth" => trunk_depth = value.parse::<usize>().ok(),
-                "input_hidden" => input_hidden = Some(parse_floats(value)?),
-                "hidden_bias" => hidden_bias = Some(parse_floats(value)?),
-                "trunk_weights" => trunk_weights = Some(parse_floats(value)?),
-                "trunk_biases" => trunk_biases = Some(parse_floats(value)?),
-                "trunk_global_weights" => trunk_global_weights = Some(parse_floats(value)?),
-                "global_hidden" => global_hidden = Some(parse_floats(value)?),
-                "global_bias" => global_bias = Some(parse_floats(value)?),
-                "value_intermediate_hidden" => value_intermediate_hidden = Some(parse_floats(value)?),
-                "value_intermediate_global" => value_intermediate_global = Some(parse_floats(value)?),
-                "value_intermediate_bias" => value_intermediate_bias = Some(parse_floats(value)?),
-                "value_logits_weights" => value_logits_weights = Some(parse_floats(value)?),
-                "value_logits_bias" => value_logits_bias = Some(parse_floats(value)?),
-                "policy_move_hidden" => policy_move_hidden = Some(parse_floats(value)?),
-                "policy_move_global" => policy_move_global = Some(parse_floats(value)?),
-                "policy_move_bias" => policy_move_bias = Some(parse_floats(value)?),
-                _ => {}
-            }
-        }
-
-        if model_format.as_deref() != Some(AZNNUE_FORMAT) {
+    fn decode_binary(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < AZNNUE_BINARY_HEADER_LEN || !bytes.starts_with(AZNNUE_BINARY_MAGIC) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{AZNNUE_FORMAT} model format required"),
+                "truncated or invalid AZNNUE binary",
             ));
         }
-        if input_size != Some(V4_INPUT_SIZE) {
+        let mut reader = Cursor::new(&bytes[AZNNUE_BINARY_MAGIC.len()..]);
+        let version = read_u32_le(&mut reader)?;
+        if version != AZNNUE_BINARY_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{AZNNUE_FORMAT} requires fixed relative-view v4 input_size"),
+                format!("unsupported AZNNUE binary version {version} (expected {AZNNUE_BINARY_VERSION})"),
             ));
         }
-        let hidden_size = hidden_size
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hidden_size"))?;
-        let trunk_depth = trunk_depth
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing trunk_depth"))?;
+        let input_size = read_u32_le(&mut reader)? as usize;
+        let hidden_size = read_u32_le(&mut reader)? as usize;
+        let trunk_depth = read_u32_le(&mut reader)? as usize;
+        let _reserved = read_u32_le(&mut reader)?;
+        if input_size != V4_INPUT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "binary input_size does not match this build (V4_INPUT_SIZE)",
+            ));
+        }
+        let input_hidden_len = V4_INPUT_SIZE * hidden_size;
+        let hidden_bias_len = hidden_size;
+        let trunk_weights_len = trunk_depth * hidden_size * hidden_size;
+        let trunk_biases_len = trunk_depth * hidden_size;
+        let trunk_global_len = trunk_depth * hidden_size * GLOBAL_CONTEXT_SIZE;
+        let global_hidden_len = GLOBAL_CONTEXT_SIZE * hidden_size;
+        let global_bias_len = GLOBAL_CONTEXT_SIZE;
+        let vih_len = VALUE_HIDDEN_SIZE * hidden_size;
+        let vig_len = VALUE_HIDDEN_SIZE * GLOBAL_CONTEXT_SIZE;
+        let vib_len = VALUE_HIDDEN_SIZE;
+        let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
+        let vlb_len = VALUE_LOGITS;
+        let pmh_len = DENSE_MOVE_SPACE * hidden_size;
+        let pmg_len = DENSE_MOVE_SPACE * GLOBAL_CONTEXT_SIZE;
+        let pmb_len = DENSE_MOVE_SPACE;
+        let float_count = input_hidden_len
+            + hidden_bias_len
+            + trunk_weights_len
+            + trunk_biases_len
+            + trunk_global_len
+            + global_hidden_len
+            + global_bias_len
+            + vih_len
+            + vig_len
+            + vib_len
+            + vlw_len
+            + vlb_len
+            + pmh_len
+            + pmg_len
+            + pmb_len;
+        let expected_len = AZNNUE_BINARY_HEADER_LEN + float_count * 4;
+        if bytes.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AZNNUE binary size mismatch: got {} bytes, expected {} (floats {})",
+                    bytes.len(),
+                    expected_len,
+                    float_count
+                ),
+            ));
+        }
+        let input_hidden = read_f32_vec_le(&mut reader, input_hidden_len)?;
+        let hidden_bias = read_f32_vec_le(&mut reader, hidden_bias_len)?;
+        let trunk_weights = read_f32_vec_le(&mut reader, trunk_weights_len)?;
+        let trunk_biases = read_f32_vec_le(&mut reader, trunk_biases_len)?;
+        let trunk_global_weights = read_f32_vec_le(&mut reader, trunk_global_len)?;
+        let global_hidden = read_f32_vec_le(&mut reader, global_hidden_len)?;
+        let global_bias = read_f32_vec_le(&mut reader, global_bias_len)?;
+        let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
+        let value_intermediate_global = read_f32_vec_le(&mut reader, vig_len)?;
+        let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
+        let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
+        let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
+        let policy_move_hidden = read_f32_vec_le(&mut reader, pmh_len)?;
+        let policy_move_global = read_f32_vec_le(&mut reader, pmg_len)?;
+        let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
         let model = Self {
             hidden_size,
             trunk_depth,
-            input_hidden: input_hidden.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing input_hidden")
-            })?,
-            hidden_bias: hidden_bias
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hidden_bias"))?,
-            trunk_weights: trunk_weights.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing trunk_weights")
-            })?,
-            trunk_biases: trunk_biases.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing trunk_biases")
-            })?,
-            trunk_global_weights: trunk_global_weights.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing trunk_global_weights")
-            })?,
-            global_hidden: global_hidden.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing global_hidden")
-            })?,
-            global_bias: global_bias
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing global_bias"))?,
-            value_intermediate_hidden: value_intermediate_hidden.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_intermediate_hidden")
-            })?,
-            value_intermediate_global: value_intermediate_global.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_intermediate_global")
-            })?,
-            value_intermediate_bias: value_intermediate_bias.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_intermediate_bias")
-            })?,
-            value_logits_weights: value_logits_weights.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_weights")
-            })?,
-            value_logits_bias: value_logits_bias.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing value_logits_bias")
-            })?,
-            policy_move_hidden: policy_move_hidden.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing policy_move_hidden")
-            })?,
-            policy_move_global: policy_move_global.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing policy_move_global")
-            })?,
-            policy_move_bias: policy_move_bias.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing policy_move_bias")
-            })?,
+            input_hidden,
+            hidden_bias,
+            trunk_weights,
+            trunk_biases,
+            trunk_global_weights,
+            global_hidden,
+            global_bias,
+            value_intermediate_hidden,
+            value_intermediate_global,
+            value_intermediate_bias,
+            value_logits_weights,
+            value_logits_bias,
+            policy_move_hidden,
+            policy_move_global,
+            policy_move_bias,
             optimizer: None,
         };
         model.validate()?;
@@ -965,9 +1223,6 @@ pub fn benchmark_training(
             policy,
             value,
             side_sign: 1.0,
-            reward: 0.0,
-            discount: 0.0,
-            bootstrap_value: 0.0,
         });
         if index + 1 == sample_count {
             break;
@@ -1133,7 +1388,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     1.0
                 });
                 terminal.no_legal_moves += 1;
-                finalize_last_transition(&mut game_samples, result.unwrap_or(0.0));
                 break;
             }
 
@@ -1161,7 +1415,16 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 temperature_mid_entropy_count += 1;
             }
             let temperature = temperature_for_ply(config, ply);
-            let Some(mv) = choose_selfplay_move(&search.candidates, temperature, &mut rng) else {
+            // 与 mctx `gumbel_muzero_policy` 一致：低温/确定性走子用 `score_considered` 的 argmax（`best_move`），
+            // 不用 `improved_policy` 的 argmax。
+            let mv_opt = if temperature <= 1e-6 {
+                search
+                    .best_move
+                    .or_else(|| choose_selfplay_move(&search.candidates, temperature, &mut rng))
+            } else {
+                choose_selfplay_move(&search.candidates, temperature, &mut rng)
+            };
+            let Some(mv) = mv_opt else {
                 result = Some(0.0);
                 break;
             };
@@ -1169,7 +1432,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &position,
                 &history,
                 &search.candidates,
-                search.value_cp,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
             append_history(&mut history, &position, mv);
@@ -1179,13 +1441,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
                 terminal.red_general_missing += 1;
-                finalize_last_transition(&mut game_samples, -1.0);
                 break;
             }
             if !position.has_general(Color::Black) {
                 result = Some(1.0);
                 terminal.black_general_missing += 1;
-                finalize_last_transition(&mut game_samples, 1.0);
                 break;
             }
             if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
@@ -1211,7 +1471,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     RuleOutcome::Win(Color::Red) => terminal.rule_win_red += 1,
                     RuleOutcome::Win(Color::Black) => terminal.rule_win_black += 1,
                 }
-                finalize_last_transition(&mut game_samples, result.unwrap_or(0.0));
                 break;
             }
         }
@@ -1227,7 +1486,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_lambda_targets(&mut game_samples, result, config.td_lambda);
+        assign_terminal_value_targets(&mut game_samples, result);
         samples.extend(game_samples.clone());
         games.push(game_samples);
     }
@@ -1245,14 +1504,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         temperature_mid_entropy_count,
         terminal,
     }
-}
-
-fn finalize_last_transition(game_samples: &mut [AzTrainingSample], game_result: f32) {
-    let Some(last) = game_samples.last_mut() else {
-        return;
-    };
-    last.reward = game_result * last.side_sign;
-    last.discount = 0.0;
 }
 
 pub fn gumbel_search(
@@ -1282,6 +1533,10 @@ pub fn gumbel_search_with_history_and_root_moves(
     gumbel_search_with_history_and_rules(position, history, None, root_moves, model, limits)
 }
 
+/// Gumbel 搜索与训练目标对齐 [DeepMind mctx](https://github.com/google-deepmind/mctx)
+/// 中 `gumbel_muzero_policy` / `qtransform_completed_by_mix_value` 的默认行为（根 Gumbel+顺序减半、
+/// 非根 `softmax(logits+q)` 确定性选择、根打分 `score_considered`）。根上 Gumbel 噪声为可复现哈希 Gumbel，
+/// 与 JAX 真随机采样不同。
 pub fn gumbel_search_with_history_and_rules(
     position: &Position,
     history: &[HistoryMove],
@@ -1625,6 +1880,8 @@ impl<'a> AzTree<'a> {
         gumbel_scale: f32,
         mut is_considered: impl FnMut(&AzChild) -> bool,
     ) -> Option<usize> {
+        // 与 mctx `seq_halving.score_considered` 一致：logits 减全局 max 后
+        // `max(low_logit, gumbel + logits + q) + penalty`，此处仅保留 penalty=0 的子边。
         let completed_q = self.completed_qvalues(node_index);
         let hash = self.nodes[node_index].position.hash() ^ seed;
         let max_prior_logit = self.nodes[node_index]
@@ -1638,9 +1895,9 @@ impl<'a> AzTree<'a> {
             .enumerate()
             .filter(|(_, child)| is_considered(child))
             .map(|(child_index, child)| {
-                let score = (child.prior_logit - max_prior_logit).max(-1e9)
-                    + completed_q[child_index]
-                    + gumbel_scale * deterministic_gumbel(hash, child.mv, child_index as u64);
+                let logits = child.prior_logit - max_prior_logit;
+                let g = gumbel_scale * deterministic_gumbel(hash, child.mv, child_index as u64);
+                let score = (g + logits + completed_q[child_index]).max(SCORE_CONSIDERED_LOW_LOGIT);
                 (score, child_index)
             })
             .max_by(|left, right| {
@@ -1662,37 +1919,43 @@ impl<'a> AzTree<'a> {
         softmax(&logits)
     }
 
+    /// 与 `mctx.qtransforms.qtransform_completed_by_mix_value` 默认参数一致
+    ///（`rescale_values=true`, `use_mixed_value=true`）。
     fn completed_qvalues(&self, node_index: usize) -> Vec<f32> {
         let children = &self.nodes[node_index].children;
         if children.is_empty() {
             return Vec::new();
         }
 
-        let total_visits = children.iter().map(|child| child.visits).sum::<u32>();
-        let max_visits = children
+        let sum_visit_counts: u32 = children.iter().map(|child| child.visits).sum();
+        let max_visit_counts = children
             .iter()
             .map(|child| child.visits)
             .max()
             .unwrap_or_default();
-        let visited_policy_sum = children
+
+        let raw_value = self.nodes[node_index].value;
+        let sum_probs: f32 = children
             .iter()
             .filter(|child| child.visits > 0)
-            .map(|child| child.prior)
-            .sum::<f32>();
-        let weighted_q = if visited_policy_sum > 0.0 {
+            .map(|child| child.prior.max(f32::MIN_POSITIVE))
+            .sum();
+        let weighted_q: f32 = if sum_probs > 0.0 {
             children
                 .iter()
                 .filter(|child| child.visits > 0)
-                .map(|child| child.prior * child.q())
-                .sum::<f32>()
-                / visited_policy_sum
+                .map(|child| {
+                    let p = child.prior.max(f32::MIN_POSITIVE);
+                    p * child.q() / sum_probs
+                })
+                .sum()
         } else {
-            self.nodes[node_index].value
+            0.0
         };
-        let mixed_value = (self.nodes[node_index].value + total_visits as f32 * weighted_q)
-            / (total_visits as f32 + 1.0);
+        let mixed_value = (raw_value + sum_visit_counts as f32 * weighted_q)
+            / (sum_visit_counts as f32 + 1.0);
 
-        let mut qvalues = children
+        let mut completed: Vec<f32> = children
             .iter()
             .map(|child| {
                 if child.visits > 0 {
@@ -1701,27 +1964,30 @@ impl<'a> AzTree<'a> {
                     mixed_value
                 }
             })
-            .collect::<Vec<_>>();
-        normalize_completed_q(&mut qvalues, max_visits);
-        qvalues
+            .collect();
+        rescale_completed_qvalues_mctx(&mut completed);
+        let visit_scale = COMPLETED_Q_MAXVISIT_INIT + max_visit_counts as f32;
+        for v in &mut completed {
+            *v *= visit_scale * COMPLETED_Q_VALUE_SCALE;
+        }
+        completed
     }
 }
 
-fn normalize_completed_q(qvalues: &mut [f32], total_visits: u32) {
+/// mctx `_rescale_qvalues`：completed 向量 min–max 到约 \([0,1]\)。
+fn rescale_completed_qvalues_mctx(qvalues: &mut [f32]) {
+    if qvalues.is_empty() {
+        return;
+    }
     let min_value = qvalues.iter().copied().fold(f32::INFINITY, f32::min);
     let max_value = qvalues.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let denominator = (max_value - min_value).max(1e-8);
-    for value in qvalues.iter_mut() {
-        *value = (*value - min_value) / denominator;
-    }
-
-    let maxvisit_scale =
-        (COMPLETED_Q_MAXVISIT_INIT + total_visits as f32) * COMPLETED_Q_VALUE_SCALE;
-    for value in qvalues.iter_mut() {
-        *value *= maxvisit_scale;
+    let denom = (max_value - min_value).max(COMPLETED_Q_RESCALE_EPSILON);
+    for v in qvalues.iter_mut() {
+        *v = (*v - min_value) / denom;
     }
 }
 
+/// 与 `mctx.seq_halving.get_sequence_of_considered_visits(m, num_simulations)` 一致。
 fn considered_visit_sequence(
     max_num_considered_actions: usize,
     num_simulations: usize,
@@ -1776,7 +2042,6 @@ fn make_training_sample(
     position: &Position,
     history: &[HistoryMove],
     candidates: &[AzCandidate],
-    value_cp: i32,
     mirror_file: bool,
 ) -> AzTrainingSample {
     let total_policy = candidates
@@ -1810,31 +2075,13 @@ fn make_training_sample(
         } else {
             -1.0
         },
-        reward: 0.0,
-        discount: -1.0,
-        bootstrap_value: (value_cp as f32 / VALUE_SCALE_CP).clamp(-1.0, 1.0),
     }
 }
 
-fn assign_lambda_targets(samples: &mut [AzTrainingSample], game_result: f32, td_lambda: f32) {
-    let lambda = td_lambda.clamp(0.0, 1.0);
-    if let Some(last) = samples.last_mut() {
-        if last.discount < 0.0 && game_result == 0.0 {
-            last.discount = 0.0;
-            last.reward = 0.0;
-        }
-    }
-
-    let mut carry = 0.0f32;
-    for index in (0..samples.len()).rev() {
-        let next_bootstrap = samples
-            .get(index + 1)
-            .map(|sample| sample.bootstrap_value)
-            .unwrap_or(0.0);
-        let blended = (1.0 - lambda) * next_bootstrap + lambda * carry;
-        let target = samples[index].reward + samples[index].discount * blended;
-        samples[index].value = target.clamp(-1.0, 1.0);
-        carry = samples[index].value;
+/// 价值目标：AlphaZero / Leela 系主流做法——每步只拟合本盘终局，从当前行棋方视角编码到 \([-1,1]\)。
+fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], game_result: f32) {
+    for sample in samples.iter_mut() {
+        sample.value = (game_result * sample.side_sign).clamp(-1.0, 1.0);
     }
 }
 
@@ -1933,11 +2180,22 @@ pub fn play_arena_games(
     games_as_red: usize,
     games_as_black: usize,
     seed: u64,
+    gumbel_scale: f32,
+    gumbel_opening_plies: usize,
 ) -> AzArenaReport {
     let mut report = AzArenaReport::default();
     let mut game_seed = seed;
     for _ in 0..games_as_red {
-        let outcome = play_arena_game(candidate, baseline, simulations, top_k, max_plies, game_seed);
+        let outcome = play_arena_game(
+            candidate,
+            baseline,
+            simulations,
+            top_k,
+            max_plies,
+            game_seed,
+            gumbel_scale,
+            gumbel_opening_plies,
+        );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
                 report.wins += 1;
@@ -1952,7 +2210,16 @@ pub fn play_arena_games(
         game_seed = game_seed.wrapping_add(1);
     }
     for _ in 0..games_as_black {
-        let outcome = play_arena_game(baseline, candidate, simulations, top_k, max_plies, game_seed);
+        let outcome = play_arena_game(
+            baseline,
+            candidate,
+            simulations,
+            top_k,
+            max_plies,
+            game_seed,
+            gumbel_scale,
+            gumbel_opening_plies,
+        );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
                 report.losses += 1;
@@ -1976,6 +2243,8 @@ fn play_arena_game(
     top_k: usize,
     max_plies: usize,
     seed: u64,
+    gumbel_scale: f32,
+    gumbel_opening_plies: usize,
 ) -> f32 {
     let mut position = Position::startpos();
     let mut history = Vec::new();
@@ -1994,6 +2263,11 @@ fn play_arena_game(
         } else {
             black_model
         };
+        let ply_gumbel = if ply < gumbel_opening_plies {
+            gumbel_scale
+        } else {
+            0.0
+        };
         let result = gumbel_search_with_history_and_rules(
             &position,
             &history,
@@ -2004,7 +2278,7 @@ fn play_arena_game(
                 simulations,
                 top_k,
                 seed: seed ^ ((ply as u64) << 32),
-                gumbel_scale: 0.0,
+                gumbel_scale: ply_gumbel,
                 workers: 1,
             },
         );
@@ -3070,27 +3344,6 @@ fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
     }
 }
 
-fn parse_floats(text: &str) -> io::Result<Vec<f32>> {
-    text.split_whitespace()
-        .map(|value| {
-            value.parse::<f32>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid float: {value}"),
-                )
-            })
-        })
-        .collect()
-}
-
-fn format_floats(values: &[f32]) -> String {
-    values
-        .iter()
-        .map(f32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn deterministic_gumbel(hash: u64, mv: Move, salt: u64) -> f32 {
     let seed = hash
         ^ ((mv.from as u64) << 48)
@@ -3242,15 +3495,31 @@ fn dense_move_index(mv: Move) -> usize {
 }
 
 #[cfg(test)]
+fn replay_pool_test_fixture() -> AzExperiencePool {
+    let sample = AzTrainingSample {
+        features: vec![1, 2, 3],
+        move_indices: vec![0, 1],
+        policy: vec![0.6, 0.4],
+        value: 0.1,
+        side_sign: 1.0,
+    };
+    let mut pool = AzExperiencePool::new(100);
+    pool.add_games(vec![vec![sample.clone()], vec![sample.clone(), sample]]);
+    pool
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn considered_visit_sequence_matches_sequential_halving_schedule() {
+        // 与 `mctx.seq_halving.get_sequence_of_considered_visits` 对若干 (m, n) 的 Python 对照一致。
         assert_eq!(
             considered_visit_sequence(4, 16),
             vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
         );
+        assert_eq!(considered_visit_sequence(16, 512).len(), 512);
         assert_eq!(considered_visit_sequence(1, 5), vec![0, 1, 2, 3, 4]);
         assert_eq!(considered_visit_sequence(0, 5), Vec::<u32>::new());
     }
@@ -3266,9 +3535,9 @@ mod tests {
     }
 
     #[test]
-    fn completed_q_normalization_turns_equal_values_into_zero_bonus() {
+    fn completed_q_rescale_gives_zero_when_all_q_equal() {
         let mut qvalues = vec![0.5, 0.5, 0.5];
-        normalize_completed_q(&mut qvalues, 0);
+        rescale_completed_qvalues_mctx(&mut qvalues);
         assert_eq!(qvalues, vec![0.0, 0.0, 0.0]);
     }
 
@@ -3297,7 +3566,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_targets_use_next_root_bootstrap() {
+    fn terminal_value_targets_match_outcome_for_side_to_move() {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
@@ -3305,9 +3574,6 @@ mod tests {
                 policy: Vec::new(),
                 value: 0.0,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: -1.0,
-                bootstrap_value: 0.2,
             },
             AzTrainingSample {
                 features: Vec::new(),
@@ -3315,16 +3581,13 @@ mod tests {
                 policy: Vec::new(),
                 value: 0.0,
                 side_sign: -1.0,
-                reward: 1.0,
-                discount: 0.0,
-                bootstrap_value: -0.4,
             },
         ];
 
-        assign_lambda_targets(&mut samples, 1.0, 0.5);
+        assign_terminal_value_targets(&mut samples, 1.0);
 
-        assert!((samples[1].value - 1.0).abs() < 1e-6);
-        assert!((samples[0].value + 0.3).abs() < 1e-6);
+        assert!((samples[0].value - 1.0).abs() < 1e-6);
+        assert!((samples[1].value + 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -3341,9 +3604,6 @@ mod tests {
                 policy: Vec::new(),
                 value: 1.0,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
             AzTrainingSample {
                 features: vec![1],
@@ -3351,9 +3611,6 @@ mod tests {
                 policy: Vec::new(),
                 value: -1.0,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
             AzTrainingSample {
                 features: vec![2],
@@ -3361,9 +3618,6 @@ mod tests {
                 policy: Vec::new(),
                 value: 0.75,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
             AzTrainingSample {
                 features: vec![3],
@@ -3371,9 +3625,6 @@ mod tests {
                 policy: Vec::new(),
                 value: -0.75,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
         ];
 
@@ -3394,9 +3645,6 @@ mod tests {
                 policy: Vec::new(),
                 value: 1.0,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
             AzTrainingSample {
                 features: vec![1, 5, 9],
@@ -3404,9 +3652,6 @@ mod tests {
                 policy: Vec::new(),
                 value: -1.0,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
             AzTrainingSample {
                 features: vec![2, 6, 10],
@@ -3414,9 +3659,6 @@ mod tests {
                 policy: Vec::new(),
                 value: 0.5,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
             AzTrainingSample {
                 features: vec![3, 7, 11],
@@ -3424,9 +3666,6 @@ mod tests {
                 policy: Vec::new(),
                 value: -0.5,
                 side_sign: 1.0,
-                reward: 0.0,
-                discount: 0.0,
-                bootstrap_value: 0.0,
             },
         ];
         let mut single = AzNnue::random_with_depth(16, 1, 23);
@@ -3450,5 +3689,31 @@ mod tests {
             .iter()
             .zip(&repeated.value_logits_bias)
             .all(|(left, right)| (*left - *right).abs() < 1e-5));
+    }
+
+    #[test]
+    fn aznnue_binary_roundtrip_matches_weights() {
+        let model = AzNnue::random_with_depth(16, 2, 42);
+        let path = std::env::temp_dir().join("chineseai_test_aznnue_roundtrip.nnue");
+        let _ = fs::remove_file(&path);
+        model.save(&path).unwrap();
+        let loaded = AzNnue::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(model.hidden_size, loaded.hidden_size);
+        assert_eq!(model.trunk_depth, loaded.trunk_depth);
+        assert_eq!(model.input_hidden, loaded.input_hidden);
+        assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
+    }
+
+    #[test]
+    fn replay_pool_lz4_snapshot_roundtrip() {
+        let path = std::env::temp_dir().join("chineseai_test_replay_roundtrip.replay.lz4");
+        let _ = fs::remove_file(&path);
+        let pool = super::replay_pool_test_fixture();
+        pool.save_snapshot_lz4(&path).unwrap();
+        let loaded = AzExperiencePool::load_snapshot_lz4(&path, 100).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded.game_count(), pool.game_count());
+        assert_eq!(loaded.sample_count(), pool.sample_count());
     }
 }

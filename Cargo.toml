@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 matrixmultiply = "0.3"
 tensorboard-rs = "0.5"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+ctrlc = "3.4"
 
 # Linux glibc 下启用 jemalloc。musl 目标不拉此依赖（且 build.rs 会直接拒绝 musl）。
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]

@@ -3,5 +3,7 @@
 pikafish
 pikafish.nnue
 /Cargo.lock
-*.nnue.txt
+*.nnue
 chineseai*
+*.conf.progress
+*.replay.lz4
