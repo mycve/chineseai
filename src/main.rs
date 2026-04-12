@@ -4,10 +4,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use chineseai::{
     az::{
-        AzArenaReport, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits,
-        alphazero_search, alphazero_search_with_history_and_rules, benchmark_training,
-        play_arena_games,
-        selfplay_train_iteration_with_pool,
+        AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue, AzSearchLimits,
+        AzSelfplayData, alphazero_search, alphazero_search_with_history_and_rules,
+        benchmark_training, generate_selfplay_data, play_arena_games, train_samples,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
     pikafish_match::run_vs_pikafish,
@@ -19,9 +18,12 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
+    thread,
+    time::{Duration, Instant},
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
 
@@ -82,7 +84,7 @@ fn best_model_path(model_path: &str) -> PathBuf {
     PathBuf::from(format!("{model_path}.best"))
 }
 
-/// `{config_path}.progress` — 记录下一轮应使用的全局 `iteration`（TensorBoard / checkpoint / 日志连续）。
+/// `{config_path}.progress` — 记录下一次训练更新应使用的全局 `update`（TensorBoard / checkpoint / 日志连续）。
 fn az_loop_progress_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.progress"))
 }
@@ -91,7 +93,7 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-fn read_az_loop_next_iteration(config_path: &str) -> Option<usize> {
+fn read_az_loop_next_update(config_path: &str) -> Option<usize> {
     let path = az_loop_progress_path(config_path);
     let text = fs::read_to_string(&path).ok()?;
     for line in text.lines() {
@@ -102,20 +104,17 @@ fn read_az_loop_next_iteration(config_path: &str) -> Option<usize> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() == "next_iteration" {
+        if key.trim() == "next_update" {
             return value.trim().parse().ok();
         }
     }
     None
 }
 
-fn write_az_loop_next_iteration(config_path: &str, next: usize) {
+fn write_az_loop_next_update(config_path: &str, next: usize) {
     let path = az_loop_progress_path(config_path);
-    fs::write(&path, format!("next_iteration={next}\n")).unwrap_or_else(|err| {
-        panic!(
-            "failed to write resume cursor `{}`: {err}",
-            path.display()
-        );
+    fs::write(&path, format!("next_update={next}\n")).unwrap_or_else(|err| {
+        panic!("failed to write resume cursor `{}`: {err}", path.display());
     });
 }
 
@@ -137,16 +136,15 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     format!(
         concat!(
-            "it{}_g{}_sim{}_bs{}_lr{}_ep{}_h{}_d{}_mxp{}_wk{}_",
+            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_d{}_mxp{}_wk{}_",
             "gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_cpi{}_",
             "ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
-        config.iterations,
-        config.games,
         config.simulations,
         config.batch_size,
         f32_slug(config.lr),
         config.epochs,
+        config.max_sample_train_count,
         config.hidden_size,
         config.trunk_depth,
         config.max_plies,
@@ -171,21 +169,24 @@ fn tensorboard_effective_logdir(config: &AzLoopFileConfig) -> PathBuf {
     Path::new(&config.tensorboard_logdir).join(tensorboard_encoded_subdir(config))
 }
 
-fn checkpoint_path(model_path: &str, checkpoint_dir: &str, iteration: usize) -> PathBuf {
+fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> PathBuf {
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("model.nnue");
-    Path::new(checkpoint_dir).join(format!("iter-{iteration:04}-{base}"))
+    Path::new(checkpoint_dir).join(format!("update-{update:04}-{base}"))
 }
 
-fn save_checkpoint_copy(model_path: &str, checkpoint_dir: &str, iteration: usize) -> PathBuf {
+fn save_checkpoint_copy(model_path: &str, checkpoint_dir: &str, update: usize) -> PathBuf {
     fs::create_dir_all(checkpoint_dir).unwrap_or_else(|err| {
         panic!("failed to create checkpoint dir `{checkpoint_dir}`: {err}");
     });
-    let path = checkpoint_path(model_path, checkpoint_dir, iteration);
+    let path = checkpoint_path(model_path, checkpoint_dir, update);
     fs::copy(model_path, &path).unwrap_or_else(|err| {
-        panic!("failed to copy `{model_path}` to `{}`: {err}", path.display());
+        panic!(
+            "failed to copy `{model_path}` to `{}`: {err}",
+            path.display()
+        );
     });
     path
 }
@@ -203,14 +204,15 @@ fn prune_old_checkpoints(
         .and_then(|name| name.to_str())
         .unwrap_or("model.nnue")
         .to_string();
-    let prefix = "iter-";
+    let prefix = "update-";
     let suffix = format!("-{base}");
     let mut entries = fs::read_dir(checkpoint_dir)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            (name.starts_with(prefix) && name.ends_with(&suffix)).then_some((name.to_string(), path))
+            (name.starts_with(prefix) && name.ends_with(&suffix))
+                .then_some((name.to_string(), path))
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -219,6 +221,157 @@ fn prune_old_checkpoints(
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+struct SelfplayBatch {
+    data: AzSelfplayData,
+    selfplay_seconds: f32,
+}
+
+struct TrainerEvent {
+    report: AzLoopReport,
+}
+
+struct SharedSelfplayModel {
+    version: u64,
+    model: AzNnue,
+}
+
+#[derive(Default)]
+struct SelfplayPauseState {
+    paused: bool,
+}
+
+#[derive(Default)]
+struct PendingTrainingData {
+    selfplay_seconds: f32,
+    started: Option<Instant>,
+    selfplay: AzSelfplayData,
+}
+
+impl PendingTrainingData {
+    fn push(&mut self, batch: SelfplayBatch) {
+        if self.started.is_none() {
+            self.started = Some(Instant::now());
+        }
+        self.selfplay_seconds += batch.selfplay_seconds;
+        self.selfplay.add_assign(&batch.data);
+    }
+}
+
+fn pool_pressure_profile(
+    replay_game_capacity: usize,
+    pool_games: usize,
+    workers: usize,
+    max_sample_train_count: usize,
+) -> (f32, usize, usize, u32) {
+    let occupancy = if replay_game_capacity == 0 {
+        0.0
+    } else {
+        pool_games as f32 / replay_game_capacity as f32
+    };
+    let workers = workers.max(1);
+    let max_sample_train_count = max_sample_train_count.max(1);
+    if occupancy >= 0.85 {
+        (
+            occupancy,
+            (workers / 2).max(1),
+            4,
+            max_sample_train_count.saturating_sub(1).max(1) as u32,
+        )
+    } else if occupancy >= (2.0 / 3.0) {
+        (
+            occupancy,
+            workers,
+            2,
+            max_sample_train_count.saturating_sub(1).max(1) as u32,
+        )
+    } else {
+        (
+            occupancy,
+            workers.saturating_mul(2),
+            1,
+            max_sample_train_count as u32,
+        )
+    }
+}
+
+fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) -> AzLoopConfig {
+    AzLoopConfig {
+        games: 1,
+        max_plies: config.max_plies,
+        simulations: config.simulations,
+        epochs: config.epochs,
+        lr: config.lr,
+        batch_size: config.batch_size,
+        seed,
+        workers,
+        temperature_start: config.temperature_start,
+        temperature_end: config.temperature_end,
+        temperature_decay_plies: config.temperature_decay_plies,
+        cpuct: config.cpuct,
+        root_dirichlet_alpha: config.root_dirichlet_alpha,
+        root_exploration_fraction: config.root_exploration_fraction,
+        replay_games: config.replay_games,
+        replay_samples: config.replay_samples,
+        mirror_probability: config.mirror_probability,
+    }
+}
+
+fn build_async_training_report(
+    pending: PendingTrainingData,
+    stats: chineseai::az::AzTrainStats,
+    train_data_len: usize,
+    epochs: usize,
+    train_seconds: f32,
+    pool_games: usize,
+    pool_samples: usize,
+) -> AzLoopReport {
+    let selfplay_games = pending.selfplay.games.len();
+    let selfplay_samples = pending.selfplay.samples.len();
+    let total_seconds = pending
+        .started
+        .map(|started| started.elapsed().as_secs_f32())
+        .unwrap_or(train_seconds);
+    AzLoopReport {
+        games: selfplay_games,
+        samples: selfplay_samples,
+        red_wins: pending.selfplay.red_wins,
+        black_wins: pending.selfplay.black_wins,
+        draws: pending.selfplay.draws,
+        avg_plies: if selfplay_games == 0 {
+            0.0
+        } else {
+            pending.selfplay.plies_total as f32 / selfplay_games as f32
+        },
+        loss: stats.loss,
+        value_loss: stats.value_loss,
+        policy_ce: stats.policy_ce,
+        temperature_early_entropy: pending.selfplay.temperature_early_entropy_sum
+            / pending.selfplay.temperature_early_entropy_count.max(1) as f32,
+        temperature_mid_entropy: pending.selfplay.temperature_mid_entropy_sum
+            / pending.selfplay.temperature_mid_entropy_count.max(1) as f32,
+        selfplay_seconds: pending.selfplay_seconds,
+        train_seconds,
+        total_seconds,
+        games_per_second: selfplay_games as f32 / pending.selfplay_seconds.max(1e-6),
+        samples_per_second: selfplay_samples as f32 / pending.selfplay_seconds.max(1e-6),
+        train_samples_per_second: (train_data_len * epochs.max(1)) as f32 / train_seconds.max(1e-6),
+        train_samples: train_data_len,
+        pool_games,
+        pool_samples,
+        terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
+        terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
+        terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
+        terminal_rule_draw: pending.selfplay.terminal.rule_draw,
+        terminal_rule_draw_halfmove120: pending.selfplay.terminal.rule_draw_halfmove120,
+        terminal_rule_draw_repetition: pending.selfplay.terminal.rule_draw_repetition,
+        terminal_rule_draw_mutual_long_check: pending.selfplay.terminal.rule_draw_mutual_long_check,
+        terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
+        terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
+        terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
+        terminal_max_plies: pending.selfplay.terminal.max_plies,
+    }
 }
 
 fn run_arena_processes(
@@ -312,27 +465,24 @@ fn az_arena_worker_next_usize(
     let text = args.next().unwrap_or_else(|| {
         panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
     });
-    text.parse().unwrap_or_else(|_| {
-        panic!("az-arena-worker: `{field}` must be usize, got {text:?}")
-    })
+    text.parse()
+        .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be usize, got {text:?}"))
 }
 
 fn az_arena_worker_next_f32(args: &mut impl Iterator<Item = String>, field: &'static str) -> f32 {
     let text = args.next().unwrap_or_else(|| {
         panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
     });
-    text.parse().unwrap_or_else(|_| {
-        panic!("az-arena-worker: `{field}` must be f32, got {text:?}")
-    })
+    text.parse()
+        .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be f32, got {text:?}"))
 }
 
 fn az_arena_worker_next_u64(args: &mut impl Iterator<Item = String>, field: &'static str) -> u64 {
     let text = args.next().unwrap_or_else(|| {
         panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
     });
-    text.parse().unwrap_or_else(|_| {
-        panic!("az-arena-worker: `{field}` must be u64, got {text:?}")
-    })
+    text.parse()
+        .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be u64, got {text:?}"))
 }
 
 fn main() {
@@ -365,9 +515,9 @@ fn main() {
             println!("output   : {output}");
         }
         Some("az-search") => {
-            let model_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-search <model> [simulations] [cpuct] [fen]")
-            });
+            let model_path = args
+                .next()
+                .unwrap_or_else(|| panic!("usage: az-search <model> [simulations] [cpuct] [fen]"));
             let simulations = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -517,9 +667,7 @@ fn main() {
         }
         Some("az-train-bench") => {
             let model_path = args.next().unwrap_or_else(|| {
-                panic!(
-                    "usage: az-train-bench <model> [samples] [epochs] [batch_size] [lr] [seed]"
-                )
+                panic!("usage: az-train-bench <model> [samples] [epochs] [batch_size] [lr] [seed]")
             });
             let sample_count = args
                 .next()
@@ -570,19 +718,17 @@ fn main() {
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
-            let start_iteration = read_az_loop_next_iteration(&config_path)
-                .unwrap_or(1)
-                .max(1);
-            if start_iteration > 1 {
+            let start_update = read_az_loop_next_update(&config_path).unwrap_or(1).max(1);
+            if start_update > 1 {
                 println!(
-                    "resume   : global_iteration starts at {} (from `{}`)",
-                    start_iteration,
+                    "resume   : update starts at {} (from `{}`)",
+                    start_update,
                     az_loop_progress_path(&config_path).display()
                 );
             }
             let best_path = best_model_path(&config.model_path);
 
-            let mut model = if Path::new(&config.model_path).exists() {
+            let model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
                 match AzNnue::load(&config.model_path) {
                     Ok(model) => model,
@@ -606,8 +752,10 @@ fn main() {
             let mut replay_pool =
                 (config.replay_games > 0).then(|| AzExperiencePool::new(config.replay_games));
             if config.replay_games > 0 && replay_snapshot_path.exists() {
-                match AzExperiencePool::load_snapshot_lz4(&replay_snapshot_path, config.replay_games)
-                {
+                match AzExperiencePool::load_snapshot_lz4(
+                    &replay_snapshot_path,
+                    config.replay_games,
+                ) {
                     Ok(pool) => {
                         fs::remove_file(&replay_snapshot_path).unwrap_or_else(|err| {
                             panic!(
@@ -633,9 +781,12 @@ fn main() {
                 }
             }
             let interrupted = Arc::new(AtomicBool::new(false));
+            let stop_requested = Arc::new(AtomicBool::new(false));
             let interrupted_flag = interrupted.clone();
+            let stop_flag = stop_requested.clone();
             ctrlc::set_handler(move || {
                 interrupted_flag.store(true, Ordering::SeqCst);
+                stop_flag.store(true, Ordering::SeqCst);
             })
             .unwrap_or_else(|err| panic!("failed to register Ctrl+C handler: {err}"));
             let tb_dir = tensorboard_effective_logdir(&config);
@@ -648,14 +799,14 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous sims={} epochs/update={} lr={} batch_size={} trigger_games(base)={} pressure_start=67% pressure_high=85% max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
-                config.iterations,
-                config.games,
                 config.simulations,
                 config.epochs,
                 config.lr,
                 config.batch_size,
+                config.workers.saturating_mul(2),
+                config.max_sample_train_count,
                 config.max_plies,
                 config.workers,
                 config.temperature_start,
@@ -675,16 +826,190 @@ fn main() {
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
-            let mut exited_after_ctrl_c = false;
-            for offset in 0..config.iterations {
-                if interrupted.load(Ordering::SeqCst) {
-                    if let Some(ref pool) = replay_pool {
-                        match pool.save_snapshot_lz4(&replay_snapshot_path) {
+            let (selfplay_tx, selfplay_rx) = mpsc::channel::<SelfplayBatch>();
+            let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
+            let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
+                version: 0,
+                model: model.clone(),
+            }));
+            let selfplay_pause =
+                Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
+            let mut selfplay_handles = Vec::with_capacity(config.workers.max(1));
+            for worker_id in 0..config.workers.max(1) {
+                let selfplay_stop = stop_requested.clone();
+                let selfplay_config = config.clone();
+                let selfplay_tx = selfplay_tx.clone();
+                let shared_model = Arc::clone(&shared_model);
+                let selfplay_pause = Arc::clone(&selfplay_pause);
+                selfplay_handles.push(thread::spawn(move || {
+                    let mut batch_index = 0usize;
+                    let mut local_version = u64::MAX;
+                    let mut local_model = AzNnue::random_with_depth(
+                        selfplay_config.hidden_size,
+                        selfplay_config.trunk_depth,
+                        selfplay_config.seed ^ worker_id as u64,
+                    );
+                    while !selfplay_stop.load(Ordering::SeqCst) {
+                        {
+                            let (pause_lock, pause_cvar) = &*selfplay_pause;
+                            let mut pause_state = pause_lock
+                                .lock()
+                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                            while pause_state.paused && !selfplay_stop.load(Ordering::SeqCst) {
+                                pause_state = pause_cvar
+                                    .wait(pause_state)
+                                    .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                            }
+                        }
+                        if selfplay_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        {
+                            let shared = shared_model
+                                .read()
+                                .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                            if shared.version != local_version {
+                                local_model = shared.model.clone();
+                                local_version = shared.version;
+                            }
+                        }
+                        let batch_seed = selfplay_config.seed
+                            ^ ((worker_id as u64).wrapping_add(1) << 32)
+                            ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let loop_config = build_az_loop_config(&selfplay_config, batch_seed, 1);
+                        let started = Instant::now();
+                        let data = generate_selfplay_data(&local_model, &loop_config);
+                        let batch = SelfplayBatch {
+                            data,
+                            selfplay_seconds: started.elapsed().as_secs_f32(),
+                        };
+                        if selfplay_tx.send(batch).is_err() {
+                            break;
+                        }
+                        batch_index += 1;
+                    }
+                }));
+            }
+            drop(selfplay_tx);
+            let trainer_stop = stop_requested.clone();
+            let trainer_interrupted = interrupted.clone();
+            let trainer_config = config.clone();
+            let trainer_model_path = config.model_path.clone();
+            let trainer_snapshot_path = replay_snapshot_path.clone();
+            let trainer_shared_model = Arc::clone(&shared_model);
+            let trainer_handle = thread::spawn(move || {
+                let mut trainer_model = model;
+                let mut trainer_pool = replay_pool;
+                let mut pending = PendingTrainingData::default();
+                let mut train_index = 0usize;
+                loop {
+                    match selfplay_rx.recv() {
+                        Ok(batch) => {
+                            if let Some(pool) = trainer_pool.as_mut() {
+                                pool.add_games(batch.data.games.clone());
+                            }
+                            pending.push(batch);
+                            while let Ok(batch) = selfplay_rx.try_recv() {
+                                if let Some(pool) = trainer_pool.as_mut() {
+                                    pool.add_games(batch.data.games.clone());
+                                }
+                                pending.push(batch);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                    if trainer_stop.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let Some(pool) = trainer_pool.as_mut() else {
+                        continue;
+                    };
+                    if pool.sample_count() < trainer_config.batch_size.max(1) {
+                        continue;
+                    }
+                    let produced_games = pending.selfplay.games.len();
+                    let (
+                        _pool_occupancy,
+                        trigger_games,
+                        sample_multiplier,
+                        effective_max_train_count,
+                    ) = pool_pressure_profile(
+                        trainer_config.replay_games,
+                        pool.game_count(),
+                        trainer_config.workers,
+                        trainer_config.max_sample_train_count,
+                    );
+                    if produced_games < trigger_games {
+                        continue;
+                    }
+                    let produced_samples = pending
+                        .selfplay
+                        .samples
+                        .len()
+                        .max(trainer_config.batch_size);
+                    let mut rng = chineseai::az::SplitMix64::new(
+                        trainer_config.seed
+                            ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
+                    );
+                    let base_train_samples = if trainer_config.replay_samples == 0 {
+                        produced_samples
+                    } else {
+                        trainer_config.replay_samples.max(produced_samples)
+                    };
+                    let train_data = pool.sample_uniform_games_marked(
+                        base_train_samples
+                            .saturating_mul(sample_multiplier)
+                            .min(pool.sample_count()),
+                        effective_max_train_count,
+                        &mut rng,
+                    );
+                    if train_data.is_empty() {
+                        continue;
+                    }
+                    let train_started = Instant::now();
+                    let stats = train_samples(
+                        &mut trainer_model,
+                        &train_data,
+                        trainer_config.epochs.max(1),
+                        trainer_config.lr,
+                        trainer_config.batch_size,
+                        &mut rng,
+                    );
+                    let train_seconds = train_started.elapsed().as_secs_f32();
+                    trainer_model
+                        .save(&trainer_model_path)
+                        .unwrap_or_else(|err| {
+                            panic!("failed to write `{trainer_model_path}`: {err}")
+                        });
+                    {
+                        let mut shared = trainer_shared_model
+                            .write()
+                            .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                        shared.model = trainer_model.clone();
+                        shared.version = shared.version.wrapping_add(1);
+                    }
+                    let report = build_async_training_report(
+                        std::mem::take(&mut pending),
+                        stats,
+                        train_data.len(),
+                        trainer_config.epochs,
+                        train_seconds,
+                        pool.game_count(),
+                        pool.sample_count(),
+                    );
+                    if trainer_tx.send(TrainerEvent { report }).is_err() {
+                        break;
+                    }
+                    train_index += 1;
+                }
+                if let Some(pool) = trainer_pool.as_mut() {
+                    if trainer_interrupted.load(Ordering::SeqCst) {
+                        match pool.save_snapshot_lz4(&trainer_snapshot_path) {
                             Ok(()) => {
                                 if pool.game_count() > 0 {
                                     println!(
                                         "replay   : interrupt snapshot `{}` ({} games)",
-                                        replay_snapshot_path.display(),
+                                        trainer_snapshot_path.display(),
                                         pool.game_count()
                                     );
                                 }
@@ -692,38 +1017,102 @@ fn main() {
                             Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
                         }
                     }
+                }
+            });
+            let mut exited_after_ctrl_c = false;
+            let mut update = start_update;
+            loop {
+                if interrupted.load(Ordering::SeqCst) {
                     exited_after_ctrl_c = true;
                     break;
                 }
-                let iteration = start_iteration + offset;
-                let started = std::time::Instant::now();
-                let report = selfplay_train_iteration_with_pool(
-                    &mut model,
-                    &AzLoopConfig {
-                        games: config.games,
-                        max_plies: config.max_plies,
-                        simulations: config.simulations,
-                        epochs: config.epochs,
-                        lr: config.lr,
-                        batch_size: config.batch_size,
-                        seed: config.seed ^ iteration as u64,
-                        workers: config.workers,
-                        temperature_start: config.temperature_start,
-                        temperature_end: config.temperature_end,
-                        temperature_decay_plies: config.temperature_decay_plies,
-                        cpuct: config.cpuct,
-                        root_dirichlet_alpha: config.root_dirichlet_alpha,
-                        root_exploration_fraction: config.root_exploration_fraction,
-                        replay_games: config.replay_games,
-                        replay_samples: config.replay_samples,
-                        mirror_probability: config.mirror_probability,
-                    },
-                    replay_pool.as_mut(),
-                );
-                model.save(&config.model_path).unwrap_or_else(|err| {
-                    panic!("failed to write `{}`: {err}", config.model_path);
-                });
-                write_az_loop_next_iteration(&config_path, iteration.saturating_add(1));
+                let started = Instant::now();
+                let report = loop {
+                    match trainer_rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(TrainerEvent { report }) => break report,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if interrupted.load(Ordering::SeqCst) {
+                                exited_after_ctrl_c = true;
+                                break AzLoopReport {
+                                    games: 0,
+                                    samples: 0,
+                                    red_wins: 0,
+                                    black_wins: 0,
+                                    draws: 0,
+                                    avg_plies: 0.0,
+                                    loss: 0.0,
+                                    value_loss: 0.0,
+                                    policy_ce: 0.0,
+                                    temperature_early_entropy: 0.0,
+                                    temperature_mid_entropy: 0.0,
+                                    selfplay_seconds: 0.0,
+                                    train_seconds: 0.0,
+                                    total_seconds: 0.0,
+                                    games_per_second: 0.0,
+                                    samples_per_second: 0.0,
+                                    train_samples_per_second: 0.0,
+                                    train_samples: 0,
+                                    pool_games: 0,
+                                    pool_samples: 0,
+                                    terminal_no_legal_moves: 0,
+                                    terminal_red_general_missing: 0,
+                                    terminal_black_general_missing: 0,
+                                    terminal_rule_draw: 0,
+                                    terminal_rule_draw_halfmove120: 0,
+                                    terminal_rule_draw_repetition: 0,
+                                    terminal_rule_draw_mutual_long_check: 0,
+                                    terminal_rule_draw_mutual_long_chase: 0,
+                                    terminal_rule_win_red: 0,
+                                    terminal_rule_win_black: 0,
+                                    terminal_max_plies: 0,
+                                };
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            if interrupted.load(Ordering::SeqCst) {
+                                exited_after_ctrl_c = true;
+                                break AzLoopReport {
+                                    games: 0,
+                                    samples: 0,
+                                    red_wins: 0,
+                                    black_wins: 0,
+                                    draws: 0,
+                                    avg_plies: 0.0,
+                                    loss: 0.0,
+                                    value_loss: 0.0,
+                                    policy_ce: 0.0,
+                                    temperature_early_entropy: 0.0,
+                                    temperature_mid_entropy: 0.0,
+                                    selfplay_seconds: 0.0,
+                                    train_seconds: 0.0,
+                                    total_seconds: 0.0,
+                                    games_per_second: 0.0,
+                                    samples_per_second: 0.0,
+                                    train_samples_per_second: 0.0,
+                                    train_samples: 0,
+                                    pool_games: 0,
+                                    pool_samples: 0,
+                                    terminal_no_legal_moves: 0,
+                                    terminal_red_general_missing: 0,
+                                    terminal_black_general_missing: 0,
+                                    terminal_rule_draw: 0,
+                                    terminal_rule_draw_halfmove120: 0,
+                                    terminal_rule_draw_repetition: 0,
+                                    terminal_rule_draw_mutual_long_check: 0,
+                                    terminal_rule_draw_mutual_long_chase: 0,
+                                    terminal_rule_win_red: 0,
+                                    terminal_rule_win_black: 0,
+                                    terminal_max_plies: 0,
+                                };
+                            }
+                            panic!("training thread exited before update {update}");
+                        }
+                    }
+                };
+                if exited_after_ctrl_c {
+                    break;
+                }
+                write_az_loop_next_update(&config_path, update.saturating_add(1));
                 if !best_path.exists() {
                     fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
                         panic!(
@@ -734,13 +1123,10 @@ fn main() {
                     });
                 }
                 let checkpoint_saved = if config.checkpoint_interval > 0
-                    && iteration % config.checkpoint_interval == 0
+                    && update % config.checkpoint_interval == 0
                 {
-                    let path = save_checkpoint_copy(
-                        &config.model_path,
-                        &config.checkpoint_dir,
-                        iteration,
-                    );
+                    let path =
+                        save_checkpoint_copy(&config.model_path, &config.checkpoint_dir, update);
                     prune_old_checkpoints(
                         &config.model_path,
                         &config.checkpoint_dir,
@@ -757,12 +1143,17 @@ fn main() {
                     None
                 };
                 println!(
-                    "iter {iteration:04}: games={} samples={} train_samples={} pool={}/{} W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} drawR[120/rep/lchk/lchs]={}/{}/{}/{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s saved={}{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s saved={}{}",
                     report.games,
                     report.samples,
                     report.train_samples,
                     report.pool_games,
                     report.pool_samples,
+                    if config.replay_games == 0 {
+                        0.0
+                    } else {
+                        100.0 * report.pool_games as f32 / config.replay_games as f32
+                    },
                     report.red_wins,
                     report.black_wins,
                     report.draws,
@@ -773,10 +1164,6 @@ fn main() {
                     config.lr,
                     report.temperature_early_entropy,
                     report.temperature_mid_entropy,
-                    report.terminal_rule_draw_halfmove120,
-                    report.terminal_rule_draw_repetition,
-                    report.terminal_rule_draw_mutual_long_check,
-                    report.terminal_rule_draw_mutual_long_chase,
                     report.selfplay_seconds,
                     report.train_seconds,
                     report.games_per_second,
@@ -784,55 +1171,174 @@ fn main() {
                     report.train_samples_per_second,
                     started.elapsed().as_secs_f32(),
                     config.model_path,
-                    checkpoint_saved.as_ref().map_or_else(
-                        String::new,
-                        |path| format!(" checkpoint={}", path.display())
-                    )
+                    checkpoint_saved
+                        .as_ref()
+                        .map_or_else(String::new, |path| format!(
+                            " checkpoint={}",
+                            path.display()
+                        ))
                 );
-                log_scalar(&mut tb, "train/loss", iteration, report.loss);
-                log_scalar(&mut tb, "train/value_mse", iteration, report.value_loss);
-                log_scalar(&mut tb, "train/policy_ce", iteration, report.policy_ce);
-                log_scalar(&mut tb, "train/lr", iteration, config.lr);
-                log_scalar(&mut tb, "selfplay/games", iteration, report.games as f32);
-                log_scalar(&mut tb, "selfplay/samples", iteration, report.samples as f32);
-                log_scalar(&mut tb, "selfplay/avg_plies", iteration, report.avg_plies);
-                log_scalar(&mut tb, "selfplay/temp_entropy_early", iteration, report.temperature_early_entropy);
-                log_scalar(&mut tb, "selfplay/temp_entropy_mid", iteration, report.temperature_mid_entropy);
-                log_scalar(&mut tb, "selfplay/games_per_second", iteration, report.games_per_second);
-                log_scalar(&mut tb, "selfplay/samples_per_second", iteration, report.samples_per_second);
-                log_scalar(&mut tb, "train/samples_per_second", iteration, report.train_samples_per_second);
-                log_scalar(&mut tb, "timing/selfplay_seconds", iteration, report.selfplay_seconds);
-                log_scalar(&mut tb, "timing/train_seconds", iteration, report.train_seconds);
-                log_scalar(&mut tb, "timing/iteration_seconds", iteration, report.total_seconds);
-                log_scalar(&mut tb, "outcome/red_wins", iteration, report.red_wins as f32);
-                log_scalar(&mut tb, "outcome/black_wins", iteration, report.black_wins as f32);
-                log_scalar(&mut tb, "outcome/draws", iteration, report.draws as f32);
-                log_scalar(&mut tb, "terminal/no_legal_moves", iteration, report.terminal_no_legal_moves as f32);
-                log_scalar(&mut tb, "terminal/red_general_missing", iteration, report.terminal_red_general_missing as f32);
-                log_scalar(&mut tb, "terminal/black_general_missing", iteration, report.terminal_black_general_missing as f32);
-                log_scalar(&mut tb, "terminal/rule_draw", iteration, report.terminal_rule_draw as f32);
-                log_scalar(&mut tb, "terminal/rule_draw_halfmove120", iteration, report.terminal_rule_draw_halfmove120 as f32);
-                log_scalar(&mut tb, "terminal/rule_draw_repetition", iteration, report.terminal_rule_draw_repetition as f32);
-                log_scalar(&mut tb, "terminal/rule_draw_mutual_long_check", iteration, report.terminal_rule_draw_mutual_long_check as f32);
-                log_scalar(&mut tb, "terminal/rule_draw_mutual_long_chase", iteration, report.terminal_rule_draw_mutual_long_chase as f32);
-                log_scalar(&mut tb, "terminal/rule_win_red", iteration, report.terminal_rule_win_red as f32);
-                log_scalar(&mut tb, "terminal/rule_win_black", iteration, report.terminal_rule_win_black as f32);
-                log_scalar(&mut tb, "terminal/max_plies", iteration, report.terminal_max_plies as f32);
-                if config.arena_interval > 0 && iteration % config.arena_interval == 0 {
+                log_scalar(&mut tb, "train/loss", update, report.loss);
+                log_scalar(&mut tb, "train/value_mse", update, report.value_loss);
+                log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
+                log_scalar(&mut tb, "train/lr", update, config.lr);
+                log_scalar(
+                    &mut tb,
+                    "pool/fill_ratio",
+                    update,
+                    if config.replay_games == 0 {
+                        0.0
+                    } else {
+                        report.pool_games as f32 / config.replay_games as f32
+                    },
+                );
+                log_scalar(&mut tb, "selfplay/games", update, report.games as f32);
+                log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
+                log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
+                log_scalar(
+                    &mut tb,
+                    "selfplay/temp_entropy_early",
+                    update,
+                    report.temperature_early_entropy,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/temp_entropy_mid",
+                    update,
+                    report.temperature_mid_entropy,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/games_per_second",
+                    update,
+                    report.games_per_second,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/samples_per_second",
+                    update,
+                    report.samples_per_second,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/samples_per_second",
+                    update,
+                    report.train_samples_per_second,
+                );
+                log_scalar(
+                    &mut tb,
+                    "timing/selfplay_seconds",
+                    update,
+                    report.selfplay_seconds,
+                );
+                log_scalar(
+                    &mut tb,
+                    "timing/train_seconds",
+                    update,
+                    report.train_seconds,
+                );
+                log_scalar(
+                    &mut tb,
+                    "timing/update_seconds",
+                    update,
+                    report.total_seconds,
+                );
+                log_scalar(&mut tb, "outcome/red_wins", update, report.red_wins as f32);
+                log_scalar(
+                    &mut tb,
+                    "outcome/black_wins",
+                    update,
+                    report.black_wins as f32,
+                );
+                log_scalar(&mut tb, "outcome/draws", update, report.draws as f32);
+                log_scalar(
+                    &mut tb,
+                    "terminal/no_legal_moves",
+                    update,
+                    report.terminal_no_legal_moves as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/red_general_missing",
+                    update,
+                    report.terminal_red_general_missing as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/black_general_missing",
+                    update,
+                    report.terminal_black_general_missing as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_draw",
+                    update,
+                    report.terminal_rule_draw as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_draw_halfmove120",
+                    update,
+                    report.terminal_rule_draw_halfmove120 as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_draw_repetition",
+                    update,
+                    report.terminal_rule_draw_repetition as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_draw_mutual_long_check",
+                    update,
+                    report.terminal_rule_draw_mutual_long_check as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_draw_mutual_long_chase",
+                    update,
+                    report.terminal_rule_draw_mutual_long_chase as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_win_red",
+                    update,
+                    report.terminal_rule_win_red as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_win_black",
+                    update,
+                    report.terminal_rule_win_black as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/max_plies",
+                    update,
+                    report.terminal_max_plies as f32,
+                );
+                if config.arena_interval > 0 && update % config.arena_interval == 0 {
+                    {
+                        let (pause_lock, _) = &*selfplay_pause;
+                        let mut pause_state = pause_lock
+                            .lock()
+                            .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                        pause_state.paused = true;
+                    }
+                    println!("pause    : selfplay paused for arena");
                     let arena = run_arena_processes(
                         &config.model_path,
-                        best_path.to_str().unwrap_or_else(|| {
-                            panic!("best model path is not valid UTF-8")
-                        }),
+                        best_path
+                            .to_str()
+                            .unwrap_or_else(|| panic!("best model path is not valid UTF-8")),
                         config.arena_games_per_side,
                         config.simulations,
                         config.max_plies,
                         config.arena_cpuct,
                         config.arena_processes,
-                        config.seed ^ (iteration as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     );
-                    let promoted = arena.score()
-                        > config.arena_games_per_side as f32;
+                    let promoted = arena.score() > config.arena_games_per_side as f32;
                     if promoted {
                         fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
                             panic!(
@@ -843,7 +1349,7 @@ fn main() {
                         });
                     }
                     println!(
-                        "arena {iteration:04}: total={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} best={}{}",
+                        "arena {update:04}: total={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} best={}{}",
                         arena.total_games(),
                         arena.wins,
                         arena.losses,
@@ -856,47 +1362,87 @@ fn main() {
                         best_path.display(),
                         if promoted { " promoted=current" } else { "" }
                     );
-                    log_scalar(&mut tb, "arena/wins", iteration, arena.wins as f32);
-                    log_scalar(&mut tb, "arena/losses", iteration, arena.losses as f32);
-                    log_scalar(&mut tb, "arena/draws", iteration, arena.draws as f32);
-                    log_scalar(&mut tb, "arena/score", iteration, arena.score());
-                    log_scalar(&mut tb, "arena/win_rate", iteration, arena.wins as f32 / arena.total_games().max(1) as f32);
-                    log_scalar(&mut tb, "arena/wins_as_red", iteration, arena.wins_as_red as f32);
-                    log_scalar(&mut tb, "arena/losses_as_red", iteration, arena.losses_as_red as f32);
-                    log_scalar(&mut tb, "arena/wins_as_black", iteration, arena.wins_as_black as f32);
-                    log_scalar(&mut tb, "arena/losses_as_black", iteration, arena.losses_as_black as f32);
-                    log_scalar(&mut tb, "arena/promoted", iteration, if promoted { 1.0 } else { 0.0 });
-                }
-                if interrupted.load(Ordering::SeqCst) {
-                    if let Some(ref pool) = replay_pool {
-                        match pool.save_snapshot_lz4(&replay_snapshot_path) {
-                            Ok(()) => {
-                                if pool.game_count() > 0 {
-                                    println!(
-                                        "replay   : interrupt snapshot `{}` ({} games)",
-                                        replay_snapshot_path.display(),
-                                        pool.game_count()
-                                    );
-                                }
-                            }
-                            Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
-                        }
+                    log_scalar(&mut tb, "arena/wins", update, arena.wins as f32);
+                    log_scalar(&mut tb, "arena/losses", update, arena.losses as f32);
+                    log_scalar(&mut tb, "arena/draws", update, arena.draws as f32);
+                    log_scalar(&mut tb, "arena/score", update, arena.score());
+                    log_scalar(
+                        &mut tb,
+                        "arena/win_rate",
+                        update,
+                        arena.wins as f32 / arena.total_games().max(1) as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/wins_as_red",
+                        update,
+                        arena.wins_as_red as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/losses_as_red",
+                        update,
+                        arena.losses_as_red as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/wins_as_black",
+                        update,
+                        arena.wins_as_black as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/losses_as_black",
+                        update,
+                        arena.losses_as_black as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/promoted",
+                        update,
+                        if promoted { 1.0 } else { 0.0 },
+                    );
+                    {
+                        let (pause_lock, pause_cvar) = &*selfplay_pause;
+                        let mut pause_state = pause_lock
+                            .lock()
+                            .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                        pause_state.paused = false;
+                        pause_cvar.notify_all();
                     }
-                    exited_after_ctrl_c = true;
-                    break;
+                    println!("resume   : selfplay resumed after arena");
                 }
+                update = update.saturating_add(1);
             }
+            stop_requested.store(true, Ordering::SeqCst);
+            {
+                let (pause_lock, pause_cvar) = &*selfplay_pause;
+                let mut pause_state = pause_lock
+                    .lock()
+                    .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                pause_state.paused = false;
+                pause_cvar.notify_all();
+            }
+            drop(trainer_rx);
+            for handle in selfplay_handles {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| panic!("selfplay thread panicked"));
+            }
+            trainer_handle
+                .join()
+                .unwrap_or_else(|_| panic!("training thread panicked"));
             if !exited_after_ctrl_c {
                 let _ = fs::remove_file(&replay_snapshot_path);
             }
         }
         Some("az-arena-worker") => {
-            let candidate_path = args.next().unwrap_or_else(|| {
-                panic!("az-arena-worker: missing <candidate> (see help)")
-            });
-            let baseline_path = args.next().unwrap_or_else(|| {
-                panic!("az-arena-worker: missing <baseline>")
-            });
+            let candidate_path = args
+                .next()
+                .unwrap_or_else(|| panic!("az-arena-worker: missing <candidate> (see help)"));
+            let baseline_path = args
+                .next()
+                .unwrap_or_else(|| panic!("az-arena-worker: missing <baseline>"));
             let red_games = az_arena_worker_next_usize(&mut args, "red_games");
             let black_games = az_arena_worker_next_usize(&mut args, "black_games");
             let simulations = az_arena_worker_next_usize(&mut args, "simulations").max(1);
@@ -904,7 +1450,9 @@ fn main() {
             let arena_cpuct = az_arena_worker_next_f32(&mut args, "arena_cpuct").max(0.0);
             let seed = az_arena_worker_next_u64(&mut args, "seed");
             if args.next().is_some() {
-                panic!("az-arena-worker: trailing arguments (expected exactly 8 after candidate and baseline)");
+                panic!(
+                    "az-arena-worker: trailing arguments (expected exactly 8 after candidate and baseline)"
+                );
             }
             let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
                 panic!("failed to load `{candidate_path}`: {err}");
@@ -1017,19 +1565,22 @@ fn print_help() {
     println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
     println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
-    println!("hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <seed>");
-    println!("hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 5");
+    println!(
+        "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <seed>"
+    );
+    println!(
+        "hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 5"
+    );
 }
 
 #[derive(Clone, Debug)]
 struct AzLoopFileConfig {
     model_path: String,
-    iterations: usize,
-    games: usize,
     simulations: usize,
     epochs: usize,
     lr: f32,
     batch_size: usize,
+    max_sample_train_count: usize,
     max_plies: usize,
     hidden_size: usize,
     trunk_depth: usize,
@@ -1059,20 +1610,19 @@ impl Default for AzLoopFileConfig {
         let default_workers = default_parallel_workers();
         Self {
             model_path: "chineseai.nnue".into(),
-            iterations: 100,
-            games: 400,
-            simulations: 512,
+            simulations: 1200,
             epochs: 2,
             lr: 0.0003,
             batch_size: 1024,
+            max_sample_train_count: 3,
             max_plies: 300,
             hidden_size: 128,
             trunk_depth: 2,
             seed: 20260409,
             workers: default_workers,
-            temperature_start: 1.0,
-            temperature_end: 0.1,
-            temperature_decay_plies: 30,
+            temperature_start: 1.2,
+            temperature_end: 0.0,
+            temperature_decay_plies: 12,
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
@@ -1105,20 +1655,35 @@ impl AzLoopFileConfig {
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
-#   Defaults: 1.0 -> 0.1 by ply 30 (sharper sampling than 0.2@40); raise decay_plies if openings collapse.
+#   Defaults: 1.2 -> 0.0 by ply 12; raise decay_plies or temperature_end if openings collapse too early.
+#
+# Pipeline:
+#   Self-play and training run in separate long-lived threads.
+#   workers controls how many independent self-play threads run in parallel.
+#   Every self-play thread keeps generating games continuously until training stops.
+#   The trainer consumes the shared queue asynchronously and publishes fresh weights back
+#   to all self-play threads after each update.
 #
 # Replay:
 #   replay_games keeps the most recent N complete games in memory.
-#   replay_samples=0 trains on about the same number of positions as newly generated this iteration.
-#   set replay_samples larger, e.g. 200000, to train more from the pool per iteration.
+#   Each training update always includes all fresh samples collected since the previous update.
+#   replay_samples=0 adds about one extra replay sample per fresh sample.
+#   set replay_samples larger, e.g. 200000, to mix more old positions into each update.
 #   Ctrl+C writes "<this_conf_filename>.replay.lz4" (LZ4); next az-loop loads it into the pool then
 #   deletes the file. A full run without interrupt removes any leftover snapshot at exit.
 #   Replay snapshot format is versioned; older .replay.lz4 files from previous formats are rejected.
 #
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
+#   epochs means how many passes to make over each fresh training window; 2-3 is a good range.
 #   batch_size=1024 is the default; lower it if memory is tight, raise it if loss is noisy.
-#   workers defaults to about all logical CPUs minus one.
+#   Pool pressure drives training intensity:
+#   below 2/3 occupancy, train after about 2 * workers fresh games.
+#   above 2/3 occupancy, train sooner and sample about 2x more data.
+#   above 85% occupancy, train much more aggressively and sample about 4x more data.
+#   max_sample_train_count removes samples after they have been used this many times; under
+#   pressure the effective cap is reduced by 1 so heavily trained samples leave sooner.
+#   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
 # Augmentation:
@@ -1126,26 +1691,25 @@ impl AzLoopFileConfig {
 #   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
 #
 # Checkpoints & Arena:
-#   Training appends "<this_conf_filename>.progress" with next_iteration=... after each global iter.
-#   Delete that file to reset the global iteration counter to 1 (TensorBoard/checkpoint numbering).
-#   checkpoint_interval saves a timestamp-free numbered copy every N iterations.
+#   Training appends "<this_conf_filename>.progress" with next_update=... after each weight update.
+#   Delete that file to reset the update counter to 1 (TensorBoard/checkpoint numbering).
+#   checkpoint_interval saves a timestamp-free numbered copy every N updates.
 #   max_checkpoints keeps only the newest N checkpoint files in checkpoint_dir.
-#   arena_interval runs current-vs-best evaluation every N iterations.
+#   arena_interval runs current-vs-best evaluation every N updates.
 #   arena_games_per_side=50 means 50 games as Red and 50 as Black.
 #   cpuct: PUCT exploration constant used by AlphaZero MCTS.
 #   root_dirichlet_alpha / root_exploration_fraction: self-play root-only Dirichlet noise.
 #   Set either to 0 to disable root noise.
 #   arena_cpuct applies during arena search.
-#   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*, g_*,
+#   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, … so TensorBoard Web can compare experiments side by side.
 
 model_path = {model_path}
-iterations = {iterations}
-games = {games}
 simulations = {simulations}
 epochs = {epochs}
 lr = {lr}
 batch_size = {batch_size}
+max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
 trunk_depth = {trunk_depth}
@@ -1170,12 +1734,11 @@ arena_processes = {arena_processes}
 tensorboard_logdir = {tensorboard_logdir}
 "#,
             model_path = self.model_path,
-            iterations = self.iterations,
-            games = self.games,
             simulations = self.simulations,
             epochs = self.epochs,
             lr = self.lr,
             batch_size = self.batch_size,
+            max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
             trunk_depth = self.trunk_depth,
@@ -1219,12 +1782,13 @@ tensorboard_logdir = {tensorboard_logdir}
     fn set(&mut self, key: &str, value: &str) {
         match key {
             "model_path" => self.model_path = value.to_string(),
-            "iterations" => self.iterations = parse_config_value(value, self.iterations),
-            "games" => self.games = parse_config_value(value, self.games),
             "simulations" => self.simulations = parse_config_value(value, self.simulations),
             "epochs" => self.epochs = parse_config_value(value, self.epochs),
             "lr" => self.lr = parse_config_value(value, self.lr),
             "batch_size" => self.batch_size = parse_config_value(value, self.batch_size),
+            "max_sample_train_count" => {
+                self.max_sample_train_count = parse_config_value(value, self.max_sample_train_count)
+            }
             "max_plies" => self.max_plies = parse_config_value(value, self.max_plies),
             "hidden_size" => self.hidden_size = parse_config_value(value, self.hidden_size),
             "trunk_depth" => self.trunk_depth = parse_config_value(value, self.trunk_depth),
@@ -1262,13 +1826,13 @@ tensorboard_logdir = {tensorboard_logdir}
             "max_checkpoints" => {
                 self.max_checkpoints = parse_config_value(value, self.max_checkpoints)
             }
-            "arena_interval" => self.arena_interval = parse_config_value(value, self.arena_interval),
+            "arena_interval" => {
+                self.arena_interval = parse_config_value(value, self.arena_interval)
+            }
             "arena_games_per_side" => {
                 self.arena_games_per_side = parse_config_value(value, self.arena_games_per_side)
             }
-            "arena_cpuct" => {
-                self.arena_cpuct = parse_config_value(value, self.arena_cpuct)
-            }
+            "arena_cpuct" => self.arena_cpuct = parse_config_value(value, self.arena_cpuct),
             "arena_processes" => {
                 self.arena_processes = parse_config_value(value, self.arena_processes)
             }
@@ -1278,11 +1842,10 @@ tensorboard_logdir = {tensorboard_logdir}
     }
 
     fn normalize(mut self) -> Self {
-        self.iterations = self.iterations.max(1);
-        self.games = self.games.max(1);
         self.simulations = self.simulations.max(1);
         self.epochs = self.epochs.max(1);
         self.batch_size = self.batch_size.max(1);
+        self.max_sample_train_count = self.max_sample_train_count.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
@@ -1552,7 +2115,11 @@ fn apply_uci_moves(
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
-        ulog!(logger, "[apply_move] #{i} {text} ok → fen={}", position.to_fen());
+        ulog!(
+            logger,
+            "[apply_move] #{i} {text} ok → fen={}",
+            position.to_fen()
+        );
     }
 }
 

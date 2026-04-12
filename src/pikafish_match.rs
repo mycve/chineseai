@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
-use crate::nnue::{HistoryMove, HISTORY_PLIES};
+use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 /// 对 Pikafish 使用固定的 PUCT 常数，与 UCI 默认保持一致，便于对比。
@@ -207,7 +207,8 @@ fn play_one_game(
     let mut ply_count = 0usize;
 
     loop {
-        if let Some(end) = terminal_before_side_selects(&position, &rule_history, ply_count, max_plies)
+        if let Some(end) =
+            terminal_before_side_selects(&position, &rule_history, ply_count, max_plies)
         {
             return Ok(end);
         }
@@ -304,21 +305,23 @@ pub fn run_vs_pikafish(
         for game_index in batch_start..batch_end {
             let exe = pikafish_path.clone();
             let m = Arc::clone(&model);
-            handles.push(thread::spawn(move || -> std::io::Result<(bool, GameEnd)> {
-                let mut ext = ExternalUci::spawn(&exe)?;
-                ext.handshake()?;
-                let chinese_red = game_index % 2 == 0;
-                let end = play_one_game(
-                    m.as_ref(),
-                    &mut ext,
-                    chinese_red,
-                    movetime_ms,
-                    max_plies,
-                    simulations,
-                    seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                )?;
-                Ok((chinese_red, end))
-            }));
+            handles.push(thread::spawn(
+                move || -> std::io::Result<(bool, GameEnd)> {
+                    let mut ext = ExternalUci::spawn(&exe)?;
+                    ext.handshake()?;
+                    let chinese_red = game_index % 2 == 0;
+                    let end = play_one_game(
+                        m.as_ref(),
+                        &mut ext,
+                        chinese_red,
+                        movetime_ms,
+                        max_plies,
+                        simulations,
+                        seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    )?;
+                    Ok((chinese_red, end))
+                },
+            ));
         }
         for handle in handles {
             let join = handle.join().map_err(|_| {

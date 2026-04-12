@@ -242,9 +242,10 @@ impl<'a> AzTree<'a> {
             return self.nodes[node_index].value;
         }
 
-        if let Some(value) =
-            terminal_value(&self.nodes[node_index].position, &self.nodes[node_index].rule_history)
-        {
+        if let Some(value) = terminal_value(
+            &self.nodes[node_index].position,
+            &self.nodes[node_index].rule_history,
+        ) {
             self.nodes[node_index].children.clear();
             self.nodes[node_index].value = value;
             self.nodes[node_index].expanded = true;
@@ -323,33 +324,37 @@ impl<'a> AzTree<'a> {
     }
 
     fn simulate_child(&mut self, node_index: usize, child_index: usize) -> f32 {
-        let child_node = if let Some(child_node) = self.nodes[node_index].children[child_index].child {
-            child_node
-        } else {
-            let mv = self.nodes[node_index].children[child_index].mv;
-            let mut child_position = self.nodes[node_index].position.clone();
-            let child_history =
-                clone_history_with_appended_move(&self.nodes[node_index].history, &child_position, mv);
-            let child_rule_history = clone_rule_history_with_appended_move(
-                &self.nodes[node_index].rule_history,
-                &child_position,
-                mv,
-            );
-            child_position.make_move(mv);
-            let child_node = self.nodes.len();
-            self.nodes.push(AzNode {
-                position: child_position,
-                history: child_history,
-                rule_history: child_rule_history,
-                children: Vec::new(),
-                visits: 0,
-                value_sum: 0.0,
-                value: 0.0,
-                expanded: false,
-            });
-            self.nodes[node_index].children[child_index].child = Some(child_node);
-            child_node
-        };
+        let child_node =
+            if let Some(child_node) = self.nodes[node_index].children[child_index].child {
+                child_node
+            } else {
+                let mv = self.nodes[node_index].children[child_index].mv;
+                let mut child_position = self.nodes[node_index].position.clone();
+                let child_history = clone_history_with_appended_move(
+                    &self.nodes[node_index].history,
+                    &child_position,
+                    mv,
+                );
+                let child_rule_history = clone_rule_history_with_appended_move(
+                    &self.nodes[node_index].rule_history,
+                    &child_position,
+                    mv,
+                );
+                child_position.make_move(mv);
+                let child_node = self.nodes.len();
+                self.nodes.push(AzNode {
+                    position: child_position,
+                    history: child_history,
+                    rule_history: child_rule_history,
+                    children: Vec::new(),
+                    visits: 0,
+                    value_sum: 0.0,
+                    value: 0.0,
+                    expanded: false,
+                });
+                self.nodes[node_index].children[child_index].child = Some(child_node);
+                child_node
+            };
         let child_value = self.simulate(child_node);
         let value = -child_value;
         let child = &mut self.nodes[node_index].children[child_index];
@@ -367,10 +372,8 @@ impl<'a> AzTree<'a> {
             .iter()
             .enumerate()
             .max_by(|(left_index, left_child), (right_index, right_child)| {
-                let left_score =
-                    puct_score(left_child, parent_visits_sqrt, self.cpuct);
-                let right_score =
-                    puct_score(right_child, parent_visits_sqrt, self.cpuct);
+                let left_score = puct_score(left_child, parent_visits_sqrt, self.cpuct);
+                let right_score = puct_score(right_child, parent_visits_sqrt, self.cpuct);
                 left_score
                     .total_cmp(&right_score)
                     .then_with(|| right_child.prior.total_cmp(&left_child.prior))
@@ -585,7 +588,12 @@ mod tests {
 
         assert_eq!(result.simulations, 128);
         assert!(result.best_move.is_some());
-        assert!(result.candidates.iter().any(|candidate| candidate.visits > 0));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.visits > 0)
+        );
         assert!((total_policy - 1.0).abs() < 1e-3);
     }
 
@@ -619,11 +627,13 @@ mod tests {
         );
 
         assert_eq!(plain.candidates.len(), noisy.candidates.len());
-        assert!(plain
-            .candidates
-            .iter()
-            .zip(&noisy.candidates)
-            .any(|(left, right)| (left.prior - right.prior).abs() > 1e-6));
+        assert!(
+            plain
+                .candidates
+                .iter()
+                .zip(&noisy.candidates)
+                .any(|(left, right)| (left.prior - right.prior).abs() > 1e-6)
+        );
     }
 
     #[test]

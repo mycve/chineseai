@@ -10,7 +10,7 @@ use super::{AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64};
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 2;
+const REPLAY_FILE_VERSION: u32 = 3;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -77,6 +77,18 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct ReplayEntry {
+    sample: AzTrainingSample,
+    train_count: u32,
+}
+
+fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()> {
+    encode_az_training_sample(out, &entry.sample)?;
+    replay_push_u32(out, entry.train_count);
+    Ok(())
+}
+
 fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
     let nf = replay_read_u32(reader)?;
     if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
@@ -115,11 +127,25 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     })
 }
 
+fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
+    let sample = decode_az_training_sample(reader)?;
+    let train_count = if version >= 3 {
+        replay_read_u32(reader)?
+    } else {
+        0
+    };
+    Ok(ReplayEntry {
+        sample,
+        train_count,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct AzExperiencePool {
     game_capacity: usize,
-    games: VecDeque<Vec<AzTrainingSample>>,
+    games: VecDeque<Vec<ReplayEntry>>,
     samples: usize,
+    train_count_sum: u64,
 }
 
 impl AzExperiencePool {
@@ -128,6 +154,7 @@ impl AzExperiencePool {
             game_capacity,
             games: VecDeque::new(),
             samples: 0,
+            train_count_sum: 0,
         }
     }
 
@@ -139,22 +166,68 @@ impl AzExperiencePool {
         self.samples
     }
 
-    pub(super) fn add_games(&mut self, games: Vec<Vec<AzTrainingSample>>) {
+    pub fn average_train_count(&self) -> f32 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            self.train_count_sum as f32 / self.samples as f32
+        }
+    }
+
+    pub fn add_games(&mut self, games: Vec<Vec<AzTrainingSample>>) {
         if self.game_capacity == 0 {
             return;
         }
         for game in games.into_iter().filter(|game| !game.is_empty()) {
             self.samples += game.len();
-            self.games.push_back(game);
+            self.games.push_back(
+                game.into_iter()
+                    .map(|sample| ReplayEntry {
+                        sample,
+                        train_count: 0,
+                    })
+                    .collect(),
+            );
             while self.games.len() > self.game_capacity {
                 if let Some(removed) = self.games.pop_front() {
                     self.samples = self.samples.saturating_sub(removed.len());
+                    self.train_count_sum = self
+                        .train_count_sum
+                        .saturating_sub(removed.iter().map(|entry| entry.train_count as u64).sum());
                 }
             }
         }
     }
 
-    pub(super) fn sample_uniform_games(
+    pub fn sample_uniform_games_marked(
+        &mut self,
+        count: usize,
+        max_train_count: u32,
+        rng: &mut SplitMix64,
+    ) -> Vec<AzTrainingSample> {
+        if self.games.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut samples = Vec::with_capacity(count);
+        for _ in 0..count {
+            let game_index = (rng.next() as usize) % self.games.len();
+            let game = &mut self.games[game_index];
+            if game.is_empty() {
+                continue;
+            }
+            let sample_index = (rng.next() as usize) % game.len();
+            let entry = &mut game[sample_index];
+            entry.train_count = entry.train_count.saturating_add(1);
+            self.train_count_sum = self.train_count_sum.saturating_add(1);
+            samples.push(entry.sample.clone());
+        }
+        if max_train_count > 0 {
+            self.prune_overtrained(max_train_count);
+        }
+        samples
+    }
+
+    pub fn sample_uniform_games(
         &self,
         count: usize,
         rng: &mut SplitMix64,
@@ -170,9 +243,32 @@ impl AzExperiencePool {
                 continue;
             }
             let sample_index = (rng.next() as usize) % game.len();
-            samples.push(game[sample_index].clone());
+            samples.push(game[sample_index].sample.clone());
         }
         samples
+    }
+
+    fn prune_overtrained(&mut self, max_train_count: u32) {
+        if max_train_count == 0 {
+            return;
+        }
+        let mut rebuilt = VecDeque::with_capacity(self.games.len());
+        let mut samples = 0usize;
+        let mut train_count_sum = 0u64;
+        while let Some(mut game) = self.games.pop_front() {
+            game.retain(|entry| entry.train_count <= max_train_count);
+            if !game.is_empty() {
+                samples += game.len();
+                train_count_sum += game
+                    .iter()
+                    .map(|entry| entry.train_count as u64)
+                    .sum::<u64>();
+                rebuilt.push_back(game);
+            }
+        }
+        self.games = rebuilt;
+        self.samples = samples;
+        self.train_count_sum = train_count_sum;
     }
 
     fn encode_replay_payload(&self) -> io::Result<Vec<u8>> {
@@ -181,14 +277,14 @@ impl AzExperiencePool {
         replay_push_u64(&mut out, self.games.len() as u64);
         for game in &self.games {
             replay_push_u64(&mut out, game.len() as u64);
-            for sample in game {
-                encode_az_training_sample(&mut out, sample)?;
+            for entry in game {
+                encode_replay_entry(&mut out, entry)?;
             }
         }
         Ok(out)
     }
 
-    fn decode_replay_payload(data: &[u8], game_capacity: usize) -> io::Result<Self> {
+    fn decode_replay_payload(data: &[u8], game_capacity: usize, version: u32) -> io::Result<Self> {
         let mut reader = Cursor::new(data);
         let _stored_capacity = replay_read_u64(&mut reader)? as usize;
         let n_games = replay_read_u64(&mut reader)? as usize;
@@ -200,6 +296,7 @@ impl AzExperiencePool {
         }
         let mut games = VecDeque::with_capacity(n_games.min(game_capacity.max(1)));
         let mut samples = 0usize;
+        let mut train_count_sum = 0u64;
         for _ in 0..n_games {
             let n_s = replay_read_u64(&mut reader)? as usize;
             if n_s > 50_000 {
@@ -210,7 +307,9 @@ impl AzExperiencePool {
             }
             let mut game = Vec::with_capacity(n_s);
             for _ in 0..n_s {
-                game.push(decode_az_training_sample(&mut reader)?);
+                let entry = decode_replay_entry(&mut reader, version)?;
+                train_count_sum += entry.train_count as u64;
+                game.push(entry);
             }
             samples += game.len();
             games.push_back(game);
@@ -219,10 +318,14 @@ impl AzExperiencePool {
             game_capacity,
             games,
             samples,
+            train_count_sum,
         };
         while pool.games.len() > pool.game_capacity {
             if let Some(removed) = pool.games.pop_front() {
                 pool.samples = pool.samples.saturating_sub(removed.len());
+                pool.train_count_sum = pool
+                    .train_count_sum
+                    .saturating_sub(removed.iter().map(|entry| entry.train_count as u64).sum());
             }
         }
         Ok(pool)
@@ -273,11 +376,11 @@ impl AzExperiencePool {
             ));
         }
         let ver = u32::from_le_bytes(file_blob[4..8].try_into().unwrap());
-        if ver != REPLAY_FILE_VERSION {
+        if !(2..=REPLAY_FILE_VERSION).contains(&ver) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "replay unsupported version {ver} (only v{REPLAY_FILE_VERSION} is supported)"
+                    "replay unsupported version {ver} (supported: v2..=v{REPLAY_FILE_VERSION})"
                 ),
             ));
         }
@@ -293,6 +396,6 @@ impl AzExperiencePool {
                 "replay decompressed size over cap",
             ));
         }
-        Self::decode_replay_payload(&inner, game_capacity)
+        Self::decode_replay_payload(&inner, game_capacity, ver)
     }
 }

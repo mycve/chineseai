@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::thread;
 
-use crate::nnue::{HistoryMove, extract_sparse_features_v4, mirror_file_move, mirror_sparse_features_file, orient_move};
+use crate::nnue::{
+    HistoryMove, extract_sparse_features_v4, mirror_file_move, mirror_sparse_features_file,
+    orient_move,
+};
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
@@ -11,22 +14,22 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct AzTerminalStats {
-    pub(super) no_legal_moves: usize,
-    pub(super) red_general_missing: usize,
-    pub(super) black_general_missing: usize,
-    pub(super) rule_draw: usize,
-    pub(super) rule_draw_halfmove120: usize,
-    pub(super) rule_draw_repetition: usize,
-    pub(super) rule_draw_mutual_long_check: usize,
-    pub(super) rule_draw_mutual_long_chase: usize,
-    pub(super) rule_win_red: usize,
-    pub(super) rule_win_black: usize,
-    pub(super) max_plies: usize,
+pub struct AzTerminalStats {
+    pub no_legal_moves: usize,
+    pub red_general_missing: usize,
+    pub black_general_missing: usize,
+    pub rule_draw: usize,
+    pub rule_draw_halfmove120: usize,
+    pub rule_draw_repetition: usize,
+    pub rule_draw_mutual_long_check: usize,
+    pub rule_draw_mutual_long_chase: usize,
+    pub rule_win_red: usize,
+    pub rule_win_black: usize,
+    pub max_plies: usize,
 }
 
 impl AzTerminalStats {
-    pub(super) fn add_assign(&mut self, other: &Self) {
+    pub fn add_assign(&mut self, other: &Self) {
         self.no_legal_moves += other.no_legal_moves;
         self.red_general_missing += other.red_general_missing;
         self.black_general_missing += other.black_general_missing;
@@ -73,21 +76,37 @@ impl AzArenaReport {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct AzSelfplayData {
-    pub(super) samples: Vec<AzTrainingSample>,
-    pub(super) games: Vec<Vec<AzTrainingSample>>,
-    pub(super) red_wins: usize,
-    pub(super) black_wins: usize,
-    pub(super) draws: usize,
-    pub(super) plies_total: usize,
-    pub(super) temperature_early_entropy_sum: f32,
-    pub(super) temperature_early_entropy_count: usize,
-    pub(super) temperature_mid_entropy_sum: f32,
-    pub(super) temperature_mid_entropy_count: usize,
-    pub(super) terminal: AzTerminalStats,
+pub struct AzSelfplayData {
+    pub samples: Vec<AzTrainingSample>,
+    pub games: Vec<Vec<AzTrainingSample>>,
+    pub red_wins: usize,
+    pub black_wins: usize,
+    pub draws: usize,
+    pub plies_total: usize,
+    pub temperature_early_entropy_sum: f32,
+    pub temperature_early_entropy_count: usize,
+    pub temperature_mid_entropy_sum: f32,
+    pub temperature_mid_entropy_count: usize,
+    pub terminal: AzTerminalStats,
 }
 
-pub(super) fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+impl AzSelfplayData {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.samples.extend(other.samples.iter().cloned());
+        self.games.extend(other.games.iter().cloned());
+        self.red_wins += other.red_wins;
+        self.black_wins += other.black_wins;
+        self.draws += other.draws;
+        self.plies_total += other.plies_total;
+        self.temperature_early_entropy_sum += other.temperature_early_entropy_sum;
+        self.temperature_early_entropy_count += other.temperature_early_entropy_count;
+        self.temperature_mid_entropy_sum += other.temperature_mid_entropy_sum;
+        self.temperature_mid_entropy_count += other.temperature_mid_entropy_count;
+        self.terminal.add_assign(&other.terminal);
+    }
+}
+
+pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     let workers = config.workers.max(1).min(config.games.max(1));
     if workers == 1 || config.games <= 1 {
         return generate_selfplay_chunk(model, config);

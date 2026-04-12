@@ -17,10 +17,11 @@ pub use alphazero::{
     alphazero_search_with_history_and_root_moves, alphazero_search_with_history_and_rules,
 };
 use optim::AdamWState;
-pub use play::{AzArenaReport, play_arena_games};
+pub use play::{
+    AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data, play_arena_games,
+};
 pub use replay::AzExperiencePool;
-use play::generate_selfplay_data;
-use train::train_samples;
+pub use train::train_samples;
 
 /// 二进制权重文件头魔数（小端 `f32` 载荷，见 `save` / `load`）。
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
@@ -194,24 +195,24 @@ pub struct AzTrainBenchmark {
 }
 
 #[derive(Clone, Debug)]
-struct AzTrainingSample {
-    features: Vec<usize>,
-    move_indices: Vec<usize>,
-    policy: Vec<f32>,
-    value: f32,
-    side_sign: f32,
+pub struct AzTrainingSample {
+    pub features: Vec<usize>,
+    pub move_indices: Vec<usize>,
+    pub policy: Vec<f32>,
+    pub value: f32,
+    pub side_sign: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct AzTrainStats {
-    loss: f32,
-    value_loss: f32,
-    policy_ce: f32,
-    value_pred_sum: f32,
-    value_pred_sq_sum: f32,
-    value_target_sum: f32,
-    value_target_sq_sum: f32,
-    samples: usize,
+pub struct AzTrainStats {
+    pub loss: f32,
+    pub value_loss: f32,
+    pub policy_ce: f32,
+    pub value_pred_sum: f32,
+    pub value_pred_sq_sum: f32,
+    pub value_target_sum: f32,
+    pub value_target_sq_sum: f32,
+    pub samples: usize,
 }
 
 #[derive(Debug)]
@@ -271,7 +272,6 @@ impl AzGrad {
         self.policy_move_global.fill(0.0);
         self.policy_move_bias.fill(0.0);
     }
-
 }
 
 impl AzTrainStats {
@@ -395,7 +395,9 @@ impl AzNnue {
         if version != AZNNUE_BINARY_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported AZNNUE binary version {version} (expected {AZNNUE_BINARY_VERSION})"),
+                format!(
+                    "unsupported AZNNUE binary version {version} (expected {AZNNUE_BINARY_VERSION})"
+                ),
             ));
         }
         let input_size = read_u32_le(&mut reader)? as usize;
@@ -552,12 +554,7 @@ impl AzNnue {
         }
     }
 
-    fn forward_trunk_into(
-        &self,
-        hidden: &mut Vec<f32>,
-        next: &mut Vec<f32>,
-        global: &[f32],
-    ) {
+    fn forward_trunk_into(&self, hidden: &mut Vec<f32>, next: &mut Vec<f32>, global: &[f32]) {
         next.resize(self.hidden_size, 0.0);
         for layer in 0..self.trunk_depth {
             let weight_offset = layer * self.hidden_size * self.hidden_size;
@@ -570,9 +567,9 @@ impl AzNnue {
                 for idx in 0..self.hidden_size {
                     value += row[idx] * hidden[idx];
                 }
-                let grow = &self.trunk_global_weights
-                    [global_weight_offset + out * GLOBAL_CONTEXT_SIZE
-                        ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
+                let grow = &self.trunk_global_weights[global_weight_offset
+                    + out * GLOBAL_CONTEXT_SIZE
+                    ..global_weight_offset + (out + 1) * GLOBAL_CONTEXT_SIZE];
                 for k in 0..GLOBAL_CONTEXT_SIZE {
                     value += grow[k] * global[k];
                 }
@@ -587,8 +584,8 @@ impl AzNnue {
             .value_intermediate
             .copy_from_slice(&self.value_intermediate_bias);
         for j in 0..VALUE_HIDDEN_SIZE {
-            let h_row = &self.value_intermediate_hidden
-                [j * self.hidden_size..(j + 1) * self.hidden_size];
+            let h_row =
+                &self.value_intermediate_hidden[j * self.hidden_size..(j + 1) * self.hidden_size];
             for i in 0..self.hidden_size {
                 scratch.value_intermediate[j] += scratch.hidden[i] * h_row[i];
             }
@@ -599,10 +596,12 @@ impl AzNnue {
             }
             scratch.value_intermediate[j] = scratch.value_intermediate[j].max(0.0);
         }
-        scratch.value_logits.copy_from_slice(&self.value_logits_bias);
+        scratch
+            .value_logits
+            .copy_from_slice(&self.value_logits_bias);
         for out in 0..VALUE_LOGITS {
-            let row = &self.value_logits_weights
-                [out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
+            let row =
+                &self.value_logits_weights[out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
             for j in 0..VALUE_HIDDEN_SIZE {
                 scratch.value_logits[out] += scratch.value_intermediate[j] * row[j];
             }
@@ -771,7 +770,8 @@ pub fn selfplay_train_iteration_with_pool(
         total_seconds,
         games_per_second: config.games as f32 / selfplay_seconds.max(1e-6),
         samples_per_second: generated_samples as f32 / selfplay_seconds.max(1e-6),
-        train_samples_per_second: (train_data.len() * config.epochs) as f32 / train_seconds.max(1e-6),
+        train_samples_per_second: (train_data.len() * config.epochs) as f32
+            / train_seconds.max(1e-6),
         train_samples: train_data.len(),
         pool_games,
         pool_samples,
@@ -905,21 +905,21 @@ fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
     }
 }
 
-pub(super) struct SplitMix64 {
+pub struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    pub(super) fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    pub(super) fn next(&mut self) -> u64 {
+    pub fn next(&mut self) -> u64 {
         self.state = splitmix64(self.state);
         self.state
     }
 
-    pub(super) fn unit_f32(&mut self) -> f32 {
+    pub fn unit_f32(&mut self) -> f32 {
         let value = self.next();
         (((value >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))) as f32
     }
@@ -972,7 +972,10 @@ const fn is_valid_policy_move(from: usize, to: usize) -> bool {
     if (df == 1 && dr == 2) || (df == 2 && dr == 1) {
         return true;
     }
-    if df == 1 && dr == 1 && is_advisor_pos(from_rank, from_file) && is_advisor_pos(to_rank, to_file)
+    if df == 1
+        && dr == 1
+        && is_advisor_pos(from_rank, from_file)
+        && is_advisor_pos(to_rank, to_file)
     {
         return true;
     }
@@ -1061,8 +1064,8 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::play::assign_terminal_value_targets;
+    use super::*;
 
     #[test]
     fn dense_move_space_matches_enumeration() {
@@ -1186,18 +1189,19 @@ mod tests {
         let mut rng_single = SplitMix64::new(99);
         let mut rng_repeated = SplitMix64::new(99);
         let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single);
-        let repeated_stats =
-            train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated);
+        let repeated_stats = train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated);
 
         assert!((single_stats.loss - repeated_stats.loss).abs() < 1e-5);
         assert!((single_stats.value_loss - repeated_stats.value_loss).abs() < 1e-5);
         assert!((single_stats.value_pred_sum - repeated_stats.value_pred_sum).abs() < 1e-4);
         assert!((single_stats.value_target_sum - repeated_stats.value_target_sum).abs() < 1e-6);
-        assert!(single
-            .value_logits_bias
-            .iter()
-            .zip(&repeated.value_logits_bias)
-            .all(|(left, right)| (*left - *right).abs() < 1e-5));
+        assert!(
+            single
+                .value_logits_bias
+                .iter()
+                .zip(&repeated.value_logits_bias)
+                .all(|(left, right)| (*left - *right).abs() < 1e-5)
+        );
     }
 
     #[test]

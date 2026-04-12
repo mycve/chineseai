@@ -7,7 +7,7 @@ use super::{
     softmax_slice,
 };
 
-pub(super) fn train_samples(
+pub fn train_samples(
     model: &mut AzNnue,
     samples: &[AzTrainingSample],
     epochs: usize,
@@ -31,14 +31,7 @@ pub(super) fn train_samples(
         shuffle(&mut order, rng);
         stats = AzTrainStats::default();
         for batch in order.chunks(batch_size) {
-            let batch_stats = train_batch(
-                model,
-                &mut optimizer,
-                &mut gradient,
-                samples,
-                batch,
-                lr,
-            );
+            let batch_stats = train_batch(model, &mut optimizer, &mut gradient, samples, batch, lr);
             stats.add_assign(&batch_stats);
         }
     }
@@ -213,13 +206,13 @@ fn accumulate_batch_cached(
         let global = row_slice(global_all, row, GLOBAL_CONTEXT_SIZE);
         for flat_index in policy_range {
             let move_index = policy_layout.move_indices[flat_index];
-            let policy_grad = (policy_probs[flat_index] - policy_layout.targets[flat_index])
-                .clamp(-4.0, 4.0);
+            let policy_grad =
+                (policy_probs[flat_index] - policy_layout.targets[flat_index]).clamp(-4.0, 4.0);
             let hidden_offset = move_index * model.hidden_size;
             let hidden_row =
                 &model.policy_move_hidden[hidden_offset..hidden_offset + model.hidden_size];
-            let hidden_grad_row = &mut gradient.policy_move_hidden
-                [hidden_offset..hidden_offset + model.hidden_size];
+            let hidden_grad_row =
+                &mut gradient.policy_move_hidden[hidden_offset..hidden_offset + model.hidden_size];
             add_scaled(activation_grad, hidden_row, policy_grad);
             add_scaled(hidden_grad_row, hidden, policy_grad);
             let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
@@ -278,7 +271,8 @@ fn accumulate_batch_cached(
             &residual_grads,
             batch_size,
             model.hidden_size,
-            &model.trunk_weights[weight_offset..weight_offset + model.hidden_size * model.hidden_size],
+            &model.trunk_weights
+                [weight_offset..weight_offset + model.hidden_size * model.hidden_size],
             model.hidden_size,
         );
         add_batch_times_weights(
@@ -537,8 +531,8 @@ fn train_batch_forward_cache(
         let sample = &samples[index];
         let row_offset = row * model.hidden_size;
         for &feature in &sample.features {
-            let weight_row = &model.input_hidden
-                [feature * model.hidden_size..(feature + 1) * model.hidden_size];
+            let weight_row =
+                &model.input_hidden[feature * model.hidden_size..(feature + 1) * model.hidden_size];
             for idx in 0..model.hidden_size {
                 hidden[row_offset + idx] += weight_row[idx];
             }
@@ -566,7 +560,8 @@ fn train_batch_forward_cache(
             previous,
             batch_size,
             model.hidden_size,
-            &model.trunk_weights[weight_offset..weight_offset + model.hidden_size * model.hidden_size],
+            &model.trunk_weights
+                [weight_offset..weight_offset + model.hidden_size * model.hidden_size],
             model.hidden_size,
             &model.trunk_biases[bias_offset..bias_offset + model.hidden_size],
         );
@@ -575,8 +570,8 @@ fn train_batch_forward_cache(
             &global,
             batch_size,
             GLOBAL_CONTEXT_SIZE,
-            &model.trunk_global_weights
-                [global_weight_offset..global_weight_offset + model.hidden_size * GLOBAL_CONTEXT_SIZE],
+            &model.trunk_global_weights[global_weight_offset
+                ..global_weight_offset + model.hidden_size * GLOBAL_CONTEXT_SIZE],
             model.hidden_size,
         );
         relu_inplace(&mut next);
@@ -586,9 +581,7 @@ fn train_batch_forward_cache(
         activations.push(next);
     }
 
-    let hidden = activations
-        .last()
-        .expect("at least one activation exists");
+    let hidden = activations.last().expect("at least one activation exists");
     let mut value_intermediate_pre = affine_batch(
         hidden,
         batch_size,
