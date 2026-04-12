@@ -3,7 +3,7 @@ use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
-mod gumbel;
+mod alphazero;
 mod optim;
 mod play;
 mod replay;
@@ -12,9 +12,9 @@ mod train;
 use crate::nnue::{HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, orient_move};
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Move, Position};
 
-pub use gumbel::{
-    AzCandidate, AzSearchLimits, AzSearchResult, gumbel_search, gumbel_search_with_history,
-    gumbel_search_with_history_and_root_moves, gumbel_search_with_history_and_rules,
+pub use alphazero::{
+    AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search, alphazero_search_with_history,
+    alphazero_search_with_history_and_root_moves, alphazero_search_with_history_and_rules,
 };
 use optim::AdamWState;
 pub use play::{AzArenaReport, play_arena_games};
@@ -57,16 +57,9 @@ const GLOBAL_CONTEXT_SIZE: usize = 32;
 const VALUE_HIDDEN_SIZE: usize = 64;
 const VALUE_LOGITS: usize = 3;
 const VALUE_SCALE_CP: f32 = 1000.0;
-/// `mctx.qtransforms.qtransform_completed_by_mix_value` 默认 `value_scale`。
-const COMPLETED_Q_VALUE_SCALE: f32 = 0.1;
-/// 同上默认 `maxvisit_init`。
-const COMPLETED_Q_MAXVISIT_INIT: f32 = 50.0;
-const COMPLETED_Q_RESCALE_EPSILON: f32 = 1e-8;
-/// `mctx.seq_halving.score_considered` 中的 `low_logit`。
-const SCORE_CONSIDERED_LOW_LOGIT: f32 = -1e9;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 /// 单次 NN 前向复用的临时张量，由 [`AzTree`] 持有，避免每步模拟反复 `Vec` 分配。
-struct AzEvalScratch {
+pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
     next: Vec<f32>,
     global: Vec<f32>,
@@ -77,7 +70,7 @@ struct AzEvalScratch {
 }
 
 impl AzEvalScratch {
-    fn new(hidden_size: usize) -> Self {
+    pub(super) fn new(hidden_size: usize) -> Self {
         Self {
             hidden: vec![0.0; hidden_size],
             next: vec![0.0; hidden_size],
@@ -142,7 +135,6 @@ pub struct AzLoopConfig {
     pub games: usize,
     pub max_plies: usize,
     pub simulations: usize,
-    pub top_k: usize,
     pub epochs: usize,
     pub lr: f32,
     pub batch_size: usize,
@@ -151,7 +143,9 @@ pub struct AzLoopConfig {
     pub temperature_start: f32,
     pub temperature_end: f32,
     pub temperature_decay_plies: usize,
-    pub gumbel_scale: f32,
+    pub cpuct: f32,
+    pub root_dirichlet_alpha: f32,
+    pub root_exploration_fraction: f32,
     pub replay_games: usize,
     pub replay_samples: usize,
     pub mirror_probability: f32,
@@ -507,7 +501,7 @@ impl AzNnue {
         (value, logits)
     }
 
-    fn evaluate_with_scratch(
+    pub(super) fn evaluate_with_scratch(
         &self,
         position: &Position,
         history: &[HistoryMove],
@@ -911,31 +905,21 @@ fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
     }
 }
 
-fn deterministic_gumbel(hash: u64, mv: Move, salt: u64) -> f32 {
-    let seed = hash
-        ^ ((mv.from as u64) << 48)
-        ^ ((mv.to as u64) << 32)
-        ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let value = splitmix64(seed);
-    let unit = (((value >> 11) as f64) + 0.5) * (1.0 / ((1u64 << 53) as f64));
-    (-(-unit.ln()).ln()) as f32
-}
-
-struct SplitMix64 {
+pub(super) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.state = splitmix64(self.state);
         self.state
     }
 
-    fn unit_f32(&mut self) -> f32 {
+    pub(super) fn unit_f32(&mut self) -> f32 {
         let value = self.next();
         (((value >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))) as f32
     }

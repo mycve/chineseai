@@ -1,4 +1,4 @@
-//! UCI 联机：ChineseAI（AZ-NNUE + Gumbel 搜索）对 Pikafish；按局交替红黑并汇总胜负。
+//! UCI 联机：ChineseAI（AZ-NNUE + AlphaZero MCTS）对 Pikafish；按局交替红黑并汇总胜负。
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -6,12 +6,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, AzSearchLimits, gumbel_search_with_history_and_rules};
+use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
 use crate::nnue::{HistoryMove, HISTORY_PLIES};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
-/// 对 Pikafish 时根 Gumbel 置 0，与 UCI 默认一致，棋力更稳、便于对比。
-const VS_PIKAFISH_GUMBEL: f32 = 0.0;
+/// 对 Pikafish 使用固定的 PUCT 常数，与 UCI 默认保持一致，便于对比。
+const VS_PIKAFISH_CPUCT: f32 = 1.5;
 
 #[derive(Clone, Debug, Default)]
 pub struct VsPikafishResult {
@@ -197,7 +197,6 @@ fn play_one_game(
     movetime_ms: u32,
     max_plies: usize,
     simulations: usize,
-    top_k: usize,
     mut seed: u64,
 ) -> std::io::Result<GameEnd> {
     let _ = external.write_line("ucinewgame");
@@ -219,7 +218,7 @@ fn play_one_game(
             || (!chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let search = gumbel_search_with_history_and_rules(
+            let search = alphazero_search_with_history_and_rules(
                 &position,
                 &history,
                 Some(rule_history.clone()),
@@ -227,10 +226,11 @@ fn play_one_game(
                 model,
                 AzSearchLimits {
                     simulations,
-                    top_k,
                     seed,
-                    gumbel_scale: VS_PIKAFISH_GUMBEL,
+                    cpuct: VS_PIKAFISH_CPUCT,
                     workers: 1,
+                    root_dirichlet_alpha: 0.0,
+                    root_exploration_fraction: 0.0,
                 },
             );
             seed = seed.wrapping_add(1);
@@ -280,7 +280,6 @@ pub fn run_vs_pikafish(
     total_games: usize,
     max_plies: usize,
     simulations: usize,
-    top_k: usize,
     seed: u64,
     parallel_games: usize,
 ) -> std::io::Result<VsPikafishResult> {
@@ -316,7 +315,6 @@ pub fn run_vs_pikafish(
                     movetime_ms,
                     max_plies,
                     simulations,
-                    top_k,
                     seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                 )?;
                 Ok((chinese_red, end))

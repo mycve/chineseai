@@ -4,10 +4,10 @@ use std::thread;
 use crate::nnue::{HistoryMove, extract_sparse_features_v4, mirror_file_move, mirror_sparse_features_file, orient_move};
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
-use super::gumbel::append_history;
+use super::alphazero::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
-    dense_move_index, gumbel_search_with_history_and_rules,
+    alphazero_search_with_history_and_rules, dense_move_index,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -164,7 +164,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search = gumbel_search_with_history_and_rules(
+            let search = alphazero_search_with_history_and_rules(
                 &position,
                 &history,
                 Some(rule_history.clone()),
@@ -172,10 +172,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 model,
                 AzSearchLimits {
                     simulations: config.simulations,
-                    top_k: config.top_k,
                     seed: rng.next() ^ ((game_index as u64) << 32) ^ ply as u64,
-                    gumbel_scale: config.gumbel_scale,
+                    cpuct: config.cpuct,
                     workers: 1,
+                    root_dirichlet_alpha: config.root_dirichlet_alpha,
+                    root_exploration_fraction: config.root_exploration_fraction,
                 },
             );
             let entropy = policy_entropy(&search.candidates);
@@ -391,13 +392,11 @@ pub fn play_arena_games(
     candidate: &AzNnue,
     baseline: &AzNnue,
     simulations: usize,
-    top_k: usize,
     max_plies: usize,
     games_as_red: usize,
     games_as_black: usize,
     seed: u64,
-    gumbel_scale: f32,
-    gumbel_opening_plies: usize,
+    cpuct: f32,
 ) -> AzArenaReport {
     let mut report = AzArenaReport::default();
     let mut game_seed = seed;
@@ -406,11 +405,9 @@ pub fn play_arena_games(
             candidate,
             baseline,
             simulations,
-            top_k,
             max_plies,
             game_seed,
-            gumbel_scale,
-            gumbel_opening_plies,
+            cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -430,11 +427,9 @@ pub fn play_arena_games(
             baseline,
             candidate,
             simulations,
-            top_k,
             max_plies,
             game_seed,
-            gumbel_scale,
-            gumbel_opening_plies,
+            cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -456,11 +451,9 @@ fn play_arena_game(
     red_model: &AzNnue,
     black_model: &AzNnue,
     simulations: usize,
-    top_k: usize,
     max_plies: usize,
     seed: u64,
-    gumbel_scale: f32,
-    gumbel_opening_plies: usize,
+    cpuct: f32,
 ) -> f32 {
     let mut position = Position::startpos();
     let mut history = Vec::new();
@@ -479,12 +472,7 @@ fn play_arena_game(
         } else {
             black_model
         };
-        let ply_gumbel = if ply < gumbel_opening_plies {
-            gumbel_scale
-        } else {
-            0.0
-        };
-        let result = gumbel_search_with_history_and_rules(
+        let result = alphazero_search_with_history_and_rules(
             &position,
             &history,
             Some(rule_history.clone()),
@@ -492,10 +480,11 @@ fn play_arena_game(
             model,
             AzSearchLimits {
                 simulations,
-                top_k,
                 seed: seed ^ ((ply as u64) << 32),
-                gumbel_scale: ply_gumbel,
+                cpuct,
                 workers: 1,
+                root_dirichlet_alpha: 0.0,
+                root_exploration_fraction: 0.0,
             },
         );
         let Some(mv) = result.best_move else {

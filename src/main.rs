@@ -5,7 +5,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use chineseai::{
     az::{
         AzArenaReport, AzExperiencePool, AzLoopConfig, AzNnue, AzSearchLimits,
-        benchmark_training, gumbel_search, gumbel_search_with_history_and_rules, play_arena_games,
+        alphazero_search, alphazero_search_with_history_and_rules, benchmark_training,
+        play_arena_games,
         selfplay_train_iteration_with_pool,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
@@ -136,14 +137,13 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     format!(
         concat!(
-            "it{}_g{}_sim{}_tk{}_bs{}_lr{}_ep{}_h{}_d{}_mxp{}_wk{}_",
+            "it{}_g{}_sim{}_bs{}_lr{}_ep{}_h{}_d{}_mxp{}_wk{}_",
             "gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_cpi{}_",
-            "ai{}_ags{}_agp{}_sd{}"
+            "ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.iterations,
         config.games,
         config.simulations,
-        config.top_k,
         config.batch_size,
         f32_slug(config.lr),
         config.epochs,
@@ -151,7 +151,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.trunk_depth,
         config.max_plies,
         config.workers,
-        f32_slug(config.gumbel_scale),
+        f32_slug(config.cpuct),
         f32_slug(config.temperature_start),
         f32_slug(config.temperature_end),
         config.temperature_decay_plies,
@@ -160,8 +160,9 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
-        f32_slug(config.arena_gumbel_scale),
-        config.arena_gumbel_plies,
+        f32_slug(config.arena_cpuct),
+        f32_slug(config.root_dirichlet_alpha),
+        f32_slug(config.root_exploration_fraction),
         config.seed,
     )
 }
@@ -225,10 +226,8 @@ fn run_arena_processes(
     baseline_path: &str,
     games_per_side: usize,
     simulations: usize,
-    top_k: usize,
     max_plies: usize,
-    arena_gumbel_scale: f32,
-    arena_gumbel_plies: usize,
+    arena_cpuct: f32,
     process_count: usize,
     seed: u64,
 ) -> AzArenaReport {
@@ -253,10 +252,8 @@ fn run_arena_processes(
             .arg(red_games.to_string())
             .arg(black_games.to_string())
             .arg(simulations.to_string())
-            .arg(top_k.to_string())
             .arg(max_plies.to_string())
-            .arg(arena_gumbel_scale.to_string())
-            .arg(arena_gumbel_plies.to_string())
+            .arg(arena_cpuct.to_string())
             .arg((seed ^ index as u64).to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -367,44 +364,40 @@ fn main() {
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
-        Some("az-gumbel") => {
+        Some("az-search") => {
             let model_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-gumbel <model> [simulations] [top_k] [gumbel_scale] [fen]")
+                panic!("usage: az-search <model> [simulations] [cpuct] [fen]")
             });
             let simulations = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(10_000);
-            let top_k = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(32);
-            let gumbel_scale = args
+            let cpuct = args
                 .next()
                 .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(0.0)
+                .unwrap_or(1.5)
                 .max(0.0);
             let fen = args.collect::<Vec<_>>().join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
-            let result = gumbel_search(
+            let result = alphazero_search(
                 &position,
                 &model,
                 AzSearchLimits {
                     simulations,
-                    top_k,
                     seed: 0,
-                    gumbel_scale,
+                    cpuct,
                     workers: 1,
+                    root_dirichlet_alpha: 0.0,
+                    root_exploration_fraction: 0.0,
                 },
             );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
-            println!("top_k    : {top_k}");
-            println!("gumbel   : {gumbel_scale}");
+            println!("cpuct    : {cpuct}");
             println!("value_cp : {}", result.value_cp);
             println!(
                 "bestmove : {}",
@@ -422,7 +415,7 @@ fn main() {
                     .count()
             );
             println!("by_policy:");
-            for candidate in result.candidates.iter().take(top_k) {
+            for candidate in &result.candidates {
                 println!(
                     "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
                     candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
@@ -437,7 +430,7 @@ fn main() {
                     .then_with(|| right.policy.total_cmp(&left.policy))
                     .then_with(|| right.q.total_cmp(&left.q))
             });
-            for candidate in by_visits.iter().take(top_k) {
+            for candidate in &by_visits {
                 println!(
                     "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
                     candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
@@ -446,27 +439,21 @@ fn main() {
         }
         Some("az-bench") => {
             let model_path = args.next().unwrap_or_else(|| {
-                panic!(
-                    "usage: az-bench <model> [simulations] [top_k] [repeat] [gumbel_scale] [fen]"
-                )
+                panic!("usage: az-bench <model> [simulations] [repeat] [cpuct] [fen]")
             });
             let simulations = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(512);
-            let top_k = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(32);
             let repeat = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(100)
                 .max(1);
-            let gumbel_scale = args
+            let cpuct = args
                 .next()
                 .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(0.0)
+                .unwrap_or(1.5)
                 .max(0.0);
             let fen = args.collect::<Vec<_>>().join(" ");
             let position = parse_position(&fen);
@@ -474,15 +461,16 @@ fn main() {
                 panic!("failed to load `{model_path}`: {err}");
             });
 
-            let _ = gumbel_search(
+            let _ = alphazero_search(
                 &position,
                 &model,
                 AzSearchLimits {
                     simulations,
-                    top_k,
                     seed: 0,
-                    gumbel_scale,
+                    cpuct,
                     workers: 1,
+                    root_dirichlet_alpha: 0.0,
+                    root_exploration_fraction: 0.0,
                 },
             );
 
@@ -490,15 +478,16 @@ fn main() {
             let mut total_sims = 0usize;
             let mut best_move = None;
             for iteration in 0..repeat {
-                let result = gumbel_search(
+                let result = alphazero_search(
                     &position,
                     &model,
                     AzSearchLimits {
                         simulations,
-                        top_k,
                         seed: iteration as u64,
-                        gumbel_scale,
+                        cpuct,
                         workers: 1,
+                        root_dirichlet_alpha: 0.0,
+                        root_exploration_fraction: 0.0,
                     },
                 );
                 total_sims += result.simulations;
@@ -510,9 +499,8 @@ fn main() {
             println!("model        : {model_path}");
             println!("fen          : {}", position.to_fen());
             println!("sims/search  : {simulations}");
-            println!("top_k        : {top_k}");
             println!("repeat       : {repeat}");
-            println!("gumbel       : {gumbel_scale}");
+            println!("cpuct        : {cpuct}");
             println!("total_sims   : {total_sims}");
             println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
             println!(
@@ -660,12 +648,11 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} iterations={} games={} sims={} top_k={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply gumbel_scale={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_gumbel_scale={} arena_gumbel_plies={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} iterations={} games={} sims={} epochs={} lr={} batch_size={} max_plies={} workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.iterations,
                 config.games,
                 config.simulations,
-                config.top_k,
                 config.epochs,
                 config.lr,
                 config.batch_size,
@@ -674,7 +661,7 @@ fn main() {
                 config.temperature_start,
                 config.temperature_end,
                 config.temperature_decay_plies,
-                config.gumbel_scale,
+                config.cpuct,
                 config.trunk_depth,
                 config.replay_games,
                 config.replay_samples,
@@ -683,8 +670,7 @@ fn main() {
                 config.max_checkpoints,
                 config.arena_interval,
                 config.arena_games_per_side,
-                config.arena_gumbel_scale,
-                config.arena_gumbel_plies,
+                config.arena_cpuct,
                 config.arena_processes,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
@@ -717,7 +703,6 @@ fn main() {
                         games: config.games,
                         max_plies: config.max_plies,
                         simulations: config.simulations,
-                        top_k: config.top_k,
                         epochs: config.epochs,
                         lr: config.lr,
                         batch_size: config.batch_size,
@@ -726,7 +711,9 @@ fn main() {
                         temperature_start: config.temperature_start,
                         temperature_end: config.temperature_end,
                         temperature_decay_plies: config.temperature_decay_plies,
-                        gumbel_scale: config.gumbel_scale,
+                        cpuct: config.cpuct,
+                        root_dirichlet_alpha: config.root_dirichlet_alpha,
+                        root_exploration_fraction: config.root_exploration_fraction,
                         replay_games: config.replay_games,
                         replay_samples: config.replay_samples,
                         mirror_probability: config.mirror_probability,
@@ -839,10 +826,8 @@ fn main() {
                         }),
                         config.arena_games_per_side,
                         config.simulations,
-                        config.top_k,
                         config.max_plies,
-                        config.arena_gumbel_scale,
-                        config.arena_gumbel_plies,
+                        config.arena_cpuct,
                         config.arena_processes,
                         config.seed ^ (iteration as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     );
@@ -915,13 +900,11 @@ fn main() {
             let red_games = az_arena_worker_next_usize(&mut args, "red_games");
             let black_games = az_arena_worker_next_usize(&mut args, "black_games");
             let simulations = az_arena_worker_next_usize(&mut args, "simulations").max(1);
-            let top_k = az_arena_worker_next_usize(&mut args, "top_k").max(1);
             let max_plies = az_arena_worker_next_usize(&mut args, "max_plies").max(1);
-            let arena_gumbel_scale = az_arena_worker_next_f32(&mut args, "arena_gumbel_scale").max(0.0);
-            let arena_gumbel_plies = az_arena_worker_next_usize(&mut args, "arena_gumbel_plies");
+            let arena_cpuct = az_arena_worker_next_f32(&mut args, "arena_cpuct").max(0.0);
             let seed = az_arena_worker_next_u64(&mut args, "seed");
             if args.next().is_some() {
-                panic!("az-arena-worker: trailing arguments (expected exactly 10 after candidate and baseline)");
+                panic!("az-arena-worker: trailing arguments (expected exactly 8 after candidate and baseline)");
             }
             let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
                 panic!("failed to load `{candidate_path}`: {err}");
@@ -933,13 +916,11 @@ fn main() {
                 &candidate,
                 &baseline,
                 simulations,
-                top_k,
                 max_plies,
                 red_games,
                 black_games,
                 seed,
-                arena_gumbel_scale,
-                arena_gumbel_plies,
+                arena_cpuct,
             );
             println!(
                 "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={}",
@@ -966,7 +947,7 @@ fn main() {
         Some("vs-pikafish") => {
             let pikafish_exe = args.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [movetime_ms] [games] [max_plies] [simulations] [top_k] [parallel_games]"
+                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [movetime_ms] [games] [max_plies] [simulations] [parallel_games]"
                 )
             });
             let model_path = args.next().unwrap_or_else(|| "chineseai.nnue".into());
@@ -990,11 +971,6 @@ fn main() {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(10_000)
                 .max(1);
-            let top_k = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(32)
-                .max(1);
             let parallel_games = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -1008,13 +984,12 @@ fn main() {
                 games,
                 max_plies,
                 simulations,
-                top_k,
                 seed,
                 parallel_games,
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
-                "vs-pikafish: games={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish movetime={}ms max_plies={} sims={} top_k={}",
+                "vs-pikafish: games={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish movetime={}ms max_plies={} sims={}",
                 summary.total_games,
                 parallel_games.min(games),
                 summary.chinese_wins,
@@ -1024,8 +999,7 @@ fn main() {
                 summary.chinese_wins_as_black,
                 movetime_ms,
                 max_plies,
-                simulations,
-                top_k
+                simulations
             );
         }
         Some("help") | _ => print_help(),
@@ -1034,17 +1008,17 @@ fn main() {
 
 fn print_help() {
     let position = Position::startpos();
-    println!("ChineseAI AZ-NNUE Gumbel core");
+    println!("ChineseAI AZ-NNUE AlphaZero MCTS core");
     println!("start : {STARTPOS_FEN}");
     println!("moves : {}", position.legal_moves().len());
     println!("hint  : cargo run --release -- az-init 128 chineseai.nnue 20260409 2");
     println!("hint  : cargo run --release -- uci");
-    println!("hint  : cargo run --release -- az-gumbel chineseai.nnue 10000 32 0.0 startpos");
-    println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 32 100 0.0 startpos");
+    println!("hint  : cargo run --release -- az-search chineseai.nnue 10000 32 1.5 startpos");
+    println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 32 100 1.5 startpos");
     println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
-    println!("hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <top_k> <max_plies> <arena_gumbel_scale> <arena_gumbel_plies> <seed>");
-    println!("hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 32 5");
+    println!("hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <seed>");
+    println!("hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 5");
 }
 
 #[derive(Clone, Debug)]
@@ -1053,7 +1027,6 @@ struct AzLoopFileConfig {
     iterations: usize,
     games: usize,
     simulations: usize,
-    top_k: usize,
     epochs: usize,
     lr: f32,
     batch_size: usize,
@@ -1065,7 +1038,9 @@ struct AzLoopFileConfig {
     temperature_start: f32,
     temperature_end: f32,
     temperature_decay_plies: usize,
-    gumbel_scale: f32,
+    cpuct: f32,
+    root_dirichlet_alpha: f32,
+    root_exploration_fraction: f32,
     replay_games: usize,
     replay_samples: usize,
     mirror_probability: f32,
@@ -1074,8 +1049,7 @@ struct AzLoopFileConfig {
     max_checkpoints: usize,
     arena_interval: usize,
     arena_games_per_side: usize,
-    arena_gumbel_scale: f32,
-    arena_gumbel_plies: usize,
+    arena_cpuct: f32,
     arena_processes: usize,
     tensorboard_logdir: String,
 }
@@ -1088,7 +1062,6 @@ impl Default for AzLoopFileConfig {
             iterations: 100,
             games: 400,
             simulations: 512,
-            top_k: 16,
             epochs: 2,
             lr: 0.0003,
             batch_size: 1024,
@@ -1100,7 +1073,9 @@ impl Default for AzLoopFileConfig {
             temperature_start: 1.0,
             temperature_end: 0.1,
             temperature_decay_plies: 30,
-            gumbel_scale: 1.0,
+            cpuct: 1.5,
+            root_dirichlet_alpha: 0.3,
+            root_exploration_fraction: 0.25,
             replay_games: 5000,
             replay_samples: 0,
             mirror_probability: 0.3,
@@ -1109,8 +1084,7 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 20,
             arena_games_per_side: 50,
-            arena_gumbel_scale: 1.0,
-            arena_gumbel_plies: 8,
+            arena_cpuct: 1.5,
             arena_processes: default_workers,
             tensorboard_logdir: "runs/chineseai".into(),
         }
@@ -1158,8 +1132,10 @@ impl AzLoopFileConfig {
 #   max_checkpoints keeps only the newest N checkpoint files in checkpoint_dir.
 #   arena_interval runs current-vs-best evaluation every N iterations.
 #   arena_games_per_side=50 means 50 games as Red and 50 as Black.
-#   arena_gumbel_scale: root Gumbel noise for the first arena_gumbel_plies half-moves only (then 0).
-#   arena_gumbel_plies=0 means no opening noise (fully deterministic).
+#   cpuct: PUCT exploration constant used by AlphaZero MCTS.
+#   root_dirichlet_alpha / root_exploration_fraction: self-play root-only Dirichlet noise.
+#   Set either to 0 to disable root noise.
+#   arena_cpuct applies during arena search.
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*, g_*,
 #   sim_*, bs_*, lr_*, … so TensorBoard Web can compare experiments side by side.
 
@@ -1167,7 +1143,6 @@ model_path = {model_path}
 iterations = {iterations}
 games = {games}
 simulations = {simulations}
-top_k = {top_k}
 epochs = {epochs}
 lr = {lr}
 batch_size = {batch_size}
@@ -1179,7 +1154,9 @@ workers = {workers}
 temperature_start = {temperature_start}
 temperature_end = {temperature_end}
 temperature_decay_plies = {temperature_decay_plies}
-gumbel_scale = {gumbel_scale}
+cpuct = {cpuct}
+root_dirichlet_alpha = {root_dirichlet_alpha}
+root_exploration_fraction = {root_exploration_fraction}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
@@ -1188,8 +1165,7 @@ checkpoint_dir = {checkpoint_dir}
 max_checkpoints = {max_checkpoints}
 arena_interval = {arena_interval}
 arena_games_per_side = {arena_games_per_side}
-arena_gumbel_scale = {arena_gumbel_scale}
-arena_gumbel_plies = {arena_gumbel_plies}
+arena_cpuct = {arena_cpuct}
 arena_processes = {arena_processes}
 tensorboard_logdir = {tensorboard_logdir}
 "#,
@@ -1197,7 +1173,6 @@ tensorboard_logdir = {tensorboard_logdir}
             iterations = self.iterations,
             games = self.games,
             simulations = self.simulations,
-            top_k = self.top_k,
             epochs = self.epochs,
             lr = self.lr,
             batch_size = self.batch_size,
@@ -1209,7 +1184,9 @@ tensorboard_logdir = {tensorboard_logdir}
             temperature_start = self.temperature_start,
             temperature_end = self.temperature_end,
             temperature_decay_plies = self.temperature_decay_plies,
-            gumbel_scale = self.gumbel_scale,
+            cpuct = self.cpuct,
+            root_dirichlet_alpha = self.root_dirichlet_alpha,
+            root_exploration_fraction = self.root_exploration_fraction,
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
@@ -1218,8 +1195,7 @@ tensorboard_logdir = {tensorboard_logdir}
             max_checkpoints = self.max_checkpoints,
             arena_interval = self.arena_interval,
             arena_games_per_side = self.arena_games_per_side,
-            arena_gumbel_scale = self.arena_gumbel_scale,
-            arena_gumbel_plies = self.arena_gumbel_plies,
+            arena_cpuct = self.arena_cpuct,
             arena_processes = self.arena_processes,
             tensorboard_logdir = self.tensorboard_logdir,
         )
@@ -1246,7 +1222,6 @@ tensorboard_logdir = {tensorboard_logdir}
             "iterations" => self.iterations = parse_config_value(value, self.iterations),
             "games" => self.games = parse_config_value(value, self.games),
             "simulations" => self.simulations = parse_config_value(value, self.simulations),
-            "top_k" => self.top_k = parse_config_value(value, self.top_k),
             "epochs" => self.epochs = parse_config_value(value, self.epochs),
             "lr" => self.lr = parse_config_value(value, self.lr),
             "batch_size" => self.batch_size = parse_config_value(value, self.batch_size),
@@ -1265,7 +1240,14 @@ tensorboard_logdir = {tensorboard_logdir}
                 self.temperature_decay_plies =
                     parse_config_value(value, self.temperature_decay_plies)
             }
-            "gumbel_scale" => self.gumbel_scale = parse_config_value(value, self.gumbel_scale),
+            "cpuct" => self.cpuct = parse_config_value(value, self.cpuct),
+            "root_dirichlet_alpha" => {
+                self.root_dirichlet_alpha = parse_config_value(value, self.root_dirichlet_alpha)
+            }
+            "root_exploration_fraction" => {
+                self.root_exploration_fraction =
+                    parse_config_value(value, self.root_exploration_fraction)
+            }
             "replay_games" => self.replay_games = parse_config_value(value, self.replay_games),
             "replay_samples" => {
                 self.replay_samples = parse_config_value(value, self.replay_samples)
@@ -1284,11 +1266,8 @@ tensorboard_logdir = {tensorboard_logdir}
             "arena_games_per_side" => {
                 self.arena_games_per_side = parse_config_value(value, self.arena_games_per_side)
             }
-            "arena_gumbel_scale" => {
-                self.arena_gumbel_scale = parse_config_value(value, self.arena_gumbel_scale)
-            }
-            "arena_gumbel_plies" => {
-                self.arena_gumbel_plies = parse_config_value(value, self.arena_gumbel_plies)
+            "arena_cpuct" => {
+                self.arena_cpuct = parse_config_value(value, self.arena_cpuct)
             }
             "arena_processes" => {
                 self.arena_processes = parse_config_value(value, self.arena_processes)
@@ -1302,7 +1281,6 @@ tensorboard_logdir = {tensorboard_logdir}
         self.iterations = self.iterations.max(1);
         self.games = self.games.max(1);
         self.simulations = self.simulations.max(1);
-        self.top_k = self.top_k.max(1);
         self.epochs = self.epochs.max(1);
         self.batch_size = self.batch_size.max(1);
         self.max_plies = self.max_plies.max(1);
@@ -1310,9 +1288,10 @@ tensorboard_logdir = {tensorboard_logdir}
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);
-        self.gumbel_scale = self.gumbel_scale.max(0.0);
-        self.arena_gumbel_scale = self.arena_gumbel_scale.max(0.0);
-        self.arena_gumbel_plies = self.arena_gumbel_plies.max(0);
+        self.cpuct = self.cpuct.max(0.0);
+        self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
+        self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_games_per_side = self.arena_games_per_side.max(1);
@@ -1349,9 +1328,8 @@ struct UciState {
     eval_file: String,
     model: Option<AzNnue>,
     simulations: usize,
-    top_k: usize,
     threads: usize,
-    gumbel_scale: f32,
+    cpuct: f32,
     policy_debug: bool,
     policy_debug_limit: usize,
     seed: u64,
@@ -1366,9 +1344,8 @@ impl Default for UciState {
             eval_file: "chineseai.nnue".into(),
             model: None,
             simulations: 10_000,
-            top_k: 32,
             threads: 1,
-            gumbel_scale: 0.0,
+            cpuct: 1.5,
             policy_debug: false,
             policy_debug_limit: 16,
             seed: 20260409,
@@ -1422,9 +1399,8 @@ fn print_uci_id() {
     println!("id author ChineseAI");
     println!("option name EvalFile type string default chineseai.nnue");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
-    println!("option name TopK type spin default 32 min 1 max 256");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name GumbelScale type string default 0.0");
+    println!("option name Cpuct type string default 1.5");
     println!("option name PolicyDebug type check default false");
     println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
@@ -1467,15 +1443,12 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         "simulations" => {
             state.simulations = value.parse::<usize>().unwrap_or(state.simulations).max(1);
         }
-        "topk" => {
-            state.top_k = value.parse::<usize>().unwrap_or(state.top_k).max(1);
-        }
         "threads" => {
             let _ = value;
             state.threads = 1;
         }
-        "gumbelscale" => {
-            state.gumbel_scale = value.parse::<f32>().unwrap_or(state.gumbel_scale).max(0.0);
+        "cpuct" => {
+            state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
         }
         "policydebug" => {
             state.policy_debug = matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on");
@@ -1636,7 +1609,7 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
         return;
     }
     let started = std::time::Instant::now();
-    let result = gumbel_search_with_history_and_rules(
+    let result = alphazero_search_with_history_and_rules(
         &state.position,
         &state.history,
         Some(state.rule_history.clone()),
@@ -1644,10 +1617,11 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
         model,
         AzSearchLimits {
             simulations,
-            top_k: state.top_k,
             seed: state.seed,
-            gumbel_scale: state.gumbel_scale,
+            cpuct: state.cpuct,
             workers: 1,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
         },
     );
     state.seed = state.seed.wrapping_add(1);
