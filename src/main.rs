@@ -1014,7 +1014,7 @@ fn print_help() {
     println!("hint  : cargo run --release -- az-init 128 chineseai.nnue 20260409 2");
     println!("hint  : cargo run --release -- uci");
     println!("hint  : cargo run --release -- az-search chineseai.nnue 10000 32 1.5 startpos");
-    println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 32 100 1.5 startpos");
+    println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
     println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
     println!("hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <seed>");

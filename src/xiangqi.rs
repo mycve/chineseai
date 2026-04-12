@@ -492,7 +492,7 @@ impl Position {
             }
         }
 
-        (repeated_indices.len() >= 2).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        (repeated_indices.len() >= 4).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -2288,9 +2288,15 @@ mod tests {
     }
 
     #[test]
-    fn third_repetition_without_forcing_is_draw() {
+    fn fifth_repetition_without_forcing_is_draw() {
         let history = vec![
             test_rule_entry(21, Color::Red, None, false, 0),
+            test_rule_entry(22, Color::Black, Some(Color::Red), false, 0),
+            test_rule_entry(23, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(21, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(22, Color::Black, Some(Color::Red), false, 0),
+            test_rule_entry(23, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(21, Color::Red, Some(Color::Black), false, 0),
             test_rule_entry(22, Color::Black, Some(Color::Red), false, 0),
             test_rule_entry(23, Color::Red, Some(Color::Black), false, 0),
             test_rule_entry(21, Color::Red, Some(Color::Black), false, 0),
