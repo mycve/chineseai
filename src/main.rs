@@ -10,7 +10,7 @@ use chineseai::{
     },
     nnue::{HISTORY_PLIES, HistoryMove},
     pikafish_match::run_vs_pikafish,
-    xiangqi::{Position, RuleHistoryEntry, STARTPOS_FEN},
+    xiangqi::{Position, RuleHistoryEntry, RuleOutcome, STARTPOS_FEN},
 };
 use std::{
     fs,
@@ -2123,12 +2123,29 @@ fn apply_uci_moves(
     }
 }
 
+/// 当前局面是否已被规则判为和棋（用于 UCI `bestmove draw`）。
+fn uci_position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry]) -> bool {
+    matches!(
+        position.rule_outcome_with_history(rule_history),
+        Some(RuleOutcome::Draw(_))
+    )
+}
+
 fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
     ensure_uci_model(state);
     let simulations = state.simulations.max(1);
     let model = state.model.as_ref().expect("model was loaded");
 
     let fen = state.position.to_fen();
+
+    if uci_position_is_rule_draw(&state.position, &state.rule_history) {
+        ulog!(logger, "[go] rule draw fen={fen} (no search)");
+        println!("info depth 0 nodes 0 time 0 score cp 0 pv draw");
+        println!("bestmove draw");
+        uci_flush();
+        return;
+    }
+
     let raw_legal = state.position.legal_moves();
     let legal = state.position.legal_moves_with_rules(&state.rule_history);
 
@@ -2170,8 +2187,8 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
                 entry.chased_mask
             );
         }
-        println!("info depth 1 nodes 0 time 0 score cp -32000 pv 0000");
-        println!("bestmove 0000");
+        // 终局（无合法走法）：不报 bestmove，由 GUI 根据局面自行判断胜负/和棋。
+        println!("info depth 1 nodes 0 time 0 score cp -32000");
         uci_flush();
         return;
     }
@@ -2195,23 +2212,31 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
     if state.policy_debug {
         print_policy_debug(&result, state.policy_debug_limit);
     }
-    println!(
-        "info depth 1 nodes {} time {} score cp {} pv {}",
-        result.simulations,
-        started.elapsed().as_millis(),
-        result.value_cp,
-        result
-            .best_move
-            .map(|mv| mv.to_string())
-            .unwrap_or_else(|| "0000".into())
-    );
-    println!(
-        "bestmove {}",
-        result
-            .best_move
-            .map(|mv| mv.to_string())
-            .unwrap_or_else(|| "0000".into())
-    );
+    match result.best_move {
+        Some(mv) => {
+            let best_text = mv.to_string();
+            println!(
+                "info depth 1 nodes {} time {} score cp {} pv {}",
+                result.simulations,
+                started.elapsed().as_millis(),
+                result.value_cp,
+                best_text
+            );
+            println!("bestmove {best_text}");
+        }
+        None => {
+            println!(
+                "info depth 1 nodes {} time {} score cp {}",
+                result.simulations,
+                started.elapsed().as_millis(),
+                result.value_cp
+            );
+            if uci_position_is_rule_draw(&state.position, &state.rule_history) {
+                println!("bestmove draw");
+            }
+            // 其余终局无着：不报 bestmove，由 GUI 自行处理。
+        }
+    }
     uci_flush();
 }
 
