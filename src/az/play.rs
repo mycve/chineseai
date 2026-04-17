@@ -10,7 +10,7 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 use super::alphazero::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_history_and_rules, dense_move_index,
+    alphazero_search_with_history_and_rules, dense_move_index, extract_board_planes,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -321,8 +321,18 @@ fn make_training_sample(
         }
     }
     let move_indices = moves.iter().copied().map(dense_move_index).collect();
+    let mut board = Vec::new();
+    extract_board_planes(position, &mut board);
+    if mirror_file {
+        let mut mirrored = board.clone();
+        for sq in 0..board.len() {
+            mirrored[crate::nnue::mirror_file_square(sq)] = board[sq];
+        }
+        board = mirrored;
+    }
     AzTrainingSample {
         features,
+        board,
         move_indices,
         policy: candidates
             .iter()

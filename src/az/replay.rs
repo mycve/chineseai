@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
-use super::{AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64};
+use super::{AzTrainingSample, BOARD_PLANES_SIZE, DENSE_MOVE_SPACE, SplitMix64};
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 3;
+const REPLAY_FILE_VERSION: u32 = 4;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -65,6 +65,13 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     for &f in &sample.features {
         replay_push_u32(out, f as u32);
     }
+    if sample.board.len() != BOARD_PLANES_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay encode: invalid board plane length",
+        ));
+    }
+    out.extend_from_slice(&sample.board);
     replay_push_u32(out, sample.move_indices.len() as u32);
     for &m in &sample.move_indices {
         replay_push_u32(out, m as u32);
@@ -89,7 +96,10 @@ fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()>
     Ok(())
 }
 
-fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
+fn decode_az_training_sample<R: Read>(
+    reader: &mut R,
+    version: u32,
+) -> io::Result<AzTrainingSample> {
     let nf = replay_read_u32(reader)?;
     if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
         return Err(io::Error::new(
@@ -100,6 +110,10 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     let mut features = Vec::with_capacity(nf as usize);
     for _ in 0..nf {
         features.push(replay_read_u32(reader)? as usize);
+    }
+    let mut board = vec![0u8; BOARD_PLANES_SIZE];
+    if version >= 4 {
+        reader.read_exact(&mut board)?;
     }
     let nm = replay_read_u32(reader)?;
     if nm > REPLAY_MAX_MOVES_PER_SAMPLE {
@@ -120,6 +134,7 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     let side_sign = replay_read_f32(reader)?;
     Ok(AzTrainingSample {
         features,
+        board,
         move_indices,
         policy,
         value,
@@ -128,7 +143,7 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
 }
 
 fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
-    let sample = decode_az_training_sample(reader)?;
+    let sample = decode_az_training_sample(reader, version)?;
     let train_count = if version >= 3 {
         replay_read_u32(reader)?
     } else {

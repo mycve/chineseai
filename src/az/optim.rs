@@ -20,14 +20,22 @@ pub(super) struct AdamWState {
     pub(super) trunk_biases_v: Vec<f32>,
     pub(super) trunk_global_weights_m: Vec<f32>,
     pub(super) trunk_global_weights_v: Vec<f32>,
+    pub(super) board_conv1_weights_m: Vec<f32>,
+    pub(super) board_conv1_weights_v: Vec<f32>,
+    pub(super) board_conv1_bias_m: Vec<f32>,
+    pub(super) board_conv1_bias_v: Vec<f32>,
+    pub(super) board_conv2_weights_m: Vec<f32>,
+    pub(super) board_conv2_weights_v: Vec<f32>,
+    pub(super) board_conv2_bias_m: Vec<f32>,
+    pub(super) board_conv2_bias_v: Vec<f32>,
+    pub(super) board_global_m: Vec<f32>,
+    pub(super) board_global_v: Vec<f32>,
     pub(super) global_hidden_m: Vec<f32>,
     pub(super) global_hidden_v: Vec<f32>,
     pub(super) global_bias_m: Vec<f32>,
     pub(super) global_bias_v: Vec<f32>,
     pub(super) value_intermediate_hidden_m: Vec<f32>,
     pub(super) value_intermediate_hidden_v: Vec<f32>,
-    pub(super) value_intermediate_global_m: Vec<f32>,
-    pub(super) value_intermediate_global_v: Vec<f32>,
     pub(super) value_intermediate_bias_m: Vec<f32>,
     pub(super) value_intermediate_bias_v: Vec<f32>,
     pub(super) value_logits_weights_m: Vec<f32>,
@@ -36,8 +44,6 @@ pub(super) struct AdamWState {
     pub(super) value_logits_bias_v: Vec<f32>,
     pub(super) policy_move_hidden_m: Vec<f32>,
     pub(super) policy_move_hidden_v: Vec<f32>,
-    pub(super) policy_move_global_m: Vec<f32>,
-    pub(super) policy_move_global_v: Vec<f32>,
     pub(super) policy_move_bias_m: Vec<f32>,
     pub(super) policy_move_bias_v: Vec<f32>,
 }
@@ -58,14 +64,22 @@ impl AdamWState {
             trunk_biases_v: vec![0.0; model.trunk_biases.len()],
             trunk_global_weights_m: vec![0.0; model.trunk_global_weights.len()],
             trunk_global_weights_v: vec![0.0; model.trunk_global_weights.len()],
+            board_conv1_weights_m: vec![0.0; model.board_conv1_weights.len()],
+            board_conv1_weights_v: vec![0.0; model.board_conv1_weights.len()],
+            board_conv1_bias_m: vec![0.0; model.board_conv1_bias.len()],
+            board_conv1_bias_v: vec![0.0; model.board_conv1_bias.len()],
+            board_conv2_weights_m: vec![0.0; model.board_conv2_weights.len()],
+            board_conv2_weights_v: vec![0.0; model.board_conv2_weights.len()],
+            board_conv2_bias_m: vec![0.0; model.board_conv2_bias.len()],
+            board_conv2_bias_v: vec![0.0; model.board_conv2_bias.len()],
+            board_global_m: vec![0.0; model.board_global.len()],
+            board_global_v: vec![0.0; model.board_global.len()],
             global_hidden_m: vec![0.0; model.global_hidden.len()],
             global_hidden_v: vec![0.0; model.global_hidden.len()],
             global_bias_m: vec![0.0; model.global_bias.len()],
             global_bias_v: vec![0.0; model.global_bias.len()],
             value_intermediate_hidden_m: vec![0.0; model.value_intermediate_hidden.len()],
             value_intermediate_hidden_v: vec![0.0; model.value_intermediate_hidden.len()],
-            value_intermediate_global_m: vec![0.0; model.value_intermediate_global.len()],
-            value_intermediate_global_v: vec![0.0; model.value_intermediate_global.len()],
             value_intermediate_bias_m: vec![0.0; model.value_intermediate_bias.len()],
             value_intermediate_bias_v: vec![0.0; model.value_intermediate_bias.len()],
             value_logits_weights_m: vec![0.0; model.value_logits_weights.len()],
@@ -74,8 +88,6 @@ impl AdamWState {
             value_logits_bias_v: vec![0.0; model.value_logits_bias.len()],
             policy_move_hidden_m: vec![0.0; model.policy_move_hidden.len()],
             policy_move_hidden_v: vec![0.0; model.policy_move_hidden.len()],
-            policy_move_global_m: vec![0.0; model.policy_move_global.len()],
-            policy_move_global_v: vec![0.0; model.policy_move_global.len()],
             policy_move_bias_m: vec![0.0; model.policy_move_bias.len()],
             policy_move_bias_v: vec![0.0; model.policy_move_bias.len()],
         }
@@ -92,14 +104,22 @@ impl AdamWState {
             && self.trunk_biases_v.len() == model.trunk_biases.len()
             && self.trunk_global_weights_m.len() == model.trunk_global_weights.len()
             && self.trunk_global_weights_v.len() == model.trunk_global_weights.len()
+            && self.board_conv1_weights_m.len() == model.board_conv1_weights.len()
+            && self.board_conv1_weights_v.len() == model.board_conv1_weights.len()
+            && self.board_conv1_bias_m.len() == model.board_conv1_bias.len()
+            && self.board_conv1_bias_v.len() == model.board_conv1_bias.len()
+            && self.board_conv2_weights_m.len() == model.board_conv2_weights.len()
+            && self.board_conv2_weights_v.len() == model.board_conv2_weights.len()
+            && self.board_conv2_bias_m.len() == model.board_conv2_bias.len()
+            && self.board_conv2_bias_v.len() == model.board_conv2_bias.len()
+            && self.board_global_m.len() == model.board_global.len()
+            && self.board_global_v.len() == model.board_global.len()
             && self.global_hidden_m.len() == model.global_hidden.len()
             && self.global_hidden_v.len() == model.global_hidden.len()
             && self.global_bias_m.len() == model.global_bias.len()
             && self.global_bias_v.len() == model.global_bias.len()
             && self.value_intermediate_hidden_m.len() == model.value_intermediate_hidden.len()
             && self.value_intermediate_hidden_v.len() == model.value_intermediate_hidden.len()
-            && self.value_intermediate_global_m.len() == model.value_intermediate_global.len()
-            && self.value_intermediate_global_v.len() == model.value_intermediate_global.len()
             && self.value_intermediate_bias_m.len() == model.value_intermediate_bias.len()
             && self.value_intermediate_bias_v.len() == model.value_intermediate_bias.len()
             && self.value_logits_weights_m.len() == model.value_logits_weights.len()
@@ -108,8 +128,6 @@ impl AdamWState {
             && self.value_logits_bias_v.len() == model.value_logits_bias.len()
             && self.policy_move_hidden_m.len() == model.policy_move_hidden.len()
             && self.policy_move_hidden_v.len() == model.policy_move_hidden.len()
-            && self.policy_move_global_m.len() == model.policy_move_global.len()
-            && self.policy_move_global_v.len() == model.policy_move_global.len()
             && self.policy_move_bias_m.len() == model.policy_move_bias.len()
             && self.policy_move_bias_v.len() == model.policy_move_bias.len()
     }

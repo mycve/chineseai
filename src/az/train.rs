@@ -2,10 +2,12 @@ use matrixmultiply::sgemm;
 
 use super::optim::{ADAMW_WEIGHT_DECAY, AdamWState, adamw_update};
 use super::{
-    AzGrad, AzNnue, AzTrainStats, AzTrainingSample, GLOBAL_CONTEXT_SIZE, RESIDUAL_TRUNK_SCALE,
-    SplitMix64, VALUE_HIDDEN_SIZE, VALUE_LOGITS, add_scaled, scalar_to_wdl_target, softmax_fixed,
+    AzGrad, AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_PLANES_SIZE,
+    CNN_CHANNELS, CNN_KERNEL_AREA, GLOBAL_CONTEXT_SIZE, RESIDUAL_TRUNK_SCALE, SplitMix64,
+    VALUE_HIDDEN_SIZE, VALUE_LOGITS, add_scaled, scalar_to_wdl_target, softmax_fixed,
     softmax_slice,
 };
+use crate::xiangqi::BOARD_FILES;
 
 pub fn train_samples(
     model: &mut AzNnue,
@@ -75,8 +77,10 @@ fn accumulate_batch_cached(
         .activations
         .last()
         .expect("at least one activation exists");
+    let cnn_global_all = &cache.cnn_global;
     let global_all = &cache.global;
     let mut activation_grads = vec![0.0; batch_size * model.hidden_size];
+    let mut cnn_global_grads = vec![0.0; batch_size * CNN_CHANNELS];
     let mut global_grads = vec![0.0; batch_size * GLOBAL_CONTEXT_SIZE];
     let mut value_logit_grads = vec![0.0; batch_size * VALUE_LOGITS];
     let policy_layout = build_policy_batch_layout(samples, batch);
@@ -150,14 +154,6 @@ fn accumulate_batch_cached(
         model.hidden_size,
         batch_size,
     );
-    grad_weights_batch(
-        &mut gradient.value_intermediate_global,
-        &intermediate_grads,
-        VALUE_HIDDEN_SIZE,
-        global_all,
-        GLOBAL_CONTEXT_SIZE,
-        batch_size,
-    );
     add_bias_grad(
         &mut gradient.value_intermediate_bias,
         &intermediate_grads,
@@ -172,22 +168,7 @@ fn accumulate_batch_cached(
         &model.value_intermediate_hidden,
         model.hidden_size,
     );
-    add_batch_times_weights(
-        &mut global_grads,
-        &intermediate_grads,
-        batch_size,
-        VALUE_HIDDEN_SIZE,
-        &model.value_intermediate_global,
-        GLOBAL_CONTEXT_SIZE,
-    );
-
-    compute_policy_batch_logits(
-        model,
-        hidden_all,
-        global_all,
-        &policy_layout,
-        &mut policy_logits,
-    );
+    compute_policy_batch_logits(model, hidden_all, &policy_layout, &mut policy_logits);
     compute_policy_batch_probs(&policy_layout, &policy_logits, &mut policy_probs);
 
     for row in 0..batch_size {
@@ -201,9 +182,7 @@ fn accumulate_batch_cached(
         stats.policy_ce += policy_ce;
 
         let activation_grad = row_slice_mut(&mut activation_grads, row, model.hidden_size);
-        let global_grad = row_slice_mut(&mut global_grads, row, GLOBAL_CONTEXT_SIZE);
         let hidden = row_slice(hidden_all, row, model.hidden_size);
-        let global = row_slice(global_all, row, GLOBAL_CONTEXT_SIZE);
         for flat_index in policy_range {
             let move_index = policy_layout.move_indices[flat_index];
             let policy_grad =
@@ -215,13 +194,6 @@ fn accumulate_batch_cached(
                 &mut gradient.policy_move_hidden[hidden_offset..hidden_offset + model.hidden_size];
             add_scaled(activation_grad, hidden_row, policy_grad);
             add_scaled(hidden_grad_row, hidden, policy_grad);
-            let global_offset = move_index * GLOBAL_CONTEXT_SIZE;
-            let global_row =
-                &model.policy_move_global[global_offset..global_offset + GLOBAL_CONTEXT_SIZE];
-            let global_grad_row = &mut gradient.policy_move_global
-                [global_offset..global_offset + GLOBAL_CONTEXT_SIZE];
-            add_scaled(global_grad, global_row, policy_grad);
-            add_scaled(global_grad_row, global, policy_grad);
             gradient.policy_move_bias[move_index] += policy_grad;
         }
     }
@@ -288,7 +260,15 @@ fn accumulate_batch_cached(
     }
 
     let initial_hidden = &cache.activations[0];
-    apply_relu_mask_and_clamp(&mut global_grads, global_all, -4.0, 4.0);
+    apply_relu_mask_and_clamp(&mut global_grads, &cache.global_pre, -4.0, 4.0);
+    grad_weights_batch(
+        &mut gradient.board_global,
+        &global_grads,
+        GLOBAL_CONTEXT_SIZE,
+        cnn_global_all,
+        CNN_CHANNELS,
+        batch_size,
+    );
     grad_weights_batch(
         &mut gradient.global_hidden,
         &global_grads,
@@ -304,6 +284,14 @@ fn accumulate_batch_cached(
         GLOBAL_CONTEXT_SIZE,
     );
     add_batch_times_weights(
+        &mut cnn_global_grads,
+        &global_grads,
+        batch_size,
+        GLOBAL_CONTEXT_SIZE,
+        &model.board_global,
+        CNN_CHANNELS,
+    );
+    add_batch_times_weights(
         &mut input_grads,
         &global_grads,
         batch_size,
@@ -311,6 +299,8 @@ fn accumulate_batch_cached(
         &model.global_hidden,
         model.hidden_size,
     );
+
+    backprop_board_branch(model, gradient, samples, batch, cache, &cnn_global_grads);
 
     for (row, &sample_index) in batch.iter().enumerate() {
         let sample = &samples[sample_index];
@@ -334,6 +324,12 @@ fn accumulate_batch_cached(
 
 pub(super) struct TrainBatchCache {
     pub(super) activations: Vec<Vec<f32>>,
+    pub(super) conv1_pre: Vec<f32>,
+    pub(super) conv1: Vec<f32>,
+    pub(super) conv2_pre: Vec<f32>,
+    pub(super) conv2: Vec<f32>,
+    pub(super) cnn_global: Vec<f32>,
+    pub(super) global_pre: Vec<f32>,
     pub(super) global: Vec<f32>,
     pub(super) value_intermediate_pre: Vec<f32>,
     pub(super) value_intermediate: Vec<f32>,
@@ -393,19 +389,17 @@ fn build_policy_batch_layout(samples: &[AzTrainingSample], batch: &[usize]) -> P
 fn compute_policy_batch_logits(
     model: &AzNnue,
     hidden_all: &[f32],
-    global_all: &[f32],
     layout: &PolicyBatchLayout,
     logits: &mut [f32],
 ) {
     for row in 0..(layout.sample_offsets.len() - 1) {
         let range = layout.sample_range(row);
         let hidden = row_slice(hidden_all, row, model.hidden_size);
-        let global = row_slice(global_all, row, GLOBAL_CONTEXT_SIZE);
         for (slot, &move_index) in logits[range.clone()]
             .iter_mut()
             .zip(layout.move_indices[range].iter())
         {
-            *slot = model.policy_logit_from_hidden_index(hidden, global, move_index);
+            *slot = model.policy_logit_from_hidden_index(hidden, move_index);
         }
     }
 }
@@ -522,6 +516,8 @@ fn train_batch_forward_cache(
     batch: &[usize],
 ) -> TrainBatchCache {
     let batch_size = batch.len();
+    let (conv1_pre, conv1, conv2_pre, conv2, cnn_global) =
+        board_forward_batch(model, samples, batch);
     let mut hidden = vec![0.0; batch_size * model.hidden_size];
     for row in 0..batch_size {
         let start = row * model.hidden_size;
@@ -540,7 +536,7 @@ fn train_batch_forward_cache(
     }
     relu_inplace(&mut hidden);
 
-    let global = affine_relu_batch(
+    let mut global_pre = affine_batch(
         &hidden,
         batch_size,
         model.hidden_size,
@@ -548,6 +544,16 @@ fn train_batch_forward_cache(
         GLOBAL_CONTEXT_SIZE,
         &model.global_bias,
     );
+    add_affine_batch(
+        &mut global_pre,
+        &cnn_global,
+        batch_size,
+        CNN_CHANNELS,
+        &model.board_global,
+        GLOBAL_CONTEXT_SIZE,
+    );
+    let mut global = global_pre.clone();
+    relu_inplace(&mut global);
 
     let mut activations = Vec::with_capacity(model.trunk_depth + 1);
     activations.push(hidden);
@@ -582,21 +588,13 @@ fn train_batch_forward_cache(
     }
 
     let hidden = activations.last().expect("at least one activation exists");
-    let mut value_intermediate_pre = affine_batch(
+    let value_intermediate_pre = affine_batch(
         hidden,
         batch_size,
         model.hidden_size,
         &model.value_intermediate_hidden,
         VALUE_HIDDEN_SIZE,
         &model.value_intermediate_bias,
-    );
-    add_affine_batch(
-        &mut value_intermediate_pre,
-        &global,
-        batch_size,
-        GLOBAL_CONTEXT_SIZE,
-        &model.value_intermediate_global,
-        VALUE_HIDDEN_SIZE,
     );
     let mut value_intermediate = value_intermediate_pre.clone();
     relu_inplace(&mut value_intermediate);
@@ -611,6 +609,12 @@ fn train_batch_forward_cache(
 
     TrainBatchCache {
         activations,
+        conv1_pre,
+        conv1,
+        conv2_pre,
+        conv2,
+        cnn_global,
+        global_pre,
         global,
         value_intermediate_pre,
         value_intermediate,
@@ -618,23 +622,284 @@ fn train_batch_forward_cache(
     }
 }
 
+fn board_forward_batch(
+    model: &AzNnue,
+    samples: &[AzTrainingSample],
+    batch: &[usize],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let batch_size = batch.len();
+    let mut conv1_pre = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
+    let mut conv1 = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
+    let mut conv2_pre = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
+    let mut conv2 = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
+    let mut cnn_global = vec![0.0; batch_size * CNN_CHANNELS];
+    for (row, &sample_index) in batch.iter().enumerate() {
+        let sample = &samples[sample_index];
+        let row_conv1_pre = row_slice_mut(&mut conv1_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        conv_sparse_pre(
+            &sample.board,
+            BOARD_CHANNELS,
+            &model.board_conv1_weights,
+            &model.board_conv1_bias,
+            row_conv1_pre,
+        );
+        let row_conv1 = row_slice_mut(&mut conv1, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        row_conv1.copy_from_slice(row_conv1_pre);
+        relu_inplace(row_conv1);
+
+        let row_conv2_pre = row_slice_mut(&mut conv2_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        conv_dense_pre(
+            row_conv1,
+            CNN_CHANNELS,
+            &model.board_conv2_weights,
+            &model.board_conv2_bias,
+            row_conv2_pre,
+        );
+        let row_conv2 = row_slice_mut(&mut conv2, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        row_conv2.copy_from_slice(row_conv2_pre);
+        relu_inplace(row_conv2);
+
+        let row_global = row_slice_mut(&mut cnn_global, row, CNN_CHANNELS);
+        let scale = 1.0 / BOARD_PLANES_SIZE as f32;
+        for channel in 0..CNN_CHANNELS {
+            let start = channel * BOARD_PLANES_SIZE;
+            row_global[channel] = row_conv2[start..start + BOARD_PLANES_SIZE]
+                .iter()
+                .sum::<f32>()
+                * scale;
+        }
+    }
+    (conv1_pre, conv1, conv2_pre, conv2, cnn_global)
+}
+
+fn backprop_board_branch(
+    model: &AzNnue,
+    gradient: &mut AzGrad,
+    samples: &[AzTrainingSample],
+    batch: &[usize],
+    cache: &TrainBatchCache,
+    cnn_global_grads: &[f32],
+) {
+    let pool_scale = 1.0 / BOARD_PLANES_SIZE as f32;
+    for (row, &sample_index) in batch.iter().enumerate() {
+        let sample = &samples[sample_index];
+        let mut conv2_grads = vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE];
+        let row_cnn_global_grads = row_slice(cnn_global_grads, row, CNN_CHANNELS);
+        let row_conv2 = row_slice(&cache.conv2, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        let row_conv2_pre = row_slice(&cache.conv2_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        let row_conv1 = row_slice(&cache.conv1, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        let row_conv1_pre = row_slice(&cache.conv1_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        for channel in 0..CNN_CHANNELS {
+            let grad = row_cnn_global_grads[channel] * pool_scale;
+            let start = channel * BOARD_PLANES_SIZE;
+            for offset in 0..BOARD_PLANES_SIZE {
+                let idx = start + offset;
+                if row_conv2_pre[idx] > 0.0 && row_conv2[idx] > 0.0 {
+                    conv2_grads[idx] = grad.clamp(-4.0, 4.0);
+                }
+            }
+        }
+
+        let mut conv1_grads = vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE];
+        backprop_conv_dense(
+            row_conv1,
+            &conv2_grads,
+            &mut conv1_grads,
+            &model.board_conv2_weights,
+            &mut gradient.board_conv2_weights,
+            &mut gradient.board_conv2_bias,
+        );
+        for idx in 0..conv1_grads.len() {
+            if row_conv1_pre[idx] <= 0.0 {
+                conv1_grads[idx] = 0.0;
+            } else {
+                conv1_grads[idx] = conv1_grads[idx].clamp(-4.0, 4.0);
+            }
+        }
+        backprop_conv_sparse(
+            &sample.board,
+            &conv1_grads,
+            &model.board_conv1_weights,
+            &mut gradient.board_conv1_weights,
+            &mut gradient.board_conv1_bias,
+        );
+    }
+}
+
+fn conv_sparse_pre(
+    board: &[u8],
+    input_channels: usize,
+    weights: &[f32],
+    bias: &[f32],
+    output: &mut [f32],
+) {
+    for out_channel in 0..CNN_CHANNELS {
+        let out_start = out_channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let mut value = bias[out_channel];
+            let file = sq % BOARD_FILES;
+            let rank = sq / BOARD_FILES;
+            for kr in 0..3 {
+                let nr = rank as isize + kr as isize - 1;
+                if !(0..10).contains(&nr) {
+                    continue;
+                }
+                for kf in 0..3 {
+                    let nf = file as isize + kf as isize - 1;
+                    if !(0..BOARD_FILES as isize).contains(&nf) {
+                        continue;
+                    }
+                    let board_index = nr as usize * BOARD_FILES + nf as usize;
+                    let plane = board[board_index];
+                    if plane == 0 {
+                        continue;
+                    }
+                    let in_channel = plane as usize - 1;
+                    debug_assert!(in_channel < input_channels);
+                    let weight_index = ((out_channel * input_channels + in_channel)
+                        * CNN_KERNEL_AREA)
+                        + kr * 3
+                        + kf;
+                    value += weights[weight_index];
+                }
+            }
+            output[out_start + sq] = value;
+        }
+    }
+}
+
+fn conv_dense_pre(
+    input: &[f32],
+    input_channels: usize,
+    weights: &[f32],
+    bias: &[f32],
+    output: &mut [f32],
+) {
+    for out_channel in 0..CNN_CHANNELS {
+        let out_start = out_channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let mut value = bias[out_channel];
+            let file = sq % BOARD_FILES;
+            let rank = sq / BOARD_FILES;
+            for kr in 0..3 {
+                let nr = rank as isize + kr as isize - 1;
+                if !(0..10).contains(&nr) {
+                    continue;
+                }
+                for kf in 0..3 {
+                    let nf = file as isize + kf as isize - 1;
+                    if !(0..BOARD_FILES as isize).contains(&nf) {
+                        continue;
+                    }
+                    let board_index = nr as usize * BOARD_FILES + nf as usize;
+                    for in_channel in 0..input_channels {
+                        let weight_index = ((out_channel * input_channels + in_channel)
+                            * CNN_KERNEL_AREA)
+                            + kr * 3
+                            + kf;
+                        value += input[in_channel * BOARD_PLANES_SIZE + board_index]
+                            * weights[weight_index];
+                    }
+                }
+            }
+            output[out_start + sq] = value;
+        }
+    }
+}
+
+fn backprop_conv_dense(
+    input: &[f32],
+    output_grads: &[f32],
+    input_grads: &mut [f32],
+    weights: &[f32],
+    weight_grads: &mut [f32],
+    bias_grads: &mut [f32],
+) {
+    for out_channel in 0..CNN_CHANNELS {
+        let out_start = out_channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let grad = output_grads[out_start + sq];
+            if grad == 0.0 {
+                continue;
+            }
+            bias_grads[out_channel] += grad;
+            let file = sq % BOARD_FILES;
+            let rank = sq / BOARD_FILES;
+            for kr in 0..3 {
+                let nr = rank as isize + kr as isize - 1;
+                if !(0..10).contains(&nr) {
+                    continue;
+                }
+                for kf in 0..3 {
+                    let nf = file as isize + kf as isize - 1;
+                    if !(0..BOARD_FILES as isize).contains(&nf) {
+                        continue;
+                    }
+                    let board_index = nr as usize * BOARD_FILES + nf as usize;
+                    for in_channel in 0..CNN_CHANNELS {
+                        let input_index = in_channel * BOARD_PLANES_SIZE + board_index;
+                        let weight_index = ((out_channel * CNN_CHANNELS + in_channel)
+                            * CNN_KERNEL_AREA)
+                            + kr * 3
+                            + kf;
+                        weight_grads[weight_index] += grad * input[input_index];
+                        input_grads[input_index] += grad * weights[weight_index];
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn backprop_conv_sparse(
+    board: &[u8],
+    output_grads: &[f32],
+    weights: &[f32],
+    weight_grads: &mut [f32],
+    bias_grads: &mut [f32],
+) {
+    for out_channel in 0..CNN_CHANNELS {
+        let out_start = out_channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let grad = output_grads[out_start + sq];
+            if grad == 0.0 {
+                continue;
+            }
+            bias_grads[out_channel] += grad;
+            let file = sq % BOARD_FILES;
+            let rank = sq / BOARD_FILES;
+            for kr in 0..3 {
+                let nr = rank as isize + kr as isize - 1;
+                if !(0..10).contains(&nr) {
+                    continue;
+                }
+                for kf in 0..3 {
+                    let nf = file as isize + kf as isize - 1;
+                    if !(0..BOARD_FILES as isize).contains(&nf) {
+                        continue;
+                    }
+                    let board_index = nr as usize * BOARD_FILES + nf as usize;
+                    let plane = board[board_index];
+                    if plane == 0 {
+                        continue;
+                    }
+                    let in_channel = plane as usize - 1;
+                    let weight_index = ((out_channel * BOARD_CHANNELS + in_channel)
+                        * CNN_KERNEL_AREA)
+                        + kr * 3
+                        + kf;
+                    let _ = weights;
+                    weight_grads[weight_index] += grad;
+                }
+            }
+        }
+    }
+}
+
 fn relu_inplace(values: &mut [f32]) {
     for value in values {
         *value = value.max(0.0);
     }
-}
-
-fn affine_relu_batch(
-    input: &[f32],
-    batch_size: usize,
-    in_dim: usize,
-    weights_out_in: &[f32],
-    out_dim: usize,
-    bias: &[f32],
-) -> Vec<f32> {
-    let mut output = affine_batch(input, batch_size, in_dim, weights_out_in, out_dim, bias);
-    relu_inplace(&mut output);
-    output
 }
 
 fn affine_batch(
@@ -708,6 +973,67 @@ fn apply_adamw_gradient(
     let inv_batch = 1.0 / batch_len.max(1.0);
     let (bias_correction1, bias_correction2) = optimizer.advance();
 
+    for idx in 0..model.board_conv1_weights.len() {
+        adamw_update(
+            &mut model.board_conv1_weights[idx],
+            &mut optimizer.board_conv1_weights_m[idx],
+            &mut optimizer.board_conv1_weights_v[idx],
+            gradient.board_conv1_weights[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.board_conv1_bias.len() {
+        adamw_update(
+            &mut model.board_conv1_bias[idx],
+            &mut optimizer.board_conv1_bias_m[idx],
+            &mut optimizer.board_conv1_bias_v[idx],
+            gradient.board_conv1_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+    for idx in 0..model.board_conv2_weights.len() {
+        adamw_update(
+            &mut model.board_conv2_weights[idx],
+            &mut optimizer.board_conv2_weights_m[idx],
+            &mut optimizer.board_conv2_weights_v[idx],
+            gradient.board_conv2_weights[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.board_conv2_bias.len() {
+        adamw_update(
+            &mut model.board_conv2_bias[idx],
+            &mut optimizer.board_conv2_bias_m[idx],
+            &mut optimizer.board_conv2_bias_v[idx],
+            gradient.board_conv2_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
+        );
+    }
+    for idx in 0..model.board_global.len() {
+        adamw_update(
+            &mut model.board_global[idx],
+            &mut optimizer.board_global_m[idx],
+            &mut optimizer.board_global_v[idx],
+            gradient.board_global[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+
     for idx in 0..model.global_hidden.len() {
         adamw_update(
             &mut model.global_hidden[idx],
@@ -738,18 +1064,6 @@ fn apply_adamw_gradient(
             &mut optimizer.value_intermediate_hidden_m[idx],
             &mut optimizer.value_intermediate_hidden_v[idx],
             gradient.value_intermediate_hidden[idx] * inv_batch,
-            lr,
-            bias_correction1,
-            bias_correction2,
-            ADAMW_WEIGHT_DECAY,
-        );
-    }
-    for idx in 0..model.value_intermediate_global.len() {
-        adamw_update(
-            &mut model.value_intermediate_global[idx],
-            &mut optimizer.value_intermediate_global_m[idx],
-            &mut optimizer.value_intermediate_global_v[idx],
-            gradient.value_intermediate_global[idx] * inv_batch,
             lr,
             bias_correction1,
             bias_correction2,
@@ -799,18 +1113,6 @@ fn apply_adamw_gradient(
             &mut optimizer.policy_move_hidden_m[idx],
             &mut optimizer.policy_move_hidden_v[idx],
             gradient.policy_move_hidden[idx] * inv_batch,
-            lr,
-            bias_correction1,
-            bias_correction2,
-            ADAMW_WEIGHT_DECAY,
-        );
-    }
-    for idx in 0..model.policy_move_global.len() {
-        adamw_update(
-            &mut model.policy_move_global[idx],
-            &mut optimizer.policy_move_global_m[idx],
-            &mut optimizer.policy_move_global_v[idx],
-            gradient.policy_move_global[idx] * inv_batch,
             lr,
             bias_correction1,
             bias_correction2,

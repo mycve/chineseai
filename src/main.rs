@@ -262,7 +262,7 @@ impl PendingTrainingData {
 fn pool_pressure_profile(
     replay_game_capacity: usize,
     pool_games: usize,
-    workers: usize,
+    batch_size: usize,
     max_sample_train_count: usize,
 ) -> (f32, usize, usize, u32) {
     let occupancy = if replay_game_capacity == 0 {
@@ -270,26 +270,33 @@ fn pool_pressure_profile(
     } else {
         pool_games as f32 / replay_game_capacity as f32
     };
-    let workers = workers.max(1);
+    let batch_size = batch_size.max(1);
     let max_sample_train_count = max_sample_train_count.max(1);
-    if occupancy >= 0.85 {
+    if occupancy >= 0.90 {
         (
             occupancy,
-            (workers / 2).max(1),
+            batch_size,
             4,
             max_sample_train_count.saturating_sub(1).max(1) as u32,
         )
-    } else if occupancy >= (2.0 / 3.0) {
+    } else if occupancy >= 0.75 {
         (
             occupancy,
-            workers,
+            batch_size.saturating_mul(2),
+            3,
+            max_sample_train_count.saturating_sub(1).max(1) as u32,
+        )
+    } else if occupancy >= 0.55 {
+        (
+            occupancy,
+            batch_size.saturating_mul(4),
             2,
             max_sample_train_count.saturating_sub(1).max(1) as u32,
         )
     } else {
         (
             occupancy,
-            workers.saturating_mul(2),
+            batch_size.saturating_mul(8),
             1,
             max_sample_train_count as u32,
         )
@@ -799,13 +806,13 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=continuous sims={} epochs/update={} lr={} batch_size={} trigger_games(base)={} pressure_start=67% pressure_high=85% max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous sims={} epochs/update={} lr={} batch_size={} train_pending(base)={} pressure_mid=55% pressure_high=75% pressure_full=90% max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.epochs,
                 config.lr,
                 config.batch_size,
-                config.workers.saturating_mul(2),
+                config.batch_size.saturating_mul(8),
                 config.max_sample_train_count,
                 config.max_plies,
                 config.workers,
@@ -927,26 +934,22 @@ fn main() {
                     if pool.sample_count() < trainer_config.batch_size.max(1) {
                         continue;
                     }
-                    let produced_games = pending.selfplay.games.len();
                     let (
                         _pool_occupancy,
-                        trigger_games,
+                        pending_sample_trigger,
                         sample_multiplier,
                         effective_max_train_count,
                     ) = pool_pressure_profile(
                         trainer_config.replay_games,
                         pool.game_count(),
-                        trainer_config.workers,
+                        trainer_config.batch_size,
                         trainer_config.max_sample_train_count,
                     );
-                    if produced_games < trigger_games {
+                    let produced_samples = pending.selfplay.samples.len();
+                    if produced_samples < pending_sample_trigger {
                         continue;
                     }
-                    let produced_samples = pending
-                        .selfplay
-                        .samples
-                        .len()
-                        .max(trainer_config.batch_size);
+                    let produced_samples = produced_samples.max(trainer_config.batch_size);
                     let mut rng = chineseai::az::SplitMix64::new(
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
