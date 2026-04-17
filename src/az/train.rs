@@ -347,6 +347,7 @@ pub(super) struct TrainBatchCache {
     pub(super) conv2: Vec<f32>,
     pub(super) cnn_global: Vec<f32>,
     pub(super) cnn_max_indices: Vec<u16>,
+    pub(super) cnn_attn_weights: Vec<f32>,
     pub(super) global_pre: Vec<f32>,
     pub(super) global: Vec<f32>,
     pub(super) value_intermediate_pre: Vec<f32>,
@@ -536,7 +537,7 @@ fn train_batch_forward_cache(
     batch: &[usize],
 ) -> TrainBatchCache {
     let batch_size = batch.len();
-    let (conv1_pre, conv1, conv2_pre, conv2, cnn_global, cnn_max_indices) =
+    let (conv1_pre, conv1, conv2_pre, conv2, cnn_global, cnn_max_indices, cnn_attn_weights) =
         board_forward_batch(model, samples, batch);
     let mut hidden = vec![0.0; batch_size * model.hidden_size];
     for row in 0..batch_size {
@@ -635,6 +636,7 @@ fn train_batch_forward_cache(
         conv2,
         cnn_global,
         cnn_max_indices,
+        cnn_attn_weights,
         global_pre,
         global,
         value_intermediate_pre,
@@ -647,7 +649,15 @@ fn board_forward_batch(
     model: &AzNnue,
     samples: &[AzTrainingSample],
     batch: &[usize],
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u16>) {
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<u16>,
+    Vec<f32>,
+) {
     let batch_size = batch.len();
     let mut conv1_pre = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
     let mut conv1 = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
@@ -655,6 +665,7 @@ fn board_forward_batch(
     let mut conv2 = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
     let mut cnn_global = vec![0.0; batch_size * CNN_POOLED_SIZE];
     let mut cnn_max_indices = vec![0u16; batch_size * CNN_CHANNELS];
+    let mut cnn_attn_weights = vec![0.0; batch_size * BOARD_PLANES_SIZE];
     for (row, &sample_index) in batch.iter().enumerate() {
         let sample = &samples[sample_index];
         let row_conv1_pre = row_slice_mut(&mut conv1_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
@@ -682,6 +693,26 @@ fn board_forward_batch(
         relu_inplace(row_conv2);
 
         let row_global = row_slice_mut(&mut cnn_global, row, CNN_POOLED_SIZE);
+        let row_attn = row_slice_mut(&mut cnn_attn_weights, row, BOARD_PLANES_SIZE);
+        let mut max_logit = f32::NEG_INFINITY;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let mut logit = 0.0;
+            for channel in 0..CNN_CHANNELS {
+                logit += row_conv2[channel * BOARD_PLANES_SIZE + sq]
+                    * model.board_attention_query[channel];
+            }
+            row_attn[sq] = logit;
+            max_logit = max_logit.max(logit);
+        }
+        let mut denom = 0.0;
+        for weight in row_attn.iter_mut() {
+            *weight = (*weight - max_logit).exp();
+            denom += *weight;
+        }
+        let inv_denom = 1.0 / denom.max(1e-12);
+        for weight in row_attn.iter_mut() {
+            *weight *= inv_denom;
+        }
         let scale = 1.0 / BOARD_PLANES_SIZE as f32;
         for channel in 0..CNN_CHANNELS {
             let start = channel * BOARD_PLANES_SIZE;
@@ -689,15 +720,18 @@ fn board_forward_batch(
             let mut sum = 0.0;
             let mut max_value = 0.0;
             let mut max_index = 0usize;
+            let mut attn_sum = 0.0;
             for (offset, value) in row_slice.iter().enumerate() {
                 sum += *value;
                 if offset == 0 || *value > max_value {
                     max_value = *value;
                     max_index = offset;
                 }
+                attn_sum += *value * row_attn[offset];
             }
             row_global[channel] = sum * scale;
             row_global[CNN_CHANNELS + channel] = max_value;
+            row_global[CNN_CHANNELS * 2 + channel] = attn_sum;
             cnn_max_indices[row * CNN_CHANNELS + channel] = max_index as u16;
         }
     }
@@ -708,6 +742,7 @@ fn board_forward_batch(
         conv2,
         cnn_global,
         cnn_max_indices,
+        cnn_attn_weights,
     )
 }
 
@@ -729,6 +764,32 @@ fn backprop_board_branch(
         let row_conv1 = row_slice(&cache.conv1, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
         let row_conv1_pre = row_slice(&cache.conv1_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
         let row_max_indices = &cache.cnn_max_indices[row * CNN_CHANNELS..(row + 1) * CNN_CHANNELS];
+        let row_attn = row_slice(&cache.cnn_attn_weights, row, BOARD_PLANES_SIZE);
+        let attn_grads = &row_cnn_global_grads[CNN_CHANNELS * 2..CNN_CHANNELS * 3];
+        let mut score_grads = vec![0.0; BOARD_PLANES_SIZE];
+        let mut attn_query_grads = vec![0.0; CNN_CHANNELS];
+        let mut attn_weight_grads_weighted_sum = 0.0;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let mut grad = 0.0;
+            for channel in 0..CNN_CHANNELS {
+                let value = row_conv2[channel * BOARD_PLANES_SIZE + sq];
+                grad += attn_grads[channel] * value;
+                conv2_grads[channel * BOARD_PLANES_SIZE + sq] += row_attn[sq] * attn_grads[channel];
+            }
+            score_grads[sq] = grad;
+            attn_weight_grads_weighted_sum += row_attn[sq] * grad;
+        }
+        for sq in 0..BOARD_PLANES_SIZE {
+            let score_grad = row_attn[sq] * (score_grads[sq] - attn_weight_grads_weighted_sum);
+            for channel in 0..CNN_CHANNELS {
+                let idx = channel * BOARD_PLANES_SIZE + sq;
+                conv2_grads[idx] += score_grad * model.board_attention_query[channel];
+                attn_query_grads[channel] += score_grad * row_conv2[idx];
+            }
+        }
+        for channel in 0..CNN_CHANNELS {
+            gradient.board_attention_query[channel] += attn_query_grads[channel];
+        }
         for channel in 0..CNN_CHANNELS {
             let start = channel * BOARD_PLANES_SIZE;
             for offset in 0..BOARD_PLANES_SIZE {
@@ -738,8 +799,11 @@ fn backprop_board_branch(
                 if offset == row_max_indices[channel] as usize {
                     grad += row_cnn_global_grads[CNN_CHANNELS + channel];
                 }
+                conv2_grads[idx] += grad;
                 if row_conv2_pre[idx] > 0.0 && row_conv2[idx] > 0.0 {
-                    conv2_grads[idx] = grad.clamp(-4.0, 4.0);
+                    conv2_grads[idx] = conv2_grads[idx].clamp(-4.0, 4.0);
+                } else {
+                    conv2_grads[idx] = 0.0;
                 }
             }
         }
@@ -1063,6 +1127,18 @@ fn apply_adamw_gradient(
             bias_correction1,
             bias_correction2,
             0.0,
+        );
+    }
+    for idx in 0..model.board_attention_query.len() {
+        adamw_update(
+            &mut model.board_attention_query[idx],
+            &mut optimizer.board_attention_query_m[idx],
+            &mut optimizer.board_attention_query_v[idx],
+            gradient.board_attention_query[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
         );
     }
     for idx in 0..model.board_global.len() {

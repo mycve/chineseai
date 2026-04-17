@@ -25,7 +25,7 @@ pub use train::train_samples;
 
 /// 二进制权重文件头魔数（小端 `f32` 载荷，见 `save` / `load`）。
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 5;
+const AZNNUE_BINARY_VERSION: u32 = 6;
 /// 魔数 4 + version/input/hidden/depth/reserved 各 4 字节。
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
@@ -61,7 +61,7 @@ pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 const BOARD_CHANNELS: usize = 14;
 const CNN_CHANNELS: usize = 8;
 const CNN_KERNEL_AREA: usize = 9;
-pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * 2;
+pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * 3;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 /// 单次 NN 前向复用的临时张量，由 [`AzTree`] 持有，避免每步模拟反复 `Vec` 分配。
@@ -110,6 +110,7 @@ pub struct AzNnue {
     pub board_conv1_bias: Vec<f32>,
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
+    pub board_attention_query: Vec<f32>,
     pub board_global: Vec<f32>,
     pub global_hidden: Vec<f32>,
     pub global_bias: Vec<f32>,
@@ -137,6 +138,7 @@ impl Clone for AzNnue {
             board_conv1_bias: self.board_conv1_bias.clone(),
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
+            board_attention_query: self.board_attention_query.clone(),
             board_global: self.board_global.clone(),
             global_hidden: self.global_hidden.clone(),
             global_bias: self.global_bias.clone(),
@@ -248,6 +250,7 @@ struct AzGrad {
     board_conv1_bias: Vec<f32>,
     board_conv2_weights: Vec<f32>,
     board_conv2_bias: Vec<f32>,
+    board_attention_query: Vec<f32>,
     board_global: Vec<f32>,
     global_hidden: Vec<f32>,
     global_bias: Vec<f32>,
@@ -272,6 +275,7 @@ impl AzGrad {
             board_conv1_bias: vec![0.0; model.board_conv1_bias.len()],
             board_conv2_weights: vec![0.0; model.board_conv2_weights.len()],
             board_conv2_bias: vec![0.0; model.board_conv2_bias.len()],
+            board_attention_query: vec![0.0; model.board_attention_query.len()],
             board_global: vec![0.0; model.board_global.len()],
             global_hidden: vec![0.0; model.global_hidden.len()],
             global_bias: vec![0.0; model.global_bias.len()],
@@ -295,6 +299,7 @@ impl AzGrad {
         self.board_conv1_bias.fill(0.0);
         self.board_conv2_weights.fill(0.0);
         self.board_conv2_bias.fill(0.0);
+        self.board_attention_query.fill(0.0);
         self.board_global.fill(0.0);
         self.global_hidden.fill(0.0);
         self.global_bias.fill(0.0);
@@ -347,6 +352,7 @@ impl AzNnue {
             .map(|_| rng.weight(0.08))
             .collect();
         let board_conv2_bias = vec![0.0; CNN_CHANNELS];
+        let board_attention_query = (0..CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
         let board_global = (0..GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
@@ -381,6 +387,7 @@ impl AzNnue {
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
+            board_attention_query,
             board_global,
             global_hidden,
             global_bias,
@@ -414,6 +421,7 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.board_conv1_bias)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
+        write_f32_slice_le(&mut writer, &self.board_attention_query)?;
         write_f32_slice_le(&mut writer, &self.board_global)?;
         write_f32_slice_le(&mut writer, &self.global_hidden)?;
         write_f32_slice_le(&mut writer, &self.global_bias)?;
@@ -469,6 +477,7 @@ impl AzNnue {
         let board_conv1_bias_len = CNN_CHANNELS;
         let board_conv2_weights_len = CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let board_conv2_bias_len = CNN_CHANNELS;
+        let board_attention_query_len = CNN_CHANNELS;
         let board_global_len = GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE;
         let global_hidden_len = GLOBAL_CONTEXT_SIZE * hidden_size;
         let global_bias_len = GLOBAL_CONTEXT_SIZE;
@@ -488,6 +497,7 @@ impl AzNnue {
             + board_conv1_bias_len
             + board_conv2_weights_len
             + board_conv2_bias_len
+            + board_attention_query_len
             + board_global_len
             + global_hidden_len
             + global_bias_len
@@ -519,6 +529,7 @@ impl AzNnue {
         let board_conv1_bias = read_f32_vec_le(&mut reader, board_conv1_bias_len)?;
         let board_conv2_weights = read_f32_vec_le(&mut reader, board_conv2_weights_len)?;
         let board_conv2_bias = read_f32_vec_le(&mut reader, board_conv2_bias_len)?;
+        let board_attention_query = read_f32_vec_le(&mut reader, board_attention_query_len)?;
         let board_global = read_f32_vec_le(&mut reader, board_global_len)?;
         let global_hidden = read_f32_vec_le(&mut reader, global_hidden_len)?;
         let global_bias = read_f32_vec_le(&mut reader, global_bias_len)?;
@@ -541,6 +552,7 @@ impl AzNnue {
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
+            board_attention_query,
             board_global,
             global_hidden,
             global_bias,
@@ -655,20 +667,39 @@ impl AzNnue {
             &self.board_conv2_bias,
             conv2,
         );
+        let mut attention_logits = [0.0f32; BOARD_PLANES_SIZE];
+        let mut max_logit = f32::NEG_INFINITY;
+        for sq in 0..BOARD_PLANES_SIZE {
+            let mut logit = 0.0;
+            for channel in 0..CNN_CHANNELS {
+                logit +=
+                    conv2[channel * BOARD_PLANES_SIZE + sq] * self.board_attention_query[channel];
+            }
+            attention_logits[sq] = logit;
+            max_logit = max_logit.max(logit);
+        }
+        let mut denom = 0.0;
+        for logit in &mut attention_logits {
+            *logit = (*logit - max_logit).exp();
+            denom += *logit;
+        }
         let scale = 1.0 / BOARD_PLANES_SIZE as f32;
         for channel in 0..CNN_CHANNELS {
             let start = channel * BOARD_PLANES_SIZE;
             let row = &conv2[start..start + BOARD_PLANES_SIZE];
             let mut sum = 0.0;
             let mut max_value = 0.0;
+            let mut attn_sum = 0.0;
             for (idx, value) in row.iter().enumerate() {
                 sum += *value;
                 if idx == 0 || *value > max_value {
                     max_value = *value;
                 }
+                attn_sum += (*value) * attention_logits[idx] / denom.max(1e-12);
             }
             cnn_global[channel] = sum * scale;
             cnn_global[CNN_CHANNELS + channel] = max_value;
+            cnn_global[CNN_CHANNELS * 2 + channel] = attn_sum;
         }
     }
 
@@ -733,6 +764,7 @@ impl AzNnue {
             || self.board_conv1_bias.len() != CNN_CHANNELS
             || self.board_conv2_weights.len() != CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
             || self.board_conv2_bias.len() != CNN_CHANNELS
+            || self.board_attention_query.len() != CNN_CHANNELS
             || self.board_global.len() != GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE
             || self.global_hidden.len() != GLOBAL_CONTEXT_SIZE * self.hidden_size
             || self.global_bias.len() != GLOBAL_CONTEXT_SIZE

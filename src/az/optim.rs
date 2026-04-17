@@ -28,6 +28,8 @@ pub(super) struct AdamWState {
     pub(super) board_conv2_weights_v: Vec<f32>,
     pub(super) board_conv2_bias_m: Vec<f32>,
     pub(super) board_conv2_bias_v: Vec<f32>,
+    pub(super) board_attention_query_m: Vec<f32>,
+    pub(super) board_attention_query_v: Vec<f32>,
     pub(super) board_global_m: Vec<f32>,
     pub(super) board_global_v: Vec<f32>,
     pub(super) global_hidden_m: Vec<f32>,
@@ -74,6 +76,8 @@ impl AdamWState {
             board_conv2_weights_v: vec![0.0; model.board_conv2_weights.len()],
             board_conv2_bias_m: vec![0.0; model.board_conv2_bias.len()],
             board_conv2_bias_v: vec![0.0; model.board_conv2_bias.len()],
+            board_attention_query_m: vec![0.0; model.board_attention_query.len()],
+            board_attention_query_v: vec![0.0; model.board_attention_query.len()],
             board_global_m: vec![0.0; model.board_global.len()],
             board_global_v: vec![0.0; model.board_global.len()],
             global_hidden_m: vec![0.0; model.global_hidden.len()],
@@ -116,6 +120,8 @@ impl AdamWState {
             && self.board_conv2_weights_v.len() == model.board_conv2_weights.len()
             && self.board_conv2_bias_m.len() == model.board_conv2_bias.len()
             && self.board_conv2_bias_v.len() == model.board_conv2_bias.len()
+            && self.board_attention_query_m.len() == model.board_attention_query.len()
+            && self.board_attention_query_v.len() == model.board_attention_query.len()
             && self.board_global_m.len() == model.board_global.len()
             && self.board_global_v.len() == model.board_global.len()
             && self.global_hidden_m.len() == model.global_hidden.len()
