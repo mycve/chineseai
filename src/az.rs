@@ -61,6 +61,7 @@ pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 const BOARD_CHANNELS: usize = 14;
 const CNN_CHANNELS: usize = 8;
 const CNN_KERNEL_AREA: usize = 9;
+pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * 2;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 /// 单次 NN 前向复用的临时张量，由 [`AzTree`] 持有，避免每步模拟反复 `Vec` 分配。
@@ -86,7 +87,7 @@ impl AzEvalScratch {
             board: vec![0; BOARD_PLANES_SIZE],
             conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
-            cnn_global: vec![0.0; CNN_CHANNELS],
+            cnn_global: vec![0.0; CNN_POOLED_SIZE],
             global: vec![0.0; GLOBAL_CONTEXT_SIZE],
             value_intermediate: vec![0.0; VALUE_HIDDEN_SIZE],
             value_logits: vec![0.0; VALUE_LOGITS],
@@ -346,8 +347,8 @@ impl AzNnue {
             .map(|_| rng.weight(0.08))
             .collect();
         let board_conv2_bias = vec![0.0; CNN_CHANNELS];
-        let board_global = (0..GLOBAL_CONTEXT_SIZE * CNN_CHANNELS)
-            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt()))
+        let board_global = (0..GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE)
+            .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
         let global_hidden = (0..GLOBAL_CONTEXT_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
@@ -364,7 +365,7 @@ impl AzNnue {
         let policy_move_hidden = (0..DENSE_MOVE_SPACE * hidden_size)
             .map(|_| rng.weight(0.01))
             .collect();
-        let policy_move_cnn = (0..DENSE_MOVE_SPACE * CNN_CHANNELS)
+        let policy_move_cnn = (0..DENSE_MOVE_SPACE * CNN_POOLED_SIZE)
             .map(|_| rng.weight(0.01))
             .collect();
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
@@ -468,7 +469,7 @@ impl AzNnue {
         let board_conv1_bias_len = CNN_CHANNELS;
         let board_conv2_weights_len = CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let board_conv2_bias_len = CNN_CHANNELS;
-        let board_global_len = GLOBAL_CONTEXT_SIZE * CNN_CHANNELS;
+        let board_global_len = GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE;
         let global_hidden_len = GLOBAL_CONTEXT_SIZE * hidden_size;
         let global_bias_len = GLOBAL_CONTEXT_SIZE;
         let vih_len = VALUE_HIDDEN_SIZE * hidden_size;
@@ -476,7 +477,7 @@ impl AzNnue {
         let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
         let vlb_len = VALUE_LOGITS;
         let pmh_len = DENSE_MOVE_SPACE * hidden_size;
-        let pmc_len = DENSE_MOVE_SPACE * CNN_CHANNELS;
+        let pmc_len = DENSE_MOVE_SPACE * CNN_POOLED_SIZE;
         let pmb_len = DENSE_MOVE_SPACE;
         let float_count = input_hidden_len
             + hidden_bias_len
@@ -622,8 +623,8 @@ impl AzNnue {
             for idx in 0..self.hidden_size {
                 global[out] += hidden[idx] * row[idx];
             }
-            let cnn_row = &self.board_global[out * CNN_CHANNELS..(out + 1) * CNN_CHANNELS];
-            for idx in 0..CNN_CHANNELS {
+            let cnn_row = &self.board_global[out * CNN_POOLED_SIZE..(out + 1) * CNN_POOLED_SIZE];
+            for idx in 0..CNN_POOLED_SIZE {
                 global[out] += cnn_global[idx] * cnn_row[idx];
             }
             global[out] = global[out].max(0.0);
@@ -639,7 +640,7 @@ impl AzNnue {
     ) {
         conv1.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
         conv2.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        cnn_global.resize(CNN_CHANNELS, 0.0);
+        cnn_global.resize(CNN_POOLED_SIZE, 0.0);
         conv_relu_layer(
             board,
             BOARD_CHANNELS,
@@ -656,12 +657,18 @@ impl AzNnue {
         );
         let scale = 1.0 / BOARD_PLANES_SIZE as f32;
         for channel in 0..CNN_CHANNELS {
-            let mut sum = 0.0;
             let start = channel * BOARD_PLANES_SIZE;
-            for value in &conv2[start..start + BOARD_PLANES_SIZE] {
+            let row = &conv2[start..start + BOARD_PLANES_SIZE];
+            let mut sum = 0.0;
+            let mut max_value = 0.0;
+            for (idx, value) in row.iter().enumerate() {
                 sum += *value;
+                if idx == 0 || *value > max_value {
+                    max_value = *value;
+                }
             }
             cnn_global[channel] = sum * scale;
+            cnn_global[CNN_CHANNELS + channel] = max_value;
         }
     }
 
@@ -726,7 +733,7 @@ impl AzNnue {
             || self.board_conv1_bias.len() != CNN_CHANNELS
             || self.board_conv2_weights.len() != CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
             || self.board_conv2_bias.len() != CNN_CHANNELS
-            || self.board_global.len() != GLOBAL_CONTEXT_SIZE * CNN_CHANNELS
+            || self.board_global.len() != GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE
             || self.global_hidden.len() != GLOBAL_CONTEXT_SIZE * self.hidden_size
             || self.global_bias.len() != GLOBAL_CONTEXT_SIZE
             || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * self.hidden_size
@@ -734,7 +741,7 @@ impl AzNnue {
             || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
             || self.value_logits_bias.len() != VALUE_LOGITS
             || self.policy_move_hidden.len() != DENSE_MOVE_SPACE * self.hidden_size
-            || self.policy_move_cnn.len() != DENSE_MOVE_SPACE * CNN_CHANNELS
+            || self.policy_move_cnn.len() != DENSE_MOVE_SPACE * CNN_POOLED_SIZE
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
         {
             return Err(io::Error::new(
@@ -753,8 +760,8 @@ impl AzNnue {
     ) -> f32 {
         let hidden_offset = move_index * self.hidden_size;
         let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
-        let cnn_offset = move_index * CNN_CHANNELS;
-        let cnn_row = &self.policy_move_cnn[cnn_offset..cnn_offset + CNN_CHANNELS];
+        let cnn_offset = move_index * CNN_POOLED_SIZE;
+        let cnn_row = &self.policy_move_cnn[cnn_offset..cnn_offset + CNN_POOLED_SIZE];
         self.policy_move_bias[move_index]
             + dot_product(hidden, hidden_row)
             + dot_product(cnn_global, cnn_row)

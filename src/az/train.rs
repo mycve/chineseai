@@ -3,8 +3,8 @@ use matrixmultiply::sgemm;
 use super::optim::{ADAMW_WEIGHT_DECAY, AdamWState, adamw_update};
 use super::{
     AzGrad, AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_PLANES_SIZE,
-    CNN_CHANNELS, CNN_KERNEL_AREA, GLOBAL_CONTEXT_SIZE, RESIDUAL_TRUNK_SCALE, SplitMix64,
-    VALUE_HIDDEN_SIZE, VALUE_LOGITS, add_scaled, scalar_to_wdl_target, softmax_fixed,
+    CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOLED_SIZE, GLOBAL_CONTEXT_SIZE, RESIDUAL_TRUNK_SCALE,
+    SplitMix64, VALUE_HIDDEN_SIZE, VALUE_LOGITS, add_scaled, scalar_to_wdl_target, softmax_fixed,
     softmax_slice,
 };
 use crate::xiangqi::BOARD_FILES;
@@ -80,7 +80,7 @@ fn accumulate_batch_cached(
     let cnn_global_all = &cache.cnn_global;
     let global_all = &cache.global;
     let mut activation_grads = vec![0.0; batch_size * model.hidden_size];
-    let mut cnn_global_grads = vec![0.0; batch_size * CNN_CHANNELS];
+    let mut cnn_global_grads = vec![0.0; batch_size * CNN_POOLED_SIZE];
     let mut global_grads = vec![0.0; batch_size * GLOBAL_CONTEXT_SIZE];
     let mut value_logit_grads = vec![0.0; batch_size * VALUE_LOGITS];
     let policy_layout = build_policy_batch_layout(samples, batch);
@@ -189,7 +189,7 @@ fn accumulate_batch_cached(
 
         let activation_grad = row_slice_mut(&mut activation_grads, row, model.hidden_size);
         let hidden = row_slice(hidden_all, row, model.hidden_size);
-        let cnn_global = row_slice(cnn_global_all, row, CNN_CHANNELS);
+        let cnn_global = row_slice(cnn_global_all, row, CNN_POOLED_SIZE);
         for flat_index in policy_range {
             let move_index = policy_layout.move_indices[flat_index];
             let policy_grad =
@@ -201,11 +201,12 @@ fn accumulate_batch_cached(
                 &mut gradient.policy_move_hidden[hidden_offset..hidden_offset + model.hidden_size];
             add_scaled(activation_grad, hidden_row, policy_grad);
             add_scaled(hidden_grad_row, hidden, policy_grad);
-            let cnn_offset = move_index * CNN_CHANNELS;
-            let cnn_row = &model.policy_move_cnn[cnn_offset..cnn_offset + CNN_CHANNELS];
-            let cnn_grad_row = &mut gradient.policy_move_cnn[cnn_offset..cnn_offset + CNN_CHANNELS];
+            let cnn_offset = move_index * CNN_POOLED_SIZE;
+            let cnn_row = &model.policy_move_cnn[cnn_offset..cnn_offset + CNN_POOLED_SIZE];
+            let cnn_grad_row =
+                &mut gradient.policy_move_cnn[cnn_offset..cnn_offset + CNN_POOLED_SIZE];
             add_scaled(
-                &mut cnn_global_grads[row * CNN_CHANNELS..(row + 1) * CNN_CHANNELS],
+                &mut cnn_global_grads[row * CNN_POOLED_SIZE..(row + 1) * CNN_POOLED_SIZE],
                 cnn_row,
                 policy_grad,
             );
@@ -282,7 +283,7 @@ fn accumulate_batch_cached(
         &global_grads,
         GLOBAL_CONTEXT_SIZE,
         cnn_global_all,
-        CNN_CHANNELS,
+        CNN_POOLED_SIZE,
         batch_size,
     );
     grad_weights_batch(
@@ -305,7 +306,7 @@ fn accumulate_batch_cached(
         batch_size,
         GLOBAL_CONTEXT_SIZE,
         &model.board_global,
-        CNN_CHANNELS,
+        CNN_POOLED_SIZE,
     );
     add_batch_times_weights(
         &mut input_grads,
@@ -345,6 +346,7 @@ pub(super) struct TrainBatchCache {
     pub(super) conv2_pre: Vec<f32>,
     pub(super) conv2: Vec<f32>,
     pub(super) cnn_global: Vec<f32>,
+    pub(super) cnn_max_indices: Vec<u16>,
     pub(super) global_pre: Vec<f32>,
     pub(super) global: Vec<f32>,
     pub(super) value_intermediate_pre: Vec<f32>,
@@ -412,7 +414,7 @@ fn compute_policy_batch_logits(
     for row in 0..(layout.sample_offsets.len() - 1) {
         let range = layout.sample_range(row);
         let hidden = row_slice(hidden_all, row, model.hidden_size);
-        let cnn_global = row_slice(cnn_global_all, row, CNN_CHANNELS);
+        let cnn_global = row_slice(cnn_global_all, row, CNN_POOLED_SIZE);
         for (slot, &move_index) in logits[range.clone()]
             .iter_mut()
             .zip(layout.move_indices[range].iter())
@@ -534,7 +536,7 @@ fn train_batch_forward_cache(
     batch: &[usize],
 ) -> TrainBatchCache {
     let batch_size = batch.len();
-    let (conv1_pre, conv1, conv2_pre, conv2, cnn_global) =
+    let (conv1_pre, conv1, conv2_pre, conv2, cnn_global, cnn_max_indices) =
         board_forward_batch(model, samples, batch);
     let mut hidden = vec![0.0; batch_size * model.hidden_size];
     for row in 0..batch_size {
@@ -632,6 +634,7 @@ fn train_batch_forward_cache(
         conv2_pre,
         conv2,
         cnn_global,
+        cnn_max_indices,
         global_pre,
         global,
         value_intermediate_pre,
@@ -644,13 +647,14 @@ fn board_forward_batch(
     model: &AzNnue,
     samples: &[AzTrainingSample],
     batch: &[usize],
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u16>) {
     let batch_size = batch.len();
     let mut conv1_pre = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
     let mut conv1 = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
     let mut conv2_pre = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
     let mut conv2 = vec![0.0; batch_size * CNN_CHANNELS * BOARD_PLANES_SIZE];
-    let mut cnn_global = vec![0.0; batch_size * CNN_CHANNELS];
+    let mut cnn_global = vec![0.0; batch_size * CNN_POOLED_SIZE];
+    let mut cnn_max_indices = vec![0u16; batch_size * CNN_CHANNELS];
     for (row, &sample_index) in batch.iter().enumerate() {
         let sample = &samples[sample_index];
         let row_conv1_pre = row_slice_mut(&mut conv1_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
@@ -677,17 +681,34 @@ fn board_forward_batch(
         row_conv2.copy_from_slice(row_conv2_pre);
         relu_inplace(row_conv2);
 
-        let row_global = row_slice_mut(&mut cnn_global, row, CNN_CHANNELS);
+        let row_global = row_slice_mut(&mut cnn_global, row, CNN_POOLED_SIZE);
         let scale = 1.0 / BOARD_PLANES_SIZE as f32;
         for channel in 0..CNN_CHANNELS {
             let start = channel * BOARD_PLANES_SIZE;
-            row_global[channel] = row_conv2[start..start + BOARD_PLANES_SIZE]
-                .iter()
-                .sum::<f32>()
-                * scale;
+            let row_slice = &row_conv2[start..start + BOARD_PLANES_SIZE];
+            let mut sum = 0.0;
+            let mut max_value = 0.0;
+            let mut max_index = 0usize;
+            for (offset, value) in row_slice.iter().enumerate() {
+                sum += *value;
+                if offset == 0 || *value > max_value {
+                    max_value = *value;
+                    max_index = offset;
+                }
+            }
+            row_global[channel] = sum * scale;
+            row_global[CNN_CHANNELS + channel] = max_value;
+            cnn_max_indices[row * CNN_CHANNELS + channel] = max_index as u16;
         }
     }
-    (conv1_pre, conv1, conv2_pre, conv2, cnn_global)
+    (
+        conv1_pre,
+        conv1,
+        conv2_pre,
+        conv2,
+        cnn_global,
+        cnn_max_indices,
+    )
 }
 
 fn backprop_board_branch(
@@ -702,16 +723,21 @@ fn backprop_board_branch(
     for (row, &sample_index) in batch.iter().enumerate() {
         let sample = &samples[sample_index];
         let mut conv2_grads = vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE];
-        let row_cnn_global_grads = row_slice(cnn_global_grads, row, CNN_CHANNELS);
+        let row_cnn_global_grads = row_slice(cnn_global_grads, row, CNN_POOLED_SIZE);
         let row_conv2 = row_slice(&cache.conv2, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
         let row_conv2_pre = row_slice(&cache.conv2_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
         let row_conv1 = row_slice(&cache.conv1, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
         let row_conv1_pre = row_slice(&cache.conv1_pre, row, CNN_CHANNELS * BOARD_PLANES_SIZE);
+        let row_max_indices = &cache.cnn_max_indices[row * CNN_CHANNELS..(row + 1) * CNN_CHANNELS];
         for channel in 0..CNN_CHANNELS {
-            let grad = row_cnn_global_grads[channel] * pool_scale;
             let start = channel * BOARD_PLANES_SIZE;
             for offset in 0..BOARD_PLANES_SIZE {
                 let idx = start + offset;
+                let mut grad = 0.0;
+                grad += row_cnn_global_grads[channel] * pool_scale;
+                if offset == row_max_indices[channel] as usize {
+                    grad += row_cnn_global_grads[CNN_CHANNELS + channel];
+                }
                 if row_conv2_pre[idx] > 0.0 && row_conv2[idx] > 0.0 {
                     conv2_grads[idx] = grad.clamp(-4.0, 4.0);
                 }
