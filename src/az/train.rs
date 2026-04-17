@@ -168,7 +168,13 @@ fn accumulate_batch_cached(
         &model.value_intermediate_hidden,
         model.hidden_size,
     );
-    compute_policy_batch_logits(model, hidden_all, &policy_layout, &mut policy_logits);
+    compute_policy_batch_logits(
+        model,
+        hidden_all,
+        cnn_global_all,
+        &policy_layout,
+        &mut policy_logits,
+    );
     compute_policy_batch_probs(&policy_layout, &policy_logits, &mut policy_probs);
 
     for row in 0..batch_size {
@@ -183,6 +189,7 @@ fn accumulate_batch_cached(
 
         let activation_grad = row_slice_mut(&mut activation_grads, row, model.hidden_size);
         let hidden = row_slice(hidden_all, row, model.hidden_size);
+        let cnn_global = row_slice(cnn_global_all, row, CNN_CHANNELS);
         for flat_index in policy_range {
             let move_index = policy_layout.move_indices[flat_index];
             let policy_grad =
@@ -194,6 +201,15 @@ fn accumulate_batch_cached(
                 &mut gradient.policy_move_hidden[hidden_offset..hidden_offset + model.hidden_size];
             add_scaled(activation_grad, hidden_row, policy_grad);
             add_scaled(hidden_grad_row, hidden, policy_grad);
+            let cnn_offset = move_index * CNN_CHANNELS;
+            let cnn_row = &model.policy_move_cnn[cnn_offset..cnn_offset + CNN_CHANNELS];
+            let cnn_grad_row = &mut gradient.policy_move_cnn[cnn_offset..cnn_offset + CNN_CHANNELS];
+            add_scaled(
+                &mut cnn_global_grads[row * CNN_CHANNELS..(row + 1) * CNN_CHANNELS],
+                cnn_row,
+                policy_grad,
+            );
+            add_scaled(cnn_grad_row, cnn_global, policy_grad);
             gradient.policy_move_bias[move_index] += policy_grad;
         }
     }
@@ -389,17 +405,19 @@ fn build_policy_batch_layout(samples: &[AzTrainingSample], batch: &[usize]) -> P
 fn compute_policy_batch_logits(
     model: &AzNnue,
     hidden_all: &[f32],
+    cnn_global_all: &[f32],
     layout: &PolicyBatchLayout,
     logits: &mut [f32],
 ) {
     for row in 0..(layout.sample_offsets.len() - 1) {
         let range = layout.sample_range(row);
         let hidden = row_slice(hidden_all, row, model.hidden_size);
+        let cnn_global = row_slice(cnn_global_all, row, CNN_CHANNELS);
         for (slot, &move_index) in logits[range.clone()]
             .iter_mut()
             .zip(layout.move_indices[range].iter())
         {
-            *slot = model.policy_logit_from_hidden_index(hidden, move_index);
+            *slot = model.policy_logit_from_hidden_index(hidden, cnn_global, move_index);
         }
     }
 }
@@ -1113,6 +1131,18 @@ fn apply_adamw_gradient(
             &mut optimizer.policy_move_hidden_m[idx],
             &mut optimizer.policy_move_hidden_v[idx],
             gradient.policy_move_hidden[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.policy_move_cnn.len() {
+        adamw_update(
+            &mut model.policy_move_cnn[idx],
+            &mut optimizer.policy_move_cnn_m[idx],
+            &mut optimizer.policy_move_cnn_v[idx],
+            gradient.policy_move_cnn[idx] * inv_batch,
             lr,
             bias_correction1,
             bias_correction2,

@@ -25,7 +25,7 @@ pub use train::train_samples;
 
 /// 二进制权重文件头魔数（小端 `f32` 载荷，见 `save` / `load`）。
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 4;
+const AZNNUE_BINARY_VERSION: u32 = 5;
 /// 魔数 4 + version/input/hidden/depth/reserved 各 4 字节。
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
@@ -59,7 +59,7 @@ const VALUE_HIDDEN_SIZE: usize = 64;
 const VALUE_LOGITS: usize = 3;
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 const BOARD_CHANNELS: usize = 14;
-const CNN_CHANNELS: usize = 16;
+const CNN_CHANNELS: usize = 8;
 const CNN_KERNEL_AREA: usize = 9;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
@@ -117,6 +117,7 @@ pub struct AzNnue {
     pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
     pub policy_move_hidden: Vec<f32>,
+    pub policy_move_cnn: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     optimizer: Option<Box<AdamWState>>,
 }
@@ -143,6 +144,7 @@ impl Clone for AzNnue {
             value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
             policy_move_hidden: self.policy_move_hidden.clone(),
+            policy_move_cnn: self.policy_move_cnn.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             optimizer: None,
         }
@@ -253,6 +255,7 @@ struct AzGrad {
     value_logits_weights: Vec<f32>,
     value_logits_bias: Vec<f32>,
     policy_move_hidden: Vec<f32>,
+    policy_move_cnn: Vec<f32>,
     policy_move_bias: Vec<f32>,
 }
 
@@ -276,6 +279,7 @@ impl AzGrad {
             value_logits_weights: vec![0.0; model.value_logits_weights.len()],
             value_logits_bias: vec![0.0; model.value_logits_bias.len()],
             policy_move_hidden: vec![0.0; model.policy_move_hidden.len()],
+            policy_move_cnn: vec![0.0; model.policy_move_cnn.len()],
             policy_move_bias: vec![0.0; model.policy_move_bias.len()],
         }
     }
@@ -298,6 +302,7 @@ impl AzGrad {
         self.value_logits_weights.fill(0.0);
         self.value_logits_bias.fill(0.0);
         self.policy_move_hidden.fill(0.0);
+        self.policy_move_cnn.fill(0.0);
         self.policy_move_bias.fill(0.0);
     }
 }
@@ -359,6 +364,9 @@ impl AzNnue {
         let policy_move_hidden = (0..DENSE_MOVE_SPACE * hidden_size)
             .map(|_| rng.weight(0.01))
             .collect();
+        let policy_move_cnn = (0..DENSE_MOVE_SPACE * CNN_CHANNELS)
+            .map(|_| rng.weight(0.01))
+            .collect();
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         Self {
             hidden_size,
@@ -380,6 +388,7 @@ impl AzNnue {
             value_logits_weights,
             value_logits_bias,
             policy_move_hidden,
+            policy_move_cnn,
             policy_move_bias,
             optimizer: None,
         }
@@ -412,6 +421,7 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_move_hidden)?;
+        write_f32_slice_le(&mut writer, &self.policy_move_cnn)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
         writer.flush()?;
         Ok(())
@@ -466,6 +476,7 @@ impl AzNnue {
         let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
         let vlb_len = VALUE_LOGITS;
         let pmh_len = DENSE_MOVE_SPACE * hidden_size;
+        let pmc_len = DENSE_MOVE_SPACE * CNN_CHANNELS;
         let pmb_len = DENSE_MOVE_SPACE;
         let float_count = input_hidden_len
             + hidden_bias_len
@@ -484,6 +495,7 @@ impl AzNnue {
             + vlw_len
             + vlb_len
             + pmh_len
+            + pmc_len
             + pmb_len;
         let expected_len = AZNNUE_BINARY_HEADER_LEN + float_count * 4;
         if bytes.len() != expected_len {
@@ -514,6 +526,7 @@ impl AzNnue {
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
         let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
         let policy_move_hidden = read_f32_vec_le(&mut reader, pmh_len)?;
+        let policy_move_cnn = read_f32_vec_le(&mut reader, pmc_len)?;
         let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
         let model = Self {
             hidden_size,
@@ -535,6 +548,7 @@ impl AzNnue {
             value_logits_weights,
             value_logits_bias,
             policy_move_hidden,
+            policy_move_cnn,
             policy_move_bias,
             optimizer: None,
         };
@@ -578,6 +592,7 @@ impl AzNnue {
         for (index, mv) in moves.iter().enumerate() {
             scratch.logits[index] = self.policy_logit_from_hidden_index(
                 &scratch.hidden,
+                &scratch.cnn_global,
                 dense_move_index(orient_move(side, *mv)),
             );
         }
@@ -719,6 +734,7 @@ impl AzNnue {
             || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
             || self.value_logits_bias.len() != VALUE_LOGITS
             || self.policy_move_hidden.len() != DENSE_MOVE_SPACE * self.hidden_size
+            || self.policy_move_cnn.len() != DENSE_MOVE_SPACE * CNN_CHANNELS
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
         {
             return Err(io::Error::new(
@@ -729,10 +745,19 @@ impl AzNnue {
         Ok(())
     }
 
-    fn policy_logit_from_hidden_index(&self, hidden: &[f32], move_index: usize) -> f32 {
+    fn policy_logit_from_hidden_index(
+        &self,
+        hidden: &[f32],
+        cnn_global: &[f32],
+        move_index: usize,
+    ) -> f32 {
         let hidden_offset = move_index * self.hidden_size;
         let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
-        self.policy_move_bias[move_index] + dot_product(hidden, hidden_row)
+        let cnn_offset = move_index * CNN_CHANNELS;
+        let cnn_row = &self.policy_move_cnn[cnn_offset..cnn_offset + CNN_CHANNELS];
+        self.policy_move_bias[move_index]
+            + dot_product(hidden, hidden_row)
+            + dot_product(cnn_global, cnn_row)
     }
 }
 

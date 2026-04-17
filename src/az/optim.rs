@@ -44,6 +44,8 @@ pub(super) struct AdamWState {
     pub(super) value_logits_bias_v: Vec<f32>,
     pub(super) policy_move_hidden_m: Vec<f32>,
     pub(super) policy_move_hidden_v: Vec<f32>,
+    pub(super) policy_move_cnn_m: Vec<f32>,
+    pub(super) policy_move_cnn_v: Vec<f32>,
     pub(super) policy_move_bias_m: Vec<f32>,
     pub(super) policy_move_bias_v: Vec<f32>,
 }
@@ -88,6 +90,8 @@ impl AdamWState {
             value_logits_bias_v: vec![0.0; model.value_logits_bias.len()],
             policy_move_hidden_m: vec![0.0; model.policy_move_hidden.len()],
             policy_move_hidden_v: vec![0.0; model.policy_move_hidden.len()],
+            policy_move_cnn_m: vec![0.0; model.policy_move_cnn.len()],
+            policy_move_cnn_v: vec![0.0; model.policy_move_cnn.len()],
             policy_move_bias_m: vec![0.0; model.policy_move_bias.len()],
             policy_move_bias_v: vec![0.0; model.policy_move_bias.len()],
         }
@@ -128,6 +132,8 @@ impl AdamWState {
             && self.value_logits_bias_v.len() == model.value_logits_bias.len()
             && self.policy_move_hidden_m.len() == model.policy_move_hidden.len()
             && self.policy_move_hidden_v.len() == model.policy_move_hidden.len()
+            && self.policy_move_cnn_m.len() == model.policy_move_cnn.len()
+            && self.policy_move_cnn_v.len() == model.policy_move_cnn.len()
             && self.policy_move_bias_m.len() == model.policy_move_bias.len()
             && self.policy_move_bias_v.len() == model.policy_move_bias.len()
     }
