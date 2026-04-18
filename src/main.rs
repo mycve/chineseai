@@ -259,50 +259,6 @@ impl PendingTrainingData {
     }
 }
 
-fn pool_pressure_profile(
-    replay_game_capacity: usize,
-    pool_games: usize,
-    batch_size: usize,
-    max_sample_train_count: usize,
-) -> (f32, usize, usize, u32) {
-    let occupancy = if replay_game_capacity == 0 {
-        0.0
-    } else {
-        pool_games as f32 / replay_game_capacity as f32
-    };
-    let batch_size = batch_size.max(1);
-    let max_sample_train_count = max_sample_train_count.max(1);
-    if occupancy >= 0.90 {
-        (
-            occupancy,
-            batch_size,
-            4,
-            max_sample_train_count.saturating_sub(1).max(1) as u32,
-        )
-    } else if occupancy >= 0.75 {
-        (
-            occupancy,
-            batch_size.saturating_mul(2),
-            3,
-            max_sample_train_count.saturating_sub(1).max(1) as u32,
-        )
-    } else if occupancy >= 0.55 {
-        (
-            occupancy,
-            batch_size.saturating_mul(4),
-            2,
-            max_sample_train_count.saturating_sub(1).max(1) as u32,
-        )
-    } else {
-        (
-            occupancy,
-            batch_size.saturating_mul(8),
-            1,
-            max_sample_train_count as u32,
-        )
-    }
-}
-
 fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) -> AzLoopConfig {
     AzLoopConfig {
         games: 1,
@@ -806,13 +762,13 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=continuous sims={} epochs/update={} lr={} batch_size={} train_pending(base)={} pressure_mid=55% pressure_high=75% pressure_full=90% max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
+                config.selfplay_batch_games,
                 config.epochs,
                 config.lr,
                 config.batch_size,
-                config.batch_size.saturating_mul(8),
                 config.max_sample_train_count,
                 config.max_plies,
                 config.workers,
@@ -928,28 +884,20 @@ fn main() {
                     if trainer_stop.load(Ordering::SeqCst) {
                         continue;
                     }
+                    if pending.selfplay.games.len() < trainer_config.selfplay_batch_games {
+                        continue;
+                    }
                     let Some(pool) = trainer_pool.as_mut() else {
                         continue;
                     };
                     if pool.sample_count() < trainer_config.batch_size.max(1) {
                         continue;
                     }
-                    let (
-                        _pool_occupancy,
-                        pending_sample_trigger,
-                        sample_multiplier,
-                        effective_max_train_count,
-                    ) = pool_pressure_profile(
-                        trainer_config.replay_games,
-                        pool.game_count(),
-                        trainer_config.batch_size,
-                        trainer_config.max_sample_train_count,
-                    );
-                    let produced_samples = pending.selfplay.samples.len();
-                    if produced_samples < pending_sample_trigger {
-                        continue;
-                    }
-                    let produced_samples = produced_samples.max(trainer_config.batch_size);
+                    let produced_samples = pending
+                        .selfplay
+                        .samples
+                        .len()
+                        .max(trainer_config.batch_size);
                     let mut rng = chineseai::az::SplitMix64::new(
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
@@ -960,10 +908,8 @@ fn main() {
                         trainer_config.replay_samples.max(produced_samples)
                     };
                     let train_data = pool.sample_uniform_games_marked(
-                        base_train_samples
-                            .saturating_mul(sample_multiplier)
-                            .min(pool.sample_count()),
-                        effective_max_train_count,
+                        base_train_samples.min(pool.sample_count()),
+                        trainer_config.max_sample_train_count as u32,
                         &mut rng,
                     );
                     if train_data.is_empty() {
@@ -1580,6 +1526,7 @@ fn print_help() {
 struct AzLoopFileConfig {
     model_path: String,
     simulations: usize,
+    selfplay_batch_games: usize,
     epochs: usize,
     lr: f32,
     batch_size: usize,
@@ -1614,6 +1561,7 @@ impl Default for AzLoopFileConfig {
         Self {
             model_path: "chineseai.nnue".into(),
             simulations: 1200,
+            selfplay_batch_games: default_workers.max(1),
             epochs: 2,
             lr: 0.0003,
             batch_size: 1024,
@@ -1652,6 +1600,10 @@ impl AzLoopFileConfig {
 #
 # model_path: AzNnue binary (magic AZB1, little-endian f32), e.g. chineseai.nnue
 #
+# selfplay_batch_games:
+#   Generate this many self-play games, then run one training update.
+#   With multiple workers, batches are accumulated across all workers.
+#
 # Value targets (AlphaZero-style): each training position uses only the final game outcome,
 # encoded from the side-to-move at that position (via side_sign × game_result). MCTS root
 # is not mixed into the value label.
@@ -1663,9 +1615,9 @@ impl AzLoopFileConfig {
 # Pipeline:
 #   Self-play and training run in separate long-lived threads.
 #   workers controls how many independent self-play threads run in parallel.
-#   Every self-play thread keeps generating games continuously until training stops.
-#   The trainer consumes the shared queue asynchronously and publishes fresh weights back
-#   to all self-play threads after each update.
+#   Self-play batches accumulate globally across workers.
+#   Every time selfplay_batch_games complete, one training update runs and then
+#   the fresh weights are published back to all self-play threads.
 #
 # Replay:
 #   replay_games keeps the most recent N complete games in memory.
@@ -1680,12 +1632,7 @@ impl AzLoopFileConfig {
 #   AdamW is used with mini-batch gradient accumulation.
 #   epochs means how many passes to make over each fresh training window; 2-3 is a good range.
 #   batch_size=1024 is the default; lower it if memory is tight, raise it if loss is noisy.
-#   Pool pressure drives training intensity:
-#   below 2/3 occupancy, train after about 2 * workers fresh games.
-#   above 2/3 occupancy, train sooner and sample about 2x more data.
-#   above 85% occupancy, train much more aggressively and sample about 4x more data.
-#   max_sample_train_count removes samples after they have been used this many times; under
-#   pressure the effective cap is reduced by 1 so heavily trained samples leave sooner.
+#   max_sample_train_count removes samples after they have been used this many times.
 #   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
@@ -1709,6 +1656,7 @@ impl AzLoopFileConfig {
 
 model_path = {model_path}
 simulations = {simulations}
+selfplay_batch_games = {selfplay_batch_games}
 epochs = {epochs}
 lr = {lr}
 batch_size = {batch_size}
@@ -1738,6 +1686,7 @@ tensorboard_logdir = {tensorboard_logdir}
 "#,
             model_path = self.model_path,
             simulations = self.simulations,
+            selfplay_batch_games = self.selfplay_batch_games,
             epochs = self.epochs,
             lr = self.lr,
             batch_size = self.batch_size,
@@ -1786,6 +1735,9 @@ tensorboard_logdir = {tensorboard_logdir}
         match key {
             "model_path" => self.model_path = value.to_string(),
             "simulations" => self.simulations = parse_config_value(value, self.simulations),
+            "selfplay_batch_games" => {
+                self.selfplay_batch_games = parse_config_value(value, self.selfplay_batch_games)
+            }
             "epochs" => self.epochs = parse_config_value(value, self.epochs),
             "lr" => self.lr = parse_config_value(value, self.lr),
             "batch_size" => self.batch_size = parse_config_value(value, self.batch_size),
@@ -1846,6 +1798,7 @@ tensorboard_logdir = {tensorboard_logdir}
 
     fn normalize(mut self) -> Self {
         self.simulations = self.simulations.max(1);
+        self.selfplay_batch_games = self.selfplay_batch_games.max(1);
         self.epochs = self.epochs.max(1);
         self.batch_size = self.batch_size.max(1);
         self.max_sample_train_count = self.max_sample_train_count.max(1);
