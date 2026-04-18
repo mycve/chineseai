@@ -317,15 +317,40 @@ fn accumulate_batch_cached(
         model.hidden_size,
     );
 
+    let mut cnn_hidden_grads = input_grads.clone();
+    apply_relu_mask_and_clamp(&mut cnn_hidden_grads, &cache.cnn_hidden_pre, -4.0, 4.0);
+    grad_weights_batch(
+        &mut gradient.board_hidden,
+        &cnn_hidden_grads,
+        model.hidden_size,
+        cnn_global_all,
+        CNN_POOLED_SIZE,
+        batch_size,
+    );
+    add_bias_grad(
+        &mut gradient.board_hidden_bias,
+        &cnn_hidden_grads,
+        batch_size,
+        model.hidden_size,
+    );
+    add_batch_times_weights(
+        &mut cnn_global_grads,
+        &cnn_hidden_grads,
+        batch_size,
+        model.hidden_size,
+        &model.board_hidden,
+        CNN_POOLED_SIZE,
+    );
+
     backprop_board_branch(model, gradient, samples, batch, cache, &cnn_global_grads);
 
     for (row, &sample_index) in batch.iter().enumerate() {
         let sample = &samples[sample_index];
-        let initial_hidden_row = row_slice(initial_hidden, row, model.hidden_size);
+        let sparse_hidden_row = row_slice(&cache.sparse_hidden, row, model.hidden_size);
         let input_grad_row = row_slice(&input_grads, row, model.hidden_size);
         let input_scale = 1.0 / (sample.features.len() as f32).sqrt().max(1.0);
         for idx in 0..model.hidden_size {
-            if initial_hidden_row[idx] <= 0.0 {
+            if sparse_hidden_row[idx] <= 0.0 {
                 continue;
             }
             let grad = input_grad_row[idx].clamp(-4.0, 4.0);
@@ -345,6 +370,8 @@ pub(super) struct TrainBatchCache {
     pub(super) conv1: Vec<f32>,
     pub(super) conv2_pre: Vec<f32>,
     pub(super) conv2: Vec<f32>,
+    pub(super) sparse_hidden: Vec<f32>,
+    pub(super) cnn_hidden_pre: Vec<f32>,
     pub(super) cnn_global: Vec<f32>,
     pub(super) cnn_max_indices: Vec<u16>,
     pub(super) cnn_attn_weights: Vec<f32>,
@@ -539,10 +566,10 @@ fn train_batch_forward_cache(
     let batch_size = batch.len();
     let (conv1_pre, conv1, conv2_pre, conv2, cnn_global, cnn_max_indices, cnn_attn_weights) =
         board_forward_batch(model, samples, batch);
-    let mut hidden = vec![0.0; batch_size * model.hidden_size];
+    let mut sparse_hidden = vec![0.0; batch_size * model.hidden_size];
     for row in 0..batch_size {
         let start = row * model.hidden_size;
-        hidden[start..start + model.hidden_size].copy_from_slice(&model.hidden_bias);
+        sparse_hidden[start..start + model.hidden_size].copy_from_slice(&model.hidden_bias);
     }
     for (row, &index) in batch.iter().enumerate() {
         let sample = &samples[index];
@@ -551,11 +578,27 @@ fn train_batch_forward_cache(
             let weight_row =
                 &model.input_hidden[feature * model.hidden_size..(feature + 1) * model.hidden_size];
             for idx in 0..model.hidden_size {
-                hidden[row_offset + idx] += weight_row[idx];
+                sparse_hidden[row_offset + idx] += weight_row[idx];
             }
         }
     }
-    relu_inplace(&mut hidden);
+    relu_inplace(&mut sparse_hidden);
+
+    let cnn_hidden_pre = affine_batch(
+        &cnn_global,
+        batch_size,
+        CNN_POOLED_SIZE,
+        &model.board_hidden,
+        model.hidden_size,
+        &model.board_hidden_bias,
+    );
+    let mut cnn_hidden = cnn_hidden_pre.clone();
+    relu_inplace(&mut cnn_hidden);
+
+    let mut hidden = sparse_hidden.clone();
+    for idx in 0..hidden.len() {
+        hidden[idx] += cnn_hidden[idx];
+    }
 
     let mut global_pre = affine_batch(
         &hidden,
@@ -569,7 +612,7 @@ fn train_batch_forward_cache(
         &mut global_pre,
         &cnn_global,
         batch_size,
-        CNN_CHANNELS,
+        CNN_POOLED_SIZE,
         &model.board_global,
         GLOBAL_CONTEXT_SIZE,
     );
@@ -634,6 +677,8 @@ fn train_batch_forward_cache(
         conv1,
         conv2_pre,
         conv2,
+        sparse_hidden,
+        cnn_hidden_pre,
         cnn_global,
         cnn_max_indices,
         cnn_attn_weights,
@@ -1139,6 +1184,30 @@ fn apply_adamw_gradient(
             bias_correction1,
             bias_correction2,
             ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.board_hidden.len() {
+        adamw_update(
+            &mut model.board_hidden[idx],
+            &mut optimizer.board_hidden_m[idx],
+            &mut optimizer.board_hidden_v[idx],
+            gradient.board_hidden[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            ADAMW_WEIGHT_DECAY,
+        );
+    }
+    for idx in 0..model.board_hidden_bias.len() {
+        adamw_update(
+            &mut model.board_hidden_bias[idx],
+            &mut optimizer.board_hidden_bias_m[idx],
+            &mut optimizer.board_hidden_bias_v[idx],
+            gradient.board_hidden_bias[idx] * inv_batch,
+            lr,
+            bias_correction1,
+            bias_correction2,
+            0.0,
         );
     }
     for idx in 0..model.board_global.len() {

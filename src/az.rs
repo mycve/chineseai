@@ -111,6 +111,8 @@ pub struct AzNnue {
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
     pub board_attention_query: Vec<f32>,
+    pub board_hidden: Vec<f32>,
+    pub board_hidden_bias: Vec<f32>,
     pub board_global: Vec<f32>,
     pub global_hidden: Vec<f32>,
     pub global_bias: Vec<f32>,
@@ -139,6 +141,8 @@ impl Clone for AzNnue {
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
             board_attention_query: self.board_attention_query.clone(),
+            board_hidden: self.board_hidden.clone(),
+            board_hidden_bias: self.board_hidden_bias.clone(),
             board_global: self.board_global.clone(),
             global_hidden: self.global_hidden.clone(),
             global_bias: self.global_bias.clone(),
@@ -251,6 +255,8 @@ struct AzGrad {
     board_conv2_weights: Vec<f32>,
     board_conv2_bias: Vec<f32>,
     board_attention_query: Vec<f32>,
+    board_hidden: Vec<f32>,
+    board_hidden_bias: Vec<f32>,
     board_global: Vec<f32>,
     global_hidden: Vec<f32>,
     global_bias: Vec<f32>,
@@ -276,6 +282,8 @@ impl AzGrad {
             board_conv2_weights: vec![0.0; model.board_conv2_weights.len()],
             board_conv2_bias: vec![0.0; model.board_conv2_bias.len()],
             board_attention_query: vec![0.0; model.board_attention_query.len()],
+            board_hidden: vec![0.0; model.board_hidden.len()],
+            board_hidden_bias: vec![0.0; model.board_hidden_bias.len()],
             board_global: vec![0.0; model.board_global.len()],
             global_hidden: vec![0.0; model.global_hidden.len()],
             global_bias: vec![0.0; model.global_bias.len()],
@@ -300,6 +308,8 @@ impl AzGrad {
         self.board_conv2_weights.fill(0.0);
         self.board_conv2_bias.fill(0.0);
         self.board_attention_query.fill(0.0);
+        self.board_hidden.fill(0.0);
+        self.board_hidden_bias.fill(0.0);
         self.board_global.fill(0.0);
         self.global_hidden.fill(0.0);
         self.global_bias.fill(0.0);
@@ -353,6 +363,10 @@ impl AzNnue {
             .collect();
         let board_conv2_bias = vec![0.0; CNN_CHANNELS];
         let board_attention_query = (0..CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
+        let board_hidden = (0..hidden_size * CNN_POOLED_SIZE)
+            .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
+            .collect();
+        let board_hidden_bias = vec![0.0; hidden_size];
         let board_global = (0..GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
@@ -388,6 +402,8 @@ impl AzNnue {
             board_conv2_weights,
             board_conv2_bias,
             board_attention_query,
+            board_hidden,
+            board_hidden_bias,
             board_global,
             global_hidden,
             global_bias,
@@ -422,6 +438,8 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
         write_f32_slice_le(&mut writer, &self.board_attention_query)?;
+        write_f32_slice_le(&mut writer, &self.board_hidden)?;
+        write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.board_global)?;
         write_f32_slice_le(&mut writer, &self.global_hidden)?;
         write_f32_slice_le(&mut writer, &self.global_bias)?;
@@ -478,6 +496,8 @@ impl AzNnue {
         let board_conv2_weights_len = CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let board_conv2_bias_len = CNN_CHANNELS;
         let board_attention_query_len = CNN_CHANNELS;
+        let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
+        let board_hidden_bias_len = hidden_size;
         let board_global_len = GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE;
         let global_hidden_len = GLOBAL_CONTEXT_SIZE * hidden_size;
         let global_bias_len = GLOBAL_CONTEXT_SIZE;
@@ -498,6 +518,8 @@ impl AzNnue {
             + board_conv2_weights_len
             + board_conv2_bias_len
             + board_attention_query_len
+            + board_hidden_len
+            + board_hidden_bias_len
             + board_global_len
             + global_hidden_len
             + global_bias_len
@@ -530,6 +552,8 @@ impl AzNnue {
         let board_conv2_weights = read_f32_vec_le(&mut reader, board_conv2_weights_len)?;
         let board_conv2_bias = read_f32_vec_le(&mut reader, board_conv2_bias_len)?;
         let board_attention_query = read_f32_vec_le(&mut reader, board_attention_query_len)?;
+        let board_hidden = read_f32_vec_le(&mut reader, board_hidden_len)?;
+        let board_hidden_bias = read_f32_vec_le(&mut reader, board_hidden_bias_len)?;
         let board_global = read_f32_vec_le(&mut reader, board_global_len)?;
         let global_hidden = read_f32_vec_le(&mut reader, global_hidden_len)?;
         let global_bias = read_f32_vec_le(&mut reader, global_bias_len)?;
@@ -553,6 +577,8 @@ impl AzNnue {
             board_conv2_weights,
             board_conv2_bias,
             board_attention_query,
+            board_hidden,
+            board_hidden_bias,
             board_global,
             global_hidden,
             global_bias,
@@ -597,6 +623,10 @@ impl AzNnue {
             &mut scratch.conv2,
             &mut scratch.cnn_global,
         );
+        self.board_hidden_into(&scratch.cnn_global, &mut scratch.next);
+        for idx in 0..self.hidden_size {
+            scratch.hidden[idx] += scratch.next[idx];
+        }
         self.global_from_hidden_into(&scratch.hidden, &scratch.cnn_global, &mut scratch.global);
         self.forward_trunk_into(&mut scratch.hidden, &mut scratch.next, &scratch.global);
         let value = self.value_from_hidden_scratch(scratch);
@@ -640,6 +670,18 @@ impl AzNnue {
                 global[out] += cnn_global[idx] * cnn_row[idx];
             }
             global[out] = global[out].max(0.0);
+        }
+    }
+
+    fn board_hidden_into(&self, cnn_global: &[f32], hidden: &mut Vec<f32>) {
+        hidden.resize(self.hidden_size, 0.0);
+        hidden.copy_from_slice(&self.board_hidden_bias);
+        for out in 0..self.hidden_size {
+            let row = &self.board_hidden[out * CNN_POOLED_SIZE..(out + 1) * CNN_POOLED_SIZE];
+            for idx in 0..CNN_POOLED_SIZE {
+                hidden[out] += cnn_global[idx] * row[idx];
+            }
+            hidden[out] = hidden[out].max(0.0);
         }
     }
 
@@ -765,6 +807,8 @@ impl AzNnue {
             || self.board_conv2_weights.len() != CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
             || self.board_conv2_bias.len() != CNN_CHANNELS
             || self.board_attention_query.len() != CNN_CHANNELS
+            || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
+            || self.board_hidden_bias.len() != self.hidden_size
             || self.board_global.len() != GLOBAL_CONTEXT_SIZE * CNN_POOLED_SIZE
             || self.global_hidden.len() != GLOBAL_CONTEXT_SIZE * self.hidden_size
             || self.global_bias.len() != GLOBAL_CONTEXT_SIZE
