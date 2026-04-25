@@ -4,9 +4,9 @@ use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
 use super::{
-    AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_PLANES_SIZE, CNN_CHANNELS,
-    CNN_POOLED_SIZE, DENSE_MOVE_SPACE, GLOBAL_CONTEXT_SIZE, RESIDUAL_TRUNK_SCALE,
-    VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
+    CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, GLOBAL_CONTEXT_SIZE, PIECE_BOARD_CHANNELS,
+    RESIDUAL_TRUNK_SCALE, SIDE_TO_MOVE_BOARD_CHANNEL, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -476,13 +476,20 @@ impl BatchTensors {
             }
 
             let board_base = row * BOARD_CHANNELS * BOARD_PLANES_SIZE;
-            for sq in 0..BOARD_PLANES_SIZE {
-                let plane = sample.board[sq];
+            for (idx, &plane) in sample.board.iter().take(BOARD_HISTORY_SIZE).enumerate() {
                 if plane > 0 {
-                    let channel = plane as usize - 1;
-                    if channel < BOARD_CHANNELS {
+                    let frame = idx / BOARD_PLANES_SIZE;
+                    let sq = idx % BOARD_PLANES_SIZE;
+                    let channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
+                    if channel < SIDE_TO_MOVE_BOARD_CHANNEL {
                         board_onehot[board_base + channel * BOARD_PLANES_SIZE + sq] = 1.0;
                     }
+                }
+            }
+            if sample.side_sign < 0.0 {
+                let side_base = board_base + SIDE_TO_MOVE_BOARD_CHANNEL * BOARD_PLANES_SIZE;
+                for sq in 0..BOARD_PLANES_SIZE {
+                    board_onehot[side_base + sq] = 1.0;
                 }
             }
 

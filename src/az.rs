@@ -9,7 +9,7 @@ mod replay;
 mod train;
 mod train_gpu;
 
-use crate::nnue::{HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4};
+use crate::nnue::{HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4};
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
@@ -23,10 +23,8 @@ pub use play::{
 pub use replay::AzExperiencePool;
 pub use train::train_samples;
 
-/// 二进制权重文件头魔数（小端 `f32` 载荷，见 `save` / `load`）。
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 7;
-/// 魔数 4 + version/input/hidden/depth/reserved 各 4 字节。
+const AZNNUE_BINARY_VERSION: u32 = 8;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -58,13 +56,16 @@ const GLOBAL_CONTEXT_SIZE: usize = 32;
 const VALUE_HIDDEN_SIZE: usize = 64;
 const VALUE_LOGITS: usize = 3;
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
-const BOARD_CHANNELS: usize = 14;
+pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
+pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
+pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
+pub(super) const SIDE_TO_MOVE_BOARD_CHANNEL: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
+pub(super) const BOARD_CHANNELS: usize = SIDE_TO_MOVE_BOARD_CHANNEL + 1;
 const CNN_CHANNELS: usize = 16;
 const CNN_KERNEL_AREA: usize = 9;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * 3;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
-/// 单次 NN 前向复用的临时张量，由 [`AzTree`] 持有，避免每步模拟反复 `Vec` 分配。
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
     next: Vec<f32>,
@@ -84,7 +85,7 @@ impl AzEvalScratch {
         Self {
             hidden: vec![0.0; hidden_size],
             next: vec![0.0; hidden_size],
-            board: vec![0; BOARD_PLANES_SIZE],
+            board: vec![0; BOARD_HISTORY_SIZE],
             conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
@@ -344,7 +345,6 @@ impl AzNnue {
         }
     }
 
-    /// 小端 `f32` 二进制（魔数 `AZB1`，约 **4×参数量** 字节）。
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let file = fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -541,10 +541,11 @@ impl AzNnue {
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         let features = extract_sparse_features_v4(position, history);
-        extract_board_planes(position, &mut scratch.board);
+        extract_board_planes(position, history, &mut scratch.board);
         self.input_embedding_into(&features, &mut scratch.hidden);
         self.board_forward_into(
             &scratch.board,
+            position.side_to_move() == Color::Black,
             &mut scratch.conv1,
             &mut scratch.conv2,
             &mut scratch.cnn_global,
@@ -613,6 +614,7 @@ impl AzNnue {
     fn board_forward_into(
         &self,
         board: &[u8],
+        black_to_move: bool,
         conv1: &mut Vec<f32>,
         conv2: &mut Vec<f32>,
         cnn_global: &mut Vec<f32>,
@@ -622,7 +624,7 @@ impl AzNnue {
         cnn_global.resize(CNN_POOLED_SIZE, 0.0);
         conv_relu_layer(
             board,
-            BOARD_CHANNELS,
+            black_to_move,
             &self.board_conv1_weights,
             &self.board_conv1_bias,
             conv1,
@@ -769,8 +771,28 @@ impl AzNnue {
     }
 }
 
-pub(super) fn extract_board_planes(position: &Position, board: &mut Vec<u8>) {
-    board.resize(BOARD_PLANES_SIZE, 0);
+pub(super) fn extract_board_planes(
+    position: &Position,
+    history: &[HistoryMove],
+    board: &mut Vec<u8>,
+) {
+    board.resize(BOARD_HISTORY_SIZE, 0);
+    board.fill(0);
+    let mut frame = [0u8; BOARD_PLANES_SIZE];
+    extract_position_piece_planes(position, &mut frame);
+    board[..BOARD_PLANES_SIZE].copy_from_slice(&frame);
+
+    let mut rewound = frame;
+    for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
+        let piece_plane = (absolute_piece_plane(entry.piece.color, entry.piece.kind) + 1) as u8;
+        rewound[entry.mv.to as usize] = 0;
+        rewound[entry.mv.from as usize] = piece_plane;
+        let start = (history_index + 1) * BOARD_PLANES_SIZE;
+        board[start..start + BOARD_PLANES_SIZE].copy_from_slice(&rewound);
+    }
+}
+
+fn extract_position_piece_planes(position: &Position, board: &mut [u8; BOARD_PLANES_SIZE]) {
     board.fill(0);
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
@@ -797,7 +819,7 @@ fn absolute_piece_plane(piece_color: Color, kind: PieceKind) -> usize {
 
 fn conv_relu_layer(
     board: &[u8],
-    input_channels: usize,
+    black_to_move: bool,
     weights: &[f32],
     bias: &[f32],
     output: &mut [f32],
@@ -819,17 +841,27 @@ fn conv_relu_layer(
                         continue;
                     }
                     let board_index = nr as usize * BOARD_FILES + nf as usize;
-                    let plane = board[board_index];
-                    if plane == 0 {
-                        continue;
+                    for frame in 0..BOARD_HISTORY_FRAMES {
+                        let plane = board[frame * BOARD_PLANES_SIZE + board_index];
+                        if plane == 0 {
+                            continue;
+                        }
+                        let in_channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
+                        debug_assert!(in_channel < SIDE_TO_MOVE_BOARD_CHANNEL);
+                        let weight_index = ((out_channel * BOARD_CHANNELS + in_channel)
+                            * CNN_KERNEL_AREA)
+                            + kr * 3
+                            + kf;
+                        value += weights[weight_index];
                     }
-                    let in_channel = plane as usize - 1;
-                    debug_assert!(in_channel < input_channels);
-                    let weight_index = ((out_channel * input_channels + in_channel)
-                        * CNN_KERNEL_AREA)
-                        + kr * 3
-                        + kf;
-                    value += weights[weight_index];
+                    if black_to_move {
+                        let weight_index = ((out_channel * BOARD_CHANNELS
+                            + SIDE_TO_MOVE_BOARD_CHANNEL)
+                            * CNN_KERNEL_AREA)
+                            + kr * 3
+                            + kf;
+                        value += weights[weight_index];
+                    }
                 }
             }
             output[out_start + sq] = value.max(0.0);
@@ -917,7 +949,7 @@ pub fn benchmark_training(
         }
         samples.push(AzTrainingSample {
             features,
-            board: vec![0; BOARD_PLANES_SIZE],
+            board: vec![0; BOARD_HISTORY_SIZE],
             move_indices,
             policy,
             value,
@@ -1244,7 +1276,7 @@ fn dense_move_index(mv: Move) -> usize {
 fn replay_pool_test_fixture() -> AzExperiencePool {
     let sample = AzTrainingSample {
         features: vec![1, 2, 3],
-        board: vec![0; BOARD_PLANES_SIZE],
+        board: vec![0; BOARD_HISTORY_SIZE],
         move_indices: vec![0, 1],
         policy: vec![0.6, 0.4],
         value: 0.1,
@@ -1271,11 +1303,32 @@ mod tests {
     }
 
     #[test]
+    fn board_history_planes_include_rewound_previous_position() {
+        let mut position = Position::startpos();
+        let mv = position.legal_moves()[0];
+        let moved_piece = position.piece_at(mv.from as usize).unwrap();
+        let history = vec![HistoryMove {
+            piece: moved_piece,
+            mv,
+        }];
+        position.make_move(mv);
+
+        let mut board = Vec::new();
+        extract_board_planes(&position, &history, &mut board);
+        let piece_plane = (absolute_piece_plane(moved_piece.color, moved_piece.kind) + 1) as u8;
+
+        assert_eq!(board.len(), BOARD_HISTORY_SIZE);
+        assert_eq!(board[mv.to as usize], piece_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + mv.from as usize], piece_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + mv.to as usize], 0);
+    }
+
+    #[test]
     fn terminal_value_targets_match_outcome_for_side_to_move() {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
@@ -1283,7 +1336,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
@@ -1302,7 +1355,7 @@ mod tests {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.2,
@@ -1310,7 +1363,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.4,
@@ -1318,7 +1371,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.6,
@@ -1364,7 +1417,7 @@ mod tests {
         let samples = vec![
             AzTrainingSample {
                 features: vec![0],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
@@ -1372,7 +1425,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![1],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
@@ -1380,7 +1433,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![2],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.75,
@@ -1388,7 +1441,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![3],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.75,
@@ -1409,7 +1462,7 @@ mod tests {
         let samples = vec![
             AzTrainingSample {
                 features: vec![0, 4, 8],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
@@ -1417,7 +1470,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![1, 5, 9],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
@@ -1425,7 +1478,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![2, 6, 10],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.5,
@@ -1433,7 +1486,7 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![3, 7, 11],
-                board: vec![0; BOARD_PLANES_SIZE],
+                board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.5,
