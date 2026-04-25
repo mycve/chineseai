@@ -301,6 +301,7 @@ fn build_async_training_report(
         .started
         .map(|started| started.elapsed().as_secs_f32())
         .unwrap_or(train_seconds);
+    let train_stat_samples = stats.samples.max(1) as f32;
     AzLoopReport {
         games: selfplay_games,
         samples: selfplay_samples,
@@ -314,6 +315,9 @@ fn build_async_training_report(
         },
         loss: stats.loss,
         value_loss: stats.value_loss,
+        value_mse: stats.value_error_sq_sum / train_stat_samples,
+        value_pred_mean: stats.value_pred_sum / train_stat_samples,
+        value_target_mean: stats.value_target_sum / train_stat_samples,
         policy_ce: stats.policy_ce,
         temperature_early_entropy: pending.selfplay.temperature_early_entropy_sum
             / pending.selfplay.temperature_early_entropy_count.max(1) as f32,
@@ -795,7 +799,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_batch_games,
@@ -810,6 +814,7 @@ fn main() {
                 config.temperature_decay_plies,
                 config.cpuct,
                 config.trunk_depth,
+                config.td_lambda,
                 config.replay_games,
                 config.replay_samples,
                 config.mirror_probability,
@@ -1018,6 +1023,9 @@ fn main() {
                                     avg_plies: 0.0,
                                     loss: 0.0,
                                     value_loss: 0.0,
+                                    value_mse: 0.0,
+                                    value_pred_mean: 0.0,
+                                    value_target_mean: 0.0,
                                     policy_ce: 0.0,
                                     temperature_early_entropy: 0.0,
                                     temperature_mid_entropy: 0.0,
@@ -1056,6 +1064,9 @@ fn main() {
                                     avg_plies: 0.0,
                                     loss: 0.0,
                                     value_loss: 0.0,
+                                    value_mse: 0.0,
+                                    value_pred_mean: 0.0,
+                                    value_target_mean: 0.0,
                                     policy_ce: 0.0,
                                     temperature_early_entropy: 0.0,
                                     temperature_mid_entropy: 0.0,
@@ -1131,7 +1142,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_ce={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_ce={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1149,6 +1160,9 @@ fn main() {
                     report.avg_plies,
                     report.loss,
                     report.value_loss,
+                    report.value_mse,
+                    report.value_pred_mean,
+                    report.value_target_mean,
                     report.policy_ce,
                     config.lr,
                     report.temperature_early_entropy,
@@ -1168,6 +1182,19 @@ fn main() {
                 );
                 log_scalar(&mut tb, "train/loss", update, report.loss);
                 log_scalar(&mut tb, "train/value_ce", update, report.value_loss);
+                log_scalar(&mut tb, "train/value_mse", update, report.value_mse);
+                log_scalar(
+                    &mut tb,
+                    "train/value_pred_mean",
+                    update,
+                    report.value_pred_mean,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/value_target_mean",
+                    update,
+                    report.value_target_mean,
+                );
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
                 log_scalar(&mut tb, "train/lr", update, config.lr);
                 log_scalar(

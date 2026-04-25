@@ -190,6 +190,9 @@ pub struct AzLoopReport {
     pub avg_plies: f32,
     pub loss: f32,
     pub value_loss: f32,
+    pub value_mse: f32,
+    pub value_pred_mean: f32,
+    pub value_target_mean: f32,
     pub policy_ce: f32,
     pub temperature_early_entropy: f32,
     pub temperature_mid_entropy: f32,
@@ -241,6 +244,7 @@ pub struct AzTrainStats {
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
     pub value_target_sq_sum: f32,
+    pub value_error_sq_sum: f32,
     pub samples: usize,
 }
 
@@ -253,6 +257,7 @@ impl AzTrainStats {
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;
         self.value_target_sq_sum += other.value_target_sq_sum;
+        self.value_error_sq_sum += other.value_error_sq_sum;
         self.samples += other.samples;
     }
 }
@@ -967,6 +972,7 @@ pub fn selfplay_train_iteration_with_pool(
     );
     let train_seconds = train_started.elapsed().as_secs_f32();
     let total_seconds = started.elapsed().as_secs_f32();
+    let train_stat_samples = stats.samples.max(1) as f32;
     AzLoopReport {
         games: config.games,
         samples: generated_samples,
@@ -980,6 +986,9 @@ pub fn selfplay_train_iteration_with_pool(
         },
         loss: stats.loss,
         value_loss: stats.value_loss,
+        value_mse: stats.value_error_sq_sum / train_stat_samples,
+        value_pred_mean: stats.value_pred_sum / train_stat_samples,
+        value_target_mean: stats.value_target_sum / train_stat_samples,
         policy_ce: stats.policy_ce,
         temperature_early_entropy: data.temperature_early_entropy_sum
             / data.temperature_early_entropy_count.max(1) as f32,

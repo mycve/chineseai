@@ -295,6 +295,7 @@ impl GpuReplica {
         let win = value_probs.narrow(1, 0, 1)?;
         let loss_prob = value_probs.narrow(1, 2, 1)?;
         let value = (win - loss_prob)?.squeeze(1)?;
+        let value_error = (&value - &batch_tensors.values)?;
         let log_value = log_softmax(&forward.value_logits, 1)?;
         let value_ce_per_sample = ((&batch_tensors.value_targets * &log_value)? * -1.0)?;
         let value_loss = value_ce_per_sample.sum_all()?;
@@ -314,6 +315,7 @@ impl GpuReplica {
         stats.value_pred_sq_sum = value.sqr()?.sum_all()?.to_scalar::<f32>()?;
         stats.value_target_sum = batch_tensors.values.sum_all()?.to_scalar::<f32>()?;
         stats.value_target_sq_sum = batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        stats.value_error_sq_sum = value_error.sqr()?.sum_all()?.to_scalar::<f32>()?;
         stats.samples = batch.len();
         let cpu_grads = if keep_grads {
             Vec::new()
