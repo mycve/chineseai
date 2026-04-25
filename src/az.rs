@@ -4,10 +4,10 @@ use std::path::Path;
 use std::time::Instant;
 
 mod alphazero;
-mod optim;
 mod play;
 mod replay;
 mod train;
+mod train_gpu;
 
 use crate::nnue::{HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, orient_move};
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
@@ -16,7 +16,6 @@ pub use alphazero::{
     AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search, alphazero_search_with_history,
     alphazero_search_with_history_and_root_moves, alphazero_search_with_history_and_rules,
 };
-use optim::AdamWState;
 pub use play::{
     AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data, play_arena_games,
     play_arena_games_from_positions,
@@ -124,7 +123,7 @@ pub struct AzNnue {
     pub policy_move_hidden: Vec<f32>,
     pub policy_move_cnn: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
-    optimizer: Option<Box<AdamWState>>,
+    gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
 impl Clone for AzNnue {
@@ -154,7 +153,7 @@ impl Clone for AzNnue {
             policy_move_hidden: self.policy_move_hidden.clone(),
             policy_move_cnn: self.policy_move_cnn.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
-            optimizer: None,
+            gpu_trainer: None,
         }
     }
 }
@@ -243,86 +242,6 @@ pub struct AzTrainStats {
     pub value_target_sum: f32,
     pub value_target_sq_sum: f32,
     pub samples: usize,
-}
-
-#[derive(Debug)]
-struct AzGrad {
-    input_hidden: Vec<f32>,
-    hidden_bias: Vec<f32>,
-    trunk_weights: Vec<f32>,
-    trunk_biases: Vec<f32>,
-    trunk_global_weights: Vec<f32>,
-    board_conv1_weights: Vec<f32>,
-    board_conv1_bias: Vec<f32>,
-    board_conv2_weights: Vec<f32>,
-    board_conv2_bias: Vec<f32>,
-    board_attention_query: Vec<f32>,
-    board_hidden: Vec<f32>,
-    board_hidden_bias: Vec<f32>,
-    board_global: Vec<f32>,
-    global_hidden: Vec<f32>,
-    global_bias: Vec<f32>,
-    value_intermediate_hidden: Vec<f32>,
-    value_intermediate_bias: Vec<f32>,
-    value_logits_weights: Vec<f32>,
-    value_logits_bias: Vec<f32>,
-    policy_move_hidden: Vec<f32>,
-    policy_move_cnn: Vec<f32>,
-    policy_move_bias: Vec<f32>,
-}
-
-impl AzGrad {
-    fn new(model: &AzNnue) -> Self {
-        Self {
-            input_hidden: vec![0.0; model.input_hidden.len()],
-            hidden_bias: vec![0.0; model.hidden_bias.len()],
-            trunk_weights: vec![0.0; model.trunk_weights.len()],
-            trunk_biases: vec![0.0; model.trunk_biases.len()],
-            trunk_global_weights: vec![0.0; model.trunk_global_weights.len()],
-            board_conv1_weights: vec![0.0; model.board_conv1_weights.len()],
-            board_conv1_bias: vec![0.0; model.board_conv1_bias.len()],
-            board_conv2_weights: vec![0.0; model.board_conv2_weights.len()],
-            board_conv2_bias: vec![0.0; model.board_conv2_bias.len()],
-            board_attention_query: vec![0.0; model.board_attention_query.len()],
-            board_hidden: vec![0.0; model.board_hidden.len()],
-            board_hidden_bias: vec![0.0; model.board_hidden_bias.len()],
-            board_global: vec![0.0; model.board_global.len()],
-            global_hidden: vec![0.0; model.global_hidden.len()],
-            global_bias: vec![0.0; model.global_bias.len()],
-            value_intermediate_hidden: vec![0.0; model.value_intermediate_hidden.len()],
-            value_intermediate_bias: vec![0.0; model.value_intermediate_bias.len()],
-            value_logits_weights: vec![0.0; model.value_logits_weights.len()],
-            value_logits_bias: vec![0.0; model.value_logits_bias.len()],
-            policy_move_hidden: vec![0.0; model.policy_move_hidden.len()],
-            policy_move_cnn: vec![0.0; model.policy_move_cnn.len()],
-            policy_move_bias: vec![0.0; model.policy_move_bias.len()],
-        }
-    }
-
-    fn clear(&mut self) {
-        self.input_hidden.fill(0.0);
-        self.hidden_bias.fill(0.0);
-        self.trunk_weights.fill(0.0);
-        self.trunk_biases.fill(0.0);
-        self.trunk_global_weights.fill(0.0);
-        self.board_conv1_weights.fill(0.0);
-        self.board_conv1_bias.fill(0.0);
-        self.board_conv2_weights.fill(0.0);
-        self.board_conv2_bias.fill(0.0);
-        self.board_attention_query.fill(0.0);
-        self.board_hidden.fill(0.0);
-        self.board_hidden_bias.fill(0.0);
-        self.board_global.fill(0.0);
-        self.global_hidden.fill(0.0);
-        self.global_bias.fill(0.0);
-        self.value_intermediate_hidden.fill(0.0);
-        self.value_intermediate_bias.fill(0.0);
-        self.value_logits_weights.fill(0.0);
-        self.value_logits_bias.fill(0.0);
-        self.policy_move_hidden.fill(0.0);
-        self.policy_move_cnn.fill(0.0);
-        self.policy_move_bias.fill(0.0);
-    }
 }
 
 impl AzTrainStats {
@@ -416,7 +335,7 @@ impl AzNnue {
             policy_move_hidden,
             policy_move_cnn,
             policy_move_bias,
-            optimizer: None,
+            gpu_trainer: None,
         }
     }
 
@@ -591,7 +510,7 @@ impl AzNnue {
             policy_move_hidden,
             policy_move_cnn,
             policy_move_bias,
-            optimizer: None,
+            gpu_trainer: None,
         };
         model.validate()?;
         Ok(model)
@@ -1128,48 +1047,6 @@ fn softmax_into(logits: &[f32], output: &mut Vec<f32>) {
     }
 }
 
-fn softmax_slice(input: &[f32], output: &mut [f32], range: std::ops::Range<usize>) {
-    if range.is_empty() {
-        return;
-    }
-    let max_logit = input[range.clone()]
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    for index in range.clone() {
-        let value = (input[index] - max_logit).exp();
-        output[index] = value;
-        sum += value;
-    }
-    let inv_sum = sum.max(1e-12).recip();
-    for index in range {
-        output[index] *= inv_sum;
-    }
-}
-
-fn softmax_fixed<const N: usize>(logits: &[f32]) -> [f32; N] {
-    let mut output = [0.0; N];
-    if logits.len() < N {
-        return output;
-    }
-    let max_logit = logits[..N]
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    for index in 0..N {
-        let value = (logits[index] - max_logit).exp();
-        output[index] = value;
-        sum += value;
-    }
-    let inv_sum = sum.max(1e-12).recip();
-    for value in &mut output {
-        *value *= inv_sum;
-    }
-    output
-}
-
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
     let mut sum0 = 0.0;
@@ -1189,13 +1066,6 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
         sum += left[index] * right[index];
     }
     sum
-}
-
-fn add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
-    debug_assert_eq!(dst.len(), src.len());
-    for (dst_value, src_value) in dst.iter_mut().zip(src.iter()) {
-        *dst_value += scale * *src_value;
-    }
 }
 
 fn scalar_value_from_logits(logits: &[f32]) -> (f32, Vec<f32>) {
@@ -1607,14 +1477,5 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.game_count(), pool.game_count());
         assert_eq!(loaded.sample_count(), pool.sample_count());
-    }
-
-    #[test]
-    fn az_grad_clear_resets_trunk_global_weights() {
-        let model = AzNnue::random_with_depth(16, 2, 7);
-        let mut grad = AzGrad::new(&model);
-        grad.trunk_global_weights.fill(1.0);
-        grad.clear();
-        assert!(grad.trunk_global_weights.iter().all(|value| *value == 0.0));
     }
 }

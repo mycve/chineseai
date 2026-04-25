@@ -74,10 +74,12 @@ macro_rules! ulog {
 
 const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.conf";
 const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
+const DEFAULT_WORKER_CAP: usize = 32;
 
 fn default_parallel_workers() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get().saturating_sub(1).max(1))
+        .map(|workers| workers.min(DEFAULT_WORKER_CAP))
         .unwrap_or(8)
 }
 
@@ -320,8 +322,8 @@ fn build_async_training_report(
         selfplay_seconds: pending.selfplay_seconds,
         train_seconds,
         total_seconds,
-        games_per_second: selfplay_games as f32 / pending.selfplay_seconds.max(1e-6),
-        samples_per_second: selfplay_samples as f32 / pending.selfplay_seconds.max(1e-6),
+        games_per_second: selfplay_games as f32 / total_seconds.max(1e-6),
+        samples_per_second: selfplay_samples as f32 / total_seconds.max(1e-6),
         train_samples_per_second: (train_data_len * epochs.max(1)) as f32 / train_seconds.max(1e-6),
         train_samples: train_data_len,
         pool_games,
@@ -1662,6 +1664,8 @@ impl AzLoopFileConfig {
 # Pipeline:
 #   Self-play and training run in separate long-lived threads.
 #   workers controls how many independent self-play threads run in parallel.
+#   The generated default is capped at 32 because this scalar MCTS/CNN code often slows down
+#   when hundreds of tiny self-play threads fight over cache and memory bandwidth.
 #   Self-play batches accumulate globally across workers.
 #   Every time selfplay_batch_games complete, one training update runs and then
 #   the fresh weights are published back to all self-play threads.
