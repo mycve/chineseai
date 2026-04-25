@@ -112,13 +112,21 @@ impl ExternalUci {
         }
     }
 
-    /// 仅发送 `position startpos moves ...` 与 `go depth`（不 `ucinewgame`，保留哈希）。
-    fn query_move(&mut self, moves_uci: &[String], depth: u32) -> std::io::Result<String> {
-        let pos_cmd = if moves_uci.is_empty() {
-            "position startpos".to_string()
+    fn query_move(
+        &mut self,
+        initial_fen: Option<&str>,
+        moves_uci: &[String],
+        depth: u32,
+    ) -> std::io::Result<String> {
+        let mut pos_cmd = if let Some(fen) = initial_fen {
+            format!("position fen {fen}")
         } else {
-            format!("position startpos moves {}", moves_uci.join(" "))
+            "position startpos".to_string()
         };
+        if !moves_uci.is_empty() {
+            pos_cmd.push_str(" moves ");
+            pos_cmd.push_str(&moves_uci.join(" "));
+        }
         self.write_line(&pos_cmd)?;
         self.write_line(&format!("go depth {depth}"))?;
         self.read_bestmove_token()
@@ -193,6 +201,7 @@ fn terminal_before_side_selects(
 fn play_one_game(
     model: &AzNnue,
     external: &mut ExternalUci,
+    initial_position: &Position,
     chinese_plays_red: bool,
     pikafish_depth: u32,
     max_plies: usize,
@@ -200,7 +209,9 @@ fn play_one_game(
     mut seed: u64,
 ) -> std::io::Result<GameEnd> {
     let _ = external.write_line("ucinewgame");
-    let mut position = Position::startpos();
+    let mut position = initial_position.clone();
+    let initial_fen =
+        (position.to_fen() != crate::xiangqi::STARTPOS_FEN).then(|| position.to_fen());
     let mut history: Vec<HistoryMove> = Vec::new();
     let mut rule_history = position.initial_rule_history();
     let mut moves_uci: Vec<String> = Vec::new();
@@ -245,7 +256,7 @@ fn play_one_game(
             apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
             moves_uci.push(uci);
         } else {
-            let token = external.query_move(&moves_uci, pikafish_depth)?;
+            let token = external.query_move(initial_fen.as_deref(), &moves_uci, pikafish_depth)?;
             if token.is_empty() || token == "(none)" || token == "0000" {
                 return Ok(match side {
                     Color::Red => GameEnd::BlackWin,
@@ -277,6 +288,7 @@ fn play_one_game(
 pub fn run_vs_pikafish(
     pikafish_exe: &Path,
     chinese_model_path: &Path,
+    start_positions: &[Position],
     pikafish_depth: u32,
     total_games: usize,
     max_plies: usize,
@@ -293,6 +305,7 @@ pub fn run_vs_pikafish(
 
     let pikafish_path = pikafish_exe.to_path_buf();
     let parallel = parallel_games.max(1).min(total_games);
+    let start_positions = Arc::new(start_positions.to_vec());
 
     let mut out = VsPikafishResult {
         total_games: total_games,
@@ -305,14 +318,20 @@ pub fn run_vs_pikafish(
         for game_index in batch_start..batch_end {
             let exe = pikafish_path.clone();
             let m = Arc::clone(&model);
+            let positions = Arc::clone(&start_positions);
             handles.push(thread::spawn(
                 move || -> std::io::Result<(bool, GameEnd)> {
                     let mut ext = ExternalUci::spawn(&exe)?;
                     ext.handshake()?;
                     let chinese_red = game_index % 2 == 0;
+                    let start_position = positions
+                        .get(game_index % positions.len().max(1))
+                        .cloned()
+                        .unwrap_or_else(Position::startpos);
                     let end = play_one_game(
                         m.as_ref(),
                         &mut ext,
+                        &start_position,
                         chinese_red,
                         pikafish_depth,
                         max_plies,

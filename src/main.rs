@@ -1509,7 +1509,7 @@ fn main() {
         Some("vs-pikafish") => {
             let pikafish_exe = args.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [pikafish_depth] [games] [max_plies] [simulations] [parallel_games]"
+                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [pikafish_depth] [games] [max_plies] [simulations] [parallel_games] [eval_fens.txt]"
                 )
             });
             let model_path = args.next().unwrap_or_else(|| "chineseai.nnue".into());
@@ -1538,10 +1538,15 @@ fn main() {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(5)
                 .max(1);
+            let eval_fens_path = args
+                .next()
+                .unwrap_or_else(|| DEFAULT_ARENA_EVAL_FENS.into());
+            let start_positions = load_arena_eval_positions(&eval_fens_path);
             let seed = 20260411_u64;
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
                 Path::new(&model_path),
+                &start_positions,
                 pikafish_depth,
                 games,
                 max_plies,
@@ -1551,8 +1556,9 @@ fn main() {
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
-                "vs-pikafish: games={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
+                "vs-pikafish: games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
                 summary.total_games,
+                start_positions.len(),
                 parallel_games.min(games),
                 summary.chinese_wins,
                 summary.chinese_losses,
