@@ -137,7 +137,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     format!(
         concat!(
             "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_d{}_mxp{}_wk{}_",
-            "gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_cpi{}_",
+            "gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
             "ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
@@ -156,6 +156,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.replay_games,
         config.replay_samples,
         f32_slug(config.mirror_probability),
+        f32_slug(config.td_lambda),
         config.checkpoint_interval,
         config.arena_interval,
         f32_slug(config.arena_cpuct),
@@ -275,6 +276,7 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         cpuct: config.cpuct,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
+        td_lambda: config.td_lambda,
         replay_games: config.replay_games,
         replay_samples: config.replay_samples,
         mirror_probability: config.mirror_probability,
@@ -1542,6 +1544,7 @@ struct AzLoopFileConfig {
     cpuct: f32,
     root_dirichlet_alpha: f32,
     root_exploration_fraction: f32,
+    td_lambda: f32,
     replay_games: usize,
     replay_samples: usize,
     mirror_probability: f32,
@@ -1577,6 +1580,7 @@ impl Default for AzLoopFileConfig {
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
+            td_lambda: 0.75,
             replay_games: 5000,
             replay_samples: 0,
             mirror_probability: 0.3,
@@ -1604,9 +1608,9 @@ impl AzLoopFileConfig {
 #   Generate this many self-play games, then run one training update.
 #   With multiple workers, batches are accumulated across all workers.
 #
-# Value targets (AlphaZero-style): each training position uses only the final game outcome,
-# encoded from the side-to-move at that position (via side_sign × game_result). MCTS root
-# is not mixed into the value label.
+# Value targets:
+#   td_lambda mixes each position's future MCTS root values with the final game outcome.
+#   1.0 keeps pure AlphaZero-style terminal labels; 0.75 is the default.
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
@@ -1672,6 +1676,7 @@ temperature_decay_plies = {temperature_decay_plies}
 cpuct = {cpuct}
 root_dirichlet_alpha = {root_dirichlet_alpha}
 root_exploration_fraction = {root_exploration_fraction}
+td_lambda = {td_lambda}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
@@ -1702,6 +1707,7 @@ tensorboard_logdir = {tensorboard_logdir}
             cpuct = self.cpuct,
             root_dirichlet_alpha = self.root_dirichlet_alpha,
             root_exploration_fraction = self.root_exploration_fraction,
+            td_lambda = self.td_lambda,
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
@@ -1767,6 +1773,7 @@ tensorboard_logdir = {tensorboard_logdir}
                 self.root_exploration_fraction =
                     parse_config_value(value, self.root_exploration_fraction)
             }
+            "td_lambda" => self.td_lambda = parse_config_value(value, self.td_lambda),
             "replay_games" => self.replay_games = parse_config_value(value, self.replay_games),
             "replay_samples" => {
                 self.replay_samples = parse_config_value(value, self.replay_samples)
@@ -1810,6 +1817,7 @@ tensorboard_logdir = {tensorboard_logdir}
         self.cpuct = self.cpuct.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.max_checkpoints = self.max_checkpoints.max(1);

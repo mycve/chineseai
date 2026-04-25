@@ -10,7 +10,8 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 use super::alphazero::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_history_and_rules, dense_move_index, extract_board_planes,
+    VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
+    extract_board_planes,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -223,6 +224,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &position,
                 &history,
                 &search.candidates,
+                search.value_cp as f32 / VALUE_SCALE_CP,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
             append_history(&mut history, &position, mv);
@@ -277,7 +279,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_terminal_value_targets(&mut game_samples, result);
+        assign_td_lambda_value_targets(&mut game_samples, result, config.td_lambda);
         samples.extend(game_samples.clone());
         games.push(game_samples);
     }
@@ -301,6 +303,7 @@ fn make_training_sample(
     position: &Position,
     history: &[HistoryMove],
     candidates: &[AzCandidate],
+    value: f32,
     mirror_file: bool,
 ) -> AzTrainingSample {
     let total_policy = candidates
@@ -338,7 +341,7 @@ fn make_training_sample(
             .iter()
             .map(|candidate| candidate.policy.max(0.0) / total_policy)
             .collect(),
-        value: 0.0,
+        value: value.clamp(-1.0, 1.0),
         side_sign: if position.side_to_move() == Color::Red {
             1.0
         } else {
@@ -350,6 +353,36 @@ fn make_training_sample(
 pub(super) fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], game_result: f32) {
     for sample in samples.iter_mut() {
         sample.value = (game_result * sample.side_sign).clamp(-1.0, 1.0);
+    }
+}
+
+pub(super) fn assign_td_lambda_value_targets(
+    samples: &mut [AzTrainingSample],
+    game_result: f32,
+    td_lambda: f32,
+) {
+    if samples.is_empty() {
+        return;
+    }
+
+    let lambda = td_lambda.clamp(0.0, 1.0);
+    if lambda >= 1.0 - 1e-6 {
+        assign_terminal_value_targets(samples, game_result);
+        return;
+    }
+
+    let bootstrap_red = samples
+        .iter()
+        .map(|sample| (sample.value * sample.side_sign).clamp(-1.0, 1.0))
+        .collect::<Vec<_>>();
+    let mut next_return_red = game_result.clamp(-1.0, 1.0);
+    for index in (0..samples.len()).rev() {
+        if index + 1 < samples.len() {
+            next_return_red = ((1.0 - lambda) * bootstrap_red[index + 1]
+                + lambda * next_return_red)
+                .clamp(-1.0, 1.0);
+        }
+        samples[index].value = (next_return_red * samples[index].side_sign).clamp(-1.0, 1.0);
     }
 }
 

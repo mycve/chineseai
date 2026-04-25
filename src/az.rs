@@ -174,6 +174,7 @@ pub struct AzLoopConfig {
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub td_lambda: f32,
     pub replay_games: usize,
     pub replay_samples: usize,
     pub mirror_probability: f32,
@@ -1374,7 +1375,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::assign_terminal_value_targets;
+    use super::play::{assign_td_lambda_value_targets, assign_terminal_value_targets};
     use super::*;
 
     #[test]
@@ -1412,6 +1413,42 @@ mod tests {
 
         assert!((samples[0].value - 1.0).abs() < 1e-6);
         assert!((samples[1].value + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn td_lambda_value_targets_mix_future_bootstrap_values() {
+        let mut samples = vec![
+            AzTrainingSample {
+                features: Vec::new(),
+                board: vec![0; BOARD_PLANES_SIZE],
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: 0.2,
+                side_sign: 1.0,
+            },
+            AzTrainingSample {
+                features: Vec::new(),
+                board: vec![0; BOARD_PLANES_SIZE],
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: -0.4,
+                side_sign: -1.0,
+            },
+            AzTrainingSample {
+                features: Vec::new(),
+                board: vec![0; BOARD_PLANES_SIZE],
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: 0.6,
+                side_sign: 1.0,
+            },
+        ];
+
+        assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
+
+        assert!((samples[2].value - 1.0).abs() < 1e-6);
+        assert!((samples[1].value + 0.8).abs() < 1e-6);
+        assert!((samples[0].value - 0.6).abs() < 1e-6);
     }
 
     #[test]
