@@ -4,8 +4,7 @@ use super::optim::{ADAMW_WEIGHT_DECAY, AdamWState, adamw_update};
 use super::{
     AzGrad, AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_PLANES_SIZE,
     CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOLED_SIZE, GLOBAL_CONTEXT_SIZE, RESIDUAL_TRUNK_SCALE,
-    SplitMix64, VALUE_HIDDEN_SIZE, VALUE_LOGITS, add_scaled, scalar_to_wdl_target, softmax_fixed,
-    softmax_slice,
+    SplitMix64, VALUE_HIDDEN_SIZE, VALUE_LOGITS, add_scaled, softmax_fixed, softmax_slice,
 };
 use crate::xiangqi::BOARD_FILES;
 
@@ -95,14 +94,9 @@ fn accumulate_batch_cached(
         } else {
             0.0
         };
-        let value_target = scalar_to_wdl_target(sample.value);
         let value_error = value - sample.value;
         let value_loss = value_error * value_error;
-        let value_train_loss = value_probs
-            .iter()
-            .zip(value_target.iter())
-            .map(|(predicted, target)| -target * predicted.max(1e-9).ln())
-            .sum::<f32>();
+        let value_train_loss = value_loss;
 
         stats.loss += value_train_loss;
         stats.value_loss += value_loss;
@@ -112,9 +106,9 @@ fn accumulate_batch_cached(
         stats.value_target_sq_sum += sample.value * sample.value;
         stats.samples += 1;
 
-        for out in 0..VALUE_LOGITS {
-            value_logit_grads[row * VALUE_LOGITS + out] = value_probs[out] - value_target[out];
-        }
+        let scalar_grads = value_scalar_mse_logit_grads(value_probs, value_error);
+        value_logit_grads[row * VALUE_LOGITS..(row + 1) * VALUE_LOGITS]
+            .copy_from_slice(&scalar_grads);
     }
 
     grad_weights_batch(
@@ -457,6 +451,21 @@ fn compute_policy_batch_probs(layout: &PolicyBatchLayout, logits: &[f32], probs:
         let range = layout.sample_range(row);
         softmax_slice(logits, probs, range);
     }
+}
+
+fn value_scalar_mse_logit_grads(
+    probs: [f32; VALUE_LOGITS],
+    value_error: f32,
+) -> [f32; VALUE_LOGITS] {
+    let win = probs[0];
+    let draw = probs[1];
+    let loss = probs[2];
+    let scale = 2.0 * value_error;
+    [
+        (scale * win * (1.0 - win + loss)).clamp(-4.0, 4.0),
+        (scale * draw * (loss - win)).clamp(-4.0, 4.0),
+        (-scale * loss * (1.0 - loss + win)).clamp(-4.0, 4.0),
+    ]
 }
 
 fn clamp_inplace(values: &mut [f32], min: f32, max: f32) {
