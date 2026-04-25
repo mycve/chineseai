@@ -1,6 +1,7 @@
-use candle_core::{Device, Result as CandleResult, Tensor, Var};
+use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 use candle_nn::ops::{log_softmax, softmax};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
+use std::thread;
 
 use super::{
     AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_PLANES_SIZE, CNN_CHANNELS,
@@ -15,11 +16,19 @@ const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
 
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
+    hidden_size: usize,
+    trunk_depth: usize,
+    device_indices: Vec<usize>,
+    replicas: Vec<GpuReplica>,
+    optimizer: AdamW,
+}
+
+#[derive(Debug)]
+struct GpuReplica {
     device: Device,
     hidden_size: usize,
     trunk_depth: usize,
     vars: GpuVars,
-    optimizer: AdamW,
 }
 
 #[derive(Debug)]
@@ -102,10 +111,13 @@ pub(super) fn train_samples_gpu(
 
 impl GpuTrainer {
     fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
-        let device = Device::new_cuda(cuda_device_index())?;
-        let vars = GpuVars::from_model(model, &device)?;
+        let device_indices = cuda_device_indices();
+        let mut replicas = Vec::with_capacity(device_indices.len());
+        for &device_index in &device_indices {
+            replicas.push(GpuReplica::new(model, device_index)?);
+        }
         let optimizer = AdamW::new(
-            vars.all_vars(),
+            replicas[0].vars.all_vars(),
             ParamsAdamW {
                 lr: lr as f64,
                 beta1: 0.9,
@@ -115,16 +127,18 @@ impl GpuTrainer {
             },
         )?;
         Ok(Self {
-            device,
             hidden_size: model.hidden_size,
             trunk_depth: model.trunk_depth,
-            vars,
+            device_indices,
+            replicas,
             optimizer,
         })
     }
 
     fn matches(&self, model: &AzNnue) -> bool {
-        self.hidden_size == model.hidden_size && self.trunk_depth == model.trunk_depth
+        self.hidden_size == model.hidden_size
+            && self.trunk_depth == model.trunk_depth
+            && self.device_indices == cuda_device_indices()
     }
 
     fn set_learning_rate(&mut self, lr: f32) {
@@ -136,6 +150,137 @@ impl GpuTrainer {
         samples: &[AzTrainingSample],
         batch: &[usize],
     ) -> CandleResult<AzTrainStats> {
+        let mut active_replicas = self.replicas.len().min(batch.len()).max(1);
+        while active_replicas > 1 && batch.len() / active_replicas == 0 {
+            active_replicas -= 1;
+        }
+        if active_replicas <= 1 {
+            return self.train_batch_single(samples, batch);
+        }
+
+        let shard_size = batch.len().div_ceil(active_replicas);
+        let mut shard_ranges = Vec::with_capacity(active_replicas);
+        for shard_index in 0..active_replicas {
+            let start = shard_index * shard_size;
+            let end = ((shard_index + 1) * shard_size).min(batch.len());
+            if start < end {
+                shard_ranges.push(start..end);
+            }
+        }
+
+        let (primary_replica, worker_replicas) = self.replicas.split_at(1);
+        let primary_replica = &primary_replica[0];
+        let primary_range = shard_ranges[0].clone();
+        let primary = primary_replica.compute_batch_grads(
+            samples,
+            &batch[primary_range],
+            batch.len(),
+            true,
+        )?;
+
+        let worker_outputs = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (worker_offset, range) in shard_ranges.iter().skip(1).cloned().enumerate() {
+                let replica = &worker_replicas[worker_offset];
+                handles.push(scope.spawn(move || {
+                    replica.compute_batch_grads(samples, &batch[range], batch.len(), false)
+                }));
+            }
+            let mut outputs = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let output = handle
+                    .join()
+                    .map_err(|_| candle_core::Error::Msg("multi-gpu worker panicked".into()))??;
+                outputs.push(output);
+            }
+            CandleResult::Ok(outputs)
+        })?;
+
+        let mut stats = primary.stats;
+        let mut grads = primary
+            .grads
+            .expect("primary shard gradients should be kept on device");
+        for output in worker_outputs {
+            stats.add_assign(&output.stats);
+            self.add_cpu_grads_to_primary(&mut grads, &output.cpu_grads)?;
+        }
+        self.optimizer.step(&grads)?;
+        self.broadcast_primary_to_workers()?;
+        Ok(stats)
+    }
+
+    fn train_batch_single(
+        &mut self,
+        samples: &[AzTrainingSample],
+        batch: &[usize],
+    ) -> CandleResult<AzTrainStats> {
+        let output = self.replicas[0].compute_batch_grads(samples, batch, batch.len(), true)?;
+        self.optimizer.step(
+            output
+                .grads
+                .as_ref()
+                .expect("single-gpu gradients should be kept on device"),
+        )?;
+        Ok(output.stats)
+    }
+
+    fn add_cpu_grads_to_primary(
+        &self,
+        grads: &mut GradStore,
+        cpu_grads: &[Option<Vec<f32>>],
+    ) -> CandleResult<()> {
+        let primary_vars = self.replicas[0].vars.all_vars();
+        for (var, cpu_grad) in primary_vars.iter().zip(cpu_grads.iter()) {
+            let Some(cpu_grad) = cpu_grad else {
+                continue;
+            };
+            let worker_grad =
+                Tensor::from_vec(cpu_grad.clone(), var.shape().clone(), var.device())?;
+            let next_grad = if let Some(current) = grads.get(var) {
+                (current + worker_grad)?
+            } else {
+                worker_grad
+            };
+            grads.insert(var, next_grad);
+        }
+        Ok(())
+    }
+
+    fn broadcast_primary_to_workers(&self) -> CandleResult<()> {
+        if self.replicas.len() <= 1 {
+            return Ok(());
+        }
+        let primary_values = self.replicas[0].vars.to_cpu_values()?;
+        for replica in self.replicas.iter().skip(1) {
+            replica.vars.set_from_cpu_values(&primary_values)?;
+        }
+        Ok(())
+    }
+
+    fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
+        self.replicas[0].vars.copy_to_model(model)
+    }
+}
+
+impl GpuReplica {
+    fn new(model: &AzNnue, device_index: usize) -> CandleResult<Self> {
+        let device = Device::new_cuda(device_index)?;
+        let vars = GpuVars::from_model(model, &device)?;
+        Ok(Self {
+            device,
+            hidden_size: model.hidden_size,
+            trunk_depth: model.trunk_depth,
+            vars,
+        })
+    }
+
+    fn compute_batch_grads(
+        &self,
+        samples: &[AzTrainingSample],
+        batch: &[usize],
+        global_batch_len: usize,
+        keep_grads: bool,
+    ) -> CandleResult<ShardOutput> {
         let batch_tensors = BatchTensors::new(samples, batch, &self.device)?;
         let forward = self.forward(&batch_tensors)?;
         let value_probs = softmax(&forward.value_logits, 1)?;
@@ -150,12 +295,11 @@ impl GpuTrainer {
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce = policy_ce_per_sample.sum_all()?;
-        let loss_tensor = ((&value_loss + &policy_ce)? / batch.len() as f64)?;
-
-        self.optimizer.backward_step(&loss_tensor)?;
+        let loss_tensor = ((&value_loss + &policy_ce)? / global_batch_len as f64)?;
+        let grads = loss_tensor.backward()?;
 
         let mut stats = AzTrainStats::default();
-        stats.loss = loss_tensor.to_scalar::<f32>()? * batch.len() as f32;
+        stats.loss = value_loss.to_scalar::<f32>()? + policy_ce.to_scalar::<f32>()?;
         stats.value_loss = value_loss.to_scalar::<f32>()?;
         stats.policy_ce = policy_ce.to_scalar::<f32>()?;
         stats.value_pred_sum = value.sum_all()?.to_scalar::<f32>()?;
@@ -163,7 +307,16 @@ impl GpuTrainer {
         stats.value_target_sum = batch_tensors.values.sum_all()?.to_scalar::<f32>()?;
         stats.value_target_sq_sum = batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?;
         stats.samples = batch.len();
-        Ok(stats)
+        let cpu_grads = if keep_grads {
+            Vec::new()
+        } else {
+            self.vars.cpu_grads(&grads)?
+        };
+        Ok(ShardOutput {
+            stats,
+            grads: if keep_grads { Some(grads) } else { None },
+            cpu_grads,
+        })
     }
 
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
@@ -260,10 +413,12 @@ impl GpuTrainer {
             policy_logits,
         })
     }
+}
 
-    fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
-        self.vars.copy_to_model(model)
-    }
+struct ShardOutput {
+    stats: AzTrainStats,
+    grads: Option<GradStore>,
+    cpu_grads: Vec<Option<Vec<f32>>>,
 }
 
 struct ForwardOutput {
@@ -521,6 +676,47 @@ impl GpuVars {
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         Ok(())
     }
+
+    fn cpu_grads(&self, grads: &GradStore) -> CandleResult<Vec<Option<Vec<f32>>>> {
+        let mut out = Vec::new();
+        for var in self.all_vars() {
+            let grad = grads
+                .get(&var)
+                .map(|grad| grad.flatten_all()?.to_vec1::<f32>())
+                .transpose()?;
+            out.push(grad);
+        }
+        Ok(out)
+    }
+
+    fn to_cpu_values(&self) -> CandleResult<Vec<Vec<f32>>> {
+        let mut values = Vec::new();
+        for var in self.all_vars() {
+            values.push(var.as_detached_tensor().flatten_all()?.to_vec1::<f32>()?);
+        }
+        Ok(values)
+    }
+
+    fn set_from_cpu_values(&self, values: &[Vec<f32>]) -> CandleResult<()> {
+        for (var, values) in self.all_vars().iter().zip(values.iter()) {
+            let tensor = Tensor::from_vec(values.clone(), var.shape().clone(), var.device())?;
+            var.set(&tensor)?;
+        }
+        Ok(())
+    }
+}
+
+fn cuda_device_indices() -> Vec<usize> {
+    if let Ok(value) = std::env::var("CHINESEAI_CUDA_DEVICES") {
+        let devices = value
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        if !devices.is_empty() {
+            return devices;
+        }
+    }
+    vec![cuda_device_index()]
 }
 
 fn cuda_device_index() -> usize {
