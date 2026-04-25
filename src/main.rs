@@ -1125,7 +1125,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s saved={}{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1152,7 +1152,6 @@ fn main() {
                     report.samples_per_second,
                     report.train_samples_per_second,
                     started.elapsed().as_secs_f32(),
-                    config.model_path,
                     checkpoint_saved
                         .as_ref()
                         .map_or_else(String::new, |path| format!(
@@ -1491,11 +1490,11 @@ fn main() {
         Some("vs-pikafish") => {
             let pikafish_exe = args.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [movetime_ms] [games] [max_plies] [simulations] [parallel_games]"
+                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [pikafish_depth] [games] [max_plies] [simulations] [parallel_games]"
                 )
             });
             let model_path = args.next().unwrap_or_else(|| "chineseai.nnue".into());
-            let movetime_ms = args
+            let pikafish_depth = args
                 .next()
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(10)
@@ -1524,7 +1523,7 @@ fn main() {
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
                 Path::new(&model_path),
-                movetime_ms,
+                pikafish_depth,
                 games,
                 max_plies,
                 simulations,
@@ -1533,7 +1532,7 @@ fn main() {
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
-                "vs-pikafish: games={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish movetime={}ms max_plies={} sims={}",
+                "vs-pikafish: games={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
                 summary.total_games,
                 parallel_games.min(games),
                 summary.chinese_wins,
@@ -1541,7 +1540,7 @@ fn main() {
                 summary.draws,
                 summary.chinese_wins_as_red,
                 summary.chinese_wins_as_black,
-                movetime_ms,
+                pikafish_depth,
                 max_plies,
                 simulations
             );

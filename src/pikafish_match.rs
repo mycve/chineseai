@@ -112,15 +112,15 @@ impl ExternalUci {
         }
     }
 
-    /// 仅发送 `position startpos moves ...` 与 `go movetime`（不 `ucinewgame`，保留哈希）。
-    fn query_move(&mut self, moves_uci: &[String], movetime_ms: u32) -> std::io::Result<String> {
+    /// 仅发送 `position startpos moves ...` 与 `go depth`（不 `ucinewgame`，保留哈希）。
+    fn query_move(&mut self, moves_uci: &[String], depth: u32) -> std::io::Result<String> {
         let pos_cmd = if moves_uci.is_empty() {
             "position startpos".to_string()
         } else {
             format!("position startpos moves {}", moves_uci.join(" "))
         };
         self.write_line(&pos_cmd)?;
-        self.write_line(&format!("go movetime {movetime_ms}"))?;
+        self.write_line(&format!("go depth {depth}"))?;
         self.read_bestmove_token()
     }
 
@@ -194,7 +194,7 @@ fn play_one_game(
     model: &AzNnue,
     external: &mut ExternalUci,
     chinese_plays_red: bool,
-    movetime_ms: u32,
+    pikafish_depth: u32,
     max_plies: usize,
     simulations: usize,
     mut seed: u64,
@@ -245,7 +245,7 @@ fn play_one_game(
             apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
             moves_uci.push(uci);
         } else {
-            let token = external.query_move(&moves_uci, movetime_ms)?;
+            let token = external.query_move(&moves_uci, pikafish_depth)?;
             if token.is_empty() || token == "(none)" || token == "0000" {
                 return Ok(match side {
                     Color::Red => GameEnd::BlackWin,
@@ -277,7 +277,7 @@ fn play_one_game(
 pub fn run_vs_pikafish(
     pikafish_exe: &Path,
     chinese_model_path: &Path,
-    movetime_ms: u32,
+    pikafish_depth: u32,
     total_games: usize,
     max_plies: usize,
     simulations: usize,
@@ -314,7 +314,7 @@ pub fn run_vs_pikafish(
                         m.as_ref(),
                         &mut ext,
                         chinese_red,
-                        movetime_ms,
+                        pikafish_depth,
                         max_plies,
                         simulations,
                         seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
