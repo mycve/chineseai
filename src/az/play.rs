@@ -74,6 +74,19 @@ impl AzArenaReport {
     pub fn score(&self) -> f32 {
         self.wins as f32 + 0.5 * self.draws as f32
     }
+
+    pub fn score_rate(&self) -> f32 {
+        self.score() / self.total_games().max(1) as f32
+    }
+
+    pub fn elo(&self) -> f32 {
+        let total = self.total_games();
+        if total == 0 {
+            return 0.0;
+        }
+        let score_rate = ((self.score() + 0.5) / (total as f32 + 1.0)).clamp(1e-6, 1.0 - 1e-6);
+        400.0 * (score_rate / (1.0 - score_rate)).log10()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -460,10 +473,37 @@ pub fn play_arena_games(
     seed: u64,
     cpuct: f32,
 ) -> AzArenaReport {
+    play_arena_games_from_positions(
+        candidate,
+        baseline,
+        &[],
+        simulations,
+        max_plies,
+        games_as_red,
+        games_as_black,
+        seed,
+        cpuct,
+    )
+}
+
+pub fn play_arena_games_from_positions(
+    candidate: &AzNnue,
+    baseline: &AzNnue,
+    positions: &[Position],
+    simulations: usize,
+    max_plies: usize,
+    games_as_red: usize,
+    games_as_black: usize,
+    seed: u64,
+    cpuct: f32,
+) -> AzArenaReport {
     let mut report = AzArenaReport::default();
     let mut game_seed = seed;
+    let mut game_index = 0usize;
     for _ in 0..games_as_red {
+        let position = arena_start_position(positions, game_index);
         let outcome = play_arena_game(
+            &position,
             candidate,
             baseline,
             simulations,
@@ -483,9 +523,12 @@ pub fn play_arena_games(
             std::cmp::Ordering::Equal => report.draws += 1,
         }
         game_seed = game_seed.wrapping_add(1);
+        game_index += 1;
     }
     for _ in 0..games_as_black {
+        let position = arena_start_position(positions, game_index);
         let outcome = play_arena_game(
+            &position,
             baseline,
             candidate,
             simulations,
@@ -505,11 +548,21 @@ pub fn play_arena_games(
             std::cmp::Ordering::Equal => report.draws += 1,
         }
         game_seed = game_seed.wrapping_add(1);
+        game_index += 1;
     }
     report
 }
 
+fn arena_start_position(positions: &[Position], game_index: usize) -> Position {
+    if positions.is_empty() {
+        Position::startpos()
+    } else {
+        positions[game_index % positions.len()].clone()
+    }
+}
+
 fn play_arena_game(
+    initial_position: &Position,
     red_model: &AzNnue,
     black_model: &AzNnue,
     simulations: usize,
@@ -517,7 +570,7 @@ fn play_arena_game(
     seed: u64,
     cpuct: f32,
 ) -> f32 {
-    let mut position = Position::startpos();
+    let mut position = initial_position.clone();
     let mut history = Vec::new();
     let mut rule_history = position.initial_rule_history();
     for ply in 0..max_plies {

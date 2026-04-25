@@ -6,7 +6,7 @@ use chineseai::{
     az::{
         AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue, AzSearchLimits,
         AzSelfplayData, alphazero_search, alphazero_search_with_history_and_rules,
-        benchmark_training, generate_selfplay_data, play_arena_games, train_samples,
+        benchmark_training, generate_selfplay_data, play_arena_games_from_positions, train_samples,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
     pikafish_match::run_vs_pikafish,
@@ -73,6 +73,7 @@ macro_rules! ulog {
 }
 
 const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.conf";
+const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
 
 fn default_parallel_workers() -> usize {
     std::thread::available_parallelism()
@@ -346,6 +347,7 @@ fn run_arena_processes(
     simulations: usize,
     max_plies: usize,
     arena_cpuct: f32,
+    eval_fens_path: &str,
     process_count: usize,
     seed: u64,
 ) -> AzArenaReport {
@@ -372,6 +374,7 @@ fn run_arena_processes(
             .arg(simulations.to_string())
             .arg(max_plies.to_string())
             .arg(arena_cpuct.to_string())
+            .arg(eval_fens_path)
             .arg((seed ^ index as u64).to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -419,6 +422,32 @@ fn parse_arena_report(text: &str) -> AzArenaReport {
     report
 }
 
+fn load_arena_eval_positions(path: &str) -> Vec<Position> {
+    let path = Path::new(path);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let text = fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("failed to read arena eval fens `{}`: {err}", path.display());
+    });
+    let mut positions = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let fen = line.split('#').next().unwrap_or("").trim();
+        if fen.is_empty() {
+            continue;
+        }
+        let position = Position::from_fen(fen).unwrap_or_else(|err| {
+            panic!(
+                "invalid arena eval fen at `{}:{}`: {err}",
+                path.display(),
+                line_index + 1
+            );
+        });
+        positions.push(position);
+    }
+    positions
+}
+
 fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
@@ -427,25 +456,25 @@ fn az_arena_worker_next_usize(
     args: &mut impl Iterator<Item = String>,
     field: &'static str,
 ) -> usize {
-    let text = args.next().unwrap_or_else(|| {
-        panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
-    });
+    let text = args
+        .next()
+        .unwrap_or_else(|| panic!("az-arena-worker: missing `{field}` (see help)"));
     text.parse()
         .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be usize, got {text:?}"))
 }
 
 fn az_arena_worker_next_f32(args: &mut impl Iterator<Item = String>, field: &'static str) -> f32 {
-    let text = args.next().unwrap_or_else(|| {
-        panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
-    });
+    let text = args
+        .next()
+        .unwrap_or_else(|| panic!("az-arena-worker: missing `{field}` (see help)"));
     text.parse()
         .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be f32, got {text:?}"))
 }
 
 fn az_arena_worker_next_u64(args: &mut impl Iterator<Item = String>, field: &'static str) -> u64 {
-    let text = args.next().unwrap_or_else(|| {
-        panic!("az-arena-worker: missing `{field}` (need 10 args after subcommand; see help)")
-    });
+    let text = args
+        .next()
+        .unwrap_or_else(|| panic!("az-arena-worker: missing `{field}` (see help)"));
     text.parse()
         .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be u64, got {text:?}"))
 }
@@ -1277,6 +1306,9 @@ fn main() {
                         pause_state.paused = true;
                     }
                     println!("pause    : selfplay paused for arena");
+                    let arena_eval_positions = load_arena_eval_positions(DEFAULT_ARENA_EVAL_FENS);
+                    let arena_eval_fens = arena_eval_positions.len();
+                    drop(arena_eval_positions);
                     let arena = run_arena_processes(
                         &config.model_path,
                         best_path
@@ -1286,10 +1318,11 @@ fn main() {
                         config.simulations,
                         config.max_plies,
                         config.arena_cpuct,
+                        DEFAULT_ARENA_EVAL_FENS,
                         config.arena_processes,
                         config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     );
-                    let promoted = arena.score() > config.arena_games_per_side as f32;
+                    let promoted = arena.score_rate() > 0.5;
                     if promoted {
                         fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
                             panic!(
@@ -1300,8 +1333,9 @@ fn main() {
                         });
                     }
                     println!(
-                        "arena {update:04}: total={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} best={}{}",
+                        "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} elo={:.1} best={}{}",
                         arena.total_games(),
+                        arena_eval_fens,
                         arena.wins,
                         arena.losses,
                         arena.draws,
@@ -1310,6 +1344,8 @@ fn main() {
                         arena.wins_as_black,
                         arena.losses_as_black,
                         arena.score(),
+                        arena.score_rate(),
+                        arena.elo(),
                         best_path.display(),
                         if promoted { " promoted=current" } else { "" }
                     );
@@ -1317,6 +1353,8 @@ fn main() {
                     log_scalar(&mut tb, "arena/losses", update, arena.losses as f32);
                     log_scalar(&mut tb, "arena/draws", update, arena.draws as f32);
                     log_scalar(&mut tb, "arena/score", update, arena.score());
+                    log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
+                    log_scalar(&mut tb, "arena/elo", update, arena.elo());
                     log_scalar(
                         &mut tb,
                         "arena/win_rate",
@@ -1399,10 +1437,13 @@ fn main() {
             let simulations = az_arena_worker_next_usize(&mut args, "simulations").max(1);
             let max_plies = az_arena_worker_next_usize(&mut args, "max_plies").max(1);
             let arena_cpuct = az_arena_worker_next_f32(&mut args, "arena_cpuct").max(0.0);
+            let eval_fens_path = args
+                .next()
+                .unwrap_or_else(|| panic!("az-arena-worker: missing <eval_fens_path>"));
             let seed = az_arena_worker_next_u64(&mut args, "seed");
             if args.next().is_some() {
                 panic!(
-                    "az-arena-worker: trailing arguments (expected exactly 8 after candidate and baseline)"
+                    "az-arena-worker: trailing arguments (expected exactly 9 after candidate and baseline)"
                 );
             }
             let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
@@ -1411,9 +1452,11 @@ fn main() {
             let baseline = AzNnue::load(&baseline_path).unwrap_or_else(|err| {
                 panic!("failed to load `{baseline_path}`: {err}");
             });
-            let report = play_arena_games(
+            let eval_positions = load_arena_eval_positions(&eval_fens_path);
+            let report = play_arena_games_from_positions(
                 &candidate,
                 &baseline,
+                &eval_positions,
                 simulations,
                 max_plies,
                 red_games,
@@ -1517,7 +1560,7 @@ fn print_help() {
     println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
     println!(
-        "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <seed>"
+        "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <eval_fens_path> <seed>"
     );
     println!(
         "hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 5"

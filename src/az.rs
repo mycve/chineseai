@@ -19,6 +19,7 @@ pub use alphazero::{
 use optim::AdamWState;
 pub use play::{
     AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data, play_arena_games,
+    play_arena_games_from_positions,
 };
 pub use replay::AzExperiencePool;
 pub use train::train_samples;
@@ -1449,6 +1450,27 @@ mod tests {
         assert!((samples[2].value - 1.0).abs() < 1e-6);
         assert!((samples[1].value + 0.8).abs() < 1e-6);
         assert!((samples[0].value - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arena_report_elo_tracks_score_rate_direction() {
+        let stronger = AzArenaReport {
+            wins: 6,
+            losses: 3,
+            draws: 1,
+            ..AzArenaReport::default()
+        };
+        let weaker = AzArenaReport {
+            wins: 3,
+            losses: 6,
+            draws: 1,
+            ..AzArenaReport::default()
+        };
+
+        assert!(stronger.score_rate() > 0.5);
+        assert!(stronger.elo() > 0.0);
+        assert!(weaker.score_rate() < 0.5);
+        assert!(weaker.elo() < 0.0);
     }
 
     #[test]
