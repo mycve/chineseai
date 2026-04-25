@@ -32,14 +32,13 @@ pub struct HistoryMove {
 }
 
 pub fn extract_sparse_features_v2(position: &Position) -> Vec<usize> {
-    let side = position.side_to_move();
-    let us_king_bucket = position
-        .general_square(side)
-        .map(|sq| palace_bucket(orient_square(side, sq)))
+    let red_king_bucket = position
+        .general_square(Color::Red)
+        .map(|sq| palace_bucket_for_color(Color::Red, sq))
         .unwrap_or(4);
-    let them_king_bucket = position
-        .general_square(side.opposite())
-        .map(|sq| palace_bucket(orient_square(side, sq)))
+    let black_king_bucket = position
+        .general_square(Color::Black)
+        .map(|sq| palace_bucket_for_color(Color::Black, sq))
         .unwrap_or(4);
     let mut features = Vec::with_capacity(97);
 
@@ -47,45 +46,45 @@ pub fn extract_sparse_features_v2(position: &Position) -> Vec<usize> {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
-        let oriented_sq = orient_square(side, sq);
-        let piece_index = relative_piece_index(side, piece.color, piece.kind);
-        features.push(piece_index * BOARD_SIZE + oriented_sq);
+        let piece_index = absolute_piece_index(piece.color, piece.kind);
+        features.push(piece_index * BOARD_SIZE + sq);
         features.push(king_aware_feature_index(
             0,
-            us_king_bucket,
+            red_king_bucket,
             piece_index,
-            oriented_sq,
+            sq,
         ));
         features.push(king_aware_feature_index(
             1,
-            them_king_bucket,
+            black_king_bucket,
             piece_index,
-            oriented_sq,
+            sq,
         ));
     }
 
-    features.push(INPUT_SIZE - 1);
+    if position.side_to_move() == Color::Black {
+        features.push(INPUT_SIZE - 1);
+    }
     features.sort_unstable();
     features
 }
 
 pub fn extract_sparse_features_v3(position: &Position, history: &[HistoryMove]) -> Vec<usize> {
-    let side = position.side_to_move();
     let mut features = extract_sparse_features_v2(position);
     features.reserve(history.len().min(HISTORY_PLIES) * HISTORY_EVENT_TYPES);
     for (age, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
-        let piece_index = relative_piece_index(side, entry.piece.color, entry.piece.kind);
+        let piece_index = absolute_piece_index(entry.piece.color, entry.piece.kind);
         features.push(history_feature_index(
             age,
             0,
             piece_index,
-            orient_square(side, entry.mv.from as usize),
+            entry.mv.from as usize,
         ));
         features.push(history_feature_index(
             age,
             1,
             piece_index,
-            orient_square(side, entry.mv.to as usize),
+            entry.mv.to as usize,
         ));
     }
     features.sort_unstable();
@@ -93,17 +92,15 @@ pub fn extract_sparse_features_v3(position: &Position, history: &[HistoryMove]) 
 }
 
 pub fn extract_sparse_features_v4(position: &Position, history: &[HistoryMove]) -> Vec<usize> {
-    let side = position.side_to_move();
     let mut features = extract_sparse_features_v3(position, history);
     features.reserve(32 * (2 + NEIGHBOR_OFFSETS.len()));
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
-        let piece_index = relative_piece_index(side, piece.color, piece.kind);
-        let oriented_sq = orient_square(side, sq);
-        let center_file = file_of(oriented_sq) as i32;
-        let center_rank = rank_of(oriented_sq) as i32;
+        let piece_index = absolute_piece_index(piece.color, piece.kind);
+        let center_file = file_of(sq) as i32;
+        let center_rank = rank_of(sq) as i32;
         features.push(row_feature_index(piece_index, center_rank as usize));
         features.push(col_feature_index(piece_index, center_file as usize));
 
@@ -113,15 +110,14 @@ pub fn extract_sparse_features_v4(position: &Position, history: &[HistoryMove]) 
             if !inside_board(target_file, target_rank) {
                 continue;
             }
-            let oriented_target = index(target_file as usize, target_rank as usize);
-            let target = orient_square(side, oriented_target);
+            let target = index(target_file as usize, target_rank as usize);
             let Some(target_piece) = position.piece_at(target) else {
                 continue;
             };
             features.push(neighbor_feature_index(
                 piece_index,
                 offset_index,
-                relative_piece_index(side, target_piece.color, target_piece.kind),
+                absolute_piece_index(target_piece.color, target_piece.kind),
             ));
         }
     }
@@ -264,8 +260,8 @@ fn mirror_palace_bucket_file(bucket: usize) -> usize {
     rank * 3 + (2 - file)
 }
 
-fn relative_piece_index(side: Color, color: Color, kind: PieceKind) -> usize {
-    let base = if color == side { 0 } else { 7 };
+fn absolute_piece_index(color: Color, kind: PieceKind) -> usize {
+    let base = if color == Color::Red { 0 } else { 7 };
     base + match kind {
         PieceKind::General => 0,
         PieceKind::Advisor => 1,
@@ -275,6 +271,10 @@ fn relative_piece_index(side: Color, color: Color, kind: PieceKind) -> usize {
         PieceKind::Cannon => 5,
         PieceKind::Soldier => 6,
     }
+}
+
+fn palace_bucket_for_color(color: Color, sq: usize) -> usize {
+    palace_bucket(orient_square(color, sq))
 }
 
 fn orient_square(side: Color, sq: usize) -> usize {
@@ -323,11 +323,17 @@ mod tests {
         }];
         let features = extract_sparse_features_v3(&position, &history);
 
-        assert_eq!(features.len(), 32 * 3 + 1 + 2);
+        assert_eq!(features.len(), 32 * 3 + 2);
         assert!(features.iter().all(|feature| *feature < V3_INPUT_SIZE));
-        assert!(features.contains(&(INPUT_SIZE - 1)));
+        assert!(!features.contains(&(INPUT_SIZE - 1)));
         assert!(features.iter().any(|feature| *feature >= INPUT_SIZE));
         assert!(features.iter().any(|feature| *feature >= V2_INPUT_SIZE));
+
+        let black_to_move =
+            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b")
+                .unwrap();
+        let black_features = extract_sparse_features_v3(&black_to_move, &history);
+        assert!(black_features.contains(&(INPUT_SIZE - 1)));
     }
 
     #[test]
@@ -345,37 +351,37 @@ mod tests {
     }
 
     #[test]
-    fn features_are_relative_to_side_to_move() {
+    fn features_are_absolute_with_side_to_move_marker() {
         let red_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 w").unwrap();
         let black_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 b").unwrap();
 
-        assert_eq!(
-            extract_sparse_features_v3(&red_to_move, &[]),
-            extract_sparse_features_v3(&black_to_move, &[])
-        );
-        assert_eq!(
-            extract_sparse_features_v4(&red_to_move, &[]),
-            extract_sparse_features_v4(&black_to_move, &[])
-        );
+        let red_v3 = extract_sparse_features_v3(&red_to_move, &[]);
+        let black_v3 = extract_sparse_features_v3(&black_to_move, &[]);
+        assert_ne!(red_v3, black_v3);
+        assert!(!red_v3.contains(&(INPUT_SIZE - 1)));
+        assert!(black_v3.contains(&(INPUT_SIZE - 1)));
+
+        let red_v4 = extract_sparse_features_v4(&red_to_move, &[]);
+        let black_v4 = extract_sparse_features_v4(&black_to_move, &[]);
+        assert_ne!(red_v4, black_v4);
+        assert!(!red_v4.contains(&(INPUT_SIZE - 1)));
+        assert!(black_v4.contains(&(INPUT_SIZE - 1)));
     }
 
     #[test]
-    fn history_features_are_relative_to_side_to_move() {
+    fn history_features_are_absolute_with_side_to_move_marker() {
         let red_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 w").unwrap();
         let black_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 b").unwrap();
-        let red_history = [HistoryMove {
+        let history = [HistoryMove {
             piece: red_to_move.piece_at(49).unwrap(),
             mv: Move::new(49, 40),
         }];
-        let black_history = [HistoryMove {
-            piece: black_to_move.piece_at(40).unwrap(),
-            mv: Move::new(40, 49),
-        }];
 
-        assert_eq!(
-            extract_sparse_features_v3(&red_to_move, &red_history),
-            extract_sparse_features_v3(&black_to_move, &black_history)
-        );
+        let red_features = extract_sparse_features_v3(&red_to_move, &history);
+        let mut black_features = extract_sparse_features_v3(&black_to_move, &history);
+        assert_ne!(red_features, black_features);
+        black_features.retain(|feature| *feature != INPUT_SIZE - 1);
+        assert_eq!(red_features, black_features);
     }
 
     #[test]

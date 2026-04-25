@@ -9,7 +9,7 @@ mod replay;
 mod train;
 mod train_gpu;
 
-use crate::nnue::{HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4, orient_move};
+use crate::nnue::{HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4};
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
@@ -551,13 +551,12 @@ impl AzNnue {
         self.global_from_hidden_into(&scratch.hidden, &scratch.cnn_global, &mut scratch.global);
         self.forward_trunk_into(&mut scratch.hidden, &mut scratch.next, &scratch.global);
         let value = self.value_from_hidden_scratch(scratch);
-        let side = position.side_to_move();
         scratch.logits.resize(moves.len(), 0.0);
         for (index, mv) in moves.iter().enumerate() {
             scratch.logits[index] = self.policy_logit_from_hidden_index(
                 &scratch.hidden,
                 &scratch.cnn_global,
-                dense_move_index(orient_move(side, *mv)),
+                dense_move_index(*mv),
             );
         }
         value
@@ -768,19 +767,17 @@ impl AzNnue {
 pub(super) fn extract_board_planes(position: &Position, board: &mut Vec<u8>) {
     board.resize(BOARD_PLANES_SIZE, 0);
     board.fill(0);
-    let side = position.side_to_move();
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
-        let oriented_sq = orient_square(side, sq);
-        let plane = relative_piece_plane(side, piece.color, piece.kind);
-        board[oriented_sq] = (plane + 1) as u8;
+        let plane = absolute_piece_plane(piece.color, piece.kind);
+        board[sq] = (plane + 1) as u8;
     }
 }
 
-fn relative_piece_plane(side: Color, piece_color: Color, kind: PieceKind) -> usize {
-    let own_offset = if piece_color == side { 0 } else { 7 };
+fn absolute_piece_plane(piece_color: Color, kind: PieceKind) -> usize {
+    let own_offset = if piece_color == Color::Red { 0 } else { 7 };
     own_offset
         + match kind {
             PieceKind::General => 0,
@@ -791,13 +788,6 @@ fn relative_piece_plane(side: Color, piece_color: Color, kind: PieceKind) -> usi
             PieceKind::Cannon => 5,
             PieceKind::Soldier => 6,
         }
-}
-
-fn orient_square(side: Color, sq: usize) -> usize {
-    match side {
-        Color::Red => sq,
-        Color::Black => BOARD_SIZE - 1 - sq,
-    }
 }
 
 fn conv_relu_layer(
@@ -1119,7 +1109,12 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 const fn is_advisor_pos(rank: usize, file: usize) -> bool {
-    (rank == 7 && file == 3)
+    (rank == 0 && file == 3)
+        || (rank == 0 && file == 5)
+        || (rank == 1 && file == 4)
+        || (rank == 2 && file == 3)
+        || (rank == 2 && file == 5)
+        || (rank == 7 && file == 3)
         || (rank == 7 && file == 5)
         || (rank == 8 && file == 4)
         || (rank == 9 && file == 3)
@@ -1127,7 +1122,14 @@ const fn is_advisor_pos(rank: usize, file: usize) -> bool {
 }
 
 const fn is_elephant_pos(rank: usize, file: usize) -> bool {
-    (rank == 5 && file == 2)
+    (rank == 0 && file == 2)
+        || (rank == 0 && file == 6)
+        || (rank == 2 && file == 0)
+        || (rank == 2 && file == 4)
+        || (rank == 2 && file == 8)
+        || (rank == 4 && file == 2)
+        || (rank == 4 && file == 6)
+        || (rank == 5 && file == 2)
         || (rank == 5 && file == 6)
         || (rank == 7 && file == 0)
         || (rank == 7 && file == 4)
@@ -1252,7 +1254,7 @@ mod tests {
     #[test]
     fn dense_move_space_matches_enumeration() {
         let map = move_map();
-        assert_eq!(DENSE_MOVE_SPACE, 2062);
+        assert_eq!(DENSE_MOVE_SPACE, 2086);
         for i in 0..DENSE_MOVE_SPACE {
             let sparse = map.dense_to_sparse[i] as usize;
             assert_eq!(map.sparse_to_dense[sparse], i as u16);

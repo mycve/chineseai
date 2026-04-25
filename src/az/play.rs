@@ -3,7 +3,6 @@ use std::thread;
 
 use crate::nnue::{
     HistoryMove, extract_sparse_features_v4, mirror_file_move, mirror_sparse_features_file,
-    orient_move,
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
@@ -324,11 +323,10 @@ fn make_training_sample(
         .map(|candidate| candidate.policy.max(0.0))
         .sum::<f32>()
         .max(1.0);
-    let side = position.side_to_move();
     let mut features = extract_sparse_features_v4(position, history);
     let mut moves = candidates
         .iter()
-        .map(|candidate| orient_move(side, candidate.mv))
+        .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
     if mirror_file {
         mirror_sparse_features_file(&mut features);
@@ -499,8 +497,7 @@ pub fn play_arena_games_from_positions(
 ) -> AzArenaReport {
     let mut report = AzArenaReport::default();
     let mut game_seed = seed;
-    let mut game_index = 0usize;
-    for _ in 0..games_as_red {
+    for game_index in 0..games_as_red {
         let position = arena_start_position(positions, game_index);
         let outcome = play_arena_game(
             &position,
@@ -523,9 +520,8 @@ pub fn play_arena_games_from_positions(
             std::cmp::Ordering::Equal => report.draws += 1,
         }
         game_seed = game_seed.wrapping_add(1);
-        game_index += 1;
     }
-    for _ in 0..games_as_black {
+    for game_index in 0..games_as_black {
         let position = arena_start_position(positions, game_index);
         let outcome = play_arena_game(
             &position,
@@ -548,7 +544,6 @@ pub fn play_arena_games_from_positions(
             std::cmp::Ordering::Equal => report.draws += 1,
         }
         game_seed = game_seed.wrapping_add(1);
-        game_index += 1;
     }
     report
 }

@@ -1097,6 +1097,18 @@ fn main() {
                             config.model_path
                         );
                     });
+                } else if let Err(err) = AzNnue::load(&best_path) {
+                    println!(
+                        "best     : reset incompatible `{}` from current ({err})",
+                        best_path.display()
+                    );
+                    fs::copy(&config.model_path, &best_path).unwrap_or_else(|copy_err| {
+                        panic!(
+                            "failed to reset best model `{}` from `{}`: {copy_err}",
+                            best_path.display(),
+                            config.model_path
+                        );
+                    });
                 }
                 let checkpoint_saved = if config.checkpoint_interval > 0
                     && update % config.checkpoint_interval == 0
@@ -1119,7 +1131,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_ce={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_ce={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1133,6 +1145,7 @@ fn main() {
                     report.red_wins,
                     report.black_wins,
                     report.draws,
+                    report.red_wins as f32 / report.games.max(1) as f32,
                     report.avg_plies,
                     report.loss,
                     report.value_loss,
@@ -1221,9 +1234,21 @@ fn main() {
                 log_scalar(&mut tb, "outcome/red_wins", update, report.red_wins as f32);
                 log_scalar(
                     &mut tb,
+                    "outcome/red_win_rate",
+                    update,
+                    report.red_wins as f32 / report.games.max(1) as f32,
+                );
+                log_scalar(
+                    &mut tb,
                     "outcome/black_wins",
                     update,
                     report.black_wins as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "outcome/black_win_rate",
+                    update,
+                    report.black_wins as f32 / report.games.max(1) as f32,
                 );
                 log_scalar(&mut tb, "outcome/draws", update, report.draws as f32);
                 log_scalar(
