@@ -1,7 +1,7 @@
 use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 use candle_nn::ops::{log_softmax, softmax};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
-use std::thread;
+use std::{process::Command, thread};
 
 use super::{
     AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_PLANES_SIZE, CNN_CHANNELS,
@@ -13,6 +13,7 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
 const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
+const DEFAULT_MIN_MULTI_GPU_SHARD_SIZE: usize = 8192;
 
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
@@ -150,10 +151,7 @@ impl GpuTrainer {
         samples: &[AzTrainingSample],
         batch: &[usize],
     ) -> CandleResult<AzTrainStats> {
-        let mut active_replicas = self.replicas.len().min(batch.len()).max(1);
-        while active_replicas > 1 && batch.len() / active_replicas == 0 {
-            active_replicas -= 1;
-        }
+        let active_replicas = self.active_replica_count(batch.len());
         if active_replicas <= 1 {
             return self.train_batch_single(samples, batch);
         }
@@ -207,6 +205,16 @@ impl GpuTrainer {
         self.optimizer.step(&grads)?;
         self.broadcast_primary_to_workers()?;
         Ok(stats)
+    }
+
+    fn active_replica_count(&self, batch_len: usize) -> usize {
+        let replicas = self.replicas.len();
+        if replicas <= 1 {
+            return 1;
+        }
+        let min_shard = min_multi_gpu_shard_size();
+        let usable = (batch_len / min_shard).max(1);
+        replicas.min(usable)
     }
 
     fn train_batch_single(
@@ -287,9 +295,9 @@ impl GpuReplica {
         let win = value_probs.narrow(1, 0, 1)?;
         let loss_prob = value_probs.narrow(1, 2, 1)?;
         let value = (win - loss_prob)?.squeeze(1)?;
-        let value_error = (&value - &batch_tensors.values)?;
-        let value_loss_per_sample = value_error.sqr()?;
-        let value_loss = value_loss_per_sample.sum_all()?;
+        let log_value = log_softmax(&forward.value_logits, 1)?;
+        let value_ce_per_sample = ((&batch_tensors.value_targets * &log_value)? * -1.0)?;
+        let value_loss = value_ce_per_sample.sum_all()?;
 
         let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
@@ -434,6 +442,7 @@ struct BatchTensors {
     board_onehot: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
+    value_targets: Tensor,
     values: Tensor,
 }
 
@@ -451,6 +460,7 @@ impl BatchTensors {
         let mut board_onehot = vec![0.0f32; batch_size * BOARD_CHANNELS * BOARD_PLANES_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * DENSE_MOVE_SPACE];
+        let mut value_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
         let mut values = vec![0.0f32; batch_size];
 
         for (row, &sample_index) in batch.iter().enumerate() {
@@ -481,7 +491,16 @@ impl BatchTensors {
                     policy_mask[policy_base + move_index] = 0.0;
                 }
             }
-            values[row] = sample.value.clamp(-1.0, 1.0);
+            let value = sample.value.clamp(-1.0, 1.0);
+            values[row] = value;
+            let value_target_base = row * VALUE_LOGITS;
+            if value >= 0.0 {
+                value_targets[value_target_base] = value;
+                value_targets[value_target_base + 1] = 1.0 - value;
+            } else {
+                value_targets[value_target_base + 1] = 1.0 + value;
+                value_targets[value_target_base + 2] = -value;
+            }
         }
 
         Ok(Self {
@@ -500,6 +519,7 @@ impl BatchTensors {
                 device,
             )?,
             policy_mask: Tensor::from_vec(policy_mask, (batch_size, DENSE_MOVE_SPACE), device)?,
+            value_targets: Tensor::from_vec(value_targets, (batch_size, VALUE_LOGITS), device)?,
             values: Tensor::from_vec(values, batch_size, device)?,
         })
     }
@@ -707,23 +727,87 @@ impl GpuVars {
 }
 
 fn cuda_device_indices() -> Vec<usize> {
-    if let Ok(value) = std::env::var("CHINESEAI_CUDA_DEVICES") {
-        let devices = value
-            .split(',')
-            .filter_map(|part| part.trim().parse::<usize>().ok())
-            .collect::<Vec<_>>();
-        if !devices.is_empty() {
-            return devices;
-        }
+    if let Some(devices) = parse_cuda_device_list_env("CHINESEAI_CUDA_DEVICES") {
+        return devices;
     }
-    vec![cuda_device_index()]
+    if let Some(device) = parse_cuda_device_env("CHINESEAI_CUDA_DEVICE") {
+        return vec![device];
+    }
+    if let Some(count) = cuda_visible_device_count() {
+        return (0..count).collect();
+    }
+    if let Some(count) = nvidia_smi_device_count() {
+        return (0..count).collect();
+    }
+    let probed = probe_cuda_device_indices(64);
+    if !probed.is_empty() {
+        return probed;
+    }
+    vec![0]
 }
 
-fn cuda_device_index() -> usize {
-    std::env::var("CHINESEAI_CUDA_DEVICE")
+fn min_multi_gpu_shard_size() -> usize {
+    std::env::var("CHINESEAI_MIN_GPU_SHARD_SIZE")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_MIN_MULTI_GPU_SHARD_SIZE)
+}
+
+fn parse_cuda_device_list_env(name: &str) -> Option<Vec<usize>> {
+    let devices = std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|devices| !devices.is_empty())?;
+    Some(devices)
+}
+
+fn parse_cuda_device_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn cuda_visible_device_count() -> Option<usize> {
+    let value = std::env::var("CUDA_VISIBLE_DEVICES").ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "-1" || trimmed.eq_ignore_ascii_case("NoDevFiles") {
+        return None;
+    }
+    let count = trimmed
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .count();
+    (count > 0).then_some(count)
+}
+
+fn nvidia_smi_device_count() -> Option<usize> {
+    let output = Command::new("nvidia-smi").arg("-L").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.trim_start().starts_with("GPU "))
+        .count();
+    (count > 0).then_some(count)
+}
+
+fn probe_cuda_device_indices(max_devices: usize) -> Vec<usize> {
+    let mut devices = Vec::new();
+    for index in 0..max_devices {
+        if Device::new_cuda(index).is_ok() {
+            devices.push(index);
+        } else if !devices.is_empty() {
+            break;
+        }
+    }
+    devices
 }
 
 fn var_from_slice<S: Into<candle_core::Shape>>(

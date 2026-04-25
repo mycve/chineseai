@@ -706,7 +706,7 @@ fn main() {
             println!("processed    : {}", sample_count * epochs);
             println!("samples/sec  : {:.0}", processed / elapsed);
             println!("loss         : {:.4}", stats.loss);
-            println!("value_mse    : {:.4}", stats.value_loss);
+            println!("value_ce     : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
         }
         Some("az-loop") => {
@@ -1119,7 +1119,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_mse={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% W/B/D={}/{}/{} avg_plies={:.1} loss={:.4} value_ce={:.4} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1154,7 +1154,7 @@ fn main() {
                         ))
                 );
                 log_scalar(&mut tb, "train/loss", update, report.loss);
-                log_scalar(&mut tb, "train/value_mse", update, report.value_loss);
+                log_scalar(&mut tb, "train/value_ce", update, report.value_loss);
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
                 log_scalar(&mut tb, "train/lr", update, config.lr);
                 log_scalar(
