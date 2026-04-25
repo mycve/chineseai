@@ -1617,9 +1617,9 @@ impl Default for AzLoopFileConfig {
             trunk_depth: 2,
             seed: 20260409,
             workers: default_workers,
-            temperature_start: 1.2,
-            temperature_end: 0.0,
-            temperature_decay_plies: 12,
+            temperature_start: 1.0,
+            temperature_end: 0.1,
+            temperature_decay_plies: 40,
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
@@ -1657,7 +1657,7 @@ impl AzLoopFileConfig {
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
-#   Defaults: 1.2 -> 0.0 by ply 12; raise decay_plies or temperature_end if openings collapse too early.
+#   Defaults: 1.0 -> 0.1 by ply 40; raise decay_plies or temperature_end if openings collapse too early.
 #
 # Pipeline:
 #   Self-play and training run in separate long-lived threads.

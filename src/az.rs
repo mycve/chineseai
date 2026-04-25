@@ -26,7 +26,7 @@ pub use train::train_samples;
 
 /// 二进制权重文件头魔数（小端 `f32` 载荷，见 `save` / `load`）。
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 6;
+const AZNNUE_BINARY_VERSION: u32 = 7;
 /// 魔数 4 + version/input/hidden/depth/reserved 各 4 字节。
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
@@ -60,7 +60,7 @@ const VALUE_HIDDEN_SIZE: usize = 64;
 const VALUE_LOGITS: usize = 3;
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 const BOARD_CHANNELS: usize = 14;
-const CNN_CHANNELS: usize = 12;
+const CNN_CHANNELS: usize = 16;
 const CNN_KERNEL_AREA: usize = 9;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * 3;
 const VALUE_SCALE_CP: f32 = 1000.0;
