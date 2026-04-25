@@ -220,12 +220,23 @@ impl AzExperiencePool {
         max_train_count: u32,
         rng: &mut SplitMix64,
     ) -> Vec<AzTrainingSample> {
-        if self.games.is_empty() || count == 0 {
+        self.sample_uniform_games_marked_excluding_newest(count, max_train_count, 0, rng)
+    }
+
+    pub fn sample_uniform_games_marked_excluding_newest(
+        &mut self,
+        count: usize,
+        max_train_count: u32,
+        exclude_newest_games: usize,
+        rng: &mut SplitMix64,
+    ) -> Vec<AzTrainingSample> {
+        let eligible_games = self.games.len().saturating_sub(exclude_newest_games);
+        if eligible_games == 0 || count == 0 {
             return Vec::new();
         }
         let mut samples = Vec::with_capacity(count);
         for _ in 0..count {
-            let game_index = (rng.next() as usize) % self.games.len();
+            let game_index = (rng.next() as usize) % eligible_games;
             let game = &mut self.games[game_index];
             if game.is_empty() {
                 continue;

@@ -926,25 +926,19 @@ fn main() {
                     if pool.sample_count() < trainer_config.batch_size.max(1) {
                         continue;
                     }
-                    let produced_samples = pending
-                        .selfplay
-                        .samples
-                        .len()
-                        .max(trainer_config.batch_size);
                     let mut rng = chineseai::az::SplitMix64::new(
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
                     );
-                    let base_train_samples = if trainer_config.replay_samples == 0 {
-                        produced_samples
-                    } else {
-                        trainer_config.replay_samples.max(produced_samples)
-                    };
-                    let train_data = pool.sample_uniform_games_marked(
-                        base_train_samples.min(pool.sample_count()),
+                    let fresh_games = pending.selfplay.games.len();
+                    let mut train_data = pending.selfplay.samples.clone();
+                    let replay_data = pool.sample_uniform_games_marked_excluding_newest(
+                        trainer_config.replay_samples,
                         trainer_config.max_sample_train_count as u32,
+                        fresh_games,
                         &mut rng,
                     );
+                    train_data.extend(replay_data);
                     if train_data.is_empty() {
                         continue;
                     }
@@ -1672,8 +1666,8 @@ impl AzLoopFileConfig {
 # Replay:
 #   replay_games keeps the most recent N complete games in memory.
 #   Each training update always includes all fresh samples collected since the previous update.
-#   replay_samples=0 adds about one extra replay sample per fresh sample.
-#   set replay_samples larger, e.g. 200000, to mix more old positions into each update.
+#   replay_samples adds this many extra old samples from replay; replay_samples=0 means fresh-only.
+#   The current fresh games are excluded from replay sampling for that same update.
 #   Ctrl+C writes "<this_conf_filename>.replay.lz4" (LZ4); next az-loop loads it into the pool then
 #   deletes the file. A full run without interrupt removes any leftover snapshot at exit.
 #   Replay snapshot format is versioned; older .replay.lz4 files from previous formats are rejected.

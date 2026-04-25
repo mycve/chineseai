@@ -102,7 +102,7 @@ pub(super) fn train_samples_gpu(
 
 impl GpuTrainer {
     fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
-        let device = Device::new_cuda(0)?;
+        let device = Device::new_cuda(cuda_device_index())?;
         let vars = GpuVars::from_model(model, &device)?;
         let optimizer = AdamW::new(
             vars.all_vars(),
@@ -521,6 +521,13 @@ impl GpuVars {
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         Ok(())
     }
+}
+
+fn cuda_device_index() -> usize {
+    std::env::var("CHINESEAI_CUDA_DEVICE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 fn var_from_slice<S: Into<candle_core::Shape>>(
