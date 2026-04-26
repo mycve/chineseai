@@ -15,8 +15,9 @@ use chineseai::{
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
-    xiangqi::{Position, STARTPOS_FEN},
+    xiangqi::Position,
 };
+use clap::{Args, Parser, Subcommand};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -35,6 +36,197 @@ const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
 const DEFAULT_VS_PIKAFISH_DEPTH: u32 = 10;
 const DEFAULT_VS_PIKAFISH_GAMES: usize = 20;
 const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 5;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "chineseai",
+    version,
+    about = "ChineseAI AZ-NNUE search and training tools",
+    long_about = "ChineseAI AZ-NNUE search and training tools.\n\nIf no command is given, the program starts in UCI mode."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Run the UCI engine loop.
+    Uci,
+    /// Create a random AZ-NNUE model.
+    AzInit(AzInitArgs),
+    /// Search one position and print policy/debug details.
+    AzSearch(AzSearchArgs),
+    /// Benchmark fixed-position search speed.
+    AzBench(AzBenchArgs),
+    /// Benchmark a synthetic training workload.
+    AzTrainBench(AzTrainBenchArgs),
+    /// Run self-play training from a TOML config.
+    AzLoop(AzLoopArgs),
+    /// Internal arena worker process.
+    AzArenaWorker(AzArenaWorkerArgs),
+    /// Count legal move tree nodes for a position.
+    Perft(PerftArgs),
+    /// Run ChineseAI against a Pikafish UCI engine.
+    VsPikafish(VsPikafishArgs),
+}
+
+#[derive(Args, Debug)]
+struct AzInitArgs {
+    /// Hidden size of the model.
+    #[arg(default_value_t = 128)]
+    hidden: usize,
+    /// Output model path.
+    #[arg(default_value = "chineseai.nnue")]
+    output: String,
+    /// Random seed.
+    #[arg(default_value_t = 20260409)]
+    seed: u64,
+    /// Number of trunk layers.
+    #[arg(default_value_t = 2)]
+    trunk_depth: usize,
+}
+
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai az-search chineseai.nnue
+  chineseai az-search chineseai.nnue 10000 1.5 startpos
+  chineseai az-search chineseai.nnue 10000 1.5 --algorithm gumbel_alphazero startpos")]
+struct AzSearchArgs {
+    /// AZ-NNUE model path.
+    model: String,
+    /// Number of MCTS simulations.
+    #[arg(default_value_t = 10_000)]
+    simulations: usize,
+    /// PUCT constant for AlphaZero search.
+    #[arg(default_value_t = 1.5)]
+    cpuct: f32,
+    /// Search algorithm: alphazero or gumbel_alphazero.
+    #[arg(long, value_parser = parse_search_algorithm)]
+    algorithm: Option<AzSearchAlgorithm>,
+    /// FEN string, or startpos if omitted.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    fen: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai az-bench chineseai.nnue 512 100 1.5 startpos
+  chineseai az-bench chineseai.nnue 512 100 1.5 --algorithm gumbel_alphazero startpos")]
+struct AzBenchArgs {
+    /// AZ-NNUE model path.
+    model: String,
+    /// Simulations per search.
+    #[arg(default_value_t = 512)]
+    simulations: usize,
+    /// Number of repeated searches.
+    #[arg(default_value_t = 100)]
+    repeat: usize,
+    /// PUCT constant for AlphaZero search.
+    #[arg(default_value_t = 1.5)]
+    cpuct: f32,
+    /// Search algorithm: alphazero or gumbel_alphazero.
+    #[arg(long, value_parser = parse_search_algorithm)]
+    algorithm: Option<AzSearchAlgorithm>,
+    /// FEN string, or startpos if omitted.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    fen: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct AzTrainBenchArgs {
+    /// AZ-NNUE model path.
+    model: String,
+    /// Generated sample count.
+    #[arg(default_value_t = 8192)]
+    samples: usize,
+    /// Passes over generated samples.
+    #[arg(default_value_t = 2)]
+    epochs: usize,
+    /// Micro-batch size per visible GPU.
+    #[arg(default_value_t = 1024)]
+    batch_size_per_gpu: usize,
+    /// Learning rate.
+    #[arg(default_value_t = 0.0003)]
+    lr: f32,
+    /// Random seed.
+    #[arg(default_value_t = 20260411)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct AzLoopArgs {
+    /// Training config path.
+    #[arg(default_value = DEFAULT_AZ_LOOP_CONFIG)]
+    config: String,
+}
+
+#[derive(Args, Debug)]
+struct AzArenaWorkerArgs {
+    /// Candidate model path.
+    candidate: String,
+    /// Baseline model path.
+    baseline: String,
+    /// Games with candidate as Red.
+    red_games: usize,
+    /// Games with candidate as Black.
+    black_games: usize,
+    /// Simulations per move.
+    simulations: usize,
+    /// Draw after this many plies.
+    max_plies: usize,
+    /// PUCT constant for arena search.
+    arena_cpuct: f32,
+    /// Start-position file.
+    eval_fens_path: String,
+    /// Random seed.
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct PerftArgs {
+    /// Search depth.
+    #[arg(default_value_t = 1)]
+    depth: u32,
+    /// FEN string, or startpos if omitted.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    fen: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai vs-pikafish ./tools/pikafish 10000
+  chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml -s 10000
+  chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml -s 10000 --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
+struct VsPikafishArgs {
+    /// Pikafish UCI executable path.
+    pikafish_exe: String,
+    /// Config path or simulations override. Numeric values use the default config.
+    config_or_simulations: Option<String>,
+    /// Override config.simulations.
+    #[arg(short = 's', long)]
+    simulations: Option<usize>,
+    /// Pikafish search depth.
+    #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_DEPTH)]
+    pikafish_depth: u32,
+    /// Total games.
+    #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_GAMES)]
+    games: usize,
+    /// Simultaneous games/processes.
+    #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_PARALLEL_GAMES)]
+    parallel_games: usize,
+    /// Start-position file.
+    #[arg(long = "eval-fens", default_value = DEFAULT_ARENA_EVAL_FENS)]
+    eval_fens_path: String,
+}
+
+fn parse_search_algorithm(text: &str) -> Result<AzSearchAlgorithm, String> {
+    AzSearchAlgorithm::parse(text)
+        .ok_or_else(|| "expected `alphazero` or `gumbel_alphazero`".to_string())
+}
 
 fn best_model_path(model_path: &str) -> PathBuf {
     PathBuf::from(format!("{model_path}.best"))
@@ -416,52 +608,16 @@ fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
 
-fn az_arena_worker_next_usize(
-    args: &mut impl Iterator<Item = String>,
-    field: &'static str,
-) -> usize {
-    let text = args
-        .next()
-        .unwrap_or_else(|| panic!("az-arena-worker: missing `{field}` (see help)"));
-    text.parse()
-        .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be usize, got {text:?}"))
-}
-
-fn az_arena_worker_next_f32(args: &mut impl Iterator<Item = String>, field: &'static str) -> f32 {
-    let text = args
-        .next()
-        .unwrap_or_else(|| panic!("az-arena-worker: missing `{field}` (see help)"));
-    text.parse()
-        .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be f32, got {text:?}"))
-}
-
-fn az_arena_worker_next_u64(args: &mut impl Iterator<Item = String>, field: &'static str) -> u64 {
-    let text = args
-        .next()
-        .unwrap_or_else(|| panic!("az-arena-worker: missing `{field}` (see help)"));
-    text.parse()
-        .unwrap_or_else(|_| panic!("az-arena-worker: `{field}` must be u64, got {text:?}"))
-}
-
 fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    let cli = Cli::parse();
+    match cli.command {
         None => run_uci(),
-        Some("uci") => run_uci(),
-        Some("az-init") => {
-            let hidden = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(128);
-            let output = args.next().unwrap_or_else(|| "chineseai.nnue".into());
-            let seed = args
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(20260409);
-            let trunk_depth = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(2);
+        Some(CliCommand::Uci) => run_uci(),
+        Some(CliCommand::AzInit(cmd)) => {
+            let hidden = cmd.hidden;
+            let output = cmd.output;
+            let seed = cmd.seed;
+            let trunk_depth = cmd.trunk_depth;
             let model = AzNnue::random_with_depth(hidden, trunk_depth, seed);
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
@@ -472,32 +628,12 @@ fn main() {
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
-        Some("az-search") => {
-            let model_path = args
-                .next()
-                .unwrap_or_else(|| panic!("usage: az-search <model> [simulations] [cpuct] [fen]"));
-            let simulations = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(10_000);
-            let cpuct = args
-                .next()
-                .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(1.5)
-                .max(0.0);
-            let mut rest = args.collect::<Vec<_>>();
-            let algorithm = rest
-                .first()
-                .and_then(|value| AzSearchAlgorithm::parse(value))
-                .unwrap_or(AzSearchAlgorithm::AlphaZero);
-            if rest
-                .first()
-                .and_then(|value| AzSearchAlgorithm::parse(value))
-                .is_some()
-            {
-                rest.remove(0);
-            }
-            let fen = rest.join(" ");
+        Some(CliCommand::AzSearch(cmd)) => {
+            let model_path = cmd.model;
+            let simulations = cmd.simulations.max(1);
+            let cpuct = cmd.cpuct.max(0.0);
+            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
+            let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
@@ -559,37 +695,13 @@ fn main() {
                 );
             }
         }
-        Some("az-bench") => {
-            let model_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-bench <model> [simulations] [repeat] [cpuct] [fen]")
-            });
-            let simulations = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(512);
-            let repeat = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(100)
-                .max(1);
-            let cpuct = args
-                .next()
-                .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(1.5)
-                .max(0.0);
-            let mut rest = args.collect::<Vec<_>>();
-            let algorithm = rest
-                .first()
-                .and_then(|value| AzSearchAlgorithm::parse(value))
-                .unwrap_or(AzSearchAlgorithm::AlphaZero);
-            if rest
-                .first()
-                .and_then(|value| AzSearchAlgorithm::parse(value))
-                .is_some()
-            {
-                rest.remove(0);
-            }
-            let fen = rest.join(" ");
+        Some(CliCommand::AzBench(cmd)) => {
+            let model_path = cmd.model;
+            let simulations = cmd.simulations.max(1);
+            let repeat = cmd.repeat.max(1);
+            let cpuct = cmd.cpuct.max(0.0);
+            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
+            let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
@@ -652,34 +764,13 @@ fn main() {
                     .unwrap_or_else(|| "(none)".into())
             );
         }
-        Some("az-train-bench") => {
-            let model_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-train-bench <model> [samples] [epochs] [batch_size_per_gpu] [lr] [seed]")
-            });
-            let sample_count = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(8192)
-                .max(1);
-            let epochs = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(2)
-                .max(1);
-            let batch_size = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1024)
-                .max(1);
-            let lr = args
-                .next()
-                .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(0.0003)
-                .max(0.0);
-            let seed = args
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(20260411);
+        Some(CliCommand::AzTrainBench(cmd)) => {
+            let model_path = cmd.model;
+            let sample_count = cmd.samples.max(1);
+            let epochs = cmd.epochs.max(1);
+            let batch_size = cmd.batch_size_per_gpu.max(1);
+            let lr = cmd.lr.max(0.0);
+            let seed = cmd.seed;
             let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
@@ -703,8 +794,8 @@ fn main() {
             println!("value_ce     : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
         }
-        Some("az-loop") => {
-            let config_path = args.next().unwrap_or_else(|| DEFAULT_AZ_LOOP_CONFIG.into());
+        Some(CliCommand::AzLoop(cmd)) => {
+            let config_path = cmd.config;
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
@@ -1467,27 +1558,16 @@ fn main() {
                 let _ = fs::remove_file(&replay_snapshot_path);
             }
         }
-        Some("az-arena-worker") => {
-            let candidate_path = args
-                .next()
-                .unwrap_or_else(|| panic!("az-arena-worker: missing <candidate> (see help)"));
-            let baseline_path = args
-                .next()
-                .unwrap_or_else(|| panic!("az-arena-worker: missing <baseline>"));
-            let red_games = az_arena_worker_next_usize(&mut args, "red_games");
-            let black_games = az_arena_worker_next_usize(&mut args, "black_games");
-            let simulations = az_arena_worker_next_usize(&mut args, "simulations").max(1);
-            let max_plies = az_arena_worker_next_usize(&mut args, "max_plies").max(1);
-            let arena_cpuct = az_arena_worker_next_f32(&mut args, "arena_cpuct").max(0.0);
-            let eval_fens_path = args
-                .next()
-                .unwrap_or_else(|| panic!("az-arena-worker: missing <eval_fens_path>"));
-            let seed = az_arena_worker_next_u64(&mut args, "seed");
-            if args.next().is_some() {
-                panic!(
-                    "az-arena-worker: trailing arguments (expected exactly 9 after candidate and baseline)"
-                );
-            }
+        Some(CliCommand::AzArenaWorker(cmd)) => {
+            let candidate_path = cmd.candidate;
+            let baseline_path = cmd.baseline;
+            let red_games = cmd.red_games;
+            let black_games = cmd.black_games;
+            let simulations = cmd.simulations.max(1);
+            let max_plies = cmd.max_plies.max(1);
+            let arena_cpuct = cmd.arena_cpuct.max(0.0);
+            let eval_fens_path = cmd.eval_fens_path;
+            let seed = cmd.seed;
             let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
                 panic!("failed to load `{candidate_path}`: {err}");
             });
@@ -1519,56 +1599,40 @@ fn main() {
                 report.losses_as_black
             );
         }
-        Some("perft") => {
-            let depth = args
-                .next()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(1);
-            let fen = args.collect::<Vec<_>>().join(" ");
+        Some(CliCommand::Perft(cmd)) => {
+            let depth = cmd.depth;
+            let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             println!("fen   : {}", position.to_fen());
             println!("depth : {depth}");
             println!("nodes : {}", position.perft(depth));
         }
-        Some("vs-pikafish") => {
-            let pikafish_exe = args.next().unwrap_or_else(|| {
-                panic!(
-                    "usage: vs-pikafish <pikafish_exe> [config.toml|simulations] [simulations] [pikafish_depth] [games] [parallel_games] [eval_fens.txt]"
-                )
-            });
-            let config_or_simulations = args.next();
-            let (config_path, simulations_override) = if let Some(value) = config_or_simulations {
+        Some(CliCommand::VsPikafish(cmd)) => {
+            let pikafish_exe = cmd.pikafish_exe;
+            let (config_path, simulations_override) = if let Some(value) = cmd.config_or_simulations
+            {
                 if let Ok(simulations) = value.parse::<usize>() {
-                    (DEFAULT_AZ_LOOP_CONFIG.to_string(), Some(simulations.max(1)))
+                    (
+                        DEFAULT_AZ_LOOP_CONFIG.to_string(),
+                        Some(cmd.simulations.unwrap_or(simulations).max(1)),
+                    )
                 } else {
-                    let simulations = args.next().and_then(|value| value.parse::<usize>().ok());
-                    (value, simulations.map(|value| value.max(1)))
+                    (value, cmd.simulations.map(|value| value.max(1)))
                 }
             } else {
-                (DEFAULT_AZ_LOOP_CONFIG.to_string(), None)
+                (
+                    DEFAULT_AZ_LOOP_CONFIG.to_string(),
+                    cmd.simulations.map(|value| value.max(1)),
+                )
             };
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
             let simulations = simulations_override.unwrap_or(config.simulations).max(1);
-            let pikafish_depth = args
-                .next()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(DEFAULT_VS_PIKAFISH_DEPTH)
-                .max(1);
-            let games = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_VS_PIKAFISH_GAMES)
-                .max(1);
-            let parallel_games = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_VS_PIKAFISH_PARALLEL_GAMES)
-                .max(1);
-            let eval_fens_path = args
-                .next()
-                .unwrap_or_else(|| DEFAULT_ARENA_EVAL_FENS.into());
+            let pikafish_depth = cmd.pikafish_depth.max(1);
+            let games = cmd.games.max(1);
+            let parallel_games = cmd.parallel_games.max(1);
+            let eval_fens_path = cmd.eval_fens_path;
             let start_positions = load_arena_eval_positions(&eval_fens_path);
             let seed = 20260411_u64;
             let summary = run_vs_pikafish(
@@ -1606,32 +1670,7 @@ fn main() {
                 simulations
             );
         }
-        Some("help") => print_help(),
-        _ => print_help(),
     }
-}
-
-fn print_help() {
-    let position = Position::startpos();
-    println!("ChineseAI AZ-NNUE AlphaZero MCTS core");
-    println!("start : {STARTPOS_FEN}");
-    println!("moves : {}", position.legal_moves().len());
-    println!("hint  : cargo run --release -- az-init 128 chineseai.nnue 20260409 2");
-    println!("hint  : cargo run --release -- uci");
-    println!(
-        "hint  : cargo run --release -- az-search chineseai.nnue 10000 1.5 gumbel_alphazero startpos"
-    );
-    println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
-    println!(
-        "hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # per-GPU batch=1024"
-    );
-    println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
-    println!(
-        "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <eval_fens_path> <seed>"
-    );
-    println!(
-        "hint  : cargo run --release -- vs-pikafish ./pikafish {DEFAULT_AZ_LOOP_CONFIG} 10000"
-    );
 }
 
 fn parse_position(text: &str) -> Position {
