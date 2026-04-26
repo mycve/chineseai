@@ -164,6 +164,7 @@ struct AzTree<'a> {
     root_noise_seed: u64,
     algorithm: AzSearchAlgorithm,
     gumbel: AzGumbelConfig,
+    num_simulations: usize,
     root_gumbels: Vec<f32>,
     root_considered_visits: Vec<u32>,
     eval_scratch: AzEvalScratch,
@@ -242,6 +243,7 @@ impl<'a> AzTree<'a> {
                 rescale_values: limits.gumbel.rescale_values,
                 use_mixed_value: limits.gumbel.use_mixed_value,
             },
+            num_simulations: limits.simulations,
             root_gumbels: Vec::new(),
             root_considered_visits: Vec::new(),
             eval_scratch: AzEvalScratch::new(model.hidden_size),
@@ -327,10 +329,8 @@ impl<'a> AzTree<'a> {
                 .max_num_considered_actions
                 .min(self.nodes[node_index].children.len())
                 .max(1);
-            self.root_considered_visits = mctx::get_sequence_of_considered_visits(
-                considered,
-                self.nodes.capacity().saturating_sub(1),
-            );
+            self.root_considered_visits =
+                mctx::get_sequence_of_considered_visits(considered, self.num_simulations);
         }
         self.nodes[node_index].value = value;
         self.nodes[node_index].expanded = true;
@@ -512,7 +512,6 @@ impl<'a> AzTree<'a> {
             .iter()
             .map(|child| ActionStats {
                 logit: child.logit,
-                prior: child.prior,
                 visit_count: child.visits,
                 qvalue: child.q(),
             })

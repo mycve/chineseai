@@ -26,7 +26,6 @@ impl Default for AzGumbelConfig {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ActionStats {
     pub logit: f32,
-    pub prior: f32,
     pub visit_count: u32,
     pub qvalue: f32,
 }
@@ -65,28 +64,23 @@ pub(super) fn gumbel_muzero_root_action_selection(
     let completed_qvalues = qtransform_completed_by_mix_value(actions, raw_value, config);
     let logits = normalized_logits(actions);
 
-    actions
-        .iter()
-        .enumerate()
-        .filter(|(_, action)| action.visit_count == considered_visit)
-        .max_by(|(left_index, left), (right_index, right)| {
-            let left_score = score_considered(
-                root_gumbel.get(*left_index).copied().unwrap_or(0.0),
-                logits[*left_index],
-                completed_qvalues[*left_index],
-            );
-            let right_score = score_considered(
-                root_gumbel.get(*right_index).copied().unwrap_or(0.0),
-                logits[*right_index],
-                completed_qvalues[*right_index],
-            );
-            left_score
-                .total_cmp(&right_score)
-                .then_with(|| left.prior.total_cmp(&right.prior))
-                .then_with(|| right_index.cmp(left_index))
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0)
+    let mut best_index = None;
+    let mut best_score = f32::NEG_INFINITY;
+    for (index, action) in actions.iter().enumerate() {
+        if action.visit_count != considered_visit {
+            continue;
+        }
+        let score = score_considered(
+            root_gumbel.get(index).copied().unwrap_or(0.0),
+            logits[index],
+            completed_qvalues[index],
+        );
+        if best_index.is_none() || score > best_score {
+            best_index = Some(index);
+            best_score = score;
+        }
+    }
+    best_index.unwrap_or(0)
 }
 
 pub(super) fn gumbel_muzero_interior_action_selection(
@@ -101,19 +95,16 @@ pub(super) fn gumbel_muzero_interior_action_selection(
         .map(|action| action.visit_count as f32)
         .sum::<f32>();
 
-    actions
-        .iter()
-        .enumerate()
-        .max_by(|(left_index, left), (right_index, right)| {
-            let left_score = probs[*left_index] - left.visit_count as f32 / (1.0 + total_visits);
-            let right_score = probs[*right_index] - right.visit_count as f32 / (1.0 + total_visits);
-            left_score
-                .total_cmp(&right_score)
-                .then_with(|| left.prior.total_cmp(&right.prior))
-                .then_with(|| right_index.cmp(left_index))
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0)
+    let mut best_index = None;
+    let mut best_score = f32::NEG_INFINITY;
+    for (index, action) in actions.iter().enumerate() {
+        let score = probs[index] - action.visit_count as f32 / (1.0 + total_visits);
+        if best_index.is_none() || score > best_score {
+            best_index = Some(index);
+            best_score = score;
+        }
+    }
+    best_index.unwrap_or(0)
 }
 
 pub(super) fn gumbel_muzero_root_best_action(
@@ -130,28 +121,23 @@ pub(super) fn gumbel_muzero_root_best_action(
     let completed_qvalues = qtransform_completed_by_mix_value(actions, raw_value, config);
     let logits = normalized_logits(actions);
 
-    actions
-        .iter()
-        .enumerate()
-        .filter(|(_, action)| action.visit_count == considered_visit)
-        .max_by(|(left_index, left), (right_index, right)| {
-            let left_score = score_considered(
-                root_gumbel.get(*left_index).copied().unwrap_or(0.0),
-                logits[*left_index],
-                completed_qvalues[*left_index],
-            );
-            let right_score = score_considered(
-                root_gumbel.get(*right_index).copied().unwrap_or(0.0),
-                logits[*right_index],
-                completed_qvalues[*right_index],
-            );
-            left_score
-                .total_cmp(&right_score)
-                .then_with(|| left.visit_count.cmp(&right.visit_count))
-                .then_with(|| left.prior.total_cmp(&right.prior))
-                .then_with(|| right_index.cmp(left_index))
-        })
-        .map(|(index, _)| index)
+    let mut best_index = None;
+    let mut best_score = f32::NEG_INFINITY;
+    for (index, action) in actions.iter().enumerate() {
+        if action.visit_count != considered_visit {
+            continue;
+        }
+        let score = score_considered(
+            root_gumbel.get(index).copied().unwrap_or(0.0),
+            logits[index],
+            completed_qvalues[index],
+        );
+        if best_index.is_none() || score > best_score {
+            best_index = Some(index);
+            best_score = score;
+        }
+    }
+    best_index
 }
 
 pub(super) fn gumbel_muzero_root_policy(
@@ -172,7 +158,10 @@ pub(super) fn qtransform_completed_by_mix_value(
         return Vec::new();
     }
 
-    let prior_probs = softmax_logits(actions);
+    let mut prior_probs = softmax_logits(actions);
+    for prior in &mut prior_probs {
+        *prior = prior.max(f32::MIN_POSITIVE);
+    }
     let sum_visits = actions
         .iter()
         .map(|action| action.visit_count as f32)
