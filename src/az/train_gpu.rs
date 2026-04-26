@@ -13,7 +13,8 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
 const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
-const DEFAULT_MIN_MULTI_GPU_SHARD_SIZE: usize = 8192;
+/// 多卡时每张卡上最少样本数，低于此则少用一些卡、避免过小的子 batch（默认 1，即不额外限制）
+const DEFAULT_MIN_SAMPLES_PER_GPU: usize = 1;
 
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
@@ -58,12 +59,18 @@ struct GpuVars {
     policy_move_bias: Var,
 }
 
+/// 与 `GpuTrainer` 使用的 `cuda_device_indices()` 一致。配置里「每卡 batch」× 本值 = 单步训练总 micro-batch 样本数。
+pub(crate) fn training_cuda_device_count() -> usize {
+    cuda_device_indices().len().max(1)
+}
+
 pub(super) fn train_samples_gpu(
     model: &mut AzNnue,
     samples: &[AzTrainingSample],
     epochs: usize,
     lr: f32,
-    batch_size: usize,
+    // 每张 GPU 上每个 training step 的样本数；单步总样本 = 该值 × 参与训练的 GPU 数
+    per_gpu_batch_size: usize,
     rng: &mut super::SplitMix64,
 ) -> CandleResult<AzTrainStats> {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
@@ -79,17 +86,19 @@ pub(super) fn train_samples_gpu(
     }
     let mut order = (0..samples.len()).collect::<Vec<_>>();
     let mut stats = AzTrainStats::default();
-    let batch_size = batch_size.max(1);
     {
         let trainer = model
             .gpu_trainer
             .as_mut()
             .expect("gpu trainer was initialized");
+        let per_gpu = per_gpu_batch_size.max(1);
+        // 与 active_replica_count 一致：整批按卡均分，每子批约 per_gpu 条/卡
+        let step_chunk = (per_gpu * trainer.replicas.len().max(1)).max(1);
         trainer.set_learning_rate(lr);
         for _ in 0..epochs {
             shuffle(&mut order, rng);
             stats = AzTrainStats::default();
-            for batch in order.chunks(batch_size) {
+            for batch in order.chunks(step_chunk) {
                 let batch_stats = trainer.train_batch(samples, batch)?;
                 stats.add_assign(&batch_stats);
             }
@@ -127,6 +136,13 @@ impl GpuTrainer {
                 weight_decay: ADAMW_WEIGHT_DECAY,
             },
         )?;
+        if device_indices.len() > 1 {
+            eprintln!(
+                "[chineseai] 多卡 CUDA 训练: 设备下标={:?}；各 micro-batch 在样本间均分。\
+                 可设 CHINESEAI_CUDA_DEVICES=0,1 固定顺序；设 CHINESEAI_MIN_SAMPLES_PER_GPU 限制每卡最少样本（默认 1）。",
+                device_indices
+            );
+        }
         Ok(Self {
             hidden_size: model.hidden_size,
             trunk_depth: model.trunk_depth,
@@ -207,14 +223,17 @@ impl GpuTrainer {
         Ok(stats)
     }
 
+    /// 实际参与本步前向/反传的 GPU 数量：数据并行下不会超过 batch 内样本数；
+    /// 若设定了每卡最小样本数，会少用几张卡，避免子 batch 过小（可选，默认不限制）。
     fn active_replica_count(&self, batch_len: usize) -> usize {
         let replicas = self.replicas.len();
         if replicas <= 1 {
             return 1;
         }
-        let min_shard = min_multi_gpu_shard_size();
-        let usable = (batch_len / min_shard).max(1);
-        replicas.min(usable)
+        let per_gpu_min = min_samples_per_gpu_limit();
+        // 在「每卡至少 per_gpu_min 个样本」约束下，最多能同时用多少张卡
+        let max_usable = (batch_len / per_gpu_min).max(1);
+        replicas.min(batch_len).min(max_usable)
     }
 
     fn train_batch_single(
@@ -755,12 +774,14 @@ fn cuda_device_indices() -> Vec<usize> {
     vec![0]
 }
 
-fn min_multi_gpu_shard_size() -> usize {
-    std::env::var("CHINESEAI_MIN_GPU_SHARD_SIZE")
+/// 多卡时「每张卡至少几个样本才参与切分」；为 1 时等价于不额外限制（仅受 batch 样本数与卡数约束）。
+fn min_samples_per_gpu_limit() -> usize {
+    std::env::var("CHINESEAI_MIN_SAMPLES_PER_GPU")
+        .or_else(|_| std::env::var("CHINESEAI_MIN_GPU_SHARD_SIZE"))
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(DEFAULT_MIN_MULTI_GPU_SHARD_SIZE)
+        .unwrap_or(DEFAULT_MIN_SAMPLES_PER_GPU)
 }
 
 fn parse_cuda_device_list_env(name: &str) -> Option<Vec<usize>> {

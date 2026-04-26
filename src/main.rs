@@ -6,7 +6,8 @@ use chineseai::{
     az::{
         AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue, AzSearchLimits,
         AzSelfplayData, alphazero_search, alphazero_search_with_history_and_rules,
-        benchmark_training, generate_selfplay_data, play_arena_games_from_positions, train_samples,
+        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions, train_samples,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
     pikafish_match::run_vs_pikafish,
@@ -667,7 +668,7 @@ fn main() {
         }
         Some("az-train-bench") => {
             let model_path = args.next().unwrap_or_else(|| {
-                panic!("usage: az-train-bench <model> [samples] [epochs] [batch_size] [lr] [seed]")
+                panic!("usage: az-train-bench <model> [samples] [epochs] [batch_size_per_gpu] [lr] [seed]")
             });
             let sample_count = args
                 .next()
@@ -700,12 +701,15 @@ fn main() {
             let stats = benchmark_training(&mut model, sample_count, epochs, batch_size, lr, seed);
             let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
             let processed = (sample_count * epochs) as f64;
+            let g_step = global_training_step_sample_count(batch_size);
+            let n_gpu = global_training_step_sample_count(1);
             println!("bench        : training");
             println!("model        : {model_path}");
             println!("samples      : {sample_count}");
             println!("epochs       : {epochs}");
-            println!("batch_size   : {batch_size}");
-            println!("lr           : {lr}");
+            println!("batch(per_gpu) : {batch_size}");
+            println!("cuda_devices  : {n_gpu}  (单步总样本: {g_step})");
+            println!("lr             : {lr}");
             println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
             println!("processed    : {}", sample_count * epochs);
             println!("samples/sec  : {:.0}", processed / elapsed);
@@ -799,13 +803,14 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_batch_games,
                 config.epochs,
                 config.lr,
                 config.batch_size,
+                global_training_step_sample_count(config.batch_size),
                 config.max_sample_train_count,
                 config.max_plies,
                 config.workers,
@@ -928,7 +933,7 @@ fn main() {
                     let Some(pool) = trainer_pool.as_mut() else {
                         continue;
                     };
-                    if pool.sample_count() < trainer_config.batch_size.max(1) {
+                    if pool.sample_count() < global_training_step_sample_count(trainer_config.batch_size) {
                         continue;
                     }
                     let mut rng = chineseai::az::SplitMix64::new(
@@ -1610,7 +1615,7 @@ fn print_help() {
     println!("hint  : cargo run --release -- uci");
     println!("hint  : cargo run --release -- az-search chineseai.nnue 10000 32 1.5 startpos");
     println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
-    println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003");
+    println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # 其中 1024=每卡 batch");
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
     println!(
         "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <eval_fens_path> <seed>"
@@ -1733,7 +1738,9 @@ impl AzLoopFileConfig {
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
 #   epochs means how many passes to make over each fresh training window; 2-3 is a good range.
-#   batch_size=1024 is the default; lower it if memory is tight, raise it if loss is noisy.
+#   batch_size: 每块 GPU 每个训练步上的样本数。单步「整批」总样本 = batch_size ×(可见训练用 CUDA 卡数,至少1)。
+#   例如 4 卡、batch_size=256 → 每优化步 1024 条；估算每 epoch 步数可用 总样本/该乘积 近似。
+#   默认 1024；显存吃紧则减小每卡值；多卡时调小单卡值可与旧版「全局长 batch」的显存/噪声水平对齐。
 #   max_sample_train_count removes samples after they have been used this many times.
 #   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.

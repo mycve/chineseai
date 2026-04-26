@@ -21,7 +21,7 @@ pub use play::{
     play_arena_games_from_positions,
 };
 pub use replay::AzExperiencePool;
-pub use train::train_samples;
+pub use train::{global_training_step_sample_count, train_samples};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
 const AZNNUE_BINARY_VERSION: u32 = 8;
@@ -166,6 +166,7 @@ pub struct AzLoopConfig {
     pub simulations: usize,
     pub epochs: usize,
     pub lr: f32,
+    /// 每卡、每训练步的样本数；单步全局 batch = `batch_size × 训练用 GPU 数`
     pub batch_size: usize,
     pub seed: u64,
     pub workers: usize,
@@ -912,6 +913,7 @@ pub fn selfplay_train_iteration(model: &mut AzNnue, config: &AzLoopConfig) -> Az
     selfplay_train_iteration_with_pool(model, config, None)
 }
 
+/// `batch_size` 为**每块 GPU 每步**的样本数；与配置文件中 `batch_size` 含义一致
 pub fn benchmark_training(
     model: &mut AzNnue,
     sample_count: usize,
