@@ -4,12 +4,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use chineseai::{
     az::{
-        AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search, benchmark_training,
-        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
+        AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
+        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions, train_samples,
     },
-    pikafish_match::run_vs_pikafish,
+    pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
     xiangqi::{Position, STARTPOS_FEN},
 };
@@ -302,42 +302,47 @@ fn build_async_training_report(
     }
 }
 
-fn run_arena_processes(
-    candidate_path: &str,
-    baseline_path: &str,
+struct ArenaProcessConfig<'a> {
+    candidate_path: &'a str,
+    baseline_path: &'a str,
     games_per_side: usize,
     simulations: usize,
     max_plies: usize,
-    arena_cpuct: f32,
-    eval_fens_path: &str,
+    cpuct: f32,
+    eval_fens_path: &'a str,
     process_count: usize,
     seed: u64,
-) -> AzArenaReport {
-    let process_count = process_count.max(1).min(games_per_side.max(1));
+}
+
+fn run_arena_processes(config: ArenaProcessConfig<'_>) -> AzArenaReport {
+    let process_count = config
+        .process_count
+        .max(1)
+        .min(config.games_per_side.max(1));
     let exe = std::env::current_exe().unwrap_or_else(|err| {
         panic!("failed to locate current executable: {err}");
     });
     let mut merged = AzArenaReport::default();
     let mut children: Vec<(usize, Child)> = Vec::new();
     for index in 0..process_count {
-        let red_games =
-            games_per_side / process_count + usize::from(index < games_per_side % process_count);
-        let black_games =
-            games_per_side / process_count + usize::from(index < games_per_side % process_count);
+        let red_games = config.games_per_side / process_count
+            + usize::from(index < config.games_per_side % process_count);
+        let black_games = config.games_per_side / process_count
+            + usize::from(index < config.games_per_side % process_count);
         if red_games == 0 && black_games == 0 {
             continue;
         }
         let child = Command::new(&exe)
             .arg("az-arena-worker")
-            .arg(candidate_path)
-            .arg(baseline_path)
+            .arg(config.candidate_path)
+            .arg(config.baseline_path)
             .arg(red_games.to_string())
             .arg(black_games.to_string())
-            .arg(simulations.to_string())
-            .arg(max_plies.to_string())
-            .arg(arena_cpuct.to_string())
-            .arg(eval_fens_path)
-            .arg((seed ^ index as u64).to_string())
+            .arg(config.simulations.to_string())
+            .arg(config.max_plies.to_string())
+            .arg(config.cpuct.to_string())
+            .arg(config.eval_fens_path)
+            .arg((config.seed ^ index as u64).to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -899,21 +904,16 @@ fn main() {
                 let mut trainer_pool = replay_pool;
                 let mut pending = PendingTrainingData::default();
                 let mut train_index = 0usize;
-                loop {
-                    match selfplay_rx.recv() {
-                        Ok(batch) => {
-                            if let Some(pool) = trainer_pool.as_mut() {
-                                pool.add_games(batch.data.games.clone());
-                            }
-                            pending.push(batch);
-                            while let Ok(batch) = selfplay_rx.try_recv() {
-                                if let Some(pool) = trainer_pool.as_mut() {
-                                    pool.add_games(batch.data.games.clone());
-                                }
-                                pending.push(batch);
-                            }
+                while let Ok(batch) = selfplay_rx.recv() {
+                    if let Some(pool) = trainer_pool.as_mut() {
+                        pool.add_games(batch.data.games.clone());
+                    }
+                    pending.push(batch);
+                    while let Ok(batch) = selfplay_rx.try_recv() {
+                        if let Some(pool) = trainer_pool.as_mut() {
+                            pool.add_games(batch.data.games.clone());
                         }
-                        Err(_) => break,
+                        pending.push(batch);
                     }
                     if trainer_stop.load(Ordering::SeqCst) {
                         continue;
@@ -981,20 +981,20 @@ fn main() {
                     }
                     train_index += 1;
                 }
-                if let Some(pool) = trainer_pool.as_mut() {
-                    if trainer_interrupted.load(Ordering::SeqCst) {
-                        match pool.save_snapshot_lz4(&trainer_snapshot_path) {
-                            Ok(()) => {
-                                if pool.game_count() > 0 {
-                                    println!(
-                                        "replay   : interrupt snapshot `{}` ({} games)",
-                                        trainer_snapshot_path.display(),
-                                        pool.game_count()
-                                    );
-                                }
+                if let Some(pool) = trainer_pool.as_mut()
+                    && trainer_interrupted.load(Ordering::SeqCst)
+                {
+                    match pool.save_snapshot_lz4(&trainer_snapshot_path) {
+                        Ok(()) => {
+                            if pool.game_count() > 0 {
+                                println!(
+                                    "replay   : interrupt snapshot `{}` ({} games)",
+                                    trainer_snapshot_path.display(),
+                                    pool.game_count()
+                                );
                             }
-                            Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
                         }
+                        Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
                     }
                 }
             });
@@ -1120,7 +1120,7 @@ fn main() {
                     });
                 }
                 let checkpoint_saved = if config.checkpoint_interval > 0
-                    && update % config.checkpoint_interval == 0
+                    && update.is_multiple_of(config.checkpoint_interval)
                 {
                     let path =
                         save_checkpoint_copy(&config.model_path, &config.checkpoint_dir, update);
@@ -1342,7 +1342,7 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                if config.arena_interval > 0 && update % config.arena_interval == 0 {
+                if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
                         let (pause_lock, _) = &*selfplay_pause;
                         let mut pause_state = pause_lock
@@ -1354,19 +1354,19 @@ fn main() {
                     let arena_eval_positions = load_arena_eval_positions(DEFAULT_ARENA_EVAL_FENS);
                     let arena_eval_fens = arena_eval_positions.len();
                     drop(arena_eval_positions);
-                    let arena = run_arena_processes(
-                        &config.model_path,
-                        best_path
+                    let arena = run_arena_processes(ArenaProcessConfig {
+                        candidate_path: &config.model_path,
+                        baseline_path: best_path
                             .to_str()
                             .unwrap_or_else(|| panic!("best model path is not valid UTF-8")),
-                        config.arena_games_per_side,
-                        config.simulations,
-                        config.max_plies,
-                        config.arena_cpuct,
-                        DEFAULT_ARENA_EVAL_FENS,
-                        config.arena_processes,
-                        config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                    );
+                        games_per_side: config.arena_games_per_side,
+                        simulations: config.simulations,
+                        max_plies: config.max_plies,
+                        cpuct: config.arena_cpuct,
+                        eval_fens_path: DEFAULT_ARENA_EVAL_FENS,
+                        process_count: config.arena_processes,
+                        seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    });
                     let promoted = arena.score_rate() > 0.5;
                     if promoted {
                         fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
@@ -1502,12 +1502,14 @@ fn main() {
                 &candidate,
                 &baseline,
                 &eval_positions,
-                simulations,
-                max_plies,
-                red_games,
-                black_games,
-                seed,
-                arena_cpuct,
+                AzArenaConfig {
+                    simulations,
+                    max_plies,
+                    games_as_red: red_games,
+                    games_as_black: black_games,
+                    seed,
+                    cpuct: arena_cpuct,
+                },
             );
             println!(
                 "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={}",
@@ -1572,12 +1574,14 @@ fn main() {
                 Path::new(&pikafish_exe),
                 Path::new(&model_path),
                 &start_positions,
-                pikafish_depth,
-                games,
-                max_plies,
-                simulations,
-                seed,
-                parallel_games,
+                VsPikafishConfig {
+                    pikafish_depth,
+                    total_games: games,
+                    max_plies,
+                    simulations,
+                    seed,
+                    parallel_games,
+                },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
@@ -1595,7 +1599,8 @@ fn main() {
                 simulations
             );
         }
-        Some("help") | _ => print_help(),
+        Some("help") => print_help(),
+        _ => print_help(),
     }
 }
 

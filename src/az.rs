@@ -18,7 +18,7 @@ pub use alphazero::{
 };
 pub use mctx::AzGumbelConfig;
 pub use play::{
-    AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
+    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions,
 };
 pub use replay::AzExperiencePool;
@@ -572,28 +572,28 @@ impl AzNnue {
     fn global_from_hidden_into(&self, hidden: &[f32], cnn_global: &[f32], global: &mut Vec<f32>) {
         global.resize(GLOBAL_CONTEXT_SIZE, 0.0);
         global.copy_from_slice(&self.global_bias);
-        for out in 0..GLOBAL_CONTEXT_SIZE {
+        for (out, global_value) in global.iter_mut().enumerate().take(GLOBAL_CONTEXT_SIZE) {
             let row = &self.global_hidden[out * self.hidden_size..(out + 1) * self.hidden_size];
-            for idx in 0..self.hidden_size {
-                global[out] += hidden[idx] * row[idx];
+            for (hidden_value, weight) in hidden.iter().zip(row) {
+                *global_value += hidden_value * weight;
             }
             let cnn_row = &self.board_global[out * CNN_POOLED_SIZE..(out + 1) * CNN_POOLED_SIZE];
-            for idx in 0..CNN_POOLED_SIZE {
-                global[out] += cnn_global[idx] * cnn_row[idx];
+            for (cnn_value, weight) in cnn_global.iter().zip(cnn_row) {
+                *global_value += cnn_value * weight;
             }
-            global[out] = global[out].max(0.0);
+            *global_value = (*global_value).max(0.0);
         }
     }
 
     fn board_hidden_into(&self, cnn_global: &[f32], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.board_hidden_bias);
-        for out in 0..self.hidden_size {
+        for (out, hidden_value) in hidden.iter_mut().enumerate().take(self.hidden_size) {
             let row = &self.board_hidden[out * CNN_POOLED_SIZE..(out + 1) * CNN_POOLED_SIZE];
-            for idx in 0..CNN_POOLED_SIZE {
-                hidden[out] += cnn_global[idx] * row[idx];
+            for (cnn_value, weight) in cnn_global.iter().zip(row) {
+                *hidden_value += cnn_value * weight;
             }
-            hidden[out] = hidden[out].max(0.0);
+            *hidden_value = (*hidden_value).max(0.0);
         }
     }
 
@@ -687,13 +687,18 @@ impl AzNnue {
         scratch
             .value_intermediate
             .copy_from_slice(&self.value_intermediate_bias);
-        for j in 0..VALUE_HIDDEN_SIZE {
+        for (j, value) in scratch
+            .value_intermediate
+            .iter_mut()
+            .enumerate()
+            .take(VALUE_HIDDEN_SIZE)
+        {
             let h_row =
                 &self.value_intermediate_hidden[j * self.hidden_size..(j + 1) * self.hidden_size];
-            for i in 0..self.hidden_size {
-                scratch.value_intermediate[j] += scratch.hidden[i] * h_row[i];
+            for (hidden_value, weight) in scratch.hidden.iter().zip(h_row) {
+                *value += hidden_value * weight;
             }
-            scratch.value_intermediate[j] = scratch.value_intermediate[j].max(0.0);
+            *value = (*value).max(0.0);
         }
         scratch
             .value_logits
@@ -701,8 +706,8 @@ impl AzNnue {
         for out in 0..VALUE_LOGITS {
             let row =
                 &self.value_logits_weights[out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
-            for j in 0..VALUE_HIDDEN_SIZE {
-                scratch.value_logits[out] += scratch.value_intermediate[j] * row[j];
+            for (intermediate, weight) in scratch.value_intermediate.iter().zip(row) {
+                scratch.value_logits[out] += intermediate * weight;
             }
         }
         scalar_value_from_logits(&scratch.value_logits).0
@@ -780,12 +785,12 @@ pub(super) fn extract_board_planes(
 
 fn extract_position_piece_planes(position: &Position, board: &mut [u8; BOARD_PLANES_SIZE]) {
     board.fill(0);
-    for sq in 0..BOARD_SIZE {
+    for (sq, slot) in board.iter_mut().enumerate().take(BOARD_SIZE) {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
         let plane = absolute_piece_plane(piece.color, piece.kind);
-        board[sq] = (plane + 1) as u8;
+        *slot = (plane + 1) as u8;
     }
 }
 
@@ -810,10 +815,10 @@ fn conv_relu_layer(
     bias: &[f32],
     output: &mut [f32],
 ) {
-    for out_channel in 0..CNN_CHANNELS {
+    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(CNN_CHANNELS) {
         let out_start = out_channel * BOARD_PLANES_SIZE;
         for sq in 0..BOARD_PLANES_SIZE {
-            let mut value = bias[out_channel];
+            let mut value = bias_value;
             let file = sq % BOARD_FILES;
             let rank = sq / BOARD_FILES;
             for kr in 0..3 {
@@ -862,10 +867,10 @@ fn conv_relu_layer_dense(
     bias: &[f32],
     output: &mut [f32],
 ) {
-    for out_channel in 0..CNN_CHANNELS {
+    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(CNN_CHANNELS) {
         let out_start = out_channel * BOARD_PLANES_SIZE;
         for sq in 0..BOARD_PLANES_SIZE {
-            let mut value = bias[out_channel];
+            let mut value = bias_value;
             let file = sq % BOARD_FILES;
             let rank = sq / BOARD_FILES;
             for kr in 0..3 {
@@ -906,19 +911,19 @@ pub fn benchmark_training(
     let mut rng = SplitMix64::new(seed);
     let mut samples = Vec::with_capacity(sample_count);
     for index in 0..sample_count {
-        let feature_count = 24 + (rng.next() as usize % 16);
+        let feature_count = 24 + (rng.next_u64() as usize % 16);
         let mut features = Vec::with_capacity(feature_count);
         for _ in 0..feature_count {
-            features.push((rng.next() as usize) % V4_INPUT_SIZE);
+            features.push((rng.next_u64() as usize) % V4_INPUT_SIZE);
         }
         features.sort_unstable();
         features.dedup();
 
         let value = rng.unit_f32() * 2.0 - 1.0;
-        let move_count = 12 + (rng.next() as usize % 24);
+        let move_count = 12 + (rng.next_u64() as usize % 24);
         let mut move_indices = Vec::with_capacity(move_count);
         while move_indices.len() < move_count {
-            let candidate = (rng.next() as usize) % DENSE_MOVE_SPACE;
+            let candidate = (rng.next_u64() as usize) % DENSE_MOVE_SPACE;
             if !move_indices.contains(&candidate) {
                 move_indices.push(candidate);
             }
@@ -1016,13 +1021,13 @@ impl SplitMix64 {
         Self { state: seed }
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.state = splitmix64(self.state);
         self.state
     }
 
     pub fn unit_f32(&mut self) -> f32 {
-        let value = self.next();
+        let value = self.next_u64();
         (((value >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))) as f32
     }
 
@@ -1040,33 +1045,30 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 const fn is_advisor_pos(rank: usize, file: usize) -> bool {
-    (rank == 0 && file == 3)
-        || (rank == 0 && file == 5)
-        || (rank == 1 && file == 4)
-        || (rank == 2 && file == 3)
-        || (rank == 2 && file == 5)
-        || (rank == 7 && file == 3)
-        || (rank == 7 && file == 5)
-        || (rank == 8 && file == 4)
-        || (rank == 9 && file == 3)
-        || (rank == 9 && file == 5)
+    matches!(
+        (rank, file),
+        (0, 3) | (0, 5) | (1, 4) | (2, 3) | (2, 5) | (7, 3) | (7, 5) | (8, 4) | (9, 3) | (9, 5)
+    )
 }
 
 const fn is_elephant_pos(rank: usize, file: usize) -> bool {
-    (rank == 0 && file == 2)
-        || (rank == 0 && file == 6)
-        || (rank == 2 && file == 0)
-        || (rank == 2 && file == 4)
-        || (rank == 2 && file == 8)
-        || (rank == 4 && file == 2)
-        || (rank == 4 && file == 6)
-        || (rank == 5 && file == 2)
-        || (rank == 5 && file == 6)
-        || (rank == 7 && file == 0)
-        || (rank == 7 && file == 4)
-        || (rank == 7 && file == 8)
-        || (rank == 9 && file == 2)
-        || (rank == 9 && file == 6)
+    matches!(
+        (rank, file),
+        (0, 2)
+            | (0, 6)
+            | (2, 0)
+            | (2, 4)
+            | (2, 8)
+            | (4, 2)
+            | (4, 6)
+            | (5, 2)
+            | (5, 6)
+            | (7, 0)
+            | (7, 4)
+            | (7, 8)
+            | (9, 2)
+            | (9, 6)
+    )
 }
 
 const fn is_valid_policy_move(from: usize, to: usize) -> bool {

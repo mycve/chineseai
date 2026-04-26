@@ -240,12 +240,12 @@ impl AzExperiencePool {
         }
         let mut samples = Vec::with_capacity(count);
         for _ in 0..count {
-            let game_index = (rng.next() as usize) % eligible_games;
+            let game_index = (rng.next_u64() as usize) % eligible_games;
             let game = &mut self.games[game_index];
             if game.is_empty() {
                 continue;
             }
-            let sample_index = (rng.next() as usize) % game.len();
+            let sample_index = (rng.next_u64() as usize) % game.len();
             let entry = &mut game[sample_index];
             entry.train_count = entry.train_count.saturating_add(1);
             self.train_count_sum = self.train_count_sum.saturating_add(1);
@@ -267,12 +267,12 @@ impl AzExperiencePool {
         }
         let mut samples = Vec::with_capacity(count);
         for _ in 0..count {
-            let game_index = (rng.next() as usize) % self.games.len();
+            let game_index = (rng.next_u64() as usize) % self.games.len();
             let game = &self.games[game_index];
             if game.is_empty() {
                 continue;
             }
-            let sample_index = (rng.next() as usize) % game.len();
+            let sample_index = (rng.next_u64() as usize) % game.len();
             samples.push(game[sample_index].sample.clone());
         }
         samples

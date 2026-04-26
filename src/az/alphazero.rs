@@ -630,7 +630,7 @@ fn sample_gamma(alpha: f32, rng: &mut SplitMix64, salt: u64) -> f32 {
 
 fn sample_standard_normal(rng: &mut SplitMix64, salt: u64) -> f32 {
     let u1 = rng.unit_f32().max(1e-12);
-    let mut aux = SplitMix64::new(rng.next() ^ salt.rotate_left(17));
+    let mut aux = SplitMix64::new(rng.next_u64() ^ salt.rotate_left(17));
     let u2 = aux.unit_f32();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
 }

@@ -187,6 +187,16 @@ pub struct Position {
     halfmove_clock: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PositionState {
+    hash: u64,
+    base_eval: i32,
+    advisor_counts: [u8; 2],
+    elephant_counts: [u8; 2],
+    dynamic_material_counts: [u8; 2],
+    general_squares: [Option<usize>; 2],
+}
+
 impl Default for Position {
     fn default() -> Self {
         Self::startpos()
@@ -251,21 +261,14 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock,
         };
-        let (
-            hash,
-            base_eval,
-            advisor_counts,
-            elephant_counts,
-            dynamic_material_counts,
-            general_squares,
-        ) = position.compute_state();
+        let state = position.compute_state();
         let position = Self {
-            hash,
-            base_eval,
-            advisor_counts,
-            elephant_counts,
-            dynamic_material_counts,
-            general_squares,
+            hash: state.hash,
+            base_eval: state.base_eval,
+            advisor_counts: state.advisor_counts,
+            elephant_counts: state.elephant_counts,
+            dynamic_material_counts: state.dynamic_material_counts,
+            general_squares: state.general_squares,
             ..position
         };
         position.validate()?;
@@ -637,8 +640,8 @@ impl Position {
         Ok(())
     }
 
-    fn compute_state(&self) -> (u64, i32, [u8; 2], [u8; 2], [u8; 2], [Option<usize>; 2]) {
-        let mut key = 0u64;
+    fn compute_state(&self) -> PositionState {
+        let mut hash = 0u64;
         let mut base_eval = 0;
         let mut advisor_counts = [0u8; 2];
         let mut elephant_counts = [0u8; 2];
@@ -648,7 +651,7 @@ impl Position {
             let Some(piece) = self.board[sq] else {
                 continue;
             };
-            key ^= zobrist_piece_key(sq, piece);
+            hash ^= zobrist_piece_key(sq, piece);
             base_eval += signed_piece_contrib(piece, sq);
             match piece.kind {
                 PieceKind::Advisor => advisor_counts[color_hash_index(piece.color)] += 1,
@@ -661,22 +664,22 @@ impl Position {
         }
 
         if self.side_to_move == Color::Red {
-            key ^= SIDE_TO_MOVE_KEY;
+            hash ^= SIDE_TO_MOVE_KEY;
         }
 
-        (
-            key,
+        PositionState {
+            hash,
             base_eval,
             advisor_counts,
             elephant_counts,
             dynamic_material_counts,
             general_squares,
-        )
+        }
     }
 
     #[cfg(test)]
     fn compute_hash(&self) -> u64 {
-        self.compute_state().0
+        self.compute_state().hash
     }
 
     fn adjust_minor_counts(&mut self, piece: Piece, delta: i8) {
@@ -1341,10 +1344,9 @@ impl Position {
                 }) if color == by
                     && inside_palace(by, file as usize, rank as usize)
                     && inside_palace(by, from_file as usize, from_rank as usize)
-            ) {
-                if visitor(from) {
-                    return true;
-                }
+            ) && visitor(from)
+            {
+                return true;
             }
         }
 
@@ -1363,10 +1365,9 @@ impl Position {
                 }) if color == by
                     && inside_palace(by, file as usize, rank as usize)
                     && inside_palace(by, from_file as usize, from_rank as usize)
-            ) {
-                if visitor(from) {
-                    return true;
-                }
+            ) && visitor(from)
+            {
+                return true;
             }
         }
 
@@ -1391,10 +1392,9 @@ impl Position {
                         kind: PieceKind::Horse
                     }) if color == by
                 )
+                && visitor(from)
             {
-                if visitor(from) {
-                    return true;
-                }
+                return true;
             }
         }
 
@@ -1419,10 +1419,9 @@ impl Position {
                         kind: PieceKind::Elephant
                     }) if color == by && elephant_stays_home(by, rank as usize)
                 )
+                && visitor(from)
             {
-                if visitor(from) {
-                    return true;
-                }
+                return true;
             }
         }
 
@@ -1435,10 +1434,9 @@ impl Position {
                     color,
                     kind: PieceKind::Soldier
                 }) if color == by
-            ) {
-                if visitor(from) {
-                    return true;
-                }
+            ) && visitor(from)
+            {
+                return true;
             }
         }
 
@@ -1454,10 +1452,9 @@ impl Position {
                     color,
                     kind: PieceKind::Soldier
                 }) if color == by && soldier_crossed_river(by, rank as usize)
-            ) {
-                if visitor(from) {
-                    return true;
-                }
+            ) && visitor(from)
+            {
+                return true;
             }
         }
 
@@ -1481,10 +1478,8 @@ impl Position {
                 if let Some(piece) = self.board[sq] {
                     if !seen_screen {
                         if piece.color == by {
-                            if piece.kind == PieceKind::Rook {
-                                if visitor(sq) {
-                                    return true;
-                                }
+                            if piece.kind == PieceKind::Rook && visitor(sq) {
+                                return true;
                             }
                             if piece.kind == PieceKind::General
                                 && df == 0
@@ -1495,18 +1490,15 @@ impl Position {
                                         kind: PieceKind::General
                                     }) if color == by.opposite()
                                 )
+                                && visitor(sq)
                             {
-                                if visitor(sq) {
-                                    return true;
-                                }
+                                return true;
                             }
                         }
                         seen_screen = true;
                     } else {
-                        if piece.color == by && piece.kind == PieceKind::Cannon {
-                            if visitor(sq) {
-                                return true;
-                            }
+                        if piece.color == by && piece.kind == PieceKind::Cannon && visitor(sq) {
+                            return true;
                         }
                         break;
                     }
@@ -1746,7 +1738,7 @@ pub fn parse_square(text: &str) -> Option<usize> {
 
     let file = bytes[0].to_ascii_lowercase();
     let rank = bytes[1];
-    if !(b'a'..=b'i').contains(&file) || !(b'0'..=b'9').contains(&rank) {
+    if !(b'a'..=b'i').contains(&file) || !rank.is_ascii_digit() {
         return None;
     }
 

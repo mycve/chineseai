@@ -26,11 +26,30 @@ pub struct VsPikafishResult {
     pub chinese_wins_as_black: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct VsPikafishConfig {
+    pub pikafish_depth: u32,
+    pub total_games: usize,
+    pub max_plies: usize,
+    pub simulations: usize,
+    pub seed: u64,
+    pub parallel_games: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GameEnd {
     RedWin,
     BlackWin,
     Draw,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GameConfig {
+    chinese_plays_red: bool,
+    pikafish_depth: u32,
+    max_plies: usize,
+    simulations: usize,
+    seed: u64,
 }
 
 struct ExternalUci {
@@ -46,12 +65,18 @@ impl ExternalUci {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        let stdin = BufWriter::new(child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "pikafish: missing stdin")
-        })?);
-        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "pikafish: missing stdout")
-        })?);
+        let stdin = BufWriter::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("pikafish: missing stdin"))?,
+        );
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| std::io::Error::other("pikafish: missing stdout"))?,
+        );
         Ok(Self {
             child,
             stdin,
@@ -205,11 +230,7 @@ fn play_one_game(
     model: &AzNnue,
     external: &mut ExternalUci,
     initial_position: &Position,
-    chinese_plays_red: bool,
-    pikafish_depth: u32,
-    max_plies: usize,
-    simulations: usize,
-    mut seed: u64,
+    config: GameConfig,
 ) -> std::io::Result<GameEnd> {
     let _ = external.write_line("ucinewgame");
     let mut position = initial_position.clone();
@@ -219,18 +240,19 @@ fn play_one_game(
     let mut rule_history = position.initial_rule_history();
     let mut moves_uci: Vec<String> = Vec::new();
     let mut ply_count = 0usize;
+    let mut seed = config.seed;
 
     loop {
         if let Some(end) =
-            terminal_before_side_selects(&position, &rule_history, ply_count, max_plies)
+            terminal_before_side_selects(&position, &rule_history, ply_count, config.max_plies)
         {
             return Ok(end);
         }
 
         let side = position.side_to_move();
         let legal = position.legal_moves_with_rules(&rule_history);
-        let chinese_to_move = (chinese_plays_red && side == Color::Red)
-            || (!chinese_plays_red && side == Color::Black);
+        let chinese_to_move = (config.chinese_plays_red && side == Color::Red)
+            || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
             let search = alphazero_search_with_history_and_rules(
@@ -240,7 +262,7 @@ fn play_one_game(
                 Some(legal.clone()),
                 model,
                 AzSearchLimits {
-                    simulations,
+                    simulations: config.simulations,
                     seed,
                     cpuct: VS_PIKAFISH_CPUCT,
                     root_dirichlet_alpha: 0.0,
@@ -260,7 +282,8 @@ fn play_one_game(
             apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
             moves_uci.push(uci);
         } else {
-            let token = external.query_move(initial_fen.as_deref(), &moves_uci, pikafish_depth)?;
+            let token =
+                external.query_move(initial_fen.as_deref(), &moves_uci, config.pikafish_depth)?;
             if token.is_empty() || token == "(none)" || token == "0000" {
                 return Ok(match side {
                     Color::Red => GameEnd::BlackWin,
@@ -273,7 +296,7 @@ fn play_one_game(
                     Color::Black => GameEnd::RedWin,
                 });
             };
-            if !legal.iter().any(|m| *m == mv) {
+            if !legal.contains(&mv) {
                 return Ok(match side {
                     Color::Red => GameEnd::BlackWin,
                     Color::Black => GameEnd::RedWin,
@@ -293,12 +316,7 @@ pub fn run_vs_pikafish(
     pikafish_exe: &Path,
     chinese_model_path: &Path,
     start_positions: &[Position],
-    pikafish_depth: u32,
-    total_games: usize,
-    max_plies: usize,
-    simulations: usize,
-    seed: u64,
-    parallel_games: usize,
+    config: VsPikafishConfig,
 ) -> std::io::Result<VsPikafishResult> {
     let model = Arc::new(AzNnue::load(chinese_model_path).map_err(|e| {
         std::io::Error::new(
@@ -308,16 +326,16 @@ pub fn run_vs_pikafish(
     })?);
 
     let pikafish_path = pikafish_exe.to_path_buf();
-    let parallel = parallel_games.max(1).min(total_games);
+    let parallel = config.parallel_games.max(1).min(config.total_games);
     let start_positions = Arc::new(start_positions.to_vec());
 
     let mut out = VsPikafishResult {
-        total_games: total_games,
+        total_games: config.total_games,
         ..Default::default()
     };
 
-    for batch_start in (0..total_games).step_by(parallel) {
-        let batch_end = (batch_start + parallel).min(total_games);
+    for batch_start in (0..config.total_games).step_by(parallel) {
+        let batch_end = (batch_start + parallel).min(config.total_games);
         let mut handles = Vec::with_capacity(batch_end - batch_start);
         for game_index in batch_start..batch_end {
             let exe = pikafish_path.clone();
@@ -336,23 +354,23 @@ pub fn run_vs_pikafish(
                         m.as_ref(),
                         &mut ext,
                         &start_position,
-                        chinese_red,
-                        pikafish_depth,
-                        max_plies,
-                        simulations,
-                        seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        GameConfig {
+                            chinese_plays_red: chinese_red,
+                            pikafish_depth: config.pikafish_depth,
+                            max_plies: config.max_plies,
+                            simulations: config.simulations,
+                            seed: config.seed
+                                ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        },
                     )?;
                     Ok((chinese_red, end))
                 },
             ));
         }
         for handle in handles {
-            let join = handle.join().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "vs-pikafish: worker thread panicked",
-                )
-            })?;
+            let join = handle
+                .join()
+                .map_err(|_| std::io::Error::other("vs-pikafish: worker thread panicked"))?;
             let (chinese_red, end) = join?;
             match (end, chinese_red) {
                 (GameEnd::Draw, _) => out.draws += 1,

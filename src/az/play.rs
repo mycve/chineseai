@@ -204,7 +204,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 model,
                 AzSearchLimits {
                     simulations: config.simulations,
-                    seed: rng.next() ^ ((game_index as u64) << 32) ^ ply as u64,
+                    seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
                     cpuct: config.cpuct,
                     root_dirichlet_alpha: config.root_dirichlet_alpha,
                     root_exploration_fraction: config.root_exploration_fraction,
@@ -465,29 +465,34 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
         .sum()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AzArenaConfig {
+    pub simulations: usize,
+    pub max_plies: usize,
+    pub games_as_red: usize,
+    pub games_as_black: usize,
+    pub seed: u64,
+    pub cpuct: f32,
+}
+
 pub fn play_arena_games_from_positions(
     candidate: &AzNnue,
     baseline: &AzNnue,
     positions: &[Position],
-    simulations: usize,
-    max_plies: usize,
-    games_as_red: usize,
-    games_as_black: usize,
-    seed: u64,
-    cpuct: f32,
+    config: AzArenaConfig,
 ) -> AzArenaReport {
     let mut report = AzArenaReport::default();
-    let mut game_seed = seed;
-    for game_index in 0..games_as_red {
+    let mut game_seed = config.seed;
+    for game_index in 0..config.games_as_red {
         let position = arena_start_position(positions, game_index);
         let outcome = play_arena_game(
             &position,
             candidate,
             baseline,
-            simulations,
-            max_plies,
+            config.simulations,
+            config.max_plies,
             game_seed,
-            cpuct,
+            config.cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -502,16 +507,16 @@ pub fn play_arena_games_from_positions(
         }
         game_seed = game_seed.wrapping_add(1);
     }
-    for game_index in 0..games_as_black {
+    for game_index in 0..config.games_as_black {
         let position = arena_start_position(positions, game_index);
         let outcome = play_arena_game(
             &position,
             baseline,
             candidate,
-            simulations,
-            max_plies,
+            config.simulations,
+            config.max_plies,
             game_seed,
-            cpuct,
+            config.cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {

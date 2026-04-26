@@ -326,16 +326,19 @@ impl GpuReplica {
         let loss_tensor = ((&value_loss + &policy_ce)? / global_batch_len as f64)?;
         let grads = loss_tensor.backward()?;
 
-        let mut stats = AzTrainStats::default();
-        stats.loss = value_loss.to_scalar::<f32>()? + policy_ce.to_scalar::<f32>()?;
-        stats.value_loss = value_loss.to_scalar::<f32>()?;
-        stats.policy_ce = policy_ce.to_scalar::<f32>()?;
-        stats.value_pred_sum = value.sum_all()?.to_scalar::<f32>()?;
-        stats.value_pred_sq_sum = value.sqr()?.sum_all()?.to_scalar::<f32>()?;
-        stats.value_target_sum = batch_tensors.values.sum_all()?.to_scalar::<f32>()?;
-        stats.value_target_sq_sum = batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?;
-        stats.value_error_sq_sum = value_error.sqr()?.sum_all()?.to_scalar::<f32>()?;
-        stats.samples = batch.len();
+        let value_loss = value_loss.to_scalar::<f32>()?;
+        let policy_ce = policy_ce.to_scalar::<f32>()?;
+        let stats = AzTrainStats {
+            loss: value_loss + policy_ce,
+            value_loss,
+            policy_ce,
+            value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
+            value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
+            value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,
+            value_target_sq_sum: batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?,
+            value_error_sq_sum: value_error.sqr()?.sum_all()?.to_scalar::<f32>()?,
+            samples: batch.len(),
+        };
         let cpu_grads = if keep_grads {
             Vec::new()
         } else {
@@ -856,7 +859,7 @@ fn copy_var(var: &Var, dst: &mut [f32]) -> CandleResult<()> {
 
 fn shuffle(values: &mut [usize], rng: &mut super::SplitMix64) {
     for index in (1..values.len()).rev() {
-        let swap_with = (rng.next() as usize) % (index + 1);
+        let swap_with = (rng.next_u64() as usize) % (index + 1);
         values.swap(index, swap_with);
     }
 }
