@@ -5,5 +5,5 @@ pikafish.nnue
 /Cargo.lock
 *.nnue
 chineseai*
-*.conf.progress
+*.toml.progress
 *.replay.lz4

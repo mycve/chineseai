@@ -125,13 +125,6 @@ pub fn extract_sparse_features_v4(position: &Position, history: &[HistoryMove]) 
     features
 }
 
-pub fn orient_move(side: Color, mv: Move) -> Move {
-    Move::new(
-        orient_square(side, mv.from as usize),
-        orient_square(side, mv.to as usize),
-    )
-}
-
 pub fn mirror_file_square(sq: usize) -> usize {
     let rank = sq / BOARD_FILES;
     let file = sq % BOARD_FILES;

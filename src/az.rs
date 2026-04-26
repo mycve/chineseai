@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
-use std::time::Instant;
 
 mod alphazero;
 mod play;
@@ -13,11 +12,11 @@ use crate::nnue::{HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, extract_sparse_feat
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
-    AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search, alphazero_search_with_history,
-    alphazero_search_with_history_and_root_moves, alphazero_search_with_history_and_rules,
+    AzCandidate, AzGumbelConfig, AzSearchAlgorithm, AzSearchLimits, AzSearchResult,
+    alphazero_search, alphazero_search_with_history_and_rules,
 };
 pub use play::{
-    AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data, play_arena_games,
+    AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions,
 };
 pub use replay::AzExperiencePool;
@@ -164,21 +163,17 @@ pub struct AzLoopConfig {
     pub games: usize,
     pub max_plies: usize,
     pub simulations: usize,
-    pub epochs: usize,
-    pub lr: f32,
-    /// 每卡、每训练步的样本数；单步全局 batch = `batch_size × 训练用 GPU 数`
-    pub batch_size: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
     pub temperature_end: f32,
     pub temperature_decay_plies: usize,
+    pub search_algorithm: AzSearchAlgorithm,
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub gumbel: AzGumbelConfig,
     pub td_lambda: f32,
-    pub replay_games: usize,
-    pub replay_samples: usize,
     pub mirror_probability: f32,
 }
 
@@ -520,18 +515,6 @@ impl AzNnue {
         };
         model.validate()?;
         Ok(model)
-    }
-
-    pub fn evaluate(
-        &self,
-        position: &Position,
-        history: &[HistoryMove],
-        moves: &[Move],
-    ) -> (f32, Vec<f32>) {
-        let mut scratch = AzEvalScratch::new(self.hidden_size);
-        let value = self.evaluate_with_scratch(position, history, moves, &mut scratch);
-        let logits = std::mem::take(&mut scratch.logits);
-        (value, logits)
     }
 
     pub(super) fn evaluate_with_scratch(
@@ -909,11 +892,7 @@ fn conv_relu_layer_dense(
     }
 }
 
-pub fn selfplay_train_iteration(model: &mut AzNnue, config: &AzLoopConfig) -> AzLoopReport {
-    selfplay_train_iteration_with_pool(model, config, None)
-}
-
-/// `batch_size` 为**每块 GPU 每步**的样本数；与配置文件中 `batch_size` 含义一致
+/// `batch_size` 为**每块 GPU 每步**的样本数；与配置文件中 `batch_size` 含义一致。
 pub fn benchmark_training(
     model: &mut AzNnue,
     sample_count: usize,
@@ -966,89 +945,6 @@ pub fn benchmark_training(
         loss: stats.loss,
         value_loss: stats.value_loss,
         policy_ce: stats.policy_ce,
-    }
-}
-
-pub fn selfplay_train_iteration_with_pool(
-    model: &mut AzNnue,
-    config: &AzLoopConfig,
-    pool: Option<&mut AzExperiencePool>,
-) -> AzLoopReport {
-    let started = Instant::now();
-    let selfplay_started = Instant::now();
-    let data = generate_selfplay_data(model, config);
-    let selfplay_seconds = selfplay_started.elapsed().as_secs_f32();
-    let mut rng = SplitMix64::new(config.seed ^ 0xA5A5_5A5A_D3C3_B4B4);
-    let generated_samples = data.samples.len();
-    let (train_data, pool_games, pool_samples) = if let Some(pool) = pool {
-        pool.add_games(data.games.clone());
-        let train_count = if config.replay_samples == 0 {
-            generated_samples
-        } else {
-            config.replay_samples
-        };
-        (
-            pool.sample_uniform_games(train_count, &mut rng),
-            pool.game_count(),
-            pool.sample_count(),
-        )
-    } else {
-        (data.samples.clone(), 0, 0)
-    };
-    let train_started = Instant::now();
-    let stats = train_samples(
-        model,
-        &train_data,
-        config.epochs,
-        config.lr,
-        config.batch_size,
-        &mut rng,
-    );
-    let train_seconds = train_started.elapsed().as_secs_f32();
-    let total_seconds = started.elapsed().as_secs_f32();
-    let train_stat_samples = stats.samples.max(1) as f32;
-    AzLoopReport {
-        games: config.games,
-        samples: generated_samples,
-        red_wins: data.red_wins,
-        black_wins: data.black_wins,
-        draws: data.draws,
-        avg_plies: if config.games == 0 {
-            0.0
-        } else {
-            data.plies_total as f32 / config.games as f32
-        },
-        loss: stats.loss,
-        value_loss: stats.value_loss,
-        value_mse: stats.value_error_sq_sum / train_stat_samples,
-        value_pred_mean: stats.value_pred_sum / train_stat_samples,
-        value_target_mean: stats.value_target_sum / train_stat_samples,
-        policy_ce: stats.policy_ce,
-        temperature_early_entropy: data.temperature_early_entropy_sum
-            / data.temperature_early_entropy_count.max(1) as f32,
-        temperature_mid_entropy: data.temperature_mid_entropy_sum
-            / data.temperature_mid_entropy_count.max(1) as f32,
-        selfplay_seconds,
-        train_seconds,
-        total_seconds,
-        games_per_second: config.games as f32 / selfplay_seconds.max(1e-6),
-        samples_per_second: generated_samples as f32 / selfplay_seconds.max(1e-6),
-        train_samples_per_second: (train_data.len() * config.epochs) as f32
-            / train_seconds.max(1e-6),
-        train_samples: train_data.len(),
-        pool_games,
-        pool_samples,
-        terminal_no_legal_moves: data.terminal.no_legal_moves,
-        terminal_red_general_missing: data.terminal.red_general_missing,
-        terminal_black_general_missing: data.terminal.black_general_missing,
-        terminal_rule_draw: data.terminal.rule_draw,
-        terminal_rule_draw_halfmove120: data.terminal.rule_draw_halfmove120,
-        terminal_rule_draw_repetition: data.terminal.rule_draw_repetition,
-        terminal_rule_draw_mutual_long_check: data.terminal.rule_draw_mutual_long_check,
-        terminal_rule_draw_mutual_long_chase: data.terminal.rule_draw_mutual_long_chase,
-        terminal_rule_win_red: data.terminal.rule_win_red,
-        terminal_rule_win_black: data.terminal.rule_win_black,
-        terminal_max_plies: data.terminal.max_plies,
     }
 }
 
@@ -1107,16 +1003,6 @@ fn scalar_value_from_logits(logits: &[f32]) -> (f32, Vec<f32>) {
         return (0.0, probs);
     }
     (probs[0] - probs[2], probs)
-}
-
-#[allow(dead_code)]
-fn scalar_to_wdl_target(value: f32) -> [f32; VALUE_LOGITS] {
-    let v = value.clamp(-1.0, 1.0);
-    if v >= 0.0 {
-        [v, 1.0 - v, 0.0]
-    } else {
-        [0.0, 1.0 + v, -v]
-    }
 }
 
 pub struct SplitMix64 {

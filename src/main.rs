@@ -4,15 +4,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use chineseai::{
     az::{
-        AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue, AzSearchLimits,
-        AzSelfplayData, alphazero_search, alphazero_search_with_history_and_rules,
-        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples,
+        AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport, AzNnue,
+        AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
+        alphazero_search_with_history_and_rules, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
     },
     nnue::{HISTORY_PLIES, HistoryMove},
     pikafish_match::run_vs_pikafish,
     xiangqi::{Position, RuleHistoryEntry, RuleOutcome, STARTPOS_FEN},
 };
+use serde::Deserialize;
 use std::{
     fs,
     io::{self, BufRead, BufWriter, Write},
@@ -73,7 +74,7 @@ macro_rules! ulog {
     };
 }
 
-const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.conf";
+const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
 const DEFAULT_WORKER_CAP: usize = 32;
 
@@ -141,8 +142,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     format!(
         concat!(
             "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_d{}_mxp{}_wk{}_",
-            "gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
-            "ai{}_acp{}_rda{}_ref{}_sd{}"
+            "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
+            "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
         config.simulations,
         config.batch_size,
@@ -153,6 +154,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.trunk_depth,
         config.max_plies,
         config.workers,
+        config.search_algorithm.as_str(),
         f32_slug(config.cpuct),
         f32_slug(config.temperature_start),
         f32_slug(config.temperature_end),
@@ -166,6 +168,10 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
+        config.gumbel.max_num_considered_actions,
+        f32_slug(config.gumbel.gumbel_scale),
+        f32_slug(config.gumbel.value_scale),
+        f32_slug(config.gumbel.maxvisit_init),
         config.seed,
     )
 }
@@ -269,20 +275,17 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         games: 1,
         max_plies: config.max_plies,
         simulations: config.simulations,
-        epochs: config.epochs,
-        lr: config.lr,
-        batch_size: config.batch_size,
         seed,
         workers,
         temperature_start: config.temperature_start,
         temperature_end: config.temperature_end,
         temperature_decay_plies: config.temperature_decay_plies,
+        search_algorithm: config.search_algorithm,
         cpuct: config.cpuct,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
+        gumbel: config.gumbel,
         td_lambda: config.td_lambda,
-        replay_games: config.replay_games,
-        replay_samples: config.replay_samples,
         mirror_probability: config.mirror_probability,
     }
 }
@@ -528,7 +531,19 @@ fn main() {
                 .and_then(|value| value.parse::<f32>().ok())
                 .unwrap_or(1.5)
                 .max(0.0);
-            let fen = args.collect::<Vec<_>>().join(" ");
+            let mut rest = args.collect::<Vec<_>>();
+            let algorithm = rest
+                .first()
+                .and_then(|value| AzSearchAlgorithm::parse(value))
+                .unwrap_or(AzSearchAlgorithm::AlphaZero);
+            if rest
+                .first()
+                .and_then(|value| AzSearchAlgorithm::parse(value))
+                .is_some()
+            {
+                rest.remove(0);
+            }
+            let fen = rest.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
@@ -540,14 +555,16 @@ fn main() {
                     simulations,
                     seed: 0,
                     cpuct,
-                    workers: 1,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
+                    algorithm,
+                    gumbel: AzGumbelConfig::default(),
                 },
             );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
+            println!("search   : {}", algorithm.as_str());
             println!("cpuct    : {cpuct}");
             println!("value_cp : {}", result.value_cp);
             println!(
@@ -606,7 +623,19 @@ fn main() {
                 .and_then(|value| value.parse::<f32>().ok())
                 .unwrap_or(1.5)
                 .max(0.0);
-            let fen = args.collect::<Vec<_>>().join(" ");
+            let mut rest = args.collect::<Vec<_>>();
+            let algorithm = rest
+                .first()
+                .and_then(|value| AzSearchAlgorithm::parse(value))
+                .unwrap_or(AzSearchAlgorithm::AlphaZero);
+            if rest
+                .first()
+                .and_then(|value| AzSearchAlgorithm::parse(value))
+                .is_some()
+            {
+                rest.remove(0);
+            }
+            let fen = rest.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
@@ -619,9 +648,10 @@ fn main() {
                     simulations,
                     seed: 0,
                     cpuct,
-                    workers: 1,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
+                    algorithm,
+                    gumbel: AzGumbelConfig::default(),
                 },
             );
 
@@ -636,9 +666,10 @@ fn main() {
                         simulations,
                         seed: iteration as u64,
                         cpuct,
-                        workers: 1,
                         root_dirichlet_alpha: 0.0,
                         root_exploration_fraction: 0.0,
+                        algorithm,
+                        gumbel: AzGumbelConfig::default(),
                     },
                 );
                 total_sims += result.simulations;
@@ -651,6 +682,7 @@ fn main() {
             println!("fen          : {}", position.to_fen());
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
+            println!("search       : {}", algorithm.as_str());
             println!("cpuct        : {cpuct}");
             println!("total_sims   : {total_sims}");
             println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
@@ -803,8 +835,9 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
+                config.search_algorithm.as_str(),
                 config.simulations,
                 config.selfplay_batch_games,
                 config.epochs,
@@ -818,6 +851,12 @@ fn main() {
                 config.temperature_end,
                 config.temperature_decay_plies,
                 config.cpuct,
+                config.gumbel.max_num_considered_actions,
+                config.gumbel.gumbel_scale,
+                config.gumbel.value_scale,
+                config.gumbel.maxvisit_init,
+                config.gumbel.rescale_values,
+                config.gumbel.use_mixed_value,
                 config.trunk_depth,
                 config.td_lambda,
                 config.replay_games,
@@ -933,7 +972,9 @@ fn main() {
                     let Some(pool) = trainer_pool.as_mut() else {
                         continue;
                     };
-                    if pool.sample_count() < global_training_step_sample_count(trainer_config.batch_size) {
+                    if pool.sample_count()
+                        < global_training_step_sample_count(trainer_config.batch_size)
+                    {
                         continue;
                     }
                     let mut rng = chineseai::az::SplitMix64::new(
@@ -1613,9 +1654,13 @@ fn print_help() {
     println!("moves : {}", position.legal_moves().len());
     println!("hint  : cargo run --release -- az-init 128 chineseai.nnue 20260409 2");
     println!("hint  : cargo run --release -- uci");
-    println!("hint  : cargo run --release -- az-search chineseai.nnue 10000 32 1.5 startpos");
+    println!(
+        "hint  : cargo run --release -- az-search chineseai.nnue 10000 1.5 gumbel_alphazero startpos"
+    );
     println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
-    println!("hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # 其中 1024=每卡 batch");
+    println!(
+        "hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # 其中 1024=每卡 batch"
+    );
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
     println!(
         "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <eval_fens_path> <seed>"
@@ -1642,9 +1687,11 @@ struct AzLoopFileConfig {
     temperature_start: f32,
     temperature_end: f32,
     temperature_decay_plies: usize,
+    search_algorithm: AzSearchAlgorithm,
     cpuct: f32,
     root_dirichlet_alpha: f32,
     root_exploration_fraction: f32,
+    gumbel: AzGumbelConfig,
     td_lambda: f32,
     replay_games: usize,
     replay_samples: usize,
@@ -1678,9 +1725,11 @@ impl Default for AzLoopFileConfig {
             temperature_start: 1.0,
             temperature_end: 0.1,
             temperature_decay_plies: 40,
+            search_algorithm: AzSearchAlgorithm::AlphaZero,
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
+            gumbel: AzGumbelConfig::default(),
             td_lambda: 0.75,
             replay_games: 5000,
             replay_samples: 0,
@@ -1693,6 +1742,165 @@ impl Default for AzLoopFileConfig {
             arena_cpuct: 1.5,
             arena_processes: default_workers,
             tensorboard_logdir: "runs/chineseai".into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AzLoopTomlConfig {
+    model_path: Option<String>,
+    simulations: Option<usize>,
+    selfplay_batch_games: Option<usize>,
+    epochs: Option<usize>,
+    lr: Option<f32>,
+    batch_size: Option<usize>,
+    max_sample_train_count: Option<usize>,
+    max_plies: Option<usize>,
+    hidden_size: Option<usize>,
+    trunk_depth: Option<usize>,
+    seed: Option<u64>,
+    workers: Option<usize>,
+    temperature_start: Option<f32>,
+    temperature_end: Option<f32>,
+    temperature_decay_plies: Option<usize>,
+    search_algorithm: Option<String>,
+    cpuct: Option<f32>,
+    root_dirichlet_alpha: Option<f32>,
+    root_exploration_fraction: Option<f32>,
+    gumbel_max_num_considered_actions: Option<usize>,
+    gumbel_scale: Option<f32>,
+    gumbel_value_scale: Option<f32>,
+    gumbel_maxvisit_init: Option<f32>,
+    gumbel_rescale_values: Option<bool>,
+    gumbel_use_mixed_value: Option<bool>,
+    td_lambda: Option<f32>,
+    replay_games: Option<usize>,
+    replay_samples: Option<usize>,
+    mirror_probability: Option<f32>,
+    checkpoint_interval: Option<usize>,
+    checkpoint_dir: Option<String>,
+    max_checkpoints: Option<usize>,
+    arena_interval: Option<usize>,
+    arena_games_per_side: Option<usize>,
+    arena_cpuct: Option<f32>,
+    arena_processes: Option<usize>,
+    tensorboard_logdir: Option<String>,
+}
+
+impl AzLoopTomlConfig {
+    fn apply_to(self, config: &mut AzLoopFileConfig) {
+        if let Some(value) = self.model_path {
+            config.model_path = value;
+        }
+        if let Some(value) = self.simulations {
+            config.simulations = value;
+        }
+        if let Some(value) = self.selfplay_batch_games {
+            config.selfplay_batch_games = value;
+        }
+        if let Some(value) = self.epochs {
+            config.epochs = value;
+        }
+        if let Some(value) = self.lr {
+            config.lr = value;
+        }
+        if let Some(value) = self.batch_size {
+            config.batch_size = value;
+        }
+        if let Some(value) = self.max_sample_train_count {
+            config.max_sample_train_count = value;
+        }
+        if let Some(value) = self.max_plies {
+            config.max_plies = value;
+        }
+        if let Some(value) = self.hidden_size {
+            config.hidden_size = value;
+        }
+        if let Some(value) = self.trunk_depth {
+            config.trunk_depth = value;
+        }
+        if let Some(value) = self.seed {
+            config.seed = value;
+        }
+        if let Some(value) = self.workers {
+            config.workers = value;
+        }
+        if let Some(value) = self.temperature_start {
+            config.temperature_start = value;
+        }
+        if let Some(value) = self.temperature_end {
+            config.temperature_end = value;
+        }
+        if let Some(value) = self.temperature_decay_plies {
+            config.temperature_decay_plies = value;
+        }
+        if let Some(value) = self.search_algorithm {
+            config.search_algorithm = AzSearchAlgorithm::parse(&value)
+                .unwrap_or_else(|| panic!("invalid search_algorithm `{value}`"));
+        }
+        if let Some(value) = self.cpuct {
+            config.cpuct = value;
+        }
+        if let Some(value) = self.root_dirichlet_alpha {
+            config.root_dirichlet_alpha = value;
+        }
+        if let Some(value) = self.root_exploration_fraction {
+            config.root_exploration_fraction = value;
+        }
+        if let Some(value) = self.gumbel_max_num_considered_actions {
+            config.gumbel.max_num_considered_actions = value;
+        }
+        if let Some(value) = self.gumbel_scale {
+            config.gumbel.gumbel_scale = value;
+        }
+        if let Some(value) = self.gumbel_value_scale {
+            config.gumbel.value_scale = value;
+        }
+        if let Some(value) = self.gumbel_maxvisit_init {
+            config.gumbel.maxvisit_init = value;
+        }
+        if let Some(value) = self.gumbel_rescale_values {
+            config.gumbel.rescale_values = value;
+        }
+        if let Some(value) = self.gumbel_use_mixed_value {
+            config.gumbel.use_mixed_value = value;
+        }
+        if let Some(value) = self.td_lambda {
+            config.td_lambda = value;
+        }
+        if let Some(value) = self.replay_games {
+            config.replay_games = value;
+        }
+        if let Some(value) = self.replay_samples {
+            config.replay_samples = value;
+        }
+        if let Some(value) = self.mirror_probability {
+            config.mirror_probability = value;
+        }
+        if let Some(value) = self.checkpoint_interval {
+            config.checkpoint_interval = value;
+        }
+        if let Some(value) = self.checkpoint_dir {
+            config.checkpoint_dir = value;
+        }
+        if let Some(value) = self.max_checkpoints {
+            config.max_checkpoints = value;
+        }
+        if let Some(value) = self.arena_interval {
+            config.arena_interval = value;
+        }
+        if let Some(value) = self.arena_games_per_side {
+            config.arena_games_per_side = value;
+        }
+        if let Some(value) = self.arena_cpuct {
+            config.arena_cpuct = value;
+        }
+        if let Some(value) = self.arena_processes {
+            config.arena_processes = value;
+        }
+        if let Some(value) = self.tensorboard_logdir {
+            config.tensorboard_logdir = value;
         }
     }
 }
@@ -1756,14 +1964,18 @@ impl AzLoopFileConfig {
 #   max_checkpoints keeps only the newest N checkpoint files in checkpoint_dir.
 #   arena_interval runs current-vs-best evaluation every N updates.
 #   arena_games_per_side=50 means 50 games as Red and 50 as Black.
-#   cpuct: PUCT exploration constant used by AlphaZero MCTS.
-#   root_dirichlet_alpha / root_exploration_fraction: self-play root-only Dirichlet noise.
-#   Set either to 0 to disable root noise.
+#   search_algorithm="alphazero" keeps the original PUCT search; "gumbel_alphazero" uses
+#   mctx-style root Gumbel top-k, Sequential Halving, deterministic interior selection, and
+#   softmax(policy_logits + completed_qvalues) policy targets.
+#   cpuct/root_dirichlet_* are used only by AlphaZero self-play search.
+#   gumbel_* follows mctx defaults: max_num_considered_actions=16, gumbel_scale=1.0,
+#   value_scale=0.1, maxvisit_init=50.0, rescale_values=true, use_mixed_value=true.
+#   For perfect-information eval you can set gumbel_scale=0.0.
 #   arena_cpuct applies during arena search.
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, … so TensorBoard Web can compare experiments side by side.
 
-model_path = {model_path}
+model_path = "{model_path}"
 simulations = {simulations}
 selfplay_batch_games = {selfplay_batch_games}
 epochs = {epochs}
@@ -1778,21 +1990,28 @@ workers = {workers}
 temperature_start = {temperature_start}
 temperature_end = {temperature_end}
 temperature_decay_plies = {temperature_decay_plies}
+search_algorithm = "{search_algorithm}"
 cpuct = {cpuct}
 root_dirichlet_alpha = {root_dirichlet_alpha}
 root_exploration_fraction = {root_exploration_fraction}
+gumbel_max_num_considered_actions = {gumbel_max_num_considered_actions}
+gumbel_scale = {gumbel_scale}
+gumbel_value_scale = {gumbel_value_scale}
+gumbel_maxvisit_init = {gumbel_maxvisit_init}
+gumbel_rescale_values = {gumbel_rescale_values}
+gumbel_use_mixed_value = {gumbel_use_mixed_value}
 td_lambda = {td_lambda}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
 checkpoint_interval = {checkpoint_interval}
-checkpoint_dir = {checkpoint_dir}
+checkpoint_dir = "{checkpoint_dir}"
 max_checkpoints = {max_checkpoints}
 arena_interval = {arena_interval}
 arena_games_per_side = {arena_games_per_side}
 arena_cpuct = {arena_cpuct}
 arena_processes = {arena_processes}
-tensorboard_logdir = {tensorboard_logdir}
+tensorboard_logdir = "{tensorboard_logdir}"
 "#,
             model_path = self.model_path,
             simulations = self.simulations,
@@ -1809,9 +2028,16 @@ tensorboard_logdir = {tensorboard_logdir}
             temperature_start = self.temperature_start,
             temperature_end = self.temperature_end,
             temperature_decay_plies = self.temperature_decay_plies,
+            search_algorithm = self.search_algorithm.as_str(),
             cpuct = self.cpuct,
             root_dirichlet_alpha = self.root_dirichlet_alpha,
             root_exploration_fraction = self.root_exploration_fraction,
+            gumbel_max_num_considered_actions = self.gumbel.max_num_considered_actions,
+            gumbel_scale = self.gumbel.gumbel_scale,
+            gumbel_value_scale = self.gumbel.value_scale,
+            gumbel_maxvisit_init = self.gumbel.maxvisit_init,
+            gumbel_rescale_values = self.gumbel.rescale_values,
+            gumbel_use_mixed_value = self.gumbel.use_mixed_value,
             td_lambda = self.td_lambda,
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
@@ -1829,83 +2055,10 @@ tensorboard_logdir = {tensorboard_logdir}
 
     fn parse(text: &str) -> Self {
         let mut config = Self::default();
-        for line in text.lines() {
-            let line = line.split('#').next().unwrap_or_default().trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            config.set(key.trim(), value.trim());
-        }
+        toml::from_str::<AzLoopTomlConfig>(text)
+            .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"))
+            .apply_to(&mut config);
         config.normalize()
-    }
-
-    fn set(&mut self, key: &str, value: &str) {
-        match key {
-            "model_path" => self.model_path = value.to_string(),
-            "simulations" => self.simulations = parse_config_value(value, self.simulations),
-            "selfplay_batch_games" => {
-                self.selfplay_batch_games = parse_config_value(value, self.selfplay_batch_games)
-            }
-            "epochs" => self.epochs = parse_config_value(value, self.epochs),
-            "lr" => self.lr = parse_config_value(value, self.lr),
-            "batch_size" => self.batch_size = parse_config_value(value, self.batch_size),
-            "max_sample_train_count" => {
-                self.max_sample_train_count = parse_config_value(value, self.max_sample_train_count)
-            }
-            "max_plies" => self.max_plies = parse_config_value(value, self.max_plies),
-            "hidden_size" => self.hidden_size = parse_config_value(value, self.hidden_size),
-            "trunk_depth" => self.trunk_depth = parse_config_value(value, self.trunk_depth),
-            "seed" => self.seed = parse_config_value(value, self.seed),
-            "workers" => self.workers = parse_config_value(value, self.workers),
-            "temperature_start" => {
-                self.temperature_start = parse_config_value(value, self.temperature_start)
-            }
-            "temperature_end" => {
-                self.temperature_end = parse_config_value(value, self.temperature_end)
-            }
-            "temperature_decay_plies" => {
-                self.temperature_decay_plies =
-                    parse_config_value(value, self.temperature_decay_plies)
-            }
-            "cpuct" => self.cpuct = parse_config_value(value, self.cpuct),
-            "root_dirichlet_alpha" => {
-                self.root_dirichlet_alpha = parse_config_value(value, self.root_dirichlet_alpha)
-            }
-            "root_exploration_fraction" => {
-                self.root_exploration_fraction =
-                    parse_config_value(value, self.root_exploration_fraction)
-            }
-            "td_lambda" => self.td_lambda = parse_config_value(value, self.td_lambda),
-            "replay_games" => self.replay_games = parse_config_value(value, self.replay_games),
-            "replay_samples" => {
-                self.replay_samples = parse_config_value(value, self.replay_samples)
-            }
-            "mirror_probability" => {
-                self.mirror_probability = parse_config_value(value, self.mirror_probability)
-            }
-            "checkpoint_interval" => {
-                self.checkpoint_interval = parse_config_value(value, self.checkpoint_interval)
-            }
-            "checkpoint_dir" => self.checkpoint_dir = value.to_string(),
-            "max_checkpoints" => {
-                self.max_checkpoints = parse_config_value(value, self.max_checkpoints)
-            }
-            "arena_interval" => {
-                self.arena_interval = parse_config_value(value, self.arena_interval)
-            }
-            "arena_games_per_side" => {
-                self.arena_games_per_side = parse_config_value(value, self.arena_games_per_side)
-            }
-            "arena_cpuct" => self.arena_cpuct = parse_config_value(value, self.arena_cpuct),
-            "arena_processes" => {
-                self.arena_processes = parse_config_value(value, self.arena_processes)
-            }
-            "tensorboard_logdir" => self.tensorboard_logdir = value.to_string(),
-            _ => {}
-        }
     }
 
     fn normalize(mut self) -> Self {
@@ -1922,6 +2075,10 @@ tensorboard_logdir = {tensorboard_logdir}
         self.cpuct = self.cpuct.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.gumbel.max_num_considered_actions = self.gumbel.max_num_considered_actions.max(1);
+        self.gumbel.gumbel_scale = self.gumbel.gumbel_scale.max(0.0);
+        self.gumbel.value_scale = self.gumbel.value_scale.max(0.0);
+        self.gumbel.maxvisit_init = self.gumbel.maxvisit_init.max(0.0);
         self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
@@ -1948,10 +2105,6 @@ fn load_or_create_az_loop_config(path: &str) -> Option<AzLoopFileConfig> {
     Some(AzLoopFileConfig::parse(&text))
 }
 
-fn parse_config_value<T: std::str::FromStr>(text: &str, default: T) -> T {
-    text.parse::<T>().unwrap_or(default)
-}
-
 #[derive(Clone, Debug)]
 struct UciState {
     position: Position,
@@ -1962,6 +2115,8 @@ struct UciState {
     simulations: usize,
     threads: usize,
     cpuct: f32,
+    search_algorithm: AzSearchAlgorithm,
+    gumbel: AzGumbelConfig,
     policy_debug: bool,
     policy_debug_limit: usize,
     seed: u64,
@@ -1978,6 +2133,8 @@ impl Default for UciState {
             simulations: 10_000,
             threads: 1,
             cpuct: 1.5,
+            search_algorithm: AzSearchAlgorithm::AlphaZero,
+            gumbel: AzGumbelConfig::default(),
             policy_debug: false,
             policy_debug_limit: 16,
             seed: 20260409,
@@ -2033,6 +2190,11 @@ fn print_uci_id() {
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name Cpuct type string default 1.5");
+    println!(
+        "option name SearchAlgorithm type combo default alphazero var alphazero var gumbel_alphazero"
+    );
+    println!("option name GumbelMaxActions type spin default 16 min 1 max 512");
+    println!("option name GumbelScale type string default 1.0");
     println!("option name PolicyDebug type check default false");
     println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
@@ -2081,6 +2243,23 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         }
         "cpuct" => {
             state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
+        }
+        "searchalgorithm" => {
+            if let Some(algorithm) = AzSearchAlgorithm::parse(&value) {
+                state.search_algorithm = algorithm;
+            }
+        }
+        "gumbelmaxactions" => {
+            state.gumbel.max_num_considered_actions = value
+                .parse::<usize>()
+                .unwrap_or(state.gumbel.max_num_considered_actions)
+                .clamp(1, 512);
+        }
+        "gumbelscale" => {
+            state.gumbel.gumbel_scale = value
+                .parse::<f32>()
+                .unwrap_or(state.gumbel.gumbel_scale)
+                .max(0.0);
         }
         "policydebug" => {
             state.policy_debug = matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on");
@@ -2272,9 +2451,10 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,
-            workers: 1,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
+            algorithm: state.search_algorithm,
+            gumbel: state.gumbel,
         },
     );
     state.seed = state.seed.wrapping_add(1);

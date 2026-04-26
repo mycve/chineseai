@@ -6,7 +6,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
+use crate::az::{
+    AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
+    alphazero_search_with_history_and_rules,
+};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
@@ -240,9 +243,10 @@ fn play_one_game(
                     simulations,
                     seed,
                     cpuct: VS_PIKAFISH_CPUCT,
-                    workers: 1,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
+                    algorithm: AzSearchAlgorithm::AlphaZero,
+                    gumbel: AzGumbelConfig::default(),
                 },
             );
             seed = seed.wrapping_add(1);

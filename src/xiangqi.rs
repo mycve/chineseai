@@ -345,21 +345,6 @@ impl Position {
         self.halfmove_clock
     }
 
-    #[inline(always)]
-    pub fn cached_base_eval(&self) -> i32 {
-        self.base_eval
-    }
-
-    #[inline(always)]
-    pub fn advisor_count(&self, color: Color) -> u8 {
-        self.advisor_counts[color_hash_index(color)]
-    }
-
-    #[inline(always)]
-    pub fn elephant_count(&self, color: Color) -> u8 {
-        self.elephant_counts[color_hash_index(color)]
-    }
-
     pub fn is_piece_protected(&self, sq: usize, color: Color) -> bool {
         self.visit_attacker_origins_to(sq, color, |from| from != sq)
     }
@@ -408,38 +393,6 @@ impl Position {
         });
 
         legal
-    }
-
-    pub fn least_valuable_legal_capture_to(&self, target: usize) -> Option<Move> {
-        let Some(target_piece) = self.board.get(target).and_then(|piece| *piece) else {
-            return None;
-        };
-        if target_piece.color == self.side_to_move {
-            return None;
-        }
-
-        let mut best = None;
-        let mut best_value = i32::MAX;
-        let mut work = self.clone();
-        self.visit_attacker_origins_to(target, self.side_to_move, |from| {
-            let Some(attacker) = self.board[from] else {
-                return false;
-            };
-            let mv = Move::new(from, target);
-            let undo = work.make_move(mv);
-            let legal = !work.in_check(self.side_to_move);
-            work.unmake_move(mv, undo);
-            if legal {
-                let value = piece_base_value(attacker.kind);
-                if value < best_value {
-                    best_value = value;
-                    best = Some(mv);
-                }
-            }
-            false
-        });
-
-        best
     }
 
     pub fn initial_rule_history(&self) -> Vec<RuleHistoryEntry> {

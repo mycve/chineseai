@@ -5,14 +5,64 @@ use super::{AzEvalScratch, AzNnue, SplitMix64, VALUE_SCALE_CP};
 
 const DEFAULT_CPUCT: f32 = 1.5;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AzSearchAlgorithm {
+    #[default]
+    AlphaZero,
+    GumbelAlphaZero,
+}
+
+impl AzSearchAlgorithm {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "alphazero" | "alpha_zero" | "puct" => Some(Self::AlphaZero),
+            "gumbel" | "gumbel_alphazero" | "gumbel-alpha-zero" | "gumbel_alpha_zero" => {
+                Some(Self::GumbelAlphaZero)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlphaZero => "alphazero",
+            Self::GumbelAlphaZero => "gumbel_alphazero",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AzGumbelConfig {
+    pub max_num_considered_actions: usize,
+    pub gumbel_scale: f32,
+    pub value_scale: f32,
+    pub maxvisit_init: f32,
+    pub rescale_values: bool,
+    pub use_mixed_value: bool,
+}
+
+impl Default for AzGumbelConfig {
+    fn default() -> Self {
+        Self {
+            max_num_considered_actions: 16,
+            gumbel_scale: 1.0,
+            value_scale: 0.1,
+            maxvisit_init: 50.0,
+            rescale_values: true,
+            use_mixed_value: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
     pub seed: u64,
     pub cpuct: f32,
-    pub workers: usize,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub algorithm: AzSearchAlgorithm,
+    pub gumbel: AzGumbelConfig,
 }
 
 impl Default for AzSearchLimits {
@@ -21,9 +71,10 @@ impl Default for AzSearchLimits {
             simulations: 10_000,
             seed: 0,
             cpuct: DEFAULT_CPUCT,
-            workers: 1,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
+            algorithm: AzSearchAlgorithm::AlphaZero,
+            gumbel: AzGumbelConfig::default(),
         }
     }
 }
@@ -84,34 +135,19 @@ pub fn alphazero_search_with_history_and_rules(
     } else {
         root_node.value
     };
-    let total_visits = root_node
-        .children
-        .iter()
-        .map(|child| child.visits as f32)
-        .sum::<f32>()
-        .max(1.0);
+    let policy = tree.root_policy(root);
     let mut candidates = root_node
         .children
         .iter()
-        .map(|child| AzCandidate {
+        .zip(policy)
+        .map(|(child, policy)| AzCandidate {
             mv: child.mv,
             visits: child.visits,
             q: child.q(),
             prior: child.prior,
-            policy: child.visits as f32 / total_visits,
+            policy,
         })
         .collect::<Vec<_>>();
-    if root_node.children.iter().all(|child| child.visits == 0) {
-        let total_prior = root_node
-            .children
-            .iter()
-            .map(|child| child.prior)
-            .sum::<f32>()
-            .max(1e-12);
-        for candidate in &mut candidates {
-            candidate.policy = candidate.prior / total_prior;
-        }
-    }
     candidates.sort_by(|left, right| {
         right
             .policy
@@ -136,26 +172,7 @@ pub fn alphazero_search(
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    alphazero_search_with_history(position, &[], model, limits)
-}
-
-pub fn alphazero_search_with_history(
-    position: &Position,
-    history: &[HistoryMove],
-    model: &AzNnue,
-    limits: AzSearchLimits,
-) -> AzSearchResult {
-    alphazero_search_with_history_and_rules(position, history, None, None, model, limits)
-}
-
-pub fn alphazero_search_with_history_and_root_moves(
-    position: &Position,
-    history: &[HistoryMove],
-    root_moves: Option<Vec<Move>>,
-    model: &AzNnue,
-    limits: AzSearchLimits,
-) -> AzSearchResult {
-    alphazero_search_with_history_and_rules(position, history, None, root_moves, model, limits)
+    alphazero_search_with_history_and_rules(position, &[], None, None, model, limits)
 }
 
 struct AzTree<'a> {
@@ -167,6 +184,10 @@ struct AzTree<'a> {
     root_dirichlet_alpha: f32,
     root_exploration_fraction: f32,
     root_noise_seed: u64,
+    algorithm: AzSearchAlgorithm,
+    gumbel: AzGumbelConfig,
+    root_gumbels: Vec<f32>,
+    root_considered_visits: Vec<u32>,
     eval_scratch: AzEvalScratch,
 }
 
@@ -184,6 +205,7 @@ struct AzNode {
 #[derive(Clone)]
 struct AzChild {
     mv: Move,
+    logit: f32,
     prior: f32,
     visits: u32,
     value_sum: f32,
@@ -233,6 +255,17 @@ impl<'a> AzTree<'a> {
             root_dirichlet_alpha: limits.root_dirichlet_alpha.max(0.0),
             root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
             root_noise_seed: limits.seed,
+            algorithm: limits.algorithm,
+            gumbel: AzGumbelConfig {
+                max_num_considered_actions: limits.gumbel.max_num_considered_actions.max(1),
+                gumbel_scale: limits.gumbel.gumbel_scale.max(0.0),
+                value_scale: limits.gumbel.value_scale.max(0.0),
+                maxvisit_init: limits.gumbel.maxvisit_init.max(0.0),
+                rescale_values: limits.gumbel.rescale_values,
+                use_mixed_value: limits.gumbel.use_mixed_value,
+            },
+            root_gumbels: Vec::new(),
+            root_considered_visits: Vec::new(),
             eval_scratch: AzEvalScratch::new(model.hidden_size),
         }
     }
@@ -276,16 +309,17 @@ impl<'a> AzTree<'a> {
             &moves,
             &mut self.eval_scratch,
         );
-        let mut priors = softmax_into(
+        let priors = softmax_into(
             &self.eval_scratch.logits[..moves.len()],
             &mut self.eval_scratch.priors,
         );
         if node_index == self.root
+            && self.algorithm == AzSearchAlgorithm::AlphaZero
             && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
         {
             apply_root_dirichlet_noise(
-                &mut priors,
+                priors,
                 self.root_dirichlet_alpha,
                 self.root_exploration_fraction,
                 self.root_noise_seed,
@@ -294,14 +328,30 @@ impl<'a> AzTree<'a> {
         self.nodes[node_index].children = moves
             .into_iter()
             .zip(priors.drain(..))
-            .map(|(mv, prior)| AzChild {
+            .enumerate()
+            .map(|(index, (mv, prior))| AzChild {
                 mv,
+                logit: self.eval_scratch.logits[index],
                 prior,
                 visits: 0,
                 value_sum: 0.0,
                 child: None,
             })
             .collect();
+        if node_index == self.root && self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
+            self.root_gumbels = sample_gumbels(
+                self.nodes[node_index].children.len(),
+                self.gumbel.gumbel_scale,
+                self.root_noise_seed,
+            );
+            let considered = self
+                .gumbel
+                .max_num_considered_actions
+                .min(self.nodes[node_index].children.len())
+                .max(1);
+            self.root_considered_visits =
+                sequence_of_considered_visits(considered, self.nodes.capacity().saturating_sub(1));
+        }
         self.nodes[node_index].value = value;
         self.nodes[node_index].expanded = true;
         value
@@ -366,6 +416,13 @@ impl<'a> AzTree<'a> {
     }
 
     fn select_child(&self, node_index: usize) -> usize {
+        if self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
+            if node_index == self.root {
+                return self.select_gumbel_root_child(node_index);
+            }
+            return self.select_gumbel_interior_child(node_index);
+        }
+
         let parent_visits_sqrt = (self.nodes[node_index].visits.max(1) as f32).sqrt();
         self.nodes[node_index]
             .children
@@ -384,6 +441,9 @@ impl<'a> AzTree<'a> {
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
+        if self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
+            return self.best_gumbel_root_child(node_index);
+        }
         self.nodes[node_index]
             .children
             .iter()
@@ -398,10 +458,266 @@ impl<'a> AzTree<'a> {
             })
             .map(|(index, _)| index)
     }
+
+    fn select_gumbel_root_child(&self, node_index: usize) -> usize {
+        let simulation_index = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.visits as usize)
+            .sum::<usize>();
+        let considered_visit = self
+            .root_considered_visits
+            .get(simulation_index)
+            .copied()
+            .unwrap_or_else(|| {
+                self.nodes[node_index]
+                    .children
+                    .iter()
+                    .map(|child| child.visits)
+                    .max()
+                    .unwrap_or(0)
+            });
+        let completed_qvalues = self.completed_qvalues(node_index);
+        let normalized_logits = normalized_child_logits(&self.nodes[node_index].children);
+        self.nodes[node_index]
+            .children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.visits == considered_visit)
+            .max_by(|(left_index, left_child), (right_index, right_child)| {
+                let left_score = gumbel_score(
+                    self.root_gumbels.get(*left_index).copied().unwrap_or(0.0),
+                    normalized_logits[*left_index],
+                    completed_qvalues[*left_index],
+                );
+                let right_score = gumbel_score(
+                    self.root_gumbels.get(*right_index).copied().unwrap_or(0.0),
+                    normalized_logits[*right_index],
+                    completed_qvalues[*right_index],
+                );
+                left_score
+                    .total_cmp(&right_score)
+                    .then_with(|| left_child.prior.total_cmp(&right_child.prior))
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    fn select_gumbel_interior_child(&self, node_index: usize) -> usize {
+        let completed_qvalues = self.completed_qvalues(node_index);
+        let probs =
+            softmax_logits_plus_values(&self.nodes[node_index].children, &completed_qvalues);
+        let total_visits = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.visits as f32)
+            .sum::<f32>();
+        self.nodes[node_index]
+            .children
+            .iter()
+            .enumerate()
+            .max_by(|(left_index, left_child), (right_index, right_child)| {
+                let left_score =
+                    probs[*left_index] - left_child.visits as f32 / (1.0 + total_visits);
+                let right_score =
+                    probs[*right_index] - right_child.visits as f32 / (1.0 + total_visits);
+                left_score
+                    .total_cmp(&right_score)
+                    .then_with(|| left_child.prior.total_cmp(&right_child.prior))
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    fn best_gumbel_root_child(&self, node_index: usize) -> Option<usize> {
+        let considered_visit = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.visits)
+            .max()
+            .unwrap_or(0);
+        let completed_qvalues = self.completed_qvalues(node_index);
+        let normalized_logits = normalized_child_logits(&self.nodes[node_index].children);
+        self.nodes[node_index]
+            .children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.visits == considered_visit)
+            .max_by(|(left_index, left_child), (right_index, right_child)| {
+                let left_score = gumbel_score(
+                    self.root_gumbels.get(*left_index).copied().unwrap_or(0.0),
+                    normalized_logits[*left_index],
+                    completed_qvalues[*left_index],
+                );
+                let right_score = gumbel_score(
+                    self.root_gumbels.get(*right_index).copied().unwrap_or(0.0),
+                    normalized_logits[*right_index],
+                    completed_qvalues[*right_index],
+                );
+                left_score
+                    .total_cmp(&right_score)
+                    .then_with(|| left_child.visits.cmp(&right_child.visits))
+                    .then_with(|| left_child.prior.total_cmp(&right_child.prior))
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn root_policy(&self, node_index: usize) -> Vec<f32> {
+        if self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
+            let completed_qvalues = self.completed_qvalues(node_index);
+            return softmax_logits_plus_values(
+                &self.nodes[node_index].children,
+                &completed_qvalues,
+            );
+        }
+
+        let total_visits = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.visits as f32)
+            .sum::<f32>()
+            .max(1.0);
+        if self.nodes[node_index]
+            .children
+            .iter()
+            .any(|child| child.visits > 0)
+        {
+            return self.nodes[node_index]
+                .children
+                .iter()
+                .map(|child| child.visits as f32 / total_visits)
+                .collect();
+        }
+
+        let total_prior = self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.prior)
+            .sum::<f32>()
+            .max(1e-12);
+        self.nodes[node_index]
+            .children
+            .iter()
+            .map(|child| child.prior / total_prior)
+            .collect()
+    }
+
+    fn completed_qvalues(&self, node_index: usize) -> Vec<f32> {
+        let children = &self.nodes[node_index].children;
+        if children.is_empty() {
+            return Vec::new();
+        }
+
+        let mut prior_probs = Vec::with_capacity(children.len());
+        let max_logit = children
+            .iter()
+            .map(|child| child.logit)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut prior_sum = 0.0f32;
+        for child in children {
+            let value = (child.logit - max_logit).exp();
+            prior_probs.push(value);
+            prior_sum += value;
+        }
+        let inv_prior_sum = prior_sum.max(1e-12).recip();
+        for prior in &mut prior_probs {
+            *prior *= inv_prior_sum;
+        }
+
+        let raw_value = self.nodes[node_index].value;
+        let sum_visits = children
+            .iter()
+            .map(|child| child.visits as f32)
+            .sum::<f32>();
+        let sum_visited_prior = children
+            .iter()
+            .zip(&prior_probs)
+            .filter(|(child, _)| child.visits > 0)
+            .map(|(_, prior)| *prior)
+            .sum::<f32>()
+            .max(f32::MIN_POSITIVE);
+        let weighted_q = children
+            .iter()
+            .zip(&prior_probs)
+            .filter(|(child, _)| child.visits > 0)
+            .map(|(child, prior)| *prior * child.q() / sum_visited_prior)
+            .sum::<f32>();
+        let mixed_value = if self.gumbel.use_mixed_value {
+            (raw_value + sum_visits * weighted_q) / (sum_visits + 1.0)
+        } else {
+            raw_value
+        };
+
+        let mut completed = children
+            .iter()
+            .map(|child| {
+                if child.visits > 0 {
+                    child.q()
+                } else {
+                    mixed_value
+                }
+            })
+            .collect::<Vec<_>>();
+        if self.gumbel.rescale_values {
+            let min_value = completed.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_value = completed.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denom = (max_value - min_value).max(1e-8);
+            for value in &mut completed {
+                *value = (*value - min_value) / denom;
+            }
+        }
+        let max_visit = children.iter().map(|child| child.visits).max().unwrap_or(0) as f32;
+        let scale = (self.gumbel.maxvisit_init + max_visit) * self.gumbel.value_scale;
+        for value in &mut completed {
+            *value *= scale;
+        }
+        completed
+    }
 }
 
 fn puct_score(child: &AzChild, parent_visits_sqrt: f32, cpuct: f32) -> f32 {
     child.q() + cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32)
+}
+
+fn gumbel_score(gumbel: f32, logit: f32, completed_qvalue: f32) -> f32 {
+    (gumbel + logit + completed_qvalue).max(-1.0e9)
+}
+
+fn normalized_child_logits(children: &[AzChild]) -> Vec<f32> {
+    let max_logit = children
+        .iter()
+        .map(|child| child.logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    children
+        .iter()
+        .map(|child| child.logit - max_logit)
+        .collect()
+}
+
+fn softmax_logits_plus_values(children: &[AzChild], values: &[f32]) -> Vec<f32> {
+    if children.is_empty() {
+        return Vec::new();
+    }
+    let max_score = children
+        .iter()
+        .zip(values)
+        .map(|(child, value)| child.logit + *value)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut out = Vec::with_capacity(children.len());
+    let mut sum = 0.0f32;
+    for (child, value) in children.iter().zip(values) {
+        let probability = (child.logit + *value - max_score).exp();
+        out.push(probability);
+        sum += probability;
+    }
+    let inv_sum = sum.max(1e-12).recip();
+    for value in &mut out {
+        *value *= inv_sum;
+    }
+    out
 }
 
 fn terminal_value(position: &Position, rule_history: &[RuleHistoryEntry]) -> Option<f32> {
@@ -465,6 +781,46 @@ fn apply_root_dirichlet_noise(
     for (prior, noise_value) in priors.iter_mut().zip(noise) {
         *prior = keep * *prior + exploration_fraction * noise_value;
     }
+}
+
+fn sample_gumbels(dim: usize, scale: f32, seed: u64) -> Vec<f32> {
+    let mut rng = SplitMix64::new(seed ^ 0x9A2D_D6ED_2B7F_5A13u64 ^ dim as u64);
+    (0..dim)
+        .map(|_| {
+            let u = rng.unit_f32().clamp(1e-12, 1.0 - 1e-7);
+            (-(-(u as f64).ln()).ln()) as f32 * scale
+        })
+        .collect()
+}
+
+fn sequence_of_considered_visits(
+    max_num_considered_actions: usize,
+    num_simulations: usize,
+) -> Vec<u32> {
+    if max_num_considered_actions <= 1 {
+        return (0..num_simulations).map(|visit| visit as u32).collect();
+    }
+    let log2max = (max_num_considered_actions as f32).log2().ceil().max(1.0) as usize;
+    let mut sequence = Vec::with_capacity(num_simulations);
+    let mut visits = vec![0u32; max_num_considered_actions];
+    let mut num_considered = max_num_considered_actions;
+    while sequence.len() < num_simulations {
+        let num_extra_visits = (num_simulations / (log2max * num_considered)).max(1);
+        for _ in 0..num_extra_visits {
+            for visit in visits.iter_mut().take(num_considered) {
+                sequence.push(*visit);
+                *visit += 1;
+                if sequence.len() == num_simulations {
+                    break;
+                }
+            }
+            if sequence.len() == num_simulations {
+                break;
+            }
+        }
+        num_considered = (num_considered / 2).max(2);
+    }
+    sequence
 }
 
 fn sample_dirichlet(dim: usize, alpha: f32, seed: u64) -> Vec<f32> {
@@ -574,9 +930,10 @@ mod tests {
                 simulations: 128,
                 seed: 11,
                 cpuct: 1.5,
-                workers: 1,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                algorithm: AzSearchAlgorithm::AlphaZero,
+                gumbel: AzGumbelConfig::default(),
             },
         );
 
@@ -608,9 +965,10 @@ mod tests {
                 simulations: 1,
                 seed: 19,
                 cpuct: 1.5,
-                workers: 1,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                algorithm: AzSearchAlgorithm::AlphaZero,
+                gumbel: AzGumbelConfig::default(),
             },
         );
         let noisy = alphazero_search(
@@ -620,9 +978,10 @@ mod tests {
                 simulations: 1,
                 seed: 19,
                 cpuct: 1.5,
-                workers: 1,
                 root_dirichlet_alpha: 0.3,
                 root_exploration_fraction: 0.25,
+                algorithm: AzSearchAlgorithm::AlphaZero,
+                gumbel: AzGumbelConfig::default(),
             },
         );
 
@@ -682,6 +1041,40 @@ mod tests {
         let child_node = tree.nodes[tree.root].children[child_index].child.unwrap();
         tree.expand(child_node);
         assert_ne!(tree.nodes[child_node].children.len(), root_moves.len());
+    }
+
+    #[test]
+    fn gumbel_search_uses_improved_policy_targets() {
+        let model = AzNnue::random_with_depth(4, 1, 7);
+        let result = alphazero_search(
+            &Position::startpos(),
+            &model,
+            AzSearchLimits {
+                simulations: 64,
+                seed: 23,
+                cpuct: 1.5,
+                root_dirichlet_alpha: 0.3,
+                root_exploration_fraction: 0.25,
+                algorithm: AzSearchAlgorithm::GumbelAlphaZero,
+                gumbel: AzGumbelConfig::default(),
+            },
+        );
+
+        let total_policy = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.policy)
+            .sum::<f32>();
+
+        assert_eq!(result.simulations, 64);
+        assert!(result.best_move.is_some());
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.visits > 0)
+        );
+        assert!((total_policy - 1.0).abs() < 1e-3);
     }
 
     #[test]

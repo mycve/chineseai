@@ -206,9 +206,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     simulations: config.simulations,
                     seed: rng.next() ^ ((game_index as u64) << 32) ^ ply as u64,
                     cpuct: config.cpuct,
-                    workers: 1,
                     root_dirichlet_alpha: config.root_dirichlet_alpha,
                     root_exploration_fraction: config.root_exploration_fraction,
+                    algorithm: config.search_algorithm,
+                    gumbel: config.gumbel,
                 },
             );
             let entropy = policy_entropy(&search.candidates);
@@ -464,29 +465,6 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
         .sum()
 }
 
-pub fn play_arena_games(
-    candidate: &AzNnue,
-    baseline: &AzNnue,
-    simulations: usize,
-    max_plies: usize,
-    games_as_red: usize,
-    games_as_black: usize,
-    seed: u64,
-    cpuct: f32,
-) -> AzArenaReport {
-    play_arena_games_from_positions(
-        candidate,
-        baseline,
-        &[],
-        simulations,
-        max_plies,
-        games_as_red,
-        games_as_black,
-        seed,
-        cpuct,
-    )
-}
-
 pub fn play_arena_games_from_positions(
     candidate: &AzNnue,
     baseline: &AzNnue,
@@ -595,9 +573,10 @@ fn play_arena_game(
                 simulations,
                 seed: seed ^ ((ply as u64) << 32),
                 cpuct,
-                workers: 1,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                algorithm: Default::default(),
+                gumbel: Default::default(),
             },
         );
         let Some(mv) = result.best_move else {
