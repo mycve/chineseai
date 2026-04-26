@@ -10,12 +10,16 @@ ctrlc = "3.4"
 clap = { version = "4.5", features = ["derive"] }
 candle-core = { version = "0.10.2", features = ["cuda"] }
 candle-nn = "0.10.2"
-half = "2"
-ndarray = "0.16"
-ndarray-npy = "0.9"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-zip = "2"
+half = { version = "2", optional = true }
+ndarray = { version = "0.16", optional = true }
+ndarray-npy = { version = "0.9", optional = true }
+zip = { version = "2", optional = true }
+
+[features]
+default = []
+distill = ["dep:half", "dep:ndarray", "dep:ndarray-npy", "dep:zip"]
 
 # Enable jemalloc on Linux glibc. musl targets skip this dependency and are
 # rejected by build.rs.
@@ -26,3 +30,9 @@ tikv-jemallocator = "0.6"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true

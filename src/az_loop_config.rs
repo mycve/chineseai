@@ -3,14 +3,6 @@ use serde::Deserialize;
 use std::{fs, path::Path};
 
 pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
-const DEFAULT_WORKER_CAP: usize = 32;
-
-fn default_parallel_workers() -> usize {
-    std::thread::available_parallelism()
-        .map(|count| count.get().saturating_sub(1).max(1))
-        .map(|workers| workers.min(DEFAULT_WORKER_CAP))
-        .unwrap_or(8)
-}
 #[derive(Clone, Debug)]
 pub struct AzLoopFileConfig {
     pub model_path: String,
@@ -22,7 +14,6 @@ pub struct AzLoopFileConfig {
     pub max_sample_train_count: usize,
     pub max_plies: usize,
     pub hidden_size: usize,
-    pub trunk_depth: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -49,31 +40,33 @@ pub struct AzLoopFileConfig {
 
 impl Default for AzLoopFileConfig {
     fn default() -> Self {
-        let default_workers = default_parallel_workers();
+        let gumbel = AzGumbelConfig {
+            max_num_considered_actions: 32,
+            ..AzGumbelConfig::default()
+        };
         Self {
             model_path: "chineseai.nnue".into(),
-            simulations: 1200,
-            selfplay_batch_games: default_workers.max(1),
+            simulations: 256,
+            selfplay_batch_games: 512,
             epochs: 2,
             lr: 0.0003,
-            batch_size: 1024,
-            max_sample_train_count: 3,
+            batch_size: 2048,
+            max_sample_train_count: 2,
             max_plies: 300,
-            hidden_size: 128,
-            trunk_depth: 2,
+            hidden_size: 256,
             seed: 20260409,
-            workers: default_workers,
+            workers: 240,
             temperature_start: 1.0,
             temperature_end: 0.1,
             temperature_decay_plies: 40,
-            search_algorithm: AzSearchAlgorithm::AlphaZero,
+            search_algorithm: AzSearchAlgorithm::GumbelAlphaZero,
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
-            gumbel: AzGumbelConfig::default(),
-            td_lambda: 0.75,
-            replay_games: 5000,
-            replay_samples: 0,
+            gumbel,
+            td_lambda: 1.0,
+            replay_games: 2000,
+            replay_samples: 20000,
             mirror_probability: 0.3,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
@@ -81,7 +74,7 @@ impl Default for AzLoopFileConfig {
             arena_interval: 20,
             arena_games_per_side: 50,
             arena_cpuct: 1.5,
-            arena_processes: default_workers,
+            arena_processes: 100,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -99,7 +92,6 @@ struct AzLoopTomlConfig {
     pub max_sample_train_count: Option<usize>,
     pub max_plies: Option<usize>,
     pub hidden_size: Option<usize>,
-    pub trunk_depth: Option<usize>,
     pub seed: Option<u64>,
     pub workers: Option<usize>,
     pub temperature_start: Option<f32>,
@@ -157,9 +149,6 @@ impl AzLoopTomlConfig {
         }
         if let Some(value) = self.hidden_size {
             config.hidden_size = value;
-        }
-        if let Some(value) = self.trunk_depth {
-            config.trunk_depth = value;
         }
         if let Some(value) = self.seed {
             config.seed = value;
@@ -260,7 +249,8 @@ impl AzLoopFileConfig {
 #
 # Value targets:
 #   td_lambda mixes each position's future MCTS root values with the final game outcome.
-#   1.0 keeps pure AlphaZero-style terminal labels; 0.75 is the default.
+#   1.0 keeps pure AlphaZero-style terminal labels and is the default for this
+#   v20 policy-trunk-free net.
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
@@ -309,12 +299,20 @@ impl AzLoopFileConfig {
 #   mctx-style root Gumbel top-k, Sequential Halving, deterministic interior selection, and
 #   softmax(policy_logits + completed_qvalues) policy targets.
 #   cpuct/root_dirichlet_* are used only by AlphaZero self-play search.
-#   gumbel_* follows mctx defaults: max_num_considered_actions=16, gumbel_scale=1.0,
+#   gumbel_* follows mctx defaults except max_num_considered_actions=32 here:
+#   gumbel_scale=1.0,
 #   value_scale=0.1, maxvisit_init=50.0, rescale_values=true, use_mixed_value=true.
 #   For perfect-information eval you can set gumbel_scale=0.0.
 #   arena_cpuct applies during arena search.
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
+#
+# Model architecture:
+#   hidden_size is the runtime-tunable model width.
+#   The rest of the tensor shapes are fixed by the v20 binary architecture:
+#   policy_trunk_layers=0, cnn_channels=24, policy_condition_size=32,
+#   value_branch=128x2, value_hidden=256.
+#   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
 
 model_path = "{model_path}"
 simulations = {simulations}
@@ -325,7 +323,6 @@ batch_size = {batch_size}
 max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
-trunk_depth = {trunk_depth}
 seed = {seed}
 workers = {workers}
 temperature_start = {temperature_start}
@@ -363,7 +360,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
             max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
-            trunk_depth = self.trunk_depth,
             seed = self.seed,
             workers = self.workers,
             temperature_start = self.temperature_start,

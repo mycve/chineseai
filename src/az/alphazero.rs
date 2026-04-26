@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn alphazero_search_populates_visit_distribution() {
-        let model = AzNnue::random_with_depth(4, 1, 7);
+        let model = AzNnue::random(4, 7);
         let result = alphazero_search(
             &Position::startpos(),
             &model,
@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn dirichlet_noise_changes_root_prior_distribution() {
         let position = Position::startpos();
-        let model = AzNnue::random_with_depth(4, 1, 7);
+        let model = AzNnue::random(4, 7);
         let plain = alphazero_search(
             &position,
             &model,
@@ -787,7 +787,7 @@ mod tests {
         let position = Position::startpos();
         let legal = position.legal_moves();
         let root_moves = vec![legal[0]];
-        let model = AzNnue::random_with_depth(4, 1, 7);
+        let model = AzNnue::random(4, 7);
         let mut tree = AzTree::new(
             position,
             Vec::new(),
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn gumbel_search_uses_improved_policy_targets() {
-        let model = AzNnue::random_with_depth(4, 1, 7);
+        let model = AzNnue::random(4, 7);
         let result = alphazero_search(
             &Position::startpos(),
             &model,

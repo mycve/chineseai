@@ -8,11 +8,10 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzDistillLoadOptions, AzExperiencePool, AzGumbelConfig,
-        AzLoopConfig, AzLoopReport, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData,
-        AzTrainLossWeights, AzTrainStats, SplitMix64, alphazero_search, benchmark_training,
-        generate_selfplay_data, global_training_step_sample_count, load_distill_npz_samples,
-        play_arena_games_from_positions, train_samples, train_samples_weighted,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig,
+        AzLoopReport, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData,
+        alphazero_search, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -32,6 +31,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
+
+#[cfg(feature = "distill")]
+use chineseai::az::{
+    AzDistillLoadOptions, AzTrainLossWeights, AzTrainStats, SplitMix64, load_distill_npz_samples,
+    train_samples_weighted,
+};
 
 const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
 const DEFAULT_VS_PIKAFISH_DEPTH: u32 = 10;
@@ -63,6 +68,7 @@ enum CliCommand {
     /// Benchmark a synthetic training workload.
     AzTrainBench(AzTrainBenchArgs),
     /// Distill GNN npz policy/value shards into an AZ-NNUE model.
+    #[cfg(feature = "distill")]
     AzDistill(AzDistillArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
@@ -85,9 +91,6 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// Number of trunk layers.
-    #[arg(default_value_t = 2)]
-    trunk_depth: usize,
 }
 
 #[derive(Args, Debug)]
@@ -160,6 +163,7 @@ struct AzTrainBenchArgs {
 }
 
 #[derive(Args, Debug)]
+#[cfg(feature = "distill")]
 struct AzDistillArgs {
     /// Directory containing metadata.json and shard_*.npz.
     #[arg(default_value = "distill_data")]
@@ -173,9 +177,6 @@ struct AzDistillArgs {
     /// Hidden size used when creating a missing model.
     #[arg(long, default_value_t = 128)]
     hidden: usize,
-    /// Trunk depth used when creating a missing model.
-    #[arg(long, default_value_t = 2)]
-    trunk_depth: usize,
     /// Training epochs over all shards.
     #[arg(long, default_value_t = 1)]
     epochs: usize,
@@ -316,6 +317,7 @@ fn read_az_loop_next_update(config_path: &str) -> Option<usize> {
     None
 }
 
+#[cfg(feature = "distill")]
 fn distill_shard_paths(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(data_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -329,6 +331,7 @@ fn distill_shard_paths(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+#[cfg(feature = "distill")]
 fn add_train_stats(total: &mut AzTrainStats, stats: &AzTrainStats) {
     total.loss += stats.loss * stats.samples as f32;
     total.value_loss += stats.value_loss * stats.samples as f32;
@@ -365,7 +368,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     format!(
         concat!(
-            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_d{}_mxp{}_wk{}_",
+            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_mxp{}_wk{}_",
             "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
             "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
@@ -375,7 +378,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.epochs,
         config.max_sample_train_count,
         config.hidden_size,
-        config.trunk_depth,
         config.max_plies,
         config.workers,
         config.search_algorithm.as_str(),
@@ -700,14 +702,12 @@ fn main() {
             let hidden = cmd.hidden;
             let output = cmd.output;
             let seed = cmd.seed;
-            let trunk_depth = cmd.trunk_depth;
-            let model = AzNnue::random_with_depth(hidden, trunk_depth, seed);
+            let model = AzNnue::random(hidden, seed);
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
             println!("aznnue   : initialized (nnue binary, magic AZB1)");
             println!("hidden   : {hidden}");
-            println!("depth    : {trunk_depth}");
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
@@ -877,6 +877,7 @@ fn main() {
             println!("value_ce     : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
         }
+        #[cfg(feature = "distill")]
         Some(CliCommand::AzDistill(cmd)) => {
             let shard_paths = distill_shard_paths(&cmd.data_dir).unwrap_or_else(|err| {
                 panic!(
@@ -896,12 +897,11 @@ fn main() {
                 })
             } else {
                 println!(
-                    "distill  : init random model {} hidden={} depth={}",
+                    "distill  : init random model {} hidden={}",
                     cmd.model.display(),
-                    cmd.hidden.max(1),
-                    cmd.trunk_depth.max(1)
+                    cmd.hidden.max(1)
                 );
-                AzNnue::random_with_depth(cmd.hidden.max(1), cmd.trunk_depth.max(1), cmd.seed)
+                AzNnue::random(cmd.hidden.max(1), cmd.seed)
             };
 
             let epochs = cmd.epochs.max(1);
@@ -1059,16 +1059,12 @@ fn main() {
                             "model    : reinit {} as random nnue ({err})",
                             config.model_path
                         );
-                        AzNnue::random_with_depth(
-                            config.hidden_size,
-                            config.trunk_depth,
-                            config.seed,
-                        )
+                        AzNnue::random(config.hidden_size, config.seed)
                     }
                 }
             } else {
                 println!("model    : init {}", config.model_path);
-                AzNnue::random_with_depth(config.hidden_size, config.trunk_depth, config.seed)
+                AzNnue::random(config.hidden_size, config.seed)
             };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
@@ -1121,7 +1117,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) depth={} td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -1143,7 +1139,6 @@ fn main() {
                 config.gumbel.maxvisit_init,
                 config.gumbel.rescale_values,
                 config.gumbel.use_mixed_value,
-                config.trunk_depth,
                 config.td_lambda,
                 config.replay_games,
                 config.replay_samples,
@@ -1175,11 +1170,8 @@ fn main() {
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    let mut local_model = AzNnue::random_with_depth(
-                        selfplay_config.hidden_size,
-                        selfplay_config.trunk_depth,
-                        selfplay_config.seed ^ worker_id as u64,
-                    );
+                    let mut local_model =
+                        AzNnue::random(selfplay_config.hidden_size, selfplay_config.seed ^ worker_id as u64);
                     while !selfplay_stop.load(Ordering::SeqCst) {
                         {
                             let (pause_lock, pause_cvar) = &*selfplay_pause;
