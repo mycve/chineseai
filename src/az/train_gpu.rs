@@ -423,7 +423,13 @@ impl GpuReplica {
         let attn_pool = conv2_flat
             .broadcast_mul(&attn_weights.unsqueeze(1)?)?
             .sum(2)?;
-        let cnn_global = Tensor::cat(&[avg_pool, max_pool, attn_pool], 1)?;
+        let conv2_grid = conv2.reshape((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
+        let row_line_pool = (conv2_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
+        let col_line_pool = (conv2_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
+        let cnn_global = Tensor::cat(
+            &[avg_pool, max_pool, attn_pool, row_line_pool, col_line_pool],
+            1,
+        )?;
 
         let cnn_hidden = cnn_global
             .matmul(&self.vars.board_hidden.t()?)?
@@ -650,7 +656,6 @@ impl GpuVars {
                 device,
             )?);
         }
-
         Ok(Self {
             input_hidden: var_from_slice(&model.input_hidden, (V4_INPUT_SIZE, hidden), device)?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,

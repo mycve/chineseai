@@ -11,7 +11,7 @@ mod train;
 mod train_gpu;
 
 use crate::nnue::{HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4};
-use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
+use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
@@ -27,7 +27,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 13;
+const AZNNUE_BINARY_VERSION: u32 = 17;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -68,7 +68,8 @@ pub(super) const SIDE_TO_MOVE_BOARD_CHANNEL: usize = PIECE_BOARD_CHANNELS * BOAR
 pub(super) const BOARD_CHANNELS: usize = SIDE_TO_MOVE_BOARD_CHANNEL + 1;
 const CNN_CHANNELS: usize = 16;
 const CNN_KERNEL_AREA: usize = 9;
-pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * 3;
+const CNN_POOL_BLOCKS: usize = 5;
+pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 pub(super) struct AzEvalScratch {
@@ -141,6 +142,19 @@ pub struct AzNnue {
     pub policy_move_bias: Vec<f32>,
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
+
+// Architecture notes:
+// - Policy and value no longer share the same learning pressure. Value has a
+//   small private branch so value targets cannot erase policy-ordering
+//   features in the shared policy trunk.
+// - Do not add a from/to-square factorized policy head on top of this absolute
+//   board representation. A previous v14/v15 experiment mixed absolute board
+//   features with partially relative action-square sharing and immediately
+//   produced a severe red/black bias in self-play. Factorized policy should
+//   wait until the whole model has a consistent per-square or canonical view.
+// - The board summary deliberately keeps cheap row/column line pools. This is
+//   the safe part borrowed from GNN-style row/column attention: it helps long
+//   rook/cannon/general files without changing action semantics.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -778,6 +792,25 @@ impl AzNnue {
             cnn_global[channel] = sum * scale;
             cnn_global[CNN_CHANNELS + channel] = max_value;
             cnn_global[CNN_CHANNELS * 2 + channel] = attn_sum;
+
+            let mut best_row_sum = 0.0f32;
+            for rank in 0..BOARD_RANKS {
+                let mut row_sum = 0.0f32;
+                for file in 0..BOARD_FILES {
+                    row_sum += row[rank * BOARD_FILES + file];
+                }
+                best_row_sum = best_row_sum.max(row_sum);
+            }
+            let mut best_col_sum = 0.0f32;
+            for file in 0..BOARD_FILES {
+                let mut col_sum = 0.0f32;
+                for rank in 0..BOARD_RANKS {
+                    col_sum += row[rank * BOARD_FILES + file];
+                }
+                best_col_sum = best_col_sum.max(col_sum);
+            }
+            cnn_global[CNN_CHANNELS * 3 + channel] = best_row_sum / BOARD_FILES as f32;
+            cnn_global[CNN_CHANNELS * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
         }
     }
 
