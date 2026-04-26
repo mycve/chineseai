@@ -1,4 +1,4 @@
-//! UCI 联机：ChineseAI（AZ-NNUE + AlphaZero MCTS）对 Pikafish；按局交替红黑并汇总胜负。
+//! UCI match runner: ChineseAI (AZ-NNUE search) vs Pikafish.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -12,9 +12,6 @@ use crate::az::{
 };
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
-
-/// 对 Pikafish 使用固定的 PUCT 常数，与 UCI 默认保持一致，便于对比。
-const VS_PIKAFISH_CPUCT: f32 = 1.5;
 
 #[derive(Clone, Debug, Default)]
 pub struct VsPikafishResult {
@@ -34,6 +31,9 @@ pub struct VsPikafishConfig {
     pub simulations: usize,
     pub seed: u64,
     pub parallel_games: usize,
+    pub search_algorithm: AzSearchAlgorithm,
+    pub cpuct: f32,
+    pub gumbel: AzGumbelConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +50,9 @@ struct GameConfig {
     max_plies: usize,
     simulations: usize,
     seed: u64,
+    search_algorithm: AzSearchAlgorithm,
+    cpuct: f32,
+    gumbel: AzGumbelConfig,
 }
 
 struct ExternalUci {
@@ -264,11 +267,11 @@ fn play_one_game(
                 AzSearchLimits {
                     simulations: config.simulations,
                     seed,
-                    cpuct: VS_PIKAFISH_CPUCT,
+                    cpuct: config.cpuct,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
-                    algorithm: AzSearchAlgorithm::AlphaZero,
-                    gumbel: AzGumbelConfig::default(),
+                    algorithm: config.search_algorithm,
+                    gumbel: config.gumbel,
                 },
             );
             seed = seed.wrapping_add(1);
@@ -309,9 +312,10 @@ fn play_one_game(
     }
 }
 
-/// `total_games` 局中，第 `i` 局 Chinese 执红当且仅当 `i % 2 == 0`。
+/// ChineseAI plays Red in even-indexed games and Black in odd-indexed games.
 ///
-/// `parallel_games`：同时进行的对局数（每局独立 Pikafish 子进程），用于加快总耗时。
+/// `parallel_games` is the number of simultaneous games. Each game owns an
+/// independent Pikafish child process.
 pub fn run_vs_pikafish(
     pikafish_exe: &Path,
     chinese_model_path: &Path,
@@ -361,6 +365,9 @@ pub fn run_vs_pikafish(
                             simulations: config.simulations,
                             seed: config.seed
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                            search_algorithm: config.search_algorithm,
+                            cpuct: config.cpuct,
+                            gumbel: config.gumbel,
                         },
                     )?;
                     Ok((chinese_red, end))

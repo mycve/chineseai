@@ -32,6 +32,10 @@ use std::{
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
+const DEFAULT_VS_PIKAFISH_DEPTH: u32 = 10;
+const DEFAULT_VS_PIKAFISH_GAMES: usize = 20;
+const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 5;
+
 fn best_model_path(model_path: &str) -> PathBuf {
     PathBuf::from(format!("{model_path}.best"))
 }
@@ -1529,34 +1533,38 @@ fn main() {
         Some("vs-pikafish") => {
             let pikafish_exe = args.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: vs-pikafish <pikafish_exe> [model.nnue] [pikafish_depth] [games] [max_plies] [simulations] [parallel_games] [eval_fens.txt]"
+                    "usage: vs-pikafish <pikafish_exe> [config.toml|simulations] [simulations] [pikafish_depth] [games] [parallel_games] [eval_fens.txt]"
                 )
             });
-            let model_path = args.next().unwrap_or_else(|| "chineseai.nnue".into());
+            let config_or_simulations = args.next();
+            let (config_path, simulations_override) = if let Some(value) = config_or_simulations {
+                if let Ok(simulations) = value.parse::<usize>() {
+                    (DEFAULT_AZ_LOOP_CONFIG.to_string(), Some(simulations.max(1)))
+                } else {
+                    let simulations = args.next().and_then(|value| value.parse::<usize>().ok());
+                    (value, simulations.map(|value| value.max(1)))
+                }
+            } else {
+                (DEFAULT_AZ_LOOP_CONFIG.to_string(), None)
+            };
+            let Some(config) = load_or_create_az_loop_config(&config_path) else {
+                return;
+            };
+            let simulations = simulations_override.unwrap_or(config.simulations).max(1);
             let pikafish_depth = args
                 .next()
                 .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(10)
+                .unwrap_or(DEFAULT_VS_PIKAFISH_DEPTH)
                 .max(1);
             let games = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(20)
-                .max(1);
-            let max_plies = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(300)
-                .max(1);
-            let simulations = args
-                .next()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(10_000)
+                .unwrap_or(DEFAULT_VS_PIKAFISH_GAMES)
                 .max(1);
             let parallel_games = args
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(5)
+                .unwrap_or(DEFAULT_VS_PIKAFISH_PARALLEL_GAMES)
                 .max(1);
             let eval_fens_path = args
                 .next()
@@ -1565,20 +1573,26 @@ fn main() {
             let seed = 20260411_u64;
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
-                Path::new(&model_path),
+                Path::new(&config.model_path),
                 &start_positions,
                 VsPikafishConfig {
                     pikafish_depth,
                     total_games: games,
-                    max_plies,
+                    max_plies: config.max_plies,
                     simulations,
-                    seed,
+                    seed: seed ^ config.seed,
                     parallel_games,
+                    search_algorithm: config.search_algorithm,
+                    cpuct: config.cpuct,
+                    gumbel: config.gumbel,
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
-                "vs-pikafish: games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
+                "vs-pikafish: config={} model={} search={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
+                config_path,
+                config.model_path,
+                config.search_algorithm.as_str(),
                 summary.total_games,
                 start_positions.len(),
                 parallel_games.min(games),
@@ -1588,7 +1602,7 @@ fn main() {
                 summary.chinese_wins_as_red,
                 summary.chinese_wins_as_black,
                 pikafish_depth,
-                max_plies,
+                config.max_plies,
                 simulations
             );
         }
@@ -1616,7 +1630,7 @@ fn print_help() {
         "hint  : az-arena-worker <cand> <base> <red_n> <black_n> <sims> <max_plies> <arena_cpuct> <eval_fens_path> <seed>"
     );
     println!(
-        "hint  : cargo run --release -- vs-pikafish ./pikafish chineseai.nnue 10 40 300 10000 5"
+        "hint  : cargo run --release -- vs-pikafish ./pikafish {DEFAULT_AZ_LOOP_CONFIG} 10000"
     );
 }
 
