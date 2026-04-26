@@ -14,6 +14,7 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
 const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
+const DEFAULT_MULTI_GPU_SYNC_EVERY: usize = 8;
 /// 多卡时每张卡上最少样本数，低于此则少用一些卡、避免过小的子 batch（默认 1，即不额外限制）
 const DEFAULT_MIN_SAMPLES_PER_GPU: usize = 1;
 
@@ -23,7 +24,9 @@ pub(super) struct GpuTrainer {
     trunk_depth: usize,
     device_indices: Vec<usize>,
     replicas: Vec<GpuReplica>,
-    optimizer: AdamW,
+    optimizers: Vec<AdamW>,
+    sync_every: usize,
+    local_steps_since_sync: usize,
 }
 
 #[derive(Debug)]
@@ -111,6 +114,7 @@ pub(super) fn train_samples_gpu(
                 stats.add_assign(&batch_stats);
             }
         }
+        trainer.finish_local_sync()?;
     }
     if stats.samples > 0 {
         let denom = stats.samples as f32;
@@ -134,16 +138,20 @@ impl GpuTrainer {
         for &device_index in &device_indices {
             replicas.push(GpuReplica::new(model, device_index)?);
         }
-        let optimizer = AdamW::new(
-            replicas[0].vars.all_vars(),
-            ParamsAdamW {
-                lr: lr as f64,
-                beta1: 0.9,
-                beta2: 0.999,
-                eps: 1e-8,
-                weight_decay: ADAMW_WEIGHT_DECAY,
-            },
-        )?;
+        let mut optimizers = Vec::with_capacity(replicas.len());
+        for replica in &replicas {
+            optimizers.push(AdamW::new(
+                replica.vars.all_vars(),
+                ParamsAdamW {
+                    lr: lr as f64,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    eps: 1e-8,
+                    weight_decay: ADAMW_WEIGHT_DECAY,
+                },
+            )?);
+        }
+        let sync_every = multi_gpu_sync_every();
         if device_indices.len() > 1 {
             eprintln!(
                 "[chineseai] 多卡 CUDA 训练: 设备下标={:?}；各 micro-batch 在样本间均分。\
@@ -151,12 +159,20 @@ impl GpuTrainer {
                 device_indices
             );
         }
+        if device_indices.len() > 1 {
+            eprintln!(
+                "[chineseai] multi-gpu optimizer: local AdamW, sync_every={}",
+                sync_every
+            );
+        }
         Ok(Self {
             hidden_size: model.hidden_size,
             trunk_depth: model.trunk_depth,
             device_indices,
             replicas,
-            optimizer,
+            optimizers,
+            sync_every,
+            local_steps_since_sync: 0,
         })
     }
 
@@ -164,10 +180,13 @@ impl GpuTrainer {
         self.hidden_size == model.hidden_size
             && self.trunk_depth == model.trunk_depth
             && self.device_indices == cuda_device_indices()
+            && self.sync_every == multi_gpu_sync_every()
     }
 
     fn set_learning_rate(&mut self, lr: f32) {
-        self.optimizer.set_learning_rate(lr as f64);
+        for optimizer in &mut self.optimizers {
+            optimizer.set_learning_rate(lr as f64);
+        }
     }
 
     fn train_batch(
@@ -190,28 +209,21 @@ impl GpuTrainer {
                 shard_ranges.push(start..end);
             }
         }
+        if self.sync_every > 1 && active_replicas == self.replicas.len() {
+            return self.train_batch_local_sgd(samples, batch, &shard_ranges, loss_weights);
+        }
+        self.finish_local_sync()?;
 
-        let (primary_replica, worker_replicas) = self.replicas.split_at(1);
-        let primary_replica = &primary_replica[0];
-        let primary_range = shard_ranges[0].clone();
-        let primary = primary_replica.compute_batch_grads(
-            samples,
-            &batch[primary_range],
-            batch.len(),
-            true,
-            loss_weights,
-        )?;
-
-        let worker_outputs = thread::scope(|scope| {
+        let shard_outputs = thread::scope(|scope| {
             let mut handles = Vec::new();
-            for (worker_offset, range) in shard_ranges.iter().skip(1).cloned().enumerate() {
-                let replica = &worker_replicas[worker_offset];
+            for (shard_index, range) in shard_ranges.iter().cloned().enumerate() {
+                let replica = &self.replicas[shard_index];
                 handles.push(scope.spawn(move || {
                     replica.compute_batch_grads(
                         samples,
                         &batch[range],
                         batch.len(),
-                        false,
+                        shard_index == 0,
                         loss_weights,
                     )
                 }));
@@ -226,16 +238,69 @@ impl GpuTrainer {
             CandleResult::Ok(outputs)
         })?;
 
+        let mut outputs = shard_outputs.into_iter();
+        let primary = outputs
+            .next()
+            .ok_or_else(|| candle_core::Error::Msg("empty multi-gpu shard output".into()))?;
         let mut stats = primary.stats;
         let mut grads = primary
             .grads
             .expect("primary shard gradients should be kept on device");
-        for output in worker_outputs {
+        for output in outputs {
             stats.add_assign(&output.stats);
             self.add_cpu_grads_to_primary(&mut grads, &output.cpu_grads)?;
         }
-        self.optimizer.step(&grads)?;
+        self.optimizers[0].step(&grads)?;
         self.broadcast_primary_to_workers()?;
+        Ok(stats)
+    }
+
+    fn train_batch_local_sgd(
+        &mut self,
+        samples: &[AzTrainingSample],
+        batch: &[usize],
+        shard_ranges: &[std::ops::Range<usize>],
+        loss_weights: AzTrainLossWeights,
+    ) -> CandleResult<AzTrainStats> {
+        let shard_outputs = {
+            let replicas = &self.replicas;
+            let optimizers = &mut self.optimizers;
+            thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for ((replica, optimizer), range) in replicas
+                    .iter()
+                    .zip(optimizers.iter_mut())
+                    .zip(shard_ranges.iter().cloned())
+                {
+                    handles.push(scope.spawn(move || {
+                        replica.train_local_batch(
+                            optimizer,
+                            samples,
+                            &batch[range],
+                            loss_weights,
+                        )
+                    }));
+                }
+                let mut outputs = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    let output = handle
+                        .join()
+                        .map_err(|_| candle_core::Error::Msg("local-sgd worker panicked".into()))??;
+                    outputs.push(output);
+                }
+                CandleResult::Ok(outputs)
+            })?
+        };
+
+        let mut stats = AzTrainStats::default();
+        for output in shard_outputs {
+            stats.add_assign(&output);
+        }
+        self.local_steps_since_sync += 1;
+        if self.local_steps_since_sync >= self.sync_every {
+            self.average_replicas_to_all()?;
+            self.local_steps_since_sync = 0;
+        }
         Ok(stats)
     }
 
@@ -265,7 +330,7 @@ impl GpuTrainer {
             true,
             loss_weights,
         )?;
-        self.optimizer.step(
+        self.optimizers[0].step(
             output
                 .grads
                 .as_ref()
@@ -303,6 +368,44 @@ impl GpuTrainer {
         let primary_values = self.replicas[0].vars.to_cpu_values()?;
         for replica in self.replicas.iter().skip(1) {
             replica.vars.set_from_cpu_values(&primary_values)?;
+        }
+        Ok(())
+    }
+
+    fn finish_local_sync(&mut self) -> CandleResult<()> {
+        if self.sync_every <= 1 || self.replicas.len() <= 1 || self.local_steps_since_sync == 0 {
+            return Ok(());
+        }
+        self.average_replicas_to_all()?;
+        self.local_steps_since_sync = 0;
+        Ok(())
+    }
+
+    fn average_replicas_to_all(&self) -> CandleResult<()> {
+        if self.replicas.len() <= 1 {
+            return Ok(());
+        }
+        let replica_values = self
+            .replicas
+            .iter()
+            .map(|replica| replica.vars.to_cpu_values())
+            .collect::<CandleResult<Vec<_>>>()?;
+        let mut average_values = replica_values[0].clone();
+        for values in replica_values.iter().skip(1) {
+            for (avg, value) in average_values.iter_mut().zip(values.iter()) {
+                for (slot, &x) in avg.iter_mut().zip(value.iter()) {
+                    *slot += x;
+                }
+            }
+        }
+        let scale = 1.0 / self.replicas.len() as f32;
+        for avg in &mut average_values {
+            for slot in avg {
+                *slot *= scale;
+            }
+        }
+        for replica in &self.replicas {
+            replica.vars.set_from_cpu_values(&average_values)?;
         }
         Ok(())
     }
@@ -376,6 +479,23 @@ impl GpuReplica {
             grads: if keep_grads { Some(grads) } else { None },
             cpu_grads,
         })
+    }
+
+    fn train_local_batch(
+        &self,
+        optimizer: &mut AdamW,
+        samples: &[AzTrainingSample],
+        batch: &[usize],
+        loss_weights: AzTrainLossWeights,
+    ) -> CandleResult<AzTrainStats> {
+        let output = self.compute_batch_grads(samples, batch, batch.len(), true, loss_weights)?;
+        optimizer.step(
+            output
+                .grads
+                .as_ref()
+                .expect("local gradients should be kept on device"),
+        )?;
+        Ok(output.stats)
     }
 
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
@@ -963,6 +1083,14 @@ fn min_samples_per_gpu_limit() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(DEFAULT_MIN_SAMPLES_PER_GPU)
+}
+
+fn multi_gpu_sync_every() -> usize {
+    std::env::var("CHINESEAI_SYNC_EVERY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_MULTI_GPU_SYNC_EVERY)
 }
 
 fn parse_cuda_device_list_env(name: &str) -> Option<Vec<usize>> {
