@@ -7,3 +7,4 @@ pikafish.nnue
 chineseai*
 *.toml.progress
 *.replay.lz4
+distill_data

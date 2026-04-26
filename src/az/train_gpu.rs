@@ -4,9 +4,10 @@ use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
 use super::{
-    AzNnue, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
-    CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, GLOBAL_CONTEXT_SIZE, PIECE_BOARD_CHANNELS,
-    RESIDUAL_TRUNK_SCALE, SIDE_TO_MOVE_BOARD_CHANNEL, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE,
+    BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, GLOBAL_CONTEXT_SIZE,
+    PIECE_BOARD_CHANNELS, RESIDUAL_TRUNK_SCALE, SIDE_TO_MOVE_BOARD_CHANNEL, VALUE_BRANCH_DEPTH,
+    VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -50,6 +51,12 @@ struct GpuVars {
     board_global: Var,
     global_hidden: Var,
     global_bias: Var,
+    value_input_hidden: Var,
+    value_hidden_bias: Var,
+    value_trunk_weights: Vec<Var>,
+    value_trunk_biases: Vec<Var>,
+    value_board_hidden: Var,
+    value_board_hidden_bias: Var,
     value_intermediate_hidden: Var,
     value_intermediate_bias: Var,
     value_logits_weights: Var,
@@ -72,6 +79,7 @@ pub(super) fn train_samples_gpu(
     // 每张 GPU 上每个 training step 的样本数；单步总样本 = 该值 × 参与训练的 GPU 数
     per_gpu_batch_size: usize,
     rng: &mut super::SplitMix64,
+    loss_weights: AzTrainLossWeights,
 ) -> CandleResult<AzTrainStats> {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
         return Ok(AzTrainStats::default());
@@ -99,7 +107,7 @@ pub(super) fn train_samples_gpu(
             shuffle(&mut order, rng);
             stats = AzTrainStats::default();
             for batch in order.chunks(step_chunk) {
-                let batch_stats = trainer.train_batch(samples, batch)?;
+                let batch_stats = trainer.train_batch(samples, batch, loss_weights)?;
                 stats.add_assign(&batch_stats);
             }
         }
@@ -166,10 +174,11 @@ impl GpuTrainer {
         &mut self,
         samples: &[AzTrainingSample],
         batch: &[usize],
+        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
         let active_replicas = self.active_replica_count(batch.len());
         if active_replicas <= 1 {
-            return self.train_batch_single(samples, batch);
+            return self.train_batch_single(samples, batch, loss_weights);
         }
 
         let shard_size = batch.len().div_ceil(active_replicas);
@@ -190,6 +199,7 @@ impl GpuTrainer {
             &batch[primary_range],
             batch.len(),
             true,
+            loss_weights,
         )?;
 
         let worker_outputs = thread::scope(|scope| {
@@ -197,7 +207,13 @@ impl GpuTrainer {
             for (worker_offset, range) in shard_ranges.iter().skip(1).cloned().enumerate() {
                 let replica = &worker_replicas[worker_offset];
                 handles.push(scope.spawn(move || {
-                    replica.compute_batch_grads(samples, &batch[range], batch.len(), false)
+                    replica.compute_batch_grads(
+                        samples,
+                        &batch[range],
+                        batch.len(),
+                        false,
+                        loss_weights,
+                    )
                 }));
             }
             let mut outputs = Vec::with_capacity(handles.len());
@@ -240,8 +256,15 @@ impl GpuTrainer {
         &mut self,
         samples: &[AzTrainingSample],
         batch: &[usize],
+        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
-        let output = self.replicas[0].compute_batch_grads(samples, batch, batch.len(), true)?;
+        let output = self.replicas[0].compute_batch_grads(
+            samples,
+            batch,
+            batch.len(),
+            true,
+            loss_weights,
+        )?;
         self.optimizer.step(
             output
                 .grads
@@ -307,6 +330,7 @@ impl GpuReplica {
         batch: &[usize],
         global_batch_len: usize,
         keep_grads: bool,
+        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<ShardOutput> {
         let batch_tensors = BatchTensors::new(samples, batch, &self.device)?;
         let forward = self.forward(&batch_tensors)?;
@@ -323,8 +347,11 @@ impl GpuReplica {
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce = policy_ce_per_sample.sum_all()?;
-        let loss_tensor = ((&value_loss + &policy_ce)? / global_batch_len as f64)?;
-        let grads = loss_tensor.backward()?;
+        let weighted_value_loss = (&value_loss * loss_weights.value.max(0.0) as f64)?;
+        let weighted_policy_ce = (&policy_ce * loss_weights.policy.max(0.0) as f64)?;
+        let loss_tensor = ((weighted_value_loss + weighted_policy_ce)? / global_batch_len as f64)?;
+        let mut grads = loss_tensor.backward()?;
+        self.vars.remove_frozen_grads(&mut grads, loss_weights);
 
         let value_loss = value_loss.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
@@ -425,7 +452,30 @@ impl GpuReplica {
             hidden = (hidden + (dense * RESIDUAL_TRUNK_SCALE as f64)?)?;
         }
 
-        let value_intermediate = hidden
+        let value_embeddings = self
+            .vars
+            .value_input_hidden
+            .index_select(&batch.feature_indices.flatten_all()?, 0)?
+            .reshape((bsz, batch.max_features, VALUE_BRANCH_SIZE))?;
+        let value_sparse_hidden = value_embeddings
+            .broadcast_mul(&batch.feature_mask)?
+            .sum(1)?
+            .broadcast_add(&self.vars.value_hidden_bias)?
+            .relu()?;
+        let value_cnn_hidden = cnn_global
+            .detach()
+            .matmul(&self.vars.value_board_hidden.t()?)?
+            .broadcast_add(&self.vars.value_board_hidden_bias)?
+            .relu()?;
+        let mut value_hidden = (value_sparse_hidden + value_cnn_hidden)?;
+        for layer in 0..VALUE_BRANCH_DEPTH {
+            let dense = value_hidden
+                .matmul(&self.vars.value_trunk_weights[layer].t()?)?
+                .broadcast_add(&self.vars.value_trunk_biases[layer])?
+                .relu()?;
+            value_hidden = (value_hidden + (dense * RESIDUAL_TRUNK_SCALE as f64)?)?;
+        }
+        let value_intermediate = value_hidden
             .matmul(&self.vars.value_intermediate_hidden.t()?)?
             .broadcast_add(&self.vars.value_intermediate_bias)?
             .relu()?;
@@ -562,6 +612,8 @@ impl GpuVars {
         let mut trunk_weights = Vec::with_capacity(model.trunk_depth);
         let mut trunk_biases = Vec::with_capacity(model.trunk_depth);
         let mut trunk_global_weights = Vec::with_capacity(model.trunk_depth);
+        let mut value_trunk_weights = Vec::with_capacity(VALUE_BRANCH_DEPTH);
+        let mut value_trunk_biases = Vec::with_capacity(VALUE_BRANCH_DEPTH);
         for layer in 0..model.trunk_depth {
             let weight_offset = layer * hidden * hidden;
             let bias_offset = layer * hidden;
@@ -580,6 +632,21 @@ impl GpuVars {
                 &model.trunk_global_weights
                     [global_offset..global_offset + hidden * GLOBAL_CONTEXT_SIZE],
                 (hidden, GLOBAL_CONTEXT_SIZE),
+                device,
+            )?);
+        }
+        for layer in 0..VALUE_BRANCH_DEPTH {
+            let weight_offset = layer * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
+            let bias_offset = layer * VALUE_BRANCH_SIZE;
+            value_trunk_weights.push(var_from_slice(
+                &model.value_trunk_weights
+                    [weight_offset..weight_offset + VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE],
+                (VALUE_BRANCH_SIZE, VALUE_BRANCH_SIZE),
+                device,
+            )?);
+            value_trunk_biases.push(var_from_slice(
+                &model.value_trunk_biases[bias_offset..bias_offset + VALUE_BRANCH_SIZE],
+                VALUE_BRANCH_SIZE,
                 device,
             )?);
         }
@@ -620,9 +687,27 @@ impl GpuVars {
                 device,
             )?,
             global_bias: var_from_slice(&model.global_bias, GLOBAL_CONTEXT_SIZE, device)?,
+            value_input_hidden: var_from_slice(
+                &model.value_input_hidden,
+                (V4_INPUT_SIZE, VALUE_BRANCH_SIZE),
+                device,
+            )?,
+            value_hidden_bias: var_from_slice(&model.value_hidden_bias, VALUE_BRANCH_SIZE, device)?,
+            value_trunk_weights,
+            value_trunk_biases,
+            value_board_hidden: var_from_slice(
+                &model.value_board_hidden,
+                (VALUE_BRANCH_SIZE, CNN_POOLED_SIZE),
+                device,
+            )?,
+            value_board_hidden_bias: var_from_slice(
+                &model.value_board_hidden_bias,
+                VALUE_BRANCH_SIZE,
+                device,
+            )?,
             value_intermediate_hidden: var_from_slice(
                 &model.value_intermediate_hidden,
-                (VALUE_HIDDEN_SIZE, hidden),
+                (VALUE_HIDDEN_SIZE, VALUE_BRANCH_SIZE),
                 device,
             )?,
             value_intermediate_bias: var_from_slice(
@@ -667,6 +752,12 @@ impl GpuVars {
         vars.push(self.board_global.clone());
         vars.push(self.global_hidden.clone());
         vars.push(self.global_bias.clone());
+        vars.push(self.value_input_hidden.clone());
+        vars.push(self.value_hidden_bias.clone());
+        vars.extend(self.value_trunk_weights.iter().cloned());
+        vars.extend(self.value_trunk_biases.iter().cloned());
+        vars.push(self.value_board_hidden.clone());
+        vars.push(self.value_board_hidden_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
         vars.push(self.value_intermediate_bias.clone());
         vars.push(self.value_logits_weights.clone());
@@ -675,6 +766,68 @@ impl GpuVars {
         vars.push(self.policy_move_cnn.clone());
         vars.push(self.policy_move_bias.clone());
         vars
+    }
+
+    fn shared_vars(&self) -> Vec<Var> {
+        let mut vars = Vec::new();
+        vars.push(self.input_hidden.clone());
+        vars.push(self.hidden_bias.clone());
+        vars.extend(self.trunk_weights.iter().cloned());
+        vars.extend(self.trunk_biases.iter().cloned());
+        vars.extend(self.trunk_global_weights.iter().cloned());
+        vars.push(self.board_conv1_weights.clone());
+        vars.push(self.board_conv1_bias.clone());
+        vars.push(self.board_conv2_weights.clone());
+        vars.push(self.board_conv2_bias.clone());
+        vars.push(self.board_attention_query.clone());
+        vars.push(self.board_hidden.clone());
+        vars.push(self.board_hidden_bias.clone());
+        vars.push(self.board_global.clone());
+        vars.push(self.global_hidden.clone());
+        vars.push(self.global_bias.clone());
+        vars
+    }
+
+    fn value_head_vars(&self) -> Vec<Var> {
+        let mut vars = vec![
+            self.value_input_hidden.clone(),
+            self.value_hidden_bias.clone(),
+            self.value_board_hidden.clone(),
+            self.value_board_hidden_bias.clone(),
+            self.value_intermediate_hidden.clone(),
+            self.value_intermediate_bias.clone(),
+            self.value_logits_weights.clone(),
+            self.value_logits_bias.clone(),
+        ];
+        vars.extend(self.value_trunk_weights.iter().cloned());
+        vars.extend(self.value_trunk_biases.iter().cloned());
+        vars
+    }
+
+    fn policy_head_vars(&self) -> Vec<Var> {
+        vec![
+            self.policy_move_hidden.clone(),
+            self.policy_move_cnn.clone(),
+            self.policy_move_bias.clone(),
+        ]
+    }
+
+    fn remove_frozen_grads(&self, grads: &mut GradStore, loss_weights: AzTrainLossWeights) {
+        if !loss_weights.train_shared {
+            for var in self.shared_vars() {
+                grads.remove(&var);
+            }
+        }
+        if !loss_weights.train_value_head {
+            for var in self.value_head_vars() {
+                grads.remove(&var);
+            }
+        }
+        if !loss_weights.train_policy_head {
+            for var in self.policy_head_vars() {
+                grads.remove(&var);
+            }
+        }
     }
 
     fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
@@ -712,6 +865,26 @@ impl GpuVars {
         copy_var(&self.board_global, &mut model.board_global)?;
         copy_var(&self.global_hidden, &mut model.global_hidden)?;
         copy_var(&self.global_bias, &mut model.global_bias)?;
+        copy_var(&self.value_input_hidden, &mut model.value_input_hidden)?;
+        copy_var(&self.value_hidden_bias, &mut model.value_hidden_bias)?;
+        for layer in 0..VALUE_BRANCH_DEPTH {
+            let weight_offset = layer * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
+            let bias_offset = layer * VALUE_BRANCH_SIZE;
+            copy_var(
+                &self.value_trunk_weights[layer],
+                &mut model.value_trunk_weights
+                    [weight_offset..weight_offset + VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE],
+            )?;
+            copy_var(
+                &self.value_trunk_biases[layer],
+                &mut model.value_trunk_biases[bias_offset..bias_offset + VALUE_BRANCH_SIZE],
+            )?;
+        }
+        copy_var(&self.value_board_hidden, &mut model.value_board_hidden)?;
+        copy_var(
+            &self.value_board_hidden_bias,
+            &mut model.value_board_hidden_bias,
+        )?;
         copy_var(
             &self.value_intermediate_hidden,
             &mut model.value_intermediate_hidden,

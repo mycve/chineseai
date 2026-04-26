@@ -8,10 +8,11 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
-        AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
-        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples,
+        AzArenaConfig, AzArenaReport, AzDistillLoadOptions, AzExperiencePool, AzGumbelConfig,
+        AzLoopConfig, AzLoopReport, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData,
+        AzTrainLossWeights, AzTrainStats, SplitMix64, alphazero_search, benchmark_training,
+        generate_selfplay_data, global_training_step_sample_count, load_distill_npz_samples,
+        play_arena_games_from_positions, train_samples, train_samples_weighted,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -61,6 +62,8 @@ enum CliCommand {
     AzBench(AzBenchArgs),
     /// Benchmark a synthetic training workload.
     AzTrainBench(AzTrainBenchArgs),
+    /// Distill GNN npz policy/value shards into an AZ-NNUE model.
+    AzDistill(AzDistillArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
     /// Internal arena worker process.
@@ -154,6 +157,61 @@ struct AzTrainBenchArgs {
     /// Random seed.
     #[arg(default_value_t = 20260411)]
     seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct AzDistillArgs {
+    /// Directory containing metadata.json and shard_*.npz.
+    #[arg(default_value = "distill_data")]
+    data_dir: PathBuf,
+    /// Input/output AZ-NNUE model path. Created randomly if missing.
+    #[arg(default_value = "chineseai.nnue")]
+    model: PathBuf,
+    /// Save to this path instead of overwriting model.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Hidden size used when creating a missing model.
+    #[arg(long, default_value_t = 128)]
+    hidden: usize,
+    /// Trunk depth used when creating a missing model.
+    #[arg(long, default_value_t = 2)]
+    trunk_depth: usize,
+    /// Training epochs over all shards.
+    #[arg(long, default_value_t = 1)]
+    epochs: usize,
+    /// Learning rate.
+    #[arg(long, default_value_t = 0.0003)]
+    lr: f32,
+    /// Weight for the value cross-entropy during distillation.
+    #[arg(long, default_value_t = 1.0)]
+    value_weight: f32,
+    /// Weight for the policy cross-entropy during distillation.
+    #[arg(long, default_value_t = 1.0)]
+    policy_weight: f32,
+    /// Update shared sparse/CNN/trunk parameters during distillation.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    train_shared: bool,
+    /// Update the value head during distillation.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    train_value_head: bool,
+    /// Update the policy head during distillation.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    train_policy_head: bool,
+    /// Batch size per visible GPU.
+    #[arg(long, default_value_t = 1024)]
+    batch_size: usize,
+    /// Cap rows loaded from each shard; 0 means all rows.
+    #[arg(long, default_value_t = 0)]
+    max_rows_per_shard: usize,
+    /// Random seed for model init and training shuffle.
+    #[arg(long, default_value_t = 20260426)]
+    seed: u64,
+    /// Skip legal-mask alignment diagnostics while loading.
+    #[arg(long, default_value_t = false)]
+    no_validate_legal: bool,
+    /// Load and validate shards without training or saving.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -256,6 +314,31 @@ fn read_az_loop_next_update(config_path: &str) -> Option<usize> {
         }
     }
     None
+}
+
+fn distill_shard_paths(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = fs::read_dir(data_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("npz"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn add_train_stats(total: &mut AzTrainStats, stats: &AzTrainStats) {
+    total.loss += stats.loss * stats.samples as f32;
+    total.value_loss += stats.value_loss * stats.samples as f32;
+    total.policy_ce += stats.policy_ce * stats.samples as f32;
+    total.value_pred_sum += stats.value_pred_sum;
+    total.value_pred_sq_sum += stats.value_pred_sq_sum;
+    total.value_target_sum += stats.value_target_sum;
+    total.value_target_sq_sum += stats.value_target_sq_sum;
+    total.value_error_sq_sum += stats.value_error_sq_sum;
+    total.samples += stats.samples;
 }
 
 fn write_az_loop_next_update(config_path: &str, next: usize) {
@@ -793,6 +876,164 @@ fn main() {
             println!("loss         : {:.4}", stats.loss);
             println!("value_ce     : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
+        }
+        Some(CliCommand::AzDistill(cmd)) => {
+            let shard_paths = distill_shard_paths(&cmd.data_dir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to list distill shards in `{}`: {err}",
+                    cmd.data_dir.display()
+                )
+            });
+            if shard_paths.is_empty() {
+                panic!("no .npz shards found in `{}`", cmd.data_dir.display());
+            }
+
+            let output_path = cmd.output.clone().unwrap_or_else(|| cmd.model.clone());
+            let mut model = if cmd.model.exists() {
+                println!("distill  : load model {}", cmd.model.display());
+                AzNnue::load(&cmd.model).unwrap_or_else(|err| {
+                    panic!("failed to load `{}`: {err}", cmd.model.display());
+                })
+            } else {
+                println!(
+                    "distill  : init random model {} hidden={} depth={}",
+                    cmd.model.display(),
+                    cmd.hidden.max(1),
+                    cmd.trunk_depth.max(1)
+                );
+                AzNnue::random_with_depth(cmd.hidden.max(1), cmd.trunk_depth.max(1), cmd.seed)
+            };
+
+            let epochs = cmd.epochs.max(1);
+            let lr = cmd.lr.max(0.0);
+            let batch_size = cmd.batch_size.max(1);
+            let loss_weights = AzTrainLossWeights {
+                value: cmd.value_weight.max(0.0),
+                policy: cmd.policy_weight.max(0.0),
+                train_shared: cmd.train_shared,
+                train_value_head: cmd.train_value_head,
+                train_policy_head: cmd.train_policy_head,
+            };
+            let max_rows = (cmd.max_rows_per_shard > 0).then_some(cmd.max_rows_per_shard);
+            let load_options = AzDistillLoadOptions {
+                max_rows,
+                validate_legal: !cmd.no_validate_legal,
+            };
+            let mut rng = SplitMix64::new(cmd.seed ^ 0xD157_1110_0000_0001);
+            let started = Instant::now();
+
+            println!(
+                "distill  : data={} shards={} epochs={} lr={} value_weight={} policy_weight={} train_shared={} train_value_head={} train_policy_head={} batch_size(per_gpu)={} max_rows_per_shard={} validate_legal={} dry_run={}",
+                cmd.data_dir.display(),
+                shard_paths.len(),
+                epochs,
+                lr,
+                loss_weights.value,
+                loss_weights.policy,
+                loss_weights.train_shared,
+                loss_weights.train_value_head,
+                loss_weights.train_policy_head,
+                batch_size,
+                max_rows.map_or_else(|| "all".to_string(), |value| value.to_string()),
+                load_options.validate_legal,
+                cmd.dry_run
+            );
+
+            let mut total_stats = AzTrainStats::default();
+            let mut total_samples = 0usize;
+            for epoch in 0..epochs {
+                for (shard_index, shard_path) in shard_paths.iter().enumerate() {
+                    let load_started = Instant::now();
+                    let (samples, load_stats) = load_distill_npz_samples(shard_path, load_options)
+                        .unwrap_or_else(|err| {
+                            panic!("failed to load `{}`: {err}", shard_path.display());
+                        });
+                    let load_seconds = load_started.elapsed().as_secs_f32();
+                    if samples.is_empty() {
+                        println!(
+                            "distill  : epoch={}/{} shard={}/{} file={} samples=0 skipped={} load={:.2}s",
+                            epoch + 1,
+                            epochs,
+                            shard_index + 1,
+                            shard_paths.len(),
+                            shard_path.display(),
+                            load_stats.skipped_positions,
+                            load_seconds
+                        );
+                        continue;
+                    }
+
+                    let train_started = Instant::now();
+                    let stats = if cmd.dry_run {
+                        AzTrainStats {
+                            samples: samples.len(),
+                            ..Default::default()
+                        }
+                    } else {
+                        train_samples_weighted(
+                            &mut model,
+                            &samples,
+                            1,
+                            lr,
+                            batch_size,
+                            &mut rng,
+                            loss_weights,
+                        )
+                    };
+                    let train_seconds = train_started.elapsed().as_secs_f32();
+                    let legal_jaccard = if load_stats.legal_union_sum > 0 {
+                        load_stats.legal_overlap_sum as f32 / load_stats.legal_union_sum as f32
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "distill  : epoch={}/{} shard={}/{} file={} samples={} skipped={} loss={:.4} value_ce={:.4} value_mse={:.4} policy_ce={:.4} v_mu={:.3}/{:.3} legal_exact={}/{} legal_jaccard={:.3} load={:.2}s train={:.2}s",
+                        epoch + 1,
+                        epochs,
+                        shard_index + 1,
+                        shard_paths.len(),
+                        shard_path.display(),
+                        samples.len(),
+                        load_stats.skipped_positions,
+                        stats.loss,
+                        stats.value_loss,
+                        stats.value_error_sq_sum / stats.samples.max(1) as f32,
+                        stats.policy_ce,
+                        stats.value_pred_sum / stats.samples.max(1) as f32,
+                        stats.value_target_sum / stats.samples.max(1) as f32,
+                        load_stats.legal_exact,
+                        load_stats.legal_checked,
+                        legal_jaccard,
+                        load_seconds,
+                        train_seconds
+                    );
+                    add_train_stats(&mut total_stats, &stats);
+                    total_samples += stats.samples;
+                }
+            }
+
+            if !cmd.dry_run {
+                model.save(&output_path).unwrap_or_else(|err| {
+                    panic!("failed to save `{}`: {err}", output_path.display());
+                });
+            }
+            if total_samples > 0 {
+                let denom = total_samples as f32;
+                println!(
+                    "distill  : done samples={} avg_loss={:.4} avg_value_ce={:.4} avg_value_mse={:.4} avg_policy_ce={:.4} elapsed={:.1}s saved={}",
+                    total_samples,
+                    total_stats.loss / denom,
+                    total_stats.value_loss / denom,
+                    total_stats.value_error_sq_sum / denom,
+                    total_stats.policy_ce / denom,
+                    started.elapsed().as_secs_f32(),
+                    if cmd.dry_run {
+                        "(dry-run)".to_string()
+                    } else {
+                        output_path.display().to_string()
+                    }
+                );
+            }
         }
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
