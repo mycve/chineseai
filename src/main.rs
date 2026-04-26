@@ -690,7 +690,7 @@ fn main() {
             println!("samples      : {sample_count}");
             println!("epochs       : {epochs}");
             println!("batch(per_gpu) : {batch_size}");
-            println!("cuda_devices  : {n_gpu}  (閸楁洘顒為幀缁樼壉閺? {g_step})");
+            println!("cuda_devices  : {n_gpu}  (global batch {g_step})");
             println!("lr             : {lr}");
             println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
             println!("processed    : {}", sample_count * epochs);
@@ -1609,7 +1609,7 @@ fn print_help() {
     );
     println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
     println!(
-        "hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # 閸忔湹鑵?1024=濮ｅ繐宕?batch"
+        "hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # per-GPU batch=1024"
     );
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
     println!(

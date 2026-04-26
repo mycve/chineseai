@@ -287,7 +287,10 @@ impl AzLoopFileConfig {
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
 #   epochs means how many passes to make over each fresh training window; 2-3 is a good range.
-#   batch_size: 濮ｅ繐娼?GPU 濮ｅ繋閲滅拋顓犵矊濮濄儰绗傞惃鍕壉閺堫剚鏆熼妴鍌氬礋濮濄儯鈧本鏆ｉ幍骞库偓宥嗏偓缁樼壉閺?= batch_size 鑴?閸欘垵顫嗙拋顓犵矊閻?CUDA 閸椻剝鏆?閼峰啿鐨?)閵?#   娓氬顩?4 閸椔扳偓涔tch_size=256 閳?濮ｅ繋绱崠鏍劄 1024 閺夆槄绱辨导鎵暬濮?epoch 濮濄儲鏆熼崣顖滄暏 閹粯鐗遍張?鐠囥儰绠荤粔?鏉╂垳鎶€閵?#   姒涙顓?1024閿涙稒妯夌€涙ê鎮嗙槐褍鍨崙蹇撶毈濮ｅ繐宕遍崐纭风幢婢舵艾宕遍弮鎯扮殶鐏忓繐宕熼崡鈥斥偓鐓庡讲娑撳孩妫悧鍫涒偓灞藉弿鐏炩偓闂€?batch閵嗗秶娈戦弰鎯х摠/閸ｎ亜锛愬鏉戦挬鐎靛綊缍堥妴?#   max_sample_train_count removes samples after they have been used this many times.
+#   batch_size is per GPU per training step. Effective global batch size is
+#   batch_size multiplied by the number of visible CUDA devices.
+#   Example: with 4 GPUs, batch_size=256 processes 1024 samples per step.
+#   max_sample_train_count removes samples after they have been used this many times.
 #   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
@@ -311,7 +314,7 @@ impl AzLoopFileConfig {
 #   For perfect-information eval you can set gumbel_scale=0.0.
 #   arena_cpuct applies during arena search.
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
-#   sim_*, bs_*, lr_*, 閳?so TensorBoard Web can compare experiments side by side.
+#   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
 
 model_path = "{model_path}"
 simulations = {simulations}
