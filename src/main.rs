@@ -5,18 +5,17 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use chineseai::{
     az::{
         AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
-        alphazero_search_with_history_and_rules, benchmark_training, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
+        AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search, benchmark_training,
+        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
+        train_samples,
     },
-    nnue::{HISTORY_PLIES, HistoryMove},
     pikafish_match::run_vs_pikafish,
-    xiangqi::{Position, RuleHistoryEntry, RuleOutcome, STARTPOS_FEN},
+    uci::run_uci,
+    xiangqi::{Position, STARTPOS_FEN},
 };
 use serde::Deserialize;
 use std::{
-    fs,
-    io::{self, BufRead, BufWriter, Write},
+    fs, io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -28,51 +27,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
-
-// ---------------------------------------------------------------------------
-// UCI 磁盘日志（写入程序所在目录的 chineseai-uci.log）
-// ---------------------------------------------------------------------------
-
-struct UciLogger {
-    file: Option<BufWriter<fs::File>>,
-    elapsed: std::time::Instant,
-}
-
-impl UciLogger {
-    fn new() -> Self {
-        let path = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("chineseai-uci.log")));
-
-        let file = path.and_then(|p| {
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
-                .map(BufWriter::new)
-        });
-
-        let logger = Self {
-            file,
-            elapsed: std::time::Instant::now(),
-        };
-        logger
-    }
-
-    fn log(&mut self, msg: &str) {
-        let Some(f) = self.file.as_mut() else { return };
-        let ms = self.elapsed.elapsed().as_millis();
-        let _ = writeln!(f, "[{ms:>8}ms] {msg}");
-        let _ = f.flush();
-    }
-}
-
-macro_rules! ulog {
-    ($logger:expr, $($arg:tt)*) => {
-        $logger.log(&format!($($arg)*))
-    };
-}
 
 const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
@@ -89,7 +43,6 @@ fn best_model_path(model_path: &str) -> PathBuf {
     PathBuf::from(format!("{model_path}.best"))
 }
 
-/// `{config_path}.progress` — 记录下一次训练更新应使用的全局 `update`（TensorBoard / checkpoint / 日志连续）。
 fn az_loop_progress_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.progress"))
 }
@@ -123,7 +76,6 @@ fn write_az_loop_next_update(config_path: &str, next: usize) {
     });
 }
 
-/// 将 `tensorboard_logdir` 作为**根目录**，其下追加由训练超参编码的子目录名（仅 `a-z0-9_`，`p`/`m` 代替 `.`/`-`），便于 Web 对照实验。
 fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     fn f32_slug(x: f32) -> String {
         if x == 0.0 {
@@ -740,7 +692,7 @@ fn main() {
             println!("samples      : {sample_count}");
             println!("epochs       : {epochs}");
             println!("batch(per_gpu) : {batch_size}");
-            println!("cuda_devices  : {n_gpu}  (单步总样本: {g_step})");
+            println!("cuda_devices  : {n_gpu}  (鍗曟鎬绘牱鏈? {g_step})");
             println!("lr             : {lr}");
             println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
             println!("processed    : {}", sample_count * epochs);
@@ -1659,7 +1611,7 @@ fn print_help() {
     );
     println!("hint  : cargo run --release -- az-bench chineseai.nnue 512 100 1.5 startpos");
     println!(
-        "hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # 其中 1024=每卡 batch"
+        "hint  : cargo run --release -- az-train-bench chineseai.nnue 8192 2 1024 0.0003  # 鍏朵腑 1024=姣忓崱 batch"
     );
     println!("hint  : cargo run --release -- az-loop {DEFAULT_AZ_LOOP_CONFIG}");
     println!(
@@ -1946,10 +1898,7 @@ impl AzLoopFileConfig {
 # Optimizer:
 #   AdamW is used with mini-batch gradient accumulation.
 #   epochs means how many passes to make over each fresh training window; 2-3 is a good range.
-#   batch_size: 每块 GPU 每个训练步上的样本数。单步「整批」总样本 = batch_size ×(可见训练用 CUDA 卡数,至少1)。
-#   例如 4 卡、batch_size=256 → 每优化步 1024 条；估算每 epoch 步数可用 总样本/该乘积 近似。
-#   默认 1024；显存吃紧则减小每卡值；多卡时调小单卡值可与旧版「全局长 batch」的显存/噪声水平对齐。
-#   max_sample_train_count removes samples after they have been used this many times.
+#   batch_size: 姣忓潡 GPU 姣忎釜璁粌姝ヤ笂鐨勬牱鏈暟銆傚崟姝ャ€屾暣鎵广€嶆€绘牱鏈?= batch_size 脳(鍙璁粌鐢?CUDA 鍗℃暟,鑷冲皯1)銆?#   渚嬪 4 鍗°€乥atch_size=256 鈫?姣忎紭鍖栨 1024 鏉★紱浼扮畻姣?epoch 姝ユ暟鍙敤 鎬绘牱鏈?璇ヤ箻绉?杩戜技銆?#   榛樿 1024锛涙樉瀛樺悆绱у垯鍑忓皬姣忓崱鍊硷紱澶氬崱鏃惰皟灏忓崟鍗″€煎彲涓庢棫鐗堛€屽叏灞€闀?batch銆嶇殑鏄惧瓨/鍣０姘村钩瀵归綈銆?#   max_sample_train_count removes samples after they have been used this many times.
 #   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #
@@ -1973,7 +1922,7 @@ impl AzLoopFileConfig {
 #   For perfect-information eval you can set gumbel_scale=0.0.
 #   arena_cpuct applies during arena search.
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
-#   sim_*, bs_*, lr_*, … so TensorBoard Web can compare experiments side by side.
+#   sim_*, bs_*, lr_*, 鈥?so TensorBoard Web can compare experiments side by side.
 
 model_path = "{model_path}"
 simulations = {simulations}
@@ -2103,425 +2052,6 @@ fn load_or_create_az_loop_config(path: &str) -> Option<AzLoopFileConfig> {
         panic!("failed to read `{path}`: {err}");
     });
     Some(AzLoopFileConfig::parse(&text))
-}
-
-#[derive(Clone, Debug)]
-struct UciState {
-    position: Position,
-    history: Vec<HistoryMove>,
-    rule_history: Vec<RuleHistoryEntry>,
-    eval_file: String,
-    model: Option<AzNnue>,
-    simulations: usize,
-    threads: usize,
-    cpuct: f32,
-    search_algorithm: AzSearchAlgorithm,
-    gumbel: AzGumbelConfig,
-    policy_debug: bool,
-    policy_debug_limit: usize,
-    seed: u64,
-}
-
-impl Default for UciState {
-    fn default() -> Self {
-        Self {
-            position: Position::startpos(),
-            history: Vec::new(),
-            rule_history: Position::startpos().initial_rule_history(),
-            eval_file: "chineseai.nnue".into(),
-            model: None,
-            simulations: 10_000,
-            threads: 1,
-            cpuct: 1.5,
-            search_algorithm: AzSearchAlgorithm::AlphaZero,
-            gumbel: AzGumbelConfig::default(),
-            policy_debug: false,
-            policy_debug_limit: 16,
-            seed: 20260409,
-        }
-    }
-}
-
-fn run_uci() {
-    let stdin = io::stdin();
-    let mut state = UciState::default();
-    let mut logger = UciLogger::new();
-    ulog!(logger, "=== UCI session started ===");
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        ulog!(logger, ">> {line}");
-        match line.split_whitespace().next() {
-            Some("uci") => print_uci_id(),
-            Some("isready") => {
-                ensure_uci_model(&mut state);
-                println!("readyok");
-                uci_flush();
-            }
-            Some("ucinewgame") => {
-                state.position = Position::startpos();
-                state.history.clear();
-                state.rule_history = state.position.initial_rule_history();
-                state.seed = 20260409;
-                ulog!(logger, "[ucinewgame] reset to startpos");
-            }
-            Some("setoption") => handle_setoption(line, &mut state),
-            Some("position") => handle_position(line, &mut state, &mut logger),
-            Some("go") => handle_go(line, &mut state, &mut logger),
-            Some("stop") => {}
-            Some("quit") => {
-                ulog!(logger, "=== UCI session ended ===");
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn print_uci_id() {
-    println!("id name ChineseAI AZ-NNUE");
-    println!("id author ChineseAI");
-    println!("option name EvalFile type string default chineseai.nnue");
-    println!("option name Simulations type spin default 10000 min 1 max 100000000");
-    println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name Cpuct type string default 1.5");
-    println!(
-        "option name SearchAlgorithm type combo default alphazero var alphazero var gumbel_alphazero"
-    );
-    println!("option name GumbelMaxActions type spin default 16 min 1 max 512");
-    println!("option name GumbelScale type string default 1.0");
-    println!("option name PolicyDebug type check default false");
-    println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
-    println!("uciok");
-    uci_flush();
-}
-
-fn ensure_uci_model(state: &mut UciState) {
-    if state.model.is_some() {
-        return;
-    }
-    state.model = Some(AzNnue::load(&state.eval_file).unwrap_or_else(|err| {
-        println!(
-            "info string failed to load {}, using random model: {}",
-            state.eval_file, err
-        );
-        uci_flush();
-        AzNnue::random(128, state.seed)
-    }));
-}
-
-fn handle_setoption(line: &str, state: &mut UciState) {
-    let tokens = line.split_whitespace().collect::<Vec<_>>();
-    let Some(name_index) = tokens.iter().position(|token| *token == "name") else {
-        return;
-    };
-    let value_index = tokens.iter().position(|token| *token == "value");
-    let name_end = value_index.unwrap_or(tokens.len());
-    let name = tokens[name_index + 1..name_end]
-        .join(" ")
-        .to_ascii_lowercase();
-    let value = value_index
-        .map(|index| tokens[index + 1..].join(" "))
-        .unwrap_or_default();
-
-    match name.as_str() {
-        "evalfile" => {
-            state.eval_file = value;
-            state.model = None;
-        }
-        "simulations" => {
-            state.simulations = value.parse::<usize>().unwrap_or(state.simulations).max(1);
-        }
-        "threads" => {
-            let _ = value;
-            state.threads = 1;
-        }
-        "cpuct" => {
-            state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
-        }
-        "searchalgorithm" => {
-            if let Some(algorithm) = AzSearchAlgorithm::parse(&value) {
-                state.search_algorithm = algorithm;
-            }
-        }
-        "gumbelmaxactions" => {
-            state.gumbel.max_num_considered_actions = value
-                .parse::<usize>()
-                .unwrap_or(state.gumbel.max_num_considered_actions)
-                .clamp(1, 512);
-        }
-        "gumbelscale" => {
-            state.gumbel.gumbel_scale = value
-                .parse::<f32>()
-                .unwrap_or(state.gumbel.gumbel_scale)
-                .max(0.0);
-        }
-        "policydebug" => {
-            state.policy_debug = matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on");
-        }
-        "policydebuglimit" => {
-            state.policy_debug_limit = value
-                .parse::<usize>()
-                .unwrap_or(state.policy_debug_limit)
-                .clamp(1, 256);
-        }
-        _ => {}
-    }
-}
-
-fn handle_position(line: &str, state: &mut UciState, logger: &mut UciLogger) {
-    let tokens = line.split_whitespace().collect::<Vec<_>>();
-    if tokens.get(1) == Some(&"startpos") {
-        state.position = Position::startpos();
-        state.history.clear();
-        state.rule_history = state.position.initial_rule_history();
-        if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
-            let move_list = &tokens[moves_index + 1..];
-            ulog!(logger, "[position] startpos moves={}", move_list.join(" "));
-            apply_uci_moves(
-                &mut state.position,
-                &mut state.history,
-                &mut state.rule_history,
-                move_list,
-                logger,
-            );
-        } else {
-            ulog!(logger, "[position] startpos (no moves)");
-        }
-        ulog!(
-            logger,
-            "[position] result fen={} halfmove_clock={}",
-            state.position.to_fen(),
-            state.position.halfmove_clock()
-        );
-        return;
-    }
-
-    if tokens.get(1) == Some(&"fen") {
-        let moves_index = tokens.iter().position(|token| *token == "moves");
-        let fen_end = moves_index.unwrap_or(tokens.len());
-        let fen = tokens[2..fen_end].join(" ");
-        if let Ok(position) = Position::from_fen(&fen) {
-            state.position = position;
-            state.history.clear();
-            state.rule_history = state.position.initial_rule_history();
-            if let Some(moves_index) = moves_index {
-                let move_list = &tokens[moves_index + 1..];
-                ulog!(logger, "[position] fen={fen} moves={}", move_list.join(" "));
-                apply_uci_moves(
-                    &mut state.position,
-                    &mut state.history,
-                    &mut state.rule_history,
-                    move_list,
-                    logger,
-                );
-            } else {
-                ulog!(logger, "[position] fen={fen} (no moves)");
-            }
-            ulog!(
-                logger,
-                "[position] result fen={} halfmove_clock={}",
-                state.position.to_fen(),
-                state.position.halfmove_clock()
-            );
-        } else {
-            eprintln!("info string invalid fen: {fen}");
-            ulog!(logger, "[position] ERROR invalid fen={fen}");
-        }
-    }
-}
-
-fn apply_uci_moves(
-    position: &mut Position,
-    history: &mut Vec<HistoryMove>,
-    rule_history: &mut Vec<RuleHistoryEntry>,
-    moves: &[&str],
-    logger: &mut UciLogger,
-) {
-    for (i, text) in moves.iter().enumerate() {
-        let Some(mv) = position.parse_uci_move(text) else {
-            eprintln!("info string illegal move ignored: {text}");
-            ulog!(
-                logger,
-                "[apply_move] #{i} {text} ILLEGAL — fen={} halfmove_clock={}",
-                position.to_fen(),
-                position.halfmove_clock()
-            );
-            break;
-        };
-        if let Some(piece) = position.piece_at(mv.from as usize) {
-            history.push(HistoryMove { piece, mv });
-            let overflow = history.len().saturating_sub(HISTORY_PLIES);
-            if overflow > 0 {
-                history.drain(0..overflow);
-            }
-        }
-        rule_history.push(position.rule_history_entry_after_move(mv));
-        position.make_move(mv);
-        ulog!(
-            logger,
-            "[apply_move] #{i} {text} ok → fen={}",
-            position.to_fen()
-        );
-    }
-}
-
-/// 当前局面是否已被规则判为和棋（用于 UCI `bestmove draw`）。
-fn uci_position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry]) -> bool {
-    matches!(
-        position.rule_outcome_with_history(rule_history),
-        Some(RuleOutcome::Draw(_))
-    )
-}
-
-fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
-    ensure_uci_model(state);
-    let simulations = state.simulations.max(1);
-    let model = state.model.as_ref().expect("model was loaded");
-
-    let fen = state.position.to_fen();
-
-    if uci_position_is_rule_draw(&state.position, &state.rule_history) {
-        ulog!(logger, "[go] rule draw fen={fen} (no search)");
-        println!("info depth 0 nodes 0 time 0 score cp 0 pv draw");
-        println!("bestmove draw");
-        uci_flush();
-        return;
-    }
-
-    let raw_legal = state.position.legal_moves();
-    let legal = state.position.legal_moves_with_rules(&state.rule_history);
-
-    ulog!(
-        logger,
-        "[go] fen={fen} halfmove_clock={} rule_history_len={} raw_legal={} filtered_legal={}",
-        state.position.halfmove_clock(),
-        state.rule_history.len(),
-        raw_legal.len(),
-        legal.len()
-    );
-
-    if legal.is_empty() {
-        // 写入完整诊断以便排查"有走法却判无合法走法"的问题
-        ulog!(logger, "[no_legal_moves] fen={fen}");
-        ulog!(
-            logger,
-            "[no_legal_moves] raw_legal_moves({})={}",
-            raw_legal.len(),
-            raw_legal
-                .iter()
-                .map(|mv| mv.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        ulog!(
-            logger,
-            "[no_legal_moves] rule_history ({} entries):",
-            state.rule_history.len()
-        );
-        for (i, entry) in state.rule_history.iter().enumerate() {
-            ulog!(
-                logger,
-                "[no_legal_moves]   [{i:>3}] hash={:#018x} side={:?} mover={:?} check={} chase_mask={:#034x}",
-                entry.hash,
-                entry.side_to_move,
-                entry.mover,
-                entry.gives_check,
-                entry.chased_mask
-            );
-        }
-        // 终局（无合法走法）：不报 bestmove，由 GUI 根据局面自行判断胜负/和棋。
-        println!("info depth 1 nodes 0 time 0 score cp -32000");
-        uci_flush();
-        return;
-    }
-    let started = std::time::Instant::now();
-    let result = alphazero_search_with_history_and_rules(
-        &state.position,
-        &state.history,
-        Some(state.rule_history.clone()),
-        Some(legal),
-        model,
-        AzSearchLimits {
-            simulations,
-            seed: state.seed,
-            cpuct: state.cpuct,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            algorithm: state.search_algorithm,
-            gumbel: state.gumbel,
-        },
-    );
-    state.seed = state.seed.wrapping_add(1);
-    if state.policy_debug {
-        print_policy_debug(&result, state.policy_debug_limit);
-    }
-    match result.best_move {
-        Some(mv) => {
-            let best_text = mv.to_string();
-            println!(
-                "info depth 1 nodes {} time {} score cp {} pv {}",
-                result.simulations,
-                started.elapsed().as_millis(),
-                result.value_cp,
-                best_text
-            );
-            println!("bestmove {best_text}");
-        }
-        None => {
-            println!(
-                "info depth 1 nodes {} time {} score cp {}",
-                result.simulations,
-                started.elapsed().as_millis(),
-                result.value_cp
-            );
-            if uci_position_is_rule_draw(&state.position, &state.rule_history) {
-                println!("bestmove draw");
-            }
-            // 其余终局无着：不报 bestmove，由 GUI 自行处理。
-        }
-    }
-    uci_flush();
-}
-
-fn print_policy_debug(result: &chineseai::az::AzSearchResult, limit: usize) {
-    let visited_actions = result
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.visits > 0)
-        .count();
-    println!("info string policy_debug visited_actions {visited_actions}");
-    println!("info string policy_debug columns move visits q raw_policy searched_policy");
-    for candidate in result.candidates.iter().take(limit) {
-        println!(
-            "info string policy_debug {} {} {:.4} {:.6} {:.6}",
-            candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-        );
-    }
-    println!("info string policy_debug_by_visits columns move visits q raw_policy searched_policy");
-    let mut by_visits = result.candidates.clone();
-    by_visits.sort_by(|left, right| {
-        right
-            .visits
-            .cmp(&left.visits)
-            .then_with(|| right.policy.total_cmp(&left.policy))
-            .then_with(|| right.q.total_cmp(&left.q))
-    });
-    for candidate in by_visits.iter().take(limit) {
-        println!(
-            "info string policy_debug_by_visits {} {} {:.4} {:.6} {:.6}",
-            candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-        );
-    }
-}
-
-fn uci_flush() {
-    let _ = io::stdout().flush();
 }
 
 fn parse_position(text: &str) -> Position {

@@ -3,6 +3,7 @@ use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 mod alphazero;
+mod mctx;
 mod play;
 mod replay;
 mod train;
@@ -12,9 +13,10 @@ use crate::nnue::{HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, extract_sparse_feat
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
-    AzCandidate, AzGumbelConfig, AzSearchAlgorithm, AzSearchLimits, AzSearchResult,
-    alphazero_search, alphazero_search_with_history_and_rules,
+    AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
+    alphazero_search_with_history_and_rules,
 };
+pub use mctx::AzGumbelConfig;
 pub use play::{
     AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions,
