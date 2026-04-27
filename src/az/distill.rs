@@ -11,7 +11,6 @@ use crate::{
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, dense_move_index, dense_move_to_move, extract_board_planes,
-    extract_value_relation_features,
 };
 
 const DISTILL_PLANES_PER_FRAME: usize = 14;
@@ -162,13 +161,6 @@ pub fn load_distill_npz_samples(
             .iter()
             .map(|&move_index| dense_targets[move_index] / prob_sum)
             .collect::<Vec<_>>();
-        let legal_moves_raw = legal_moves_actual
-            .iter()
-            .filter_map(|&move_index| dense_move_to_move(move_index))
-            .collect::<Vec<_>>();
-        let mut value_relation = Vec::new();
-        extract_value_relation_features(&position, &legal_moves_raw, &mut value_relation);
-
         let mut board = Vec::new();
         extract_board_planes(&position, &[], &mut board);
         samples.push(AzTrainingSample {
@@ -176,7 +168,6 @@ pub fn load_distill_npz_samples(
             board,
             move_indices: legal_moves,
             policy,
-            value_relation,
             value: value_tgt[row].clamp(-1.0, 1.0),
             side_sign: -1.0,
         });

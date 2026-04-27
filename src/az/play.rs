@@ -327,10 +327,6 @@ fn make_training_sample(
         .max(1.0);
     let side = position.side_to_move();
     let mut features = extract_sparse_features_v4_canonical(position, history);
-    let actual_moves = candidates
-        .iter()
-        .map(|candidate| candidate.mv)
-        .collect::<Vec<_>>();
     let mut moves = candidates
         .iter()
         .map(|candidate| canonical_move(side, candidate.mv))
@@ -342,8 +338,6 @@ fn make_training_sample(
         }
     }
     let move_indices = moves.iter().copied().map(dense_move_index).collect();
-    let mut value_relation = Vec::new();
-    super::extract_value_relation_features(position, &actual_moves, &mut value_relation);
     let mut board = Vec::new();
     extract_board_planes(position, history, &mut board);
     if mirror_file {
@@ -364,7 +358,6 @@ fn make_training_sample(
             .iter()
             .map(|candidate| candidate.policy.max(0.0) / total_policy)
             .collect(),
-        value_relation,
         value: value.clamp(-1.0, 1.0),
         side_sign: if position.side_to_move() == Color::Red {
             1.0

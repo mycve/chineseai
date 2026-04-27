@@ -5,14 +5,12 @@ use std::path::{Path, PathBuf};
 
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
-use super::{
-    AzTrainingSample, BOARD_HISTORY_SIZE, DENSE_MOVE_SPACE, SplitMix64, VALUE_RELATION_FEATURE_SIZE,
-};
+use super::{AzTrainingSample, BOARD_HISTORY_SIZE, DENSE_MOVE_SPACE, SplitMix64};
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 7;
+const REPLAY_FILE_VERSION: u32 = 8;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -81,15 +79,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     for &p in &sample.policy {
         replay_push_f32(out, p);
     }
-    if sample.value_relation.len() != VALUE_RELATION_FEATURE_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "replay encode: invalid value relation length",
-        ));
-    }
-    for &feature in &sample.value_relation {
-        replay_push_f32(out, feature);
-    }
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
     Ok(())
@@ -111,10 +100,10 @@ fn decode_az_training_sample<R: Read>(
     reader: &mut R,
     version: u32,
 ) -> io::Result<AzTrainingSample> {
-    if version < REPLAY_FILE_VERSION {
+    if version != REPLAY_FILE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "replay decode: incompatible board history version",
+            "replay decode: incompatible replay sample version",
         ));
     }
     let nf = replay_read_u32(reader)?;
@@ -145,10 +134,6 @@ fn decode_az_training_sample<R: Read>(
     for _ in 0..nm {
         policy.push(replay_read_f32(reader)?);
     }
-    let mut value_relation = vec![0.0f32; VALUE_RELATION_FEATURE_SIZE];
-    for feature in &mut value_relation {
-        *feature = replay_read_f32(reader)?;
-    }
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     Ok(AzTrainingSample {
@@ -156,7 +141,6 @@ fn decode_az_training_sample<R: Read>(
         board,
         move_indices,
         policy,
-        value_relation,
         value,
         side_sign,
     })

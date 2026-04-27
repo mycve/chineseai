@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
@@ -16,7 +16,7 @@ use crate::nnue::{
     extract_sparse_features_v4_canonical,
 };
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position, piece_base_value,
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position,
 };
 
 pub use alphazero::{
@@ -34,7 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 23;
+const AZNNUE_BINARY_VERSION: u32 = 24;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -71,15 +71,15 @@ pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
 pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
+pub(super) const VALUE_SQUARE_INPUT_SIZE: usize = BOARD_CHANNELS * BOARD_PLANES_SIZE;
 const CNN_CHANNELS: usize = 24;
-pub(super) const VALUE_CNN_CHANNELS: usize = 12;
+pub(super) const VALUE_CNN_CHANNELS: usize = 32;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
 const CNN_KERNEL_AREA: usize = 9;
 const CNN_POOL_BLOCKS: usize = 5;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
 pub(super) const VALUE_CNN_POOLED_SIZE: usize = VALUE_CNN_CHANNELS * CNN_POOL_BLOCKS;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
-pub(super) const VALUE_RELATION_FEATURE_SIZE: usize = 64;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 pub(super) struct AzEvalScratch {
@@ -91,8 +91,8 @@ pub(super) struct AzEvalScratch {
     cnn_global: Vec<f32>,
     value_conv1: Vec<f32>,
     value_conv2: Vec<f32>,
+    value_conv3: Vec<f32>,
     value_cnn_global: Vec<f32>,
-    value_relation: Vec<f32>,
     value_hidden: Vec<f32>,
     value_next: Vec<f32>,
     value_intermediate: Vec<f32>,
@@ -113,8 +113,8 @@ impl AzEvalScratch {
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
             value_conv1: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
             value_conv2: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
+            value_conv3: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
             value_cnn_global: vec![0.0; VALUE_CNN_POOLED_SIZE],
-            value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
             value_hidden: vec![0.0; VALUE_BRANCH_SIZE],
             value_next: vec![0.0; VALUE_BRANCH_SIZE],
             value_intermediate: vec![0.0; VALUE_HIDDEN_SIZE],
@@ -138,19 +138,19 @@ pub struct AzNnue {
     pub board_attention_query: Vec<f32>,
     pub board_hidden: Vec<f32>,
     pub board_hidden_bias: Vec<f32>,
-    pub value_input_hidden: Vec<f32>,
-    pub value_hidden_bias: Vec<f32>,
     pub value_trunk_weights: Vec<f32>,
     pub value_trunk_biases: Vec<f32>,
+    pub value_square_hidden: Vec<f32>,
+    pub value_square_hidden_bias: Vec<f32>,
     pub value_board_conv1_weights: Vec<f32>,
     pub value_board_conv1_bias: Vec<f32>,
     pub value_board_conv2_weights: Vec<f32>,
     pub value_board_conv2_bias: Vec<f32>,
+    pub value_board_conv3_weights: Vec<f32>,
+    pub value_board_conv3_bias: Vec<f32>,
     pub value_board_attention_query: Vec<f32>,
     pub value_board_hidden: Vec<f32>,
     pub value_board_hidden_bias: Vec<f32>,
-    pub value_relation_hidden: Vec<f32>,
-    pub value_relation_hidden_bias: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
@@ -186,19 +186,19 @@ pub struct AzNnue {
 // - v20 removes the old policy residual trunk completely. It was not a useful
 //   runtime knob: width, cheap board summaries, and move-conditioned policy
 //   sharing were more valuable than hidden->hidden depth for this CPU MCTS net.
-// - v21 adds a value-only relation/move encoder. This is the important
-//   GNN-inspired piece: value should not infer "good position" only from a
-//   static board image. It receives a compact summary of legal move
-//   consequences, checking moves, captures, and attacked/protected pieces so
-//   value can learn from rule-level interactions while policy stays cheap.
+// - v21 tried a value-only relation/move encoder. It helped loss in places but
+//   made the value experiment muddy: hand summaries can become shortcuts and
+//   hide whether the board model itself understands positions.
 // - v22 switches the net to side-to-move canonical inputs and canonical policy
 //   actions: the mover is always represented as Red, and Black-to-move boards
 //   are rotated 180 degrees with colors swapped. The old side-to-move board
 //   channel is removed; do not feed canonical boards with absolute move labels,
 //   because that recreates the red/black leakage bug.
-// - v23 gives value its own tiny board CNN (12 channels). Value no longer
-//   adapts to a policy-oriented board summary; this is the cleanest low-cost
-//   test for hidden policy/value representation pulling.
+// - v23 gave value its own tiny board CNN. v24 removes value-side sparse V4
+//   and hand relation inputs. Value now starts from a learned piece-square
+//   board embedding plus a 32-channel residual CNN. This keeps value fully
+//   learned from canonical board planes while still giving it a natural way to
+//   learn material/position baselines before local attack/defense patterns.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -213,19 +213,19 @@ impl Clone for AzNnue {
             board_attention_query: self.board_attention_query.clone(),
             board_hidden: self.board_hidden.clone(),
             board_hidden_bias: self.board_hidden_bias.clone(),
-            value_input_hidden: self.value_input_hidden.clone(),
-            value_hidden_bias: self.value_hidden_bias.clone(),
             value_trunk_weights: self.value_trunk_weights.clone(),
             value_trunk_biases: self.value_trunk_biases.clone(),
+            value_square_hidden: self.value_square_hidden.clone(),
+            value_square_hidden_bias: self.value_square_hidden_bias.clone(),
             value_board_conv1_weights: self.value_board_conv1_weights.clone(),
             value_board_conv1_bias: self.value_board_conv1_bias.clone(),
             value_board_conv2_weights: self.value_board_conv2_weights.clone(),
             value_board_conv2_bias: self.value_board_conv2_bias.clone(),
+            value_board_conv3_weights: self.value_board_conv3_weights.clone(),
+            value_board_conv3_bias: self.value_board_conv3_bias.clone(),
             value_board_attention_query: self.value_board_attention_query.clone(),
             value_board_hidden: self.value_board_hidden.clone(),
             value_board_hidden_bias: self.value_board_hidden_bias.clone(),
-            value_relation_hidden: self.value_relation_hidden.clone(),
-            value_relation_hidden_bias: self.value_relation_hidden_bias.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
@@ -311,7 +311,6 @@ pub struct AzTrainingSample {
     pub board: Vec<u8>,
     pub move_indices: Vec<usize>,
     pub policy: Vec<f32>,
-    pub value_relation: Vec<f32>,
     pub value: f32,
     pub side_sign: f32,
 }
@@ -385,15 +384,15 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
         let board_hidden_bias = vec![0.0; hidden_size];
-        let value_input_hidden: Vec<f32> = (0..V4_INPUT_SIZE * VALUE_BRANCH_SIZE)
-            .map(|_| rng.weight(0.015))
-            .collect();
-        let value_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
         let value_trunk_weights: Vec<f32> =
             (0..VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE)
                 .map(|_| rng.weight((2.0 / VALUE_BRANCH_SIZE as f32).sqrt()))
                 .collect();
         let value_trunk_biases = vec![0.0; VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE];
+        let value_square_hidden: Vec<f32> = (0..VALUE_SQUARE_INPUT_SIZE * VALUE_BRANCH_SIZE)
+            .map(|_| rng.weight(0.015))
+            .collect();
+        let value_square_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
         let value_board_conv1_weights: Vec<f32> =
             (0..VALUE_CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA)
                 .map(|_| rng.weight(0.08))
@@ -404,16 +403,17 @@ impl AzNnue {
                 .map(|_| rng.weight(0.08))
                 .collect();
         let value_board_conv2_bias = vec![0.0; VALUE_CNN_CHANNELS];
+        let value_board_conv3_weights: Vec<f32> =
+            (0..VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA)
+                .map(|_| rng.weight(0.06))
+                .collect();
+        let value_board_conv3_bias = vec![0.0; VALUE_CNN_CHANNELS];
         let value_board_attention_query: Vec<f32> =
             (0..VALUE_CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
         let value_board_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / VALUE_CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
         let value_board_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
-        let value_relation_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * VALUE_RELATION_FEATURE_SIZE)
-            .map(|_| rng.weight((2.0 / VALUE_RELATION_FEATURE_SIZE as f32).sqrt()))
-            .collect();
-        let value_relation_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
         let value_intermediate_hidden = (0..VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE)
             .map(|_| rng.weight((2.0 / VALUE_BRANCH_SIZE as f32).sqrt()))
             .collect();
@@ -447,19 +447,19 @@ impl AzNnue {
             board_attention_query,
             board_hidden,
             board_hidden_bias,
-            value_input_hidden,
-            value_hidden_bias,
             value_trunk_weights,
             value_trunk_biases,
+            value_square_hidden,
+            value_square_hidden_bias,
             value_board_conv1_weights,
             value_board_conv1_bias,
             value_board_conv2_weights,
             value_board_conv2_bias,
+            value_board_conv3_weights,
+            value_board_conv3_bias,
             value_board_attention_query,
             value_board_hidden,
             value_board_hidden_bias,
-            value_relation_hidden,
-            value_relation_hidden_bias,
             value_intermediate_hidden,
             value_intermediate_bias,
             value_logits_weights,
@@ -492,19 +492,19 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.board_attention_query)?;
         write_f32_slice_le(&mut writer, &self.board_hidden)?;
         write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_input_hidden)?;
-        write_f32_slice_le(&mut writer, &self.value_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_trunk_weights)?;
         write_f32_slice_le(&mut writer, &self.value_trunk_biases)?;
+        write_f32_slice_le(&mut writer, &self.value_square_hidden)?;
+        write_f32_slice_le(&mut writer, &self.value_square_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_board_conv1_weights)?;
         write_f32_slice_le(&mut writer, &self.value_board_conv1_bias)?;
         write_f32_slice_le(&mut writer, &self.value_board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.value_board_conv2_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_board_conv3_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_board_conv3_bias)?;
         write_f32_slice_le(&mut writer, &self.value_board_attention_query)?;
         write_f32_slice_le(&mut writer, &self.value_board_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_board_hidden_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_relation_hidden)?;
-        write_f32_slice_le(&mut writer, &self.value_relation_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
@@ -560,21 +560,22 @@ impl AzNnue {
         let board_attention_query_len = CNN_CHANNELS;
         let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
         let board_hidden_bias_len = hidden_size;
-        let value_input_hidden_len = V4_INPUT_SIZE * VALUE_BRANCH_SIZE;
-        let value_hidden_bias_len = VALUE_BRANCH_SIZE;
         let value_trunk_weights_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
         let value_trunk_biases_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE;
+        let value_square_hidden_len = VALUE_SQUARE_INPUT_SIZE * VALUE_BRANCH_SIZE;
+        let value_square_hidden_bias_len = VALUE_BRANCH_SIZE;
         let value_board_conv1_weights_len =
             VALUE_CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
         let value_board_conv1_bias_len = VALUE_CNN_CHANNELS;
         let value_board_conv2_weights_len =
             VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA;
         let value_board_conv2_bias_len = VALUE_CNN_CHANNELS;
+        let value_board_conv3_weights_len =
+            VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA;
+        let value_board_conv3_bias_len = VALUE_CNN_CHANNELS;
         let value_board_attention_query_len = VALUE_CNN_CHANNELS;
         let value_board_hidden_len = VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE;
         let value_board_hidden_bias_len = VALUE_BRANCH_SIZE;
-        let value_relation_hidden_len = VALUE_BRANCH_SIZE * VALUE_RELATION_FEATURE_SIZE;
-        let value_relation_hidden_bias_len = VALUE_BRANCH_SIZE;
         let vih_len = VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE;
         let vib_len = VALUE_HIDDEN_SIZE;
         let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
@@ -594,19 +595,19 @@ impl AzNnue {
             + board_attention_query_len
             + board_hidden_len
             + board_hidden_bias_len
-            + value_input_hidden_len
-            + value_hidden_bias_len
             + value_trunk_weights_len
             + value_trunk_biases_len
+            + value_square_hidden_len
+            + value_square_hidden_bias_len
             + value_board_conv1_weights_len
             + value_board_conv1_bias_len
             + value_board_conv2_weights_len
             + value_board_conv2_bias_len
+            + value_board_conv3_weights_len
+            + value_board_conv3_bias_len
             + value_board_attention_query_len
             + value_board_hidden_len
             + value_board_hidden_bias_len
-            + value_relation_hidden_len
-            + value_relation_hidden_bias_len
             + vih_len
             + vib_len
             + vlw_len
@@ -638,23 +639,23 @@ impl AzNnue {
         let board_attention_query = read_f32_vec_le(&mut reader, board_attention_query_len)?;
         let board_hidden = read_f32_vec_le(&mut reader, board_hidden_len)?;
         let board_hidden_bias = read_f32_vec_le(&mut reader, board_hidden_bias_len)?;
-        let value_input_hidden = read_f32_vec_le(&mut reader, value_input_hidden_len)?;
-        let value_hidden_bias = read_f32_vec_le(&mut reader, value_hidden_bias_len)?;
         let value_trunk_weights = read_f32_vec_le(&mut reader, value_trunk_weights_len)?;
         let value_trunk_biases = read_f32_vec_le(&mut reader, value_trunk_biases_len)?;
+        let value_square_hidden = read_f32_vec_le(&mut reader, value_square_hidden_len)?;
+        let value_square_hidden_bias = read_f32_vec_le(&mut reader, value_square_hidden_bias_len)?;
         let value_board_conv1_weights =
             read_f32_vec_le(&mut reader, value_board_conv1_weights_len)?;
         let value_board_conv1_bias = read_f32_vec_le(&mut reader, value_board_conv1_bias_len)?;
         let value_board_conv2_weights =
             read_f32_vec_le(&mut reader, value_board_conv2_weights_len)?;
         let value_board_conv2_bias = read_f32_vec_le(&mut reader, value_board_conv2_bias_len)?;
+        let value_board_conv3_weights =
+            read_f32_vec_le(&mut reader, value_board_conv3_weights_len)?;
+        let value_board_conv3_bias = read_f32_vec_le(&mut reader, value_board_conv3_bias_len)?;
         let value_board_attention_query =
             read_f32_vec_le(&mut reader, value_board_attention_query_len)?;
         let value_board_hidden = read_f32_vec_le(&mut reader, value_board_hidden_len)?;
         let value_board_hidden_bias = read_f32_vec_le(&mut reader, value_board_hidden_bias_len)?;
-        let value_relation_hidden = read_f32_vec_le(&mut reader, value_relation_hidden_len)?;
-        let value_relation_hidden_bias =
-            read_f32_vec_le(&mut reader, value_relation_hidden_bias_len)?;
         let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
         let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
@@ -676,19 +677,19 @@ impl AzNnue {
             board_attention_query,
             board_hidden,
             board_hidden_bias,
-            value_input_hidden,
-            value_hidden_bias,
             value_trunk_weights,
             value_trunk_biases,
+            value_square_hidden,
+            value_square_hidden_bias,
             value_board_conv1_weights,
             value_board_conv1_bias,
             value_board_conv2_weights,
             value_board_conv2_bias,
+            value_board_conv3_weights,
+            value_board_conv3_bias,
             value_board_attention_query,
             value_board_hidden,
             value_board_hidden_bias,
-            value_relation_hidden,
-            value_relation_hidden_bias,
             value_intermediate_hidden,
             value_intermediate_bias,
             value_logits_weights,
@@ -730,15 +731,11 @@ impl AzNnue {
             &scratch.board,
             &mut scratch.value_conv1,
             &mut scratch.value_conv2,
+            &mut scratch.value_conv3,
             &mut scratch.value_cnn_global,
         );
-        self.value_embedding_into(&features, &mut scratch.value_hidden);
+        self.value_square_embedding_into(&scratch.board, &mut scratch.value_hidden);
         self.value_board_hidden_into(&scratch.value_cnn_global, &mut scratch.value_next);
-        for idx in 0..VALUE_BRANCH_SIZE {
-            scratch.value_hidden[idx] += scratch.value_next[idx];
-        }
-        extract_value_relation_features(position, moves, &mut scratch.value_relation);
-        self.value_relation_hidden_into(&scratch.value_relation, &mut scratch.value_next);
         for idx in 0..VALUE_BRANCH_SIZE {
             scratch.value_hidden[idx] += scratch.value_next[idx];
         }
@@ -776,21 +773,6 @@ impl AzNnue {
         }
     }
 
-    fn value_embedding_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
-        hidden.resize(VALUE_BRANCH_SIZE, 0.0);
-        hidden.copy_from_slice(&self.value_hidden_bias);
-        for &feature in features {
-            let row = &self.value_input_hidden
-                [feature * VALUE_BRANCH_SIZE..(feature + 1) * VALUE_BRANCH_SIZE];
-            for idx in 0..VALUE_BRANCH_SIZE {
-                hidden[idx] += row[idx];
-            }
-        }
-        for value in hidden.iter_mut() {
-            *value = value.max(0.0);
-        }
-    }
-
     fn board_hidden_into(&self, cnn_global: &[f32], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.board_hidden_bias);
@@ -816,16 +798,26 @@ impl AzNnue {
         }
     }
 
-    fn value_relation_hidden_into(&self, relation: &[f32], hidden: &mut Vec<f32>) {
+    fn value_square_embedding_into(&self, board: &[u8], hidden: &mut Vec<f32>) {
         hidden.resize(VALUE_BRANCH_SIZE, 0.0);
-        hidden.copy_from_slice(&self.value_relation_hidden_bias);
-        for (out, hidden_value) in hidden.iter_mut().enumerate().take(VALUE_BRANCH_SIZE) {
-            let row = &self.value_relation_hidden
-                [out * VALUE_RELATION_FEATURE_SIZE..(out + 1) * VALUE_RELATION_FEATURE_SIZE];
-            for (feature, weight) in relation.iter().zip(row) {
-                *hidden_value += feature * weight;
+        hidden.copy_from_slice(&self.value_square_hidden_bias);
+        for (idx, &plane) in board.iter().take(BOARD_HISTORY_SIZE).enumerate() {
+            if plane == 0 {
+                continue;
             }
-            *hidden_value = (*hidden_value).max(0.0);
+            let frame = idx / BOARD_PLANES_SIZE;
+            let sq = idx % BOARD_PLANES_SIZE;
+            let channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
+            debug_assert!(channel < BOARD_CHANNELS);
+            let feature = channel * BOARD_PLANES_SIZE + sq;
+            let row = &self.value_square_hidden
+                [feature * VALUE_BRANCH_SIZE..(feature + 1) * VALUE_BRANCH_SIZE];
+            for idx in 0..VALUE_BRANCH_SIZE {
+                hidden[idx] += row[idx];
+            }
+        }
+        for value in hidden.iter_mut() {
+            *value = value.max(0.0);
         }
     }
 
@@ -862,10 +854,12 @@ impl AzNnue {
         board: &[u8],
         conv1: &mut Vec<f32>,
         conv2: &mut Vec<f32>,
+        conv3: &mut Vec<f32>,
         value_cnn_global: &mut Vec<f32>,
     ) {
         conv1.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
         conv2.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        conv3.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
         value_cnn_global.resize(VALUE_CNN_POOLED_SIZE, 0.0);
         conv_relu_layer_generic(
             board,
@@ -882,8 +876,19 @@ impl AzNnue {
             &self.value_board_conv2_bias,
             conv2,
         );
-        pool_cnn_features(
+        conv_relu_layer_dense_generic(
             conv2,
+            VALUE_CNN_CHANNELS,
+            VALUE_CNN_CHANNELS,
+            &self.value_board_conv3_weights,
+            &self.value_board_conv3_bias,
+            conv3,
+        );
+        for (dst, skip) in conv3.iter_mut().zip(conv1.iter()) {
+            *dst = (*dst + skip).max(0.0);
+        }
+        pool_cnn_features(
+            conv3,
             VALUE_CNN_CHANNELS,
             &self.value_board_attention_query,
             value_cnn_global,
@@ -962,22 +967,23 @@ impl AzNnue {
             || self.board_attention_query.len() != CNN_CHANNELS
             || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
             || self.board_hidden_bias.len() != self.hidden_size
-            || self.value_input_hidden.len() != V4_INPUT_SIZE * VALUE_BRANCH_SIZE
-            || self.value_hidden_bias.len() != VALUE_BRANCH_SIZE
             || self.value_trunk_weights.len()
                 != VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE
             || self.value_trunk_biases.len() != VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE
+            || self.value_square_hidden.len() != VALUE_SQUARE_INPUT_SIZE * VALUE_BRANCH_SIZE
+            || self.value_square_hidden_bias.len() != VALUE_BRANCH_SIZE
             || self.value_board_conv1_weights.len()
                 != VALUE_CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
             || self.value_board_conv1_bias.len() != VALUE_CNN_CHANNELS
             || self.value_board_conv2_weights.len()
                 != VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA
             || self.value_board_conv2_bias.len() != VALUE_CNN_CHANNELS
+            || self.value_board_conv3_weights.len()
+                != VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA
+            || self.value_board_conv3_bias.len() != VALUE_CNN_CHANNELS
             || self.value_board_attention_query.len() != VALUE_CNN_CHANNELS
             || self.value_board_hidden.len() != VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE
             || self.value_board_hidden_bias.len() != VALUE_BRANCH_SIZE
-            || self.value_relation_hidden.len() != VALUE_BRANCH_SIZE * VALUE_RELATION_FEATURE_SIZE
-            || self.value_relation_hidden_bias.len() != VALUE_BRANCH_SIZE
             || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE
             || self.value_intermediate_bias.len() != VALUE_HIDDEN_SIZE
             || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
@@ -1074,169 +1080,6 @@ fn canonical_piece_plane(side: Color, piece_color: Color, kind: PieceKind) -> us
         Color::Black
     };
     absolute_piece_plane(canonical_color, kind)
-}
-
-pub(super) fn extract_value_relation_features(
-    position: &Position,
-    moves: &[Move],
-    out: &mut Vec<f32>,
-) {
-    out.resize(VALUE_RELATION_FEATURE_SIZE, 0.0);
-    out.fill(0.0);
-    let side = position.side_to_move();
-    let enemy = side.opposite();
-    out[0] = 1.0;
-    out[1] = 1.0;
-    out[2] = position.in_check(side) as u8 as f32;
-    out[3] = (moves.len() as f32 / 128.0).min(1.5);
-
-    let mut capture_count = 0.0f32;
-    let mut check_count = 0.0f32;
-    let mut capture_value_sum = 0.0f32;
-    let mut best_capture_value = 0.0f32;
-    let mut destination_center_sum = 0.0f32;
-    let mut forward_sum = 0.0f32;
-    let mut river_cross_sum = 0.0f32;
-    let mut palace_target_sum = 0.0f32;
-    let mut line_move_sum = 0.0f32;
-    let mut horse_move_sum = 0.0f32;
-    let mut bad_capture_sum = 0.0f32;
-    let mut work = position.clone();
-
-    for &mv in moves {
-        let from = mv.from as usize;
-        let to = mv.to as usize;
-        let Some(mover) = position.piece_at(from) else {
-            continue;
-        };
-        let mover_slot = piece_kind_slot(mover.kind);
-        out[10 + mover_slot] += 1.0 / 32.0;
-
-        let from_rank = from / BOARD_FILES;
-        let from_file = from % BOARD_FILES;
-        let to_rank = to / BOARD_FILES;
-        let to_file = to % BOARD_FILES;
-        let df = to_file.abs_diff(from_file);
-        let dr = to_rank.abs_diff(from_rank);
-        destination_center_sum += 1.0 - ((to_file as f32 - 4.0).abs() / 4.0);
-        forward_sum += ((to_rank as i32 - from_rank as i32) * side.forward_step()).signum() as f32;
-        river_cross_sum += ((from_rank < 5) != (to_rank < 5)) as u8 as f32;
-        palace_target_sum += is_palace_pos(to_rank, to_file) as u8 as f32;
-        line_move_sum += (df == 0 || dr == 0) as u8 as f32;
-        horse_move_sum += ((df == 1 && dr == 2) || (df == 2 && dr == 1)) as u8 as f32;
-
-        let captured = position.piece_at(to);
-        if let Some(target) = captured {
-            capture_count += 1.0;
-            let capture_value = piece_base_value(target.kind).max(0) as f32 / VALUE_SCALE_CP;
-            capture_value_sum += capture_value;
-            best_capture_value = best_capture_value.max(capture_value);
-            out[17 + mover_slot] += 1.0 / 16.0;
-            out[31 + piece_kind_slot(target.kind)] += capture_value;
-            if position.is_piece_protected(to, enemy) {
-                bad_capture_sum += capture_value;
-            }
-        }
-
-        let gives_check = captured.is_some_and(|piece| piece.kind == PieceKind::General) || {
-            let undo = work.make_move(mv);
-            let gives_check = work.has_general(enemy) && work.in_check(enemy);
-            work.unmake_move(mv, undo);
-            gives_check
-        };
-        if gives_check {
-            check_count += 1.0;
-            out[24 + mover_slot] += 1.0 / 16.0;
-        }
-    }
-
-    let move_scale = if moves.is_empty() {
-        0.0
-    } else {
-        1.0 / moves.len() as f32
-    };
-    out[4] = (capture_count / 64.0).min(1.0);
-    out[5] = (check_count / 64.0).min(1.0);
-    out[6] = ((moves.len() as f32 - capture_count).max(0.0) / 128.0).min(1.0);
-    out[7] = best_capture_value;
-    out[8] = (capture_value_sum / 4.0).min(2.0);
-    out[9] = (bad_capture_sum / 4.0).min(2.0);
-    out[52] = destination_center_sum * move_scale;
-    out[53] = forward_sum * move_scale;
-    out[54] = river_cross_sum * move_scale;
-    out[55] = palace_target_sum * move_scale;
-    out[56] = line_move_sum * move_scale;
-    out[57] = horse_move_sum * move_scale;
-
-    let mut own_material = 0.0f32;
-    let mut enemy_material = 0.0f32;
-    let mut own_attacked = 0.0f32;
-    let mut enemy_attacked = 0.0f32;
-    let mut own_protected = 0.0f32;
-    let mut enemy_protected = 0.0f32;
-    let mut own_hanging = 0.0f32;
-    let mut enemy_hanging = 0.0f32;
-    let mut own_pieces = 0.0f32;
-    let mut enemy_pieces = 0.0f32;
-    for sq in 0..BOARD_SIZE {
-        let Some(piece) = position.piece_at(sq) else {
-            continue;
-        };
-        let value = piece_base_value(piece.kind).max(0) as f32 / VALUE_SCALE_CP;
-        let attacked_by_enemy = position.is_piece_protected(sq, piece.color.opposite());
-        let protected_by_own = position.is_piece_protected(sq, piece.color);
-        if piece.color == side {
-            own_material += value;
-            own_pieces += 1.0;
-            if attacked_by_enemy {
-                own_attacked += value;
-            }
-            if protected_by_own {
-                own_protected += value;
-            }
-            if attacked_by_enemy && !protected_by_own {
-                own_hanging += value;
-            }
-        } else {
-            enemy_material += value;
-            enemy_pieces += 1.0;
-            if attacked_by_enemy {
-                enemy_attacked += value;
-            }
-            if protected_by_own {
-                enemy_protected += value;
-            }
-            if attacked_by_enemy && !protected_by_own {
-                enemy_hanging += value;
-            }
-        }
-    }
-    out[38] = (own_material / 5.0).min(2.0);
-    out[39] = (enemy_material / 5.0).min(2.0);
-    out[40] = ((own_material - enemy_material) / 5.0).clamp(-2.0, 2.0);
-    out[41] = (own_attacked / 5.0).min(2.0);
-    out[42] = (enemy_attacked / 5.0).min(2.0);
-    out[43] = (own_protected / 5.0).min(2.0);
-    out[44] = (enemy_protected / 5.0).min(2.0);
-    out[45] = (own_hanging / 5.0).min(2.0);
-    out[46] = (enemy_hanging / 5.0).min(2.0);
-    out[47] = own_pieces / 16.0;
-    out[48] = enemy_pieces / 16.0;
-    out[49] = position.in_check(side) as u8 as f32;
-    out[50] = position.in_check(enemy) as u8 as f32;
-    out[51] = (position.halfmove_clock() as f32 / 120.0).min(1.0);
-}
-
-fn piece_kind_slot(kind: PieceKind) -> usize {
-    match kind {
-        PieceKind::General => 0,
-        PieceKind::Advisor => 1,
-        PieceKind::Elephant => 2,
-        PieceKind::Horse => 3,
-        PieceKind::Rook => 4,
-        PieceKind::Cannon => 5,
-        PieceKind::Soldier => 6,
-    }
 }
 
 fn conv_relu_layer_generic(
@@ -1363,7 +1206,7 @@ fn pool_cnn_features(input: &[f32], channels: usize, attention_query: &[f32], ou
     }
 }
 
-/// `batch_size` 为**每块 GPU 每步**的样本数；与配置文件中 `batch_size` 含义一致。
+/// `batch_size` is the per-device training batch size.
 pub fn benchmark_training(
     model: &mut AzNnue,
     sample_count: usize,
@@ -1404,7 +1247,6 @@ pub fn benchmark_training(
             board: vec![0; BOARD_HISTORY_SIZE],
             move_indices,
             policy,
-            value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
             value,
             side_sign: 1.0,
         });
@@ -1714,7 +1556,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
         board: vec![0; BOARD_HISTORY_SIZE],
         move_indices: vec![0, 1],
         policy: vec![0.6, 0.4],
-        value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
         value: 0.1,
         side_sign: 1.0,
     };
@@ -1771,7 +1612,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 0.0,
                 side_sign: 1.0,
             },
@@ -1780,7 +1620,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 0.0,
                 side_sign: -1.0,
             },
@@ -1800,7 +1639,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 0.2,
                 side_sign: 1.0,
             },
@@ -1809,7 +1647,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: -0.4,
                 side_sign: -1.0,
             },
@@ -1818,7 +1655,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 0.6,
                 side_sign: 1.0,
             },
@@ -1857,41 +1693,42 @@ mod tests {
         let mut model = AzNnue::random(16, 7);
         model.hidden_bias.fill(0.1);
         model.hidden_bias.fill(0.1);
+        let board_with = |sq: usize, plane: u8| {
+            let mut board = vec![0; BOARD_HISTORY_SIZE];
+            board[sq] = plane;
+            board
+        };
 
         let samples = vec![
             AzTrainingSample {
                 features: vec![0],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: board_with(0, 1),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 1.0,
                 side_sign: 1.0,
             },
             AzTrainingSample {
                 features: vec![1],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: board_with(10, 2),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: -1.0,
                 side_sign: 1.0,
             },
             AzTrainingSample {
                 features: vec![2],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: board_with(40, 3),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 0.75,
                 side_sign: 1.0,
             },
             AzTrainingSample {
                 features: vec![3],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: board_with(80, 4),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: -0.75,
                 side_sign: 1.0,
             },
@@ -1913,7 +1750,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 1.0,
                 side_sign: 1.0,
             },
@@ -1922,7 +1758,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: -1.0,
                 side_sign: 1.0,
             },
@@ -1931,7 +1766,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: 0.5,
                 side_sign: 1.0,
             },
@@ -1940,7 +1774,6 @@ mod tests {
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
                 value: -0.5,
                 side_sign: 1.0,
             },
