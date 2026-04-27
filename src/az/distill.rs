@@ -5,7 +5,7 @@ use ndarray_npy::NpzReader;
 use zip::ZipArchive;
 
 use crate::{
-    nnue::{canonical_move, extract_sparse_features_v4_canonical},
+    nnue::canonical_move,
     xiangqi::{BOARD_FILES, BOARD_RANKS, Position},
 };
 
@@ -164,7 +164,6 @@ pub fn load_distill_npz_samples(
         let mut board = Vec::new();
         extract_board_planes(&position, &[], &mut board);
         samples.push(AzTrainingSample {
-            features: extract_sparse_features_v4_canonical(&position, &[]),
             board,
             move_indices: legal_moves,
             policy,

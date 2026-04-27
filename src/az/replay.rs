@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+﻿use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -7,13 +7,9 @@ use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 use super::{AzTrainingSample, BOARD_HISTORY_SIZE, DENSE_MOVE_SPACE, SplitMix64};
 
-/// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
-/// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 8;
-/// 解压后体积极限（防恶意或损坏文件占满内存）。
+const REPLAY_FILE_VERSION: u32 = 9;
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
-const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
 const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
 
 fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
@@ -47,12 +43,6 @@ fn replay_read_f32<R: Read>(reader: &mut R) -> io::Result<f32> {
 }
 
 fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io::Result<()> {
-    if sample.features.len() > REPLAY_MAX_FEATURES_PER_SAMPLE as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "replay encode: too many features",
-        ));
-    }
     if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
         || sample.policy.len() != sample.move_indices.len()
     {
@@ -60,10 +50,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
             io::ErrorKind::InvalidInput,
             "replay encode: move_indices/policy mismatch or too long",
         ));
-    }
-    replay_push_u32(out, sample.features.len() as u32);
-    for &f in &sample.features {
-        replay_push_u32(out, f as u32);
     }
     if sample.board.len() != BOARD_HISTORY_SIZE {
         return Err(io::Error::new(
@@ -106,17 +92,6 @@ fn decode_az_training_sample<R: Read>(
             "replay decode: incompatible replay sample version",
         ));
     }
-    let nf = replay_read_u32(reader)?;
-    if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "replay decode: feature count out of range",
-        ));
-    }
-    let mut features = Vec::with_capacity(nf as usize);
-    for _ in 0..nf {
-        features.push(replay_read_u32(reader)? as usize);
-    }
     let mut board = vec![0u8; BOARD_HISTORY_SIZE];
     reader.read_exact(&mut board)?;
     let nm = replay_read_u32(reader)?;
@@ -137,7 +112,6 @@ fn decode_az_training_sample<R: Read>(
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     Ok(AzTrainingSample {
-        features,
         board,
         move_indices,
         policy,

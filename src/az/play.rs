@@ -1,10 +1,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use crate::nnue::{
-    HistoryMove, canonical_move, extract_sparse_features_v4_canonical, mirror_file_move,
-    mirror_sparse_features_file,
-};
+use crate::nnue::{HistoryMove, canonical_move, mirror_file_move};
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
@@ -326,13 +323,11 @@ fn make_training_sample(
         .sum::<f32>()
         .max(1.0);
     let side = position.side_to_move();
-    let mut features = extract_sparse_features_v4_canonical(position, history);
     let mut moves = candidates
         .iter()
         .map(|candidate| canonical_move(side, candidate.mv))
         .collect::<Vec<_>>();
     if mirror_file {
-        mirror_sparse_features_file(&mut features);
         for mv in &mut moves {
             *mv = mirror_file_move(*mv);
         }
@@ -351,7 +346,6 @@ fn make_training_sample(
         board = mirrored;
     }
     AzTrainingSample {
-        features,
         board,
         move_indices,
         policy: candidates

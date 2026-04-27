@@ -10,7 +10,6 @@ use super::{
     VALUE_CNN_CHANNELS, VALUE_CNN_POOLED_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
     VALUE_SQUARE_INPUT_SIZE, policy_move_features,
 };
-use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -32,14 +31,11 @@ pub(super) struct GpuTrainer {
 #[derive(Debug)]
 struct GpuReplica {
     device: Device,
-    hidden_size: usize,
     vars: GpuVars,
 }
 
 #[derive(Debug)]
 struct GpuVars {
-    input_hidden: Var,
-    hidden_bias: Var,
     board_conv1_weights: Var,
     board_conv1_bias: Var,
     board_conv2_weights: Var,
@@ -51,12 +47,8 @@ struct GpuVars {
     value_trunk_biases: Vec<Var>,
     value_square_hidden: Var,
     value_square_hidden_bias: Var,
-    value_board_conv1_weights: Var,
-    value_board_conv1_bias: Var,
-    value_board_conv2_weights: Var,
-    value_board_conv2_bias: Var,
-    value_board_conv3_weights: Var,
-    value_board_conv3_bias: Var,
+    value_tail_conv_weights: Var,
+    value_tail_conv_bias: Var,
     value_board_attention_query: Var,
     value_board_hidden: Var,
     value_board_hidden_bias: Var,
@@ -416,11 +408,7 @@ impl GpuReplica {
     fn new(model: &AzNnue, device_index: usize) -> CandleResult<Self> {
         let device = Device::new_cuda(device_index)?;
         let vars = GpuVars::from_model(model, &device)?;
-        Ok(Self {
-            device,
-            hidden_size: model.hidden_size,
-            vars,
-        })
+        Ok(Self { device, vars })
     }
 
     fn compute_batch_grads(
@@ -496,17 +484,6 @@ impl GpuReplica {
 
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
-        let feature_embeddings = self
-            .vars
-            .input_hidden
-            .index_select(&batch.feature_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, self.hidden_size))?;
-        let sparse_hidden = feature_embeddings
-            .broadcast_mul(&batch.feature_mask)?
-            .sum(1)?
-            .broadcast_add(&self.vars.hidden_bias)?
-            .relu()?;
-
         let conv1 = batch
             .board_onehot
             .reshape((bsz, BOARD_CHANNELS, BOARD_PLANES_SIZE))?
@@ -552,55 +529,31 @@ impl GpuReplica {
             .matmul(&self.vars.board_hidden.t()?)?
             .broadcast_add(&self.vars.board_hidden_bias)?
             .relu()?;
-        let hidden = (sparse_hidden + cnn_hidden)?;
+        let hidden = cnn_hidden;
 
-        let value_conv1 = batch
-            .board_onehot
-            .reshape((bsz, BOARD_CHANNELS, BOARD_PLANES_SIZE))?
-            .transpose(1, 2)?
-            .reshape((bsz * BOARD_PLANES_SIZE, BOARD_CHANNELS))?
-            .matmul(&self.vars.value_board_conv1_weights.t()?)?
-            .reshape((bsz, BOARD_PLANES_SIZE, VALUE_CNN_CHANNELS))?
-            .broadcast_add(&self.vars.value_board_conv1_bias.reshape((
-                1,
-                1,
-                VALUE_CNN_CHANNELS,
-            ))?)?
-            .transpose(1, 2)?
-            .reshape((bsz, VALUE_CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?
-            .relu()?;
-        let value_conv2 = value_conv1
-            .conv2d(&self.vars.value_board_conv2_weights, 1, 1, 1, 1)?
-            .broadcast_add(&self.vars.value_board_conv2_bias.reshape((
-                1,
-                VALUE_CNN_CHANNELS,
-                1,
-                1,
-            ))?)?
-            .relu()?;
-        let value_conv3_raw = value_conv2
-            .conv2d(&self.vars.value_board_conv3_weights, 1, 1, 1, 1)?
-            .broadcast_add(&self.vars.value_board_conv3_bias.reshape((
+        let value_tail_raw = conv2
+            .conv2d(&self.vars.value_tail_conv_weights, 1, 1, 1, 1)?
+            .broadcast_add(&self.vars.value_tail_conv_bias.reshape((
                 1,
                 VALUE_CNN_CHANNELS,
                 1,
                 1,
             ))?)?;
-        let value_conv3 = (value_conv3_raw + value_conv1)?.relu()?;
-        let value_conv3_flat = value_conv3.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
-        let value_avg_pool = value_conv3_flat.mean(2)?;
-        let value_max_pool = value_conv3_flat.max(2)?;
+        let value_tail = (value_tail_raw + conv2)?.relu()?;
+        let value_tail_flat = value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
+        let value_avg_pool = value_tail_flat.mean(2)?;
+        let value_max_pool = value_tail_flat.max(2)?;
         let value_attn_query =
             self.vars
                 .value_board_attention_query
                 .reshape((1, VALUE_CNN_CHANNELS, 1))?;
-        let value_attn_logits = value_conv3_flat.broadcast_mul(&value_attn_query)?.sum(1)?;
+        let value_attn_logits = value_tail_flat.broadcast_mul(&value_attn_query)?.sum(1)?;
         let value_attn_weights = softmax(&value_attn_logits, 1)?;
-        let value_attn_pool = value_conv3_flat
+        let value_attn_pool = value_tail_flat
             .broadcast_mul(&value_attn_weights.unsqueeze(1)?)?
             .sum(2)?;
         let value_conv2_grid =
-            value_conv3.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
+            value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
         let value_row_line_pool = (value_conv2_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
         let value_col_line_pool = (value_conv2_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
         let value_cnn_global = Tensor::cat(
@@ -676,9 +629,6 @@ struct ForwardOutput {
 
 struct BatchTensors {
     batch_size: usize,
-    max_features: usize,
-    feature_indices: Tensor,
-    feature_mask: Tensor,
     board_onehot: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
@@ -689,14 +639,6 @@ struct BatchTensors {
 impl BatchTensors {
     fn new(samples: &[AzTrainingSample], batch: &[usize], device: &Device) -> CandleResult<Self> {
         let batch_size = batch.len();
-        let max_features = batch
-            .iter()
-            .map(|&sample_index| samples[sample_index].features.len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let mut feature_indices = vec![0u32; batch_size * max_features];
-        let mut feature_mask = vec![0.0f32; batch_size * max_features];
         let mut board_onehot = vec![0.0f32; batch_size * BOARD_CHANNELS * BOARD_PLANES_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * DENSE_MOVE_SPACE];
@@ -705,14 +647,6 @@ impl BatchTensors {
 
         for (row, &sample_index) in batch.iter().enumerate() {
             let sample = &samples[sample_index];
-            let feature_base = row * max_features;
-            for (feature_offset, &feature) in sample.features.iter().enumerate() {
-                if feature < V4_INPUT_SIZE {
-                    feature_indices[feature_base + feature_offset] = feature as u32;
-                    feature_mask[feature_base + feature_offset] = 1.0;
-                }
-            }
-
             let board_base = row * BOARD_CHANNELS * BOARD_PLANES_SIZE;
             for (idx, &plane) in sample.board.iter().take(BOARD_HISTORY_SIZE).enumerate() {
                 if plane > 0 {
@@ -746,9 +680,6 @@ impl BatchTensors {
 
         Ok(Self {
             batch_size,
-            max_features,
-            feature_indices: Tensor::from_vec(feature_indices, (batch_size, max_features), device)?,
-            feature_mask: Tensor::from_vec(feature_mask, (batch_size, max_features, 1), device)?,
             board_onehot: Tensor::from_vec(
                 board_onehot,
                 (batch_size, BOARD_CHANNELS, BOARD_RANKS, BOARD_FILES),
@@ -787,8 +718,6 @@ impl GpuVars {
             )?);
         }
         Ok(Self {
-            input_hidden: var_from_slice(&model.input_hidden, (V4_INPUT_SIZE, hidden), device)?,
-            hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
             board_conv1_weights: var_from_slice(
                 &model.board_conv1_weights,
                 (CNN_CHANNELS, BOARD_CHANNELS),
@@ -820,33 +749,13 @@ impl GpuVars {
                 VALUE_BRANCH_SIZE,
                 device,
             )?,
-            value_board_conv1_weights: var_from_slice(
-                &model.value_board_conv1_weights,
-                (VALUE_CNN_CHANNELS, BOARD_CHANNELS),
+            value_tail_conv_weights: var_from_slice(
+                &model.value_tail_conv_weights,
+                (VALUE_CNN_CHANNELS, CNN_CHANNELS, 3, 3),
                 device,
             )?,
-            value_board_conv1_bias: var_from_slice(
-                &model.value_board_conv1_bias,
-                VALUE_CNN_CHANNELS,
-                device,
-            )?,
-            value_board_conv2_weights: var_from_slice(
-                &model.value_board_conv2_weights,
-                (VALUE_CNN_CHANNELS, VALUE_CNN_CHANNELS, 3, 3),
-                device,
-            )?,
-            value_board_conv2_bias: var_from_slice(
-                &model.value_board_conv2_bias,
-                VALUE_CNN_CHANNELS,
-                device,
-            )?,
-            value_board_conv3_weights: var_from_slice(
-                &model.value_board_conv3_weights,
-                (VALUE_CNN_CHANNELS, VALUE_CNN_CHANNELS, 3, 3),
-                device,
-            )?,
-            value_board_conv3_bias: var_from_slice(
-                &model.value_board_conv3_bias,
+            value_tail_conv_bias: var_from_slice(
+                &model.value_tail_conv_bias,
                 VALUE_CNN_CHANNELS,
                 device,
             )?,
@@ -917,8 +826,6 @@ impl GpuVars {
 
     fn all_vars(&self) -> Vec<Var> {
         let mut vars = Vec::new();
-        vars.push(self.input_hidden.clone());
-        vars.push(self.hidden_bias.clone());
         vars.push(self.board_conv1_weights.clone());
         vars.push(self.board_conv1_bias.clone());
         vars.push(self.board_conv2_weights.clone());
@@ -928,12 +835,8 @@ impl GpuVars {
         vars.push(self.board_hidden_bias.clone());
         vars.extend(self.value_trunk_weights.iter().cloned());
         vars.extend(self.value_trunk_biases.iter().cloned());
-        vars.push(self.value_board_conv1_weights.clone());
-        vars.push(self.value_board_conv1_bias.clone());
-        vars.push(self.value_board_conv2_weights.clone());
-        vars.push(self.value_board_conv2_bias.clone());
-        vars.push(self.value_board_conv3_weights.clone());
-        vars.push(self.value_board_conv3_bias.clone());
+        vars.push(self.value_tail_conv_weights.clone());
+        vars.push(self.value_tail_conv_bias.clone());
         vars.push(self.value_square_hidden.clone());
         vars.push(self.value_square_hidden_bias.clone());
         vars.push(self.value_board_attention_query.clone());
@@ -954,8 +857,6 @@ impl GpuVars {
 
     fn shared_vars(&self) -> Vec<Var> {
         let mut vars = Vec::new();
-        vars.push(self.input_hidden.clone());
-        vars.push(self.hidden_bias.clone());
         vars.push(self.board_conv1_weights.clone());
         vars.push(self.board_conv1_bias.clone());
         vars.push(self.board_conv2_weights.clone());
@@ -968,12 +869,8 @@ impl GpuVars {
 
     fn value_head_vars(&self) -> Vec<Var> {
         let mut vars = vec![
-            self.value_board_conv1_weights.clone(),
-            self.value_board_conv1_bias.clone(),
-            self.value_board_conv2_weights.clone(),
-            self.value_board_conv2_bias.clone(),
-            self.value_board_conv3_weights.clone(),
-            self.value_board_conv3_bias.clone(),
+            self.value_tail_conv_weights.clone(),
+            self.value_tail_conv_bias.clone(),
             self.value_square_hidden.clone(),
             self.value_square_hidden_bias.clone(),
             self.value_board_attention_query.clone(),
@@ -1019,8 +916,6 @@ impl GpuVars {
     }
 
     fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
-        copy_var(&self.input_hidden, &mut model.input_hidden)?;
-        copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
         copy_var(&self.board_conv2_weights, &mut model.board_conv2_weights)?;
@@ -1045,29 +940,10 @@ impl GpuVars {
             )?;
         }
         copy_var(
-            &self.value_board_conv1_weights,
-            &mut model.value_board_conv1_weights,
+            &self.value_tail_conv_weights,
+            &mut model.value_tail_conv_weights,
         )?;
-        copy_var(
-            &self.value_board_conv1_bias,
-            &mut model.value_board_conv1_bias,
-        )?;
-        copy_var(
-            &self.value_board_conv2_weights,
-            &mut model.value_board_conv2_weights,
-        )?;
-        copy_var(
-            &self.value_board_conv2_bias,
-            &mut model.value_board_conv2_bias,
-        )?;
-        copy_var(
-            &self.value_board_conv3_weights,
-            &mut model.value_board_conv3_weights,
-        )?;
-        copy_var(
-            &self.value_board_conv3_bias,
-            &mut model.value_board_conv3_bias,
-        )?;
+        copy_var(&self.value_tail_conv_bias, &mut model.value_tail_conv_bias)?;
         copy_var(&self.value_square_hidden, &mut model.value_square_hidden)?;
         copy_var(
             &self.value_square_hidden_bias,

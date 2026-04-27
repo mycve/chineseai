@@ -310,11 +310,11 @@ impl AzLoopFileConfig {
 #
 # Model architecture:
 #   hidden_size is the runtime-tunable model width.
-#   The rest of the tensor shapes are fixed by the v24 binary architecture:
+#   The rest of the tensor shapes are fixed by the v26 binary architecture:
 #   policy_trunk_layers=0, board_channels=126, policy_cnn_channels=24,
-#   value_cnn_channels=32, value_cnn_layers=3 residual, policy_condition_size=32,
-#   value_branch=128x2, value_hidden=256. Value uses learned piece-square board
-#   embeddings + board CNN only: no value-side sparse V4 and no hand relation shortcut.
+#   value_tail_channels=24, value_tail_layers=1 residual, policy_condition_size=32,
+#   value_branch=128x2, value_hidden=256. Policy and value share the board CNN
+#   stem; value keeps a small tail and learned piece-square baseline.
 #   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
 
 model_path = "{model_path}"
