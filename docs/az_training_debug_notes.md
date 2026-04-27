@@ -1,6 +1,6 @@
 # ChineseAI 自对弈训练问题复盘
 
-本文记录这轮从 NNUE 式模型到 Tiny CNN/Line-GNN 过程中遇到的核心问题、判断方式和处理思路。重点不是“补救某个指标”，而是避免以后再次把结构问题误判成搜索、TD 或参数问题。
+本文记录这轮从 NNUE 式模型到 Tiny CNN、Line-GNN、Tiny Mobile-CNN 过程中遇到的核心问题、判断方式和处理思路。重点不是“补救某个指标”，而是避免以后再次把结构问题误判成搜索、TD 或参数问题。
 
 ## 1. 初始症状
 
@@ -58,7 +58,7 @@
 
 ### 5.2 Tiny Line-GNN
 
-当前方向改成轻量 Line-GNN：
+曾经尝试轻量 Line-GNN：
 
 - local 3x3 卷积负责近邻关系。
 - row context 负责横线关系。
@@ -66,9 +66,20 @@
 - 每层 row/column 有可学习 gate。
 - 保留 CNN 格式，CPU/GPU 实现都比较直接。
 
-这是借鉴 GNN 项目的关键归纳偏置，但避免完整图注意力的高推理成本。
+这是借鉴 GNN 项目的关键归纳偏置，但实测这个 row/column mean 近似不够像 ZeroForge 的 attention GNN，速度和效果都没有占到便宜。结论：这条分支先判负，不继续加复杂度。
 
-### 5.3 当前 value head
+### 5.3 Tiny Mobile-CNN
+
+当前方向改成 Tiny Mobile-CNN：
+
+- sparse 3x3 stem。
+- depthwise 3x3 做便宜局部混合。
+- pointwise 1x1 做通道混合。
+- residual 连接保留局部战术特征。
+
+目的：保留 CNN 的稳定性，同时避开 dense 3x3 Tiny CNN 的 CPU 推理成本。
+
+### 5.4 当前 value head
 
 当前 value 读出是：
 
@@ -83,7 +94,7 @@
 
 关键修正：value head 不能只有硬 ReLU MLP。小样本测试中它会很容易只学到全局均值，导致看起来像 TD 或搜索问题。
 
-### 5.4 当前 policy head
+### 5.5 当前 policy head
 
 当前 policy 是 factorized scorer：
 
@@ -157,10 +168,10 @@
 
 - 终局/重复规则 target 是否有系统偏差。
 - value target 是否过噪。
-- 当前 line-GNN 容量是否不足。
+- 当前 Mobile-CNN 容量是否不足。
 - search backup/value scale 是否仍不匹配。
 - 自对弈分布是否过早塌到低质量循环。
 
 ## 10. 当前模型一句话总结
 
-当前模型是一个 CPU 友好的 Tiny Line-GNN AlphaZero 网络：用 3x3 局部卷积加行列图聚合表达象棋长线关系，用稳定 value readout 防止均值坍缩，用 from/to factorized policy scorer 保持推理轻量。
+当前模型是一个 CPU 友好的 Tiny Mobile-CNN AlphaZero 网络：用 sparse stem、depthwise 3x3 和 pointwise 1x1 低成本表达棋盘局部关系，用稳定 value readout 防止均值坍缩，用 from/to factorized policy scorer 保持推理轻量。

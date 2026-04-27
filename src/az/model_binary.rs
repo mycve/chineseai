@@ -5,8 +5,9 @@ use std::path::Path;
 use super::{
     AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_MAGIC, AZ_MODEL_BINARY_VERSION, AzModel,
     AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, CNN_CHANNELS,
-    CNN_KERNEL_AREA, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
-    VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    CNN_POOLED_SIZE, DENSE_MOVE_SPACE, MOBILE_BLOCK_BIAS_SIZE, MOBILE_BLOCK_WEIGHT_SIZE,
+    POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES,
+    VALUE_HIDDEN_SIZE, VALUE_LOGITS,
 };
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -40,8 +41,8 @@ impl AzModel {
         writer.write_all(&AZ_MODEL_BINARY_VERSION.to_le_bytes())?;
         writer.write_all(&(BOARD_CHANNELS as u32).to_le_bytes())?;
         writer.write_all(&(self.hidden_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.line_channels as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.line_blocks as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.model_channels as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.model_blocks as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.value_head_channels as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.value_hidden_size as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.policy_condition_size as u32).to_le_bytes())?;
@@ -51,7 +52,6 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
         write_f32_slice_le(&mut writer, &self.position_embed)?;
-        write_f32_slice_le(&mut writer, &self.line_gates)?;
         write_f32_slice_le(&mut writer, &self.board_hidden)?;
         write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_weights)?;
@@ -99,8 +99,8 @@ impl AzModel {
         let hidden_size = read_u32_le(&mut reader)? as usize;
         let model_config = AzModelConfig {
             hidden_size,
-            line_channels: read_u32_le(&mut reader)? as usize,
-            line_blocks: read_u32_le(&mut reader)? as usize,
+            model_channels: read_u32_le(&mut reader)? as usize,
+            model_blocks: read_u32_le(&mut reader)? as usize,
             value_head_channels: read_u32_le(&mut reader)? as usize,
             value_hidden_size: read_u32_le(&mut reader)? as usize,
             policy_condition_size: read_u32_le(&mut reader)? as usize,
@@ -116,11 +116,9 @@ impl AzModel {
         }
         let board_conv1_weights_len = CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
         let board_conv1_bias_len = CNN_CHANNELS;
-        let board_conv2_weights_len =
-            RESIDUAL_BLOCKS * 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
-        let board_conv2_bias_len = RESIDUAL_BLOCKS * 2 * CNN_CHANNELS;
+        let board_conv2_weights_len = RESIDUAL_BLOCKS * MOBILE_BLOCK_WEIGHT_SIZE;
+        let board_conv2_bias_len = RESIDUAL_BLOCKS * MOBILE_BLOCK_BIAS_SIZE;
         let position_embed_len = CNN_CHANNELS * BOARD_PLANES_SIZE;
-        let line_gates_len = RESIDUAL_BLOCKS * 2 * CNN_CHANNELS;
         let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
         let board_hidden_bias_len = hidden_size;
         let value_tail_conv_weights_len = VALUE_HEAD_CHANNELS * CNN_CHANNELS;
@@ -143,7 +141,6 @@ impl AzModel {
             + board_conv2_weights_len
             + board_conv2_bias_len
             + position_embed_len
-            + line_gates_len
             + board_hidden_len
             + board_hidden_bias_len
             + value_tail_conv_weights_len
@@ -181,7 +178,6 @@ impl AzModel {
             board_conv2_weights: read_f32_vec_le(&mut reader, board_conv2_weights_len)?,
             board_conv2_bias: read_f32_vec_le(&mut reader, board_conv2_bias_len)?,
             position_embed: read_f32_vec_le(&mut reader, position_embed_len)?,
-            line_gates: read_f32_vec_le(&mut reader, line_gates_len)?,
             board_hidden: read_f32_vec_le(&mut reader, board_hidden_len)?,
             board_hidden_bias: read_f32_vec_le(&mut reader, board_hidden_bias_len)?,
             value_tail_conv_weights: read_f32_vec_le(&mut reader, value_tail_conv_weights_len)?,

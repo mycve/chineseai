@@ -6,12 +6,12 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 use super::model_config::AzModelConfig;
 use super::model_ops::{
     conv_relu_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic, dot_product,
-    pool_cnn_features, residual_line_gnn_block_generic, scalar_value_from_logits,
+    pool_cnn_features, residual_mobile_block_generic, scalar_value_from_logits,
 };
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 4;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 5;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -28,7 +28,9 @@ pub(super) const RESIDUAL_BLOCKS: usize = 3;
 pub(super) const VALUE_HEAD_CHANNELS: usize = 8;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
-pub(super) const LINE_CONTEXT_SCALE: f32 = 0.25;
+pub(super) const MOBILE_BLOCK_WEIGHT_SIZE: usize =
+    CNN_CHANNELS * CNN_KERNEL_AREA + CNN_CHANNELS * CNN_CHANNELS;
+pub(super) const MOBILE_BLOCK_BIAS_SIZE: usize = CNN_CHANNELS * 2;
 pub(super) const CNN_POOL_BLOCKS: usize = 4;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
 pub(super) const VALUE_HEAD_MAP_SIZE: usize = VALUE_HEAD_CHANNELS * BOARD_PLANES_SIZE;
@@ -84,7 +86,6 @@ pub struct AzModel {
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
     pub position_embed: Vec<f32>,
-    pub line_gates: Vec<f32>,
     pub board_hidden: Vec<f32>,
     pub board_hidden_bias: Vec<f32>,
     pub value_tail_conv_weights: Vec<f32>,
@@ -106,11 +107,10 @@ pub struct AzModel {
 }
 
 // Architecture notes:
-// - v30 is a Tiny Line-GNN. The board is canonical side-to-move input, then a
-//   sparse 3x3 stem and residual blocks that mix three cheap graph branches:
-//   local 3x3 neighborhood, same-row context, and same-column context. This
-//   keeps the useful part of the JAX GNN (local/row/col inductive bias for
-//   soldiers/advisors plus rook/cannon files) without full attention overhead.
+// - v32 is a Tiny Mobile-CNN. The board is canonical side-to-move input, then a
+//   sparse 3x3 stem and residual depthwise-3x3 + pointwise-1x1 blocks. Dense
+//   3x3 CNN was too slow on CPU, and the previous row/column mean Line-GNN
+//   branch was weaker than the old fast baseline because it blurred tactics.
 // - Value is intentionally closer to the ZeroForge GNN readout than to the old
 //   NNUE head: 1x1 conv -> attention/mean/max/std line-aware pooling plus a
 //   small spatial tail -> leaky MLP -> three outcome logits. The leaky gate is
@@ -134,7 +134,6 @@ impl Clone for AzModel {
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
             position_embed: self.position_embed.clone(),
-            line_gates: self.line_gates.clone(),
             board_hidden: self.board_hidden.clone(),
             board_hidden_bias: self.board_hidden_bias.clone(),
             value_tail_conv_weights: self.value_tail_conv_weights.clone(),
@@ -175,16 +174,21 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / (BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA) as f32).sqrt()))
             .collect();
         let board_conv1_bias = vec![0.0; CNN_CHANNELS];
-        let residual_layer_count = RESIDUAL_BLOCKS * 2;
-        let board_conv2_weights: Vec<f32> =
-            (0..residual_layer_count * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA)
-                .map(|_| rng.weight((2.0 / (CNN_CHANNELS * CNN_KERNEL_AREA) as f32).sqrt()))
-                .collect();
-        let board_conv2_bias = vec![0.0; residual_layer_count * CNN_CHANNELS];
+        let board_conv2_weights: Vec<f32> = (0..RESIDUAL_BLOCKS * MOBILE_BLOCK_WEIGHT_SIZE)
+            .map(|index| {
+                let block_offset = index % MOBILE_BLOCK_WEIGHT_SIZE;
+                let scale = if block_offset < CNN_CHANNELS * CNN_KERNEL_AREA {
+                    (2.0 / CNN_KERNEL_AREA as f32).sqrt()
+                } else {
+                    (2.0 / CNN_CHANNELS as f32).sqrt()
+                };
+                rng.weight(scale)
+            })
+            .collect();
+        let board_conv2_bias = vec![0.0; RESIDUAL_BLOCKS * MOBILE_BLOCK_BIAS_SIZE];
         let position_embed = (0..CNN_CHANNELS * BOARD_PLANES_SIZE)
             .map(|_| rng.weight(0.02))
             .collect();
-        let line_gates = vec![1.0; RESIDUAL_BLOCKS * 2 * CNN_CHANNELS];
         let board_hidden: Vec<f32> = (0..hidden_size * CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
@@ -226,7 +230,6 @@ impl AzModel {
             board_conv2_weights,
             board_conv2_bias,
             position_embed,
-            line_gates,
             board_hidden,
             board_hidden_bias,
             value_tail_conv_weights,
@@ -314,19 +317,16 @@ impl AzModel {
         for (feature, pos) in features.iter_mut().zip(&self.position_embed) {
             *feature = (*feature + pos).max(0.0);
         }
-        let block_weight_len = 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
-        let block_bias_len = 2 * CNN_CHANNELS;
         for block in 0..RESIDUAL_BLOCKS {
-            let weight_start = block * block_weight_len;
-            let bias_start = block * block_bias_len;
-            residual_line_gnn_block_generic(
+            let weight_start = block * MOBILE_BLOCK_WEIGHT_SIZE;
+            let bias_start = block * MOBILE_BLOCK_BIAS_SIZE;
+            residual_mobile_block_generic(
                 features,
                 tmp,
                 delta,
                 CNN_CHANNELS,
-                &self.board_conv2_weights[weight_start..weight_start + block_weight_len],
-                &self.board_conv2_bias[bias_start..bias_start + block_bias_len],
-                &self.line_gates[block * 2 * CNN_CHANNELS..(block + 1) * 2 * CNN_CHANNELS],
+                &self.board_conv2_weights[weight_start..weight_start + MOBILE_BLOCK_WEIGHT_SIZE],
+                &self.board_conv2_bias[bias_start..bias_start + MOBILE_BLOCK_BIAS_SIZE],
             );
         }
         pool_cnn_features(features, CNN_CHANNELS, cnn_global);
@@ -411,11 +411,9 @@ impl AzModel {
     pub(super) fn validate(&self) -> io::Result<()> {
         if self.board_conv1_weights.len() != CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
             || self.board_conv1_bias.len() != CNN_CHANNELS
-            || self.board_conv2_weights.len()
-                != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
-            || self.board_conv2_bias.len() != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS
+            || self.board_conv2_weights.len() != RESIDUAL_BLOCKS * MOBILE_BLOCK_WEIGHT_SIZE
+            || self.board_conv2_bias.len() != RESIDUAL_BLOCKS * MOBILE_BLOCK_BIAS_SIZE
             || self.position_embed.len() != CNN_CHANNELS * BOARD_PLANES_SIZE
-            || self.line_gates.len() != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS
             || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
             || self.board_hidden_bias.len() != self.hidden_size
             || self.value_tail_conv_weights.len() != VALUE_HEAD_CHANNELS * CNN_CHANNELS

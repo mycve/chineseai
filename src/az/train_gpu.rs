@@ -5,10 +5,11 @@ use std::{process::Command, thread};
 
 use super::{
     AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
-    CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, LINE_CONTEXT_SCALE, PIECE_BOARD_CHANNELS,
-    POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES,
-    VALUE_HEAD_LEAK, VALUE_HEAD_MAP_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS,
-    policy_move_features, policy_move_from_select, policy_move_to_select,
+    CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, MOBILE_BLOCK_BIAS_SIZE,
+    MOBILE_BLOCK_WEIGHT_SIZE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
+    VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES, VALUE_HEAD_LEAK, VALUE_HEAD_MAP_SIZE,
+    VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS, policy_move_features,
+    policy_move_from_select, policy_move_to_select,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -39,10 +40,11 @@ struct GpuReplica {
 struct GpuVars {
     board_conv1_weights: Var,
     board_conv1_bias: Var,
-    residual_weights: Vec<Var>,
-    residual_biases: Vec<Var>,
+    residual_dw_weights: Vec<Var>,
+    residual_dw_biases: Vec<Var>,
+    residual_pw_weights: Vec<Var>,
+    residual_pw_biases: Vec<Var>,
     position_embed: Var,
-    line_gates: Var,
     board_hidden: Var,
     board_hidden_bias: Var,
     value_tail_conv_weights: Var,
@@ -485,37 +487,18 @@ impl GpuReplica {
             ))?)?
             .relu()?;
         for block in 0..RESIDUAL_BLOCKS {
-            let first = block * 2;
             let hidden = features
-                .conv2d(&self.vars.residual_weights[first], 1, 1, 1, 1)?
-                .broadcast_add(&self.vars.residual_biases[first].reshape((
+                .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, CNN_CHANNELS)?
+                .broadcast_add(&self.vars.residual_dw_biases[block].reshape((
                     1,
                     CNN_CHANNELS,
                     1,
                     1,
                 ))?)?
                 .relu()?;
-            let row_ctx = (hidden.sum(3)? * (1.0 / BOARD_FILES as f64))?
-                .unsqueeze(3)?
-                .broadcast_as((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
-            let col_ctx = (hidden.sum(2)? * (1.0 / BOARD_RANKS as f64))?
-                .unsqueeze(2)?
-                .broadcast_as((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
-            let gates = self
-                .vars
-                .line_gates
-                .narrow(0, block, 1)?
-                .reshape((2, CNN_CHANNELS))?;
-            let row_gate = gates.narrow(0, 0, 1)?.reshape((1, CNN_CHANNELS, 1, 1))?;
-            let col_gate = gates.narrow(0, 1, 1)?.reshape((1, CNN_CHANNELS, 1, 1))?;
-            let row_ctx = row_ctx.broadcast_mul(&row_gate)?;
-            let col_ctx = col_ctx.broadcast_mul(&col_gate)?;
-            let line_sum = (&row_ctx + &col_ctx)?;
-            let line_ctx = line_sum * LINE_CONTEXT_SCALE as f64;
-            let hidden = (hidden + line_ctx)?.relu()?;
             let delta = hidden
-                .conv2d(&self.vars.residual_weights[first + 1], 1, 1, 1, 1)?
-                .broadcast_add(&self.vars.residual_biases[first + 1].reshape((
+                .conv2d(&self.vars.residual_pw_weights[block], 0, 1, 1, 1)?
+                .broadcast_add(&self.vars.residual_pw_biases[block].reshape((
                     1,
                     CNN_CHANNELS,
                     1,
@@ -688,19 +671,33 @@ impl BatchTensors {
 impl GpuVars {
     fn from_model(model: &AzModel, device: &Device) -> CandleResult<Self> {
         let hidden = model.hidden_size;
-        let mut residual_weights = Vec::with_capacity(RESIDUAL_BLOCKS * 2);
-        let mut residual_biases = Vec::with_capacity(RESIDUAL_BLOCKS * 2);
-        let weight_len = CNN_CHANNELS * CNN_CHANNELS * 3 * 3;
-        for layer in 0..RESIDUAL_BLOCKS * 2 {
-            let weight_offset = layer * weight_len;
-            let bias_offset = layer * CNN_CHANNELS;
-            residual_weights.push(var_from_slice(
-                &model.board_conv2_weights[weight_offset..weight_offset + weight_len],
-                (CNN_CHANNELS, CNN_CHANNELS, 3, 3),
+        let mut residual_dw_weights = Vec::with_capacity(RESIDUAL_BLOCKS);
+        let mut residual_dw_biases = Vec::with_capacity(RESIDUAL_BLOCKS);
+        let mut residual_pw_weights = Vec::with_capacity(RESIDUAL_BLOCKS);
+        let mut residual_pw_biases = Vec::with_capacity(RESIDUAL_BLOCKS);
+        let dw_len = CNN_CHANNELS * CNN_KERNEL_AREA;
+        let pw_len = CNN_CHANNELS * CNN_CHANNELS;
+        for block in 0..RESIDUAL_BLOCKS {
+            let weight_offset = block * MOBILE_BLOCK_WEIGHT_SIZE;
+            let bias_offset = block * MOBILE_BLOCK_BIAS_SIZE;
+            residual_dw_weights.push(var_from_slice(
+                &model.board_conv2_weights[weight_offset..weight_offset + dw_len],
+                (CNN_CHANNELS, 1, 3, 3),
                 device,
             )?);
-            residual_biases.push(var_from_slice(
+            residual_dw_biases.push(var_from_slice(
                 &model.board_conv2_bias[bias_offset..bias_offset + CNN_CHANNELS],
+                CNN_CHANNELS,
+                device,
+            )?);
+            residual_pw_weights.push(var_from_slice(
+                &model.board_conv2_weights[weight_offset + dw_len..weight_offset + dw_len + pw_len],
+                (CNN_CHANNELS, CNN_CHANNELS, 1, 1),
+                device,
+            )?);
+            residual_pw_biases.push(var_from_slice(
+                &model.board_conv2_bias
+                    [bias_offset + CNN_CHANNELS..bias_offset + MOBILE_BLOCK_BIAS_SIZE],
                 CNN_CHANNELS,
                 device,
             )?);
@@ -712,16 +709,13 @@ impl GpuVars {
                 device,
             )?,
             board_conv1_bias: var_from_slice(&model.board_conv1_bias, CNN_CHANNELS, device)?,
-            residual_weights,
-            residual_biases,
+            residual_dw_weights,
+            residual_dw_biases,
+            residual_pw_weights,
+            residual_pw_biases,
             position_embed: var_from_slice(
                 &model.position_embed,
                 (CNN_CHANNELS, BOARD_RANKS, BOARD_FILES),
-                device,
-            )?,
-            line_gates: var_from_slice(
-                &model.line_gates,
-                (RESIDUAL_BLOCKS, 2, CNN_CHANNELS),
                 device,
             )?,
             board_hidden: var_from_slice(&model.board_hidden, (hidden, CNN_POOLED_SIZE), device)?,
@@ -807,10 +801,11 @@ impl GpuVars {
         let mut vars = Vec::new();
         vars.push(self.board_conv1_weights.clone());
         vars.push(self.board_conv1_bias.clone());
-        vars.extend(self.residual_weights.iter().cloned());
-        vars.extend(self.residual_biases.iter().cloned());
+        vars.extend(self.residual_dw_weights.iter().cloned());
+        vars.extend(self.residual_dw_biases.iter().cloned());
+        vars.extend(self.residual_pw_weights.iter().cloned());
+        vars.extend(self.residual_pw_biases.iter().cloned());
         vars.push(self.position_embed.clone());
-        vars.push(self.line_gates.clone());
         vars.push(self.board_hidden.clone());
         vars.push(self.board_hidden_bias.clone());
         vars.push(self.value_tail_conv_weights.clone());
@@ -834,21 +829,31 @@ impl GpuVars {
     fn copy_to_model(&self, model: &mut AzModel) -> CandleResult<()> {
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
-        let weight_len = CNN_CHANNELS * CNN_CHANNELS * 3 * 3;
-        for layer in 0..RESIDUAL_BLOCKS * 2 {
-            let weight_offset = layer * weight_len;
-            let bias_offset = layer * CNN_CHANNELS;
+        let dw_len = CNN_CHANNELS * CNN_KERNEL_AREA;
+        let pw_len = CNN_CHANNELS * CNN_CHANNELS;
+        for block in 0..RESIDUAL_BLOCKS {
+            let weight_offset = block * MOBILE_BLOCK_WEIGHT_SIZE;
+            let bias_offset = block * MOBILE_BLOCK_BIAS_SIZE;
             copy_var(
-                &self.residual_weights[layer],
-                &mut model.board_conv2_weights[weight_offset..weight_offset + weight_len],
+                &self.residual_dw_weights[block],
+                &mut model.board_conv2_weights[weight_offset..weight_offset + dw_len],
             )?;
             copy_var(
-                &self.residual_biases[layer],
+                &self.residual_dw_biases[block],
                 &mut model.board_conv2_bias[bias_offset..bias_offset + CNN_CHANNELS],
+            )?;
+            copy_var(
+                &self.residual_pw_weights[block],
+                &mut model.board_conv2_weights
+                    [weight_offset + dw_len..weight_offset + dw_len + pw_len],
+            )?;
+            copy_var(
+                &self.residual_pw_biases[block],
+                &mut model.board_conv2_bias
+                    [bias_offset + CNN_CHANNELS..bias_offset + MOBILE_BLOCK_BIAS_SIZE],
             )?;
         }
         copy_var(&self.position_embed, &mut model.position_embed)?;
-        copy_var(&self.line_gates, &mut model.line_gates)?;
         copy_var(&self.board_hidden, &mut model.board_hidden)?;
         copy_var(&self.board_hidden_bias, &mut model.board_hidden_bias)?;
         copy_var(

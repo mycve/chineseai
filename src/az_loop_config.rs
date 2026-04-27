@@ -14,9 +14,9 @@ pub struct AzLoopFileConfig {
     pub max_sample_train_count: usize,
     pub max_plies: usize,
     pub hidden_size: usize,
-    pub line_channels: usize,
+    pub model_channels: usize,
     pub value_head_channels: usize,
-    pub line_blocks: usize,
+    pub model_blocks: usize,
     pub value_hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
@@ -58,9 +58,9 @@ impl Default for AzLoopFileConfig {
             max_sample_train_count: 2,
             max_plies: 300,
             hidden_size: 256,
-            line_channels: 32,
+            model_channels: 32,
             value_head_channels: 8,
-            line_blocks: 3,
+            model_blocks: 3,
             value_hidden_size: 256,
             seed: 20260409,
             workers: 240,
@@ -100,9 +100,9 @@ struct AzLoopTomlConfig {
     pub max_sample_train_count: Option<usize>,
     pub max_plies: Option<usize>,
     pub hidden_size: Option<usize>,
-    pub line_channels: Option<usize>,
+    pub model_channels: Option<usize>,
     pub value_head_channels: Option<usize>,
-    pub line_blocks: Option<usize>,
+    pub model_blocks: Option<usize>,
     pub value_hidden_size: Option<usize>,
     pub seed: Option<u64>,
     pub workers: Option<usize>,
@@ -162,14 +162,14 @@ impl AzLoopTomlConfig {
         if let Some(value) = self.hidden_size {
             config.hidden_size = value;
         }
-        if let Some(value) = self.line_channels {
-            config.line_channels = value;
+        if let Some(value) = self.model_channels {
+            config.model_channels = value;
         }
         if let Some(value) = self.value_head_channels {
             config.value_head_channels = value;
         }
-        if let Some(value) = self.line_blocks {
-            config.line_blocks = value;
+        if let Some(value) = self.model_blocks {
+            config.model_blocks = value;
         }
         if let Some(value) = self.value_hidden_size {
             config.value_hidden_size = value;
@@ -263,9 +263,9 @@ impl AzLoopFileConfig {
     pub fn model_config(&self) -> AzModelConfig {
         AzModelConfig {
             hidden_size: self.hidden_size,
-            line_channels: self.line_channels,
+            model_channels: self.model_channels,
             value_head_channels: self.value_head_channels,
-            line_blocks: self.line_blocks,
+            model_blocks: self.model_blocks,
             value_hidden_size: self.value_hidden_size,
             policy_condition_size: 32,
         }
@@ -350,10 +350,10 @@ impl AzLoopFileConfig {
 #   This build supports changing hidden_size now. Other shape fields are written
 #   here so experiments are explicit, but unsupported values fail fast until the
 #   CPU/GPU forward paths are generalized for that shape.
-#   Current v31 shape: canonical board planes=126, line_channels=32, line_blocks=3,
+#   Current v32 shape: canonical board planes=126, model_channels=32, model_blocks=3,
 #   value_head_channels=8, value_hidden=256, policy_condition_size=32.
-#   line_channels is the hidden width of each board square embedding.
-#   line_blocks are residual local+row+column graph-mixing blocks.
+#   model_channels is the hidden width of each board square embedding.
+#   model_blocks are residual depthwise-3x3 + pointwise-1x1 mobile blocks.
 #   Historical sparse/NNUE inputs and value shortcuts are gone.
 
 model_path = "{model_path}"
@@ -365,8 +365,8 @@ batch_size = {batch_size}
 max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
-line_channels = {line_channels}
-line_blocks = {line_blocks}
+model_channels = {model_channels}
+model_blocks = {model_blocks}
 value_head_channels = {value_head_channels}
 value_hidden_size = {value_hidden_size}
 seed = {seed}
@@ -406,9 +406,9 @@ tensorboard_logdir = "{tensorboard_logdir}"
             max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
-            line_channels = self.line_channels,
+            model_channels = self.model_channels,
             value_head_channels = self.value_head_channels,
-            line_blocks = self.line_blocks,
+            model_blocks = self.model_blocks,
             value_hidden_size = self.value_hidden_size,
             seed = self.seed,
             workers = self.workers,
@@ -456,9 +456,9 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.max_sample_train_count = self.max_sample_train_count.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
-        self.line_channels = self.line_channels.max(1);
+        self.model_channels = self.model_channels.max(1);
         self.value_head_channels = self.value_head_channels.max(1);
-        self.line_blocks = self.line_blocks.max(1);
+        self.model_blocks = self.model_blocks.max(1);
         self.value_hidden_size = self.value_hidden_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
