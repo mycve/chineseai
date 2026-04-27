@@ -7,7 +7,8 @@ use super::{
     AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE,
     BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
     POLICY_CONDITION_SIZE, RESIDUAL_TRUNK_SCALE, VALUE_BRANCH_DEPTH, VALUE_BRANCH_SIZE,
-    VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_RELATION_FEATURE_SIZE, policy_move_features,
+    VALUE_CNN_CHANNELS, VALUE_CNN_POOLED_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    VALUE_RELATION_FEATURE_SIZE, policy_move_features,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -50,6 +51,11 @@ struct GpuVars {
     value_hidden_bias: Var,
     value_trunk_weights: Vec<Var>,
     value_trunk_biases: Vec<Var>,
+    value_board_conv1_weights: Var,
+    value_board_conv1_bias: Var,
+    value_board_conv2_weights: Var,
+    value_board_conv2_bias: Var,
+    value_board_attention_query: Var,
     value_board_hidden: Var,
     value_board_hidden_bias: Var,
     value_relation_hidden: Var,
@@ -558,8 +564,57 @@ impl GpuReplica {
             .sum(1)?
             .broadcast_add(&self.vars.value_hidden_bias)?
             .relu()?;
-        let value_cnn_hidden = cnn_global
-            .detach()
+        let value_conv1 = batch
+            .board_onehot
+            .reshape((bsz, BOARD_CHANNELS, BOARD_PLANES_SIZE))?
+            .transpose(1, 2)?
+            .reshape((bsz * BOARD_PLANES_SIZE, BOARD_CHANNELS))?
+            .matmul(&self.vars.value_board_conv1_weights.t()?)?
+            .reshape((bsz, BOARD_PLANES_SIZE, VALUE_CNN_CHANNELS))?
+            .broadcast_add(&self.vars.value_board_conv1_bias.reshape((
+                1,
+                1,
+                VALUE_CNN_CHANNELS,
+            ))?)?
+            .transpose(1, 2)?
+            .reshape((bsz, VALUE_CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?
+            .relu()?;
+        let value_conv2 = value_conv1
+            .conv2d(&self.vars.value_board_conv2_weights, 1, 1, 1, 1)?
+            .broadcast_add(&self.vars.value_board_conv2_bias.reshape((
+                1,
+                VALUE_CNN_CHANNELS,
+                1,
+                1,
+            ))?)?
+            .relu()?;
+        let value_conv2_flat = value_conv2.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
+        let value_avg_pool = value_conv2_flat.mean(2)?;
+        let value_max_pool = value_conv2_flat.max(2)?;
+        let value_attn_query =
+            self.vars
+                .value_board_attention_query
+                .reshape((1, VALUE_CNN_CHANNELS, 1))?;
+        let value_attn_logits = value_conv2_flat.broadcast_mul(&value_attn_query)?.sum(1)?;
+        let value_attn_weights = softmax(&value_attn_logits, 1)?;
+        let value_attn_pool = value_conv2_flat
+            .broadcast_mul(&value_attn_weights.unsqueeze(1)?)?
+            .sum(2)?;
+        let value_conv2_grid =
+            value_conv2.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
+        let value_row_line_pool = (value_conv2_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
+        let value_col_line_pool = (value_conv2_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
+        let value_cnn_global = Tensor::cat(
+            &[
+                value_avg_pool,
+                value_max_pool,
+                value_attn_pool,
+                value_row_line_pool,
+                value_col_line_pool,
+            ],
+            1,
+        )?;
+        let value_cnn_hidden = value_cnn_global
             .matmul(&self.vars.value_board_hidden.t()?)?
             .broadcast_add(&self.vars.value_board_hidden_bias)?
             .relu()?;
@@ -777,9 +832,34 @@ impl GpuVars {
             value_hidden_bias: var_from_slice(&model.value_hidden_bias, VALUE_BRANCH_SIZE, device)?,
             value_trunk_weights,
             value_trunk_biases,
+            value_board_conv1_weights: var_from_slice(
+                &model.value_board_conv1_weights,
+                (VALUE_CNN_CHANNELS, BOARD_CHANNELS),
+                device,
+            )?,
+            value_board_conv1_bias: var_from_slice(
+                &model.value_board_conv1_bias,
+                VALUE_CNN_CHANNELS,
+                device,
+            )?,
+            value_board_conv2_weights: var_from_slice(
+                &model.value_board_conv2_weights,
+                (VALUE_CNN_CHANNELS, VALUE_CNN_CHANNELS, 3, 3),
+                device,
+            )?,
+            value_board_conv2_bias: var_from_slice(
+                &model.value_board_conv2_bias,
+                VALUE_CNN_CHANNELS,
+                device,
+            )?,
+            value_board_attention_query: var_from_slice(
+                &model.value_board_attention_query,
+                VALUE_CNN_CHANNELS,
+                device,
+            )?,
             value_board_hidden: var_from_slice(
                 &model.value_board_hidden,
-                (VALUE_BRANCH_SIZE, CNN_POOLED_SIZE),
+                (VALUE_BRANCH_SIZE, VALUE_CNN_POOLED_SIZE),
                 device,
             )?,
             value_board_hidden_bias: var_from_slice(
@@ -862,6 +942,11 @@ impl GpuVars {
         vars.push(self.value_hidden_bias.clone());
         vars.extend(self.value_trunk_weights.iter().cloned());
         vars.extend(self.value_trunk_biases.iter().cloned());
+        vars.push(self.value_board_conv1_weights.clone());
+        vars.push(self.value_board_conv1_bias.clone());
+        vars.push(self.value_board_conv2_weights.clone());
+        vars.push(self.value_board_conv2_bias.clone());
+        vars.push(self.value_board_attention_query.clone());
         vars.push(self.value_board_hidden.clone());
         vars.push(self.value_board_hidden_bias.clone());
         vars.push(self.value_relation_hidden.clone());
@@ -897,6 +982,11 @@ impl GpuVars {
         let mut vars = vec![
             self.value_input_hidden.clone(),
             self.value_hidden_bias.clone(),
+            self.value_board_conv1_weights.clone(),
+            self.value_board_conv1_bias.clone(),
+            self.value_board_conv2_weights.clone(),
+            self.value_board_conv2_bias.clone(),
+            self.value_board_attention_query.clone(),
             self.value_board_hidden.clone(),
             self.value_board_hidden_bias.clone(),
             self.value_relation_hidden.clone(),
@@ -968,6 +1058,26 @@ impl GpuVars {
                 &mut model.value_trunk_biases[bias_offset..bias_offset + VALUE_BRANCH_SIZE],
             )?;
         }
+        copy_var(
+            &self.value_board_conv1_weights,
+            &mut model.value_board_conv1_weights,
+        )?;
+        copy_var(
+            &self.value_board_conv1_bias,
+            &mut model.value_board_conv1_bias,
+        )?;
+        copy_var(
+            &self.value_board_conv2_weights,
+            &mut model.value_board_conv2_weights,
+        )?;
+        copy_var(
+            &self.value_board_conv2_bias,
+            &mut model.value_board_conv2_bias,
+        )?;
+        copy_var(
+            &self.value_board_attention_query,
+            &mut model.value_board_attention_query,
+        )?;
         copy_var(&self.value_board_hidden, &mut model.value_board_hidden)?;
         copy_var(
             &self.value_board_hidden_bias,

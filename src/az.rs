@@ -34,7 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 22;
+const AZNNUE_BINARY_VERSION: u32 = 23;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -72,10 +72,12 @@ pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES
 pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
 pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
 const CNN_CHANNELS: usize = 24;
+pub(super) const VALUE_CNN_CHANNELS: usize = 12;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
 const CNN_KERNEL_AREA: usize = 9;
 const CNN_POOL_BLOCKS: usize = 5;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
+pub(super) const VALUE_CNN_POOLED_SIZE: usize = VALUE_CNN_CHANNELS * CNN_POOL_BLOCKS;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const VALUE_RELATION_FEATURE_SIZE: usize = 64;
 const VALUE_SCALE_CP: f32 = 1000.0;
@@ -87,6 +89,9 @@ pub(super) struct AzEvalScratch {
     conv1: Vec<f32>,
     conv2: Vec<f32>,
     cnn_global: Vec<f32>,
+    value_conv1: Vec<f32>,
+    value_conv2: Vec<f32>,
+    value_cnn_global: Vec<f32>,
     value_relation: Vec<f32>,
     value_hidden: Vec<f32>,
     value_next: Vec<f32>,
@@ -106,6 +111,9 @@ impl AzEvalScratch {
             conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
+            value_conv1: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
+            value_conv2: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
+            value_cnn_global: vec![0.0; VALUE_CNN_POOLED_SIZE],
             value_relation: vec![0.0; VALUE_RELATION_FEATURE_SIZE],
             value_hidden: vec![0.0; VALUE_BRANCH_SIZE],
             value_next: vec![0.0; VALUE_BRANCH_SIZE],
@@ -134,6 +142,11 @@ pub struct AzNnue {
     pub value_hidden_bias: Vec<f32>,
     pub value_trunk_weights: Vec<f32>,
     pub value_trunk_biases: Vec<f32>,
+    pub value_board_conv1_weights: Vec<f32>,
+    pub value_board_conv1_bias: Vec<f32>,
+    pub value_board_conv2_weights: Vec<f32>,
+    pub value_board_conv2_bias: Vec<f32>,
+    pub value_board_attention_query: Vec<f32>,
     pub value_board_hidden: Vec<f32>,
     pub value_board_hidden_bias: Vec<f32>,
     pub value_relation_hidden: Vec<f32>,
@@ -183,6 +196,9 @@ pub struct AzNnue {
 //   are rotated 180 degrees with colors swapped. The old side-to-move board
 //   channel is removed; do not feed canonical boards with absolute move labels,
 //   because that recreates the red/black leakage bug.
+// - v23 gives value its own tiny board CNN (12 channels). Value no longer
+//   adapts to a policy-oriented board summary; this is the cleanest low-cost
+//   test for hidden policy/value representation pulling.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -201,6 +217,11 @@ impl Clone for AzNnue {
             value_hidden_bias: self.value_hidden_bias.clone(),
             value_trunk_weights: self.value_trunk_weights.clone(),
             value_trunk_biases: self.value_trunk_biases.clone(),
+            value_board_conv1_weights: self.value_board_conv1_weights.clone(),
+            value_board_conv1_bias: self.value_board_conv1_bias.clone(),
+            value_board_conv2_weights: self.value_board_conv2_weights.clone(),
+            value_board_conv2_bias: self.value_board_conv2_bias.clone(),
+            value_board_attention_query: self.value_board_attention_query.clone(),
             value_board_hidden: self.value_board_hidden.clone(),
             value_board_hidden_bias: self.value_board_hidden_bias.clone(),
             value_relation_hidden: self.value_relation_hidden.clone(),
@@ -373,8 +394,20 @@ impl AzNnue {
                 .map(|_| rng.weight((2.0 / VALUE_BRANCH_SIZE as f32).sqrt()))
                 .collect();
         let value_trunk_biases = vec![0.0; VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE];
-        let value_board_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * CNN_POOLED_SIZE)
-            .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
+        let value_board_conv1_weights: Vec<f32> =
+            (0..VALUE_CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA)
+                .map(|_| rng.weight(0.08))
+                .collect();
+        let value_board_conv1_bias = vec![0.0; VALUE_CNN_CHANNELS];
+        let value_board_conv2_weights: Vec<f32> =
+            (0..VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA)
+                .map(|_| rng.weight(0.08))
+                .collect();
+        let value_board_conv2_bias = vec![0.0; VALUE_CNN_CHANNELS];
+        let value_board_attention_query: Vec<f32> =
+            (0..VALUE_CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
+        let value_board_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE)
+            .map(|_| rng.weight((2.0 / VALUE_CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
         let value_board_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
         let value_relation_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * VALUE_RELATION_FEATURE_SIZE)
@@ -418,6 +451,11 @@ impl AzNnue {
             value_hidden_bias,
             value_trunk_weights,
             value_trunk_biases,
+            value_board_conv1_weights,
+            value_board_conv1_bias,
+            value_board_conv2_weights,
+            value_board_conv2_bias,
+            value_board_attention_query,
             value_board_hidden,
             value_board_hidden_bias,
             value_relation_hidden,
@@ -458,6 +496,11 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.value_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_trunk_weights)?;
         write_f32_slice_le(&mut writer, &self.value_trunk_biases)?;
+        write_f32_slice_le(&mut writer, &self.value_board_conv1_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_board_conv1_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_board_conv2_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_board_conv2_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_board_attention_query)?;
         write_f32_slice_le(&mut writer, &self.value_board_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_relation_hidden)?;
@@ -521,7 +564,14 @@ impl AzNnue {
         let value_hidden_bias_len = VALUE_BRANCH_SIZE;
         let value_trunk_weights_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
         let value_trunk_biases_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE;
-        let value_board_hidden_len = VALUE_BRANCH_SIZE * CNN_POOLED_SIZE;
+        let value_board_conv1_weights_len =
+            VALUE_CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
+        let value_board_conv1_bias_len = VALUE_CNN_CHANNELS;
+        let value_board_conv2_weights_len =
+            VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA;
+        let value_board_conv2_bias_len = VALUE_CNN_CHANNELS;
+        let value_board_attention_query_len = VALUE_CNN_CHANNELS;
+        let value_board_hidden_len = VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE;
         let value_board_hidden_bias_len = VALUE_BRANCH_SIZE;
         let value_relation_hidden_len = VALUE_BRANCH_SIZE * VALUE_RELATION_FEATURE_SIZE;
         let value_relation_hidden_bias_len = VALUE_BRANCH_SIZE;
@@ -548,6 +598,11 @@ impl AzNnue {
             + value_hidden_bias_len
             + value_trunk_weights_len
             + value_trunk_biases_len
+            + value_board_conv1_weights_len
+            + value_board_conv1_bias_len
+            + value_board_conv2_weights_len
+            + value_board_conv2_bias_len
+            + value_board_attention_query_len
             + value_board_hidden_len
             + value_board_hidden_bias_len
             + value_relation_hidden_len
@@ -587,6 +642,14 @@ impl AzNnue {
         let value_hidden_bias = read_f32_vec_le(&mut reader, value_hidden_bias_len)?;
         let value_trunk_weights = read_f32_vec_le(&mut reader, value_trunk_weights_len)?;
         let value_trunk_biases = read_f32_vec_le(&mut reader, value_trunk_biases_len)?;
+        let value_board_conv1_weights =
+            read_f32_vec_le(&mut reader, value_board_conv1_weights_len)?;
+        let value_board_conv1_bias = read_f32_vec_le(&mut reader, value_board_conv1_bias_len)?;
+        let value_board_conv2_weights =
+            read_f32_vec_le(&mut reader, value_board_conv2_weights_len)?;
+        let value_board_conv2_bias = read_f32_vec_le(&mut reader, value_board_conv2_bias_len)?;
+        let value_board_attention_query =
+            read_f32_vec_le(&mut reader, value_board_attention_query_len)?;
         let value_board_hidden = read_f32_vec_le(&mut reader, value_board_hidden_len)?;
         let value_board_hidden_bias = read_f32_vec_le(&mut reader, value_board_hidden_bias_len)?;
         let value_relation_hidden = read_f32_vec_le(&mut reader, value_relation_hidden_len)?;
@@ -617,6 +680,11 @@ impl AzNnue {
             value_hidden_bias,
             value_trunk_weights,
             value_trunk_biases,
+            value_board_conv1_weights,
+            value_board_conv1_bias,
+            value_board_conv2_weights,
+            value_board_conv2_bias,
+            value_board_attention_query,
             value_board_hidden,
             value_board_hidden_bias,
             value_relation_hidden,
@@ -658,8 +726,14 @@ impl AzNnue {
         for idx in 0..self.hidden_size {
             scratch.hidden[idx] += scratch.next[idx];
         }
+        self.value_board_forward_into(
+            &scratch.board,
+            &mut scratch.value_conv1,
+            &mut scratch.value_conv2,
+            &mut scratch.value_cnn_global,
+        );
         self.value_embedding_into(&features, &mut scratch.value_hidden);
-        self.value_board_hidden_into(&scratch.cnn_global, &mut scratch.value_next);
+        self.value_board_hidden_into(&scratch.value_cnn_global, &mut scratch.value_next);
         for idx in 0..VALUE_BRANCH_SIZE {
             scratch.value_hidden[idx] += scratch.value_next[idx];
         }
@@ -729,12 +803,13 @@ impl AzNnue {
         }
     }
 
-    fn value_board_hidden_into(&self, cnn_global: &[f32], hidden: &mut Vec<f32>) {
+    fn value_board_hidden_into(&self, value_cnn_global: &[f32], hidden: &mut Vec<f32>) {
         hidden.resize(VALUE_BRANCH_SIZE, 0.0);
         hidden.copy_from_slice(&self.value_board_hidden_bias);
         for (out, hidden_value) in hidden.iter_mut().enumerate().take(VALUE_BRANCH_SIZE) {
-            let row = &self.value_board_hidden[out * CNN_POOLED_SIZE..(out + 1) * CNN_POOLED_SIZE];
-            for (cnn_value, weight) in cnn_global.iter().zip(row) {
+            let row = &self.value_board_hidden
+                [out * VALUE_CNN_POOLED_SIZE..(out + 1) * VALUE_CNN_POOLED_SIZE];
+            for (cnn_value, weight) in value_cnn_global.iter().zip(row) {
                 *hidden_value += cnn_value * weight;
             }
             *hidden_value = (*hidden_value).max(0.0);
@@ -764,72 +839,55 @@ impl AzNnue {
         conv1.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
         conv2.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
         cnn_global.resize(CNN_POOLED_SIZE, 0.0);
-        conv_relu_layer(
+        conv_relu_layer_generic(
             board,
+            CNN_CHANNELS,
             &self.board_conv1_weights,
             &self.board_conv1_bias,
             conv1,
         );
-        conv_relu_layer_dense(
+        conv_relu_layer_dense_generic(
             conv1,
+            CNN_CHANNELS,
             CNN_CHANNELS,
             &self.board_conv2_weights,
             &self.board_conv2_bias,
             conv2,
         );
-        let mut attention_logits = [0.0f32; BOARD_PLANES_SIZE];
-        let mut max_logit = f32::NEG_INFINITY;
-        for sq in 0..BOARD_PLANES_SIZE {
-            let mut logit = 0.0;
-            for channel in 0..CNN_CHANNELS {
-                logit +=
-                    conv2[channel * BOARD_PLANES_SIZE + sq] * self.board_attention_query[channel];
-            }
-            attention_logits[sq] = logit;
-            max_logit = max_logit.max(logit);
-        }
-        let mut denom = 0.0;
-        for logit in &mut attention_logits {
-            *logit = (*logit - max_logit).exp();
-            denom += *logit;
-        }
-        let scale = 1.0 / BOARD_PLANES_SIZE as f32;
-        for channel in 0..CNN_CHANNELS {
-            let start = channel * BOARD_PLANES_SIZE;
-            let row = &conv2[start..start + BOARD_PLANES_SIZE];
-            let mut sum = 0.0;
-            let mut max_value = 0.0;
-            let mut attn_sum = 0.0;
-            for (idx, value) in row.iter().enumerate() {
-                sum += *value;
-                if idx == 0 || *value > max_value {
-                    max_value = *value;
-                }
-                attn_sum += (*value) * attention_logits[idx] / denom.max(1e-12);
-            }
-            cnn_global[channel] = sum * scale;
-            cnn_global[CNN_CHANNELS + channel] = max_value;
-            cnn_global[CNN_CHANNELS * 2 + channel] = attn_sum;
+        pool_cnn_features(conv2, CNN_CHANNELS, &self.board_attention_query, cnn_global);
+    }
 
-            let mut best_row_sum = 0.0f32;
-            for rank in 0..BOARD_RANKS {
-                let mut row_sum = 0.0f32;
-                for file in 0..BOARD_FILES {
-                    row_sum += row[rank * BOARD_FILES + file];
-                }
-                best_row_sum = best_row_sum.max(row_sum);
-            }
-            let mut best_col_sum = 0.0f32;
-            for file in 0..BOARD_FILES {
-                let mut col_sum = 0.0f32;
-                for rank in 0..BOARD_RANKS {
-                    col_sum += row[rank * BOARD_FILES + file];
-                }
-                best_col_sum = best_col_sum.max(col_sum);
-            }
-            cnn_global[CNN_CHANNELS * 3 + channel] = best_row_sum / BOARD_FILES as f32;
-            cnn_global[CNN_CHANNELS * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
-        }
+    fn value_board_forward_into(
+        &self,
+        board: &[u8],
+        conv1: &mut Vec<f32>,
+        conv2: &mut Vec<f32>,
+        value_cnn_global: &mut Vec<f32>,
+    ) {
+        conv1.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        conv2.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        value_cnn_global.resize(VALUE_CNN_POOLED_SIZE, 0.0);
+        conv_relu_layer_generic(
+            board,
+            VALUE_CNN_CHANNELS,
+            &self.value_board_conv1_weights,
+            &self.value_board_conv1_bias,
+            conv1,
+        );
+        conv_relu_layer_dense_generic(
+            conv1,
+            VALUE_CNN_CHANNELS,
+            VALUE_CNN_CHANNELS,
+            &self.value_board_conv2_weights,
+            &self.value_board_conv2_bias,
+            conv2,
+        );
+        pool_cnn_features(
+            conv2,
+            VALUE_CNN_CHANNELS,
+            &self.value_board_attention_query,
+            value_cnn_global,
+        );
     }
 
     fn forward_value_trunk_into(&self, hidden: &mut Vec<f32>, next: &mut Vec<f32>) {
@@ -909,7 +967,14 @@ impl AzNnue {
             || self.value_trunk_weights.len()
                 != VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE
             || self.value_trunk_biases.len() != VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE
-            || self.value_board_hidden.len() != VALUE_BRANCH_SIZE * CNN_POOLED_SIZE
+            || self.value_board_conv1_weights.len()
+                != VALUE_CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
+            || self.value_board_conv1_bias.len() != VALUE_CNN_CHANNELS
+            || self.value_board_conv2_weights.len()
+                != VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS * CNN_KERNEL_AREA
+            || self.value_board_conv2_bias.len() != VALUE_CNN_CHANNELS
+            || self.value_board_attention_query.len() != VALUE_CNN_CHANNELS
+            || self.value_board_hidden.len() != VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE
             || self.value_board_hidden_bias.len() != VALUE_BRANCH_SIZE
             || self.value_relation_hidden.len() != VALUE_BRANCH_SIZE * VALUE_RELATION_FEATURE_SIZE
             || self.value_relation_hidden_bias.len() != VALUE_BRANCH_SIZE
@@ -1174,9 +1239,15 @@ fn piece_kind_slot(kind: PieceKind) -> usize {
     }
 }
 
-fn conv_relu_layer(board: &[u8], weights: &[f32], bias: &[f32], output: &mut [f32]) {
+fn conv_relu_layer_generic(
+    board: &[u8],
+    output_channels: usize,
+    weights: &[f32],
+    bias: &[f32],
+    output: &mut [f32],
+) {
     debug_assert_eq!(BOARD_INPUT_KERNEL_AREA, 1);
-    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(CNN_CHANNELS) {
+    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(output_channels) {
         let out_start = out_channel * BOARD_PLANES_SIZE;
         for sq in 0..BOARD_PLANES_SIZE {
             let mut value = bias_value;
@@ -1194,14 +1265,15 @@ fn conv_relu_layer(board: &[u8], weights: &[f32], bias: &[f32], output: &mut [f3
     }
 }
 
-fn conv_relu_layer_dense(
+fn conv_relu_layer_dense_generic(
     input: &[f32],
     input_channels: usize,
+    output_channels: usize,
     weights: &[f32],
     bias: &[f32],
     output: &mut [f32],
 ) {
-    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(CNN_CHANNELS) {
+    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(output_channels) {
         let out_start = out_channel * BOARD_PLANES_SIZE;
         for sq in 0..BOARD_PLANES_SIZE {
             let mut value = bias_value;
@@ -1230,6 +1302,64 @@ fn conv_relu_layer_dense(
             }
             output[out_start + sq] = value.max(0.0);
         }
+    }
+}
+
+fn pool_cnn_features(input: &[f32], channels: usize, attention_query: &[f32], output: &mut [f32]) {
+    debug_assert_eq!(input.len(), channels * BOARD_PLANES_SIZE);
+    debug_assert_eq!(attention_query.len(), channels);
+    debug_assert_eq!(output.len(), channels * CNN_POOL_BLOCKS);
+    let mut attention_logits = [0.0f32; BOARD_PLANES_SIZE];
+    let mut max_logit = f32::NEG_INFINITY;
+    for sq in 0..BOARD_PLANES_SIZE {
+        let mut logit = 0.0;
+        for channel in 0..channels {
+            logit += input[channel * BOARD_PLANES_SIZE + sq] * attention_query[channel];
+        }
+        attention_logits[sq] = logit;
+        max_logit = max_logit.max(logit);
+    }
+    let mut denom = 0.0;
+    for logit in &mut attention_logits {
+        *logit = (*logit - max_logit).exp();
+        denom += *logit;
+    }
+    let scale = 1.0 / BOARD_PLANES_SIZE as f32;
+    for channel in 0..channels {
+        let start = channel * BOARD_PLANES_SIZE;
+        let row = &input[start..start + BOARD_PLANES_SIZE];
+        let mut sum = 0.0;
+        let mut max_value = 0.0;
+        let mut attn_sum = 0.0;
+        for (idx, value) in row.iter().enumerate() {
+            sum += *value;
+            if idx == 0 || *value > max_value {
+                max_value = *value;
+            }
+            attn_sum += (*value) * attention_logits[idx] / denom.max(1e-12);
+        }
+        output[channel] = sum * scale;
+        output[channels + channel] = max_value;
+        output[channels * 2 + channel] = attn_sum;
+
+        let mut best_row_sum = 0.0f32;
+        for rank in 0..BOARD_RANKS {
+            let mut row_sum = 0.0f32;
+            for file in 0..BOARD_FILES {
+                row_sum += row[rank * BOARD_FILES + file];
+            }
+            best_row_sum = best_row_sum.max(row_sum);
+        }
+        let mut best_col_sum = 0.0f32;
+        for file in 0..BOARD_FILES {
+            let mut col_sum = 0.0f32;
+            for rank in 0..BOARD_RANKS {
+                col_sum += row[rank * BOARD_FILES + file];
+            }
+            best_col_sum = best_col_sum.max(col_sum);
+        }
+        output[channels * 3 + channel] = best_row_sum / BOARD_FILES as f32;
+        output[channels * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
     }
 }
 
