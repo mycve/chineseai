@@ -5,6 +5,7 @@ pub const HISTORY_PLIES: usize = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
+    pub captured: Option<Piece>,
     pub mv: Move,
 }
 

@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::board_transform::{HistoryMove, canonical_square};
 #[cfg(test)]
-use crate::xiangqi::Position;
+use crate::xiangqi::{Move, Position};
 #[cfg(test)]
 use std::fs;
 
@@ -203,6 +203,7 @@ mod tests {
         let moved_piece = position.piece_at(mv.from as usize).unwrap();
         let history = vec![HistoryMove {
             piece: moved_piece,
+            captured: None,
             mv,
         }];
         position.make_move(mv);
@@ -219,6 +220,35 @@ mod tests {
         assert_eq!(board[to], piece_plane);
         assert_eq!(board[BOARD_PLANES_SIZE + from], piece_plane);
         assert_eq!(board[BOARD_PLANES_SIZE + to], 0);
+    }
+
+    #[test]
+    fn board_history_planes_restore_captured_piece_when_rewound() {
+        let mut position = Position::from_fen("4k4/9/9/9/r3c4/9/9/9/R8/4K4 w").unwrap();
+        let mv = Move::new(72, 36);
+        assert!(position.is_legal_move(mv));
+        let moved_piece = position.piece_at(mv.from as usize).unwrap();
+        let captured_piece = position.piece_at(mv.to as usize).unwrap();
+        let history = vec![HistoryMove {
+            piece: moved_piece,
+            captured: Some(captured_piece),
+            mv,
+        }];
+        position.make_move(mv);
+
+        let mut board = Vec::new();
+        extract_board_planes(&position, &history, &mut board);
+        let side = position.side_to_move();
+        let moved_plane =
+            (canonical_piece_plane(side, moved_piece.color, moved_piece.kind) + 1) as u8;
+        let captured_plane =
+            (canonical_piece_plane(side, captured_piece.color, captured_piece.kind) + 1) as u8;
+        let from = canonical_square(side, mv.from as usize);
+        let to = canonical_square(side, mv.to as usize);
+
+        assert_eq!(board[to], moved_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + from], moved_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + to], captured_plane);
     }
 
     #[test]

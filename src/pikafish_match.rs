@@ -182,7 +182,11 @@ fn apply_move_recorded(
     mv: Move,
 ) {
     if let Some(piece) = position.piece_at(mv.from as usize) {
-        history.push(HistoryMove { piece, mv });
+        history.push(HistoryMove {
+            piece,
+            captured: position.piece_at(mv.to as usize),
+            mv,
+        });
         let overflow = history.len().saturating_sub(HISTORY_PLIES);
         if overflow > 0 {
             history.drain(0..overflow);

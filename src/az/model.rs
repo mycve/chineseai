@@ -421,7 +421,11 @@ pub(super) fn extract_board_planes(
     for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
         let piece_plane =
             (canonical_piece_plane(side, entry.piece.color, entry.piece.kind) + 1) as u8;
-        rewound[canonical_square(side, entry.mv.to as usize)] = 0;
+        let captured_plane = entry
+            .captured
+            .map(|piece| (canonical_piece_plane(side, piece.color, piece.kind) + 1) as u8)
+            .unwrap_or(0);
+        rewound[canonical_square(side, entry.mv.to as usize)] = captured_plane;
         rewound[canonical_square(side, entry.mv.from as usize)] = piece_plane;
         let start = (history_index + 1) * BOARD_PLANES_SIZE;
         board[start..start + BOARD_PLANES_SIZE].copy_from_slice(&rewound);
