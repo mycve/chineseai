@@ -4,9 +4,9 @@ use std::path::Path;
 
 use super::{
     AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_MAGIC, AZ_MODEL_BINARY_VERSION, AzModel,
-    AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, CNN_CHANNELS, CNN_KERNEL_AREA,
-    CNN_POOLED_SIZE, DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS,
-    VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, CNN_CHANNELS,
+    CNN_KERNEL_AREA, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
+    VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
 };
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -50,6 +50,8 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.board_conv1_bias)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
+        write_f32_slice_le(&mut writer, &self.position_embed)?;
+        write_f32_slice_le(&mut writer, &self.line_gates)?;
         write_f32_slice_le(&mut writer, &self.board_hidden)?;
         write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_weights)?;
@@ -57,9 +59,12 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_direct_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
-        write_f32_slice_le(&mut writer, &self.policy_move_hidden)?;
-        write_f32_slice_le(&mut writer, &self.policy_move_cnn)?;
+        write_f32_slice_le(&mut writer, &self.policy_from_weights)?;
+        write_f32_slice_le(&mut writer, &self.policy_from_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_to_weights)?;
+        write_f32_slice_le(&mut writer, &self.policy_to_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_hidden)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_cnn)?;
@@ -114,6 +119,8 @@ impl AzModel {
         let board_conv2_weights_len =
             RESIDUAL_BLOCKS * 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let board_conv2_bias_len = RESIDUAL_BLOCKS * 2 * CNN_CHANNELS;
+        let position_embed_len = CNN_CHANNELS * BOARD_PLANES_SIZE;
+        let line_gates_len = RESIDUAL_BLOCKS * 2 * CNN_CHANNELS;
         let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
         let board_hidden_bias_len = hidden_size;
         let value_tail_conv_weights_len = VALUE_HEAD_CHANNELS * CNN_CHANNELS;
@@ -121,9 +128,12 @@ impl AzModel {
         let vih_len = VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES;
         let vib_len = VALUE_HIDDEN_SIZE;
         let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
+        let vdlw_len = VALUE_LOGITS * VALUE_HEAD_FEATURES;
         let vlb_len = VALUE_LOGITS;
-        let pmh_len = DENSE_MOVE_SPACE * hidden_size;
-        let pmc_len = DENSE_MOVE_SPACE * CNN_POOLED_SIZE;
+        let pfw_len = CNN_CHANNELS;
+        let pfbias_len = 1;
+        let ptw_len = CNN_CHANNELS;
+        let ptbias_len = 1;
         let pmb_len = DENSE_MOVE_SPACE;
         let pfh_len = POLICY_CONDITION_SIZE * hidden_size;
         let pfc_len = POLICY_CONDITION_SIZE * CNN_POOLED_SIZE;
@@ -132,6 +142,8 @@ impl AzModel {
             + board_conv1_bias_len
             + board_conv2_weights_len
             + board_conv2_bias_len
+            + position_embed_len
+            + line_gates_len
             + board_hidden_len
             + board_hidden_bias_len
             + value_tail_conv_weights_len
@@ -139,9 +151,12 @@ impl AzModel {
             + vih_len
             + vib_len
             + vlw_len
+            + vdlw_len
             + vlb_len
-            + pmh_len
-            + pmc_len
+            + pfw_len
+            + pfbias_len
+            + ptw_len
+            + ptbias_len
             + pmb_len
             + pfh_len
             + pfc_len
@@ -165,6 +180,8 @@ impl AzModel {
             board_conv1_bias: read_f32_vec_le(&mut reader, board_conv1_bias_len)?,
             board_conv2_weights: read_f32_vec_le(&mut reader, board_conv2_weights_len)?,
             board_conv2_bias: read_f32_vec_le(&mut reader, board_conv2_bias_len)?,
+            position_embed: read_f32_vec_le(&mut reader, position_embed_len)?,
+            line_gates: read_f32_vec_le(&mut reader, line_gates_len)?,
             board_hidden: read_f32_vec_le(&mut reader, board_hidden_len)?,
             board_hidden_bias: read_f32_vec_le(&mut reader, board_hidden_bias_len)?,
             value_tail_conv_weights: read_f32_vec_le(&mut reader, value_tail_conv_weights_len)?,
@@ -172,9 +189,12 @@ impl AzModel {
             value_intermediate_hidden: read_f32_vec_le(&mut reader, vih_len)?,
             value_intermediate_bias: read_f32_vec_le(&mut reader, vib_len)?,
             value_logits_weights: read_f32_vec_le(&mut reader, vlw_len)?,
+            value_direct_logits_weights: read_f32_vec_le(&mut reader, vdlw_len)?,
             value_logits_bias: read_f32_vec_le(&mut reader, vlb_len)?,
-            policy_move_hidden: read_f32_vec_le(&mut reader, pmh_len)?,
-            policy_move_cnn: read_f32_vec_le(&mut reader, pmc_len)?,
+            policy_from_weights: read_f32_vec_le(&mut reader, pfw_len)?,
+            policy_from_bias: read_f32_vec_le(&mut reader, pfbias_len)?,
+            policy_to_weights: read_f32_vec_le(&mut reader, ptw_len)?,
+            policy_to_bias: read_f32_vec_le(&mut reader, ptbias_len)?,
             policy_move_bias: read_f32_vec_le(&mut reader, pmb_len)?,
             policy_feature_hidden: read_f32_vec_le(&mut reader, pfh_len)?,
             policy_feature_cnn: read_f32_vec_le(&mut reader, pfc_len)?,

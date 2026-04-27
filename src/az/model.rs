@@ -5,13 +5,13 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 use super::model_config::AzModelConfig;
 use super::model_ops::{
-    conv_relu_board_layer_sparse_3x3, conv1x1_relu_layer_dense_generic, dot_product,
-    pool_cnn_features, residual_cnn_block_generic, scalar_value_from_logits,
+    conv_relu_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic, dot_product,
+    pool_cnn_features, residual_line_gnn_block_generic, scalar_value_from_logits,
 };
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 2;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 4;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -28,9 +28,14 @@ pub(super) const RESIDUAL_BLOCKS: usize = 3;
 pub(super) const VALUE_HEAD_CHANNELS: usize = 8;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
+pub(super) const LINE_CONTEXT_SCALE: f32 = 0.25;
 pub(super) const CNN_POOL_BLOCKS: usize = 4;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
-pub(super) const VALUE_HEAD_FEATURES: usize = VALUE_HEAD_CHANNELS * BOARD_PLANES_SIZE;
+pub(super) const VALUE_HEAD_MAP_SIZE: usize = VALUE_HEAD_CHANNELS * BOARD_PLANES_SIZE;
+pub(super) const VALUE_HEAD_FEATURES: usize =
+    VALUE_HEAD_MAP_SIZE + VALUE_HEAD_CHANNELS * 4 + CNN_POOLED_SIZE;
+pub(super) const VALUE_HEAD_LEAK: f32 = 0.05;
+pub(super) const VALUE_LOGIT_SCALE: f32 = 0.25;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const VALUE_SCALE_CP: f32 = 1000.0;
 
@@ -42,6 +47,7 @@ pub(super) struct AzEvalScratch {
     pub(super) conv_residual: Vec<f32>,
     pub(super) cnn_global: Vec<f32>,
     pub(super) value_tail: Vec<f32>,
+    pub(super) value_pool: Vec<f32>,
     pub(super) value_hidden: Vec<f32>,
     pub(super) value_logits: Vec<f32>,
     pub(super) policy_condition: Vec<f32>,
@@ -58,7 +64,8 @@ impl AzEvalScratch {
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv_residual: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
-            value_tail: vec![0.0; VALUE_HEAD_FEATURES],
+            value_tail: vec![0.0; VALUE_HEAD_MAP_SIZE],
+            value_pool: vec![0.0; VALUE_HEAD_FEATURES],
             value_hidden: vec![0.0; VALUE_HIDDEN_SIZE],
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
@@ -76,6 +83,8 @@ pub struct AzModel {
     pub board_conv1_bias: Vec<f32>,
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
+    pub position_embed: Vec<f32>,
+    pub line_gates: Vec<f32>,
     pub board_hidden: Vec<f32>,
     pub board_hidden_bias: Vec<f32>,
     pub value_tail_conv_weights: Vec<f32>,
@@ -83,9 +92,12 @@ pub struct AzModel {
     pub value_intermediate_hidden: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
+    pub value_direct_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
-    pub policy_move_hidden: Vec<f32>,
-    pub policy_move_cnn: Vec<f32>,
+    pub policy_from_weights: Vec<f32>,
+    pub policy_from_bias: Vec<f32>,
+    pub policy_to_weights: Vec<f32>,
+    pub policy_to_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
     pub policy_feature_cnn: Vec<f32>,
@@ -94,18 +106,20 @@ pub struct AzModel {
 }
 
 // Architecture notes:
-// - v29 is a Tiny ResCNN. The board is canonical side-to-move input, then a
-//   3x3 sparse stem and three 3x3 residual blocks keep spatial features alive
-//   until the heads. This replaces the old early-pool/attention/value-embedding
-//   hybrid that was too easy for policy and value to pull in different ways.
-// - Value is now a standard CNN value head: 1x1 conv -> flatten -> MLP ->
-//   three outcome logits. There is no piece-square value shortcut, no relation
-//   shortcut, and no value-only attention path; if value improves, it is because
-//   the spatial tower learned useful board features.
-// - Policy still uses a CPU-friendly legal-move scorer. It reads the same CNN
-//   pooled features plus a small move-geometry condition, so legal move masking
-//   stays cheap while the board representation is now much closer to a normal
-//   AlphaZero-style CNN tower.
+// - v30 is a Tiny Line-GNN. The board is canonical side-to-move input, then a
+//   sparse 3x3 stem and residual blocks that mix three cheap graph branches:
+//   local 3x3 neighborhood, same-row context, and same-column context. This
+//   keeps the useful part of the JAX GNN (local/row/col inductive bias for
+//   soldiers/advisors plus rook/cannon files) without full attention overhead.
+// - Value is intentionally closer to the ZeroForge GNN readout than to the old
+//   NNUE head: 1x1 conv -> attention/mean/max/std line-aware pooling plus a
+//   small spatial tail -> leaky MLP -> three outcome logits. The leaky gate is
+//   important; a hard ReLU can kill value gradients on tiny or early self-play
+//   batches and masquerade as a search/TD problem.
+// - Policy is a factorized legal-move scorer: from-square score + to-square
+//   score + move-geometry condition + move bias. This is much cheaper than a
+//   dense move tower and matches the "node embedding + edge/action scorer"
+//   spirit of the GNN project.
 // - Do not resurrect the old sparse V4/NNUE-style board identities here. They
 //   made offline fitting easier but muddied whether self-play value was learning
 //   from board structure.
@@ -119,6 +133,8 @@ impl Clone for AzModel {
             board_conv1_bias: self.board_conv1_bias.clone(),
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
+            position_embed: self.position_embed.clone(),
+            line_gates: self.line_gates.clone(),
             board_hidden: self.board_hidden.clone(),
             board_hidden_bias: self.board_hidden_bias.clone(),
             value_tail_conv_weights: self.value_tail_conv_weights.clone(),
@@ -126,9 +142,12 @@ impl Clone for AzModel {
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
+            value_direct_logits_weights: self.value_direct_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
-            policy_move_hidden: self.policy_move_hidden.clone(),
-            policy_move_cnn: self.policy_move_cnn.clone(),
+            policy_from_weights: self.policy_from_weights.clone(),
+            policy_from_bias: self.policy_from_bias.clone(),
+            policy_to_weights: self.policy_to_weights.clone(),
+            policy_to_bias: self.policy_to_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
             policy_feature_cnn: self.policy_feature_cnn.clone(),
@@ -162,6 +181,10 @@ impl AzModel {
                 .map(|_| rng.weight((2.0 / (CNN_CHANNELS * CNN_KERNEL_AREA) as f32).sqrt()))
                 .collect();
         let board_conv2_bias = vec![0.0; residual_layer_count * CNN_CHANNELS];
+        let position_embed = (0..CNN_CHANNELS * BOARD_PLANES_SIZE)
+            .map(|_| rng.weight(0.02))
+            .collect();
+        let line_gates = vec![1.0; RESIDUAL_BLOCKS * 2 * CNN_CHANNELS];
         let board_hidden: Vec<f32> = (0..hidden_size * CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
@@ -177,13 +200,16 @@ impl AzModel {
         let value_logits_weights = (0..VALUE_LOGITS * VALUE_HIDDEN_SIZE)
             .map(|_| rng.weight((2.0 / VALUE_HIDDEN_SIZE as f32).sqrt()))
             .collect();
+        let value_direct_logits_weights = vec![0.0; VALUE_LOGITS * VALUE_HEAD_FEATURES];
         let value_logits_bias = vec![0.0; VALUE_LOGITS];
-        let policy_move_hidden = (0..DENSE_MOVE_SPACE * hidden_size)
-            .map(|_| rng.weight(0.01))
+        let policy_from_weights = (0..CNN_CHANNELS)
+            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt() * 0.25))
             .collect();
-        let policy_move_cnn = (0..DENSE_MOVE_SPACE * CNN_POOLED_SIZE)
-            .map(|_| rng.weight(0.01))
+        let policy_from_bias = vec![0.0; 1];
+        let policy_to_weights = (0..CNN_CHANNELS)
+            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt() * 0.25))
             .collect();
+        let policy_to_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
@@ -199,6 +225,8 @@ impl AzModel {
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
+            position_embed,
+            line_gates,
             board_hidden,
             board_hidden_bias,
             value_tail_conv_weights,
@@ -206,9 +234,12 @@ impl AzModel {
             value_intermediate_hidden,
             value_intermediate_bias,
             value_logits_weights,
+            value_direct_logits_weights,
             value_logits_bias,
-            policy_move_hidden,
-            policy_move_cnn,
+            policy_from_weights,
+            policy_from_bias,
+            policy_to_weights,
+            policy_to_bias,
             policy_move_bias,
             policy_feature_hidden,
             policy_feature_cnn,
@@ -236,7 +267,9 @@ impl AzModel {
         self.board_hidden_into(&scratch.cnn_global, &mut scratch.hidden);
         self.value_head_into(
             &scratch.conv1,
+            &scratch.cnn_global,
             &mut scratch.value_tail,
+            &mut scratch.value_pool,
             &mut scratch.value_hidden,
         );
         let value = self.value_from_hidden_scratch(scratch);
@@ -248,9 +281,11 @@ impl AzModel {
         scratch.logits.resize(moves.len(), 0.0);
         for (index, mv) in moves.iter().enumerate() {
             scratch.logits[index] = self.policy_logit_from_hidden_index(
-                &scratch.hidden,
+                &scratch.conv1,
                 &scratch.cnn_global,
                 &scratch.policy_condition,
+                side,
+                *mv,
                 dense_move_index(canonical_move(side, *mv)),
             );
         }
@@ -276,18 +311,22 @@ impl AzModel {
             &self.board_conv1_bias,
             features,
         );
+        for (feature, pos) in features.iter_mut().zip(&self.position_embed) {
+            *feature = (*feature + pos).max(0.0);
+        }
         let block_weight_len = 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let block_bias_len = 2 * CNN_CHANNELS;
         for block in 0..RESIDUAL_BLOCKS {
             let weight_start = block * block_weight_len;
             let bias_start = block * block_bias_len;
-            residual_cnn_block_generic(
+            residual_line_gnn_block_generic(
                 features,
                 tmp,
                 delta,
                 CNN_CHANNELS,
                 &self.board_conv2_weights[weight_start..weight_start + block_weight_len],
                 &self.board_conv2_bias[bias_start..bias_start + block_bias_len],
+                &self.line_gates[block * 2 * CNN_CHANNELS..(block + 1) * 2 * CNN_CHANNELS],
             );
         }
         pool_cnn_features(features, CNN_CHANNELS, cnn_global);
@@ -305,9 +344,16 @@ impl AzModel {
         }
     }
 
-    fn value_head_into(&self, features: &[f32], value_tail: &mut Vec<f32>, hidden: &mut Vec<f32>) {
-        value_tail.resize(VALUE_HEAD_FEATURES, 0.0);
-        conv1x1_relu_layer_dense_generic(
+    fn value_head_into(
+        &self,
+        features: &[f32],
+        cnn_global: &[f32],
+        value_tail: &mut Vec<f32>,
+        pooled: &mut Vec<f32>,
+        hidden: &mut Vec<f32>,
+    ) {
+        value_tail.resize(VALUE_HEAD_MAP_SIZE, 0.0);
+        conv1x1_linear_layer_dense_generic(
             features,
             CNN_CHANNELS,
             VALUE_HEAD_CHANNELS,
@@ -315,15 +361,18 @@ impl AzModel {
             &self.value_tail_conv_bias,
             value_tail,
         );
+        value_pool_features(value_tail, cnn_global, pooled);
         hidden.resize(VALUE_HIDDEN_SIZE, 0.0);
         hidden.copy_from_slice(&self.value_intermediate_bias);
         for (j, value) in hidden.iter_mut().enumerate().take(VALUE_HIDDEN_SIZE) {
             let row = &self.value_intermediate_hidden
                 [j * VALUE_HEAD_FEATURES..(j + 1) * VALUE_HEAD_FEATURES];
-            for (feature, weight) in value_tail.iter().zip(row) {
+            for (feature, weight) in pooled.iter().zip(row) {
                 *value += feature * weight;
             }
-            *value = (*value).max(0.0);
+            if *value < 0.0 {
+                *value *= VALUE_HEAD_LEAK;
+            }
         }
     }
 
@@ -336,6 +385,11 @@ impl AzModel {
                 &self.value_logits_weights[out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
             for (hidden, weight) in scratch.value_hidden.iter().zip(row) {
                 scratch.value_logits[out] += hidden * weight;
+            }
+            let direct_row = &self.value_direct_logits_weights
+                [out * VALUE_HEAD_FEATURES..(out + 1) * VALUE_HEAD_FEATURES];
+            for (feature, weight) in scratch.value_pool.iter().zip(direct_row) {
+                scratch.value_logits[out] += feature * weight;
             }
         }
         scalar_value_from_logits(&scratch.value_logits).0
@@ -360,6 +414,8 @@ impl AzModel {
             || self.board_conv2_weights.len()
                 != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
             || self.board_conv2_bias.len() != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS
+            || self.position_embed.len() != CNN_CHANNELS * BOARD_PLANES_SIZE
+            || self.line_gates.len() != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS
             || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
             || self.board_hidden_bias.len() != self.hidden_size
             || self.value_tail_conv_weights.len() != VALUE_HEAD_CHANNELS * CNN_CHANNELS
@@ -367,9 +423,12 @@ impl AzModel {
             || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES
             || self.value_intermediate_bias.len() != VALUE_HIDDEN_SIZE
             || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
+            || self.value_direct_logits_weights.len() != VALUE_LOGITS * VALUE_HEAD_FEATURES
             || self.value_logits_bias.len() != VALUE_LOGITS
-            || self.policy_move_hidden.len() != DENSE_MOVE_SPACE * self.hidden_size
-            || self.policy_move_cnn.len() != DENSE_MOVE_SPACE * CNN_POOLED_SIZE
+            || self.policy_from_weights.len() != CNN_CHANNELS
+            || self.policy_from_bias.len() != 1
+            || self.policy_to_weights.len() != CNN_CHANNELS
+            || self.policy_to_bias.len() != 1
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
             || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * self.hidden_size
             || self.policy_feature_cnn.len() != POLICY_CONDITION_SIZE * CNN_POOLED_SIZE
@@ -385,22 +444,41 @@ impl AzModel {
 
     fn policy_logit_from_hidden_index(
         &self,
-        hidden: &[f32],
-        cnn_global: &[f32],
+        features: &[f32],
+        _cnn_global: &[f32],
         policy_condition: &[f32],
+        side: Color,
+        mv: Move,
         move_index: usize,
     ) -> f32 {
-        let hidden_offset = move_index * self.hidden_size;
-        let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
-        let cnn_offset = move_index * CNN_POOLED_SIZE;
-        let cnn_row = &self.policy_move_cnn[cnn_offset..cnn_offset + CNN_POOLED_SIZE];
+        let canonical = canonical_move(side, mv);
+        let from = canonical.from as usize;
+        let to = canonical.to as usize;
         let feature_offset = move_index * POLICY_CONDITION_SIZE;
         let move_features =
             &policy_move_features()[feature_offset..feature_offset + POLICY_CONDITION_SIZE];
         self.policy_move_bias[move_index]
-            + dot_product(hidden, hidden_row)
-            + dot_product(cnn_global, cnn_row)
+            + self.policy_square_score(
+                features,
+                from,
+                &self.policy_from_weights,
+                self.policy_from_bias[0],
+            )
+            + self.policy_square_score(
+                features,
+                to,
+                &self.policy_to_weights,
+                self.policy_to_bias[0],
+            )
             + dot_product(policy_condition, move_features)
+    }
+
+    fn policy_square_score(&self, features: &[f32], sq: usize, weights: &[f32], bias: f32) -> f32 {
+        let mut value = bias;
+        for channel in 0..CNN_CHANNELS {
+            value += features[channel * BOARD_PLANES_SIZE + sq] * weights[channel];
+        }
+        value
     }
 }
 pub(super) fn extract_board_planes(
@@ -463,6 +541,49 @@ pub(super) fn canonical_piece_plane(side: Color, piece_color: Color, kind: Piece
         Color::Black
     };
     absolute_piece_plane(canonical_color, kind)
+}
+
+fn value_pool_features(value_tail: &[f32], cnn_global: &[f32], pooled: &mut Vec<f32>) {
+    debug_assert_eq!(value_tail.len(), VALUE_HEAD_MAP_SIZE);
+    debug_assert_eq!(cnn_global.len(), CNN_POOLED_SIZE);
+    pooled.resize(VALUE_HEAD_FEATURES, 0.0);
+    let logits = &value_tail[..BOARD_PLANES_SIZE];
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut weights = [0.0f32; BOARD_PLANES_SIZE];
+    let mut denom = 0.0f32;
+    for (weight, &logit) in weights.iter_mut().zip(logits) {
+        let value = (logit - max_logit).exp();
+        *weight = value;
+        denom += value;
+    }
+    let inv_denom = denom.max(1e-12).recip();
+    for weight in &mut weights {
+        *weight *= inv_denom;
+    }
+
+    for channel in 0..VALUE_HEAD_CHANNELS {
+        let start = channel * BOARD_PLANES_SIZE;
+        let row = &value_tail[start..start + BOARD_PLANES_SIZE];
+        let mut attn = 0.0f32;
+        let mut sum = 0.0f32;
+        let mut sum_sq = 0.0f32;
+        let mut max_value = f32::NEG_INFINITY;
+        for (&feature, &weight) in row.iter().zip(weights.iter()) {
+            attn += feature * weight;
+            sum += feature;
+            sum_sq += feature * feature;
+            max_value = max_value.max(feature);
+        }
+        let mean = sum / BOARD_PLANES_SIZE as f32;
+        let variance = (sum_sq / BOARD_PLANES_SIZE as f32 - mean * mean).max(0.0);
+        pooled[channel] = attn;
+        pooled[VALUE_HEAD_CHANNELS + channel] = mean;
+        pooled[VALUE_HEAD_CHANNELS * 2 + channel] = max_value;
+        pooled[VALUE_HEAD_CHANNELS * 3 + channel] = variance.sqrt();
+    }
+    let flat_start = VALUE_HEAD_CHANNELS * 4;
+    pooled[flat_start..flat_start + VALUE_HEAD_MAP_SIZE].copy_from_slice(value_tail);
+    pooled[flat_start + VALUE_HEAD_MAP_SIZE..].copy_from_slice(cnn_global);
 }
 
 pub struct SplitMix64 {
@@ -674,6 +795,32 @@ pub(super) fn policy_move_features() -> &'static [f32] {
             features.extend_from_slice(&raw);
         }
         features
+    })
+}
+
+pub(super) fn policy_move_from_select() -> &'static [f32] {
+    use std::sync::OnceLock;
+    static SELECT: OnceLock<Vec<f32>> = OnceLock::new();
+    SELECT.get_or_init(|| {
+        let mut select = vec![0.0f32; BOARD_SIZE * DENSE_MOVE_SPACE];
+        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
+            let from = sparse as usize / BOARD_SIZE;
+            select[from * DENSE_MOVE_SPACE + move_index] = 1.0;
+        }
+        select
+    })
+}
+
+pub(super) fn policy_move_to_select() -> &'static [f32] {
+    use std::sync::OnceLock;
+    static SELECT: OnceLock<Vec<f32>> = OnceLock::new();
+    SELECT.get_or_init(|| {
+        let mut select = vec![0.0f32; BOARD_SIZE * DENSE_MOVE_SPACE];
+        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
+            let to = sparse as usize % BOARD_SIZE;
+            select[to * DENSE_MOVE_SPACE + move_index] = 1.0;
+        }
+        select
     })
 }
 

@@ -1,6 +1,6 @@
 use super::{
     BOARD_CHANNELS, BOARD_HISTORY_FRAMES, BOARD_PLANES_SIZE, CNN_KERNEL_AREA, CNN_POOL_BLOCKS,
-    PIECE_BOARD_CHANNELS, VALUE_LOGITS,
+    LINE_CONTEXT_SCALE, PIECE_BOARD_CHANNELS, VALUE_LOGIT_SCALE, VALUE_LOGITS,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -133,7 +133,25 @@ fn conv_layer_dense_generic(
     }
 }
 
-pub(super) fn conv1x1_relu_layer_dense_generic(
+pub(super) fn conv1x1_linear_layer_dense_generic(
+    input: &[f32],
+    input_channels: usize,
+    output_channels: usize,
+    weights: &[f32],
+    bias: &[f32],
+    output: &mut [f32],
+) {
+    conv1x1_layer_dense_generic(
+        input,
+        input_channels,
+        output_channels,
+        weights,
+        bias,
+        output,
+    );
+}
+
+fn conv1x1_layer_dense_generic(
     input: &[f32],
     input_channels: usize,
     output_channels: usize,
@@ -150,18 +168,19 @@ pub(super) fn conv1x1_relu_layer_dense_generic(
             for in_channel in 0..input_channels {
                 value += input[in_channel * BOARD_PLANES_SIZE + sq] * weight_row[in_channel];
             }
-            output[out_start + sq] = value.max(0.0);
+            output[out_start + sq] = value;
         }
     }
 }
 
-pub(super) fn residual_cnn_block_generic(
+pub(super) fn residual_line_gnn_block_generic(
     features: &mut [f32],
     tmp: &mut [f32],
     delta: &mut [f32],
     channels: usize,
     weights: &[f32],
     bias: &[f32],
+    line_gates: &[f32],
 ) {
     let layer_len = channels * channels * CNN_KERNEL_AREA;
     debug_assert_eq!(weights.len(), layer_len * 2);
@@ -174,6 +193,7 @@ pub(super) fn residual_cnn_block_generic(
         &bias[..channels],
         tmp,
     );
+    add_row_col_context(tmp, channels, line_gates);
     conv_linear_layer_dense_generic(
         tmp,
         channels,
@@ -184,6 +204,35 @@ pub(super) fn residual_cnn_block_generic(
     );
     for (feature, add) in features.iter_mut().zip(delta.iter()) {
         *feature = (*feature + *add).max(0.0);
+    }
+}
+
+fn add_row_col_context(features: &mut [f32], channels: usize, line_gates: &[f32]) {
+    debug_assert_eq!(features.len(), channels * BOARD_PLANES_SIZE);
+    debug_assert_eq!(line_gates.len(), channels * 2);
+    for channel in 0..channels {
+        let start = channel * BOARD_PLANES_SIZE;
+        let mut row_sum = [0.0f32; BOARD_RANKS];
+        let mut col_sum = [0.0f32; BOARD_FILES];
+        for rank in 0..BOARD_RANKS {
+            for file in 0..BOARD_FILES {
+                let value = features[start + rank * BOARD_FILES + file];
+                row_sum[rank] += value;
+                col_sum[file] += value;
+            }
+        }
+        for rank in 0..BOARD_RANKS {
+            let row_mean = row_sum[rank] / BOARD_FILES as f32;
+            for file in 0..BOARD_FILES {
+                let col_mean = col_sum[file] / BOARD_RANKS as f32;
+                let idx = start + rank * BOARD_FILES + file;
+                features[idx] = (features[idx]
+                    + LINE_CONTEXT_SCALE
+                        * (line_gates[channel] * row_mean
+                            + line_gates[channels + channel] * col_mean))
+                    .max(0.0);
+            }
+        }
     }
 }
 
@@ -226,45 +275,16 @@ pub(super) fn pool_cnn_features(input: &[f32], channels: usize, output: &mut [f3
     }
 }
 
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    if logits.is_empty() {
-        return Vec::new();
-    }
-    let mut values = Vec::with_capacity(logits.len());
-    softmax_into(logits, &mut values);
-    values
-}
-
-fn softmax_into(logits: &[f32], output: &mut Vec<f32>) {
-    output.clear();
-    if logits.is_empty() {
-        return;
-    }
-    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    output.reserve(logits.len());
-    for &logit in logits {
-        let value = (logit - max_logit).exp();
-        sum += value;
-        output.push(value);
-    }
-    let inv_sum = sum.max(1e-12).recip();
-    for value in output {
-        *value *= inv_sum;
-    }
-}
-
 pub(super) fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
     left.iter().zip(right.iter()).map(|(a, b)| a * b).sum()
 }
 
 pub(super) fn scalar_value_from_logits(logits: &[f32]) -> (f32, f32) {
-    let probs = softmax(logits);
-    if probs.len() < VALUE_LOGITS {
+    if logits.len() < VALUE_LOGITS {
         return (0.0, 0.0);
     }
-    let value = probs[0] - probs[2];
-    let mse_center = probs[0] + probs[2];
-    (value, mse_center)
+    let raw = (logits[0] - logits[2]) * VALUE_LOGIT_SCALE;
+    let value = raw.tanh();
+    (value, value.abs())
 }
