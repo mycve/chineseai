@@ -15,10 +15,9 @@ pub struct AzLoopFileConfig {
     pub max_plies: usize,
     pub hidden_size: usize,
     pub cnn_channels: usize,
-    pub value_branch_size: usize,
-    pub value_branch_depth: usize,
+    pub value_head_channels: usize,
+    pub residual_blocks: usize,
     pub value_hidden_size: usize,
-    pub attention_feedback: bool,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -59,11 +58,10 @@ impl Default for AzLoopFileConfig {
             max_sample_train_count: 2,
             max_plies: 300,
             hidden_size: 256,
-            cnn_channels: 24,
-            value_branch_size: 128,
-            value_branch_depth: 2,
+            cnn_channels: 32,
+            value_head_channels: 8,
+            residual_blocks: 3,
             value_hidden_size: 256,
-            attention_feedback: true,
             seed: 20260409,
             workers: 240,
             temperature_start: 1.0,
@@ -103,10 +101,9 @@ struct AzLoopTomlConfig {
     pub max_plies: Option<usize>,
     pub hidden_size: Option<usize>,
     pub cnn_channels: Option<usize>,
-    pub value_branch_size: Option<usize>,
-    pub value_branch_depth: Option<usize>,
+    pub value_head_channels: Option<usize>,
+    pub residual_blocks: Option<usize>,
     pub value_hidden_size: Option<usize>,
-    pub attention_feedback: Option<bool>,
     pub seed: Option<u64>,
     pub workers: Option<usize>,
     pub temperature_start: Option<f32>,
@@ -168,17 +165,14 @@ impl AzLoopTomlConfig {
         if let Some(value) = self.cnn_channels {
             config.cnn_channels = value;
         }
-        if let Some(value) = self.value_branch_size {
-            config.value_branch_size = value;
+        if let Some(value) = self.value_head_channels {
+            config.value_head_channels = value;
         }
-        if let Some(value) = self.value_branch_depth {
-            config.value_branch_depth = value;
+        if let Some(value) = self.residual_blocks {
+            config.residual_blocks = value;
         }
         if let Some(value) = self.value_hidden_size {
             config.value_hidden_size = value;
-        }
-        if let Some(value) = self.attention_feedback {
-            config.attention_feedback = value;
         }
         if let Some(value) = self.seed {
             config.seed = value;
@@ -270,11 +264,10 @@ impl AzLoopFileConfig {
         AzModelConfig {
             hidden_size: self.hidden_size,
             cnn_channels: self.cnn_channels,
-            value_branch_size: self.value_branch_size,
-            value_branch_depth: self.value_branch_depth,
+            value_head_channels: self.value_head_channels,
+            residual_blocks: self.residual_blocks,
             value_hidden_size: self.value_hidden_size,
             policy_condition_size: 32,
-            attention_feedback: self.attention_feedback,
         }
         .normalized()
     }
@@ -357,9 +350,9 @@ impl AzLoopFileConfig {
 #   This build supports changing hidden_size now. Other shape fields are written
 #   here so experiments are explicit, but unsupported values fail fast until the
 #   CPU/GPU forward paths are generalized for that shape.
-#   Current v28 shape: canonical board planes=126, cnn_channels=24,
-#   attention_feedback=true, value_branch=128x2, value_hidden=256,
-#   policy_condition_size=32. Historical sparse/azm inputs are gone.
+#   Current v29 shape: canonical board planes=126, cnn_channels=32, residual_blocks=3,
+#   value_head_channels=8, value_hidden=256, policy_condition_size=32.
+#   Historical sparse/NNUE inputs, value shortcuts, and attention feedback are gone.
 
 model_path = "{model_path}"
 simulations = {simulations}
@@ -371,10 +364,9 @@ max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
 cnn_channels = {cnn_channels}
-value_branch_size = {value_branch_size}
-value_branch_depth = {value_branch_depth}
+residual_blocks = {residual_blocks}
+value_head_channels = {value_head_channels}
 value_hidden_size = {value_hidden_size}
-attention_feedback = {attention_feedback}
 seed = {seed}
 workers = {workers}
 temperature_start = {temperature_start}
@@ -413,10 +405,9 @@ tensorboard_logdir = "{tensorboard_logdir}"
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
             cnn_channels = self.cnn_channels,
-            value_branch_size = self.value_branch_size,
-            value_branch_depth = self.value_branch_depth,
+            value_head_channels = self.value_head_channels,
+            residual_blocks = self.residual_blocks,
             value_hidden_size = self.value_hidden_size,
-            attention_feedback = self.attention_feedback,
             seed = self.seed,
             workers = self.workers,
             temperature_start = self.temperature_start,
@@ -464,8 +455,8 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.cnn_channels = self.cnn_channels.max(1);
-        self.value_branch_size = self.value_branch_size.max(1);
-        self.value_branch_depth = self.value_branch_depth.max(1);
+        self.value_head_channels = self.value_head_channels.max(1);
+        self.residual_blocks = self.residual_blocks.max(1);
         self.value_hidden_size = self.value_hidden_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);

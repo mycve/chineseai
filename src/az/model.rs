@@ -5,20 +5,19 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 use super::model_config::AzModelConfig;
 use super::model_ops::{
-    apply_global_attention_feedback, conv_relu_layer_dense_generic, conv_relu_layer_generic,
-    dot_product, pool_cnn_features, scalar_value_from_logits,
+    conv_relu_board_layer_sparse_3x3, conv1x1_relu_layer_dense_generic, dot_product,
+    pool_cnn_features, residual_cnn_block_generic, scalar_value_from_logits,
 };
 use super::train::train_samples;
 use super::train_gpu;
 use super::{AzTrainBenchmark, AzTrainingSample};
+
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 1;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 2;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub(super) const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
-pub(super) const VALUE_BRANCH_SIZE: usize = 128;
-pub(super) const VALUE_BRANCH_DEPTH: usize = 2;
 pub(super) const VALUE_HIDDEN_SIZE: usize = 256;
 pub(super) const VALUE_LOGITS: usize = 3;
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
@@ -26,31 +25,26 @@ pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
 pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
-pub(super) const VALUE_SQUARE_INPUT_SIZE: usize = BOARD_CHANNELS * BOARD_PLANES_SIZE;
-pub(super) const CNN_CHANNELS: usize = 24;
-pub(super) const VALUE_CNN_CHANNELS: usize = CNN_CHANNELS;
-pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
+pub(super) const CNN_CHANNELS: usize = 32;
+pub(super) const RESIDUAL_BLOCKS: usize = 3;
+pub(super) const VALUE_HEAD_CHANNELS: usize = 8;
+pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
-pub(super) const CNN_POOL_BLOCKS: usize = 5;
+pub(super) const CNN_POOL_BLOCKS: usize = 4;
 pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
-pub(super) const VALUE_CNN_POOLED_SIZE: usize = VALUE_CNN_CHANNELS * CNN_POOL_BLOCKS;
+pub(super) const VALUE_HEAD_FEATURES: usize = VALUE_HEAD_CHANNELS * BOARD_PLANES_SIZE;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const VALUE_SCALE_CP: f32 = 1000.0;
-pub(super) const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
 
 pub(super) struct AzEvalScratch {
     pub(super) hidden: Vec<f32>,
     pub(super) board: Vec<u8>,
     pub(super) conv1: Vec<f32>,
     pub(super) conv2: Vec<f32>,
+    pub(super) conv_residual: Vec<f32>,
     pub(super) cnn_global: Vec<f32>,
-    pub(super) cnn_context: Vec<f32>,
     pub(super) value_tail: Vec<f32>,
-    pub(super) value_cnn_global: Vec<f32>,
-    pub(super) value_cnn_context: Vec<f32>,
     pub(super) value_hidden: Vec<f32>,
-    pub(super) value_next: Vec<f32>,
-    pub(super) value_intermediate: Vec<f32>,
     pub(super) value_logits: Vec<f32>,
     pub(super) policy_condition: Vec<f32>,
     pub(super) logits: Vec<f32>,
@@ -64,14 +58,10 @@ impl AzEvalScratch {
             board: vec![0; BOARD_HISTORY_SIZE],
             conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
+            conv_residual: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
-            cnn_context: vec![0.0; CNN_CHANNELS],
-            value_tail: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
-            value_cnn_global: vec![0.0; VALUE_CNN_POOLED_SIZE],
-            value_cnn_context: vec![0.0; VALUE_CNN_CHANNELS],
-            value_hidden: vec![0.0; VALUE_BRANCH_SIZE],
-            value_next: vec![0.0; VALUE_BRANCH_SIZE],
-            value_intermediate: vec![0.0; VALUE_HIDDEN_SIZE],
+            value_tail: vec![0.0; VALUE_HEAD_FEATURES],
+            value_hidden: vec![0.0; VALUE_HIDDEN_SIZE],
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
             logits: Vec::with_capacity(192),
@@ -88,22 +78,10 @@ pub struct AzModel {
     pub board_conv1_bias: Vec<f32>,
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
-    pub board_attention_query: Vec<f32>,
-    pub board_context_weights: Vec<f32>,
-    pub board_context_bias: Vec<f32>,
     pub board_hidden: Vec<f32>,
     pub board_hidden_bias: Vec<f32>,
-    pub value_trunk_weights: Vec<f32>,
-    pub value_trunk_biases: Vec<f32>,
-    pub value_square_hidden: Vec<f32>,
-    pub value_square_hidden_bias: Vec<f32>,
     pub value_tail_conv_weights: Vec<f32>,
     pub value_tail_conv_bias: Vec<f32>,
-    pub value_board_attention_query: Vec<f32>,
-    pub value_context_weights: Vec<f32>,
-    pub value_context_bias: Vec<f32>,
-    pub value_board_hidden: Vec<f32>,
-    pub value_board_hidden_bias: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
@@ -118,51 +96,21 @@ pub struct AzModel {
 }
 
 // Architecture notes:
-// - Policy and value no longer share the same learning pressure. Value has a
-//   small private branch so value targets cannot erase policy-ordering
-//   features in the policy representation.
-// - Do not add a from/to-square factorized policy head on top of this absolute
-//   board representation. A previous v14/v15 experiment mixed absolute board
-//   features with partially relative action-square sharing and immediately
-//   produced a severe red/black bias in self-play. Factorized policy should
-//   wait until the whole model has a consistent per-square or canonical view.
-// - The board summary deliberately keeps cheap row/column line pools. This is
-//   the safe part borrowed from GNN-style row/column attention: it helps long
-//   rook/cannon/general files without changing action semantics.
-// - v18 removes the expensive first 3x3 input-board convolution. The first
-//   board layer is now a 1x1 channel mixer, then the second layer handles local
-//   3x3 patterns. This keeps local tactics while cutting the worst early CPU
-//   eval cost.
-// - v18 adds a static geometry-conditioned policy residual. It shares policy
-//   knowledge across similar move shapes without resurrecting the bad v14/v15
-//   from/to factorization or changing the absolute board view.
-// - v20 removes the old policy residual trunk completely. It was not a useful
-//   runtime knob: width, cheap board summaries, and move-conditioned policy
-//   sharing were more valuable than hidden->hidden depth for this CPU MCTS net.
-// - v21 tried a value-only relation/move encoder. It helped loss in places but
-//   made the value experiment muddy: hand summaries can become shortcuts and
-//   hide whether the board model itself understands positions.
-// - v22 switches the net to side-to-move canonical inputs and canonical policy
-//   actions: the mover is always represented as Red, and Black-to-move boards
-//   are rotated 180 degrees with colors swapped. The old side-to-move board
-//   channel is removed; do not feed canonical boards with absolute move labels,
-//   because that recreates the red/black leakage bug.
-// - v23 gave value its own tiny board CNN. v24 removes value-side sparse V4
-//   and hand relation inputs. Value now starts from a learned piece-square
-//   board embedding plus a 32-channel residual CNN. This keeps value fully
-//   learned from canonical board planes while still giving it a natural way to
-//   learn material/position baselines before local attack/defense patterns.
-// - v25 removes sparse V4 from the policy/shared path too. The AZ model now
-//   learns from canonical board planes end to end; policy keeps only the
-//   move-conditioned geometry residual, which shares action shapes rather than
-//   injecting sparse board identities.
-// - v26 shares the board CNN stem between policy and value. Value keeps a
-//   small residual tail and its piece-square baseline, so the tasks share
-//   low-level board perception without collapsing into a single head.
-// - v27 adds lightweight global-attention feedback inside the board CNN. The
-//   attention context is projected back into every square before pooling, so
-//   the net gets a small amount of whole-board interaction without paying for
-//   a full Transformer or a heavy AlphaZero residual tower.
+// - v29 is a Tiny ResCNN. The board is canonical side-to-move input, then a
+//   3x3 sparse stem and three 3x3 residual blocks keep spatial features alive
+//   until the heads. This replaces the old early-pool/attention/value-embedding
+//   hybrid that was too easy for policy and value to pull in different ways.
+// - Value is now a standard CNN value head: 1x1 conv -> flatten -> MLP ->
+//   three outcome logits. There is no piece-square value shortcut, no relation
+//   shortcut, and no value-only attention path; if value improves, it is because
+//   the spatial tower learned useful board features.
+// - Policy still uses a CPU-friendly legal-move scorer. It reads the same CNN
+//   pooled features plus a small move-geometry condition, so legal move masking
+//   stays cheap while the board representation is now much closer to a normal
+//   AlphaZero-style CNN tower.
+// - Do not resurrect the old sparse V4/NNUE-style board identities here. They
+//   made distillation easier to overfit but muddied whether self-play value was
+//   learning from board structure.
 
 impl Clone for AzModel {
     fn clone(&self) -> Self {
@@ -173,22 +121,10 @@ impl Clone for AzModel {
             board_conv1_bias: self.board_conv1_bias.clone(),
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
-            board_attention_query: self.board_attention_query.clone(),
-            board_context_weights: self.board_context_weights.clone(),
-            board_context_bias: self.board_context_bias.clone(),
             board_hidden: self.board_hidden.clone(),
             board_hidden_bias: self.board_hidden_bias.clone(),
-            value_trunk_weights: self.value_trunk_weights.clone(),
-            value_trunk_biases: self.value_trunk_biases.clone(),
-            value_square_hidden: self.value_square_hidden.clone(),
-            value_square_hidden_bias: self.value_square_hidden_bias.clone(),
             value_tail_conv_weights: self.value_tail_conv_weights.clone(),
             value_tail_conv_bias: self.value_tail_conv_bias.clone(),
-            value_board_attention_query: self.value_board_attention_query.clone(),
-            value_context_weights: self.value_context_weights.clone(),
-            value_context_bias: self.value_context_bias.clone(),
-            value_board_hidden: self.value_board_hidden.clone(),
-            value_board_hidden_bias: self.value_board_hidden_bias.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
@@ -216,50 +152,28 @@ impl AzModel {
             .expect("unsupported model config");
         let hidden_size = config.hidden_size;
         let mut rng = SplitMix64::new(seed);
-        let board_conv1_weights: Vec<f32> =
-            (0..CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA)
-                .map(|_| rng.weight(0.08))
-                .collect();
+        let board_conv1_weights: Vec<f32> = (0..CNN_CHANNELS
+            * BOARD_CHANNELS
+            * BOARD_INPUT_KERNEL_AREA)
+            .map(|_| rng.weight((2.0 / (BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA) as f32).sqrt()))
+            .collect();
         let board_conv1_bias = vec![0.0; CNN_CHANNELS];
-        let board_conv2_weights: Vec<f32> = (0..CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA)
-            .map(|_| rng.weight(0.08))
-            .collect();
-        let board_conv2_bias = vec![0.0; CNN_CHANNELS];
-        let board_attention_query: Vec<f32> = (0..CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
-        let board_context_weights: Vec<f32> = (0..CNN_CHANNELS * CNN_CHANNELS)
-            .map(|_| rng.weight(0.03))
-            .collect();
-        let board_context_bias = vec![0.0; CNN_CHANNELS];
+        let residual_layer_count = RESIDUAL_BLOCKS * 2;
+        let board_conv2_weights: Vec<f32> =
+            (0..residual_layer_count * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA)
+                .map(|_| rng.weight((2.0 / (CNN_CHANNELS * CNN_KERNEL_AREA) as f32).sqrt()))
+                .collect();
+        let board_conv2_bias = vec![0.0; residual_layer_count * CNN_CHANNELS];
         let board_hidden: Vec<f32> = (0..hidden_size * CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
         let board_hidden_bias = vec![0.0; hidden_size];
-        let value_trunk_weights: Vec<f32> =
-            (0..VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE)
-                .map(|_| rng.weight((2.0 / VALUE_BRANCH_SIZE as f32).sqrt()))
-                .collect();
-        let value_trunk_biases = vec![0.0; VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE];
-        let value_square_hidden: Vec<f32> = (0..VALUE_SQUARE_INPUT_SIZE * VALUE_BRANCH_SIZE)
-            .map(|_| rng.weight(0.015))
+        let value_tail_conv_weights: Vec<f32> = (0..VALUE_HEAD_CHANNELS * CNN_CHANNELS)
+            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt()))
             .collect();
-        let value_square_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
-        let value_tail_conv_weights: Vec<f32> =
-            (0..VALUE_CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA)
-                .map(|_| rng.weight(0.06))
-                .collect();
-        let value_tail_conv_bias = vec![0.0; VALUE_CNN_CHANNELS];
-        let value_board_attention_query: Vec<f32> =
-            (0..VALUE_CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
-        let value_context_weights: Vec<f32> = (0..VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS)
-            .map(|_| rng.weight(0.03))
-            .collect();
-        let value_context_bias = vec![0.0; VALUE_CNN_CHANNELS];
-        let value_board_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE)
-            .map(|_| rng.weight((2.0 / VALUE_CNN_POOLED_SIZE as f32).sqrt()))
-            .collect();
-        let value_board_hidden_bias = vec![0.0; VALUE_BRANCH_SIZE];
-        let value_intermediate_hidden = (0..VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE)
-            .map(|_| rng.weight((2.0 / VALUE_BRANCH_SIZE as f32).sqrt()))
+        let value_tail_conv_bias = vec![0.0; VALUE_HEAD_CHANNELS];
+        let value_intermediate_hidden = (0..VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES)
+            .map(|_| rng.weight((2.0 / VALUE_HEAD_FEATURES as f32).sqrt()))
             .collect();
         let value_intermediate_bias = vec![0.0; VALUE_HIDDEN_SIZE];
         let value_logits_weights = (0..VALUE_LOGITS * VALUE_HIDDEN_SIZE)
@@ -287,22 +201,10 @@ impl AzModel {
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
-            board_attention_query,
-            board_context_weights,
-            board_context_bias,
             board_hidden,
             board_hidden_bias,
-            value_trunk_weights,
-            value_trunk_biases,
-            value_square_hidden,
-            value_square_hidden_bias,
             value_tail_conv_weights,
             value_tail_conv_bias,
-            value_board_attention_query,
-            value_context_weights,
-            value_context_bias,
-            value_board_hidden,
-            value_board_hidden_bias,
             value_intermediate_hidden,
             value_intermediate_bias,
             value_logits_weights,
@@ -330,22 +232,15 @@ impl AzModel {
             &scratch.board,
             &mut scratch.conv1,
             &mut scratch.conv2,
-            &mut scratch.cnn_context,
+            &mut scratch.conv_residual,
             &mut scratch.cnn_global,
         );
         self.board_hidden_into(&scratch.cnn_global, &mut scratch.hidden);
-        self.value_board_forward_into(
-            &scratch.conv2,
+        self.value_head_into(
+            &scratch.conv1,
             &mut scratch.value_tail,
-            &mut scratch.value_cnn_context,
-            &mut scratch.value_cnn_global,
+            &mut scratch.value_hidden,
         );
-        self.value_square_embedding_into(&scratch.board, &mut scratch.value_hidden);
-        self.value_board_hidden_into(&scratch.value_cnn_global, &mut scratch.value_next);
-        for idx in 0..VALUE_BRANCH_SIZE {
-            scratch.value_hidden[idx] += scratch.value_next[idx];
-        }
-        self.forward_value_trunk_into(&mut scratch.value_hidden, &mut scratch.value_next);
         let value = self.value_from_hidden_scratch(scratch);
         self.policy_condition_into(
             &scratch.hidden,
@@ -364,6 +259,42 @@ impl AzModel {
         value
     }
 
+    fn board_forward_into(
+        &self,
+        board: &[u8],
+        features: &mut Vec<f32>,
+        tmp: &mut Vec<f32>,
+        delta: &mut Vec<f32>,
+        cnn_global: &mut Vec<f32>,
+    ) {
+        features.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        tmp.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        delta.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        cnn_global.resize(CNN_POOLED_SIZE, 0.0);
+        conv_relu_board_layer_sparse_3x3(
+            board,
+            CNN_CHANNELS,
+            &self.board_conv1_weights,
+            &self.board_conv1_bias,
+            features,
+        );
+        let block_weight_len = 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
+        let block_bias_len = 2 * CNN_CHANNELS;
+        for block in 0..RESIDUAL_BLOCKS {
+            let weight_start = block * block_weight_len;
+            let bias_start = block * block_bias_len;
+            residual_cnn_block_generic(
+                features,
+                tmp,
+                delta,
+                CNN_CHANNELS,
+                &self.board_conv2_weights[weight_start..weight_start + block_weight_len],
+                &self.board_conv2_bias[bias_start..bias_start + block_bias_len],
+            );
+        }
+        pool_cnn_features(features, CNN_CHANNELS, cnn_global);
+    }
+
     fn board_hidden_into(&self, cnn_global: &[f32], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.board_hidden_bias);
@@ -376,161 +307,37 @@ impl AzModel {
         }
     }
 
-    fn value_board_hidden_into(&self, value_cnn_global: &[f32], hidden: &mut Vec<f32>) {
-        hidden.resize(VALUE_BRANCH_SIZE, 0.0);
-        hidden.copy_from_slice(&self.value_board_hidden_bias);
-        for (out, hidden_value) in hidden.iter_mut().enumerate().take(VALUE_BRANCH_SIZE) {
-            let row = &self.value_board_hidden
-                [out * VALUE_CNN_POOLED_SIZE..(out + 1) * VALUE_CNN_POOLED_SIZE];
-            for (cnn_value, weight) in value_cnn_global.iter().zip(row) {
-                *hidden_value += cnn_value * weight;
-            }
-            *hidden_value = (*hidden_value).max(0.0);
-        }
-    }
-
-    fn value_square_embedding_into(&self, board: &[u8], hidden: &mut Vec<f32>) {
-        hidden.resize(VALUE_BRANCH_SIZE, 0.0);
-        hidden.copy_from_slice(&self.value_square_hidden_bias);
-        for (idx, &plane) in board.iter().take(BOARD_HISTORY_SIZE).enumerate() {
-            if plane == 0 {
-                continue;
-            }
-            let frame = idx / BOARD_PLANES_SIZE;
-            let sq = idx % BOARD_PLANES_SIZE;
-            let channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
-            debug_assert!(channel < BOARD_CHANNELS);
-            let feature = channel * BOARD_PLANES_SIZE + sq;
-            let row = &self.value_square_hidden
-                [feature * VALUE_BRANCH_SIZE..(feature + 1) * VALUE_BRANCH_SIZE];
-            for idx in 0..VALUE_BRANCH_SIZE {
-                hidden[idx] += row[idx];
-            }
-        }
-        for value in hidden.iter_mut() {
-            *value = value.max(0.0);
-        }
-    }
-
-    fn board_forward_into(
-        &self,
-        board: &[u8],
-        conv1: &mut Vec<f32>,
-        conv2: &mut Vec<f32>,
-        cnn_context: &mut Vec<f32>,
-        cnn_global: &mut Vec<f32>,
-    ) {
-        conv1.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        conv2.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        cnn_context.resize(CNN_CHANNELS, 0.0);
-        cnn_global.resize(CNN_POOLED_SIZE, 0.0);
-        conv_relu_layer_generic(
-            board,
+    fn value_head_into(&self, features: &[f32], value_tail: &mut Vec<f32>, hidden: &mut Vec<f32>) {
+        value_tail.resize(VALUE_HEAD_FEATURES, 0.0);
+        conv1x1_relu_layer_dense_generic(
+            features,
             CNN_CHANNELS,
-            &self.board_conv1_weights,
-            &self.board_conv1_bias,
-            conv1,
-        );
-        conv_relu_layer_dense_generic(
-            conv1,
-            CNN_CHANNELS,
-            CNN_CHANNELS,
-            &self.board_conv2_weights,
-            &self.board_conv2_bias,
-            conv2,
-        );
-        apply_global_attention_feedback(
-            conv2,
-            CNN_CHANNELS,
-            &self.board_attention_query,
-            &self.board_context_weights,
-            &self.board_context_bias,
-            cnn_context,
-        );
-        pool_cnn_features(conv2, CNN_CHANNELS, &self.board_attention_query, cnn_global);
-    }
-
-    fn value_board_forward_into(
-        &self,
-        shared_conv: &[f32],
-        value_tail: &mut Vec<f32>,
-        value_context: &mut Vec<f32>,
-        value_cnn_global: &mut Vec<f32>,
-    ) {
-        debug_assert_eq!(VALUE_CNN_CHANNELS, CNN_CHANNELS);
-        value_tail.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        value_context.resize(VALUE_CNN_CHANNELS, 0.0);
-        value_cnn_global.resize(VALUE_CNN_POOLED_SIZE, 0.0);
-        conv_relu_layer_dense_generic(
-            shared_conv,
-            CNN_CHANNELS,
-            VALUE_CNN_CHANNELS,
+            VALUE_HEAD_CHANNELS,
             &self.value_tail_conv_weights,
             &self.value_tail_conv_bias,
             value_tail,
         );
-        for (dst, skip) in value_tail.iter_mut().zip(shared_conv.iter()) {
-            *dst = (*dst + skip).max(0.0);
-        }
-        apply_global_attention_feedback(
-            value_tail,
-            VALUE_CNN_CHANNELS,
-            &self.value_board_attention_query,
-            &self.value_context_weights,
-            &self.value_context_bias,
-            value_context,
-        );
-        pool_cnn_features(
-            value_tail,
-            VALUE_CNN_CHANNELS,
-            &self.value_board_attention_query,
-            value_cnn_global,
-        );
-    }
-
-    fn forward_value_trunk_into(&self, hidden: &mut Vec<f32>, next: &mut Vec<f32>) {
-        next.resize(VALUE_BRANCH_SIZE, 0.0);
-        for layer in 0..VALUE_BRANCH_DEPTH {
-            let weight_offset = layer * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
-            let bias_offset = layer * VALUE_BRANCH_SIZE;
-            for out in 0..VALUE_BRANCH_SIZE {
-                let mut value = self.value_trunk_biases[bias_offset + out];
-                let row = &self.value_trunk_weights[weight_offset + out * VALUE_BRANCH_SIZE
-                    ..weight_offset + (out + 1) * VALUE_BRANCH_SIZE];
-                for idx in 0..VALUE_BRANCH_SIZE {
-                    value += row[idx] * hidden[idx];
-                }
-                next[out] = hidden[out] + RESIDUAL_TRUNK_SCALE * value.max(0.0);
+        hidden.resize(VALUE_HIDDEN_SIZE, 0.0);
+        hidden.copy_from_slice(&self.value_intermediate_bias);
+        for (j, value) in hidden.iter_mut().enumerate().take(VALUE_HIDDEN_SIZE) {
+            let row = &self.value_intermediate_hidden
+                [j * VALUE_HEAD_FEATURES..(j + 1) * VALUE_HEAD_FEATURES];
+            for (feature, weight) in value_tail.iter().zip(row) {
+                *value += feature * weight;
             }
-            std::mem::swap(hidden, next);
+            *value = (*value).max(0.0);
         }
     }
 
     fn value_from_hidden_scratch(&self, scratch: &mut AzEvalScratch) -> f32 {
-        scratch
-            .value_intermediate
-            .copy_from_slice(&self.value_intermediate_bias);
-        for (j, value) in scratch
-            .value_intermediate
-            .iter_mut()
-            .enumerate()
-            .take(VALUE_HIDDEN_SIZE)
-        {
-            let h_row =
-                &self.value_intermediate_hidden[j * VALUE_BRANCH_SIZE..(j + 1) * VALUE_BRANCH_SIZE];
-            for (hidden_value, weight) in scratch.value_hidden.iter().zip(h_row) {
-                *value += hidden_value * weight;
-            }
-            *value = (*value).max(0.0);
-        }
         scratch
             .value_logits
             .copy_from_slice(&self.value_logits_bias);
         for out in 0..VALUE_LOGITS {
             let row =
                 &self.value_logits_weights[out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
-            for (intermediate, weight) in scratch.value_intermediate.iter().zip(row) {
-                scratch.value_logits[out] += intermediate * weight;
+            for (hidden, weight) in scratch.value_hidden.iter().zip(row) {
+                scratch.value_logits[out] += hidden * weight;
             }
         }
         scalar_value_from_logits(&scratch.value_logits).0
@@ -552,27 +359,14 @@ impl AzModel {
     pub(super) fn validate(&self) -> io::Result<()> {
         if self.board_conv1_weights.len() != CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
             || self.board_conv1_bias.len() != CNN_CHANNELS
-            || self.board_conv2_weights.len() != CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
-            || self.board_conv2_bias.len() != CNN_CHANNELS
-            || self.board_attention_query.len() != CNN_CHANNELS
-            || self.board_context_weights.len() != CNN_CHANNELS * CNN_CHANNELS
-            || self.board_context_bias.len() != CNN_CHANNELS
+            || self.board_conv2_weights.len()
+                != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
+            || self.board_conv2_bias.len() != RESIDUAL_BLOCKS * 2 * CNN_CHANNELS
             || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
             || self.board_hidden_bias.len() != self.hidden_size
-            || self.value_trunk_weights.len()
-                != VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE
-            || self.value_trunk_biases.len() != VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE
-            || self.value_square_hidden.len() != VALUE_SQUARE_INPUT_SIZE * VALUE_BRANCH_SIZE
-            || self.value_square_hidden_bias.len() != VALUE_BRANCH_SIZE
-            || self.value_tail_conv_weights.len()
-                != VALUE_CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
-            || self.value_tail_conv_bias.len() != VALUE_CNN_CHANNELS
-            || self.value_board_attention_query.len() != VALUE_CNN_CHANNELS
-            || self.value_context_weights.len() != VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS
-            || self.value_context_bias.len() != VALUE_CNN_CHANNELS
-            || self.value_board_hidden.len() != VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE
-            || self.value_board_hidden_bias.len() != VALUE_BRANCH_SIZE
-            || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE
+            || self.value_tail_conv_weights.len() != VALUE_HEAD_CHANNELS * CNN_CHANNELS
+            || self.value_tail_conv_bias.len() != VALUE_HEAD_CHANNELS
+            || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES
             || self.value_intermediate_bias.len() != VALUE_HIDDEN_SIZE
             || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
             || self.value_logits_bias.len() != VALUE_LOGITS
@@ -611,7 +405,6 @@ impl AzModel {
             + dot_product(policy_condition, move_features)
     }
 }
-
 pub(super) fn extract_board_planes(
     position: &Position,
     history: &[HistoryMove],

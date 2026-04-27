@@ -5,9 +5,8 @@ use std::path::Path;
 use super::{
     AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_MAGIC, AZ_MODEL_BINARY_VERSION, AzModel,
     AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, CNN_CHANNELS, CNN_KERNEL_AREA,
-    CNN_POOLED_SIZE, DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE, VALUE_BRANCH_DEPTH,
-    VALUE_BRANCH_SIZE, VALUE_CNN_CHANNELS, VALUE_CNN_POOLED_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
-    VALUE_SQUARE_INPUT_SIZE,
+    CNN_POOLED_SIZE, DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS,
+    VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
 };
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -39,34 +38,22 @@ impl AzModel {
         let mut writer = BufWriter::new(file);
         writer.write_all(AZ_MODEL_BINARY_MAGIC)?;
         writer.write_all(&AZ_MODEL_BINARY_VERSION.to_le_bytes())?;
-        writer.write_all(&(VALUE_SQUARE_INPUT_SIZE as u32).to_le_bytes())?;
+        writer.write_all(&(BOARD_CHANNELS as u32).to_le_bytes())?;
         writer.write_all(&(self.hidden_size as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.cnn_channels as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.value_branch_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.value_branch_depth as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.residual_blocks as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.value_head_channels as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.value_hidden_size as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.policy_condition_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.attention_feedback as u32).to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?;
         write_f32_slice_le(&mut writer, &self.board_conv1_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv1_bias)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
-        write_f32_slice_le(&mut writer, &self.board_attention_query)?;
-        write_f32_slice_le(&mut writer, &self.board_context_weights)?;
-        write_f32_slice_le(&mut writer, &self.board_context_bias)?;
         write_f32_slice_le(&mut writer, &self.board_hidden)?;
         write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_trunk_weights)?;
-        write_f32_slice_le(&mut writer, &self.value_trunk_biases)?;
-        write_f32_slice_le(&mut writer, &self.value_square_hidden)?;
-        write_f32_slice_le(&mut writer, &self.value_square_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_weights)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_board_attention_query)?;
-        write_f32_slice_le(&mut writer, &self.value_context_weights)?;
-        write_f32_slice_le(&mut writer, &self.value_context_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_board_hidden)?;
-        write_f32_slice_le(&mut writer, &self.value_board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
@@ -103,46 +90,35 @@ impl AzModel {
                 ),
             ));
         }
-        let input_size = read_u32_le(&mut reader)? as usize;
+        let input_channels = read_u32_le(&mut reader)? as usize;
         let hidden_size = read_u32_le(&mut reader)? as usize;
         let model_config = AzModelConfig {
             hidden_size,
             cnn_channels: read_u32_le(&mut reader)? as usize,
-            value_branch_size: read_u32_le(&mut reader)? as usize,
-            value_branch_depth: read_u32_le(&mut reader)? as usize,
+            residual_blocks: read_u32_le(&mut reader)? as usize,
+            value_head_channels: read_u32_le(&mut reader)? as usize,
             value_hidden_size: read_u32_le(&mut reader)? as usize,
             policy_condition_size: read_u32_le(&mut reader)? as usize,
-            attention_feedback: read_u32_le(&mut reader)? != 0,
         }
         .normalized();
+        let _reserved = read_u32_le(&mut reader)?;
         model_config.validate_supported()?;
-        if input_size != VALUE_SQUARE_INPUT_SIZE {
+        if input_channels != BOARD_CHANNELS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "binary input_size does not match this build (VALUE_SQUARE_INPUT_SIZE)",
+                "binary input channel count does not match this build",
             ));
         }
         let board_conv1_weights_len = CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
         let board_conv1_bias_len = CNN_CHANNELS;
-        let board_conv2_weights_len = CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
-        let board_conv2_bias_len = CNN_CHANNELS;
-        let board_attention_query_len = CNN_CHANNELS;
-        let board_context_weights_len = CNN_CHANNELS * CNN_CHANNELS;
-        let board_context_bias_len = CNN_CHANNELS;
+        let board_conv2_weights_len =
+            RESIDUAL_BLOCKS * 2 * CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
+        let board_conv2_bias_len = RESIDUAL_BLOCKS * 2 * CNN_CHANNELS;
         let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
         let board_hidden_bias_len = hidden_size;
-        let value_trunk_weights_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
-        let value_trunk_biases_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE;
-        let value_square_hidden_len = VALUE_SQUARE_INPUT_SIZE * VALUE_BRANCH_SIZE;
-        let value_square_hidden_bias_len = VALUE_BRANCH_SIZE;
-        let value_tail_conv_weights_len = VALUE_CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
-        let value_tail_conv_bias_len = VALUE_CNN_CHANNELS;
-        let value_board_attention_query_len = VALUE_CNN_CHANNELS;
-        let value_context_weights_len = VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS;
-        let value_context_bias_len = VALUE_CNN_CHANNELS;
-        let value_board_hidden_len = VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE;
-        let value_board_hidden_bias_len = VALUE_BRANCH_SIZE;
-        let vih_len = VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE;
+        let value_tail_conv_weights_len = VALUE_HEAD_CHANNELS * CNN_CHANNELS;
+        let value_tail_conv_bias_len = VALUE_HEAD_CHANNELS;
+        let vih_len = VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES;
         let vib_len = VALUE_HIDDEN_SIZE;
         let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
         let vlb_len = VALUE_LOGITS;
@@ -156,22 +132,10 @@ impl AzModel {
             + board_conv1_bias_len
             + board_conv2_weights_len
             + board_conv2_bias_len
-            + board_attention_query_len
-            + board_context_weights_len
-            + board_context_bias_len
             + board_hidden_len
             + board_hidden_bias_len
-            + value_trunk_weights_len
-            + value_trunk_biases_len
-            + value_square_hidden_len
-            + value_square_hidden_bias_len
             + value_tail_conv_weights_len
             + value_tail_conv_bias_len
-            + value_board_attention_query_len
-            + value_context_weights_len
-            + value_context_bias_len
-            + value_board_hidden_len
-            + value_board_hidden_bias_len
             + vih_len
             + vib_len
             + vlw_len
@@ -194,70 +158,27 @@ impl AzModel {
                 ),
             ));
         }
-        let board_conv1_weights = read_f32_vec_le(&mut reader, board_conv1_weights_len)?;
-        let board_conv1_bias = read_f32_vec_le(&mut reader, board_conv1_bias_len)?;
-        let board_conv2_weights = read_f32_vec_le(&mut reader, board_conv2_weights_len)?;
-        let board_conv2_bias = read_f32_vec_le(&mut reader, board_conv2_bias_len)?;
-        let board_attention_query = read_f32_vec_le(&mut reader, board_attention_query_len)?;
-        let board_context_weights = read_f32_vec_le(&mut reader, board_context_weights_len)?;
-        let board_context_bias = read_f32_vec_le(&mut reader, board_context_bias_len)?;
-        let board_hidden = read_f32_vec_le(&mut reader, board_hidden_len)?;
-        let board_hidden_bias = read_f32_vec_le(&mut reader, board_hidden_bias_len)?;
-        let value_trunk_weights = read_f32_vec_le(&mut reader, value_trunk_weights_len)?;
-        let value_trunk_biases = read_f32_vec_le(&mut reader, value_trunk_biases_len)?;
-        let value_square_hidden = read_f32_vec_le(&mut reader, value_square_hidden_len)?;
-        let value_square_hidden_bias = read_f32_vec_le(&mut reader, value_square_hidden_bias_len)?;
-        let value_tail_conv_weights = read_f32_vec_le(&mut reader, value_tail_conv_weights_len)?;
-        let value_tail_conv_bias = read_f32_vec_le(&mut reader, value_tail_conv_bias_len)?;
-        let value_board_attention_query =
-            read_f32_vec_le(&mut reader, value_board_attention_query_len)?;
-        let value_context_weights = read_f32_vec_le(&mut reader, value_context_weights_len)?;
-        let value_context_bias = read_f32_vec_le(&mut reader, value_context_bias_len)?;
-        let value_board_hidden = read_f32_vec_le(&mut reader, value_board_hidden_len)?;
-        let value_board_hidden_bias = read_f32_vec_le(&mut reader, value_board_hidden_bias_len)?;
-        let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
-        let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
-        let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
-        let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
-        let policy_move_hidden = read_f32_vec_le(&mut reader, pmh_len)?;
-        let policy_move_cnn = read_f32_vec_le(&mut reader, pmc_len)?;
-        let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
-        let policy_feature_hidden = read_f32_vec_le(&mut reader, pfh_len)?;
-        let policy_feature_cnn = read_f32_vec_le(&mut reader, pfc_len)?;
-        let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
         let model = Self {
             model_config,
             hidden_size,
-            board_conv1_weights,
-            board_conv1_bias,
-            board_conv2_weights,
-            board_conv2_bias,
-            board_attention_query,
-            board_context_weights,
-            board_context_bias,
-            board_hidden,
-            board_hidden_bias,
-            value_trunk_weights,
-            value_trunk_biases,
-            value_square_hidden,
-            value_square_hidden_bias,
-            value_tail_conv_weights,
-            value_tail_conv_bias,
-            value_board_attention_query,
-            value_context_weights,
-            value_context_bias,
-            value_board_hidden,
-            value_board_hidden_bias,
-            value_intermediate_hidden,
-            value_intermediate_bias,
-            value_logits_weights,
-            value_logits_bias,
-            policy_move_hidden,
-            policy_move_cnn,
-            policy_move_bias,
-            policy_feature_hidden,
-            policy_feature_cnn,
-            policy_feature_bias,
+            board_conv1_weights: read_f32_vec_le(&mut reader, board_conv1_weights_len)?,
+            board_conv1_bias: read_f32_vec_le(&mut reader, board_conv1_bias_len)?,
+            board_conv2_weights: read_f32_vec_le(&mut reader, board_conv2_weights_len)?,
+            board_conv2_bias: read_f32_vec_le(&mut reader, board_conv2_bias_len)?,
+            board_hidden: read_f32_vec_le(&mut reader, board_hidden_len)?,
+            board_hidden_bias: read_f32_vec_le(&mut reader, board_hidden_bias_len)?,
+            value_tail_conv_weights: read_f32_vec_le(&mut reader, value_tail_conv_weights_len)?,
+            value_tail_conv_bias: read_f32_vec_le(&mut reader, value_tail_conv_bias_len)?,
+            value_intermediate_hidden: read_f32_vec_le(&mut reader, vih_len)?,
+            value_intermediate_bias: read_f32_vec_le(&mut reader, vib_len)?,
+            value_logits_weights: read_f32_vec_le(&mut reader, vlw_len)?,
+            value_logits_bias: read_f32_vec_le(&mut reader, vlb_len)?,
+            policy_move_hidden: read_f32_vec_le(&mut reader, pmh_len)?,
+            policy_move_cnn: read_f32_vec_le(&mut reader, pmc_len)?,
+            policy_move_bias: read_f32_vec_le(&mut reader, pmb_len)?,
+            policy_feature_hidden: read_f32_vec_le(&mut reader, pfh_len)?,
+            policy_feature_cnn: read_f32_vec_le(&mut reader, pfc_len)?,
+            policy_feature_bias: read_f32_vec_le(&mut reader, pfb_len)?,
             gpu_trainer: None,
         };
         model.validate()?;

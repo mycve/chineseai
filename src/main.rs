@@ -91,21 +91,18 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// CNN channels. This build currently supports 24.
+    /// CNN channels. This build currently supports 32.
     #[arg(long)]
     cnn_channels: Option<usize>,
-    /// Value branch width. This build currently supports 128.
+    /// Residual CNN blocks. This build currently supports 3.
     #[arg(long)]
-    value_branch_size: Option<usize>,
-    /// Value residual branch depth. This build currently supports 2.
+    residual_blocks: Option<usize>,
+    /// Value head channels. This build currently supports 8.
     #[arg(long)]
-    value_branch_depth: Option<usize>,
+    value_head_channels: Option<usize>,
     /// Value hidden width. This build currently supports 256.
     #[arg(long)]
     value_hidden_size: Option<usize>,
-    /// Enable lightweight global attention feedback.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    attention_feedback: bool,
 }
 
 #[derive(Args, Debug)]
@@ -383,7 +380,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     format!(
         concat!(
-            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_c{}_vb{}x{}_vh{}_af{}_mxp{}_wk{}_",
+            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_c{}_rb{}_vhc{}_vh{}_mxp{}_wk{}_",
             "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
             "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
@@ -394,10 +391,9 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.max_sample_train_count,
         config.hidden_size,
         config.cnn_channels,
-        config.value_branch_size,
-        config.value_branch_depth,
+        config.residual_blocks,
+        config.value_head_channels,
         config.value_hidden_size,
-        config.attention_feedback as u8,
         config.max_plies,
         config.workers,
         config.search_algorithm.as_str(),
@@ -721,12 +717,11 @@ fn main() {
         Some(CliCommand::AzInit(cmd)) => {
             let model_config = AzModelConfig {
                 hidden_size: cmd.hidden,
-                cnn_channels: cmd.cnn_channels.unwrap_or(24),
-                value_branch_size: cmd.value_branch_size.unwrap_or(128),
-                value_branch_depth: cmd.value_branch_depth.unwrap_or(2),
+                cnn_channels: cmd.cnn_channels.unwrap_or(32),
+                residual_blocks: cmd.residual_blocks.unwrap_or(3),
+                value_head_channels: cmd.value_head_channels.unwrap_or(8),
                 value_hidden_size: cmd.value_hidden_size.unwrap_or(256),
                 policy_condition_size: 32,
-                attention_feedback: cmd.attention_feedback,
             }
             .normalized();
             model_config

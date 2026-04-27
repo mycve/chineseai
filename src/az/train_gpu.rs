@@ -6,9 +6,8 @@ use std::{process::Command, thread};
 use super::{
     AzModel, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS,
     BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE,
-    PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_TRUNK_SCALE, VALUE_BRANCH_DEPTH,
-    VALUE_BRANCH_SIZE, VALUE_CNN_CHANNELS, VALUE_CNN_POOLED_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
-    VALUE_SQUARE_INPUT_SIZE, policy_move_features,
+    PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS,
+    VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS, policy_move_features,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -39,24 +38,12 @@ struct GpuReplica {
 struct GpuVars {
     board_conv1_weights: Var,
     board_conv1_bias: Var,
-    board_conv2_weights: Var,
-    board_conv2_bias: Var,
-    board_attention_query: Var,
-    board_context_weights: Var,
-    board_context_bias: Var,
+    residual_weights: Vec<Var>,
+    residual_biases: Vec<Var>,
     board_hidden: Var,
     board_hidden_bias: Var,
-    value_trunk_weights: Vec<Var>,
-    value_trunk_biases: Vec<Var>,
-    value_square_hidden: Var,
-    value_square_hidden_bias: Var,
     value_tail_conv_weights: Var,
     value_tail_conv_bias: Var,
-    value_board_attention_query: Var,
-    value_context_weights: Var,
-    value_context_bias: Var,
-    value_board_hidden: Var,
-    value_board_hidden_bias: Var,
     value_intermediate_hidden: Var,
     value_intermediate_bias: Var,
     value_logits_weights: Var,
@@ -485,145 +472,69 @@ impl GpuReplica {
 
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
-        let conv1 = batch
+        let mut features = batch
             .board_onehot
-            .reshape((bsz, BOARD_CHANNELS, BOARD_PLANES_SIZE))?
-            .transpose(1, 2)?
-            .reshape((bsz * BOARD_PLANES_SIZE, BOARD_CHANNELS))?
-            .matmul(&self.vars.board_conv1_weights.t()?)?
-            .reshape((bsz, BOARD_PLANES_SIZE, CNN_CHANNELS))?
-            .broadcast_add(&self.vars.board_conv1_bias.reshape((1, 1, CNN_CHANNELS))?)?
-            .transpose(1, 2)?
-            .reshape((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?
-            .relu()?;
-        let conv2 = conv1
-            .conv2d(&self.vars.board_conv2_weights, 1, 1, 1, 1)?
+            .conv2d(&self.vars.board_conv1_weights, 1, 1, 1, 1)?
             .broadcast_add(
                 &self
                     .vars
-                    .board_conv2_bias
+                    .board_conv1_bias
                     .reshape((1, CNN_CHANNELS, 1, 1))?,
             )?
             .relu()?;
+        for block in 0..RESIDUAL_BLOCKS {
+            let first = block * 2;
+            let hidden = features
+                .conv2d(&self.vars.residual_weights[first], 1, 1, 1, 1)?
+                .broadcast_add(&self.vars.residual_biases[first].reshape((
+                    1,
+                    CNN_CHANNELS,
+                    1,
+                    1,
+                ))?)?
+                .relu()?;
+            let delta = hidden
+                .conv2d(&self.vars.residual_weights[first + 1], 1, 1, 1, 1)?
+                .broadcast_add(&self.vars.residual_biases[first + 1].reshape((
+                    1,
+                    CNN_CHANNELS,
+                    1,
+                    1,
+                ))?)?;
+            features = (features + delta)?.relu()?;
+        }
 
-        let conv2_flat = conv2.reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?;
-        let context_query = self
-            .vars
-            .board_attention_query
-            .reshape((1, CNN_CHANNELS, 1))?;
-        let context_logits = conv2_flat.broadcast_mul(&context_query)?.sum(1)?;
-        let context_weights = softmax(&context_logits, 1)?;
-        let context_pool = conv2_flat
-            .broadcast_mul(&context_weights.unsqueeze(1)?)?
-            .sum(2)?;
-        let context_delta = context_pool
-            .matmul(&self.vars.board_context_weights.t()?)?
-            .broadcast_add(&self.vars.board_context_bias)?
-            .reshape((bsz, CNN_CHANNELS, 1, 1))?;
-        let conv2 = conv2.broadcast_add(&context_delta)?.relu()?;
-        let conv2_flat = conv2.reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?;
-        let avg_pool = conv2_flat.mean(2)?;
-        let max_pool = conv2_flat.max(2)?;
-        let attn_query = self
-            .vars
-            .board_attention_query
-            .reshape((1, CNN_CHANNELS, 1))?;
-        let attn_logits = conv2_flat.broadcast_mul(&attn_query)?.sum(1)?;
-        let attn_weights = softmax(&attn_logits, 1)?;
-        let attn_pool = conv2_flat
-            .broadcast_mul(&attn_weights.unsqueeze(1)?)?
-            .sum(2)?;
-        let conv2_grid = conv2.reshape((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
-        let row_line_pool = (conv2_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
-        let col_line_pool = (conv2_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
-        let cnn_global = Tensor::cat(
-            &[avg_pool, max_pool, attn_pool, row_line_pool, col_line_pool],
-            1,
-        )?;
+        let feature_flat = features.reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?;
+        let avg_pool = feature_flat.mean(2)?;
+        let max_pool = feature_flat.max(2)?;
+        let feature_grid = features.reshape((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
+        let row_line_pool = (feature_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
+        let col_line_pool = (feature_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
+        let cnn_global = Tensor::cat(&[avg_pool, max_pool, row_line_pool, col_line_pool], 1)?;
 
-        let cnn_hidden = cnn_global
+        let hidden = cnn_global
             .matmul(&self.vars.board_hidden.t()?)?
             .broadcast_add(&self.vars.board_hidden_bias)?
             .relu()?;
-        let hidden = cnn_hidden;
 
-        let value_tail_raw = conv2
-            .conv2d(&self.vars.value_tail_conv_weights, 1, 1, 1, 1)?
+        let value_tail = features
+            .conv2d(&self.vars.value_tail_conv_weights, 0, 1, 1, 1)?
             .broadcast_add(&self.vars.value_tail_conv_bias.reshape((
                 1,
-                VALUE_CNN_CHANNELS,
+                VALUE_HEAD_CHANNELS,
                 1,
                 1,
-            ))?)?;
-        let value_tail = (value_tail_raw + conv2)?.relu()?;
-        let value_tail_flat = value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
-        let value_context_query =
-            self.vars
-                .value_board_attention_query
-                .reshape((1, VALUE_CNN_CHANNELS, 1))?;
-        let value_context_logits = value_tail_flat
-            .broadcast_mul(&value_context_query)?
-            .sum(1)?;
-        let value_context_weights = softmax(&value_context_logits, 1)?;
-        let value_context_pool = value_tail_flat
-            .broadcast_mul(&value_context_weights.unsqueeze(1)?)?
-            .sum(2)?;
-        let value_context_delta = value_context_pool
-            .matmul(&self.vars.value_context_weights.t()?)?
-            .broadcast_add(&self.vars.value_context_bias)?
-            .reshape((bsz, VALUE_CNN_CHANNELS, 1, 1))?;
-        let value_tail = value_tail.broadcast_add(&value_context_delta)?.relu()?;
-        let value_tail_flat = value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
-        let value_avg_pool = value_tail_flat.mean(2)?;
-        let value_max_pool = value_tail_flat.max(2)?;
-        let value_attn_query =
-            self.vars
-                .value_board_attention_query
-                .reshape((1, VALUE_CNN_CHANNELS, 1))?;
-        let value_attn_logits = value_tail_flat.broadcast_mul(&value_attn_query)?.sum(1)?;
-        let value_attn_weights = softmax(&value_attn_logits, 1)?;
-        let value_attn_pool = value_tail_flat
-            .broadcast_mul(&value_attn_weights.unsqueeze(1)?)?
-            .sum(2)?;
-        let value_conv2_grid =
-            value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
-        let value_row_line_pool = (value_conv2_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
-        let value_col_line_pool = (value_conv2_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
-        let value_cnn_global = Tensor::cat(
-            &[
-                value_avg_pool,
-                value_max_pool,
-                value_attn_pool,
-                value_row_line_pool,
-                value_col_line_pool,
-            ],
-            1,
-        )?;
-        let value_cnn_hidden = value_cnn_global
-            .matmul(&self.vars.value_board_hidden.t()?)?
-            .broadcast_add(&self.vars.value_board_hidden_bias)?
+            ))?)?
             .relu()?;
-        let value_square_hidden = batch
-            .board_onehot
-            .reshape((bsz, VALUE_SQUARE_INPUT_SIZE))?
-            .matmul(&self.vars.value_square_hidden)?
-            .broadcast_add(&self.vars.value_square_hidden_bias)?
-            .relu()?;
-        let mut value_hidden = (value_square_hidden + value_cnn_hidden)?;
-        for layer in 0..VALUE_BRANCH_DEPTH {
-            let dense = value_hidden
-                .matmul(&self.vars.value_trunk_weights[layer].t()?)?
-                .broadcast_add(&self.vars.value_trunk_biases[layer])?
-                .relu()?;
-            value_hidden = (value_hidden + (dense * RESIDUAL_TRUNK_SCALE as f64)?)?;
-        }
-        let value_intermediate = value_hidden
+        let value_hidden = value_tail
+            .reshape((bsz, VALUE_HEAD_FEATURES))?
             .matmul(&self.vars.value_intermediate_hidden.t()?)?
             .broadcast_add(&self.vars.value_intermediate_bias)?
             .relu()?;
-        let value_logits = value_intermediate
+        let value_logits = value_hidden
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
+
         let policy_logits = hidden
             .matmul(&self.vars.policy_move_hidden.t()?)?
             .broadcast_add(
@@ -733,99 +644,47 @@ impl BatchTensors {
 impl GpuVars {
     fn from_model(model: &AzModel, device: &Device) -> CandleResult<Self> {
         let hidden = model.hidden_size;
-        let mut value_trunk_weights = Vec::with_capacity(VALUE_BRANCH_DEPTH);
-        let mut value_trunk_biases = Vec::with_capacity(VALUE_BRANCH_DEPTH);
-        for layer in 0..VALUE_BRANCH_DEPTH {
-            let weight_offset = layer * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
-            let bias_offset = layer * VALUE_BRANCH_SIZE;
-            value_trunk_weights.push(var_from_slice(
-                &model.value_trunk_weights
-                    [weight_offset..weight_offset + VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE],
-                (VALUE_BRANCH_SIZE, VALUE_BRANCH_SIZE),
+        let mut residual_weights = Vec::with_capacity(RESIDUAL_BLOCKS * 2);
+        let mut residual_biases = Vec::with_capacity(RESIDUAL_BLOCKS * 2);
+        let weight_len = CNN_CHANNELS * CNN_CHANNELS * 3 * 3;
+        for layer in 0..RESIDUAL_BLOCKS * 2 {
+            let weight_offset = layer * weight_len;
+            let bias_offset = layer * CNN_CHANNELS;
+            residual_weights.push(var_from_slice(
+                &model.board_conv2_weights[weight_offset..weight_offset + weight_len],
+                (CNN_CHANNELS, CNN_CHANNELS, 3, 3),
                 device,
             )?);
-            value_trunk_biases.push(var_from_slice(
-                &model.value_trunk_biases[bias_offset..bias_offset + VALUE_BRANCH_SIZE],
-                VALUE_BRANCH_SIZE,
+            residual_biases.push(var_from_slice(
+                &model.board_conv2_bias[bias_offset..bias_offset + CNN_CHANNELS],
+                CNN_CHANNELS,
                 device,
             )?);
         }
         Ok(Self {
             board_conv1_weights: var_from_slice(
                 &model.board_conv1_weights,
-                (CNN_CHANNELS, BOARD_CHANNELS),
+                (CNN_CHANNELS, BOARD_CHANNELS, 3, 3),
                 device,
             )?,
             board_conv1_bias: var_from_slice(&model.board_conv1_bias, CNN_CHANNELS, device)?,
-            board_conv2_weights: var_from_slice(
-                &model.board_conv2_weights,
-                (CNN_CHANNELS, CNN_CHANNELS, 3, 3),
-                device,
-            )?,
-            board_conv2_bias: var_from_slice(&model.board_conv2_bias, CNN_CHANNELS, device)?,
-            board_attention_query: var_from_slice(
-                &model.board_attention_query,
-                CNN_CHANNELS,
-                device,
-            )?,
-            board_context_weights: var_from_slice(
-                &model.board_context_weights,
-                (CNN_CHANNELS, CNN_CHANNELS),
-                device,
-            )?,
-            board_context_bias: var_from_slice(&model.board_context_bias, CNN_CHANNELS, device)?,
+            residual_weights,
+            residual_biases,
             board_hidden: var_from_slice(&model.board_hidden, (hidden, CNN_POOLED_SIZE), device)?,
             board_hidden_bias: var_from_slice(&model.board_hidden_bias, hidden, device)?,
-            value_trunk_weights,
-            value_trunk_biases,
-            value_square_hidden: var_from_slice(
-                &model.value_square_hidden,
-                (VALUE_SQUARE_INPUT_SIZE, VALUE_BRANCH_SIZE),
-                device,
-            )?,
-            value_square_hidden_bias: var_from_slice(
-                &model.value_square_hidden_bias,
-                VALUE_BRANCH_SIZE,
-                device,
-            )?,
             value_tail_conv_weights: var_from_slice(
                 &model.value_tail_conv_weights,
-                (VALUE_CNN_CHANNELS, CNN_CHANNELS, 3, 3),
+                (VALUE_HEAD_CHANNELS, CNN_CHANNELS, 1, 1),
                 device,
             )?,
             value_tail_conv_bias: var_from_slice(
                 &model.value_tail_conv_bias,
-                VALUE_CNN_CHANNELS,
-                device,
-            )?,
-            value_board_attention_query: var_from_slice(
-                &model.value_board_attention_query,
-                VALUE_CNN_CHANNELS,
-                device,
-            )?,
-            value_context_weights: var_from_slice(
-                &model.value_context_weights,
-                (VALUE_CNN_CHANNELS, VALUE_CNN_CHANNELS),
-                device,
-            )?,
-            value_context_bias: var_from_slice(
-                &model.value_context_bias,
-                VALUE_CNN_CHANNELS,
-                device,
-            )?,
-            value_board_hidden: var_from_slice(
-                &model.value_board_hidden,
-                (VALUE_BRANCH_SIZE, VALUE_CNN_POOLED_SIZE),
-                device,
-            )?,
-            value_board_hidden_bias: var_from_slice(
-                &model.value_board_hidden_bias,
-                VALUE_BRANCH_SIZE,
+                VALUE_HEAD_CHANNELS,
                 device,
             )?,
             value_intermediate_hidden: var_from_slice(
                 &model.value_intermediate_hidden,
-                (VALUE_HIDDEN_SIZE, VALUE_BRANCH_SIZE),
+                (VALUE_HIDDEN_SIZE, VALUE_HEAD_FEATURES),
                 device,
             )?,
             value_intermediate_bias: var_from_slice(
@@ -877,24 +736,12 @@ impl GpuVars {
         let mut vars = Vec::new();
         vars.push(self.board_conv1_weights.clone());
         vars.push(self.board_conv1_bias.clone());
-        vars.push(self.board_conv2_weights.clone());
-        vars.push(self.board_conv2_bias.clone());
-        vars.push(self.board_attention_query.clone());
-        vars.push(self.board_context_weights.clone());
-        vars.push(self.board_context_bias.clone());
+        vars.extend(self.residual_weights.iter().cloned());
+        vars.extend(self.residual_biases.iter().cloned());
         vars.push(self.board_hidden.clone());
         vars.push(self.board_hidden_bias.clone());
-        vars.extend(self.value_trunk_weights.iter().cloned());
-        vars.extend(self.value_trunk_biases.iter().cloned());
         vars.push(self.value_tail_conv_weights.clone());
         vars.push(self.value_tail_conv_bias.clone());
-        vars.push(self.value_square_hidden.clone());
-        vars.push(self.value_square_hidden_bias.clone());
-        vars.push(self.value_board_attention_query.clone());
-        vars.push(self.value_context_weights.clone());
-        vars.push(self.value_context_bias.clone());
-        vars.push(self.value_board_hidden.clone());
-        vars.push(self.value_board_hidden_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
         vars.push(self.value_intermediate_bias.clone());
         vars.push(self.value_logits_weights.clone());
@@ -912,35 +759,22 @@ impl GpuVars {
         let mut vars = Vec::new();
         vars.push(self.board_conv1_weights.clone());
         vars.push(self.board_conv1_bias.clone());
-        vars.push(self.board_conv2_weights.clone());
-        vars.push(self.board_conv2_bias.clone());
-        vars.push(self.board_attention_query.clone());
-        vars.push(self.board_context_weights.clone());
-        vars.push(self.board_context_bias.clone());
+        vars.extend(self.residual_weights.iter().cloned());
+        vars.extend(self.residual_biases.iter().cloned());
         vars.push(self.board_hidden.clone());
         vars.push(self.board_hidden_bias.clone());
         vars
     }
 
     fn value_head_vars(&self) -> Vec<Var> {
-        let mut vars = vec![
+        vec![
             self.value_tail_conv_weights.clone(),
             self.value_tail_conv_bias.clone(),
-            self.value_square_hidden.clone(),
-            self.value_square_hidden_bias.clone(),
-            self.value_board_attention_query.clone(),
-            self.value_context_weights.clone(),
-            self.value_context_bias.clone(),
-            self.value_board_hidden.clone(),
-            self.value_board_hidden_bias.clone(),
             self.value_intermediate_hidden.clone(),
             self.value_intermediate_bias.clone(),
             self.value_logits_weights.clone(),
             self.value_logits_bias.clone(),
-        ];
-        vars.extend(self.value_trunk_weights.iter().cloned());
-        vars.extend(self.value_trunk_biases.iter().cloned());
-        vars
+        ]
     }
 
     fn policy_head_vars(&self) -> Vec<Var> {
@@ -975,56 +809,26 @@ impl GpuVars {
     fn copy_to_model(&self, model: &mut AzModel) -> CandleResult<()> {
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
-        copy_var(&self.board_conv2_weights, &mut model.board_conv2_weights)?;
-        copy_var(&self.board_conv2_bias, &mut model.board_conv2_bias)?;
-        copy_var(
-            &self.board_attention_query,
-            &mut model.board_attention_query,
-        )?;
-        copy_var(
-            &self.board_context_weights,
-            &mut model.board_context_weights,
-        )?;
-        copy_var(&self.board_context_bias, &mut model.board_context_bias)?;
-        copy_var(&self.board_hidden, &mut model.board_hidden)?;
-        copy_var(&self.board_hidden_bias, &mut model.board_hidden_bias)?;
-        for layer in 0..VALUE_BRANCH_DEPTH {
-            let weight_offset = layer * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
-            let bias_offset = layer * VALUE_BRANCH_SIZE;
+        let weight_len = CNN_CHANNELS * CNN_CHANNELS * 3 * 3;
+        for layer in 0..RESIDUAL_BLOCKS * 2 {
+            let weight_offset = layer * weight_len;
+            let bias_offset = layer * CNN_CHANNELS;
             copy_var(
-                &self.value_trunk_weights[layer],
-                &mut model.value_trunk_weights
-                    [weight_offset..weight_offset + VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE],
+                &self.residual_weights[layer],
+                &mut model.board_conv2_weights[weight_offset..weight_offset + weight_len],
             )?;
             copy_var(
-                &self.value_trunk_biases[layer],
-                &mut model.value_trunk_biases[bias_offset..bias_offset + VALUE_BRANCH_SIZE],
+                &self.residual_biases[layer],
+                &mut model.board_conv2_bias[bias_offset..bias_offset + CNN_CHANNELS],
             )?;
         }
+        copy_var(&self.board_hidden, &mut model.board_hidden)?;
+        copy_var(&self.board_hidden_bias, &mut model.board_hidden_bias)?;
         copy_var(
             &self.value_tail_conv_weights,
             &mut model.value_tail_conv_weights,
         )?;
         copy_var(&self.value_tail_conv_bias, &mut model.value_tail_conv_bias)?;
-        copy_var(&self.value_square_hidden, &mut model.value_square_hidden)?;
-        copy_var(
-            &self.value_square_hidden_bias,
-            &mut model.value_square_hidden_bias,
-        )?;
-        copy_var(
-            &self.value_board_attention_query,
-            &mut model.value_board_attention_query,
-        )?;
-        copy_var(
-            &self.value_context_weights,
-            &mut model.value_context_weights,
-        )?;
-        copy_var(&self.value_context_bias, &mut model.value_context_bias)?;
-        copy_var(&self.value_board_hidden, &mut model.value_board_hidden)?;
-        copy_var(
-            &self.value_board_hidden_bias,
-            &mut model.value_board_hidden_bias,
-        )?;
         copy_var(
             &self.value_intermediate_hidden,
             &mut model.value_intermediate_hidden,
@@ -1075,7 +879,6 @@ impl GpuVars {
         Ok(())
     }
 }
-
 fn cuda_device_indices() -> Vec<usize> {
     if let Some(devices) = parse_cuda_device_list_env("CHINESEAI_CUDA_DEVICES") {
         return devices;

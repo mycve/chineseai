@@ -1,18 +1,17 @@
-use std::io;
+﻿use std::io;
 
 use super::{
-    CNN_CHANNELS, POLICY_CONDITION_SIZE, VALUE_BRANCH_DEPTH, VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE,
+    CNN_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HIDDEN_SIZE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AzModelConfig {
     pub hidden_size: usize,
     pub cnn_channels: usize,
-    pub value_branch_size: usize,
-    pub value_branch_depth: usize,
+    pub residual_blocks: usize,
+    pub value_head_channels: usize,
     pub value_hidden_size: usize,
     pub policy_condition_size: usize,
-    pub attention_feedback: bool,
 }
 
 impl Default for AzModelConfig {
@@ -20,11 +19,10 @@ impl Default for AzModelConfig {
         Self {
             hidden_size: 256,
             cnn_channels: CNN_CHANNELS,
-            value_branch_size: VALUE_BRANCH_SIZE,
-            value_branch_depth: VALUE_BRANCH_DEPTH,
+            residual_blocks: RESIDUAL_BLOCKS,
+            value_head_channels: VALUE_HEAD_CHANNELS,
             value_hidden_size: VALUE_HIDDEN_SIZE,
             policy_condition_size: POLICY_CONDITION_SIZE,
-            attention_feedback: true,
         }
     }
 }
@@ -40,8 +38,8 @@ impl AzModelConfig {
     pub fn normalized(mut self) -> Self {
         self.hidden_size = self.hidden_size.max(1);
         self.cnn_channels = self.cnn_channels.max(1);
-        self.value_branch_size = self.value_branch_size.max(1);
-        self.value_branch_depth = self.value_branch_depth.max(1);
+        self.residual_blocks = self.residual_blocks.max(1);
+        self.value_head_channels = self.value_head_channels.max(1);
         self.value_hidden_size = self.value_hidden_size.max(1);
         self.policy_condition_size = self.policy_condition_size.max(1);
         self
@@ -56,11 +54,11 @@ impl AzModelConfig {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unsupported model config {:?}; this build currently supports hidden_size only, with cnn_channels={}, value_branch_size={}, value_branch_depth={}, value_hidden_size={}, policy_condition_size={}, attention_feedback=true",
+                "unsupported model config {:?}; this build currently supports hidden_size only, with cnn_channels={}, residual_blocks={}, value_head_channels={}, value_hidden_size={}, policy_condition_size={}",
                 config,
                 CNN_CHANNELS,
-                VALUE_BRANCH_SIZE,
-                VALUE_BRANCH_DEPTH,
+                RESIDUAL_BLOCKS,
+                VALUE_HEAD_CHANNELS,
                 VALUE_HIDDEN_SIZE,
                 POLICY_CONDITION_SIZE
             ),
