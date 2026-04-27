@@ -246,7 +246,7 @@ impl<'a> AzTree<'a> {
             num_simulations: limits.simulations,
             root_gumbels: Vec::new(),
             root_considered_visits: Vec::new(),
-            eval_scratch: AzEvalScratch::new(model.hidden_size),
+            eval_scratch: AzEvalScratch::new(model.model_config),
         }
     }
 

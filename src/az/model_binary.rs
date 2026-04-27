@@ -4,10 +4,9 @@ use std::path::Path;
 
 use super::{
     AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_MAGIC, AZ_MODEL_BINARY_VERSION, AzModel,
-    AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, CNN_CHANNELS,
-    CNN_POOLED_SIZE, DENSE_MOVE_SPACE, MOBILE_BLOCK_BIAS_SIZE, MOBILE_BLOCK_WEIGHT_SIZE,
-    POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES,
-    VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, DENSE_MOVE_SPACE,
+    POLICY_CONDITION_SIZE, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
+    mobile_block_weight_size, value_head_features,
 };
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -114,27 +113,33 @@ impl AzModel {
                 "binary input channel count does not match this build",
             ));
         }
-        let board_conv1_weights_len = CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
-        let board_conv1_bias_len = CNN_CHANNELS;
-        let board_conv2_weights_len = RESIDUAL_BLOCKS * MOBILE_BLOCK_WEIGHT_SIZE;
-        let board_conv2_bias_len = RESIDUAL_BLOCKS * MOBILE_BLOCK_BIAS_SIZE;
-        let position_embed_len = CNN_CHANNELS * BOARD_PLANES_SIZE;
-        let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
+        let channels = model_config.model_channels;
+        let blocks = model_config.model_blocks;
+        let value_channels = model_config.value_head_channels;
+        let value_hidden_size = model_config.value_hidden_size;
+        let pooled_size = cnn_pooled_size(channels);
+        let value_features = value_head_features(channels, value_channels);
+        let board_conv1_weights_len = channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
+        let board_conv1_bias_len = channels;
+        let board_conv2_weights_len = blocks * mobile_block_weight_size(channels);
+        let board_conv2_bias_len = blocks * mobile_block_bias_size(channels);
+        let position_embed_len = channels * BOARD_PLANES_SIZE;
+        let board_hidden_len = hidden_size * pooled_size;
         let board_hidden_bias_len = hidden_size;
-        let value_tail_conv_weights_len = VALUE_HEAD_CHANNELS * CNN_CHANNELS;
-        let value_tail_conv_bias_len = VALUE_HEAD_CHANNELS;
-        let vih_len = VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES;
-        let vib_len = VALUE_HIDDEN_SIZE;
-        let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
-        let vdlw_len = VALUE_LOGITS * VALUE_HEAD_FEATURES;
+        let value_tail_conv_weights_len = value_channels * channels;
+        let value_tail_conv_bias_len = value_channels;
+        let vih_len = value_hidden_size * value_features;
+        let vib_len = value_hidden_size;
+        let vlw_len = VALUE_LOGITS * value_hidden_size;
+        let vdlw_len = VALUE_LOGITS * value_features;
         let vlb_len = VALUE_LOGITS;
-        let pfw_len = CNN_CHANNELS;
+        let pfw_len = channels;
         let pfbias_len = 1;
-        let ptw_len = CNN_CHANNELS;
+        let ptw_len = channels;
         let ptbias_len = 1;
         let pmb_len = DENSE_MOVE_SPACE;
         let pfh_len = POLICY_CONDITION_SIZE * hidden_size;
-        let pfc_len = POLICY_CONDITION_SIZE * CNN_POOLED_SIZE;
+        let pfc_len = POLICY_CONDITION_SIZE * pooled_size;
         let pfb_len = POLICY_CONDITION_SIZE;
         let float_count = board_conv1_weights_len
             + board_conv1_bias_len

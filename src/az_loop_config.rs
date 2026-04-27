@@ -347,13 +347,11 @@ impl AzLoopFileConfig {
 #   These fields define the model created when model_path is missing. The model
 #   file also stores them, and az-loop refuses to continue if the config and
 #   model file disagree.
-#   This build supports changing hidden_size now. Other shape fields are written
-#   here so experiments are explicit, but unsupported values fail fast until the
-#   CPU/GPU forward paths are generalized for that shape.
-#   Current v32 shape: canonical board planes=126, model_channels=32, model_blocks=3,
-#   value_head_channels=8, value_hidden=256, policy_condition_size=32.
+#   Current model: configurable Tiny Mobile-CNN over canonical board history planes.
 #   model_channels is the hidden width of each board square embedding.
 #   model_blocks are residual depthwise-3x3 + pointwise-1x1 mobile blocks.
+#   value_head_channels/value_hidden_size control the value head capacity.
+#   policy_condition_size stays fixed at 32 because the move-geometry feature table is 32-D.
 #   Historical sparse/NNUE inputs and value shortcuts are gone.
 
 model_path = "{model_path}"

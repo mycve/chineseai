@@ -47,20 +47,14 @@ impl AzModelConfig {
 
     pub fn validate_supported(&self) -> io::Result<()> {
         let config = self.normalized();
-        let expected = Self::with_hidden_size(config.hidden_size);
-        if config == expected {
+        if config.policy_condition_size == POLICY_CONDITION_SIZE {
             return Ok(());
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unsupported model config {:?}; this build currently supports hidden_size only, with model_channels={}, model_blocks={}, value_head_channels={}, value_hidden_size={}, policy_condition_size={}",
-                config,
-                CNN_CHANNELS,
-                RESIDUAL_BLOCKS,
-                VALUE_HEAD_CHANNELS,
-                VALUE_HIDDEN_SIZE,
-                POLICY_CONDITION_SIZE
+                "unsupported policy_condition_size {}; this build uses the fixed {}-dim move-geometry feature table",
+                config.policy_condition_size, POLICY_CONDITION_SIZE
             ),
         ))
     }

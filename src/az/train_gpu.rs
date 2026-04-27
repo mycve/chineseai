@@ -5,11 +5,10 @@ use std::{process::Command, thread};
 
 use super::{
     AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
-    CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, MOBILE_BLOCK_BIAS_SIZE,
-    MOBILE_BLOCK_WEIGHT_SIZE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
-    VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES, VALUE_HEAD_LEAK, VALUE_HEAD_MAP_SIZE,
-    VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS, policy_move_features,
-    policy_move_from_select, policy_move_to_select,
+    CNN_KERNEL_AREA, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE,
+    VALUE_HEAD_LEAK, VALUE_LOGIT_SCALE, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
+    mobile_block_weight_size, policy_move_features, policy_move_from_select, policy_move_to_select,
+    value_head_features, value_head_map_size,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -33,6 +32,7 @@ pub(super) struct GpuTrainer {
 #[derive(Debug)]
 struct GpuReplica {
     device: Device,
+    model_config: super::AzModelConfig,
     vars: GpuVars,
 }
 
@@ -395,7 +395,11 @@ impl GpuReplica {
     fn new(model: &AzModel, device_index: usize) -> CandleResult<Self> {
         let device = Device::new_cuda(device_index)?;
         let vars = GpuVars::from_model(model, &device)?;
-        Ok(Self { device, vars })
+        Ok(Self {
+            device,
+            model_config: model.model_config,
+            vars,
+        })
     }
 
     fn compute_batch_grads(
@@ -468,49 +472,40 @@ impl GpuReplica {
 
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
+        let channels = self.model_config.model_channels;
+        let blocks = self.model_config.model_blocks;
+        let value_channels = self.model_config.value_head_channels;
+        let value_map_size = value_head_map_size(value_channels);
         let mut features = batch
             .board_onehot
             .conv2d(&self.vars.board_conv1_weights, 1, 1, 1, 1)?
-            .broadcast_add(
-                &self
-                    .vars
-                    .board_conv1_bias
-                    .reshape((1, CNN_CHANNELS, 1, 1))?,
-            )?
+            .broadcast_add(&self.vars.board_conv1_bias.reshape((1, channels, 1, 1))?)?
             .relu()?;
         features = features
             .broadcast_add(&self.vars.position_embed.reshape((
                 1,
-                CNN_CHANNELS,
+                channels,
                 BOARD_RANKS,
                 BOARD_FILES,
             ))?)?
             .relu()?;
-        for block in 0..RESIDUAL_BLOCKS {
+        for block in 0..blocks {
             let hidden = features
-                .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, CNN_CHANNELS)?
-                .broadcast_add(&self.vars.residual_dw_biases[block].reshape((
-                    1,
-                    CNN_CHANNELS,
-                    1,
-                    1,
-                ))?)?
+                .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, channels)?
+                .broadcast_add(&self.vars.residual_dw_biases[block].reshape((1, channels, 1, 1))?)?
                 .relu()?;
             let delta = hidden
                 .conv2d(&self.vars.residual_pw_weights[block], 0, 1, 1, 1)?
-                .broadcast_add(&self.vars.residual_pw_biases[block].reshape((
-                    1,
-                    CNN_CHANNELS,
-                    1,
-                    1,
-                ))?)?;
+                .broadcast_add(
+                    &self.vars.residual_pw_biases[block].reshape((1, channels, 1, 1))?,
+                )?;
             features = (features + delta)?.relu()?;
         }
 
-        let feature_flat = features.reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?;
+        let feature_flat = features.reshape((bsz, channels, BOARD_PLANES_SIZE))?;
         let avg_pool = feature_flat.mean(2)?;
         let max_pool = feature_flat.max(2)?;
-        let feature_grid = features.reshape((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
+        let feature_grid = features.reshape((bsz, channels, BOARD_RANKS, BOARD_FILES))?;
         let row_line_pool = (feature_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
         let col_line_pool = (feature_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
         let cnn_global = Tensor::cat(&[avg_pool, max_pool, row_line_pool, col_line_pool], 1)?;
@@ -522,13 +517,13 @@ impl GpuReplica {
 
         let value_tail = features
             .conv2d(&self.vars.value_tail_conv_weights, 0, 1, 1, 1)?
-            .broadcast_add(&self.vars.value_tail_conv_bias.reshape((
-                1,
-                VALUE_HEAD_CHANNELS,
-                1,
-                1,
-            ))?)?;
-        let value_flat = value_tail.reshape((bsz, VALUE_HEAD_CHANNELS, BOARD_PLANES_SIZE))?;
+            .broadcast_add(
+                &self
+                    .vars
+                    .value_tail_conv_bias
+                    .reshape((1, value_channels, 1, 1))?,
+            )?;
+        let value_flat = value_tail.reshape((bsz, value_channels, BOARD_PLANES_SIZE))?;
         let attn_logits = value_flat.narrow(1, 0, 1)?.squeeze(1)?;
         let attn_weights = softmax(&attn_logits, 1)?;
         let attn_pooled = value_flat
@@ -545,7 +540,7 @@ impl GpuReplica {
                 mean_pooled,
                 max_pooled,
                 std_pooled,
-                value_flat.reshape((bsz, VALUE_HEAD_MAP_SIZE))?,
+                value_flat.reshape((bsz, value_map_size))?,
                 cnn_global.clone(),
             ],
             1,
@@ -671,95 +666,103 @@ impl BatchTensors {
 impl GpuVars {
     fn from_model(model: &AzModel, device: &Device) -> CandleResult<Self> {
         let hidden = model.hidden_size;
-        let mut residual_dw_weights = Vec::with_capacity(RESIDUAL_BLOCKS);
-        let mut residual_dw_biases = Vec::with_capacity(RESIDUAL_BLOCKS);
-        let mut residual_pw_weights = Vec::with_capacity(RESIDUAL_BLOCKS);
-        let mut residual_pw_biases = Vec::with_capacity(RESIDUAL_BLOCKS);
-        let dw_len = CNN_CHANNELS * CNN_KERNEL_AREA;
-        let pw_len = CNN_CHANNELS * CNN_CHANNELS;
-        for block in 0..RESIDUAL_BLOCKS {
-            let weight_offset = block * MOBILE_BLOCK_WEIGHT_SIZE;
-            let bias_offset = block * MOBILE_BLOCK_BIAS_SIZE;
+        let config = model.model_config.normalized();
+        let channels = config.model_channels;
+        let blocks = config.model_blocks;
+        let value_channels = config.value_head_channels;
+        let value_hidden_size = config.value_hidden_size;
+        let pooled_size = cnn_pooled_size(channels);
+        let value_features = value_head_features(channels, value_channels);
+        let mobile_weight_size = mobile_block_weight_size(channels);
+        let mobile_bias_size = mobile_block_bias_size(channels);
+        let mut residual_dw_weights = Vec::with_capacity(blocks);
+        let mut residual_dw_biases = Vec::with_capacity(blocks);
+        let mut residual_pw_weights = Vec::with_capacity(blocks);
+        let mut residual_pw_biases = Vec::with_capacity(blocks);
+        let dw_len = channels * CNN_KERNEL_AREA;
+        let pw_len = channels * channels;
+        for block in 0..blocks {
+            let weight_offset = block * mobile_weight_size;
+            let bias_offset = block * mobile_bias_size;
             residual_dw_weights.push(var_from_slice(
                 &model.board_conv2_weights[weight_offset..weight_offset + dw_len],
-                (CNN_CHANNELS, 1, 3, 3),
+                (channels, 1, 3, 3),
                 device,
             )?);
             residual_dw_biases.push(var_from_slice(
-                &model.board_conv2_bias[bias_offset..bias_offset + CNN_CHANNELS],
-                CNN_CHANNELS,
+                &model.board_conv2_bias[bias_offset..bias_offset + channels],
+                channels,
                 device,
             )?);
             residual_pw_weights.push(var_from_slice(
                 &model.board_conv2_weights[weight_offset + dw_len..weight_offset + dw_len + pw_len],
-                (CNN_CHANNELS, CNN_CHANNELS, 1, 1),
+                (channels, channels, 1, 1),
                 device,
             )?);
             residual_pw_biases.push(var_from_slice(
-                &model.board_conv2_bias
-                    [bias_offset + CNN_CHANNELS..bias_offset + MOBILE_BLOCK_BIAS_SIZE],
-                CNN_CHANNELS,
+                &model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
+                channels,
                 device,
             )?);
         }
         Ok(Self {
             board_conv1_weights: var_from_slice(
                 &model.board_conv1_weights,
-                (CNN_CHANNELS, BOARD_CHANNELS, 3, 3),
+                (channels, BOARD_CHANNELS, 3, 3),
                 device,
             )?,
-            board_conv1_bias: var_from_slice(&model.board_conv1_bias, CNN_CHANNELS, device)?,
+            board_conv1_bias: var_from_slice(&model.board_conv1_bias, channels, device)?,
             residual_dw_weights,
             residual_dw_biases,
             residual_pw_weights,
             residual_pw_biases,
             position_embed: var_from_slice(
                 &model.position_embed,
-                (CNN_CHANNELS, BOARD_RANKS, BOARD_FILES),
+                (channels, BOARD_RANKS, BOARD_FILES),
                 device,
             )?,
-            board_hidden: var_from_slice(&model.board_hidden, (hidden, CNN_POOLED_SIZE), device)?,
+            board_hidden: var_from_slice(&model.board_hidden, (hidden, pooled_size), device)?,
             board_hidden_bias: var_from_slice(&model.board_hidden_bias, hidden, device)?,
             value_tail_conv_weights: var_from_slice(
                 &model.value_tail_conv_weights,
-                (VALUE_HEAD_CHANNELS, CNN_CHANNELS, 1, 1),
+                (value_channels, channels, 1, 1),
                 device,
             )?,
             value_tail_conv_bias: var_from_slice(
                 &model.value_tail_conv_bias,
-                VALUE_HEAD_CHANNELS,
+                value_channels,
                 device,
             )?,
             value_intermediate_hidden: var_from_slice(
                 &model.value_intermediate_hidden,
-                (VALUE_HIDDEN_SIZE, VALUE_HEAD_FEATURES),
+                (value_hidden_size, value_features),
                 device,
             )?,
             value_intermediate_bias: var_from_slice(
                 &model.value_intermediate_bias,
-                VALUE_HIDDEN_SIZE,
+                value_hidden_size,
                 device,
             )?,
             value_logits_weights: var_from_slice(
                 &model.value_logits_weights,
-                (VALUE_LOGITS, VALUE_HIDDEN_SIZE),
+                (VALUE_LOGITS, value_hidden_size),
                 device,
             )?,
             value_direct_logits_weights: var_from_slice(
                 &model.value_direct_logits_weights,
-                (VALUE_LOGITS, VALUE_HEAD_FEATURES),
+                (VALUE_LOGITS, value_features),
                 device,
             )?,
             value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
             policy_from_weights: var_from_slice(
                 &model.policy_from_weights,
-                (1, CNN_CHANNELS, 1, 1),
+                (1, channels, 1, 1),
                 device,
             )?,
             policy_from_bias: var_from_slice(&model.policy_from_bias, 1, device)?,
             policy_to_weights: var_from_slice(
                 &model.policy_to_weights,
-                (1, CNN_CHANNELS, 1, 1),
+                (1, channels, 1, 1),
                 device,
             )?,
             policy_to_bias: var_from_slice(&model.policy_to_bias, 1, device)?,
@@ -771,7 +774,7 @@ impl GpuVars {
             )?,
             policy_feature_cnn: var_from_slice(
                 &model.policy_feature_cnn,
-                (POLICY_CONDITION_SIZE, CNN_POOLED_SIZE),
+                (POLICY_CONDITION_SIZE, pooled_size),
                 device,
             )?,
             policy_feature_bias: var_from_slice(
@@ -827,20 +830,25 @@ impl GpuVars {
     }
 
     fn copy_to_model(&self, model: &mut AzModel) -> CandleResult<()> {
+        let config = model.model_config.normalized();
+        let channels = config.model_channels;
+        let blocks = config.model_blocks;
+        let mobile_weight_size = mobile_block_weight_size(channels);
+        let mobile_bias_size = mobile_block_bias_size(channels);
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
-        let dw_len = CNN_CHANNELS * CNN_KERNEL_AREA;
-        let pw_len = CNN_CHANNELS * CNN_CHANNELS;
-        for block in 0..RESIDUAL_BLOCKS {
-            let weight_offset = block * MOBILE_BLOCK_WEIGHT_SIZE;
-            let bias_offset = block * MOBILE_BLOCK_BIAS_SIZE;
+        let dw_len = channels * CNN_KERNEL_AREA;
+        let pw_len = channels * channels;
+        for block in 0..blocks {
+            let weight_offset = block * mobile_weight_size;
+            let bias_offset = block * mobile_bias_size;
             copy_var(
                 &self.residual_dw_weights[block],
                 &mut model.board_conv2_weights[weight_offset..weight_offset + dw_len],
             )?;
             copy_var(
                 &self.residual_dw_biases[block],
-                &mut model.board_conv2_bias[bias_offset..bias_offset + CNN_CHANNELS],
+                &mut model.board_conv2_bias[bias_offset..bias_offset + channels],
             )?;
             copy_var(
                 &self.residual_pw_weights[block],
@@ -849,8 +857,7 @@ impl GpuVars {
             )?;
             copy_var(
                 &self.residual_pw_biases[block],
-                &mut model.board_conv2_bias
-                    [bias_offset + CNN_CHANNELS..bias_offset + MOBILE_BLOCK_BIAS_SIZE],
+                &mut model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
             )?;
         }
         copy_var(&self.position_embed, &mut model.position_embed)?;

@@ -24,12 +24,12 @@ pub use mctx::AzGumbelConfig;
 use model::{
     AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_VERSION, AzEvalScratch, BOARD_CHANNELS,
     BOARD_HISTORY_FRAMES, BOARD_HISTORY_SIZE, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE,
-    CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOL_BLOCKS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE,
-    MOBILE_BLOCK_BIAS_SIZE, MOBILE_BLOCK_WEIGHT_SIZE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE,
-    RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES, VALUE_HEAD_LEAK,
-    VALUE_HEAD_MAP_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS, VALUE_SCALE_CP,
-    dense_move_index, extract_board_planes, policy_move_features, policy_move_from_select,
-    policy_move_to_select,
+    CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOL_BLOCKS, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
+    POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_LEAK,
+    VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS, VALUE_SCALE_CP, cnn_pooled_size,
+    dense_move_index, extract_board_planes, mobile_block_bias_size, mobile_block_weight_size,
+    policy_move_features, policy_move_from_select, policy_move_to_select, value_head_features,
+    value_head_map_size,
 };
 pub use model::{AZ_MODEL_BINARY_MAGIC, AzModel, SplitMix64};
 #[cfg(test)]
@@ -415,6 +415,32 @@ mod tests {
         assert_eq!(model.hidden_size, loaded.hidden_size);
         assert_eq!(model.board_hidden, loaded.board_hidden);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
+    }
+
+    #[test]
+    fn az_model_binary_roundtrip_matches_non_default_shape() {
+        let config = AzModelConfig {
+            hidden_size: 64,
+            model_channels: 16,
+            model_blocks: 2,
+            value_head_channels: 4,
+            value_hidden_size: 96,
+            policy_condition_size: POLICY_CONDITION_SIZE,
+        };
+        let model = AzModel::random_with_config(config, 43);
+        let path = std::env::temp_dir().join("chineseai_test_az_model_roundtrip_dynamic.azm");
+        let _ = fs::remove_file(&path);
+        model.save(&path).unwrap();
+        let loaded = AzModel::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(model.model_config, loaded.model_config);
+        assert_eq!(model.board_conv1_weights, loaded.board_conv1_weights);
+        assert_eq!(model.board_conv2_weights, loaded.board_conv2_weights);
+        assert_eq!(
+            model.value_intermediate_hidden,
+            loaded.value_intermediate_hidden
+        );
+        assert_eq!(model.policy_feature_cnn, loaded.policy_feature_cnn);
     }
 
     #[test]

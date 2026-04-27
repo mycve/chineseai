@@ -11,7 +11,7 @@ use super::model_ops::{
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 5;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 6;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -28,18 +28,31 @@ pub(super) const RESIDUAL_BLOCKS: usize = 3;
 pub(super) const VALUE_HEAD_CHANNELS: usize = 8;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
-pub(super) const MOBILE_BLOCK_WEIGHT_SIZE: usize =
-    CNN_CHANNELS * CNN_KERNEL_AREA + CNN_CHANNELS * CNN_CHANNELS;
-pub(super) const MOBILE_BLOCK_BIAS_SIZE: usize = CNN_CHANNELS * 2;
 pub(super) const CNN_POOL_BLOCKS: usize = 4;
-pub(super) const CNN_POOLED_SIZE: usize = CNN_CHANNELS * CNN_POOL_BLOCKS;
-pub(super) const VALUE_HEAD_MAP_SIZE: usize = VALUE_HEAD_CHANNELS * BOARD_PLANES_SIZE;
-pub(super) const VALUE_HEAD_FEATURES: usize =
-    VALUE_HEAD_MAP_SIZE + VALUE_HEAD_CHANNELS * 4 + CNN_POOLED_SIZE;
 pub(super) const VALUE_HEAD_LEAK: f32 = 0.05;
 pub(super) const VALUE_LOGIT_SCALE: f32 = 0.25;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const VALUE_SCALE_CP: f32 = 1000.0;
+
+pub(super) fn cnn_pooled_size(channels: usize) -> usize {
+    channels * CNN_POOL_BLOCKS
+}
+
+pub(super) fn mobile_block_weight_size(channels: usize) -> usize {
+    channels * CNN_KERNEL_AREA + channels * channels
+}
+
+pub(super) fn mobile_block_bias_size(channels: usize) -> usize {
+    channels * 2
+}
+
+pub(super) fn value_head_map_size(value_channels: usize) -> usize {
+    value_channels * BOARD_PLANES_SIZE
+}
+
+pub(super) fn value_head_features(channels: usize, value_channels: usize) -> usize {
+    value_head_map_size(value_channels) + value_channels * 4 + cnn_pooled_size(channels)
+}
 
 pub(super) struct AzEvalScratch {
     pub(super) hidden: Vec<f32>,
@@ -58,17 +71,23 @@ pub(super) struct AzEvalScratch {
 }
 
 impl AzEvalScratch {
-    pub(super) fn new(hidden_size: usize) -> Self {
+    pub(super) fn new(config: AzModelConfig) -> Self {
+        let config = config.normalized();
+        let channels = config.model_channels;
+        let value_channels = config.value_head_channels;
+        let pooled_size = cnn_pooled_size(channels);
+        let value_map_size = value_head_map_size(value_channels);
+        let value_features = value_head_features(channels, value_channels);
         Self {
-            hidden: vec![0.0; hidden_size],
+            hidden: vec![0.0; config.hidden_size],
             board: vec![0; BOARD_HISTORY_SIZE],
-            conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
-            conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
-            conv_residual: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
-            cnn_global: vec![0.0; CNN_POOLED_SIZE],
-            value_tail: vec![0.0; VALUE_HEAD_MAP_SIZE],
-            value_pool: vec![0.0; VALUE_HEAD_FEATURES],
-            value_hidden: vec![0.0; VALUE_HIDDEN_SIZE],
+            conv1: vec![0.0; channels * BOARD_PLANES_SIZE],
+            conv2: vec![0.0; channels * BOARD_PLANES_SIZE],
+            conv_residual: vec![0.0; channels * BOARD_PLANES_SIZE],
+            cnn_global: vec![0.0; pooled_size],
+            value_tail: vec![0.0; value_map_size],
+            value_pool: vec![0.0; value_features],
+            value_hidden: vec![0.0; config.value_hidden_size],
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
             logits: Vec::with_capacity(192),
@@ -167,59 +186,67 @@ impl AzModel {
             .validate_supported()
             .expect("unsupported model config");
         let hidden_size = config.hidden_size;
+        let channels = config.model_channels;
+        let blocks = config.model_blocks;
+        let value_channels = config.value_head_channels;
+        let value_hidden_size = config.value_hidden_size;
+        let pooled_size = cnn_pooled_size(channels);
+        let mobile_weight_size = mobile_block_weight_size(channels);
+        let mobile_bias_size = mobile_block_bias_size(channels);
+        let value_features = value_head_features(channels, value_channels);
         let mut rng = SplitMix64::new(seed);
-        let board_conv1_weights: Vec<f32> = (0..CNN_CHANNELS
+        let board_conv1_weights: Vec<f32> = (0..channels
             * BOARD_CHANNELS
             * BOARD_INPUT_KERNEL_AREA)
             .map(|_| rng.weight((2.0 / (BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA) as f32).sqrt()))
             .collect();
-        let board_conv1_bias = vec![0.0; CNN_CHANNELS];
-        let board_conv2_weights: Vec<f32> = (0..RESIDUAL_BLOCKS * MOBILE_BLOCK_WEIGHT_SIZE)
+        let board_conv1_bias = vec![0.0; channels];
+        let board_conv2_weights: Vec<f32> = (0..blocks * mobile_weight_size)
             .map(|index| {
-                let block_offset = index % MOBILE_BLOCK_WEIGHT_SIZE;
-                let scale = if block_offset < CNN_CHANNELS * CNN_KERNEL_AREA {
+                let block_offset = index % mobile_weight_size;
+                let scale = if block_offset < channels * CNN_KERNEL_AREA {
                     (2.0 / CNN_KERNEL_AREA as f32).sqrt()
                 } else {
-                    (2.0 / CNN_CHANNELS as f32).sqrt()
+                    (2.0 / channels as f32).sqrt()
                 };
                 rng.weight(scale)
             })
             .collect();
-        let board_conv2_bias = vec![0.0; RESIDUAL_BLOCKS * MOBILE_BLOCK_BIAS_SIZE];
-        let position_embed = (0..CNN_CHANNELS * BOARD_PLANES_SIZE)
+        let board_conv2_bias = vec![0.0; blocks * mobile_bias_size];
+        let position_embed = (0..channels * BOARD_PLANES_SIZE)
             .map(|_| rng.weight(0.02))
             .collect();
-        let board_hidden: Vec<f32> = (0..hidden_size * CNN_POOLED_SIZE)
-            .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
+        let board_hidden: Vec<f32> = (0..hidden_size * pooled_size)
+            .map(|_| rng.weight((2.0 / pooled_size as f32).sqrt()))
             .collect();
         let board_hidden_bias = vec![0.0; hidden_size];
-        let value_tail_conv_weights: Vec<f32> = (0..VALUE_HEAD_CHANNELS * CNN_CHANNELS)
-            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt()))
+        let value_tail_conv_weights: Vec<f32> = (0..value_channels * channels)
+            .map(|_| rng.weight((2.0 / channels as f32).sqrt()))
             .collect();
-        let value_tail_conv_bias = vec![0.0; VALUE_HEAD_CHANNELS];
-        let value_intermediate_hidden = (0..VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES)
-            .map(|_| rng.weight((2.0 / VALUE_HEAD_FEATURES as f32).sqrt()))
+        let value_tail_conv_bias = vec![0.0; value_channels];
+        let value_intermediate_hidden = (0..value_hidden_size * value_features)
+            .map(|_| rng.weight((2.0 / value_features as f32).sqrt()))
             .collect();
-        let value_intermediate_bias = vec![0.0; VALUE_HIDDEN_SIZE];
-        let value_logits_weights = (0..VALUE_LOGITS * VALUE_HIDDEN_SIZE)
-            .map(|_| rng.weight((2.0 / VALUE_HIDDEN_SIZE as f32).sqrt()))
+        let value_intermediate_bias = vec![0.0; value_hidden_size];
+        let value_logits_weights = (0..VALUE_LOGITS * value_hidden_size)
+            .map(|_| rng.weight((2.0 / value_hidden_size as f32).sqrt()))
             .collect();
-        let value_direct_logits_weights = vec![0.0; VALUE_LOGITS * VALUE_HEAD_FEATURES];
+        let value_direct_logits_weights = vec![0.0; VALUE_LOGITS * value_features];
         let value_logits_bias = vec![0.0; VALUE_LOGITS];
-        let policy_from_weights = (0..CNN_CHANNELS)
-            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt() * 0.25))
+        let policy_from_weights = (0..channels)
+            .map(|_| rng.weight((2.0 / channels as f32).sqrt() * 0.25))
             .collect();
         let policy_from_bias = vec![0.0; 1];
-        let policy_to_weights = (0..CNN_CHANNELS)
-            .map(|_| rng.weight((2.0 / CNN_CHANNELS as f32).sqrt() * 0.25))
+        let policy_to_weights = (0..channels)
+            .map(|_| rng.weight((2.0 / channels as f32).sqrt() * 0.25))
             .collect();
         let policy_to_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
-        let policy_feature_cnn = (0..POLICY_CONDITION_SIZE * CNN_POOLED_SIZE)
-            .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt() * 0.5))
+        let policy_feature_cnn = (0..POLICY_CONDITION_SIZE * pooled_size)
+            .map(|_| rng.weight((2.0 / pooled_size as f32).sqrt() * 0.5))
             .collect();
         let policy_feature_bias = vec![0.0; POLICY_CONDITION_SIZE];
         Self {
@@ -303,13 +330,18 @@ impl AzModel {
         delta: &mut Vec<f32>,
         cnn_global: &mut Vec<f32>,
     ) {
-        features.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        tmp.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        delta.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
-        cnn_global.resize(CNN_POOLED_SIZE, 0.0);
+        let channels = self.model_config.model_channels;
+        let blocks = self.model_config.model_blocks;
+        let pooled_size = cnn_pooled_size(channels);
+        let mobile_weight_size = mobile_block_weight_size(channels);
+        let mobile_bias_size = mobile_block_bias_size(channels);
+        features.resize(channels * BOARD_PLANES_SIZE, 0.0);
+        tmp.resize(channels * BOARD_PLANES_SIZE, 0.0);
+        delta.resize(channels * BOARD_PLANES_SIZE, 0.0);
+        cnn_global.resize(pooled_size, 0.0);
         conv_relu_board_layer_sparse_3x3(
             board,
-            CNN_CHANNELS,
+            channels,
             &self.board_conv1_weights,
             &self.board_conv1_bias,
             features,
@@ -317,26 +349,27 @@ impl AzModel {
         for (feature, pos) in features.iter_mut().zip(&self.position_embed) {
             *feature = (*feature + pos).max(0.0);
         }
-        for block in 0..RESIDUAL_BLOCKS {
-            let weight_start = block * MOBILE_BLOCK_WEIGHT_SIZE;
-            let bias_start = block * MOBILE_BLOCK_BIAS_SIZE;
+        for block in 0..blocks {
+            let weight_start = block * mobile_weight_size;
+            let bias_start = block * mobile_bias_size;
             residual_mobile_block_generic(
                 features,
                 tmp,
                 delta,
-                CNN_CHANNELS,
-                &self.board_conv2_weights[weight_start..weight_start + MOBILE_BLOCK_WEIGHT_SIZE],
-                &self.board_conv2_bias[bias_start..bias_start + MOBILE_BLOCK_BIAS_SIZE],
+                channels,
+                &self.board_conv2_weights[weight_start..weight_start + mobile_weight_size],
+                &self.board_conv2_bias[bias_start..bias_start + mobile_bias_size],
             );
         }
-        pool_cnn_features(features, CNN_CHANNELS, cnn_global);
+        pool_cnn_features(features, channels, cnn_global);
     }
 
     fn board_hidden_into(&self, cnn_global: &[f32], hidden: &mut Vec<f32>) {
+        let pooled_size = cnn_pooled_size(self.model_config.model_channels);
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.board_hidden_bias);
         for (out, hidden_value) in hidden.iter_mut().enumerate().take(self.hidden_size) {
-            let row = &self.board_hidden[out * CNN_POOLED_SIZE..(out + 1) * CNN_POOLED_SIZE];
+            let row = &self.board_hidden[out * pooled_size..(out + 1) * pooled_size];
             for (cnn_value, weight) in cnn_global.iter().zip(row) {
                 *hidden_value += cnn_value * weight;
             }
@@ -352,21 +385,25 @@ impl AzModel {
         pooled: &mut Vec<f32>,
         hidden: &mut Vec<f32>,
     ) {
-        value_tail.resize(VALUE_HEAD_MAP_SIZE, 0.0);
+        let channels = self.model_config.model_channels;
+        let value_channels = self.model_config.value_head_channels;
+        let value_hidden_size = self.model_config.value_hidden_size;
+        let value_map_size = value_head_map_size(value_channels);
+        let value_features = value_head_features(channels, value_channels);
+        value_tail.resize(value_map_size, 0.0);
         conv1x1_linear_layer_dense_generic(
             features,
-            CNN_CHANNELS,
-            VALUE_HEAD_CHANNELS,
+            channels,
+            value_channels,
             &self.value_tail_conv_weights,
             &self.value_tail_conv_bias,
             value_tail,
         );
-        value_pool_features(value_tail, cnn_global, pooled);
-        hidden.resize(VALUE_HIDDEN_SIZE, 0.0);
+        value_pool_features(value_tail, cnn_global, value_channels, channels, pooled);
+        hidden.resize(value_hidden_size, 0.0);
         hidden.copy_from_slice(&self.value_intermediate_bias);
-        for (j, value) in hidden.iter_mut().enumerate().take(VALUE_HIDDEN_SIZE) {
-            let row = &self.value_intermediate_hidden
-                [j * VALUE_HEAD_FEATURES..(j + 1) * VALUE_HEAD_FEATURES];
+        for (j, value) in hidden.iter_mut().enumerate().take(value_hidden_size) {
+            let row = &self.value_intermediate_hidden[j * value_features..(j + 1) * value_features];
             for (feature, weight) in pooled.iter().zip(row) {
                 *value += feature * weight;
             }
@@ -380,14 +417,19 @@ impl AzModel {
         scratch
             .value_logits
             .copy_from_slice(&self.value_logits_bias);
+        let value_hidden_size = self.model_config.value_hidden_size;
+        let value_features = value_head_features(
+            self.model_config.model_channels,
+            self.model_config.value_head_channels,
+        );
         for out in 0..VALUE_LOGITS {
             let row =
-                &self.value_logits_weights[out * VALUE_HIDDEN_SIZE..(out + 1) * VALUE_HIDDEN_SIZE];
+                &self.value_logits_weights[out * value_hidden_size..(out + 1) * value_hidden_size];
             for (hidden, weight) in scratch.value_hidden.iter().zip(row) {
                 scratch.value_logits[out] += hidden * weight;
             }
-            let direct_row = &self.value_direct_logits_weights
-                [out * VALUE_HEAD_FEATURES..(out + 1) * VALUE_HEAD_FEATURES];
+            let direct_row =
+                &self.value_direct_logits_weights[out * value_features..(out + 1) * value_features];
             for (feature, weight) in scratch.value_pool.iter().zip(direct_row) {
                 scratch.value_logits[out] += feature * weight;
             }
@@ -396,40 +438,49 @@ impl AzModel {
     }
 
     fn policy_condition_into(&self, hidden: &[f32], cnn_global: &[f32], out: &mut Vec<f32>) {
+        let pooled_size = cnn_pooled_size(self.model_config.model_channels);
         out.resize(POLICY_CONDITION_SIZE, 0.0);
         out.copy_from_slice(&self.policy_feature_bias);
         for (feature, value) in out.iter_mut().enumerate().take(POLICY_CONDITION_SIZE) {
             let hidden_row = &self.policy_feature_hidden
                 [feature * self.hidden_size..(feature + 1) * self.hidden_size];
             *value += dot_product(hidden, hidden_row);
-            let cnn_row = &self.policy_feature_cnn
-                [feature * CNN_POOLED_SIZE..(feature + 1) * CNN_POOLED_SIZE];
+            let cnn_row =
+                &self.policy_feature_cnn[feature * pooled_size..(feature + 1) * pooled_size];
             *value += dot_product(cnn_global, cnn_row);
         }
     }
 
     pub(super) fn validate(&self) -> io::Result<()> {
-        if self.board_conv1_weights.len() != CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
-            || self.board_conv1_bias.len() != CNN_CHANNELS
-            || self.board_conv2_weights.len() != RESIDUAL_BLOCKS * MOBILE_BLOCK_WEIGHT_SIZE
-            || self.board_conv2_bias.len() != RESIDUAL_BLOCKS * MOBILE_BLOCK_BIAS_SIZE
-            || self.position_embed.len() != CNN_CHANNELS * BOARD_PLANES_SIZE
-            || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
+        let config = self.model_config.normalized();
+        let channels = config.model_channels;
+        let blocks = config.model_blocks;
+        let value_channels = config.value_head_channels;
+        let value_hidden_size = config.value_hidden_size;
+        let pooled_size = cnn_pooled_size(channels);
+        let value_features = value_head_features(channels, value_channels);
+        if self.hidden_size != config.hidden_size
+            || self.board_conv1_weights.len() != channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
+            || self.board_conv1_bias.len() != channels
+            || self.board_conv2_weights.len() != blocks * mobile_block_weight_size(channels)
+            || self.board_conv2_bias.len() != blocks * mobile_block_bias_size(channels)
+            || self.position_embed.len() != channels * BOARD_PLANES_SIZE
+            || self.board_hidden.len() != self.hidden_size * pooled_size
             || self.board_hidden_bias.len() != self.hidden_size
-            || self.value_tail_conv_weights.len() != VALUE_HEAD_CHANNELS * CNN_CHANNELS
-            || self.value_tail_conv_bias.len() != VALUE_HEAD_CHANNELS
-            || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * VALUE_HEAD_FEATURES
-            || self.value_intermediate_bias.len() != VALUE_HIDDEN_SIZE
-            || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
-            || self.value_direct_logits_weights.len() != VALUE_LOGITS * VALUE_HEAD_FEATURES
+            || self.value_tail_conv_weights.len() != value_channels * channels
+            || self.value_tail_conv_bias.len() != value_channels
+            || self.value_intermediate_hidden.len() != value_hidden_size * value_features
+            || self.value_intermediate_bias.len() != value_hidden_size
+            || self.value_logits_weights.len() != VALUE_LOGITS * value_hidden_size
+            || self.value_direct_logits_weights.len() != VALUE_LOGITS * value_features
             || self.value_logits_bias.len() != VALUE_LOGITS
-            || self.policy_from_weights.len() != CNN_CHANNELS
+            || self.policy_from_weights.len() != channels
             || self.policy_from_bias.len() != 1
-            || self.policy_to_weights.len() != CNN_CHANNELS
+            || self.policy_to_weights.len() != channels
             || self.policy_to_bias.len() != 1
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
             || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * self.hidden_size
-            || self.policy_feature_cnn.len() != POLICY_CONDITION_SIZE * CNN_POOLED_SIZE
+            || self.policy_feature_cnn.len() != POLICY_CONDITION_SIZE * pooled_size
             || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
         {
             return Err(io::Error::new(
@@ -473,7 +524,7 @@ impl AzModel {
 
     fn policy_square_score(&self, features: &[f32], sq: usize, weights: &[f32], bias: f32) -> f32 {
         let mut value = bias;
-        for channel in 0..CNN_CHANNELS {
+        for channel in 0..self.model_config.model_channels {
             value += features[channel * BOARD_PLANES_SIZE + sq] * weights[channel];
         }
         value
@@ -541,10 +592,18 @@ pub(super) fn canonical_piece_plane(side: Color, piece_color: Color, kind: Piece
     absolute_piece_plane(canonical_color, kind)
 }
 
-fn value_pool_features(value_tail: &[f32], cnn_global: &[f32], pooled: &mut Vec<f32>) {
-    debug_assert_eq!(value_tail.len(), VALUE_HEAD_MAP_SIZE);
-    debug_assert_eq!(cnn_global.len(), CNN_POOLED_SIZE);
-    pooled.resize(VALUE_HEAD_FEATURES, 0.0);
+fn value_pool_features(
+    value_tail: &[f32],
+    cnn_global: &[f32],
+    value_channels: usize,
+    channels: usize,
+    pooled: &mut Vec<f32>,
+) {
+    let value_map_size = value_head_map_size(value_channels);
+    let value_features = value_head_features(channels, value_channels);
+    debug_assert_eq!(value_tail.len(), value_map_size);
+    debug_assert_eq!(cnn_global.len(), cnn_pooled_size(channels));
+    pooled.resize(value_features, 0.0);
     let logits = &value_tail[..BOARD_PLANES_SIZE];
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut weights = [0.0f32; BOARD_PLANES_SIZE];
@@ -559,7 +618,7 @@ fn value_pool_features(value_tail: &[f32], cnn_global: &[f32], pooled: &mut Vec<
         *weight *= inv_denom;
     }
 
-    for channel in 0..VALUE_HEAD_CHANNELS {
+    for channel in 0..value_channels {
         let start = channel * BOARD_PLANES_SIZE;
         let row = &value_tail[start..start + BOARD_PLANES_SIZE];
         let mut attn = 0.0f32;
@@ -575,13 +634,13 @@ fn value_pool_features(value_tail: &[f32], cnn_global: &[f32], pooled: &mut Vec<
         let mean = sum / BOARD_PLANES_SIZE as f32;
         let variance = (sum_sq / BOARD_PLANES_SIZE as f32 - mean * mean).max(0.0);
         pooled[channel] = attn;
-        pooled[VALUE_HEAD_CHANNELS + channel] = mean;
-        pooled[VALUE_HEAD_CHANNELS * 2 + channel] = max_value;
-        pooled[VALUE_HEAD_CHANNELS * 3 + channel] = variance.sqrt();
+        pooled[value_channels + channel] = mean;
+        pooled[value_channels * 2 + channel] = max_value;
+        pooled[value_channels * 3 + channel] = variance.sqrt();
     }
-    let flat_start = VALUE_HEAD_CHANNELS * 4;
-    pooled[flat_start..flat_start + VALUE_HEAD_MAP_SIZE].copy_from_slice(value_tail);
-    pooled[flat_start + VALUE_HEAD_MAP_SIZE..].copy_from_slice(cnn_global);
+    let flat_start = value_channels * 4;
+    pooled[flat_start..flat_start + value_map_size].copy_from_slice(value_tail);
+    pooled[flat_start + value_map_size..].copy_from_slice(cnn_global);
 }
 
 pub struct SplitMix64 {
