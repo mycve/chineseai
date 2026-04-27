@@ -5,10 +5,10 @@ use std::{process::Command, thread};
 
 use super::{
     AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE,
-    BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE,
-    PIECE_BOARD_CHANNELS, RESIDUAL_TRUNK_SCALE, SIDE_TO_MOVE_BOARD_CHANNEL, VALUE_BRANCH_DEPTH,
-    VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
-    POLICY_CONDITION_SIZE, policy_move_features,
+    BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
+    POLICY_CONDITION_SIZE, RESIDUAL_TRUNK_SCALE, SIDE_TO_MOVE_BOARD_CHANNEL, VALUE_BRANCH_DEPTH,
+    VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_RELATION_FEATURE_SIZE,
+    policy_move_features,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -53,6 +53,8 @@ struct GpuVars {
     value_trunk_biases: Vec<Var>,
     value_board_hidden: Var,
     value_board_hidden_bias: Var,
+    value_relation_hidden: Var,
+    value_relation_hidden_bias: Var,
     value_intermediate_hidden: Var,
     value_intermediate_bias: Var,
     value_logits_weights: Var,
@@ -268,19 +270,14 @@ impl GpuTrainer {
                     .zip(shard_ranges.iter().cloned())
                 {
                     handles.push(scope.spawn(move || {
-                        replica.train_local_batch(
-                            optimizer,
-                            samples,
-                            &batch[range],
-                            loss_weights,
-                        )
+                        replica.train_local_batch(optimizer, samples, &batch[range], loss_weights)
                     }));
                 }
                 let mut outputs = Vec::with_capacity(handles.len());
                 for handle in handles {
-                    let output = handle
-                        .join()
-                        .map_err(|_| candle_core::Error::Msg("local-sgd worker panicked".into()))??;
+                    let output = handle.join().map_err(|_| {
+                        candle_core::Error::Msg("local-sgd worker panicked".into())
+                    })??;
                     outputs.push(output);
                 }
                 CandleResult::Ok(outputs)
@@ -567,7 +564,12 @@ impl GpuReplica {
             .matmul(&self.vars.value_board_hidden.t()?)?
             .broadcast_add(&self.vars.value_board_hidden_bias)?
             .relu()?;
-        let mut value_hidden = (value_sparse_hidden + value_cnn_hidden)?;
+        let value_relation_hidden = batch
+            .value_relation
+            .matmul(&self.vars.value_relation_hidden.t()?)?
+            .broadcast_add(&self.vars.value_relation_hidden_bias)?
+            .relu()?;
+        let mut value_hidden = ((value_sparse_hidden + value_cnn_hidden)? + value_relation_hidden)?;
         for layer in 0..VALUE_BRANCH_DEPTH {
             let dense = value_hidden
                 .matmul(&self.vars.value_trunk_weights[layer].t()?)?
@@ -626,6 +628,7 @@ struct BatchTensors {
     board_onehot: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
+    value_relation: Tensor,
     value_targets: Tensor,
     values: Tensor,
 }
@@ -644,6 +647,7 @@ impl BatchTensors {
         let mut board_onehot = vec![0.0f32; batch_size * BOARD_CHANNELS * BOARD_PLANES_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * DENSE_MOVE_SPACE];
+        let mut value_relation = vec![0.0f32; batch_size * VALUE_RELATION_FEATURE_SIZE];
         let mut value_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
         let mut values = vec![0.0f32; batch_size];
 
@@ -682,6 +686,15 @@ impl BatchTensors {
                     policy_mask[policy_base + move_index] = 0.0;
                 }
             }
+            let relation_base = row * VALUE_RELATION_FEATURE_SIZE;
+            for (offset, &feature) in sample
+                .value_relation
+                .iter()
+                .take(VALUE_RELATION_FEATURE_SIZE)
+                .enumerate()
+            {
+                value_relation[relation_base + offset] = feature;
+            }
             let value = sample.value.clamp(-1.0, 1.0);
             values[row] = value;
             let value_target_base = row * VALUE_LOGITS;
@@ -710,6 +723,11 @@ impl BatchTensors {
                 device,
             )?,
             policy_mask: Tensor::from_vec(policy_mask, (batch_size, DENSE_MOVE_SPACE), device)?,
+            value_relation: Tensor::from_vec(
+                value_relation,
+                (batch_size, VALUE_RELATION_FEATURE_SIZE),
+                device,
+            )?,
             value_targets: Tensor::from_vec(value_targets, (batch_size, VALUE_LOGITS), device)?,
             values: Tensor::from_vec(values, batch_size, device)?,
         })
@@ -773,6 +791,16 @@ impl GpuVars {
             )?,
             value_board_hidden_bias: var_from_slice(
                 &model.value_board_hidden_bias,
+                VALUE_BRANCH_SIZE,
+                device,
+            )?,
+            value_relation_hidden: var_from_slice(
+                &model.value_relation_hidden,
+                (VALUE_BRANCH_SIZE, VALUE_RELATION_FEATURE_SIZE),
+                device,
+            )?,
+            value_relation_hidden_bias: var_from_slice(
+                &model.value_relation_hidden_bias,
                 VALUE_BRANCH_SIZE,
                 device,
             )?,
@@ -843,6 +871,8 @@ impl GpuVars {
         vars.extend(self.value_trunk_biases.iter().cloned());
         vars.push(self.value_board_hidden.clone());
         vars.push(self.value_board_hidden_bias.clone());
+        vars.push(self.value_relation_hidden.clone());
+        vars.push(self.value_relation_hidden_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
         vars.push(self.value_intermediate_bias.clone());
         vars.push(self.value_logits_weights.clone());
@@ -876,6 +906,8 @@ impl GpuVars {
             self.value_hidden_bias.clone(),
             self.value_board_hidden.clone(),
             self.value_board_hidden_bias.clone(),
+            self.value_relation_hidden.clone(),
+            self.value_relation_hidden_bias.clone(),
             self.value_intermediate_hidden.clone(),
             self.value_intermediate_bias.clone(),
             self.value_logits_weights.clone(),
@@ -947,6 +979,14 @@ impl GpuVars {
         copy_var(
             &self.value_board_hidden_bias,
             &mut model.value_board_hidden_bias,
+        )?;
+        copy_var(
+            &self.value_relation_hidden,
+            &mut model.value_relation_hidden,
+        )?;
+        copy_var(
+            &self.value_relation_hidden_bias,
+            &mut model.value_relation_hidden_bias,
         )?;
         copy_var(
             &self.value_intermediate_hidden,

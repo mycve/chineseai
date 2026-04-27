@@ -336,6 +336,8 @@ fn make_training_sample(
         }
     }
     let move_indices = moves.iter().copied().map(dense_move_index).collect();
+    let mut value_relation = Vec::new();
+    super::extract_value_relation_features(position, &moves, &mut value_relation);
     let mut board = Vec::new();
     extract_board_planes(position, history, &mut board);
     if mirror_file {
@@ -356,6 +358,7 @@ fn make_training_sample(
             .iter()
             .map(|candidate| candidate.policy.max(0.0) / total_policy)
             .collect(),
+        value_relation,
         value: value.clamp(-1.0, 1.0),
         side_sign: if position.side_to_move() == Color::Red {
             1.0

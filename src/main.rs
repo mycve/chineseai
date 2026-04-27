@@ -8,10 +8,10 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig,
-        AzLoopReport, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData,
-        alphazero_search, benchmark_training, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
+        AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
+        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions, train_samples,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -1170,8 +1170,10 @@ fn main() {
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    let mut local_model =
-                        AzNnue::random(selfplay_config.hidden_size, selfplay_config.seed ^ worker_id as u64);
+                    let mut local_model = AzNnue::random(
+                        selfplay_config.hidden_size,
+                        selfplay_config.seed ^ worker_id as u64,
+                    );
                     while !selfplay_stop.load(Ordering::SeqCst) {
                         {
                             let (pause_lock, pause_cvar) = &*selfplay_pause;
