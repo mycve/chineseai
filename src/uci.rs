@@ -1,5 +1,5 @@
 use crate::az::{
-    AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
+    AzGumbelConfig, AzModel, AzSearchAlgorithm, AzSearchLimits,
     alphazero_search_with_history_and_rules,
 };
 use crate::board_transform::{HISTORY_PLIES, HistoryMove};
@@ -53,7 +53,7 @@ struct UciState {
     history: Vec<HistoryMove>,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
-    model: Option<AzNnue>,
+    model: Option<AzModel>,
     simulations: usize,
     threads: usize,
     cpuct: f32,
@@ -70,7 +70,7 @@ impl Default for UciState {
             position: Position::startpos(),
             history: Vec::new(),
             rule_history: Position::startpos().initial_rule_history(),
-            eval_file: "chineseai.nnue".into(),
+            eval_file: "chineseai.azm".into(),
             model: None,
             simulations: 10_000,
             threads: 1,
@@ -128,7 +128,7 @@ pub fn run_uci() {
 fn print_uci_id() {
     println!("id name ChineseAI AZ");
     println!("id author ChineseAI");
-    println!("option name EvalFile type string default chineseai.nnue");
+    println!("option name EvalFile type string default chineseai.azm");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name Cpuct type string default 1.5");
@@ -147,13 +147,13 @@ fn ensure_model(state: &mut UciState) {
     if state.model.is_some() {
         return;
     }
-    state.model = Some(AzNnue::load(&state.eval_file).unwrap_or_else(|err| {
+    state.model = Some(AzModel::load(&state.eval_file).unwrap_or_else(|err| {
         println!(
             "info string failed to load {}, using random model: {}",
             state.eval_file, err
         );
         flush();
-        AzNnue::random(128, state.seed)
+        AzModel::random(128, state.seed)
     }));
 }
 

@@ -6,7 +6,7 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, BOARD_HISTORY_FRAMES,
+    AzCandidate, AzLoopConfig, AzModel, AzSearchLimits, AzTrainingSample, BOARD_HISTORY_FRAMES,
     BOARD_PLANES_SIZE, SplitMix64, VALUE_SCALE_CP, alphazero_search_with_history_and_rules,
     dense_move_index, extract_board_planes,
 };
@@ -117,7 +117,7 @@ impl AzSelfplayData {
     }
 }
 
-pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+pub fn generate_selfplay_data(model: &AzModel, config: &AzLoopConfig) -> AzSelfplayData {
     let workers = config.workers.max(1).min(config.games.max(1));
     if workers == 1 || config.games <= 1 {
         return generate_selfplay_chunk(model, config);
@@ -159,7 +159,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
-fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+fn generate_selfplay_chunk(model: &AzModel, config: &AzLoopConfig) -> AzSelfplayData {
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
     let mut red_wins = 0usize;
@@ -472,8 +472,8 @@ pub struct AzArenaConfig {
 }
 
 pub fn play_arena_games_from_positions(
-    candidate: &AzNnue,
-    baseline: &AzNnue,
+    candidate: &AzModel,
+    baseline: &AzModel,
     positions: &[Position],
     config: AzArenaConfig,
 ) -> AzArenaReport {
@@ -543,8 +543,8 @@ fn arena_start_position(positions: &[Position], seed: u64, game_index: usize) ->
 
 fn play_arena_game(
     initial_position: &Position,
-    red_model: &AzNnue,
-    black_model: &AzNnue,
+    red_model: &AzModel,
+    black_model: &AzModel,
     simulations: usize,
     max_plies: usize,
     seed: u64,

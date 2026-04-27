@@ -1,4 +1,4 @@
-﻿use std::collections::VecDeque;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-//! UCI match runner: ChineseAI (AZ-NNUE search) vs Pikafish.
+//! UCI match runner: ChineseAI (AZ-azm search) vs Pikafish.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::az::{
-    AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
+    AzGumbelConfig, AzModel, AzSearchAlgorithm, AzSearchLimits,
     alphazero_search_with_history_and_rules,
 };
 use crate::board_transform::{HISTORY_PLIES, HistoryMove};
@@ -230,7 +230,7 @@ fn terminal_before_side_selects(
 }
 
 fn play_one_game(
-    model: &AzNnue,
+    model: &AzModel,
     external: &mut ExternalUci,
     initial_position: &Position,
     config: GameConfig,
@@ -322,7 +322,7 @@ pub fn run_vs_pikafish(
     start_positions: &[Position],
     config: VsPikafishConfig,
 ) -> std::io::Result<VsPikafishResult> {
-    let model = Arc::new(AzNnue::load(chinese_model_path).map_err(|e| {
+    let model = Arc::new(AzModel::load(chinese_model_path).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("load chinese model `{}`: {e}", chinese_model_path.display()),

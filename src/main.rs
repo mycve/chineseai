@@ -9,9 +9,9 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
-        AzModelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
-        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples,
+        AzModel, AzModelConfig, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData,
+        alphazero_search, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -86,7 +86,7 @@ struct AzInitArgs {
     #[arg(default_value_t = 128)]
     hidden: usize,
     /// Output model path.
-    #[arg(default_value = "chineseai.nnue")]
+    #[arg(default_value = "chineseai.azm")]
     output: String,
     /// Random seed.
     #[arg(default_value_t = 20260409)]
@@ -111,9 +111,9 @@ struct AzInitArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-search chineseai.nnue
-  chineseai az-search chineseai.nnue 10000 1.5 startpos
-  chineseai az-search chineseai.nnue 10000 1.5 --algorithm gumbel_alphazero startpos")]
+  chineseai az-search chineseai.azm
+  chineseai az-search chineseai.azm 10000 1.5 startpos
+  chineseai az-search chineseai.azm 10000 1.5 --algorithm gumbel_alphazero startpos")]
 struct AzSearchArgs {
     /// AZ model path.
     model: String,
@@ -134,8 +134,8 @@ struct AzSearchArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-bench chineseai.nnue 512 100 1.5 startpos
-  chineseai az-bench chineseai.nnue 512 100 1.5 --algorithm gumbel_alphazero startpos")]
+  chineseai az-bench chineseai.azm 512 100 1.5 startpos
+  chineseai az-bench chineseai.azm 512 100 1.5 --algorithm gumbel_alphazero startpos")]
 struct AzBenchArgs {
     /// AZ model path.
     model: String,
@@ -184,7 +184,7 @@ struct AzDistillArgs {
     #[arg(default_value = "distill_data")]
     data_dir: PathBuf,
     /// Input/output AZ model path. Created randomly if missing.
-    #[arg(default_value = "chineseai.nnue")]
+    #[arg(default_value = "chineseai.azm")]
     model: PathBuf,
     /// Save to this path instead of overwriting model.
     #[arg(long)]
@@ -430,7 +430,7 @@ fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> Pat
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue");
+        .unwrap_or("model.azm");
     Path::new(checkpoint_dir).join(format!("update-{update:04}-{base}"))
 }
 
@@ -459,7 +459,7 @@ fn prune_old_checkpoints(
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue")
+        .unwrap_or("model.azm")
         .to_string();
     let prefix = "update-";
     let suffix = format!("-{base}");
@@ -491,7 +491,7 @@ struct TrainerEvent {
 
 struct SharedSelfplayModel {
     version: u64,
-    model: AzNnue,
+    model: AzModel,
 }
 
 #[derive(Default)]
@@ -734,11 +734,11 @@ fn main() {
                 .unwrap_or_else(|err| panic!("{err}"));
             let output = cmd.output;
             let seed = cmd.seed;
-            let model = AzNnue::random_with_config(model_config, seed);
+            let model = AzModel::random_with_config(model_config, seed);
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
-            println!("azmodel  : initialized (binary magic AZB1)");
+            println!("azmodel  : initialized (binary magic AZM1)");
             println!("arch     : {:?}", model.model_config);
             println!("seed     : {seed}");
             println!("output   : {output}");
@@ -750,7 +750,7 @@ fn main() {
             let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
-            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+            let model = AzModel::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
             let result = alphazero_search(
@@ -818,7 +818,7 @@ fn main() {
             let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
-            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+            let model = AzModel::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
 
@@ -886,7 +886,7 @@ fn main() {
             let batch_size = cmd.batch_size_per_gpu.max(1);
             let lr = cmd.lr.max(0.0);
             let seed = cmd.seed;
-            let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+            let mut model = AzModel::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
             let started = std::time::Instant::now();
@@ -924,7 +924,7 @@ fn main() {
             let output_path = cmd.output.clone().unwrap_or_else(|| cmd.model.clone());
             let mut model = if cmd.model.exists() {
                 println!("distill  : load model {}", cmd.model.display());
-                AzNnue::load(&cmd.model).unwrap_or_else(|err| {
+                AzModel::load(&cmd.model).unwrap_or_else(|err| {
                     panic!("failed to load `{}`: {err}", cmd.model.display());
                 })
             } else {
@@ -933,7 +933,7 @@ fn main() {
                     cmd.model.display(),
                     cmd.hidden.max(1)
                 );
-                AzNnue::random(cmd.hidden.max(1), cmd.seed)
+                AzModel::random(cmd.hidden.max(1), cmd.seed)
             };
 
             let epochs = cmd.epochs.max(1);
@@ -1088,7 +1088,7 @@ fn main() {
 
             let model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
-                match AzNnue::load(&config.model_path) {
+                match AzModel::load(&config.model_path) {
                     Ok(model) => {
                         if model.model_config != model_config {
                             panic!(
@@ -1103,12 +1103,12 @@ fn main() {
                             "model    : reinit {} as random model ({err})",
                             config.model_path
                         );
-                        AzNnue::random_with_config(model_config, config.seed)
+                        AzModel::random_with_config(model_config, config.seed)
                     }
                 }
             } else {
                 println!("model    : init {}", config.model_path);
-                AzNnue::random_with_config(model_config, config.seed)
+                AzModel::random_with_config(model_config, config.seed)
             };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
@@ -1215,7 +1215,7 @@ fn main() {
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    let mut local_model = AzNnue::random_with_config(
+                    let mut local_model = AzModel::random_with_config(
                         selfplay_config.model_config(),
                         selfplay_config.seed ^ worker_id as u64,
                     );
@@ -1474,7 +1474,7 @@ fn main() {
                             config.model_path
                         );
                     });
-                } else if let Err(err) = AzNnue::load(&best_path) {
+                } else if let Err(err) = AzModel::load(&best_path) {
                     println!(
                         "best     : reset incompatible `{}` from current ({err})",
                         best_path.display()
@@ -1848,10 +1848,10 @@ fn main() {
             let arena_cpuct = cmd.arena_cpuct.max(0.0);
             let eval_fens_path = cmd.eval_fens_path;
             let seed = cmd.seed;
-            let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
+            let candidate = AzModel::load(&candidate_path).unwrap_or_else(|err| {
                 panic!("failed to load `{candidate_path}`: {err}");
             });
-            let baseline = AzNnue::load(&baseline_path).unwrap_or_else(|err| {
+            let baseline = AzModel::load(&baseline_path).unwrap_or_else(|err| {
                 panic!("failed to load `{baseline_path}`: {err}");
             });
             let eval_positions = load_arena_eval_positions(&eval_fens_path);

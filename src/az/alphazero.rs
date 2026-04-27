@@ -2,7 +2,7 @@ use crate::board_transform::HistoryMove;
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 use super::mctx::{self, ActionStats, AzGumbelConfig};
-use super::{AzEvalScratch, AzNnue, SplitMix64, VALUE_SCALE_CP};
+use super::{AzEvalScratch, AzModel, SplitMix64, VALUE_SCALE_CP};
 
 const DEFAULT_CPUCT: f32 = 1.5;
 
@@ -79,7 +79,7 @@ pub fn alphazero_search_with_history_and_rules(
     history: &[HistoryMove],
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
-    model: &AzNnue,
+    model: &AzModel,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
     let mut tree = AzTree::new(
@@ -147,7 +147,7 @@ pub fn alphazero_search_with_history_and_rules(
 
 pub fn alphazero_search(
     position: &Position,
-    model: &AzNnue,
+    model: &AzModel,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
     alphazero_search_with_history_and_rules(position, &[], None, None, model, limits)
@@ -155,7 +155,7 @@ pub fn alphazero_search(
 
 struct AzTree<'a> {
     nodes: Vec<AzNode>,
-    model: &'a AzNnue,
+    model: &'a AzModel,
     root_moves: Option<Vec<Move>>,
     root: usize,
     cpuct: f32,
@@ -207,7 +207,7 @@ impl<'a> AzTree<'a> {
         history: Vec<HistoryMove>,
         rule_history: Vec<RuleHistoryEntry>,
         root_moves: Option<Vec<Move>>,
-        model: &'a AzNnue,
+        model: &'a AzModel,
         limits: AzSearchLimits,
     ) -> Self {
         let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1));
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn alphazero_search_populates_visit_distribution() {
-        let model = AzNnue::random(4, 7);
+        let model = AzModel::random(4, 7);
         let result = alphazero_search(
             &Position::startpos(),
             &model,
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn dirichlet_noise_changes_root_prior_distribution() {
         let position = Position::startpos();
-        let model = AzNnue::random(4, 7);
+        let model = AzModel::random(4, 7);
         let plain = alphazero_search(
             &position,
             &model,
@@ -790,7 +790,7 @@ mod tests {
         let position = Position::startpos();
         let legal = position.legal_moves();
         let root_moves = vec![legal[0]];
-        let model = AzNnue::random(4, 7);
+        let model = AzModel::random(4, 7);
         let mut tree = AzTree::new(
             position,
             Vec::new(),
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn gumbel_search_uses_improved_policy_targets() {
-        let model = AzNnue::random(4, 7);
+        let model = AzModel::random(4, 7);
         let result = alphazero_search(
             &Position::startpos(),
             &model,

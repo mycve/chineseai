@@ -50,7 +50,7 @@ impl Default for AzLoopFileConfig {
             ..AzGumbelConfig::default()
         };
         Self {
-            model_path: "chineseai.nnue".into(),
+            model_path: "chineseai.azm".into(),
             simulations: 256,
             selfplay_batch_games: 512,
             epochs: 2,
@@ -284,7 +284,7 @@ impl AzLoopFileConfig {
             r#"# ChineseAI AZ self-play training config.
 # Run: ./target/release/chineseai az-loop {DEFAULT_AZ_LOOP_CONFIG}
 #
-# model_path: AzNnue binary (magic AZB1, little-endian f32), e.g. chineseai.nnue
+# model_path: AzModel binary (magic AZM1, little-endian f32), e.g. chineseai.azm
 #
 # selfplay_batch_games:
 #   Generate this many self-play games, then run one training update.
@@ -359,7 +359,7 @@ impl AzLoopFileConfig {
 #   CPU/GPU forward paths are generalized for that shape.
 #   Current v28 shape: canonical board planes=126, cnn_channels=24,
 #   attention_feedback=true, value_branch=128x2, value_hidden=256,
-#   policy_condition_size=32. Historical sparse/NNUE inputs are gone.
+#   policy_condition_size=32. Historical sparse/azm inputs are gone.
 
 model_path = "{model_path}"
 simulations = {simulations}
