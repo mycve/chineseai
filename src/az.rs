@@ -11,7 +11,7 @@ mod replay;
 mod train;
 mod train_gpu;
 
-use crate::nnue::{HISTORY_PLIES, HistoryMove, canonical_move, canonical_square};
+use crate::board_transform::{HISTORY_PLIES, HistoryMove, canonical_move, canonical_square};
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
@@ -29,8 +29,8 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 26;
-const AZNNUE_BINARY_HEADER_LEN: usize = 24;
+const AZNNUE_BINARY_VERSION: u32 = 28;
+const AZNNUE_BINARY_HEADER_LEN: usize = 40;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
     for &value in slice {
@@ -77,14 +77,81 @@ pub(super) const VALUE_CNN_POOLED_SIZE: usize = VALUE_CNN_CHANNELS * CNN_POOL_BL
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RESIDUAL_TRUNK_SCALE: f32 = 0.5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AzModelConfig {
+    pub hidden_size: usize,
+    pub cnn_channels: usize,
+    pub value_branch_size: usize,
+    pub value_branch_depth: usize,
+    pub value_hidden_size: usize,
+    pub policy_condition_size: usize,
+    pub attention_feedback: bool,
+}
+
+impl Default for AzModelConfig {
+    fn default() -> Self {
+        Self {
+            hidden_size: 256,
+            cnn_channels: CNN_CHANNELS,
+            value_branch_size: VALUE_BRANCH_SIZE,
+            value_branch_depth: VALUE_BRANCH_DEPTH,
+            value_hidden_size: VALUE_HIDDEN_SIZE,
+            policy_condition_size: POLICY_CONDITION_SIZE,
+            attention_feedback: true,
+        }
+    }
+}
+
+impl AzModelConfig {
+    pub fn with_hidden_size(hidden_size: usize) -> Self {
+        Self {
+            hidden_size: hidden_size.max(1),
+            ..Self::default()
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.hidden_size = self.hidden_size.max(1);
+        self.cnn_channels = self.cnn_channels.max(1);
+        self.value_branch_size = self.value_branch_size.max(1);
+        self.value_branch_depth = self.value_branch_depth.max(1);
+        self.value_hidden_size = self.value_hidden_size.max(1);
+        self.policy_condition_size = self.policy_condition_size.max(1);
+        self
+    }
+
+    pub fn validate_supported(&self) -> io::Result<()> {
+        let config = self.normalized();
+        let expected = Self::with_hidden_size(config.hidden_size);
+        if config == expected {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported model config {:?}; this build currently supports hidden_size only, with cnn_channels={}, value_branch_size={}, value_branch_depth={}, value_hidden_size={}, policy_condition_size={}, attention_feedback=true",
+                config,
+                CNN_CHANNELS,
+                VALUE_BRANCH_SIZE,
+                VALUE_BRANCH_DEPTH,
+                VALUE_HIDDEN_SIZE,
+                POLICY_CONDITION_SIZE
+            ),
+        ))
+    }
+}
+
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
     board: Vec<u8>,
     conv1: Vec<f32>,
     conv2: Vec<f32>,
     cnn_global: Vec<f32>,
+    cnn_context: Vec<f32>,
     value_tail: Vec<f32>,
     value_cnn_global: Vec<f32>,
+    value_cnn_context: Vec<f32>,
     value_hidden: Vec<f32>,
     value_next: Vec<f32>,
     value_intermediate: Vec<f32>,
@@ -102,8 +169,10 @@ impl AzEvalScratch {
             conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
+            cnn_context: vec![0.0; CNN_CHANNELS],
             value_tail: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
             value_cnn_global: vec![0.0; VALUE_CNN_POOLED_SIZE],
+            value_cnn_context: vec![0.0; VALUE_CNN_CHANNELS],
             value_hidden: vec![0.0; VALUE_BRANCH_SIZE],
             value_next: vec![0.0; VALUE_BRANCH_SIZE],
             value_intermediate: vec![0.0; VALUE_HIDDEN_SIZE],
@@ -117,12 +186,15 @@ impl AzEvalScratch {
 
 #[derive(Debug)]
 pub struct AzNnue {
+    pub model_config: AzModelConfig,
     pub hidden_size: usize,
     pub board_conv1_weights: Vec<f32>,
     pub board_conv1_bias: Vec<f32>,
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
     pub board_attention_query: Vec<f32>,
+    pub board_context_weights: Vec<f32>,
+    pub board_context_bias: Vec<f32>,
     pub board_hidden: Vec<f32>,
     pub board_hidden_bias: Vec<f32>,
     pub value_trunk_weights: Vec<f32>,
@@ -132,6 +204,8 @@ pub struct AzNnue {
     pub value_tail_conv_weights: Vec<f32>,
     pub value_tail_conv_bias: Vec<f32>,
     pub value_board_attention_query: Vec<f32>,
+    pub value_context_weights: Vec<f32>,
+    pub value_context_bias: Vec<f32>,
     pub value_board_hidden: Vec<f32>,
     pub value_board_hidden_bias: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
@@ -189,16 +263,23 @@ pub struct AzNnue {
 // - v26 shares the board CNN stem between policy and value. Value keeps a
 //   small residual tail and its piece-square baseline, so the tasks share
 //   low-level board perception without collapsing into a single head.
+// - v27 adds lightweight global-attention feedback inside the board CNN. The
+//   attention context is projected back into every square before pooling, so
+//   the net gets a small amount of whole-board interaction without paying for
+//   a full Transformer or a heavy AlphaZero residual tower.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
         Self {
+            model_config: self.model_config,
             hidden_size: self.hidden_size,
             board_conv1_weights: self.board_conv1_weights.clone(),
             board_conv1_bias: self.board_conv1_bias.clone(),
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
             board_attention_query: self.board_attention_query.clone(),
+            board_context_weights: self.board_context_weights.clone(),
+            board_context_bias: self.board_context_bias.clone(),
             board_hidden: self.board_hidden.clone(),
             board_hidden_bias: self.board_hidden_bias.clone(),
             value_trunk_weights: self.value_trunk_weights.clone(),
@@ -208,6 +289,8 @@ impl Clone for AzNnue {
             value_tail_conv_weights: self.value_tail_conv_weights.clone(),
             value_tail_conv_bias: self.value_tail_conv_bias.clone(),
             value_board_attention_query: self.value_board_attention_query.clone(),
+            value_context_weights: self.value_context_weights.clone(),
+            value_context_bias: self.value_context_bias.clone(),
             value_board_hidden: self.value_board_hidden.clone(),
             value_board_hidden_bias: self.value_board_hidden_bias.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
@@ -348,6 +431,15 @@ impl AzTrainStats {
 
 impl AzNnue {
     pub fn random(hidden_size: usize, seed: u64) -> Self {
+        Self::random_with_config(AzModelConfig::with_hidden_size(hidden_size), seed)
+    }
+
+    pub fn random_with_config(config: AzModelConfig, seed: u64) -> Self {
+        let config = config.normalized();
+        config
+            .validate_supported()
+            .expect("unsupported model config");
+        let hidden_size = config.hidden_size;
         let mut rng = SplitMix64::new(seed);
         let board_conv1_weights: Vec<f32> =
             (0..CNN_CHANNELS * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA)
@@ -359,6 +451,10 @@ impl AzNnue {
             .collect();
         let board_conv2_bias = vec![0.0; CNN_CHANNELS];
         let board_attention_query: Vec<f32> = (0..CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
+        let board_context_weights: Vec<f32> = (0..CNN_CHANNELS * CNN_CHANNELS)
+            .map(|_| rng.weight(0.03))
+            .collect();
+        let board_context_bias = vec![0.0; CNN_CHANNELS];
         let board_hidden: Vec<f32> = (0..hidden_size * CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
@@ -379,6 +475,10 @@ impl AzNnue {
         let value_tail_conv_bias = vec![0.0; VALUE_CNN_CHANNELS];
         let value_board_attention_query: Vec<f32> =
             (0..VALUE_CNN_CHANNELS).map(|_| rng.weight(0.08)).collect();
+        let value_context_weights: Vec<f32> = (0..VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS)
+            .map(|_| rng.weight(0.03))
+            .collect();
+        let value_context_bias = vec![0.0; VALUE_CNN_CHANNELS];
         let value_board_hidden: Vec<f32> = (0..VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE)
             .map(|_| rng.weight((2.0 / VALUE_CNN_POOLED_SIZE as f32).sqrt()))
             .collect();
@@ -406,12 +506,15 @@ impl AzNnue {
             .collect();
         let policy_feature_bias = vec![0.0; POLICY_CONDITION_SIZE];
         Self {
+            model_config: config,
             hidden_size,
             board_conv1_weights,
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
             board_attention_query,
+            board_context_weights,
+            board_context_bias,
             board_hidden,
             board_hidden_bias,
             value_trunk_weights,
@@ -421,6 +524,8 @@ impl AzNnue {
             value_tail_conv_weights,
             value_tail_conv_bias,
             value_board_attention_query,
+            value_context_weights,
+            value_context_bias,
             value_board_hidden,
             value_board_hidden_bias,
             value_intermediate_hidden,
@@ -444,13 +549,19 @@ impl AzNnue {
         writer.write_all(&AZNNUE_BINARY_VERSION.to_le_bytes())?;
         writer.write_all(&(VALUE_SQUARE_INPUT_SIZE as u32).to_le_bytes())?;
         writer.write_all(&(self.hidden_size as u32).to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?;
+        writer.write_all(&(self.model_config.cnn_channels as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.value_branch_size as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.value_branch_depth as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.value_hidden_size as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.policy_condition_size as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.attention_feedback as u32).to_le_bytes())?;
         write_f32_slice_le(&mut writer, &self.board_conv1_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv1_bias)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
         write_f32_slice_le(&mut writer, &self.board_attention_query)?;
+        write_f32_slice_le(&mut writer, &self.board_context_weights)?;
+        write_f32_slice_le(&mut writer, &self.board_context_bias)?;
         write_f32_slice_le(&mut writer, &self.board_hidden)?;
         write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_trunk_weights)?;
@@ -460,6 +571,8 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.value_tail_conv_weights)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_bias)?;
         write_f32_slice_le(&mut writer, &self.value_board_attention_query)?;
+        write_f32_slice_le(&mut writer, &self.value_context_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_context_bias)?;
         write_f32_slice_le(&mut writer, &self.value_board_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_board_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
@@ -500,8 +613,17 @@ impl AzNnue {
         }
         let input_size = read_u32_le(&mut reader)? as usize;
         let hidden_size = read_u32_le(&mut reader)? as usize;
-        let _arch_reserved = read_u32_le(&mut reader)?;
-        let _reserved = read_u32_le(&mut reader)?;
+        let model_config = AzModelConfig {
+            hidden_size,
+            cnn_channels: read_u32_le(&mut reader)? as usize,
+            value_branch_size: read_u32_le(&mut reader)? as usize,
+            value_branch_depth: read_u32_le(&mut reader)? as usize,
+            value_hidden_size: read_u32_le(&mut reader)? as usize,
+            policy_condition_size: read_u32_le(&mut reader)? as usize,
+            attention_feedback: read_u32_le(&mut reader)? != 0,
+        }
+        .normalized();
+        model_config.validate_supported()?;
         if input_size != VALUE_SQUARE_INPUT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -513,6 +635,8 @@ impl AzNnue {
         let board_conv2_weights_len = CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let board_conv2_bias_len = CNN_CHANNELS;
         let board_attention_query_len = CNN_CHANNELS;
+        let board_context_weights_len = CNN_CHANNELS * CNN_CHANNELS;
+        let board_context_bias_len = CNN_CHANNELS;
         let board_hidden_len = hidden_size * CNN_POOLED_SIZE;
         let board_hidden_bias_len = hidden_size;
         let value_trunk_weights_len = VALUE_BRANCH_DEPTH * VALUE_BRANCH_SIZE * VALUE_BRANCH_SIZE;
@@ -522,6 +646,8 @@ impl AzNnue {
         let value_tail_conv_weights_len = VALUE_CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA;
         let value_tail_conv_bias_len = VALUE_CNN_CHANNELS;
         let value_board_attention_query_len = VALUE_CNN_CHANNELS;
+        let value_context_weights_len = VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS;
+        let value_context_bias_len = VALUE_CNN_CHANNELS;
         let value_board_hidden_len = VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE;
         let value_board_hidden_bias_len = VALUE_BRANCH_SIZE;
         let vih_len = VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE;
@@ -539,6 +665,8 @@ impl AzNnue {
             + board_conv2_weights_len
             + board_conv2_bias_len
             + board_attention_query_len
+            + board_context_weights_len
+            + board_context_bias_len
             + board_hidden_len
             + board_hidden_bias_len
             + value_trunk_weights_len
@@ -548,6 +676,8 @@ impl AzNnue {
             + value_tail_conv_weights_len
             + value_tail_conv_bias_len
             + value_board_attention_query_len
+            + value_context_weights_len
+            + value_context_bias_len
             + value_board_hidden_len
             + value_board_hidden_bias_len
             + vih_len
@@ -577,6 +707,8 @@ impl AzNnue {
         let board_conv2_weights = read_f32_vec_le(&mut reader, board_conv2_weights_len)?;
         let board_conv2_bias = read_f32_vec_le(&mut reader, board_conv2_bias_len)?;
         let board_attention_query = read_f32_vec_le(&mut reader, board_attention_query_len)?;
+        let board_context_weights = read_f32_vec_le(&mut reader, board_context_weights_len)?;
+        let board_context_bias = read_f32_vec_le(&mut reader, board_context_bias_len)?;
         let board_hidden = read_f32_vec_le(&mut reader, board_hidden_len)?;
         let board_hidden_bias = read_f32_vec_le(&mut reader, board_hidden_bias_len)?;
         let value_trunk_weights = read_f32_vec_le(&mut reader, value_trunk_weights_len)?;
@@ -587,6 +719,8 @@ impl AzNnue {
         let value_tail_conv_bias = read_f32_vec_le(&mut reader, value_tail_conv_bias_len)?;
         let value_board_attention_query =
             read_f32_vec_le(&mut reader, value_board_attention_query_len)?;
+        let value_context_weights = read_f32_vec_le(&mut reader, value_context_weights_len)?;
+        let value_context_bias = read_f32_vec_le(&mut reader, value_context_bias_len)?;
         let value_board_hidden = read_f32_vec_le(&mut reader, value_board_hidden_len)?;
         let value_board_hidden_bias = read_f32_vec_le(&mut reader, value_board_hidden_bias_len)?;
         let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
@@ -600,12 +734,15 @@ impl AzNnue {
         let policy_feature_cnn = read_f32_vec_le(&mut reader, pfc_len)?;
         let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
         let model = Self {
+            model_config,
             hidden_size,
             board_conv1_weights,
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
             board_attention_query,
+            board_context_weights,
+            board_context_bias,
             board_hidden,
             board_hidden_bias,
             value_trunk_weights,
@@ -615,6 +752,8 @@ impl AzNnue {
             value_tail_conv_weights,
             value_tail_conv_bias,
             value_board_attention_query,
+            value_context_weights,
+            value_context_bias,
             value_board_hidden,
             value_board_hidden_bias,
             value_intermediate_hidden,
@@ -646,12 +785,14 @@ impl AzNnue {
             &scratch.board,
             &mut scratch.conv1,
             &mut scratch.conv2,
+            &mut scratch.cnn_context,
             &mut scratch.cnn_global,
         );
         self.board_hidden_into(&scratch.cnn_global, &mut scratch.hidden);
         self.value_board_forward_into(
             &scratch.conv2,
             &mut scratch.value_tail,
+            &mut scratch.value_cnn_context,
             &mut scratch.value_cnn_global,
         );
         self.value_square_embedding_into(&scratch.board, &mut scratch.value_hidden);
@@ -731,10 +872,12 @@ impl AzNnue {
         board: &[u8],
         conv1: &mut Vec<f32>,
         conv2: &mut Vec<f32>,
+        cnn_context: &mut Vec<f32>,
         cnn_global: &mut Vec<f32>,
     ) {
         conv1.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
         conv2.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        cnn_context.resize(CNN_CHANNELS, 0.0);
         cnn_global.resize(CNN_POOLED_SIZE, 0.0);
         conv_relu_layer_generic(
             board,
@@ -751,6 +894,14 @@ impl AzNnue {
             &self.board_conv2_bias,
             conv2,
         );
+        apply_global_attention_feedback(
+            conv2,
+            CNN_CHANNELS,
+            &self.board_attention_query,
+            &self.board_context_weights,
+            &self.board_context_bias,
+            cnn_context,
+        );
         pool_cnn_features(conv2, CNN_CHANNELS, &self.board_attention_query, cnn_global);
     }
 
@@ -758,10 +909,12 @@ impl AzNnue {
         &self,
         shared_conv: &[f32],
         value_tail: &mut Vec<f32>,
+        value_context: &mut Vec<f32>,
         value_cnn_global: &mut Vec<f32>,
     ) {
         debug_assert_eq!(VALUE_CNN_CHANNELS, CNN_CHANNELS);
         value_tail.resize(VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+        value_context.resize(VALUE_CNN_CHANNELS, 0.0);
         value_cnn_global.resize(VALUE_CNN_POOLED_SIZE, 0.0);
         conv_relu_layer_dense_generic(
             shared_conv,
@@ -774,6 +927,14 @@ impl AzNnue {
         for (dst, skip) in value_tail.iter_mut().zip(shared_conv.iter()) {
             *dst = (*dst + skip).max(0.0);
         }
+        apply_global_attention_feedback(
+            value_tail,
+            VALUE_CNN_CHANNELS,
+            &self.value_board_attention_query,
+            &self.value_context_weights,
+            &self.value_context_bias,
+            value_context,
+        );
         pool_cnn_features(
             value_tail,
             VALUE_CNN_CHANNELS,
@@ -849,6 +1010,8 @@ impl AzNnue {
             || self.board_conv2_weights.len() != CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
             || self.board_conv2_bias.len() != CNN_CHANNELS
             || self.board_attention_query.len() != CNN_CHANNELS
+            || self.board_context_weights.len() != CNN_CHANNELS * CNN_CHANNELS
+            || self.board_context_bias.len() != CNN_CHANNELS
             || self.board_hidden.len() != self.hidden_size * CNN_POOLED_SIZE
             || self.board_hidden_bias.len() != self.hidden_size
             || self.value_trunk_weights.len()
@@ -860,6 +1023,8 @@ impl AzNnue {
                 != VALUE_CNN_CHANNELS * CNN_CHANNELS * CNN_KERNEL_AREA
             || self.value_tail_conv_bias.len() != VALUE_CNN_CHANNELS
             || self.value_board_attention_query.len() != VALUE_CNN_CHANNELS
+            || self.value_context_weights.len() != VALUE_CNN_CHANNELS * VALUE_CNN_CHANNELS
+            || self.value_context_bias.len() != VALUE_CNN_CHANNELS
             || self.value_board_hidden.len() != VALUE_BRANCH_SIZE * VALUE_CNN_POOLED_SIZE
             || self.value_board_hidden_bias.len() != VALUE_BRANCH_SIZE
             || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * VALUE_BRANCH_SIZE
@@ -1081,6 +1246,60 @@ fn pool_cnn_features(input: &[f32], channels: usize, attention_query: &[f32], ou
         }
         output[channels * 3 + channel] = best_row_sum / BOARD_FILES as f32;
         output[channels * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
+    }
+}
+
+fn apply_global_attention_feedback(
+    features: &mut [f32],
+    channels: usize,
+    attention_query: &[f32],
+    context_weights: &[f32],
+    context_bias: &[f32],
+    context: &mut [f32],
+) {
+    debug_assert_eq!(features.len(), channels * BOARD_PLANES_SIZE);
+    debug_assert_eq!(attention_query.len(), channels);
+    debug_assert_eq!(context_weights.len(), channels * channels);
+    debug_assert_eq!(context_bias.len(), channels);
+    debug_assert_eq!(context.len(), channels);
+
+    let mut attention_logits = [0.0f32; BOARD_PLANES_SIZE];
+    let mut max_logit = f32::NEG_INFINITY;
+    for sq in 0..BOARD_PLANES_SIZE {
+        let mut logit = 0.0;
+        for channel in 0..channels {
+            logit += features[channel * BOARD_PLANES_SIZE + sq] * attention_query[channel];
+        }
+        attention_logits[sq] = logit;
+        max_logit = max_logit.max(logit);
+    }
+
+    let mut denom = 0.0;
+    for logit in &mut attention_logits {
+        *logit = (*logit - max_logit).exp();
+        denom += *logit;
+    }
+    let inv_denom = 1.0 / denom.max(1e-12);
+    context.fill(0.0);
+    for channel in 0..channels {
+        let row = &features[channel * BOARD_PLANES_SIZE..(channel + 1) * BOARD_PLANES_SIZE];
+        let mut sum = 0.0;
+        for (value, weight) in row.iter().zip(attention_logits.iter()) {
+            sum += *value * *weight * inv_denom;
+        }
+        context[channel] = sum;
+    }
+
+    for out_channel in 0..channels {
+        let mut delta = context_bias[out_channel];
+        let row = &context_weights[out_channel * channels..(out_channel + 1) * channels];
+        for (ctx, weight) in context.iter().zip(row) {
+            delta += ctx * weight;
+        }
+        let start = out_channel * BOARD_PLANES_SIZE;
+        for value in &mut features[start..start + BOARD_PLANES_SIZE] {
+            *value = (*value + delta).max(0.0);
+        }
     }
 }
 

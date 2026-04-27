@@ -5,7 +5,7 @@ use ndarray_npy::NpzReader;
 use zip::ZipArchive;
 
 use crate::{
-    nnue::canonical_move,
+    board_transform::canonical_move,
     xiangqi::{BOARD_FILES, BOARD_RANKS, Position},
 };
 

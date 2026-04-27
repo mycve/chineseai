@@ -9,7 +9,7 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
-        AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
+        AzModelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
         benchmark_training, generate_selfplay_data, global_training_step_sample_count,
         play_arena_games_from_positions, train_samples,
     },
@@ -47,8 +47,8 @@ const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 5;
 #[command(
     name = "chineseai",
     version,
-    about = "ChineseAI AZ-NNUE search and training tools",
-    long_about = "ChineseAI AZ-NNUE search and training tools.\n\nIf no command is given, the program starts in UCI mode."
+    about = "ChineseAI AZ search and training tools",
+    long_about = "ChineseAI AZ search and training tools.\n\nIf no command is given, the program starts in UCI mode."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,7 +59,7 @@ struct Cli {
 enum CliCommand {
     /// Run the UCI engine loop.
     Uci,
-    /// Create a random AZ-NNUE model.
+    /// Create a random AZ model.
     AzInit(AzInitArgs),
     /// Search one position and print policy/debug details.
     AzSearch(AzSearchArgs),
@@ -67,7 +67,7 @@ enum CliCommand {
     AzBench(AzBenchArgs),
     /// Benchmark a synthetic training workload.
     AzTrainBench(AzTrainBenchArgs),
-    /// Distill GNN npz policy/value shards into an AZ-NNUE model.
+    /// Distill GNN npz policy/value shards into an AZ model.
     #[cfg(feature = "distill")]
     AzDistill(AzDistillArgs),
     /// Run self-play training from a TOML config.
@@ -91,6 +91,21 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
+    /// CNN channels. This build currently supports 24.
+    #[arg(long)]
+    cnn_channels: Option<usize>,
+    /// Value branch width. This build currently supports 128.
+    #[arg(long)]
+    value_branch_size: Option<usize>,
+    /// Value residual branch depth. This build currently supports 2.
+    #[arg(long)]
+    value_branch_depth: Option<usize>,
+    /// Value hidden width. This build currently supports 256.
+    #[arg(long)]
+    value_hidden_size: Option<usize>,
+    /// Enable lightweight global attention feedback.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    attention_feedback: bool,
 }
 
 #[derive(Args, Debug)]
@@ -100,7 +115,7 @@ Examples:
   chineseai az-search chineseai.nnue 10000 1.5 startpos
   chineseai az-search chineseai.nnue 10000 1.5 --algorithm gumbel_alphazero startpos")]
 struct AzSearchArgs {
-    /// AZ-NNUE model path.
+    /// AZ model path.
     model: String,
     /// Number of MCTS simulations.
     #[arg(default_value_t = 10_000)]
@@ -122,7 +137,7 @@ Examples:
   chineseai az-bench chineseai.nnue 512 100 1.5 startpos
   chineseai az-bench chineseai.nnue 512 100 1.5 --algorithm gumbel_alphazero startpos")]
 struct AzBenchArgs {
-    /// AZ-NNUE model path.
+    /// AZ model path.
     model: String,
     /// Simulations per search.
     #[arg(default_value_t = 512)]
@@ -143,7 +158,7 @@ struct AzBenchArgs {
 
 #[derive(Args, Debug)]
 struct AzTrainBenchArgs {
-    /// AZ-NNUE model path.
+    /// AZ model path.
     model: String,
     /// Generated sample count.
     #[arg(default_value_t = 8192)]
@@ -168,7 +183,7 @@ struct AzDistillArgs {
     /// Directory containing metadata.json and shard_*.npz.
     #[arg(default_value = "distill_data")]
     data_dir: PathBuf,
-    /// Input/output AZ-NNUE model path. Created randomly if missing.
+    /// Input/output AZ model path. Created randomly if missing.
     #[arg(default_value = "chineseai.nnue")]
     model: PathBuf,
     /// Save to this path instead of overwriting model.
@@ -189,7 +204,7 @@ struct AzDistillArgs {
     /// Weight for the policy cross-entropy during distillation.
     #[arg(long, default_value_t = 1.0)]
     policy_weight: f32,
-    /// Update shared sparse/CNN/trunk parameters during distillation.
+    /// Update shared board CNN parameters during distillation.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     train_shared: bool,
     /// Update the value head during distillation.
@@ -368,7 +383,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     format!(
         concat!(
-            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_mxp{}_wk{}_",
+            "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_c{}_vb{}x{}_vh{}_af{}_mxp{}_wk{}_",
             "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
             "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
@@ -378,6 +393,11 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.epochs,
         config.max_sample_train_count,
         config.hidden_size,
+        config.cnn_channels,
+        config.value_branch_size,
+        config.value_branch_depth,
+        config.value_hidden_size,
+        config.attention_feedback as u8,
         config.max_plies,
         config.workers,
         config.search_algorithm.as_str(),
@@ -699,15 +719,27 @@ fn main() {
         None => run_uci(),
         Some(CliCommand::Uci) => run_uci(),
         Some(CliCommand::AzInit(cmd)) => {
-            let hidden = cmd.hidden;
+            let model_config = AzModelConfig {
+                hidden_size: cmd.hidden,
+                cnn_channels: cmd.cnn_channels.unwrap_or(24),
+                value_branch_size: cmd.value_branch_size.unwrap_or(128),
+                value_branch_depth: cmd.value_branch_depth.unwrap_or(2),
+                value_hidden_size: cmd.value_hidden_size.unwrap_or(256),
+                policy_condition_size: 32,
+                attention_feedback: cmd.attention_feedback,
+            }
+            .normalized();
+            model_config
+                .validate_supported()
+                .unwrap_or_else(|err| panic!("{err}"));
             let output = cmd.output;
             let seed = cmd.seed;
-            let model = AzNnue::random(hidden, seed);
+            let model = AzNnue::random_with_config(model_config, seed);
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
-            println!("aznnue   : initialized (nnue binary, magic AZB1)");
-            println!("hidden   : {hidden}");
+            println!("azmodel  : initialized (binary magic AZB1)");
+            println!("arch     : {:?}", model.model_config);
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
@@ -1049,22 +1081,34 @@ fn main() {
                 );
             }
             let best_path = best_model_path(&config.model_path);
+            let model_config = config.model_config();
+            model_config
+                .validate_supported()
+                .unwrap_or_else(|err| panic!("{err}"));
 
             let model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
                 match AzNnue::load(&config.model_path) {
-                    Ok(model) => model,
+                    Ok(model) => {
+                        if model.model_config != model_config {
+                            panic!(
+                                "model config mismatch: file has {:?}, config has {:?}; initialize a new model or edit config",
+                                model.model_config, model_config
+                            );
+                        }
+                        model
+                    }
                     Err(err) => {
                         println!(
-                            "model    : reinit {} as random nnue ({err})",
+                            "model    : reinit {} as random model ({err})",
                             config.model_path
                         );
-                        AzNnue::random(config.hidden_size, config.seed)
+                        AzNnue::random_with_config(model_config, config.seed)
                     }
                 }
             } else {
                 println!("model    : init {}", config.model_path);
-                AzNnue::random(config.hidden_size, config.seed)
+                AzNnue::random_with_config(model_config, config.seed)
             };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
@@ -1117,10 +1161,11 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} model={:?} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
+                model_config,
                 config.selfplay_batch_games,
                 config.epochs,
                 config.lr,
@@ -1170,8 +1215,8 @@ fn main() {
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    let mut local_model = AzNnue::random(
-                        selfplay_config.hidden_size,
+                    let mut local_model = AzNnue::random_with_config(
+                        selfplay_config.model_config(),
                         selfplay_config.seed ^ worker_id as u64,
                     );
                     while !selfplay_stop.load(Ordering::SeqCst) {

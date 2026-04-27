@@ -2,7 +2,7 @@ use crate::az::{
     AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
     alphazero_search_with_history_and_rules,
 };
-use crate::nnue::{HISTORY_PLIES, HistoryMove};
+use crate::board_transform::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Position, RuleHistoryEntry, RuleOutcome};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Write};
@@ -126,7 +126,7 @@ pub fn run_uci() {
 }
 
 fn print_uci_id() {
-    println!("id name ChineseAI AZ-NNUE");
+    println!("id name ChineseAI AZ");
     println!("id author ChineseAI");
     println!("option name EvalFile type string default chineseai.nnue");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");

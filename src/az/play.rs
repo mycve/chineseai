@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use crate::nnue::{HistoryMove, canonical_move, mirror_file_move};
+use crate::board_transform::{HistoryMove, canonical_move, mirror_file_move};
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
@@ -340,7 +340,7 @@ fn make_training_sample(
         for frame in 0..BOARD_HISTORY_FRAMES {
             let base = frame * BOARD_PLANES_SIZE;
             for sq in 0..BOARD_PLANES_SIZE {
-                mirrored[base + crate::nnue::mirror_file_square(sq)] = board[base + sq];
+                mirrored[base + crate::board_transform::mirror_file_square(sq)] = board[base + sq];
             }
         }
         board = mirrored;

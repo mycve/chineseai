@@ -1,4 +1,4 @@
-﻿use chineseai::az::{AzGumbelConfig, AzSearchAlgorithm};
+use chineseai::az::{AzGumbelConfig, AzModelConfig, AzSearchAlgorithm};
 use serde::Deserialize;
 use std::{fs, path::Path};
 
@@ -14,6 +14,11 @@ pub struct AzLoopFileConfig {
     pub max_sample_train_count: usize,
     pub max_plies: usize,
     pub hidden_size: usize,
+    pub cnn_channels: usize,
+    pub value_branch_size: usize,
+    pub value_branch_depth: usize,
+    pub value_hidden_size: usize,
+    pub attention_feedback: bool,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -54,6 +59,11 @@ impl Default for AzLoopFileConfig {
             max_sample_train_count: 2,
             max_plies: 300,
             hidden_size: 256,
+            cnn_channels: 24,
+            value_branch_size: 128,
+            value_branch_depth: 2,
+            value_hidden_size: 256,
+            attention_feedback: true,
             seed: 20260409,
             workers: 240,
             temperature_start: 1.0,
@@ -92,6 +102,11 @@ struct AzLoopTomlConfig {
     pub max_sample_train_count: Option<usize>,
     pub max_plies: Option<usize>,
     pub hidden_size: Option<usize>,
+    pub cnn_channels: Option<usize>,
+    pub value_branch_size: Option<usize>,
+    pub value_branch_depth: Option<usize>,
+    pub value_hidden_size: Option<usize>,
+    pub attention_feedback: Option<bool>,
     pub seed: Option<u64>,
     pub workers: Option<usize>,
     pub temperature_start: Option<f32>,
@@ -149,6 +164,21 @@ impl AzLoopTomlConfig {
         }
         if let Some(value) = self.hidden_size {
             config.hidden_size = value;
+        }
+        if let Some(value) = self.cnn_channels {
+            config.cnn_channels = value;
+        }
+        if let Some(value) = self.value_branch_size {
+            config.value_branch_size = value;
+        }
+        if let Some(value) = self.value_branch_depth {
+            config.value_branch_depth = value;
+        }
+        if let Some(value) = self.value_hidden_size {
+            config.value_hidden_size = value;
+        }
+        if let Some(value) = self.attention_feedback {
+            config.attention_feedback = value;
         }
         if let Some(value) = self.seed {
             config.seed = value;
@@ -236,6 +266,19 @@ impl AzLoopTomlConfig {
 }
 
 impl AzLoopFileConfig {
+    pub fn model_config(&self) -> AzModelConfig {
+        AzModelConfig {
+            hidden_size: self.hidden_size,
+            cnn_channels: self.cnn_channels,
+            value_branch_size: self.value_branch_size,
+            value_branch_depth: self.value_branch_depth,
+            value_hidden_size: self.value_hidden_size,
+            policy_condition_size: 32,
+            attention_feedback: self.attention_feedback,
+        }
+        .normalized()
+    }
+
     fn to_file_text(&self) -> String {
         format!(
             r#"# ChineseAI AZ self-play training config.
@@ -250,8 +293,7 @@ impl AzLoopFileConfig {
 # Value targets:
 #   td_lambda mixes each position's future MCTS root values with the final game outcome.
 #   1.0 keeps pure AlphaZero-style terminal labels and is the default for this
-#   v23 canonical-view policy-trunk-free net with value-only relation/move features
-#   and an independent tiny value CNN.
+#   canonical board-only net. Lower it only when terminal targets are too sparse/noisy.
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
@@ -309,13 +351,15 @@ impl AzLoopFileConfig {
 #   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
 #
 # Model architecture:
-#   hidden_size is the runtime-tunable model width.
-#   The rest of the tensor shapes are fixed by the v26 binary architecture:
-#   policy_trunk_layers=0, board_channels=126, policy_cnn_channels=24,
-#   value_tail_channels=24, value_tail_layers=1 residual, policy_condition_size=32,
-#   value_branch=128x2, value_hidden=256. Policy and value share the board CNN
-#   stem; value keeps a small tail and learned piece-square baseline.
-#   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
+#   These fields define the model created when model_path is missing. The model
+#   file also stores them, and az-loop refuses to continue if the config and
+#   model file disagree.
+#   This build supports changing hidden_size now. Other shape fields are written
+#   here so experiments are explicit, but unsupported values fail fast until the
+#   CPU/GPU forward paths are generalized for that shape.
+#   Current v28 shape: canonical board planes=126, cnn_channels=24,
+#   attention_feedback=true, value_branch=128x2, value_hidden=256,
+#   policy_condition_size=32. Historical sparse/NNUE inputs are gone.
 
 model_path = "{model_path}"
 simulations = {simulations}
@@ -326,6 +370,11 @@ batch_size = {batch_size}
 max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
+cnn_channels = {cnn_channels}
+value_branch_size = {value_branch_size}
+value_branch_depth = {value_branch_depth}
+value_hidden_size = {value_hidden_size}
+attention_feedback = {attention_feedback}
 seed = {seed}
 workers = {workers}
 temperature_start = {temperature_start}
@@ -363,6 +412,11 @@ tensorboard_logdir = "{tensorboard_logdir}"
             max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
+            cnn_channels = self.cnn_channels,
+            value_branch_size = self.value_branch_size,
+            value_branch_depth = self.value_branch_depth,
+            value_hidden_size = self.value_hidden_size,
+            attention_feedback = self.attention_feedback,
             seed = self.seed,
             workers = self.workers,
             temperature_start = self.temperature_start,
@@ -409,6 +463,10 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.max_sample_train_count = self.max_sample_train_count.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
+        self.cnn_channels = self.cnn_channels.max(1);
+        self.value_branch_size = self.value_branch_size.max(1);
+        self.value_branch_depth = self.value_branch_depth.max(1);
+        self.value_hidden_size = self.value_hidden_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);

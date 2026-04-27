@@ -1,4 +1,4 @@
-use crate::nnue::HistoryMove;
+use crate::board_transform::HistoryMove;
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 use super::mctx::{self, ActionStats, AzGumbelConfig};
@@ -637,7 +637,9 @@ fn sample_standard_normal(rng: &mut SplitMix64, salt: u64) -> f32 {
 pub(super) fn append_history(history: &mut Vec<HistoryMove>, position: &Position, mv: Move) {
     if let Some(piece) = position.piece_at(mv.from as usize) {
         history.push(HistoryMove { piece, mv });
-        let overflow = history.len().saturating_sub(crate::nnue::HISTORY_PLIES);
+        let overflow = history
+            .len()
+            .saturating_sub(crate::board_transform::HISTORY_PLIES);
         if overflow > 0 {
             history.drain(0..overflow);
         }
@@ -649,7 +651,8 @@ fn clone_history_with_appended_move(
     position: &Position,
     mv: Move,
 ) -> Vec<HistoryMove> {
-    let mut out = Vec::with_capacity((history.len() + 1).min(crate::nnue::HISTORY_PLIES));
+    let mut out =
+        Vec::with_capacity((history.len() + 1).min(crate::board_transform::HISTORY_PLIES));
     out.extend_from_slice(history);
     append_history(&mut out, position, mv);
     out
@@ -670,7 +673,7 @@ fn truncate_history(history: &[HistoryMove]) -> Vec<HistoryMove> {
     history
         .iter()
         .rev()
-        .take(crate::nnue::HISTORY_PLIES)
+        .take(crate::board_transform::HISTORY_PLIES)
         .copied()
         .collect::<Vec<_>>()
         .into_iter()

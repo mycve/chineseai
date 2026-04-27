@@ -20,6 +20,7 @@ const DEFAULT_MIN_SAMPLES_PER_GPU: usize = 1;
 
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
+    model_config: super::AzModelConfig,
     hidden_size: usize,
     device_indices: Vec<usize>,
     replicas: Vec<GpuReplica>,
@@ -41,6 +42,8 @@ struct GpuVars {
     board_conv2_weights: Var,
     board_conv2_bias: Var,
     board_attention_query: Var,
+    board_context_weights: Var,
+    board_context_bias: Var,
     board_hidden: Var,
     board_hidden_bias: Var,
     value_trunk_weights: Vec<Var>,
@@ -50,6 +53,8 @@ struct GpuVars {
     value_tail_conv_weights: Var,
     value_tail_conv_bias: Var,
     value_board_attention_query: Var,
+    value_context_weights: Var,
+    value_context_bias: Var,
     value_board_hidden: Var,
     value_board_hidden_bias: Var,
     value_intermediate_hidden: Var,
@@ -163,6 +168,7 @@ impl GpuTrainer {
         }
         Ok(Self {
             hidden_size: model.hidden_size,
+            model_config: model.model_config,
             device_indices,
             replicas,
             optimizers,
@@ -173,6 +179,7 @@ impl GpuTrainer {
 
     fn matches(&self, model: &AzNnue) -> bool {
         self.hidden_size == model.hidden_size
+            && self.model_config == model.model_config
             && self.device_indices == cuda_device_indices()
             && self.sync_every == multi_gpu_sync_every()
     }
@@ -506,6 +513,21 @@ impl GpuReplica {
             .relu()?;
 
         let conv2_flat = conv2.reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?;
+        let context_query = self
+            .vars
+            .board_attention_query
+            .reshape((1, CNN_CHANNELS, 1))?;
+        let context_logits = conv2_flat.broadcast_mul(&context_query)?.sum(1)?;
+        let context_weights = softmax(&context_logits, 1)?;
+        let context_pool = conv2_flat
+            .broadcast_mul(&context_weights.unsqueeze(1)?)?
+            .sum(2)?;
+        let context_delta = context_pool
+            .matmul(&self.vars.board_context_weights.t()?)?
+            .broadcast_add(&self.vars.board_context_bias)?
+            .reshape((bsz, CNN_CHANNELS, 1, 1))?;
+        let conv2 = conv2.broadcast_add(&context_delta)?.relu()?;
+        let conv2_flat = conv2.reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?;
         let avg_pool = conv2_flat.mean(2)?;
         let max_pool = conv2_flat.max(2)?;
         let attn_query = self
@@ -540,6 +562,23 @@ impl GpuReplica {
                 1,
             ))?)?;
         let value_tail = (value_tail_raw + conv2)?.relu()?;
+        let value_tail_flat = value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
+        let value_context_query =
+            self.vars
+                .value_board_attention_query
+                .reshape((1, VALUE_CNN_CHANNELS, 1))?;
+        let value_context_logits = value_tail_flat
+            .broadcast_mul(&value_context_query)?
+            .sum(1)?;
+        let value_context_weights = softmax(&value_context_logits, 1)?;
+        let value_context_pool = value_tail_flat
+            .broadcast_mul(&value_context_weights.unsqueeze(1)?)?
+            .sum(2)?;
+        let value_context_delta = value_context_pool
+            .matmul(&self.vars.value_context_weights.t()?)?
+            .broadcast_add(&self.vars.value_context_bias)?
+            .reshape((bsz, VALUE_CNN_CHANNELS, 1, 1))?;
+        let value_tail = value_tail.broadcast_add(&value_context_delta)?.relu()?;
         let value_tail_flat = value_tail.reshape((bsz, VALUE_CNN_CHANNELS, BOARD_PLANES_SIZE))?;
         let value_avg_pool = value_tail_flat.mean(2)?;
         let value_max_pool = value_tail_flat.max(2)?;
@@ -735,6 +774,12 @@ impl GpuVars {
                 CNN_CHANNELS,
                 device,
             )?,
+            board_context_weights: var_from_slice(
+                &model.board_context_weights,
+                (CNN_CHANNELS, CNN_CHANNELS),
+                device,
+            )?,
+            board_context_bias: var_from_slice(&model.board_context_bias, CNN_CHANNELS, device)?,
             board_hidden: var_from_slice(&model.board_hidden, (hidden, CNN_POOLED_SIZE), device)?,
             board_hidden_bias: var_from_slice(&model.board_hidden_bias, hidden, device)?,
             value_trunk_weights,
@@ -761,6 +806,16 @@ impl GpuVars {
             )?,
             value_board_attention_query: var_from_slice(
                 &model.value_board_attention_query,
+                VALUE_CNN_CHANNELS,
+                device,
+            )?,
+            value_context_weights: var_from_slice(
+                &model.value_context_weights,
+                (VALUE_CNN_CHANNELS, VALUE_CNN_CHANNELS),
+                device,
+            )?,
+            value_context_bias: var_from_slice(
+                &model.value_context_bias,
                 VALUE_CNN_CHANNELS,
                 device,
             )?,
@@ -831,6 +886,8 @@ impl GpuVars {
         vars.push(self.board_conv2_weights.clone());
         vars.push(self.board_conv2_bias.clone());
         vars.push(self.board_attention_query.clone());
+        vars.push(self.board_context_weights.clone());
+        vars.push(self.board_context_bias.clone());
         vars.push(self.board_hidden.clone());
         vars.push(self.board_hidden_bias.clone());
         vars.extend(self.value_trunk_weights.iter().cloned());
@@ -840,6 +897,8 @@ impl GpuVars {
         vars.push(self.value_square_hidden.clone());
         vars.push(self.value_square_hidden_bias.clone());
         vars.push(self.value_board_attention_query.clone());
+        vars.push(self.value_context_weights.clone());
+        vars.push(self.value_context_bias.clone());
         vars.push(self.value_board_hidden.clone());
         vars.push(self.value_board_hidden_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
@@ -862,6 +921,8 @@ impl GpuVars {
         vars.push(self.board_conv2_weights.clone());
         vars.push(self.board_conv2_bias.clone());
         vars.push(self.board_attention_query.clone());
+        vars.push(self.board_context_weights.clone());
+        vars.push(self.board_context_bias.clone());
         vars.push(self.board_hidden.clone());
         vars.push(self.board_hidden_bias.clone());
         vars
@@ -874,6 +935,8 @@ impl GpuVars {
             self.value_square_hidden.clone(),
             self.value_square_hidden_bias.clone(),
             self.value_board_attention_query.clone(),
+            self.value_context_weights.clone(),
+            self.value_context_bias.clone(),
             self.value_board_hidden.clone(),
             self.value_board_hidden_bias.clone(),
             self.value_intermediate_hidden.clone(),
@@ -924,6 +987,11 @@ impl GpuVars {
             &self.board_attention_query,
             &mut model.board_attention_query,
         )?;
+        copy_var(
+            &self.board_context_weights,
+            &mut model.board_context_weights,
+        )?;
+        copy_var(&self.board_context_bias, &mut model.board_context_bias)?;
         copy_var(&self.board_hidden, &mut model.board_hidden)?;
         copy_var(&self.board_hidden_bias, &mut model.board_hidden_bias)?;
         for layer in 0..VALUE_BRANCH_DEPTH {
@@ -953,6 +1021,11 @@ impl GpuVars {
             &self.value_board_attention_query,
             &mut model.value_board_attention_query,
         )?;
+        copy_var(
+            &self.value_context_weights,
+            &mut model.value_context_weights,
+        )?;
+        copy_var(&self.value_context_bias, &mut model.value_context_bias)?;
         copy_var(&self.value_board_hidden, &mut model.value_board_hidden)?;
         copy_var(
             &self.value_board_hidden_bias,

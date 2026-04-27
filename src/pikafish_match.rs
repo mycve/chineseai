@@ -10,7 +10,7 @@ use crate::az::{
     AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
     alphazero_search_with_history_and_rules,
 };
-use crate::nnue::{HISTORY_PLIES, HistoryMove};
+use crate::board_transform::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 #[derive(Clone, Debug, Default)]
