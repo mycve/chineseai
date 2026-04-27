@@ -520,25 +520,6 @@ impl Position {
         legal
     }
 
-    pub fn perft(&self, depth: u32) -> u64 {
-        if depth == 0 {
-            return 1;
-        }
-
-        let moves = self.legal_moves();
-        if depth == 1 {
-            return moves.len() as u64;
-        }
-
-        let mut nodes = 0u64;
-        for mv in moves {
-            let mut next = self.clone();
-            next.make_move(mv);
-            nodes += next.perft(depth - 1);
-        }
-        nodes
-    }
-
     pub fn make_move(&mut self, mv: Move) -> Undo {
         let from = mv.from as usize;
         let to = mv.to as usize;
@@ -2002,14 +1983,6 @@ mod tests {
     }
 
     #[test]
-    fn startpos_perft_matches_reference_depths_1_to_3() {
-        let position = Position::startpos();
-        assert_eq!(position.perft(1), 44);
-        assert_eq!(position.perft(2), 1_920);
-        assert_eq!(position.perft(3), 79_666);
-    }
-
-    #[test]
     fn horse_leg_block_prevents_move() {
         let position = Position::from_fen("4k4/9/9/9/4P4/9/3P5/3H5/9/4K4 w").unwrap();
         let moves = position.legal_moves();
@@ -2080,6 +2053,51 @@ mod tests {
         let undo = position.make_move(mv);
         position.unmake_move(mv, undo);
         assert_eq!(position.hash(), original_hash);
+    }
+
+    #[test]
+    fn random_legal_playouts_preserve_move_and_cache_invariants() {
+        let mut rng = TestRng::new(0x2026_0427_cafe_f00d);
+        for game in 0..16 {
+            let mut position = Position::startpos();
+            for ply in 0..160 {
+                assert_position_caches_consistent(&position);
+                if !position.has_general(Color::Red) || !position.has_general(Color::Black) {
+                    break;
+                }
+
+                let fen = position.to_fen();
+                let reparsed = Position::from_fen(&fen).unwrap();
+                assert_eq!(reparsed.to_fen(), fen, "game={game} ply={ply}");
+
+                let legal = position.legal_moves();
+                for &mv in &legal {
+                    assert!(
+                        position.is_legal_move(mv),
+                        "legal list contains move rejected by is_legal_move: game={game} ply={ply} mv={mv} fen={fen}"
+                    );
+                    let mut next = position.clone();
+                    next.make_move(mv);
+                    assert!(
+                        !next.in_check(position.side_to_move()),
+                        "legal move leaves mover in check: game={game} ply={ply} mv={mv} fen={fen}"
+                    );
+                    assert_position_caches_consistent(&next);
+                }
+
+                if legal.is_empty() {
+                    break;
+                }
+
+                let original = position.clone();
+                let mv = legal[rng.next_usize(legal.len())];
+                let undo = position.make_move(mv);
+                assert_position_caches_consistent(&position);
+                position.unmake_move(mv, undo);
+                assert_eq!(position, original, "unmake mismatch: game={game} ply={ply}");
+                position.make_move(mv);
+            }
+        }
     }
 
     #[test]
@@ -2199,6 +2217,39 @@ mod tests {
             mover,
             gives_check,
             chased_mask,
+        }
+    }
+
+    fn assert_position_caches_consistent(position: &Position) {
+        let state = position.compute_state();
+        assert_eq!(position.hash, state.hash);
+        assert_eq!(position.base_eval, state.base_eval);
+        assert_eq!(position.advisor_counts, state.advisor_counts);
+        assert_eq!(position.elephant_counts, state.elephant_counts);
+        assert_eq!(
+            position.dynamic_material_counts,
+            state.dynamic_material_counts
+        );
+        assert_eq!(position.general_squares, state.general_squares);
+    }
+
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut x = self.0;
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            x ^ (x >> 31)
+        }
+
+        fn next_usize(&mut self, upper: usize) -> usize {
+            (self.next_u64() as usize) % upper
         }
     }
 

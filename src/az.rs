@@ -6,8 +6,6 @@ use crate::xiangqi::{Move, Position};
 use std::fs;
 
 mod alphazero;
-#[cfg(feature = "distill")]
-mod distill;
 mod mctx;
 mod model;
 mod model_binary;
@@ -22,11 +20,7 @@ pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
     alphazero_search_with_history_and_rules,
 };
-#[cfg(feature = "distill")]
-pub use distill::{AzDistillLoadOptions, AzDistillLoadStats, load_distill_npz_samples};
 pub use mctx::AzGumbelConfig;
-#[cfg(feature = "distill")]
-use model::dense_move_to_move;
 use model::{
     AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_VERSION, AzEvalScratch, BOARD_CHANNELS,
     BOARD_HISTORY_FRAMES, BOARD_HISTORY_SIZE, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE,
@@ -35,7 +29,7 @@ use model::{
     VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_SCALE_CP, dense_move_index,
     extract_board_planes, policy_move_features,
 };
-pub use model::{AZ_MODEL_BINARY_MAGIC, AzModel, SplitMix64, benchmark_training};
+pub use model::{AZ_MODEL_BINARY_MAGIC, AzModel, SplitMix64};
 #[cfg(test)]
 use model::{canonical_piece_plane, move_map};
 pub use model_config::AzModelConfig;
@@ -44,7 +38,7 @@ pub use play::{
     play_arena_games_from_positions,
 };
 pub use replay::AzExperiencePool;
-pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
+pub use train::{global_training_step_sample_count, train_samples};
 
 #[derive(Clone, Debug)]
 pub struct AzLoopConfig {
@@ -103,13 +97,6 @@ pub struct AzLoopReport {
     pub terminal_max_plies: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AzTrainBenchmark {
-    pub loss: f32,
-    pub value_loss: f32,
-    pub policy_ce: f32,
-}
-
 #[derive(Clone, Debug)]
 pub struct AzTrainingSample {
     pub board: Vec<u8>,
@@ -130,27 +117,6 @@ pub struct AzTrainStats {
     pub value_target_sq_sum: f32,
     pub value_error_sq_sum: f32,
     pub samples: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct AzTrainLossWeights {
-    pub value: f32,
-    pub policy: f32,
-    pub train_shared: bool,
-    pub train_value_head: bool,
-    pub train_policy_head: bool,
-}
-
-impl Default for AzTrainLossWeights {
-    fn default() -> Self {
-        Self {
-            value: 1.0,
-            policy: 1.0,
-            train_shared: true,
-            train_value_head: true,
-            train_policy_head: true,
-        }
-    }
 }
 
 impl AzTrainStats {

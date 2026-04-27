@@ -4,10 +4,10 @@ use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
 use super::{
-    AzModel, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS,
-    BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE,
-    PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS,
-    VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS, policy_move_features,
+    AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
+    CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE,
+    RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_FEATURES, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
+    policy_move_features,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -69,7 +69,6 @@ pub(super) fn train_samples_gpu(
     // Per-GPU micro-batch size for one training step.
     per_gpu_batch_size: usize,
     rng: &mut super::SplitMix64,
-    loss_weights: AzTrainLossWeights,
 ) -> CandleResult<AzTrainStats> {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
         return Ok(AzTrainStats::default());
@@ -96,7 +95,7 @@ pub(super) fn train_samples_gpu(
             shuffle(&mut order, rng);
             stats = AzTrainStats::default();
             for batch in order.chunks(step_chunk) {
-                let batch_stats = trainer.train_batch(samples, batch, loss_weights)?;
+                let batch_stats = trainer.train_batch(samples, batch)?;
                 stats.add_assign(&batch_stats);
             }
         }
@@ -178,11 +177,10 @@ impl GpuTrainer {
         &mut self,
         samples: &[AzTrainingSample],
         batch: &[usize],
-        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
         let active_replicas = self.active_replica_count(batch.len());
         if active_replicas <= 1 {
-            return self.train_batch_single(samples, batch, loss_weights);
+            return self.train_batch_single(samples, batch);
         }
 
         let shard_size = batch.len().div_ceil(active_replicas);
@@ -195,7 +193,7 @@ impl GpuTrainer {
             }
         }
         if self.sync_every > 1 && active_replicas == self.replicas.len() {
-            return self.train_batch_local_sgd(samples, batch, &shard_ranges, loss_weights);
+            return self.train_batch_local_sgd(samples, batch, &shard_ranges);
         }
         self.finish_local_sync()?;
 
@@ -209,7 +207,6 @@ impl GpuTrainer {
                         &batch[range],
                         batch.len(),
                         shard_index == 0,
-                        loss_weights,
                     )
                 }));
             }
@@ -245,7 +242,6 @@ impl GpuTrainer {
         samples: &[AzTrainingSample],
         batch: &[usize],
         shard_ranges: &[std::ops::Range<usize>],
-        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
         let shard_outputs = {
             let replicas = &self.replicas;
@@ -258,7 +254,7 @@ impl GpuTrainer {
                     .zip(shard_ranges.iter().cloned())
                 {
                     handles.push(scope.spawn(move || {
-                        replica.train_local_batch(optimizer, samples, &batch[range], loss_weights)
+                        replica.train_local_batch(optimizer, samples, &batch[range])
                     }));
                 }
                 let mut outputs = Vec::with_capacity(handles.len());
@@ -298,15 +294,8 @@ impl GpuTrainer {
         &mut self,
         samples: &[AzTrainingSample],
         batch: &[usize],
-        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
-        let output = self.replicas[0].compute_batch_grads(
-            samples,
-            batch,
-            batch.len(),
-            true,
-            loss_weights,
-        )?;
+        let output = self.replicas[0].compute_batch_grads(samples, batch, batch.len(), true)?;
         self.optimizers[0].step(
             output
                 .grads
@@ -405,7 +394,6 @@ impl GpuReplica {
         batch: &[usize],
         global_batch_len: usize,
         keep_grads: bool,
-        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<ShardOutput> {
         let batch_tensors = BatchTensors::new(samples, batch, &self.device)?;
         let forward = self.forward(&batch_tensors)?;
@@ -422,11 +410,8 @@ impl GpuReplica {
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce = policy_ce_per_sample.sum_all()?;
-        let weighted_value_loss = (&value_loss * loss_weights.value.max(0.0) as f64)?;
-        let weighted_policy_ce = (&policy_ce * loss_weights.policy.max(0.0) as f64)?;
-        let loss_tensor = ((weighted_value_loss + weighted_policy_ce)? / global_batch_len as f64)?;
-        let mut grads = loss_tensor.backward()?;
-        self.vars.remove_frozen_grads(&mut grads, loss_weights);
+        let loss_tensor = ((&value_loss + &policy_ce)? / global_batch_len as f64)?;
+        let grads = loss_tensor.backward()?;
 
         let value_loss = value_loss.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
@@ -458,9 +443,8 @@ impl GpuReplica {
         optimizer: &mut AdamW,
         samples: &[AzTrainingSample],
         batch: &[usize],
-        loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
-        let output = self.compute_batch_grads(samples, batch, batch.len(), true, loss_weights)?;
+        let output = self.compute_batch_grads(samples, batch, batch.len(), true)?;
         optimizer.step(
             output
                 .grads
@@ -753,57 +737,6 @@ impl GpuVars {
         vars.push(self.policy_feature_cnn.clone());
         vars.push(self.policy_feature_bias.clone());
         vars
-    }
-
-    fn shared_vars(&self) -> Vec<Var> {
-        let mut vars = Vec::new();
-        vars.push(self.board_conv1_weights.clone());
-        vars.push(self.board_conv1_bias.clone());
-        vars.extend(self.residual_weights.iter().cloned());
-        vars.extend(self.residual_biases.iter().cloned());
-        vars.push(self.board_hidden.clone());
-        vars.push(self.board_hidden_bias.clone());
-        vars
-    }
-
-    fn value_head_vars(&self) -> Vec<Var> {
-        vec![
-            self.value_tail_conv_weights.clone(),
-            self.value_tail_conv_bias.clone(),
-            self.value_intermediate_hidden.clone(),
-            self.value_intermediate_bias.clone(),
-            self.value_logits_weights.clone(),
-            self.value_logits_bias.clone(),
-        ]
-    }
-
-    fn policy_head_vars(&self) -> Vec<Var> {
-        vec![
-            self.policy_move_hidden.clone(),
-            self.policy_move_cnn.clone(),
-            self.policy_move_bias.clone(),
-            self.policy_feature_hidden.clone(),
-            self.policy_feature_cnn.clone(),
-            self.policy_feature_bias.clone(),
-        ]
-    }
-
-    fn remove_frozen_grads(&self, grads: &mut GradStore, loss_weights: AzTrainLossWeights) {
-        if !loss_weights.train_shared {
-            for var in self.shared_vars() {
-                grads.remove(&var);
-            }
-        }
-        if !loss_weights.train_value_head {
-            for var in self.value_head_vars() {
-                grads.remove(&var);
-            }
-        }
-        if !loss_weights.train_policy_head {
-            for var in self.policy_head_vars() {
-                grads.remove(&var);
-            }
-        }
     }
 
     fn copy_to_model(&self, model: &mut AzModel) -> CandleResult<()> {

@@ -8,9 +8,7 @@ use super::model_ops::{
     conv_relu_board_layer_sparse_3x3, conv1x1_relu_layer_dense_generic, dot_product,
     pool_cnn_features, residual_cnn_block_generic, scalar_value_from_logits,
 };
-use super::train::train_samples;
 use super::train_gpu;
-use super::{AzTrainBenchmark, AzTrainingSample};
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
 pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 2;
@@ -109,8 +107,8 @@ pub struct AzModel {
 //   stays cheap while the board representation is now much closer to a normal
 //   AlphaZero-style CNN tower.
 // - Do not resurrect the old sparse V4/NNUE-style board identities here. They
-//   made distillation easier to overfit but muddied whether self-play value was
-//   learning from board structure.
+//   made offline fitting easier but muddied whether self-play value was learning
+//   from board structure.
 
 impl Clone for AzModel {
     fn clone(&self) -> Self {
@@ -467,58 +465,6 @@ pub(super) fn canonical_piece_plane(side: Color, piece_color: Color, kind: Piece
     absolute_piece_plane(canonical_color, kind)
 }
 
-/// `batch_size` is the per-device training batch size.
-pub fn benchmark_training(
-    model: &mut AzModel,
-    sample_count: usize,
-    epochs: usize,
-    batch_size: usize,
-    lr: f32,
-    seed: u64,
-) -> AzTrainBenchmark {
-    let mut rng = SplitMix64::new(seed);
-    let mut samples = Vec::with_capacity(sample_count);
-    for index in 0..sample_count {
-        let mut board = vec![0; BOARD_HISTORY_SIZE];
-        for _ in 0..32 {
-            let sq = (rng.next_u64() as usize) % BOARD_HISTORY_SIZE;
-            board[sq] = 1 + (rng.next_u64() as u8 % PIECE_BOARD_CHANNELS as u8);
-        }
-        let value = rng.unit_f32() * 2.0 - 1.0;
-        let move_count = 12 + (rng.next_u64() as usize % 24);
-        let mut move_indices = Vec::with_capacity(move_count);
-        while move_indices.len() < move_count {
-            let candidate = (rng.next_u64() as usize) % DENSE_MOVE_SPACE;
-            if !move_indices.contains(&candidate) {
-                move_indices.push(candidate);
-            }
-        }
-        let mut policy = (0..move_count)
-            .map(|_| rng.unit_f32().max(1e-6))
-            .collect::<Vec<_>>();
-        let policy_sum = policy.iter().sum::<f32>().max(1e-6);
-        for value in &mut policy {
-            *value /= policy_sum;
-        }
-        samples.push(AzTrainingSample {
-            board,
-            move_indices,
-            policy,
-            value,
-            side_sign: 1.0,
-        });
-        if index + 1 == sample_count {
-            break;
-        }
-    }
-    let stats = train_samples(model, &samples, epochs, lr, batch_size, &mut rng);
-    AzTrainBenchmark {
-        loss: stats.loss,
-        value_loss: stats.value_loss,
-        policy_ce: stats.policy_ce,
-    }
-}
-
 pub struct SplitMix64 {
     state: u64,
 }
@@ -741,10 +687,4 @@ pub(super) fn dense_move_index(mv: Move) -> usize {
         mv.to
     );
     dense as usize
-}
-
-#[cfg_attr(not(feature = "distill"), allow(dead_code))]
-pub(super) fn dense_move_to_move(index: usize) -> Option<Move> {
-    let sparse = *move_map().dense_to_sparse.get(index)? as usize;
-    Some(Move::new(sparse / BOARD_SIZE, sparse % BOARD_SIZE))
 }

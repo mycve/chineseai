@@ -3,15 +3,16 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod az_loop_config;
+mod rule_ui;
 
 use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az_loop_config};
+use rule_ui::run_rule_ui;
 
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
-        AzModel, AzModelConfig, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData,
-        alphazero_search, benchmark_training, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzModel,
+        AzModelConfig, AzSelfplayData, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions, train_samples,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -31,12 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
-
-#[cfg(feature = "distill")]
-use chineseai::az::{
-    AzDistillLoadOptions, AzTrainLossWeights, AzTrainStats, SplitMix64, load_distill_npz_samples,
-    train_samples_weighted,
-};
 
 const DEFAULT_ARENA_EVAL_FENS: &str = "eval_fens.txt";
 const DEFAULT_VS_PIKAFISH_DEPTH: u32 = 10;
@@ -61,21 +56,12 @@ enum CliCommand {
     Uci,
     /// Create a random AZ model.
     AzInit(AzInitArgs),
-    /// Search one position and print policy/debug details.
-    AzSearch(AzSearchArgs),
-    /// Benchmark fixed-position search speed.
-    AzBench(AzBenchArgs),
-    /// Benchmark a synthetic training workload.
-    AzTrainBench(AzTrainBenchArgs),
-    /// Distill GNN npz policy/value shards into an AZ model.
-    #[cfg(feature = "distill")]
-    AzDistill(AzDistillArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
     /// Internal arena worker process.
     AzArenaWorker(AzArenaWorkerArgs),
-    /// Count legal move tree nodes for a position.
-    Perft(PerftArgs),
+    /// Lightweight browser UI for testing Xiangqi rules.
+    RuleUi(RuleUiArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
 }
@@ -103,128 +89,6 @@ struct AzInitArgs {
     /// Value hidden width. This build currently supports 256.
     #[arg(long)]
     value_hidden_size: Option<usize>,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai az-search chineseai.azm
-  chineseai az-search chineseai.azm 10000 1.5 startpos
-  chineseai az-search chineseai.azm 10000 1.5 --algorithm gumbel_alphazero startpos")]
-struct AzSearchArgs {
-    /// AZ model path.
-    model: String,
-    /// Number of MCTS simulations.
-    #[arg(default_value_t = 10_000)]
-    simulations: usize,
-    /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.5)]
-    cpuct: f32,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
-    /// FEN string, or startpos if omitted.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    fen: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai az-bench chineseai.azm 512 100 1.5 startpos
-  chineseai az-bench chineseai.azm 512 100 1.5 --algorithm gumbel_alphazero startpos")]
-struct AzBenchArgs {
-    /// AZ model path.
-    model: String,
-    /// Simulations per search.
-    #[arg(default_value_t = 512)]
-    simulations: usize,
-    /// Number of repeated searches.
-    #[arg(default_value_t = 100)]
-    repeat: usize,
-    /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.5)]
-    cpuct: f32,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
-    /// FEN string, or startpos if omitted.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    fen: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-struct AzTrainBenchArgs {
-    /// AZ model path.
-    model: String,
-    /// Generated sample count.
-    #[arg(default_value_t = 8192)]
-    samples: usize,
-    /// Passes over generated samples.
-    #[arg(default_value_t = 2)]
-    epochs: usize,
-    /// Micro-batch size per visible GPU.
-    #[arg(default_value_t = 1024)]
-    batch_size_per_gpu: usize,
-    /// Learning rate.
-    #[arg(default_value_t = 0.0003)]
-    lr: f32,
-    /// Random seed.
-    #[arg(default_value_t = 20260411)]
-    seed: u64,
-}
-
-#[derive(Args, Debug)]
-#[cfg(feature = "distill")]
-struct AzDistillArgs {
-    /// Directory containing metadata.json and shard_*.npz.
-    #[arg(default_value = "distill_data")]
-    data_dir: PathBuf,
-    /// Input/output AZ model path. Created randomly if missing.
-    #[arg(default_value = "chineseai.azm")]
-    model: PathBuf,
-    /// Save to this path instead of overwriting model.
-    #[arg(long)]
-    output: Option<PathBuf>,
-    /// Hidden size used when creating a missing model.
-    #[arg(long, default_value_t = 128)]
-    hidden: usize,
-    /// Training epochs over all shards.
-    #[arg(long, default_value_t = 1)]
-    epochs: usize,
-    /// Learning rate.
-    #[arg(long, default_value_t = 0.0003)]
-    lr: f32,
-    /// Weight for the value cross-entropy during distillation.
-    #[arg(long, default_value_t = 1.0)]
-    value_weight: f32,
-    /// Weight for the policy cross-entropy during distillation.
-    #[arg(long, default_value_t = 1.0)]
-    policy_weight: f32,
-    /// Update shared board CNN parameters during distillation.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    train_shared: bool,
-    /// Update the value head during distillation.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    train_value_head: bool,
-    /// Update the policy head during distillation.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    train_policy_head: bool,
-    /// Batch size per visible GPU.
-    #[arg(long, default_value_t = 1024)]
-    batch_size: usize,
-    /// Cap rows loaded from each shard; 0 means all rows.
-    #[arg(long, default_value_t = 0)]
-    max_rows_per_shard: usize,
-    /// Random seed for model init and training shuffle.
-    #[arg(long, default_value_t = 20260426)]
-    seed: u64,
-    /// Skip legal-mask alignment diagnostics while loading.
-    #[arg(long, default_value_t = false)]
-    no_validate_legal: bool,
-    /// Load and validate shards without training or saving.
-    #[arg(long, default_value_t = false)]
-    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -257,10 +121,13 @@ struct AzArenaWorkerArgs {
 }
 
 #[derive(Args, Debug)]
-struct PerftArgs {
-    /// Search depth.
-    #[arg(default_value_t = 1)]
-    depth: u32,
+struct RuleUiArgs {
+    /// Bind host.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// Bind port.
+    #[arg(long, default_value_t = 7878)]
+    port: u16,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -294,11 +161,6 @@ struct VsPikafishArgs {
     eval_fens_path: String,
 }
 
-fn parse_search_algorithm(text: &str) -> Result<AzSearchAlgorithm, String> {
-    AzSearchAlgorithm::parse(text)
-        .ok_or_else(|| "expected `alphazero` or `gumbel_alphazero`".to_string())
-}
-
 fn best_model_path(model_path: &str) -> PathBuf {
     PathBuf::from(format!("{model_path}.best"))
 }
@@ -327,33 +189,6 @@ fn read_az_loop_next_update(config_path: &str) -> Option<usize> {
         }
     }
     None
-}
-
-#[cfg(feature = "distill")]
-fn distill_shard_paths(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut paths = fs::read_dir(data_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("npz"))
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    Ok(paths)
-}
-
-#[cfg(feature = "distill")]
-fn add_train_stats(total: &mut AzTrainStats, stats: &AzTrainStats) {
-    total.loss += stats.loss * stats.samples as f32;
-    total.value_loss += stats.value_loss * stats.samples as f32;
-    total.policy_ce += stats.policy_ce * stats.samples as f32;
-    total.value_pred_sum += stats.value_pred_sum;
-    total.value_pred_sq_sum += stats.value_pred_sq_sum;
-    total.value_target_sum += stats.value_target_sum;
-    total.value_target_sq_sum += stats.value_target_sq_sum;
-    total.value_error_sq_sum += stats.value_error_sq_sum;
-    total.samples += stats.samples;
 }
 
 fn write_az_loop_next_update(config_path: &str, next: usize) {
@@ -737,330 +572,6 @@ fn main() {
             println!("arch     : {:?}", model.model_config);
             println!("seed     : {seed}");
             println!("output   : {output}");
-        }
-        Some(CliCommand::AzSearch(cmd)) => {
-            let model_path = cmd.model;
-            let simulations = cmd.simulations.max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-            let fen = cmd.fen.join(" ");
-            let position = parse_position(&fen);
-            let model = AzModel::load(&model_path).unwrap_or_else(|err| {
-                panic!("failed to load `{model_path}`: {err}");
-            });
-            let result = alphazero_search(
-                &position,
-                &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    algorithm,
-                    gumbel: AzGumbelConfig::default(),
-                },
-            );
-            println!("fen      : {}", position.to_fen());
-            println!("model    : {model_path}");
-            println!("sims     : {}", result.simulations);
-            println!("search   : {}", algorithm.as_str());
-            println!("cpuct    : {cpuct}");
-            println!("value_cp : {}", result.value_cp);
-            println!(
-                "bestmove : {}",
-                result
-                    .best_move
-                    .map(|mv| mv.to_string())
-                    .unwrap_or_else(|| "(none)".into())
-            );
-            println!(
-                "visited_actions: {}",
-                result
-                    .candidates
-                    .iter()
-                    .filter(|candidate| candidate.visits > 0)
-                    .count()
-            );
-            println!("by_policy:");
-            for candidate in &result.candidates {
-                println!(
-                    "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-                );
-            }
-            println!("by_visits:");
-            let mut by_visits = result.candidates.clone();
-            by_visits.sort_by(|left, right| {
-                right
-                    .visits
-                    .cmp(&left.visits)
-                    .then_with(|| right.policy.total_cmp(&left.policy))
-                    .then_with(|| right.q.total_cmp(&left.q))
-            });
-            for candidate in &by_visits {
-                println!(
-                    "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-                );
-            }
-        }
-        Some(CliCommand::AzBench(cmd)) => {
-            let model_path = cmd.model;
-            let simulations = cmd.simulations.max(1);
-            let repeat = cmd.repeat.max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-            let fen = cmd.fen.join(" ");
-            let position = parse_position(&fen);
-            let model = AzModel::load(&model_path).unwrap_or_else(|err| {
-                panic!("failed to load `{model_path}`: {err}");
-            });
-
-            let _ = alphazero_search(
-                &position,
-                &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    algorithm,
-                    gumbel: AzGumbelConfig::default(),
-                },
-            );
-
-            let started = std::time::Instant::now();
-            let mut total_sims = 0usize;
-            let mut best_move = None;
-            for iteration in 0..repeat {
-                let result = alphazero_search(
-                    &position,
-                    &model,
-                    AzSearchLimits {
-                        simulations,
-                        seed: iteration as u64,
-                        cpuct,
-                        root_dirichlet_alpha: 0.0,
-                        root_exploration_fraction: 0.0,
-                        algorithm,
-                        gumbel: AzGumbelConfig::default(),
-                    },
-                );
-                total_sims += result.simulations;
-                best_move = result.best_move;
-            }
-            let elapsed = started.elapsed();
-            let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
-            println!("bench        : fixed-search");
-            println!("model        : {model_path}");
-            println!("fen          : {}", position.to_fen());
-            println!("sims/search  : {simulations}");
-            println!("repeat       : {repeat}");
-            println!("search       : {}", algorithm.as_str());
-            println!("cpuct        : {cpuct}");
-            println!("total_sims   : {total_sims}");
-            println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
-            println!(
-                "ms/search    : {:.3}",
-                elapsed.as_secs_f64() * 1000.0 / repeat as f64
-            );
-            println!("sims/sec     : {:.0}", total_sims as f64 / elapsed_secs);
-            println!(
-                "last_bestmove: {}",
-                best_move
-                    .map(|mv| mv.to_string())
-                    .unwrap_or_else(|| "(none)".into())
-            );
-        }
-        Some(CliCommand::AzTrainBench(cmd)) => {
-            let model_path = cmd.model;
-            let sample_count = cmd.samples.max(1);
-            let epochs = cmd.epochs.max(1);
-            let batch_size = cmd.batch_size_per_gpu.max(1);
-            let lr = cmd.lr.max(0.0);
-            let seed = cmd.seed;
-            let mut model = AzModel::load(&model_path).unwrap_or_else(|err| {
-                panic!("failed to load `{model_path}`: {err}");
-            });
-            let started = std::time::Instant::now();
-            let stats = benchmark_training(&mut model, sample_count, epochs, batch_size, lr, seed);
-            let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
-            let processed = (sample_count * epochs) as f64;
-            let g_step = global_training_step_sample_count(batch_size);
-            let n_gpu = global_training_step_sample_count(1);
-            println!("bench        : training");
-            println!("model        : {model_path}");
-            println!("samples      : {sample_count}");
-            println!("epochs       : {epochs}");
-            println!("batch(per_gpu) : {batch_size}");
-            println!("cuda_devices  : {n_gpu}  (global batch {g_step})");
-            println!("lr             : {lr}");
-            println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
-            println!("processed    : {}", sample_count * epochs);
-            println!("samples/sec  : {:.0}", processed / elapsed);
-            println!("loss         : {:.4}", stats.loss);
-            println!("value_ce     : {:.4}", stats.value_loss);
-            println!("policy_ce    : {:.4}", stats.policy_ce);
-        }
-        #[cfg(feature = "distill")]
-        Some(CliCommand::AzDistill(cmd)) => {
-            let shard_paths = distill_shard_paths(&cmd.data_dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to list distill shards in `{}`: {err}",
-                    cmd.data_dir.display()
-                )
-            });
-            if shard_paths.is_empty() {
-                panic!("no .npz shards found in `{}`", cmd.data_dir.display());
-            }
-
-            let output_path = cmd.output.clone().unwrap_or_else(|| cmd.model.clone());
-            let mut model = if cmd.model.exists() {
-                println!("distill  : load model {}", cmd.model.display());
-                AzModel::load(&cmd.model).unwrap_or_else(|err| {
-                    panic!("failed to load `{}`: {err}", cmd.model.display());
-                })
-            } else {
-                println!(
-                    "distill  : init random model {} hidden={}",
-                    cmd.model.display(),
-                    cmd.hidden.max(1)
-                );
-                AzModel::random(cmd.hidden.max(1), cmd.seed)
-            };
-
-            let epochs = cmd.epochs.max(1);
-            let lr = cmd.lr.max(0.0);
-            let batch_size = cmd.batch_size.max(1);
-            let loss_weights = AzTrainLossWeights {
-                value: cmd.value_weight.max(0.0),
-                policy: cmd.policy_weight.max(0.0),
-                train_shared: cmd.train_shared,
-                train_value_head: cmd.train_value_head,
-                train_policy_head: cmd.train_policy_head,
-            };
-            let max_rows = (cmd.max_rows_per_shard > 0).then_some(cmd.max_rows_per_shard);
-            let load_options = AzDistillLoadOptions {
-                max_rows,
-                validate_legal: !cmd.no_validate_legal,
-            };
-            let mut rng = SplitMix64::new(cmd.seed ^ 0xD157_1110_0000_0001);
-            let started = Instant::now();
-
-            println!(
-                "distill  : data={} shards={} epochs={} lr={} value_weight={} policy_weight={} train_shared={} train_value_head={} train_policy_head={} batch_size(per_gpu)={} max_rows_per_shard={} validate_legal={} dry_run={}",
-                cmd.data_dir.display(),
-                shard_paths.len(),
-                epochs,
-                lr,
-                loss_weights.value,
-                loss_weights.policy,
-                loss_weights.train_shared,
-                loss_weights.train_value_head,
-                loss_weights.train_policy_head,
-                batch_size,
-                max_rows.map_or_else(|| "all".to_string(), |value| value.to_string()),
-                load_options.validate_legal,
-                cmd.dry_run
-            );
-
-            let mut total_stats = AzTrainStats::default();
-            let mut total_samples = 0usize;
-            for epoch in 0..epochs {
-                for (shard_index, shard_path) in shard_paths.iter().enumerate() {
-                    let load_started = Instant::now();
-                    let (samples, load_stats) = load_distill_npz_samples(shard_path, load_options)
-                        .unwrap_or_else(|err| {
-                            panic!("failed to load `{}`: {err}", shard_path.display());
-                        });
-                    let load_seconds = load_started.elapsed().as_secs_f32();
-                    if samples.is_empty() {
-                        println!(
-                            "distill  : epoch={}/{} shard={}/{} file={} samples=0 skipped={} load={:.2}s",
-                            epoch + 1,
-                            epochs,
-                            shard_index + 1,
-                            shard_paths.len(),
-                            shard_path.display(),
-                            load_stats.skipped_positions,
-                            load_seconds
-                        );
-                        continue;
-                    }
-
-                    let train_started = Instant::now();
-                    let stats = if cmd.dry_run {
-                        AzTrainStats {
-                            samples: samples.len(),
-                            ..Default::default()
-                        }
-                    } else {
-                        train_samples_weighted(
-                            &mut model,
-                            &samples,
-                            1,
-                            lr,
-                            batch_size,
-                            &mut rng,
-                            loss_weights,
-                        )
-                    };
-                    let train_seconds = train_started.elapsed().as_secs_f32();
-                    let legal_jaccard = if load_stats.legal_union_sum > 0 {
-                        load_stats.legal_overlap_sum as f32 / load_stats.legal_union_sum as f32
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "distill  : epoch={}/{} shard={}/{} file={} samples={} skipped={} loss={:.4} value_ce={:.4} value_mse={:.4} policy_ce={:.4} v_mu={:.3}/{:.3} legal_exact={}/{} legal_jaccard={:.3} load={:.2}s train={:.2}s",
-                        epoch + 1,
-                        epochs,
-                        shard_index + 1,
-                        shard_paths.len(),
-                        shard_path.display(),
-                        samples.len(),
-                        load_stats.skipped_positions,
-                        stats.loss,
-                        stats.value_loss,
-                        stats.value_error_sq_sum / stats.samples.max(1) as f32,
-                        stats.policy_ce,
-                        stats.value_pred_sum / stats.samples.max(1) as f32,
-                        stats.value_target_sum / stats.samples.max(1) as f32,
-                        load_stats.legal_exact,
-                        load_stats.legal_checked,
-                        legal_jaccard,
-                        load_seconds,
-                        train_seconds
-                    );
-                    add_train_stats(&mut total_stats, &stats);
-                    total_samples += stats.samples;
-                }
-            }
-
-            if !cmd.dry_run {
-                model.save(&output_path).unwrap_or_else(|err| {
-                    panic!("failed to save `{}`: {err}", output_path.display());
-                });
-            }
-            if total_samples > 0 {
-                let denom = total_samples as f32;
-                println!(
-                    "distill  : done samples={} avg_loss={:.4} avg_value_ce={:.4} avg_value_mse={:.4} avg_policy_ce={:.4} elapsed={:.1}s saved={}",
-                    total_samples,
-                    total_stats.loss / denom,
-                    total_stats.value_loss / denom,
-                    total_stats.value_error_sq_sum / denom,
-                    total_stats.policy_ce / denom,
-                    started.elapsed().as_secs_f32(),
-                    if cmd.dry_run {
-                        "(dry-run)".to_string()
-                    } else {
-                        output_path.display().to_string()
-                    }
-                );
-            }
         }
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
@@ -1874,13 +1385,10 @@ fn main() {
                 report.losses_as_black
             );
         }
-        Some(CliCommand::Perft(cmd)) => {
-            let depth = cmd.depth;
+        Some(CliCommand::RuleUi(cmd)) => {
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
-            println!("fen   : {}", position.to_fen());
-            println!("depth : {depth}");
-            println!("nodes : {}", position.perft(depth));
+            run_rule_ui(position, &cmd.host, cmd.port);
         }
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;

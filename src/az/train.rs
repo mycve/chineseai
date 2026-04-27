@@ -1,4 +1,4 @@
-﻿use super::{AzModel, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
+use super::{AzModel, AzTrainStats, AzTrainingSample, SplitMix64};
 
 /// Number of samples covered by one global training step across visible GPUs.
 pub fn global_training_step_sample_count(batch_size_per_gpu: usize) -> usize {
@@ -14,35 +14,7 @@ pub fn train_samples(
     batch_size: usize,
     rng: &mut SplitMix64,
 ) -> AzTrainStats {
-    train_samples_weighted(
-        model,
-        samples,
-        epochs,
-        lr,
-        batch_size,
-        rng,
-        AzTrainLossWeights::default(),
-    )
-}
-
-pub fn train_samples_weighted(
-    model: &mut AzModel,
-    samples: &[AzTrainingSample],
-    epochs: usize,
-    lr: f32,
-    batch_size: usize,
-    rng: &mut SplitMix64,
-    loss_weights: AzTrainLossWeights,
-) -> AzTrainStats {
-    match super::train_gpu::train_samples_gpu(
-        model,
-        samples,
-        epochs,
-        lr,
-        batch_size,
-        rng,
-        loss_weights,
-    ) {
+    match super::train_gpu::train_samples_gpu(model, samples, epochs, lr, batch_size, rng) {
         Ok(stats) => stats,
         Err(err) => panic!("Candle CUDA training failed: {err}"),
     }
