@@ -125,6 +125,91 @@ pub fn extract_sparse_features_v4(position: &Position, history: &[HistoryMove]) 
     features
 }
 
+pub fn extract_sparse_features_v4_canonical(
+    position: &Position,
+    history: &[HistoryMove],
+) -> Vec<usize> {
+    let side = position.side_to_move();
+    let own_king_bucket = position
+        .general_square(side)
+        .map(|sq| palace_bucket(orient_square(side, sq)))
+        .unwrap_or(4);
+    let enemy_king_bucket = position
+        .general_square(side.opposite())
+        .map(|sq| palace_bucket(orient_square(side, sq)))
+        .unwrap_or(4);
+    let mut features = Vec::with_capacity(160);
+
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let piece_index = canonical_piece_index(side, piece);
+        let canonical_sq = orient_square(side, sq);
+        features.push(piece_index * BOARD_SIZE + canonical_sq);
+        features.push(king_aware_feature_index(
+            0,
+            own_king_bucket,
+            piece_index,
+            canonical_sq,
+        ));
+        features.push(king_aware_feature_index(
+            1,
+            enemy_king_bucket,
+            piece_index,
+            canonical_sq,
+        ));
+    }
+
+    for (age, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
+        let piece_index = canonical_piece_index(side, entry.piece);
+        features.push(history_feature_index(
+            age,
+            0,
+            piece_index,
+            orient_square(side, entry.mv.from as usize),
+        ));
+        features.push(history_feature_index(
+            age,
+            1,
+            piece_index,
+            orient_square(side, entry.mv.to as usize),
+        ));
+    }
+
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let piece_index = canonical_piece_index(side, piece);
+        let canonical_sq = orient_square(side, sq);
+        let center_file = file_of(canonical_sq) as i32;
+        let center_rank = rank_of(canonical_sq) as i32;
+        features.push(row_feature_index(piece_index, center_rank as usize));
+        features.push(col_feature_index(piece_index, center_file as usize));
+
+        for (offset_index, (df, dr)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+            let target_file = center_file + df;
+            let target_rank = center_rank + dr;
+            if !inside_board(target_file, target_rank) {
+                continue;
+            }
+            let canonical_target = index(target_file as usize, target_rank as usize);
+            let target = orient_square(side, canonical_target);
+            let Some(target_piece) = position.piece_at(target) else {
+                continue;
+            };
+            features.push(neighbor_feature_index(
+                piece_index,
+                offset_index,
+                canonical_piece_index(side, target_piece),
+            ));
+        }
+    }
+    features.sort_unstable();
+    features
+}
+
 pub fn mirror_file_square(sq: usize) -> usize {
     let rank = sq / BOARD_FILES;
     let file = sq % BOARD_FILES;
@@ -135,6 +220,17 @@ pub fn mirror_file_move(mv: Move) -> Move {
     Move::new(
         mirror_file_square(mv.from as usize),
         mirror_file_square(mv.to as usize),
+    )
+}
+
+pub fn canonical_square(side: Color, sq: usize) -> usize {
+    orient_square(side, sq)
+}
+
+pub fn canonical_move(side: Color, mv: Move) -> Move {
+    Move::new(
+        orient_square(side, mv.from as usize),
+        orient_square(side, mv.to as usize),
     )
 }
 
@@ -264,6 +360,15 @@ fn absolute_piece_index(color: Color, kind: PieceKind) -> usize {
         PieceKind::Cannon => 5,
         PieceKind::Soldier => 6,
     }
+}
+
+fn canonical_piece_index(side: Color, piece: Piece) -> usize {
+    let canonical_color = if piece.color == side {
+        Color::Red
+    } else {
+        Color::Black
+    };
+    absolute_piece_index(canonical_color, piece.kind)
 }
 
 fn palace_bucket_for_color(color: Color, sq: usize) -> usize {

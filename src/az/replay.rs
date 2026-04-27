@@ -12,7 +12,7 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 6;
+const REPLAY_FILE_VERSION: u32 = 7;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -422,12 +422,10 @@ impl AzExperiencePool {
             ));
         }
         let ver = u32::from_le_bytes(file_blob[4..8].try_into().unwrap());
-        if !(2..=REPLAY_FILE_VERSION).contains(&ver) {
+        if ver != REPLAY_FILE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "replay unsupported version {ver} (supported: v2..=v{REPLAY_FILE_VERSION})"
-                ),
+                format!("replay unsupported version {ver} (expected v{REPLAY_FILE_VERSION})"),
             ));
         }
         let inner = decompress_size_prepended(&file_blob[8..]).map_err(|err| {

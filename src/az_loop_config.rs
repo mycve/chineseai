@@ -250,7 +250,7 @@ impl AzLoopFileConfig {
 # Value targets:
 #   td_lambda mixes each position's future MCTS root values with the final game outcome.
 #   1.0 keeps pure AlphaZero-style terminal labels and is the default for this
-#   v21 policy-trunk-free net with value-only relation/move features.
+#   v22 canonical-view policy-trunk-free net with value-only relation/move features.
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
@@ -309,8 +309,8 @@ impl AzLoopFileConfig {
 #
 # Model architecture:
 #   hidden_size is the runtime-tunable model width.
-#   The rest of the tensor shapes are fixed by the v21 binary architecture:
-#   policy_trunk_layers=0, cnn_channels=24, policy_condition_size=32,
+#   The rest of the tensor shapes are fixed by the v22 binary architecture:
+#   policy_trunk_layers=0, board_channels=126, cnn_channels=24, policy_condition_size=32,
 #   value_branch=128x2, value_hidden=256, value_relation_features=64.
 #   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
 

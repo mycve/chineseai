@@ -11,7 +11,10 @@ mod replay;
 mod train;
 mod train_gpu;
 
-use crate::nnue::{HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, extract_sparse_features_v4};
+use crate::nnue::{
+    HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, canonical_move, canonical_square,
+    extract_sparse_features_v4_canonical,
+};
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position, piece_base_value,
 };
@@ -31,7 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 21;
+const AZNNUE_BINARY_VERSION: u32 = 22;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -67,8 +70,7 @@ pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
-pub(super) const SIDE_TO_MOVE_BOARD_CHANNEL: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
-pub(super) const BOARD_CHANNELS: usize = SIDE_TO_MOVE_BOARD_CHANNEL + 1;
+pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
 const CNN_CHANNELS: usize = 24;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
 const CNN_KERNEL_AREA: usize = 9;
@@ -176,6 +178,11 @@ pub struct AzNnue {
 //   static board image. It receives a compact summary of legal move
 //   consequences, checking moves, captures, and attacked/protected pieces so
 //   value can learn from rule-level interactions while policy stays cheap.
+// - v22 switches the net to side-to-move canonical inputs and canonical policy
+//   actions: the mover is always represented as Red, and Black-to-move boards
+//   are rotated 180 degrees with colors swapped. The old side-to-move board
+//   channel is removed; do not feed canonical boards with absolute move labels,
+//   because that recreates the red/black leakage bug.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -637,12 +644,12 @@ impl AzNnue {
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
-        let features = extract_sparse_features_v4(position, history);
+        let side = position.side_to_move();
+        let features = extract_sparse_features_v4_canonical(position, history);
         extract_board_planes(position, history, &mut scratch.board);
         self.input_embedding_into(&features, &mut scratch.hidden);
         self.board_forward_into(
             &scratch.board,
-            position.side_to_move() == Color::Black,
             &mut scratch.conv1,
             &mut scratch.conv2,
             &mut scratch.cnn_global,
@@ -674,7 +681,7 @@ impl AzNnue {
                 &scratch.hidden,
                 &scratch.cnn_global,
                 &scratch.policy_condition,
-                dense_move_index(*mv),
+                dense_move_index(canonical_move(side, *mv)),
             );
         }
         value
@@ -750,7 +757,6 @@ impl AzNnue {
     fn board_forward_into(
         &self,
         board: &[u8],
-        black_to_move: bool,
         conv1: &mut Vec<f32>,
         conv2: &mut Vec<f32>,
         cnn_global: &mut Vec<f32>,
@@ -760,7 +766,6 @@ impl AzNnue {
         cnn_global.resize(CNN_POOLED_SIZE, 0.0);
         conv_relu_layer(
             board,
-            black_to_move,
             &self.board_conv1_weights,
             &self.board_conv1_bias,
             conv1,
@@ -953,6 +958,7 @@ pub(super) fn extract_board_planes(
     history: &[HistoryMove],
     board: &mut Vec<u8>,
 ) {
+    let side = position.side_to_move();
     board.resize(BOARD_HISTORY_SIZE, 0);
     board.fill(0);
     let mut frame = [0u8; BOARD_PLANES_SIZE];
@@ -961,9 +967,10 @@ pub(super) fn extract_board_planes(
 
     let mut rewound = frame;
     for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
-        let piece_plane = (absolute_piece_plane(entry.piece.color, entry.piece.kind) + 1) as u8;
-        rewound[entry.mv.to as usize] = 0;
-        rewound[entry.mv.from as usize] = piece_plane;
+        let piece_plane =
+            (canonical_piece_plane(side, entry.piece.color, entry.piece.kind) + 1) as u8;
+        rewound[canonical_square(side, entry.mv.to as usize)] = 0;
+        rewound[canonical_square(side, entry.mv.from as usize)] = piece_plane;
         let start = (history_index + 1) * BOARD_PLANES_SIZE;
         board[start..start + BOARD_PLANES_SIZE].copy_from_slice(&rewound);
     }
@@ -971,12 +978,13 @@ pub(super) fn extract_board_planes(
 
 fn extract_position_piece_planes(position: &Position, board: &mut [u8; BOARD_PLANES_SIZE]) {
     board.fill(0);
-    for (sq, slot) in board.iter_mut().enumerate().take(BOARD_SIZE) {
+    let side = position.side_to_move();
+    for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
-        let plane = absolute_piece_plane(piece.color, piece.kind);
-        *slot = (plane + 1) as u8;
+        let plane = canonical_piece_plane(side, piece.color, piece.kind);
+        board[canonical_square(side, sq)] = (plane + 1) as u8;
     }
 }
 
@@ -994,6 +1002,15 @@ fn absolute_piece_plane(piece_color: Color, kind: PieceKind) -> usize {
         }
 }
 
+fn canonical_piece_plane(side: Color, piece_color: Color, kind: PieceKind) -> usize {
+    let canonical_color = if piece_color == side {
+        Color::Red
+    } else {
+        Color::Black
+    };
+    absolute_piece_plane(canonical_color, kind)
+}
+
 pub(super) fn extract_value_relation_features(
     position: &Position,
     moves: &[Move],
@@ -1004,7 +1021,7 @@ pub(super) fn extract_value_relation_features(
     let side = position.side_to_move();
     let enemy = side.opposite();
     out[0] = 1.0;
-    out[1] = if side == Color::Red { 1.0 } else { -1.0 };
+    out[1] = 1.0;
     out[2] = position.in_check(side) as u8 as f32;
     out[3] = (moves.len() as f32 / 128.0).min(1.5);
 
@@ -1157,13 +1174,7 @@ fn piece_kind_slot(kind: PieceKind) -> usize {
     }
 }
 
-fn conv_relu_layer(
-    board: &[u8],
-    black_to_move: bool,
-    weights: &[f32],
-    bias: &[f32],
-    output: &mut [f32],
-) {
+fn conv_relu_layer(board: &[u8], weights: &[f32], bias: &[f32], output: &mut [f32]) {
     debug_assert_eq!(BOARD_INPUT_KERNEL_AREA, 1);
     for (out_channel, bias_value) in bias.iter().copied().enumerate().take(CNN_CHANNELS) {
         let out_start = out_channel * BOARD_PLANES_SIZE;
@@ -1175,11 +1186,8 @@ fn conv_relu_layer(
                     continue;
                 }
                 let in_channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
-                debug_assert!(in_channel < SIDE_TO_MOVE_BOARD_CHANNEL);
+                debug_assert!(in_channel < BOARD_CHANNELS);
                 value += weights[out_channel * BOARD_CHANNELS + in_channel];
-            }
-            if black_to_move {
-                value += weights[out_channel * BOARD_CHANNELS + SIDE_TO_MOVE_BOARD_CHANNEL];
             }
             output[out_start + sq] = value.max(0.0);
         }
@@ -1613,12 +1621,16 @@ mod tests {
 
         let mut board = Vec::new();
         extract_board_planes(&position, &history, &mut board);
-        let piece_plane = (absolute_piece_plane(moved_piece.color, moved_piece.kind) + 1) as u8;
+        let side = position.side_to_move();
+        let piece_plane =
+            (canonical_piece_plane(side, moved_piece.color, moved_piece.kind) + 1) as u8;
+        let from = canonical_square(side, mv.from as usize);
+        let to = canonical_square(side, mv.to as usize);
 
         assert_eq!(board.len(), BOARD_HISTORY_SIZE);
-        assert_eq!(board[mv.to as usize], piece_plane);
-        assert_eq!(board[BOARD_PLANES_SIZE + mv.from as usize], piece_plane);
-        assert_eq!(board[BOARD_PLANES_SIZE + mv.to as usize], 0);
+        assert_eq!(board[to], piece_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + from], piece_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + to], 0);
     }
 
     #[test]

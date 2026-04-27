@@ -5,7 +5,7 @@ use ndarray_npy::NpzReader;
 use zip::ZipArchive;
 
 use crate::{
-    nnue::extract_sparse_features_v4,
+    nnue::{canonical_move, extract_sparse_features_v4_canonical},
     xiangqi::{BOARD_FILES, BOARD_RANKS, Position},
 };
 
@@ -129,7 +129,13 @@ pub fn load_distill_npz_samples(
             stats.legal_union_sum += union;
         }
 
-        let legal_moves = legal_dense_moves(&position);
+        let side = position.side_to_move();
+        let legal_moves_actual = legal_dense_moves(&position);
+        let legal_moves = legal_moves_actual
+            .iter()
+            .filter_map(|&move_index| dense_move_to_move(move_index))
+            .map(|mv| dense_move_index(canonical_move(side, mv)))
+            .collect::<Vec<_>>();
         let mut dense_targets = vec![0.0f32; DENSE_MOVE_SPACE];
         let mut prob_sum = 0.0f32;
         for slot in 0..DISTILL_TOP_K {
@@ -138,7 +144,11 @@ pub fn load_distill_npz_samples(
             if move_index >= DENSE_MOVE_SPACE || prob <= 0.0 {
                 continue;
             }
-            dense_targets[move_index] += prob;
+            let Some(mv) = dense_move_to_move(move_index) else {
+                continue;
+            };
+            let canonical_index = dense_move_index(canonical_move(side, mv));
+            dense_targets[canonical_index] += prob;
             prob_sum += prob;
         }
         if legal_moves.is_empty() || prob_sum <= 0.0 {
@@ -152,7 +162,7 @@ pub fn load_distill_npz_samples(
             .iter()
             .map(|&move_index| dense_targets[move_index] / prob_sum)
             .collect::<Vec<_>>();
-        let legal_moves_raw = legal_moves
+        let legal_moves_raw = legal_moves_actual
             .iter()
             .filter_map(|&move_index| dense_move_to_move(move_index))
             .collect::<Vec<_>>();
@@ -162,7 +172,7 @@ pub fn load_distill_npz_samples(
         let mut board = Vec::new();
         extract_board_planes(&position, &[], &mut board);
         samples.push(AzTrainingSample {
-            features: extract_sparse_features_v4(&position, &[]),
+            features: extract_sparse_features_v4_canonical(&position, &[]),
             board,
             move_indices: legal_moves,
             policy,

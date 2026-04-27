@@ -6,9 +6,8 @@ use std::{process::Command, thread};
 use super::{
     AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE,
     BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
-    POLICY_CONDITION_SIZE, RESIDUAL_TRUNK_SCALE, SIDE_TO_MOVE_BOARD_CHANNEL, VALUE_BRANCH_DEPTH,
-    VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_RELATION_FEATURE_SIZE,
-    policy_move_features,
+    POLICY_CONDITION_SIZE, RESIDUAL_TRUNK_SCALE, VALUE_BRANCH_DEPTH, VALUE_BRANCH_SIZE,
+    VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_RELATION_FEATURE_SIZE, policy_move_features,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -667,15 +666,9 @@ impl BatchTensors {
                     let frame = idx / BOARD_PLANES_SIZE;
                     let sq = idx % BOARD_PLANES_SIZE;
                     let channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
-                    if channel < SIDE_TO_MOVE_BOARD_CHANNEL {
+                    if channel < BOARD_CHANNELS {
                         board_onehot[board_base + channel * BOARD_PLANES_SIZE + sq] = 1.0;
                     }
-                }
-            }
-            if sample.side_sign < 0.0 {
-                let side_base = board_base + SIDE_TO_MOVE_BOARD_CHANNEL * BOARD_PLANES_SIZE;
-                for sq in 0..BOARD_PLANES_SIZE {
-                    board_onehot[side_base + sq] = 1.0;
                 }
             }
 

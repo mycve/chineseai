@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::nnue::{
-    HistoryMove, extract_sparse_features_v4, mirror_file_move, mirror_sparse_features_file,
+    HistoryMove, canonical_move, extract_sparse_features_v4_canonical, mirror_file_move,
+    mirror_sparse_features_file,
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
@@ -324,10 +325,15 @@ fn make_training_sample(
         .map(|candidate| candidate.policy.max(0.0))
         .sum::<f32>()
         .max(1.0);
-    let mut features = extract_sparse_features_v4(position, history);
-    let mut moves = candidates
+    let side = position.side_to_move();
+    let mut features = extract_sparse_features_v4_canonical(position, history);
+    let actual_moves = candidates
         .iter()
         .map(|candidate| candidate.mv)
+        .collect::<Vec<_>>();
+    let mut moves = candidates
+        .iter()
+        .map(|candidate| canonical_move(side, candidate.mv))
         .collect::<Vec<_>>();
     if mirror_file {
         mirror_sparse_features_file(&mut features);
@@ -337,7 +343,7 @@ fn make_training_sample(
     }
     let move_indices = moves.iter().copied().map(dense_move_index).collect();
     let mut value_relation = Vec::new();
-    super::extract_value_relation_features(position, &moves, &mut value_relation);
+    super::extract_value_relation_features(position, &actual_moves, &mut value_relation);
     let mut board = Vec::new();
     extract_board_planes(position, history, &mut board);
     if mirror_file {
