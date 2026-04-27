@@ -3,10 +3,8 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod az_loop_config;
-mod rule_ui;
 
 use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az_loop_config};
-use rule_ui::run_rule_ui;
 
 use chineseai::{
     az::{
@@ -60,8 +58,6 @@ enum CliCommand {
     AzLoop(AzLoopArgs),
     /// Internal arena worker process.
     AzArenaWorker(AzArenaWorkerArgs),
-    /// Lightweight browser UI for testing Xiangqi rules.
-    RuleUi(RuleUiArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
 }
@@ -118,19 +114,6 @@ struct AzArenaWorkerArgs {
     eval_fens_path: String,
     /// Random seed.
     seed: u64,
-}
-
-#[derive(Args, Debug)]
-struct RuleUiArgs {
-    /// Bind host.
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-    /// Bind port.
-    #[arg(long, default_value_t = 7878)]
-    port: u16,
-    /// FEN string, or startpos if omitted.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    fen: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1014,7 +997,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_ce={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1053,7 +1036,7 @@ fn main() {
                         ))
                 );
                 log_scalar(&mut tb, "train/loss", update, report.loss);
-                log_scalar(&mut tb, "train/value_ce", update, report.value_loss);
+                log_scalar(&mut tb, "train/value_loss", update, report.value_loss);
                 log_scalar(&mut tb, "train/value_mse", update, report.value_mse);
                 log_scalar(
                     &mut tb,
@@ -1385,11 +1368,6 @@ fn main() {
                 report.losses_as_black
             );
         }
-        Some(CliCommand::RuleUi(cmd)) => {
-            let fen = cmd.fen.join(" ");
-            let position = parse_position(&fen);
-            run_rule_ui(position, &cmd.host, cmd.port);
-        }
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
             let (config_path, simulations_override) = if let Some(value) = cmd.config_or_simulations
@@ -1453,15 +1431,5 @@ fn main() {
                 simulations
             );
         }
-    }
-}
-
-fn parse_position(text: &str) -> Position {
-    if text.trim().is_empty() || text == "startpos" {
-        Position::startpos()
-    } else {
-        Position::from_fen(text).unwrap_or_else(|err| {
-            panic!("invalid FEN `{text}`: {err}");
-        })
     }
 }
