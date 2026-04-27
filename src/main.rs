@@ -73,12 +73,12 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// CNN channels. This build currently supports 32.
+    /// Line-GNN square embedding channels. This build currently supports 32.
     #[arg(long)]
-    cnn_channels: Option<usize>,
-    /// Residual CNN blocks. This build currently supports 3.
+    line_channels: Option<usize>,
+    /// Residual local+row+column Line-GNN blocks. This build currently supports 3.
     #[arg(long)]
-    residual_blocks: Option<usize>,
+    line_blocks: Option<usize>,
     /// Value head channels. This build currently supports 8.
     #[arg(long)]
     value_head_channels: Option<usize>,
@@ -208,8 +208,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.epochs,
         config.max_sample_train_count,
         config.hidden_size,
-        config.cnn_channels,
-        config.residual_blocks,
+        config.line_channels,
+        config.line_blocks,
         config.value_head_channels,
         config.value_hidden_size,
         config.max_plies,
@@ -535,8 +535,8 @@ fn main() {
         Some(CliCommand::AzInit(cmd)) => {
             let model_config = AzModelConfig {
                 hidden_size: cmd.hidden,
-                cnn_channels: cmd.cnn_channels.unwrap_or(32),
-                residual_blocks: cmd.residual_blocks.unwrap_or(3),
+                line_channels: cmd.line_channels.unwrap_or(32),
+                line_blocks: cmd.line_blocks.unwrap_or(3),
                 value_head_channels: cmd.value_head_channels.unwrap_or(8),
                 value_hidden_size: cmd.value_hidden_size.unwrap_or(256),
                 policy_condition_size: 32,

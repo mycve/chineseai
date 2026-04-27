@@ -40,8 +40,8 @@ impl AzModel {
         writer.write_all(&AZ_MODEL_BINARY_VERSION.to_le_bytes())?;
         writer.write_all(&(BOARD_CHANNELS as u32).to_le_bytes())?;
         writer.write_all(&(self.hidden_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.cnn_channels as u32).to_le_bytes())?;
-        writer.write_all(&(self.model_config.residual_blocks as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.line_channels as u32).to_le_bytes())?;
+        writer.write_all(&(self.model_config.line_blocks as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.value_head_channels as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.value_hidden_size as u32).to_le_bytes())?;
         writer.write_all(&(self.model_config.policy_condition_size as u32).to_le_bytes())?;
@@ -99,8 +99,8 @@ impl AzModel {
         let hidden_size = read_u32_le(&mut reader)? as usize;
         let model_config = AzModelConfig {
             hidden_size,
-            cnn_channels: read_u32_le(&mut reader)? as usize,
-            residual_blocks: read_u32_le(&mut reader)? as usize,
+            line_channels: read_u32_le(&mut reader)? as usize,
+            line_blocks: read_u32_le(&mut reader)? as usize,
             value_head_channels: read_u32_le(&mut reader)? as usize,
             value_hidden_size: read_u32_le(&mut reader)? as usize,
             policy_condition_size: read_u32_le(&mut reader)? as usize,
