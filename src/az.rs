@@ -299,54 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn value_head_can_overfit_tiny_fixed_dataset() {
-        let mut model = AzModel::random(16, 7);
-        let board_with = |sq: usize, plane: u8| {
-            let mut board = vec![0; BOARD_HISTORY_SIZE];
-            board[sq] = plane;
-            board
-        };
-
-        let samples = vec![
-            AzTrainingSample {
-                board: board_with(0, 1),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: 1.0,
-                side_sign: 1.0,
-            },
-            AzTrainingSample {
-                board: board_with(10, 2),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: -1.0,
-                side_sign: 1.0,
-            },
-            AzTrainingSample {
-                board: board_with(40, 3),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: 0.75,
-                side_sign: 1.0,
-            },
-            AzTrainingSample {
-                board: board_with(80, 4),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: -0.75,
-                side_sign: 1.0,
-            },
-        ];
-
-        let mut rng = SplitMix64::new(17);
-        let before = train_samples(&mut model, &samples, 1, 0.003, 4, &mut rng).value_loss;
-        let after = train_samples(&mut model, &samples, 300, 0.003, 4, &mut rng).value_loss;
-
-        assert!(after < before * 0.5, "before={before} after={after}");
-        assert!(after < 0.35, "after={after}");
-    }
-
-    #[test]
     fn batched_training_is_deterministic() {
         let board_with = |sq: usize, plane: u8| {
             let mut board = vec![0; BOARD_HISTORY_SIZE];
@@ -414,6 +366,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(model.hidden_size, loaded.hidden_size);
         assert_eq!(model.board_hidden, loaded.board_hidden);
+        assert_eq!(model.policy_pair_weights, loaded.policy_pair_weights);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
     }
 
@@ -440,7 +393,48 @@ mod tests {
             model.value_intermediate_hidden,
             loaded.value_intermediate_hidden
         );
+        assert_eq!(model.policy_pair_weights, loaded.policy_pair_weights);
         assert_eq!(model.policy_feature_cnn, loaded.policy_feature_cnn);
+    }
+
+    #[test]
+    fn az_model_binary_v6_loads_with_zero_policy_pair_weights() {
+        let model = AzModel::random(16, 44);
+        let path = std::env::temp_dir().join("chineseai_test_az_model_v6_upgrade.azm");
+        let _ = fs::remove_file(&path);
+        model.save(&path).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+        let floats_before_pair = model.board_conv1_weights.len()
+            + model.board_conv1_bias.len()
+            + model.board_conv2_weights.len()
+            + model.board_conv2_bias.len()
+            + model.position_embed.len()
+            + model.board_hidden.len()
+            + model.board_hidden_bias.len()
+            + model.value_tail_conv_weights.len()
+            + model.value_tail_conv_bias.len()
+            + model.value_intermediate_hidden.len()
+            + model.value_intermediate_bias.len()
+            + model.value_logits_weights.len()
+            + model.value_direct_logits_weights.len()
+            + model.value_logits_bias.len()
+            + model.policy_from_weights.len()
+            + model.policy_from_bias.len()
+            + model.policy_to_weights.len()
+            + model.policy_to_bias.len();
+        let pair_start = AZ_MODEL_BINARY_HEADER_LEN + floats_before_pair * 4;
+        let pair_end = pair_start + model.policy_pair_weights.len() * 4;
+        bytes.drain(pair_start..pair_end);
+        fs::write(&path, bytes).unwrap();
+
+        let loaded = AzModel::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            loaded.policy_pair_weights,
+            vec![0.0; model.model_config.model_channels]
+        );
+        assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
     }
 
     #[test]

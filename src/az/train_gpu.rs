@@ -58,6 +58,7 @@ struct GpuVars {
     policy_from_bias: Var,
     policy_to_weights: Var,
     policy_to_bias: Var,
+    policy_pair_weights: Var,
     policy_move_bias: Var,
     policy_feature_hidden: Var,
     policy_feature_cnn: Var,
@@ -569,6 +570,18 @@ impl GpuReplica {
             .matmul(&self.vars.policy_move_from_select)?
             .broadcast_add(&to_scores.matmul(&self.vars.policy_move_to_select)?)?
             .broadcast_add(&self.vars.policy_move_bias)?;
+        let from_features = feature_flat
+            .reshape((bsz * channels, BOARD_PLANES_SIZE))?
+            .matmul(&self.vars.policy_move_from_select)?
+            .reshape((bsz, channels, DENSE_MOVE_SPACE))?;
+        let to_features = feature_flat
+            .reshape((bsz * channels, BOARD_PLANES_SIZE))?
+            .matmul(&self.vars.policy_move_to_select)?
+            .reshape((bsz, channels, DENSE_MOVE_SPACE))?;
+        let policy_pair_logits = (&from_features * &to_features)?
+            .broadcast_mul(&self.vars.policy_pair_weights.reshape((1, channels, 1))?)?
+            .sum(1)?;
+        let policy_logits = (policy_logits + policy_pair_logits)?;
         let policy_condition = hidden
             .matmul(&self.vars.policy_feature_hidden.t()?)?
             .broadcast_add(
@@ -766,6 +779,7 @@ impl GpuVars {
                 device,
             )?,
             policy_to_bias: var_from_slice(&model.policy_to_bias, 1, device)?,
+            policy_pair_weights: var_from_slice(&model.policy_pair_weights, channels, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_feature_hidden: var_from_slice(
                 &model.policy_feature_hidden,
@@ -822,6 +836,7 @@ impl GpuVars {
         vars.push(self.policy_from_bias.clone());
         vars.push(self.policy_to_weights.clone());
         vars.push(self.policy_to_bias.clone());
+        vars.push(self.policy_pair_weights.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_feature_hidden.clone());
         vars.push(self.policy_feature_cnn.clone());
@@ -886,6 +901,7 @@ impl GpuVars {
         copy_var(&self.policy_from_bias, &mut model.policy_from_bias)?;
         copy_var(&self.policy_to_weights, &mut model.policy_to_weights)?;
         copy_var(&self.policy_to_bias, &mut model.policy_to_bias)?;
+        copy_var(&self.policy_pair_weights, &mut model.policy_pair_weights)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(
             &self.policy_feature_hidden,

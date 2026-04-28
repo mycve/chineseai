@@ -9,12 +9,13 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzModel,
-        AzModelConfig, AzSelfplayData, generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples,
+        AzModelConfig, AzSearchLimits, AzSelfplayData, alphazero_search, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
     },
+    board_transform::HISTORY_PLIES,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
-    xiangqi::Position,
+    xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Position},
 };
 use clap::{Args, Parser, Subcommand};
 use std::{
@@ -54,6 +55,8 @@ enum CliCommand {
     Uci,
     /// Create a random AZ model.
     AzInit(AzInitArgs),
+    /// Probe AZ model structures with cheap CPU root-eval tests.
+    AzArchProbe(AzArchProbeArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
     /// Internal arena worker process.
@@ -73,13 +76,13 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// Model square embedding channels. This build currently supports 32.
+    /// Model square embedding channels.
     #[arg(long)]
     model_channels: Option<usize>,
-    /// Residual mobile board blocks. This build currently supports 3.
+    /// Residual mobile board blocks.
     #[arg(long)]
     model_blocks: Option<usize>,
-    /// Value head channels. This build currently supports 8.
+    /// Value head channels.
     #[arg(long)]
     value_head_channels: Option<usize>,
     /// Value hidden width. This build currently supports 256.
@@ -92,6 +95,28 @@ struct AzLoopArgs {
     /// Training config path.
     #[arg(default_value = DEFAULT_AZ_LOOP_CONFIG)]
     config: String,
+    /// Stop after this many training updates. Omit for continuous training.
+    #[arg(long)]
+    updates: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+struct AzArchProbeArgs {
+    /// Root evaluations per candidate and position.
+    #[arg(long, default_value_t = 128)]
+    reps: usize,
+    /// Random initializations tested for each candidate.
+    #[arg(long, default_value_t = 3)]
+    seed_trials: usize,
+    /// Random seed used to initialize candidate models.
+    #[arg(long, default_value_t = 20260428)]
+    seed: u64,
+    /// FEN file used as the probe position set.
+    #[arg(long = "eval-fens", default_value = DEFAULT_ARENA_EVAL_FENS)]
+    eval_fens_path: String,
+    /// Maximum positions read from the FEN file.
+    #[arg(long, default_value_t = 16)]
+    max_positions: usize,
 }
 
 #[derive(Args, Debug)]
@@ -527,6 +552,245 @@ fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
 
+fn az_model_parameter_count(model: &AzModel) -> usize {
+    model.board_conv1_weights.len()
+        + model.board_conv1_bias.len()
+        + model.board_conv2_weights.len()
+        + model.board_conv2_bias.len()
+        + model.position_embed.len()
+        + model.board_hidden.len()
+        + model.board_hidden_bias.len()
+        + model.value_tail_conv_weights.len()
+        + model.value_tail_conv_bias.len()
+        + model.value_intermediate_hidden.len()
+        + model.value_intermediate_bias.len()
+        + model.value_logits_weights.len()
+        + model.value_direct_logits_weights.len()
+        + model.value_logits_bias.len()
+        + model.policy_from_weights.len()
+        + model.policy_from_bias.len()
+        + model.policy_to_weights.len()
+        + model.policy_to_bias.len()
+        + model.policy_pair_weights.len()
+        + model.policy_move_bias.len()
+        + model.policy_feature_hidden.len()
+        + model.policy_feature_cnn.len()
+        + model.policy_feature_bias.len()
+}
+
+fn az_arch_probe_candidates() -> Vec<AzModelConfig> {
+    [
+        (128, 16, 2, 4, 128),
+        (160, 20, 3, 5, 160),
+        (192, 24, 2, 6, 192),
+        (192, 24, 3, 6, 192),
+        (256, 32, 2, 8, 224),
+        (256, 32, 3, 8, 256),
+        (288, 40, 2, 8, 256),
+    ]
+    .into_iter()
+    .map(
+        |(hidden_size, model_channels, model_blocks, value_head_channels, value_hidden_size)| {
+            AzModelConfig {
+                hidden_size,
+                model_channels,
+                model_blocks,
+                value_head_channels,
+                value_hidden_size,
+                policy_condition_size: 32,
+            }
+            .normalized()
+        },
+    )
+    .collect()
+}
+
+fn az_arch_local_window(config: AzModelConfig) -> usize {
+    let radius = config.model_blocks + 1;
+    let edge = radius * 2 + 1;
+    edge.min(BOARD_FILES.max(BOARD_RANKS))
+}
+
+fn az_arch_value_feature_count(config: AzModelConfig) -> usize {
+    let channels = config.model_channels;
+    let value_channels = config.value_head_channels;
+    value_channels * BOARD_SIZE + value_channels * 4 + channels * 4
+}
+
+fn az_arch_dense64x6_mac_ratio(config: AzModelConfig) -> f64 {
+    let board_channels = 14usize * (HISTORY_PLIES + 1);
+    let board = BOARD_SIZE as f64;
+    let channels = config.model_channels as f64;
+    let dense_channels = 64.0f64;
+    let stem = board * board_channels as f64 * 9.0 * channels;
+    let mobile_blocks = config.model_blocks as f64 * board * (channels * 9.0 + channels * channels);
+    let head = (channels * 4.0) * config.hidden_size as f64
+        + az_arch_value_feature_count(config) as f64 * config.value_hidden_size as f64
+        + channels * 90.0 * 3.0;
+    let mobile_total = stem + mobile_blocks + head;
+
+    let dense_stem = board * board_channels as f64 * 9.0 * dense_channels;
+    let dense_blocks = 6.0 * board * dense_channels * dense_channels * 9.0;
+    mobile_total / (dense_stem + dense_blocks)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AzArchProbeStats {
+    us_per_root: f64,
+    value_abs: f32,
+    entropy_ratio: f32,
+    avg_moves: f32,
+}
+
+fn mean_and_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let diff = value - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    (mean, variance.sqrt())
+}
+
+fn run_single_az_arch_probe(
+    model: &AzModel,
+    positions: &[Position],
+    reps: usize,
+    seed: u64,
+) -> AzArchProbeStats {
+    let limits = AzSearchLimits {
+        simulations: 0,
+        seed,
+        ..AzSearchLimits::default()
+    };
+
+    for position in positions {
+        let _ = alphazero_search(position, model, limits);
+    }
+
+    let started = Instant::now();
+    let mut value_abs_sum = 0.0f32;
+    let mut entropy_ratio_sum = 0.0f32;
+    let mut move_count_sum = 0usize;
+    let mut root_count = 0usize;
+    for _ in 0..reps {
+        for position in positions {
+            let result = alphazero_search(position, model, limits);
+            value_abs_sum += (result.value_cp as f32 / 1000.0).abs();
+            let moves = result.candidates.len();
+            move_count_sum += moves;
+            if moves > 1 {
+                let entropy = result
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.policy > 0.0)
+                    .map(|candidate| -candidate.policy * candidate.policy.ln())
+                    .sum::<f32>();
+                entropy_ratio_sum += entropy / (moves as f32).ln();
+            }
+            root_count += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    let root_count_f = root_count.max(1) as f64;
+    AzArchProbeStats {
+        us_per_root: elapsed.as_secs_f64() * 1_000_000.0 / root_count_f,
+        value_abs: value_abs_sum / root_count.max(1) as f32,
+        entropy_ratio: entropy_ratio_sum / root_count.max(1) as f32,
+        avg_moves: move_count_sum as f32 / root_count.max(1) as f32,
+    }
+}
+
+fn run_az_arch_probe(cmd: AzArchProbeArgs) {
+    let mut positions = load_arena_eval_positions(&cmd.eval_fens_path);
+    if positions.is_empty() {
+        positions.push(Position::startpos());
+    }
+    positions.truncate(cmd.max_positions.max(1));
+    let reps = cmd.reps.max(1);
+    let seed_trials = cmd.seed_trials.max(1);
+
+    println!(
+        "arch-probe: positions={} reps={} seed_trials={} seed={} eval_fens={}",
+        positions.len(),
+        reps,
+        seed_trials,
+        cmd.seed,
+        cmd.eval_fens_path
+    );
+    println!(
+        "{:>3} {:>4} {:>2} {:>4} {:>3} {:>4} {:>9} {:>7} {:>5} {:>6} {:>10} {:>7} {:>8} {:>8} {:>8}",
+        "#",
+        "chan",
+        "bk",
+        "hid",
+        "vhc",
+        "vhh",
+        "params",
+        "win",
+        "line",
+        "mac%",
+        "us/root",
+        "us_sd",
+        "v_abs",
+        "ent",
+        "moves"
+    );
+
+    for (index, config) in az_arch_probe_candidates().into_iter().enumerate() {
+        config
+            .validate_supported()
+            .unwrap_or_else(|err| panic!("{err}"));
+        let mut stats = Vec::with_capacity(seed_trials);
+        let mut params = 0usize;
+        for trial in 0..seed_trials {
+            let seed = cmd.seed ^ ((index as u64) << 32) ^ trial as u64;
+            let model = AzModel::random_with_config(config, seed);
+            params = az_model_parameter_count(&model);
+            stats.push(run_single_az_arch_probe(&model, &positions, reps, seed));
+        }
+        let us_values = stats
+            .iter()
+            .map(|stats| stats.us_per_root)
+            .collect::<Vec<_>>();
+        let (us_mean, us_std) = mean_and_std(&us_values);
+        let value_abs_max = stats
+            .iter()
+            .map(|stats| stats.value_abs)
+            .fold(0.0f32, f32::max);
+        let entropy_min = stats
+            .iter()
+            .map(|stats| stats.entropy_ratio)
+            .fold(f32::INFINITY, f32::min);
+        let avg_moves = stats.iter().map(|stats| stats.avg_moves).sum::<f32>() / stats.len() as f32;
+
+        println!(
+            "{:>3} {:>4} {:>2} {:>4} {:>3} {:>4} {:>9} {:>7} {:>5} {:>6.1} {:>10.2} {:>7.2} {:>8.3} {:>8.3} {:>8.1}",
+            index + 1,
+            config.model_channels,
+            config.model_blocks,
+            config.hidden_size,
+            config.value_head_channels,
+            config.value_hidden_size,
+            params,
+            az_arch_local_window(config),
+            config.model_channels * 2,
+            az_arch_dense64x6_mac_ratio(config) * 100.0,
+            us_mean,
+            us_std,
+            value_abs_max,
+            entropy_min,
+            avg_moves
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -556,8 +820,12 @@ fn main() {
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
+        Some(CliCommand::AzArchProbe(cmd)) => {
+            run_az_arch_probe(cmd);
+        }
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
+            let max_updates = cmd.updates;
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
@@ -686,6 +954,9 @@ fn main() {
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
+            if let Some(max_updates) = max_updates {
+                println!("loop     : bounded run updates={}", max_updates.max(1));
+            }
             let (selfplay_tx, selfplay_rx) = mpsc::channel::<SelfplayBatch>();
             let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
@@ -1304,6 +1575,12 @@ fn main() {
                     println!("resume   : selfplay resumed after arena");
                 }
                 update = update.saturating_add(1);
+                if let Some(max_updates) = max_updates
+                    && update.saturating_sub(start_update) >= max_updates.max(1)
+                {
+                    println!("loop     : reached bounded update limit ({max_updates})");
+                    break;
+                }
             }
             stop_requested.store(true, Ordering::SeqCst);
             {

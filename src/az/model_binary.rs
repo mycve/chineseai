@@ -64,6 +64,7 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.policy_from_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_to_weights)?;
         write_f32_slice_le(&mut writer, &self.policy_to_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_pair_weights)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_hidden)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_cnn)?;
@@ -86,11 +87,11 @@ impl AzModel {
         }
         let mut reader = Cursor::new(&bytes[AZ_MODEL_BINARY_MAGIC.len()..]);
         let version = read_u32_le(&mut reader)?;
-        if version != AZ_MODEL_BINARY_VERSION {
+        if version != AZ_MODEL_BINARY_VERSION && version != 6 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported AzModel binary version {version} (expected {AZ_MODEL_BINARY_VERSION})"
+                    "unsupported AzModel binary version {version} (expected {AZ_MODEL_BINARY_VERSION} or 6)"
                 ),
             ));
         }
@@ -137,6 +138,7 @@ impl AzModel {
         let pfbias_len = 1;
         let ptw_len = channels;
         let ptbias_len = 1;
+        let ppw_len = if version >= 7 { channels } else { 0 };
         let pmb_len = DENSE_MOVE_SPACE;
         let pfh_len = POLICY_CONDITION_SIZE * hidden_size;
         let pfc_len = POLICY_CONDITION_SIZE * pooled_size;
@@ -159,6 +161,7 @@ impl AzModel {
             + pfbias_len
             + ptw_len
             + ptbias_len
+            + ppw_len
             + pmb_len
             + pfh_len
             + pfc_len
@@ -196,6 +199,11 @@ impl AzModel {
             policy_from_bias: read_f32_vec_le(&mut reader, pfbias_len)?,
             policy_to_weights: read_f32_vec_le(&mut reader, ptw_len)?,
             policy_to_bias: read_f32_vec_le(&mut reader, ptbias_len)?,
+            policy_pair_weights: if ppw_len > 0 {
+                read_f32_vec_le(&mut reader, ppw_len)?
+            } else {
+                vec![0.0; channels]
+            },
             policy_move_bias: read_f32_vec_le(&mut reader, pmb_len)?,
             policy_feature_hidden: read_f32_vec_le(&mut reader, pfh_len)?,
             policy_feature_cnn: read_f32_vec_le(&mut reader, pfc_len)?,

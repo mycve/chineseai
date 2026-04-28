@@ -11,7 +11,7 @@ use super::model_ops::{
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 6;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 7;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -118,6 +118,7 @@ pub struct AzModel {
     pub policy_from_bias: Vec<f32>,
     pub policy_to_weights: Vec<f32>,
     pub policy_to_bias: Vec<f32>,
+    pub policy_pair_weights: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
     pub policy_feature_cnn: Vec<f32>,
@@ -135,10 +136,10 @@ pub struct AzModel {
 //   small spatial tail -> leaky MLP -> three outcome logits. The leaky gate is
 //   important; a hard ReLU can kill value gradients on tiny or early self-play
 //   batches and masquerade as a search/TD problem.
-// - Policy is a factorized legal-move scorer: from-square score + to-square
-//   score + move-geometry condition + move bias. This is much cheaper than a
-//   dense move tower and matches the "node embedding + edge/action scorer"
-//   spirit of the GNN project.
+// - Policy is a lightweight legal-move scorer: from-square score + to-square
+//   score + channelwise from/to interaction + move-geometry condition + move
+//   bias. This is much cheaper than a dense move tower while still giving the
+//   action scorer a direct pair feature.
 // - Do not resurrect the old sparse V4/NNUE-style board identities here. They
 //   made offline fitting easier but muddied whether self-play value was learning
 //   from board structure.
@@ -166,6 +167,7 @@ impl Clone for AzModel {
             policy_from_bias: self.policy_from_bias.clone(),
             policy_to_weights: self.policy_to_weights.clone(),
             policy_to_bias: self.policy_to_bias.clone(),
+            policy_pair_weights: self.policy_pair_weights.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
             policy_feature_cnn: self.policy_feature_cnn.clone(),
@@ -241,6 +243,7 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / channels as f32).sqrt() * 0.25))
             .collect();
         let policy_to_bias = vec![0.0; 1];
+        let policy_pair_weights = vec![0.0; channels];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
@@ -270,6 +273,7 @@ impl AzModel {
             policy_from_bias,
             policy_to_weights,
             policy_to_bias,
+            policy_pair_weights,
             policy_move_bias,
             policy_feature_hidden,
             policy_feature_cnn,
@@ -478,6 +482,7 @@ impl AzModel {
             || self.policy_from_bias.len() != 1
             || self.policy_to_weights.len() != channels
             || self.policy_to_bias.len() != 1
+            || self.policy_pair_weights.len() != channels
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
             || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * self.hidden_size
             || self.policy_feature_cnn.len() != POLICY_CONDITION_SIZE * pooled_size
@@ -519,6 +524,7 @@ impl AzModel {
                 &self.policy_to_weights,
                 self.policy_to_bias[0],
             )
+            + self.policy_pair_score(features, from, to)
             + dot_product(policy_condition, move_features)
     }
 
@@ -526,6 +532,16 @@ impl AzModel {
         let mut value = bias;
         for channel in 0..self.model_config.model_channels {
             value += features[channel * BOARD_PLANES_SIZE + sq] * weights[channel];
+        }
+        value
+    }
+
+    fn policy_pair_score(&self, features: &[f32], from: usize, to: usize) -> f32 {
+        let mut value = 0.0;
+        for channel in 0..self.model_config.model_channels {
+            let base = channel * BOARD_PLANES_SIZE;
+            value +=
+                features[base + from] * features[base + to] * self.policy_pair_weights[channel];
         }
         value
     }
