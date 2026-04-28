@@ -51,11 +51,23 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.board_conv1_bias)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_weights)?;
         write_f32_slice_le(&mut writer, &self.board_conv2_bias)?;
+        write_f32_slice_le(&mut writer, &self.board_bn_scale)?;
+        write_f32_slice_le(&mut writer, &self.board_bn_bias)?;
+        write_f32_slice_le(&mut writer, &self.board_bn_running_mean)?;
+        write_f32_slice_le(&mut writer, &self.board_bn_running_var)?;
+        write_f32_slice_le(&mut writer, &self.residual_bn_scale)?;
+        write_f32_slice_le(&mut writer, &self.residual_bn_bias)?;
+        write_f32_slice_le(&mut writer, &self.residual_bn_running_mean)?;
+        write_f32_slice_le(&mut writer, &self.residual_bn_running_var)?;
         write_f32_slice_le(&mut writer, &self.position_embed)?;
         write_f32_slice_le(&mut writer, &self.value_relation_weights)?;
         write_f32_slice_le(&mut writer, &self.value_relation_bias)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_weights)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_tail_bn_scale)?;
+        write_f32_slice_le(&mut writer, &self.value_tail_bn_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_tail_bn_running_mean)?;
+        write_f32_slice_le(&mut writer, &self.value_tail_bn_running_var)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
@@ -66,6 +78,10 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.value_scalar_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_tail_conv_weights)?;
         write_f32_slice_le(&mut writer, &self.policy_tail_conv_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_tail_bn_scale)?;
+        write_f32_slice_le(&mut writer, &self.policy_tail_bn_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_tail_bn_running_mean)?;
+        write_f32_slice_le(&mut writer, &self.policy_tail_bn_running_var)?;
         write_f32_slice_le(&mut writer, &self.policy_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
         writer.flush()?;
@@ -122,12 +138,15 @@ impl AzModel {
         let board_conv1_bias_len = channels;
         let board_conv2_weights_len = blocks * mobile_block_weight_size(channels);
         let board_conv2_bias_len = blocks * mobile_block_bias_size(channels);
+        let board_bn_len = channels;
+        let residual_bn_len = blocks * mobile_block_bias_size(channels);
         let position_embed_len = channels * BOARD_PLANES_SIZE;
         let value_relation_weights_len =
             VALUE_RELATION_LAYERS * value_relation_weight_size(channels);
         let value_relation_bias_len = VALUE_RELATION_LAYERS * value_relation_bias_size(channels);
         let value_tail_conv_weights_len = value_channels * channels;
         let value_tail_conv_bias_len = value_channels;
+        let value_tail_bn_len = value_channels;
         let vih_len = value_hidden_size * value_features;
         let vib_len = value_hidden_size;
         let vlw_len = VALUE_LOGITS * value_hidden_size;
@@ -138,17 +157,21 @@ impl AzModel {
         let vsb_len = 1;
         let ptcw_len = super::model::POLICY_HEAD_CHANNELS * channels;
         let ptcb_len = super::model::POLICY_HEAD_CHANNELS;
+        let ptbn_len = super::model::POLICY_HEAD_CHANNELS;
         let plw_len = DENSE_MOVE_SPACE * super::model::policy_head_map_size();
         let pmb_len = DENSE_MOVE_SPACE;
         let float_count = board_conv1_weights_len
             + board_conv1_bias_len
             + board_conv2_weights_len
             + board_conv2_bias_len
+            + board_bn_len * 4
+            + residual_bn_len * 4
             + position_embed_len
             + value_relation_weights_len
             + value_relation_bias_len
             + value_tail_conv_weights_len
             + value_tail_conv_bias_len
+            + value_tail_bn_len * 4
             + vih_len
             + vib_len
             + vlw_len
@@ -159,6 +182,7 @@ impl AzModel {
             + vsb_len
             + ptcw_len
             + ptcb_len
+            + ptbn_len * 4
             + plw_len
             + pmb_len;
         let expected_len = AZ_MODEL_BINARY_HEADER_LEN + float_count * 4;
@@ -180,11 +204,23 @@ impl AzModel {
             board_conv1_bias: read_f32_vec_le(&mut reader, board_conv1_bias_len)?,
             board_conv2_weights: read_f32_vec_le(&mut reader, board_conv2_weights_len)?,
             board_conv2_bias: read_f32_vec_le(&mut reader, board_conv2_bias_len)?,
+            board_bn_scale: read_f32_vec_le(&mut reader, board_bn_len)?,
+            board_bn_bias: read_f32_vec_le(&mut reader, board_bn_len)?,
+            board_bn_running_mean: read_f32_vec_le(&mut reader, board_bn_len)?,
+            board_bn_running_var: read_f32_vec_le(&mut reader, board_bn_len)?,
+            residual_bn_scale: read_f32_vec_le(&mut reader, residual_bn_len)?,
+            residual_bn_bias: read_f32_vec_le(&mut reader, residual_bn_len)?,
+            residual_bn_running_mean: read_f32_vec_le(&mut reader, residual_bn_len)?,
+            residual_bn_running_var: read_f32_vec_le(&mut reader, residual_bn_len)?,
             position_embed: read_f32_vec_le(&mut reader, position_embed_len)?,
             value_relation_weights: read_f32_vec_le(&mut reader, value_relation_weights_len)?,
             value_relation_bias: read_f32_vec_le(&mut reader, value_relation_bias_len)?,
             value_tail_conv_weights: read_f32_vec_le(&mut reader, value_tail_conv_weights_len)?,
             value_tail_conv_bias: read_f32_vec_le(&mut reader, value_tail_conv_bias_len)?,
+            value_tail_bn_scale: read_f32_vec_le(&mut reader, value_tail_bn_len)?,
+            value_tail_bn_bias: read_f32_vec_le(&mut reader, value_tail_bn_len)?,
+            value_tail_bn_running_mean: read_f32_vec_le(&mut reader, value_tail_bn_len)?,
+            value_tail_bn_running_var: read_f32_vec_le(&mut reader, value_tail_bn_len)?,
             value_intermediate_hidden: read_f32_vec_le(&mut reader, vih_len)?,
             value_intermediate_bias: read_f32_vec_le(&mut reader, vib_len)?,
             value_logits_weights: read_f32_vec_le(&mut reader, vlw_len)?,
@@ -195,6 +231,10 @@ impl AzModel {
             value_scalar_bias: read_f32_vec_le(&mut reader, vsb_len)?,
             policy_tail_conv_weights: read_f32_vec_le(&mut reader, ptcw_len)?,
             policy_tail_conv_bias: read_f32_vec_le(&mut reader, ptcb_len)?,
+            policy_tail_bn_scale: read_f32_vec_le(&mut reader, ptbn_len)?,
+            policy_tail_bn_bias: read_f32_vec_le(&mut reader, ptbn_len)?,
+            policy_tail_bn_running_mean: read_f32_vec_le(&mut reader, ptbn_len)?,
+            policy_tail_bn_running_var: read_f32_vec_le(&mut reader, ptbn_len)?,
             policy_logits_weights: read_f32_vec_le(&mut reader, plw_len)?,
             policy_move_bias: read_f32_vec_le(&mut reader, pmb_len)?,
             gpu_trainer: None,

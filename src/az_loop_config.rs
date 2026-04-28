@@ -349,7 +349,7 @@ impl AzLoopFileConfig {
 #   model file disagree.
 #   Current model: configurable Tiny residual CNN over canonical board history planes.
 #   model_channels is the hidden width of each board square embedding.
-#   model_blocks are residual 3x3 CNN blocks, each with two dense convolutions.
+#   model_blocks are residual 3x3 CNN blocks, each with two dense conv+BN layers.
 #   value_head_channels/value_hidden_size control the value head capacity.
 #   Policy is the standard CNN-style 1x1-conv + dense move-logit head.
 #   Historical sparse/NNUE inputs and value shortcuts are gone.

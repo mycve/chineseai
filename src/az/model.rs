@@ -5,13 +5,14 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKin
 
 use super::model_config::AzModelConfig;
 use super::model_ops::{
-    conv_relu_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic, dot_product,
-    pool_cnn_features, residual_cnn_block_generic, residual_value_relation_block_generic,
+    apply_batch_norm_2d_inplace, conv_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic,
+    dot_product, pool_cnn_features, residual_cnn_block_generic,
+    residual_value_relation_block_generic,
 };
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 14;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 15;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -35,6 +36,7 @@ pub(super) const CNN_POOL_BLOCKS: usize = 4;
 pub(super) const VALUE_HEAD_LEAK: f32 = 0.05;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const VALUE_SCALE_CP: f32 = 1000.0;
+pub(super) const BATCH_NORM_EPS: f32 = 1.0e-5;
 
 pub(super) fn cnn_pooled_size(channels: usize) -> usize {
     channels * CNN_POOL_BLOCKS
@@ -130,11 +132,23 @@ pub struct AzModel {
     pub board_conv1_bias: Vec<f32>,
     pub board_conv2_weights: Vec<f32>,
     pub board_conv2_bias: Vec<f32>,
+    pub board_bn_scale: Vec<f32>,
+    pub board_bn_bias: Vec<f32>,
+    pub board_bn_running_mean: Vec<f32>,
+    pub board_bn_running_var: Vec<f32>,
+    pub residual_bn_scale: Vec<f32>,
+    pub residual_bn_bias: Vec<f32>,
+    pub residual_bn_running_mean: Vec<f32>,
+    pub residual_bn_running_var: Vec<f32>,
     pub position_embed: Vec<f32>,
     pub value_relation_weights: Vec<f32>,
     pub value_relation_bias: Vec<f32>,
     pub value_tail_conv_weights: Vec<f32>,
     pub value_tail_conv_bias: Vec<f32>,
+    pub value_tail_bn_scale: Vec<f32>,
+    pub value_tail_bn_bias: Vec<f32>,
+    pub value_tail_bn_running_mean: Vec<f32>,
+    pub value_tail_bn_running_var: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
@@ -145,15 +159,20 @@ pub struct AzModel {
     pub value_scalar_bias: Vec<f32>,
     pub policy_tail_conv_weights: Vec<f32>,
     pub policy_tail_conv_bias: Vec<f32>,
+    pub policy_tail_bn_scale: Vec<f32>,
+    pub policy_tail_bn_bias: Vec<f32>,
+    pub policy_tail_bn_running_mean: Vec<f32>,
+    pub policy_tail_bn_running_var: Vec<f32>,
     pub policy_logits_weights: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub(super) gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
 // Architecture notes:
-// - v14 is a canonical board-only AlphaZero-style CNN. The board is canonical
+// - v15 is a canonical board-only AlphaZero-style CNN. The board is canonical
 //   side-to-move history planes, followed by a sparse 3x3 input stem and N
-//   residual blocks. Each residual block is two dense padded 3x3 convolutions.
+//   residual blocks. Each conv is followed by BatchNorm; each residual block is
+//   two dense padded 3x3 convolutions.
 // - Value uses a 1x1 conv tail plus global/line pooling and a leaky MLP scalar
 //   readout. The extra scalar skip keeps early value gradients alive on noisy
 //   self-play batches.
@@ -172,11 +191,23 @@ impl Clone for AzModel {
             board_conv1_bias: self.board_conv1_bias.clone(),
             board_conv2_weights: self.board_conv2_weights.clone(),
             board_conv2_bias: self.board_conv2_bias.clone(),
+            board_bn_scale: self.board_bn_scale.clone(),
+            board_bn_bias: self.board_bn_bias.clone(),
+            board_bn_running_mean: self.board_bn_running_mean.clone(),
+            board_bn_running_var: self.board_bn_running_var.clone(),
+            residual_bn_scale: self.residual_bn_scale.clone(),
+            residual_bn_bias: self.residual_bn_bias.clone(),
+            residual_bn_running_mean: self.residual_bn_running_mean.clone(),
+            residual_bn_running_var: self.residual_bn_running_var.clone(),
             position_embed: self.position_embed.clone(),
             value_relation_weights: self.value_relation_weights.clone(),
             value_relation_bias: self.value_relation_bias.clone(),
             value_tail_conv_weights: self.value_tail_conv_weights.clone(),
             value_tail_conv_bias: self.value_tail_conv_bias.clone(),
+            value_tail_bn_scale: self.value_tail_bn_scale.clone(),
+            value_tail_bn_bias: self.value_tail_bn_bias.clone(),
+            value_tail_bn_running_mean: self.value_tail_bn_running_mean.clone(),
+            value_tail_bn_running_var: self.value_tail_bn_running_var.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
@@ -187,6 +218,10 @@ impl Clone for AzModel {
             value_scalar_bias: self.value_scalar_bias.clone(),
             policy_tail_conv_weights: self.policy_tail_conv_weights.clone(),
             policy_tail_conv_bias: self.policy_tail_conv_bias.clone(),
+            policy_tail_bn_scale: self.policy_tail_bn_scale.clone(),
+            policy_tail_bn_bias: self.policy_tail_bn_bias.clone(),
+            policy_tail_bn_running_mean: self.policy_tail_bn_running_mean.clone(),
+            policy_tail_bn_running_var: self.policy_tail_bn_running_var.clone(),
             policy_logits_weights: self.policy_logits_weights.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             gpu_trainer: None,
@@ -233,6 +268,15 @@ impl AzModel {
             })
             .collect();
         let board_conv2_bias = vec![0.0; blocks * mobile_bias_size];
+        let board_bn_scale = vec![1.0; channels];
+        let board_bn_bias = vec![0.0; channels];
+        let board_bn_running_mean = vec![0.0; channels];
+        let board_bn_running_var = vec![1.0; channels];
+        let residual_bn_len = blocks * mobile_bias_size;
+        let residual_bn_scale = vec![1.0; residual_bn_len];
+        let residual_bn_bias = vec![0.0; residual_bn_len];
+        let residual_bn_running_mean = vec![0.0; residual_bn_len];
+        let residual_bn_running_var = vec![1.0; residual_bn_len];
         let position_embed = (0..channels * BOARD_PLANES_SIZE)
             .map(|_| rng.weight(0.02))
             .collect();
@@ -267,6 +311,10 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / channels as f32).sqrt()))
             .collect();
         let value_tail_conv_bias = vec![0.0; value_channels];
+        let value_tail_bn_scale = vec![1.0; value_channels];
+        let value_tail_bn_bias = vec![0.0; value_channels];
+        let value_tail_bn_running_mean = vec![0.0; value_channels];
+        let value_tail_bn_running_var = vec![1.0; value_channels];
         let value_intermediate_hidden = (0..value_hidden_size * value_features)
             .map(|_| rng.weight((2.0 / value_features as f32).sqrt()))
             .collect();
@@ -287,6 +335,10 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / channels as f32).sqrt()))
             .collect();
         let policy_tail_conv_bias = vec![0.0; POLICY_HEAD_CHANNELS];
+        let policy_tail_bn_scale = vec![1.0; POLICY_HEAD_CHANNELS];
+        let policy_tail_bn_bias = vec![0.0; POLICY_HEAD_CHANNELS];
+        let policy_tail_bn_running_mean = vec![0.0; POLICY_HEAD_CHANNELS];
+        let policy_tail_bn_running_var = vec![1.0; POLICY_HEAD_CHANNELS];
         let policy_logits_weights = (0..DENSE_MOVE_SPACE * policy_head_map_size())
             .map(|_| rng.weight((2.0 / policy_head_map_size() as f32).sqrt() * 0.1))
             .collect();
@@ -298,11 +350,23 @@ impl AzModel {
             board_conv1_bias,
             board_conv2_weights,
             board_conv2_bias,
+            board_bn_scale,
+            board_bn_bias,
+            board_bn_running_mean,
+            board_bn_running_var,
+            residual_bn_scale,
+            residual_bn_bias,
+            residual_bn_running_mean,
+            residual_bn_running_var,
             position_embed,
             value_relation_weights,
             value_relation_bias,
             value_tail_conv_weights,
             value_tail_conv_bias,
+            value_tail_bn_scale,
+            value_tail_bn_bias,
+            value_tail_bn_running_mean,
+            value_tail_bn_running_var,
             value_intermediate_hidden,
             value_intermediate_bias,
             value_logits_weights,
@@ -313,6 +377,10 @@ impl AzModel {
             value_scalar_bias,
             policy_tail_conv_weights,
             policy_tail_conv_bias,
+            policy_tail_bn_scale,
+            policy_tail_bn_bias,
+            policy_tail_bn_running_mean,
+            policy_tail_bn_running_var,
             policy_logits_weights,
             policy_move_bias,
             gpu_trainer: None,
@@ -438,12 +506,21 @@ impl AzModel {
         tmp.resize(channels * BOARD_PLANES_SIZE, 0.0);
         delta.resize(channels * BOARD_PLANES_SIZE, 0.0);
         cnn_global.resize(pooled_size, 0.0);
-        conv_relu_board_layer_sparse_3x3(
+        conv_board_layer_sparse_3x3(
             board,
             channels,
             &self.board_conv1_weights,
             &self.board_conv1_bias,
             features,
+        );
+        apply_batch_norm_2d_inplace(
+            features,
+            channels,
+            &self.board_bn_scale,
+            &self.board_bn_bias,
+            &self.board_bn_running_mean,
+            &self.board_bn_running_var,
+            true,
         );
         for (feature, pos) in features.iter_mut().zip(&self.position_embed) {
             *feature = (*feature + pos).max(0.0);
@@ -458,6 +535,10 @@ impl AzModel {
                 channels,
                 &self.board_conv2_weights[weight_start..weight_start + mobile_weight_size],
                 &self.board_conv2_bias[bias_start..bias_start + mobile_bias_size],
+                &self.residual_bn_scale[bias_start..bias_start + mobile_bias_size],
+                &self.residual_bn_bias[bias_start..bias_start + mobile_bias_size],
+                &self.residual_bn_running_mean[bias_start..bias_start + mobile_bias_size],
+                &self.residual_bn_running_var[bias_start..bias_start + mobile_bias_size],
             );
         }
         pool_cnn_features(features, channels, cnn_global);
@@ -518,6 +599,15 @@ impl AzModel {
             &self.value_tail_conv_bias,
             value_tail,
         );
+        apply_batch_norm_2d_inplace(
+            value_tail,
+            value_channels,
+            &self.value_tail_bn_scale,
+            &self.value_tail_bn_bias,
+            &self.value_tail_bn_running_mean,
+            &self.value_tail_bn_running_var,
+            true,
+        );
         relation_global.resize(cnn_pooled_size(channels), 0.0);
         pool_cnn_features(features, channels, relation_global);
         value_pool_features(
@@ -570,9 +660,15 @@ impl AzModel {
             &self.policy_tail_conv_bias,
             policy_tail,
         );
-        for value in policy_tail.iter_mut() {
-            *value = value.max(0.0);
-        }
+        apply_batch_norm_2d_inplace(
+            policy_tail,
+            POLICY_HEAD_CHANNELS,
+            &self.policy_tail_bn_scale,
+            &self.policy_tail_bn_bias,
+            &self.policy_tail_bn_running_mean,
+            &self.policy_tail_bn_running_var,
+            true,
+        );
     }
 
     pub(super) fn validate(&self) -> io::Result<()> {
@@ -587,6 +683,14 @@ impl AzModel {
             || self.board_conv1_bias.len() != channels
             || self.board_conv2_weights.len() != blocks * mobile_block_weight_size(channels)
             || self.board_conv2_bias.len() != blocks * mobile_block_bias_size(channels)
+            || self.board_bn_scale.len() != channels
+            || self.board_bn_bias.len() != channels
+            || self.board_bn_running_mean.len() != channels
+            || self.board_bn_running_var.len() != channels
+            || self.residual_bn_scale.len() != blocks * mobile_block_bias_size(channels)
+            || self.residual_bn_bias.len() != blocks * mobile_block_bias_size(channels)
+            || self.residual_bn_running_mean.len() != blocks * mobile_block_bias_size(channels)
+            || self.residual_bn_running_var.len() != blocks * mobile_block_bias_size(channels)
             || self.position_embed.len() != channels * BOARD_PLANES_SIZE
             || self.value_relation_weights.len()
                 != VALUE_RELATION_LAYERS * value_relation_weight_size(channels)
@@ -594,6 +698,10 @@ impl AzModel {
                 != VALUE_RELATION_LAYERS * value_relation_bias_size(channels)
             || self.value_tail_conv_weights.len() != value_channels * channels
             || self.value_tail_conv_bias.len() != value_channels
+            || self.value_tail_bn_scale.len() != value_channels
+            || self.value_tail_bn_bias.len() != value_channels
+            || self.value_tail_bn_running_mean.len() != value_channels
+            || self.value_tail_bn_running_var.len() != value_channels
             || self.value_intermediate_hidden.len() != value_hidden_size * value_features
             || self.value_intermediate_bias.len() != value_hidden_size
             || self.value_logits_weights.len() != VALUE_LOGITS * value_hidden_size
@@ -604,6 +712,10 @@ impl AzModel {
             || self.value_scalar_bias.len() != 1
             || self.policy_tail_conv_weights.len() != POLICY_HEAD_CHANNELS * channels
             || self.policy_tail_conv_bias.len() != POLICY_HEAD_CHANNELS
+            || self.policy_tail_bn_scale.len() != POLICY_HEAD_CHANNELS
+            || self.policy_tail_bn_bias.len() != POLICY_HEAD_CHANNELS
+            || self.policy_tail_bn_running_mean.len() != POLICY_HEAD_CHANNELS
+            || self.policy_tail_bn_running_var.len() != POLICY_HEAD_CHANNELS
             || self.policy_logits_weights.len() != DENSE_MOVE_SPACE * policy_head_map_size()
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
         {

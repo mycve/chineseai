@@ -1,9 +1,10 @@
 use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 use candle_nn::ops::{log_softmax, softmax};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
+use candle_nn::{BatchNorm, ModuleT};
 use std::{process::Command, thread};
 
-use super::model::{VALUE_RELATION_FFN_MULT, VALUE_RELATION_LAYERS};
+use super::model::{BATCH_NORM_EPS, VALUE_RELATION_FFN_MULT, VALUE_RELATION_LAYERS};
 use super::{
     AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
     CNN_KERNEL_AREA, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, VALUE_HEAD_LEAK, VALUE_LOGITS,
@@ -40,10 +41,19 @@ struct GpuReplica {
 struct GpuVars {
     board_conv1_weights: Var,
     board_conv1_bias: Var,
+    board_bn_scale: Var,
+    board_bn_bias: Var,
+    board_bn: BatchNorm,
     residual_dw_weights: Vec<Var>,
     residual_dw_biases: Vec<Var>,
+    residual_dw_bn_scales: Vec<Var>,
+    residual_dw_bn_biases: Vec<Var>,
+    residual_dw_bns: Vec<BatchNorm>,
     residual_pw_weights: Vec<Var>,
     residual_pw_biases: Vec<Var>,
+    residual_pw_bn_scales: Vec<Var>,
+    residual_pw_bn_biases: Vec<Var>,
+    residual_pw_bns: Vec<BatchNorm>,
     position_embed: Var,
     value_relation_row_weights: Vec<Var>,
     value_relation_row_gates: Vec<Var>,
@@ -56,6 +66,9 @@ struct GpuVars {
     value_relation_ffn_down_biases: Vec<Var>,
     value_tail_conv_weights: Var,
     value_tail_conv_bias: Var,
+    value_tail_bn_scale: Var,
+    value_tail_bn_bias: Var,
+    value_tail_bn: BatchNorm,
     value_intermediate_hidden: Var,
     value_intermediate_bias: Var,
     value_logits_weights: Var,
@@ -66,6 +79,9 @@ struct GpuVars {
     value_scalar_bias: Var,
     policy_tail_conv_weights: Var,
     policy_tail_conv_bias: Var,
+    policy_tail_bn_scale: Var,
+    policy_tail_bn_bias: Var,
+    policy_tail_bn: BatchNorm,
     policy_logits_weights: Var,
     policy_move_bias: Var,
 }
@@ -413,7 +429,7 @@ impl GpuReplica {
         keep_grads: bool,
     ) -> CandleResult<ShardOutput> {
         let batch_tensors = BatchTensors::new(samples, batch, &self.device)?;
-        let forward = self.forward(&batch_tensors)?;
+        let forward = self.forward_t(&batch_tensors, true)?;
         let value_error = (&forward.value - &batch_tensors.values)?;
         let value_loss_tensor = value_error.sqr()?.sum_all()?;
 
@@ -468,7 +484,7 @@ impl GpuReplica {
         Ok(output.stats)
     }
 
-    fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
+    fn forward_t(&self, batch: &BatchTensors, train: bool) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
         let channels = self.model_config.model_channels;
         let blocks = self.model_config.model_blocks;
@@ -477,8 +493,8 @@ impl GpuReplica {
         let mut features = batch
             .board_onehot
             .conv2d(&self.vars.board_conv1_weights, 1, 1, 1, 1)?
-            .broadcast_add(&self.vars.board_conv1_bias.reshape((1, channels, 1, 1))?)?
-            .relu()?;
+            .broadcast_add(&self.vars.board_conv1_bias.reshape((1, channels, 1, 1))?)?;
+        features = self.vars.board_bn.forward_t(&features, train)?.relu()?;
         features = features
             .broadcast_add(&self.vars.position_embed.reshape((
                 1,
@@ -490,13 +506,18 @@ impl GpuReplica {
         for block in 0..blocks {
             let hidden = features
                 .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, 1)?
-                .broadcast_add(&self.vars.residual_dw_biases[block].reshape((1, channels, 1, 1))?)?
+                .broadcast_add(
+                    &self.vars.residual_dw_biases[block].reshape((1, channels, 1, 1))?,
+                )?;
+            let hidden = self.vars.residual_dw_bns[block]
+                .forward_t(&hidden, train)?
                 .relu()?;
             let delta = hidden
                 .conv2d(&self.vars.residual_pw_weights[block], 1, 1, 1, 1)?
                 .broadcast_add(
                     &self.vars.residual_pw_biases[block].reshape((1, channels, 1, 1))?,
                 )?;
+            let delta = self.vars.residual_pw_bns[block].forward_t(&delta, train)?;
             features = (features + delta)?.relu()?;
         }
 
@@ -578,6 +599,11 @@ impl GpuReplica {
                     .value_tail_conv_bias
                     .reshape((1, value_channels, 1, 1))?,
             )?;
+        let value_tail = self
+            .vars
+            .value_tail_bn
+            .forward_t(&value_tail, train)?
+            .relu()?;
         let relation_flat = value_features.reshape((bsz, channels, BOARD_PLANES_SIZE))?;
         let relation_avg_pool = relation_flat.mean(2)?;
         let relation_max_pool = relation_flat.max(2)?;
@@ -648,7 +674,11 @@ impl GpuReplica {
                 super::model::POLICY_HEAD_CHANNELS,
                 1,
                 1,
-            ))?)?
+            ))?)?;
+        let policy_tail = self
+            .vars
+            .policy_tail_bn
+            .forward_t(&policy_tail, train)?
             .relu()?
             .reshape((bsz, super::model::policy_head_map_size()))?;
         let policy_logits = policy_tail
@@ -752,8 +782,14 @@ impl GpuVars {
         let value_relation_bias_size = value_relation_bias_size(channels);
         let mut residual_dw_weights = Vec::with_capacity(blocks);
         let mut residual_dw_biases = Vec::with_capacity(blocks);
+        let mut residual_dw_bn_scales = Vec::with_capacity(blocks);
+        let mut residual_dw_bn_biases = Vec::with_capacity(blocks);
+        let mut residual_dw_bns = Vec::with_capacity(blocks);
         let mut residual_pw_weights = Vec::with_capacity(blocks);
         let mut residual_pw_biases = Vec::with_capacity(blocks);
+        let mut residual_pw_bn_scales = Vec::with_capacity(blocks);
+        let mut residual_pw_bn_biases = Vec::with_capacity(blocks);
+        let mut residual_pw_bns = Vec::with_capacity(blocks);
         let conv_len = channels * channels * CNN_KERNEL_AREA;
         for block in 0..blocks {
             let weight_offset = block * mobile_weight_size;
@@ -768,6 +804,26 @@ impl GpuVars {
                 channels,
                 device,
             )?);
+            let dw_bn_scale = var_from_slice(
+                &model.residual_bn_scale[bias_offset..bias_offset + channels],
+                channels,
+                device,
+            )?;
+            let dw_bn_bias = var_from_slice(
+                &model.residual_bn_bias[bias_offset..bias_offset + channels],
+                channels,
+                device,
+            )?;
+            residual_dw_bns.push(batch_norm_from_parts(
+                channels,
+                &model.residual_bn_running_mean[bias_offset..bias_offset + channels],
+                &model.residual_bn_running_var[bias_offset..bias_offset + channels],
+                &dw_bn_scale,
+                &dw_bn_bias,
+                device,
+            )?);
+            residual_dw_bn_scales.push(dw_bn_scale);
+            residual_dw_bn_biases.push(dw_bn_bias);
             let pw_start = weight_offset + conv_len;
             residual_pw_weights.push(var_from_slice(
                 &model.board_conv2_weights[pw_start..pw_start + conv_len],
@@ -779,6 +835,28 @@ impl GpuVars {
                 channels,
                 device,
             )?);
+            let pw_bn_scale = var_from_slice(
+                &model.residual_bn_scale[bias_offset + channels..bias_offset + mobile_bias_size],
+                channels,
+                device,
+            )?;
+            let pw_bn_bias = var_from_slice(
+                &model.residual_bn_bias[bias_offset + channels..bias_offset + mobile_bias_size],
+                channels,
+                device,
+            )?;
+            residual_pw_bns.push(batch_norm_from_parts(
+                channels,
+                &model.residual_bn_running_mean
+                    [bias_offset + channels..bias_offset + mobile_bias_size],
+                &model.residual_bn_running_var
+                    [bias_offset + channels..bias_offset + mobile_bias_size],
+                &pw_bn_scale,
+                &pw_bn_bias,
+                device,
+            )?);
+            residual_pw_bn_scales.push(pw_bn_scale);
+            residual_pw_bn_biases.push(pw_bn_bias);
         }
         let mut value_relation_row_weights = Vec::with_capacity(VALUE_RELATION_LAYERS);
         let mut value_relation_row_gates = Vec::with_capacity(VALUE_RELATION_LAYERS);
@@ -848,6 +926,45 @@ impl GpuVars {
                 device,
             )?);
         }
+        let board_bn_scale = var_from_slice(&model.board_bn_scale, channels, device)?;
+        let board_bn_bias = var_from_slice(&model.board_bn_bias, channels, device)?;
+        let board_bn = batch_norm_from_parts(
+            channels,
+            &model.board_bn_running_mean,
+            &model.board_bn_running_var,
+            &board_bn_scale,
+            &board_bn_bias,
+            device,
+        )?;
+        let value_tail_bn_scale =
+            var_from_slice(&model.value_tail_bn_scale, value_channels, device)?;
+        let value_tail_bn_bias = var_from_slice(&model.value_tail_bn_bias, value_channels, device)?;
+        let value_tail_bn = batch_norm_from_parts(
+            value_channels,
+            &model.value_tail_bn_running_mean,
+            &model.value_tail_bn_running_var,
+            &value_tail_bn_scale,
+            &value_tail_bn_bias,
+            device,
+        )?;
+        let policy_tail_bn_scale = var_from_slice(
+            &model.policy_tail_bn_scale,
+            super::model::POLICY_HEAD_CHANNELS,
+            device,
+        )?;
+        let policy_tail_bn_bias = var_from_slice(
+            &model.policy_tail_bn_bias,
+            super::model::POLICY_HEAD_CHANNELS,
+            device,
+        )?;
+        let policy_tail_bn = batch_norm_from_parts(
+            super::model::POLICY_HEAD_CHANNELS,
+            &model.policy_tail_bn_running_mean,
+            &model.policy_tail_bn_running_var,
+            &policy_tail_bn_scale,
+            &policy_tail_bn_bias,
+            device,
+        )?;
         Ok(Self {
             board_conv1_weights: var_from_slice(
                 &model.board_conv1_weights,
@@ -855,10 +972,19 @@ impl GpuVars {
                 device,
             )?,
             board_conv1_bias: var_from_slice(&model.board_conv1_bias, channels, device)?,
+            board_bn_scale,
+            board_bn_bias,
+            board_bn,
             residual_dw_weights,
             residual_dw_biases,
+            residual_dw_bn_scales,
+            residual_dw_bn_biases,
+            residual_dw_bns,
             residual_pw_weights,
             residual_pw_biases,
+            residual_pw_bn_scales,
+            residual_pw_bn_biases,
+            residual_pw_bns,
             position_embed: var_from_slice(
                 &model.position_embed,
                 (channels, BOARD_RANKS, BOARD_FILES),
@@ -883,6 +1009,9 @@ impl GpuVars {
                 value_channels,
                 device,
             )?,
+            value_tail_bn_scale,
+            value_tail_bn_bias,
+            value_tail_bn,
             value_intermediate_hidden: var_from_slice(
                 &model.value_intermediate_hidden,
                 (value_hidden_size, value_features),
@@ -925,6 +1054,9 @@ impl GpuVars {
                 super::model::POLICY_HEAD_CHANNELS,
                 device,
             )?,
+            policy_tail_bn_scale,
+            policy_tail_bn_bias,
+            policy_tail_bn,
             policy_logits_weights: var_from_slice(
                 &model.policy_logits_weights,
                 (DENSE_MOVE_SPACE, super::model::policy_head_map_size()),
@@ -938,10 +1070,16 @@ impl GpuVars {
         let mut vars = Vec::new();
         vars.push(self.board_conv1_weights.clone());
         vars.push(self.board_conv1_bias.clone());
+        vars.push(self.board_bn_scale.clone());
+        vars.push(self.board_bn_bias.clone());
         vars.extend(self.residual_dw_weights.iter().cloned());
         vars.extend(self.residual_dw_biases.iter().cloned());
+        vars.extend(self.residual_dw_bn_scales.iter().cloned());
+        vars.extend(self.residual_dw_bn_biases.iter().cloned());
         vars.extend(self.residual_pw_weights.iter().cloned());
         vars.extend(self.residual_pw_biases.iter().cloned());
+        vars.extend(self.residual_pw_bn_scales.iter().cloned());
+        vars.extend(self.residual_pw_bn_biases.iter().cloned());
         vars.push(self.position_embed.clone());
         vars.extend(self.value_relation_row_weights.iter().cloned());
         vars.extend(self.value_relation_row_gates.iter().cloned());
@@ -954,6 +1092,8 @@ impl GpuVars {
         vars.extend(self.value_relation_ffn_down_biases.iter().cloned());
         vars.push(self.value_tail_conv_weights.clone());
         vars.push(self.value_tail_conv_bias.clone());
+        vars.push(self.value_tail_bn_scale.clone());
+        vars.push(self.value_tail_bn_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
         vars.push(self.value_intermediate_bias.clone());
         vars.push(self.value_logits_weights.clone());
@@ -964,6 +1104,8 @@ impl GpuVars {
         vars.push(self.value_scalar_bias.clone());
         vars.push(self.policy_tail_conv_weights.clone());
         vars.push(self.policy_tail_conv_bias.clone());
+        vars.push(self.policy_tail_bn_scale.clone());
+        vars.push(self.policy_tail_bn_bias.clone());
         vars.push(self.policy_logits_weights.clone());
         vars.push(self.policy_move_bias.clone());
         vars
@@ -979,6 +1121,13 @@ impl GpuVars {
         let value_relation_bias_size = value_relation_bias_size(channels);
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
+        copy_var(&self.board_bn_scale, &mut model.board_bn_scale)?;
+        copy_var(&self.board_bn_bias, &mut model.board_bn_bias)?;
+        copy_tensor(
+            self.board_bn.running_mean(),
+            &mut model.board_bn_running_mean,
+        )?;
+        copy_tensor(self.board_bn.running_var(), &mut model.board_bn_running_var)?;
         let conv_len = channels * channels * CNN_KERNEL_AREA;
         for block in 0..blocks {
             let weight_offset = block * mobile_weight_size;
@@ -991,6 +1140,22 @@ impl GpuVars {
                 &self.residual_dw_biases[block],
                 &mut model.board_conv2_bias[bias_offset..bias_offset + channels],
             )?;
+            copy_var(
+                &self.residual_dw_bn_scales[block],
+                &mut model.residual_bn_scale[bias_offset..bias_offset + channels],
+            )?;
+            copy_var(
+                &self.residual_dw_bn_biases[block],
+                &mut model.residual_bn_bias[bias_offset..bias_offset + channels],
+            )?;
+            copy_tensor(
+                self.residual_dw_bns[block].running_mean(),
+                &mut model.residual_bn_running_mean[bias_offset..bias_offset + channels],
+            )?;
+            copy_tensor(
+                self.residual_dw_bns[block].running_var(),
+                &mut model.residual_bn_running_var[bias_offset..bias_offset + channels],
+            )?;
             let pw_start = weight_offset + conv_len;
             copy_var(
                 &self.residual_pw_weights[block],
@@ -999,6 +1164,25 @@ impl GpuVars {
             copy_var(
                 &self.residual_pw_biases[block],
                 &mut model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
+            )?;
+            copy_var(
+                &self.residual_pw_bn_scales[block],
+                &mut model.residual_bn_scale
+                    [bias_offset + channels..bias_offset + mobile_bias_size],
+            )?;
+            copy_var(
+                &self.residual_pw_bn_biases[block],
+                &mut model.residual_bn_bias[bias_offset + channels..bias_offset + mobile_bias_size],
+            )?;
+            copy_tensor(
+                self.residual_pw_bns[block].running_mean(),
+                &mut model.residual_bn_running_mean
+                    [bias_offset + channels..bias_offset + mobile_bias_size],
+            )?;
+            copy_tensor(
+                self.residual_pw_bns[block].running_var(),
+                &mut model.residual_bn_running_var
+                    [bias_offset + channels..bias_offset + mobile_bias_size],
             )?;
         }
         copy_var(&self.position_embed, &mut model.position_embed)?;
@@ -1058,6 +1242,16 @@ impl GpuVars {
             &mut model.value_tail_conv_weights,
         )?;
         copy_var(&self.value_tail_conv_bias, &mut model.value_tail_conv_bias)?;
+        copy_var(&self.value_tail_bn_scale, &mut model.value_tail_bn_scale)?;
+        copy_var(&self.value_tail_bn_bias, &mut model.value_tail_bn_bias)?;
+        copy_tensor(
+            self.value_tail_bn.running_mean(),
+            &mut model.value_tail_bn_running_mean,
+        )?;
+        copy_tensor(
+            self.value_tail_bn.running_var(),
+            &mut model.value_tail_bn_running_var,
+        )?;
         copy_var(
             &self.value_intermediate_hidden,
             &mut model.value_intermediate_hidden,
@@ -1088,6 +1282,16 @@ impl GpuVars {
         copy_var(
             &self.policy_tail_conv_bias,
             &mut model.policy_tail_conv_bias,
+        )?;
+        copy_var(&self.policy_tail_bn_scale, &mut model.policy_tail_bn_scale)?;
+        copy_var(&self.policy_tail_bn_bias, &mut model.policy_tail_bn_bias)?;
+        copy_tensor(
+            self.policy_tail_bn.running_mean(),
+            &mut model.policy_tail_bn_running_mean,
+        )?;
+        copy_tensor(
+            self.policy_tail_bn.running_var(),
+            &mut model.policy_tail_bn_running_var,
         )?;
         copy_var(
             &self.policy_logits_weights,
@@ -1226,8 +1430,33 @@ fn var_from_slice<S: Into<candle_core::Shape>>(
     Var::from_slice(values, shape, device)
 }
 
+fn batch_norm_from_parts(
+    channels: usize,
+    running_mean: &[f32],
+    running_var: &[f32],
+    scale: &Var,
+    bias: &Var,
+    device: &Device,
+) -> CandleResult<BatchNorm> {
+    BatchNorm::new_with_momentum(
+        channels,
+        Tensor::from_vec(running_mean.to_vec(), channels, device)?,
+        Tensor::from_vec(running_var.to_vec(), channels, device)?,
+        scale.as_tensor().clone(),
+        bias.as_tensor().clone(),
+        BATCH_NORM_EPS as f64,
+        0.1,
+    )
+}
+
 fn copy_var(var: &Var, dst: &mut [f32]) -> CandleResult<()> {
     let values = var.as_detached_tensor().flatten_all()?.to_vec1::<f32>()?;
+    dst.copy_from_slice(&values);
+    Ok(())
+}
+
+fn copy_tensor(tensor: &Tensor, dst: &mut [f32]) -> CandleResult<()> {
+    let values = tensor.flatten_all()?.to_vec1::<f32>()?;
     dst.copy_from_slice(&values);
     Ok(())
 }
@@ -1286,7 +1515,7 @@ mod tests {
         };
         let batch = [0usize, 1usize];
         let tensors = BatchTensors::new(&samples, &batch, &replica.device).unwrap();
-        let forward = replica.forward(&tensors).unwrap();
+        let forward = replica.forward_t(&tensors, false).unwrap();
         let gpu_values = forward.value.to_vec1::<f32>().unwrap();
         let gpu_policy = forward
             .policy_logits

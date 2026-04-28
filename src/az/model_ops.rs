@@ -5,7 +5,7 @@ use super::{
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
-pub(super) fn conv_relu_board_layer_sparse_3x3(
+pub(super) fn conv_board_layer_sparse_3x3(
     board: &[u8],
     output_channels: usize,
     weights: &[f32],
@@ -49,7 +49,35 @@ pub(super) fn conv_relu_board_layer_sparse_3x3(
                     }
                 }
             }
-            output[out_start + sq] = value.max(0.0);
+            output[out_start + sq] = value;
+        }
+    }
+}
+
+pub(super) fn apply_batch_norm_2d_inplace(
+    values: &mut [f32],
+    channels: usize,
+    scale: &[f32],
+    bias: &[f32],
+    running_mean: &[f32],
+    running_var: &[f32],
+    relu: bool,
+) {
+    debug_assert_eq!(values.len(), channels * BOARD_PLANES_SIZE);
+    debug_assert_eq!(scale.len(), channels);
+    debug_assert_eq!(bias.len(), channels);
+    debug_assert_eq!(running_mean.len(), channels);
+    debug_assert_eq!(running_var.len(), channels);
+    for channel in 0..channels {
+        let start = channel * BOARD_PLANES_SIZE;
+        let inv_std = (running_var[channel] + super::model::BATCH_NORM_EPS)
+            .max(super::model::BATCH_NORM_EPS)
+            .sqrt()
+            .recip();
+        for value in &mut values[start..start + BOARD_PLANES_SIZE] {
+            let normalized = (*value - running_mean[channel]) * inv_std;
+            let out = normalized * scale[channel] + bias[channel];
+            *value = if relu { out.max(0.0) } else { out };
         }
     }
 }
@@ -192,6 +220,10 @@ pub(super) fn residual_cnn_block_generic(
     channels: usize,
     weights: &[f32],
     bias: &[f32],
+    bn_scale: &[f32],
+    bn_bias: &[f32],
+    bn_running_mean: &[f32],
+    bn_running_var: &[f32],
 ) {
     let conv_len = channels * channels * CNN_KERNEL_AREA;
     debug_assert_eq!(weights.len(), conv_len * 2);
@@ -202,6 +234,15 @@ pub(super) fn residual_cnn_block_generic(
         &weights[..conv_len],
         &bias[..channels],
         tmp,
+        false,
+    );
+    apply_batch_norm_2d_inplace(
+        tmp,
+        channels,
+        &bn_scale[..channels],
+        &bn_bias[..channels],
+        &bn_running_mean[..channels],
+        &bn_running_var[..channels],
         true,
     );
     conv3x3_layer_dense_generic(
@@ -210,6 +251,15 @@ pub(super) fn residual_cnn_block_generic(
         &weights[conv_len..conv_len * 2],
         &bias[channels..channels * 2],
         delta,
+        false,
+    );
+    apply_batch_norm_2d_inplace(
+        delta,
+        channels,
+        &bn_scale[channels..channels * 2],
+        &bn_bias[channels..channels * 2],
+        &bn_running_mean[channels..channels * 2],
+        &bn_running_var[channels..channels * 2],
         false,
     );
     for (feature, add) in features.iter_mut().zip(delta.iter()) {
