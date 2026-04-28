@@ -45,23 +45,23 @@ pub struct AzLoopFileConfig {
 impl Default for AzLoopFileConfig {
     fn default() -> Self {
         let gumbel = AzGumbelConfig {
-            max_num_considered_actions: 32,
+            max_num_considered_actions: 24,
             ..AzGumbelConfig::default()
         };
         Self {
             model_path: "chineseai.azm".into(),
-            simulations: 256,
+            simulations: 192,
             selfplay_batch_games: 512,
             epochs: 2,
             lr: 0.0003,
             batch_size: 2048,
             max_sample_train_count: 2,
             max_plies: 300,
-            hidden_size: 256,
-            model_channels: 32,
-            value_head_channels: 8,
+            hidden_size: 160,
+            model_channels: 20,
+            value_head_channels: 5,
             model_blocks: 3,
-            value_hidden_size: 256,
+            value_hidden_size: 160,
             seed: 20260409,
             workers: 240,
             temperature_start: 1.0,

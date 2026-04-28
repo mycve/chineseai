@@ -263,3 +263,24 @@ wins=1 losses=1 draws=6
 - 这是“长期训练链条没有立刻坏掉”的正证据：多 update 后权重仍有限，`policy_ce` 有轻微下降，`value` 没有明显饱和。
 - 这还不是最终棋力证明：`1` sim、短局、随机初始附近的 arena 大量和棋，信号很弱。
 - 当前更可靠的结论是：结构本身具备继续训练潜力，但训练超参数必须保守启动；在没有更强 target 或更多模拟前，激进 LR/replay 会把模型打成 NaN。
+
+## 13. 默认配置调整
+
+为了优先解决 CPU 推理/自对弈吞吐问题，默认新建配置改为快模型主线：
+
+```text
+simulations = 192
+gumbel_max_num_considered_actions = 24
+hidden_size = 160
+model_channels = 20
+model_blocks = 3
+value_head_channels = 5
+value_hidden_size = 160
+```
+
+理由：
+
+- 相比当前跑出正信号的 `32c/12b/h256`，`20c/3b/h160/vhc5/vh160` 在本机结构探针中约 `2.8x` 快。
+- 再把默认搜索从 `256/32 actions` 降到 `192/24 actions`，整体自对弈吞吐目标可以越过 `3x`。
+- `3 blocks` 仍保留 `9x9` 局部窗口和行列长线偏置，比 `16c/2b` 更适合作为主线默认结构。
+- 这会牺牲一部分容量，因此旧的 `32c/12b` 可以作为慢速高容量对照，不建议再作为默认自对弈结构。
