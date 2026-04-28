@@ -89,6 +89,55 @@ fn depthwise_conv_relu_layer_generic(
     }
 }
 
+fn row_depthwise_linear_layer_generic(
+    input: &[f32],
+    channels: usize,
+    weights: &[f32],
+    output: &mut [f32],
+) {
+    debug_assert_eq!(weights.len(), channels * BOARD_FILES * BOARD_FILES);
+    for channel in 0..channels {
+        let start = channel * BOARD_PLANES_SIZE;
+        let weight_start = channel * BOARD_FILES * BOARD_FILES;
+        for rank in 0..BOARD_RANKS {
+            let row_start = start + rank * BOARD_FILES;
+            for out_file in 0..BOARD_FILES {
+                let weight_row = &weights[weight_start + out_file * BOARD_FILES
+                    ..weight_start + (out_file + 1) * BOARD_FILES];
+                let mut value = 0.0;
+                for in_file in 0..BOARD_FILES {
+                    value += input[row_start + in_file] * weight_row[in_file];
+                }
+                output[row_start + out_file] = value;
+            }
+        }
+    }
+}
+
+fn col_depthwise_linear_layer_generic(
+    input: &[f32],
+    channels: usize,
+    weights: &[f32],
+    output: &mut [f32],
+) {
+    debug_assert_eq!(weights.len(), channels * BOARD_RANKS * BOARD_RANKS);
+    for channel in 0..channels {
+        let start = channel * BOARD_PLANES_SIZE;
+        let weight_start = channel * BOARD_RANKS * BOARD_RANKS;
+        for file in 0..BOARD_FILES {
+            for out_rank in 0..BOARD_RANKS {
+                let weight_row = &weights[weight_start + out_rank * BOARD_RANKS
+                    ..weight_start + (out_rank + 1) * BOARD_RANKS];
+                let mut value = 0.0;
+                for in_rank in 0..BOARD_RANKS {
+                    value += input[start + in_rank * BOARD_FILES + file] * weight_row[in_rank];
+                }
+                output[start + out_rank * BOARD_FILES + file] = value;
+            }
+        }
+    }
+}
+
 pub(super) fn conv1x1_linear_layer_dense_generic(
     input: &[f32],
     input_channels: usize,
@@ -138,9 +187,11 @@ pub(super) fn residual_mobile_block_generic(
     bias: &[f32],
 ) {
     let dw_len = channels * CNN_KERNEL_AREA;
+    let row_len = channels * BOARD_FILES * BOARD_FILES;
+    let col_len = channels * BOARD_RANKS * BOARD_RANKS;
     let pw_len = channels * channels;
-    debug_assert_eq!(weights.len(), dw_len + pw_len);
-    debug_assert_eq!(bias.len(), channels * 2);
+    debug_assert_eq!(weights.len(), dw_len + row_len + col_len + pw_len);
+    debug_assert_eq!(bias.len(), channels * 4);
     depthwise_conv_relu_layer_generic(
         features,
         channels,
@@ -148,12 +199,40 @@ pub(super) fn residual_mobile_block_generic(
         &bias[..channels],
         tmp,
     );
+    row_depthwise_linear_layer_generic(
+        features,
+        channels,
+        &weights[dw_len..dw_len + row_len],
+        delta,
+    );
+    for channel in 0..channels {
+        let gate = bias[channels + channel];
+        let start = channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            tmp[start + sq] += gate * delta[start + sq];
+        }
+    }
+    let col_start = dw_len + row_len;
+    col_depthwise_linear_layer_generic(
+        features,
+        channels,
+        &weights[col_start..col_start + col_len],
+        delta,
+    );
+    for channel in 0..channels {
+        let gate = bias[channels * 2 + channel];
+        let start = channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            tmp[start + sq] += gate * delta[start + sq];
+        }
+    }
+    let pw_start = dw_len + row_len + col_len;
     conv1x1_linear_layer_dense_generic(
         tmp,
         channels,
         channels,
-        &weights[dw_len..dw_len + pw_len],
-        &bias[channels..channels * 2],
+        &weights[pw_start..pw_start + pw_len],
+        &bias[channels * 3..channels * 4],
         delta,
     );
     for (feature, add) in features.iter_mut().zip(delta.iter()) {

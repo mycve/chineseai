@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::board_transform::{HISTORY_PLIES, HistoryMove, canonical_move, canonical_square};
-use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
+use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 use super::model_config::AzModelConfig;
 use super::model_ops::{
@@ -11,7 +11,7 @@ use super::model_ops::{
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 7;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 8;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -39,11 +39,11 @@ pub(super) fn cnn_pooled_size(channels: usize) -> usize {
 }
 
 pub(super) fn mobile_block_weight_size(channels: usize) -> usize {
-    channels * CNN_KERNEL_AREA + channels * channels
+    channels * (CNN_KERNEL_AREA + BOARD_FILES * BOARD_FILES + BOARD_RANKS * BOARD_RANKS + channels)
 }
 
 pub(super) fn mobile_block_bias_size(channels: usize) -> usize {
-    channels * 2
+    channels * 4
 }
 
 pub(super) fn value_head_map_size(value_channels: usize) -> usize {
@@ -127,10 +127,12 @@ pub struct AzModel {
 }
 
 // Architecture notes:
-// - v32 is a Tiny Mobile-CNN. The board is canonical side-to-move input, then a
-//   sparse 3x3 stem and residual depthwise-3x3 + pointwise-1x1 blocks. Dense
-//   3x3 CNN was too slow on CPU, and the previous row/column mean Line-GNN
-//   branch was weaker than the old fast baseline because it blurred tactics.
+// - v8 is a Gated Multi-Scale Ray Mobile-CNN. The board is canonical
+//   side-to-move input, then a sparse 3x3 stem and residual blocks with local
+//   depthwise-3x3, learnable row mixing, learnable column mixing, and
+//   pointwise-1x1 channel mixing. Row/column gates start small, so early
+//   training remains close to the old local mobile block while value/policy can
+//   learn to amplify long-line context for rooks, cannons, pins, and king lines.
 // - Value is intentionally closer to the ZeroForge GNN readout than to the old
 //   NNUE head: 1x1 conv -> attention/mean/max/std line-aware pooling plus a
 //   small spatial tail -> leaky MLP -> three outcome logits. The leaky gate is
@@ -203,18 +205,32 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / (BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA) as f32).sqrt()))
             .collect();
         let board_conv1_bias = vec![0.0; channels];
+        let dw_len = channels * CNN_KERNEL_AREA;
+        let row_len = channels * BOARD_FILES * BOARD_FILES;
+        let col_len = channels * BOARD_RANKS * BOARD_RANKS;
         let board_conv2_weights: Vec<f32> = (0..blocks * mobile_weight_size)
             .map(|index| {
                 let block_offset = index % mobile_weight_size;
-                let scale = if block_offset < channels * CNN_KERNEL_AREA {
+                let scale = if block_offset < dw_len {
                     (2.0 / CNN_KERNEL_AREA as f32).sqrt()
+                } else if block_offset < dw_len + row_len {
+                    (2.0 / BOARD_FILES as f32).sqrt() * 0.25
+                } else if block_offset < dw_len + row_len + col_len {
+                    (2.0 / BOARD_RANKS as f32).sqrt() * 0.25
                 } else {
                     (2.0 / channels as f32).sqrt()
                 };
                 rng.weight(scale)
             })
             .collect();
-        let board_conv2_bias = vec![0.0; blocks * mobile_bias_size];
+        let mut board_conv2_bias = vec![0.0; blocks * mobile_bias_size];
+        for block in 0..blocks {
+            let bias_start = block * mobile_bias_size;
+            for channel in 0..channels {
+                board_conv2_bias[bias_start + channels + channel] = 0.1;
+                board_conv2_bias[bias_start + channels * 2 + channel] = 0.1;
+            }
+        }
         let position_embed = (0..channels * BOARD_PLANES_SIZE)
             .map(|_| rng.weight(0.02))
             .collect();

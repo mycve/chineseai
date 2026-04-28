@@ -266,21 +266,22 @@ wins=1 losses=1 draws=6
 
 ## 13. 默认配置调整
 
-为了优先解决 CPU 推理/自对弈吞吐问题，默认新建配置改为快模型主线：
+为了优先解决 CPU 推理/自对弈吞吐问题，同时保留更强的 value 局面理解偏置，默认新建配置改为表达优先的 Gated Multi-Scale Ray Mobile-CNN：
 
 ```text
 simulations = 192
 gumbel_max_num_considered_actions = 24
-hidden_size = 160
-model_channels = 20
+hidden_size = 192
+model_channels = 24
 model_blocks = 3
-value_head_channels = 5
-value_hidden_size = 160
+value_head_channels = 6
+value_hidden_size = 192
 ```
 
 理由：
 
-- 相比当前跑出正信号的 `32c/12b/h256`，`20c/3b/h160/vhc5/vh160` 在本机结构探针中约 `2.8x` 快。
-- 再把默认搜索从 `256/32 actions` 降到 `192/24 actions`，整体自对弈吞吐目标可以越过 `3x`。
-- `3 blocks` 仍保留 `9x9` 局部窗口和行列长线偏置，比 `16c/2b` 更适合作为主线默认结构。
-- 这会牺牲一部分容量，因此旧的 `32c/12b` 可以作为慢速高容量对照，不建议再作为默认自对弈结构。
+- trunk block 不再是单纯 `depthwise 3x3 + pointwise 1x1`，而是 `local 3x3 + learnable row mix + learnable column mix + pointwise 1x1`。
+- row/column gate 初始较小，让模型从稳定局部 CNN 起步，再自己学习是否放大长线关系。
+- `24c/3b/h192/vhc6/vh192` 在新 ray block 探针中约 `840us/root`，相比 `32c/12b/h256` 约 `2545us/root`，接近 `3x` 快。
+- 默认搜索从 `256/32 actions` 降到 `192/24 actions`，整体自对弈吞吐目标可以越过 `3x`。
+- 相比 `20c/3b`，该结构更偏表达和 value 泛化；相比旧 `32c/12b`，它通过可学习行列聚合拿长线偏置，而不是靠大量深度反复堆出来。

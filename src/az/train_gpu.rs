@@ -42,6 +42,10 @@ struct GpuVars {
     board_conv1_bias: Var,
     residual_dw_weights: Vec<Var>,
     residual_dw_biases: Vec<Var>,
+    residual_row_weights: Vec<Var>,
+    residual_row_gates: Vec<Var>,
+    residual_col_weights: Vec<Var>,
+    residual_col_gates: Vec<Var>,
     residual_pw_weights: Vec<Var>,
     residual_pw_biases: Vec<Var>,
     position_embed: Var,
@@ -491,10 +495,37 @@ impl GpuReplica {
             ))?)?
             .relu()?;
         for block in 0..blocks {
-            let hidden = features
+            let local = features
                 .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, channels)?
                 .broadcast_add(&self.vars.residual_dw_biases[block].reshape((1, channels, 1, 1))?)?
                 .relu()?;
+            let row_ctx = features
+                .unsqueeze(3)?
+                .broadcast_mul(&self.vars.residual_row_weights[block].reshape((
+                    1,
+                    channels,
+                    1,
+                    BOARD_FILES,
+                    BOARD_FILES,
+                ))?)?
+                .sum(4)?
+                .broadcast_mul(
+                    &self.vars.residual_row_gates[block].reshape((1, channels, 1, 1))?,
+                )?;
+            let col_ctx = features
+                .unsqueeze(2)?
+                .broadcast_mul(&self.vars.residual_col_weights[block].reshape((
+                    1,
+                    channels,
+                    BOARD_RANKS,
+                    BOARD_RANKS,
+                    1,
+                ))?)?
+                .sum(3)?
+                .broadcast_mul(
+                    &self.vars.residual_col_gates[block].reshape((1, channels, 1, 1))?,
+                )?;
+            let hidden = ((local + row_ctx)? + col_ctx)?;
             let delta = hidden
                 .conv2d(&self.vars.residual_pw_weights[block], 0, 1, 1, 1)?
                 .broadcast_add(
@@ -690,9 +721,15 @@ impl GpuVars {
         let mobile_bias_size = mobile_block_bias_size(channels);
         let mut residual_dw_weights = Vec::with_capacity(blocks);
         let mut residual_dw_biases = Vec::with_capacity(blocks);
+        let mut residual_row_weights = Vec::with_capacity(blocks);
+        let mut residual_row_gates = Vec::with_capacity(blocks);
+        let mut residual_col_weights = Vec::with_capacity(blocks);
+        let mut residual_col_gates = Vec::with_capacity(blocks);
         let mut residual_pw_weights = Vec::with_capacity(blocks);
         let mut residual_pw_biases = Vec::with_capacity(blocks);
         let dw_len = channels * CNN_KERNEL_AREA;
+        let row_len = channels * BOARD_FILES * BOARD_FILES;
+        let col_len = channels * BOARD_RANKS * BOARD_RANKS;
         let pw_len = channels * channels;
         for block in 0..blocks {
             let weight_offset = block * mobile_weight_size;
@@ -707,13 +744,36 @@ impl GpuVars {
                 channels,
                 device,
             )?);
+            let row_start = weight_offset + dw_len;
+            residual_row_weights.push(var_from_slice(
+                &model.board_conv2_weights[row_start..row_start + row_len],
+                (channels, BOARD_FILES, BOARD_FILES),
+                device,
+            )?);
+            residual_row_gates.push(var_from_slice(
+                &model.board_conv2_bias[bias_offset + channels..bias_offset + channels * 2],
+                channels,
+                device,
+            )?);
+            let col_start = row_start + row_len;
+            residual_col_weights.push(var_from_slice(
+                &model.board_conv2_weights[col_start..col_start + col_len],
+                (channels, BOARD_RANKS, BOARD_RANKS),
+                device,
+            )?);
+            residual_col_gates.push(var_from_slice(
+                &model.board_conv2_bias[bias_offset + channels * 2..bias_offset + channels * 3],
+                channels,
+                device,
+            )?);
+            let pw_start = col_start + col_len;
             residual_pw_weights.push(var_from_slice(
-                &model.board_conv2_weights[weight_offset + dw_len..weight_offset + dw_len + pw_len],
+                &model.board_conv2_weights[pw_start..pw_start + pw_len],
                 (channels, channels, 1, 1),
                 device,
             )?);
             residual_pw_biases.push(var_from_slice(
-                &model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
+                &model.board_conv2_bias[bias_offset + channels * 3..bias_offset + mobile_bias_size],
                 channels,
                 device,
             )?);
@@ -727,6 +787,10 @@ impl GpuVars {
             board_conv1_bias: var_from_slice(&model.board_conv1_bias, channels, device)?,
             residual_dw_weights,
             residual_dw_biases,
+            residual_row_weights,
+            residual_row_gates,
+            residual_col_weights,
+            residual_col_gates,
             residual_pw_weights,
             residual_pw_biases,
             position_embed: var_from_slice(
@@ -820,6 +884,10 @@ impl GpuVars {
         vars.push(self.board_conv1_bias.clone());
         vars.extend(self.residual_dw_weights.iter().cloned());
         vars.extend(self.residual_dw_biases.iter().cloned());
+        vars.extend(self.residual_row_weights.iter().cloned());
+        vars.extend(self.residual_row_gates.iter().cloned());
+        vars.extend(self.residual_col_weights.iter().cloned());
+        vars.extend(self.residual_col_gates.iter().cloned());
         vars.extend(self.residual_pw_weights.iter().cloned());
         vars.extend(self.residual_pw_biases.iter().cloned());
         vars.push(self.position_embed.clone());
@@ -853,6 +921,8 @@ impl GpuVars {
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
         let dw_len = channels * CNN_KERNEL_AREA;
+        let row_len = channels * BOARD_FILES * BOARD_FILES;
+        let col_len = channels * BOARD_RANKS * BOARD_RANKS;
         let pw_len = channels * channels;
         for block in 0..blocks {
             let weight_offset = block * mobile_weight_size;
@@ -865,14 +935,33 @@ impl GpuVars {
                 &self.residual_dw_biases[block],
                 &mut model.board_conv2_bias[bias_offset..bias_offset + channels],
             )?;
+            let row_start = weight_offset + dw_len;
+            copy_var(
+                &self.residual_row_weights[block],
+                &mut model.board_conv2_weights[row_start..row_start + row_len],
+            )?;
+            copy_var(
+                &self.residual_row_gates[block],
+                &mut model.board_conv2_bias[bias_offset + channels..bias_offset + channels * 2],
+            )?;
+            let col_start = row_start + row_len;
+            copy_var(
+                &self.residual_col_weights[block],
+                &mut model.board_conv2_weights[col_start..col_start + col_len],
+            )?;
+            copy_var(
+                &self.residual_col_gates[block],
+                &mut model.board_conv2_bias[bias_offset + channels * 2..bias_offset + channels * 3],
+            )?;
+            let pw_start = col_start + col_len;
             copy_var(
                 &self.residual_pw_weights[block],
-                &mut model.board_conv2_weights
-                    [weight_offset + dw_len..weight_offset + dw_len + pw_len],
+                &mut model.board_conv2_weights[pw_start..pw_start + pw_len],
             )?;
             copy_var(
                 &self.residual_pw_biases[block],
-                &mut model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
+                &mut model.board_conv2_bias
+                    [bias_offset + channels * 3..bias_offset + mobile_bias_size],
             )?;
         }
         copy_var(&self.position_embed, &mut model.position_embed)?;

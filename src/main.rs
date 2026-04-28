@@ -627,7 +627,9 @@ fn az_arch_dense64x6_mac_ratio(config: AzModelConfig) -> f64 {
     let channels = config.model_channels as f64;
     let dense_channels = 64.0f64;
     let stem = board * board_channels as f64 * 9.0 * channels;
-    let mobile_blocks = config.model_blocks as f64 * board * (channels * 9.0 + channels * channels);
+    let mobile_blocks = config.model_blocks as f64
+        * board
+        * (channels * (9.0 + BOARD_FILES as f64 + BOARD_RANKS as f64) + channels * channels);
     let head = (channels * 4.0) * config.hidden_size as f64
         + az_arch_value_feature_count(config) as f64 * config.value_hidden_size as f64
         + channels * 90.0 * 3.0;

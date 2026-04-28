@@ -21,17 +21,16 @@ pub use alphazero::{
     alphazero_search_with_history_and_rules,
 };
 pub use mctx::AzGumbelConfig;
-use model::{
-    AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_VERSION, AzEvalScratch, BOARD_CHANNELS,
-    BOARD_HISTORY_FRAMES, BOARD_HISTORY_SIZE, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE,
-    CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOL_BLOCKS, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
-    POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS, VALUE_HEAD_CHANNELS, VALUE_HEAD_LEAK,
-    VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS, VALUE_SCALE_CP, cnn_pooled_size,
-    dense_move_index, extract_board_planes, mobile_block_bias_size, mobile_block_weight_size,
-    policy_move_features, policy_move_from_select, policy_move_to_select, value_head_features,
-    value_head_map_size,
-};
 pub use model::{AZ_MODEL_BINARY_MAGIC, AzModel, SplitMix64};
+use model::{
+    AzEvalScratch, BOARD_CHANNELS, BOARD_HISTORY_FRAMES, BOARD_HISTORY_SIZE,
+    BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOL_BLOCKS,
+    DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
+    VALUE_HEAD_CHANNELS, VALUE_HEAD_LEAK, VALUE_HIDDEN_SIZE, VALUE_LOGIT_SCALE, VALUE_LOGITS,
+    VALUE_SCALE_CP, cnn_pooled_size, dense_move_index, extract_board_planes,
+    mobile_block_bias_size, mobile_block_weight_size, policy_move_features,
+    policy_move_from_select, policy_move_to_select, value_head_features, value_head_map_size,
+};
 #[cfg(test)]
 use model::{canonical_piece_plane, move_map};
 pub use model_config::AzModelConfig;
@@ -398,43 +397,20 @@ mod tests {
     }
 
     #[test]
-    fn az_model_binary_v6_loads_with_zero_policy_pair_weights() {
+    fn az_model_binary_rejects_old_versions() {
         let model = AzModel::random(16, 44);
-        let path = std::env::temp_dir().join("chineseai_test_az_model_v6_upgrade.azm");
+        let path = std::env::temp_dir().join("chineseai_test_az_model_old_version.azm");
         let _ = fs::remove_file(&path);
         model.save(&path).unwrap();
         let mut bytes = fs::read(&path).unwrap();
         bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
-        let floats_before_pair = model.board_conv1_weights.len()
-            + model.board_conv1_bias.len()
-            + model.board_conv2_weights.len()
-            + model.board_conv2_bias.len()
-            + model.position_embed.len()
-            + model.board_hidden.len()
-            + model.board_hidden_bias.len()
-            + model.value_tail_conv_weights.len()
-            + model.value_tail_conv_bias.len()
-            + model.value_intermediate_hidden.len()
-            + model.value_intermediate_bias.len()
-            + model.value_logits_weights.len()
-            + model.value_direct_logits_weights.len()
-            + model.value_logits_bias.len()
-            + model.policy_from_weights.len()
-            + model.policy_from_bias.len()
-            + model.policy_to_weights.len()
-            + model.policy_to_bias.len();
-        let pair_start = AZ_MODEL_BINARY_HEADER_LEN + floats_before_pair * 4;
-        let pair_end = pair_start + model.policy_pair_weights.len() * 4;
-        bytes.drain(pair_start..pair_end);
         fs::write(&path, bytes).unwrap();
-
-        let loaded = AzModel::load(&path).unwrap();
+        let err = AzModel::load(&path).unwrap_err();
         let _ = fs::remove_file(&path);
-        assert_eq!(
-            loaded.policy_pair_weights,
-            vec![0.0; model.model_config.model_channels]
+        assert!(
+            err.to_string()
+                .contains("unsupported AzModel binary version")
         );
-        assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
     }
 
     #[test]
