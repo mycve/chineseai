@@ -43,10 +43,6 @@ struct GpuVars {
     board_conv1_bias: Var,
     residual_dw_weights: Vec<Var>,
     residual_dw_biases: Vec<Var>,
-    residual_row_weights: Vec<Var>,
-    residual_row_gates: Vec<Var>,
-    residual_col_weights: Vec<Var>,
-    residual_col_gates: Vec<Var>,
     residual_pw_weights: Vec<Var>,
     residual_pw_biases: Vec<Var>,
     position_embed: Var,
@@ -503,39 +499,12 @@ impl GpuReplica {
             ))?)?
             .relu()?;
         for block in 0..blocks {
-            let local = features
-                .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, channels)?
+            let hidden = features
+                .conv2d(&self.vars.residual_dw_weights[block], 1, 1, 1, 1)?
                 .broadcast_add(&self.vars.residual_dw_biases[block].reshape((1, channels, 1, 1))?)?
                 .relu()?;
-            let row_ctx = features
-                .unsqueeze(3)?
-                .broadcast_mul(&self.vars.residual_row_weights[block].reshape((
-                    1,
-                    channels,
-                    1,
-                    BOARD_FILES,
-                    BOARD_FILES,
-                ))?)?
-                .sum(4)?
-                .broadcast_mul(
-                    &self.vars.residual_row_gates[block].reshape((1, channels, 1, 1))?,
-                )?;
-            let col_ctx = features
-                .unsqueeze(2)?
-                .broadcast_mul(&self.vars.residual_col_weights[block].reshape((
-                    1,
-                    channels,
-                    BOARD_RANKS,
-                    BOARD_RANKS,
-                    1,
-                ))?)?
-                .sum(3)?
-                .broadcast_mul(
-                    &self.vars.residual_col_gates[block].reshape((1, channels, 1, 1))?,
-                )?;
-            let hidden = ((local + row_ctx)? + col_ctx)?;
             let delta = hidden
-                .conv2d(&self.vars.residual_pw_weights[block], 0, 1, 1, 1)?
+                .conv2d(&self.vars.residual_pw_weights[block], 1, 1, 1, 1)?
                 .broadcast_add(
                     &self.vars.residual_pw_biases[block].reshape((1, channels, 1, 1))?,
                 )?;
@@ -822,22 +791,15 @@ impl GpuVars {
         let value_relation_bias_size = value_relation_bias_size(channels);
         let mut residual_dw_weights = Vec::with_capacity(blocks);
         let mut residual_dw_biases = Vec::with_capacity(blocks);
-        let mut residual_row_weights = Vec::with_capacity(blocks);
-        let mut residual_row_gates = Vec::with_capacity(blocks);
-        let mut residual_col_weights = Vec::with_capacity(blocks);
-        let mut residual_col_gates = Vec::with_capacity(blocks);
         let mut residual_pw_weights = Vec::with_capacity(blocks);
         let mut residual_pw_biases = Vec::with_capacity(blocks);
-        let dw_len = channels * CNN_KERNEL_AREA;
-        let row_len = channels * BOARD_FILES * BOARD_FILES;
-        let col_len = channels * BOARD_RANKS * BOARD_RANKS;
-        let pw_len = channels * channels;
+        let conv_len = channels * channels * CNN_KERNEL_AREA;
         for block in 0..blocks {
             let weight_offset = block * mobile_weight_size;
             let bias_offset = block * mobile_bias_size;
             residual_dw_weights.push(var_from_slice(
-                &model.board_conv2_weights[weight_offset..weight_offset + dw_len],
-                (channels, 1, 3, 3),
+                &model.board_conv2_weights[weight_offset..weight_offset + conv_len],
+                (channels, channels, 3, 3),
                 device,
             )?);
             residual_dw_biases.push(var_from_slice(
@@ -845,36 +807,14 @@ impl GpuVars {
                 channels,
                 device,
             )?);
-            let row_start = weight_offset + dw_len;
-            residual_row_weights.push(var_from_slice(
-                &model.board_conv2_weights[row_start..row_start + row_len],
-                (channels, BOARD_FILES, BOARD_FILES),
-                device,
-            )?);
-            residual_row_gates.push(var_from_slice(
-                &model.board_conv2_bias[bias_offset + channels..bias_offset + channels * 2],
-                channels,
-                device,
-            )?);
-            let col_start = row_start + row_len;
-            residual_col_weights.push(var_from_slice(
-                &model.board_conv2_weights[col_start..col_start + col_len],
-                (channels, BOARD_RANKS, BOARD_RANKS),
-                device,
-            )?);
-            residual_col_gates.push(var_from_slice(
-                &model.board_conv2_bias[bias_offset + channels * 2..bias_offset + channels * 3],
-                channels,
-                device,
-            )?);
-            let pw_start = col_start + col_len;
+            let pw_start = weight_offset + conv_len;
             residual_pw_weights.push(var_from_slice(
-                &model.board_conv2_weights[pw_start..pw_start + pw_len],
-                (channels, channels, 1, 1),
+                &model.board_conv2_weights[pw_start..pw_start + conv_len],
+                (channels, channels, 3, 3),
                 device,
             )?);
             residual_pw_biases.push(var_from_slice(
-                &model.board_conv2_bias[bias_offset + channels * 3..bias_offset + mobile_bias_size],
+                &model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
                 channels,
                 device,
             )?);
@@ -956,10 +896,6 @@ impl GpuVars {
             board_conv1_bias: var_from_slice(&model.board_conv1_bias, channels, device)?,
             residual_dw_weights,
             residual_dw_biases,
-            residual_row_weights,
-            residual_row_gates,
-            residual_col_weights,
-            residual_col_gates,
             residual_pw_weights,
             residual_pw_biases,
             position_embed: var_from_slice(
@@ -1073,10 +1009,6 @@ impl GpuVars {
         vars.push(self.board_conv1_bias.clone());
         vars.extend(self.residual_dw_weights.iter().cloned());
         vars.extend(self.residual_dw_biases.iter().cloned());
-        vars.extend(self.residual_row_weights.iter().cloned());
-        vars.extend(self.residual_row_gates.iter().cloned());
-        vars.extend(self.residual_col_weights.iter().cloned());
-        vars.extend(self.residual_col_gates.iter().cloned());
         vars.extend(self.residual_pw_weights.iter().cloned());
         vars.extend(self.residual_pw_biases.iter().cloned());
         vars.push(self.position_embed.clone());
@@ -1123,48 +1055,26 @@ impl GpuVars {
         let value_relation_bias_size = value_relation_bias_size(channels);
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
-        let dw_len = channels * CNN_KERNEL_AREA;
-        let row_len = channels * BOARD_FILES * BOARD_FILES;
-        let col_len = channels * BOARD_RANKS * BOARD_RANKS;
-        let pw_len = channels * channels;
+        let conv_len = channels * channels * CNN_KERNEL_AREA;
         for block in 0..blocks {
             let weight_offset = block * mobile_weight_size;
             let bias_offset = block * mobile_bias_size;
             copy_var(
                 &self.residual_dw_weights[block],
-                &mut model.board_conv2_weights[weight_offset..weight_offset + dw_len],
+                &mut model.board_conv2_weights[weight_offset..weight_offset + conv_len],
             )?;
             copy_var(
                 &self.residual_dw_biases[block],
                 &mut model.board_conv2_bias[bias_offset..bias_offset + channels],
             )?;
-            let row_start = weight_offset + dw_len;
-            copy_var(
-                &self.residual_row_weights[block],
-                &mut model.board_conv2_weights[row_start..row_start + row_len],
-            )?;
-            copy_var(
-                &self.residual_row_gates[block],
-                &mut model.board_conv2_bias[bias_offset + channels..bias_offset + channels * 2],
-            )?;
-            let col_start = row_start + row_len;
-            copy_var(
-                &self.residual_col_weights[block],
-                &mut model.board_conv2_weights[col_start..col_start + col_len],
-            )?;
-            copy_var(
-                &self.residual_col_gates[block],
-                &mut model.board_conv2_bias[bias_offset + channels * 2..bias_offset + channels * 3],
-            )?;
-            let pw_start = col_start + col_len;
+            let pw_start = weight_offset + conv_len;
             copy_var(
                 &self.residual_pw_weights[block],
-                &mut model.board_conv2_weights[pw_start..pw_start + pw_len],
+                &mut model.board_conv2_weights[pw_start..pw_start + conv_len],
             )?;
             copy_var(
                 &self.residual_pw_biases[block],
-                &mut model.board_conv2_bias
-                    [bias_offset + channels * 3..bias_offset + mobile_bias_size],
+                &mut model.board_conv2_bias[bias_offset + channels..bias_offset + mobile_bias_size],
             )?;
         }
         copy_var(&self.position_embed, &mut model.position_embed)?;
@@ -1403,5 +1313,82 @@ fn shuffle(values: &mut [usize], rng: &mut super::SplitMix64) {
     for index in (1..values.len()).rev() {
         let swap_with = (rng.next_u64() as usize) % (index + 1);
         values.swap(index, swap_with);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::AzModelConfig;
+    use super::*;
+
+    #[test]
+    fn gpu_forward_matches_cpu_forward_on_value_and_policy() {
+        let config = AzModelConfig {
+            hidden_size: 32,
+            model_channels: 8,
+            model_blocks: 2,
+            value_head_channels: 3,
+            value_hidden_size: 32,
+            policy_condition_size: POLICY_CONDITION_SIZE,
+        };
+        let model = AzModel::random_with_config(config, 20260429);
+        let mut board_a = vec![0; BOARD_HISTORY_SIZE];
+        board_a[0] = 1;
+        board_a[10] = 2;
+        board_a[BOARD_PLANES_SIZE + 40] = 3;
+        let mut board_b = vec![0; BOARD_HISTORY_SIZE];
+        board_b[20] = 4;
+        board_b[50] = 5;
+        board_b[BOARD_PLANES_SIZE * 2 + 80] = 6;
+        let samples = vec![
+            AzTrainingSample {
+                board: board_a,
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: 0.0,
+                side_sign: 1.0,
+            },
+            AzTrainingSample {
+                board: board_b,
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: 0.0,
+                side_sign: 1.0,
+            },
+        ];
+
+        let Ok(replica) = GpuReplica::new(&model, 0) else {
+            return;
+        };
+        let batch = [0usize, 1usize];
+        let tensors = BatchTensors::new(&samples, &batch, &replica.device).unwrap();
+        let forward = replica.forward(&tensors).unwrap();
+        let gpu_values = forward.value.to_vec1::<f32>().unwrap();
+        let gpu_policy = forward
+            .policy_logits
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let policy_indices = [0usize, 17, 128, 511, 1024, DENSE_MOVE_SPACE - 1];
+
+        for (row, sample) in samples.iter().enumerate() {
+            let cpu_value = model.debug_value_from_board_planes(&sample.board);
+            assert!(
+                (cpu_value - gpu_values[row]).abs() < 1e-4,
+                "CPU/GPU value mismatch: cpu={} gpu={}",
+                cpu_value,
+                gpu_values[row]
+            );
+            let cpu_logits =
+                model.debug_policy_logits_from_board_planes(&sample.board, &policy_indices);
+            for (&dense, &cpu_logit) in policy_indices.iter().zip(cpu_logits.iter()) {
+                let gpu_logit = gpu_policy[row * DENSE_MOVE_SPACE + dense];
+                assert!(
+                    (cpu_logit - gpu_logit).abs() < 1e-4,
+                    "CPU/GPU policy mismatch at row={row} dense={dense}: cpu={cpu_logit} gpu={gpu_logit}"
+                );
+            }
+        }
     }
 }

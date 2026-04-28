@@ -60,7 +60,7 @@ impl Default for AzLoopFileConfig {
             hidden_size: 192,
             model_channels: 24,
             value_head_channels: 6,
-            model_blocks: 3,
+            model_blocks: 2,
             value_hidden_size: 192,
             seed: 20260409,
             workers: 240,
@@ -347,9 +347,9 @@ impl AzLoopFileConfig {
 #   These fields define the model created when model_path is missing. The model
 #   file also stores them, and az-loop refuses to continue if the config and
 #   model file disagree.
-#   Current model: configurable Tiny Mobile-CNN over canonical board history planes.
+#   Current model: configurable Tiny residual CNN over canonical board history planes.
 #   model_channels is the hidden width of each board square embedding.
-#   model_blocks are residual depthwise-3x3 + pointwise-1x1 mobile blocks.
+#   model_blocks are residual 3x3 CNN blocks, each with two dense convolutions.
 #   value_head_channels/value_hidden_size control the value head capacity.
 #   policy_condition_size stays fixed at 32 because the move-geometry feature table is 32-D.
 #   Historical sparse/NNUE inputs and value shortcuts are gone.

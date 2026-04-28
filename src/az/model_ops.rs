@@ -54,38 +54,44 @@ pub(super) fn conv_relu_board_layer_sparse_3x3(
     }
 }
 
-fn depthwise_conv_relu_layer_generic(
+fn conv3x3_layer_dense_generic(
     input: &[f32],
     channels: usize,
     weights: &[f32],
     bias: &[f32],
     output: &mut [f32],
+    relu: bool,
 ) {
-    debug_assert_eq!(weights.len(), channels * CNN_KERNEL_AREA);
+    debug_assert_eq!(weights.len(), channels * channels * CNN_KERNEL_AREA);
     debug_assert_eq!(bias.len(), channels);
-    for channel in 0..channels {
-        let start = channel * BOARD_PLANES_SIZE;
-        for sq in 0..BOARD_PLANES_SIZE {
-            let file = sq % BOARD_FILES;
-            let rank = sq / BOARD_FILES;
-            let mut value = bias[channel];
-            for kr in 0..3 {
-                let nr = rank as isize + kr as isize - 1;
-                if !(0..BOARD_RANKS as isize).contains(&nr) {
-                    continue;
-                }
-                for kf in 0..3 {
-                    let nf = file as isize + kf as isize - 1;
-                    if !(0..BOARD_FILES as isize).contains(&nf) {
-                        continue;
+    for out_channel in 0..channels {
+        let out_start = out_channel * BOARD_PLANES_SIZE;
+        let weight_out_start = out_channel * channels * CNN_KERNEL_AREA;
+        for rank in 0..BOARD_RANKS {
+            for file in 0..BOARD_FILES {
+                let sq = rank * BOARD_FILES + file;
+                let mut value = bias[out_channel];
+                for in_channel in 0..channels {
+                    let in_start = in_channel * BOARD_PLANES_SIZE;
+                    let weight_start = weight_out_start + in_channel * CNN_KERNEL_AREA;
+                    for kr in 0..3 {
+                        let nr = rank as isize + kr as isize - 1;
+                        if !(0..BOARD_RANKS as isize).contains(&nr) {
+                            continue;
+                        }
+                        for kf in 0..3 {
+                            let nf = file as isize + kf as isize - 1;
+                            if !(0..BOARD_FILES as isize).contains(&nf) {
+                                continue;
+                            }
+                            let board_index = nr as usize * BOARD_FILES + nf as usize;
+                            value +=
+                                input[in_start + board_index] * weights[weight_start + kr * 3 + kf];
+                        }
                     }
-                    let board_index = nr as usize * BOARD_FILES + nf as usize;
-                    let kernel_index = kr * 3 + kf;
-                    value += input[start + board_index]
-                        * weights[channel * CNN_KERNEL_AREA + kernel_index];
                 }
+                output[out_start + sq] = if relu { value.max(0.0) } else { value };
             }
-            output[start + sq] = value.max(0.0);
         }
     }
 }
@@ -179,7 +185,7 @@ fn conv1x1_layer_dense_generic(
     }
 }
 
-pub(super) fn residual_mobile_block_generic(
+pub(super) fn residual_cnn_block_generic(
     features: &mut [f32],
     tmp: &mut [f32],
     delta: &mut [f32],
@@ -187,54 +193,24 @@ pub(super) fn residual_mobile_block_generic(
     weights: &[f32],
     bias: &[f32],
 ) {
-    let dw_len = channels * CNN_KERNEL_AREA;
-    let row_len = channels * BOARD_FILES * BOARD_FILES;
-    let col_len = channels * BOARD_RANKS * BOARD_RANKS;
-    let pw_len = channels * channels;
-    debug_assert_eq!(weights.len(), dw_len + row_len + col_len + pw_len);
-    debug_assert_eq!(bias.len(), channels * 4);
-    depthwise_conv_relu_layer_generic(
+    let conv_len = channels * channels * CNN_KERNEL_AREA;
+    debug_assert_eq!(weights.len(), conv_len * 2);
+    debug_assert_eq!(bias.len(), channels * 2);
+    conv3x3_layer_dense_generic(
         features,
         channels,
-        &weights[..dw_len],
+        &weights[..conv_len],
         &bias[..channels],
         tmp,
+        true,
     );
-    row_depthwise_linear_layer_generic(
-        features,
-        channels,
-        &weights[dw_len..dw_len + row_len],
-        delta,
-    );
-    for channel in 0..channels {
-        let gate = bias[channels + channel];
-        let start = channel * BOARD_PLANES_SIZE;
-        for sq in 0..BOARD_PLANES_SIZE {
-            tmp[start + sq] += gate * delta[start + sq];
-        }
-    }
-    let col_start = dw_len + row_len;
-    col_depthwise_linear_layer_generic(
-        features,
-        channels,
-        &weights[col_start..col_start + col_len],
-        delta,
-    );
-    for channel in 0..channels {
-        let gate = bias[channels * 2 + channel];
-        let start = channel * BOARD_PLANES_SIZE;
-        for sq in 0..BOARD_PLANES_SIZE {
-            tmp[start + sq] += gate * delta[start + sq];
-        }
-    }
-    let pw_start = dw_len + row_len + col_len;
-    conv1x1_linear_layer_dense_generic(
+    conv3x3_layer_dense_generic(
         tmp,
         channels,
-        channels,
-        &weights[pw_start..pw_start + pw_len],
-        &bias[channels * 3..channels * 4],
+        &weights[conv_len..conv_len * 2],
+        &bias[channels..channels * 2],
         delta,
+        false,
     );
     for (feature, add) in features.iter_mut().zip(delta.iter()) {
         *feature = (*feature + *add).max(0.0);

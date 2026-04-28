@@ -27,10 +27,9 @@ use model::{
     BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOL_BLOCKS,
     DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
     VALUE_HEAD_CHANNELS, VALUE_HEAD_LEAK, VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_SCALE_CP,
-    cnn_pooled_size, dense_move_index, extract_board_planes,
-    mobile_block_bias_size, mobile_block_weight_size, policy_move_features,
-    policy_move_from_select, policy_move_to_select, value_head_features, value_head_map_size,
-    value_relation_bias_size, value_relation_weight_size,
+    cnn_pooled_size, dense_move_index, extract_board_planes, mobile_block_bias_size,
+    mobile_block_weight_size, policy_move_features, policy_move_from_select, policy_move_to_select,
+    value_head_features, value_head_map_size, value_relation_bias_size, value_relation_weight_size,
 };
 #[cfg(test)]
 use model::{canonical_piece_plane, move_map};
@@ -349,10 +348,62 @@ mod tests {
         assert!((single_stats.value_target_sum - repeated_stats.value_target_sum).abs() < 1e-6);
         assert!(
             single
-                .value_logits_bias
+                .value_scalar_hidden_weights
                 .iter()
-                .zip(&repeated.value_logits_bias)
+                .zip(&repeated.value_scalar_hidden_weights)
                 .all(|(left, right)| (*left - *right).abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn value_head_can_overfit_tiny_fixed_dataset() {
+        let board_with = |sq: usize, plane: u8| {
+            let mut board = vec![0; BOARD_HISTORY_SIZE];
+            board[sq] = plane;
+            board
+        };
+        let samples = vec![
+            AzTrainingSample {
+                board: board_with(0, 1),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: 1.0,
+                side_sign: 1.0,
+            },
+            AzTrainingSample {
+                board: board_with(10, 2),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: -1.0,
+                side_sign: 1.0,
+            },
+            AzTrainingSample {
+                board: board_with(40, 3),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: 0.75,
+                side_sign: 1.0,
+            },
+            AzTrainingSample {
+                board: board_with(80, 4),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value: -0.75,
+                side_sign: 1.0,
+            },
+        ];
+        let mut model = AzModel::random(32, 20260429);
+        let mut before_model = model.clone();
+        let mut rng_before = SplitMix64::new(7);
+        let before = train_samples(&mut before_model, &samples, 1, 1.0e-12, 4, &mut rng_before);
+        let mut rng = SplitMix64::new(7);
+        let after = train_samples(&mut model, &samples, 80, 0.003, 4, &mut rng);
+
+        assert!(
+            after.value_loss < before.value_loss * 0.4,
+            "value head failed to overfit tiny dataset: before={} after={}",
+            before.value_loss,
+            after.value_loss
         );
     }
 

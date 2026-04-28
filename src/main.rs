@@ -615,7 +615,7 @@ fn az_arch_probe_candidates() -> Vec<AzModelConfig> {
 }
 
 fn az_arch_local_window(config: AzModelConfig) -> usize {
-    let radius = config.model_blocks + 1;
+    let radius = config.model_blocks * 2 + 1;
     let edge = radius * 2 + 1;
     edge.min(BOARD_FILES.max(BOARD_RANKS))
 }
@@ -632,20 +632,11 @@ fn az_arch_dense64x6_mac_ratio(config: AzModelConfig) -> f64 {
     let channels = config.model_channels as f64;
     let dense_channels = 64.0f64;
     let stem = board * board_channels as f64 * 9.0 * channels;
-    let mobile_blocks = config.model_blocks as f64
-        * board
-        * (channels * (9.0 + BOARD_FILES as f64 + BOARD_RANKS as f64) + channels * channels);
-    let value_relation_layers = 4.0;
-    let value_relation_ffn_mult = 2.0;
-    let value_relation = value_relation_layers
-        * board
-        * (channels * (BOARD_FILES as f64 + BOARD_RANKS as f64)
-            + 2.0 * value_relation_ffn_mult * channels * channels);
-    let head = value_relation
-        + (channels * 4.0) * config.hidden_size as f64
+    let cnn_blocks = config.model_blocks as f64 * board * (2.0 * channels * channels * 9.0);
+    let head = (channels * 4.0) * config.hidden_size as f64
         + az_arch_value_feature_count(config) as f64 * config.value_hidden_size as f64
         + channels * 90.0 * 3.0;
-    let mobile_total = stem + mobile_blocks + head;
+    let mobile_total = stem + cnn_blocks + head;
 
     let dense_stem = board * board_channels as f64 * 9.0 * dense_channels;
     let dense_blocks = 6.0 * board * dense_channels * dense_channels * 9.0;

@@ -6,12 +6,12 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKin
 use super::model_config::AzModelConfig;
 use super::model_ops::{
     conv_relu_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic, dot_product,
-    pool_cnn_features, residual_mobile_block_generic, residual_value_relation_block_generic,
+    pool_cnn_features, residual_cnn_block_generic, residual_value_relation_block_generic,
 };
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 12;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 13;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -26,7 +26,7 @@ pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FR
 pub(super) const CNN_CHANNELS: usize = 32;
 pub(super) const RESIDUAL_BLOCKS: usize = 3;
 pub(super) const VALUE_HEAD_CHANNELS: usize = 8;
-pub(super) const VALUE_RELATION_LAYERS: usize = 4;
+pub(super) const VALUE_RELATION_LAYERS: usize = 0;
 pub(super) const VALUE_RELATION_FFN_MULT: usize = 2;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
@@ -40,11 +40,11 @@ pub(super) fn cnn_pooled_size(channels: usize) -> usize {
 }
 
 pub(super) fn mobile_block_weight_size(channels: usize) -> usize {
-    channels * (CNN_KERNEL_AREA + BOARD_FILES * BOARD_FILES + BOARD_RANKS * BOARD_RANKS + channels)
+    channels * channels * CNN_KERNEL_AREA * 2
 }
 
 pub(super) fn mobile_block_bias_size(channels: usize) -> usize {
-    channels * 4
+    channels * 2
 }
 
 pub(super) fn value_head_map_size(value_channels: usize) -> usize {
@@ -240,32 +240,18 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / (BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA) as f32).sqrt()))
             .collect();
         let board_conv1_bias = vec![0.0; channels];
-        let dw_len = channels * CNN_KERNEL_AREA;
-        let row_len = channels * BOARD_FILES * BOARD_FILES;
-        let col_len = channels * BOARD_RANKS * BOARD_RANKS;
+        let conv_len = channels * channels * CNN_KERNEL_AREA;
         let board_conv2_weights: Vec<f32> = (0..blocks * mobile_weight_size)
             .map(|index| {
                 let block_offset = index % mobile_weight_size;
-                let scale = if block_offset < dw_len {
-                    (2.0 / CNN_KERNEL_AREA as f32).sqrt()
-                } else if block_offset < dw_len + row_len {
-                    (2.0 / BOARD_FILES as f32).sqrt() * 0.25
-                } else if block_offset < dw_len + row_len + col_len {
-                    (2.0 / BOARD_RANKS as f32).sqrt() * 0.25
-                } else {
-                    (2.0 / channels as f32).sqrt()
+                let mut scale = (2.0 / (channels * CNN_KERNEL_AREA) as f32).sqrt();
+                if block_offset >= conv_len {
+                    scale *= 0.25;
                 };
                 rng.weight(scale)
             })
             .collect();
-        let mut board_conv2_bias = vec![0.0; blocks * mobile_bias_size];
-        for block in 0..blocks {
-            let bias_start = block * mobile_bias_size;
-            for channel in 0..channels {
-                board_conv2_bias[bias_start + channels + channel] = 0.1;
-                board_conv2_bias[bias_start + channels * 2 + channel] = 0.1;
-            }
-        }
+        let board_conv2_bias = vec![0.0; blocks * mobile_bias_size];
         let position_embed = (0..channels * BOARD_PLANES_SIZE)
             .map(|_| rng.weight(0.02))
             .collect();
@@ -424,6 +410,75 @@ impl AzModel {
         value
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_value_from_board_planes(&self, board: &[u8]) -> f32 {
+        assert_eq!(board.len(), BOARD_HISTORY_SIZE);
+        let mut scratch = AzEvalScratch::new(self.model_config);
+        scratch.board.copy_from_slice(board);
+        self.board_forward_into(
+            &scratch.board,
+            &mut scratch.conv1,
+            &mut scratch.conv2,
+            &mut scratch.conv_residual,
+            &mut scratch.cnn_global,
+        );
+        self.value_relation_into(
+            &scratch.conv1,
+            &mut scratch.value_features,
+            &mut scratch.value_relation_tmp,
+            &mut scratch.value_relation_hidden,
+            &mut scratch.value_relation_delta,
+        );
+        self.value_head_into(
+            &scratch.value_features,
+            &scratch.cnn_global,
+            &mut scratch.value_relation_global,
+            &mut scratch.value_tail,
+            &mut scratch.value_pool,
+            &mut scratch.value_hidden,
+        );
+        self.value_from_hidden_scratch(&mut scratch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_policy_logits_from_board_planes(
+        &self,
+        board: &[u8],
+        dense_indices: &[usize],
+    ) -> Vec<f32> {
+        assert_eq!(board.len(), BOARD_HISTORY_SIZE);
+        let mut scratch = AzEvalScratch::new(self.model_config);
+        scratch.board.copy_from_slice(board);
+        self.board_forward_into(
+            &scratch.board,
+            &mut scratch.conv1,
+            &mut scratch.conv2,
+            &mut scratch.conv_residual,
+            &mut scratch.cnn_global,
+        );
+        self.board_hidden_into(&scratch.cnn_global, &mut scratch.hidden);
+        self.policy_condition_into(
+            &scratch.hidden,
+            &scratch.cnn_global,
+            &mut scratch.policy_condition,
+        );
+        dense_indices
+            .iter()
+            .map(|&dense| {
+                let sparse = move_map().dense_to_sparse[dense] as usize;
+                let mv = Move::new(sparse / BOARD_SIZE, sparse % BOARD_SIZE);
+                self.policy_logit_from_hidden_index(
+                    &scratch.conv1,
+                    &scratch.cnn_global,
+                    &scratch.policy_condition,
+                    Color::Red,
+                    mv,
+                    dense,
+                )
+            })
+            .collect()
+    }
+
     fn board_forward_into(
         &self,
         board: &[u8],
@@ -454,7 +509,7 @@ impl AzModel {
         for block in 0..blocks {
             let weight_start = block * mobile_weight_size;
             let bias_start = block * mobile_bias_size;
-            residual_mobile_block_generic(
+            residual_cnn_block_generic(
                 features,
                 tmp,
                 delta,
