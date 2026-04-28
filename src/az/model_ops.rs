@@ -1,3 +1,4 @@
+use super::model::VALUE_RELATION_FFN_MULT;
 use super::{
     BOARD_CHANNELS, BOARD_HISTORY_FRAMES, BOARD_PLANES_SIZE, CNN_KERNEL_AREA, CNN_POOL_BLOCKS,
     PIECE_BOARD_CHANNELS, VALUE_LOGIT_SCALE, VALUE_LOGITS,
@@ -233,6 +234,89 @@ pub(super) fn residual_mobile_block_generic(
         channels,
         &weights[pw_start..pw_start + pw_len],
         &bias[channels * 3..channels * 4],
+        delta,
+    );
+    for (feature, add) in features.iter_mut().zip(delta.iter()) {
+        *feature = (*feature + *add).max(0.0);
+    }
+}
+
+pub(super) fn residual_value_relation_block_generic(
+    features: &mut [f32],
+    tmp: &mut [f32],
+    hidden: &mut [f32],
+    delta: &mut [f32],
+    channels: usize,
+    weights: &[f32],
+    bias: &[f32],
+) {
+    let ffn_channels = channels * VALUE_RELATION_FFN_MULT;
+    let row_len = channels * BOARD_FILES * BOARD_FILES;
+    let col_len = channels * BOARD_RANKS * BOARD_RANKS;
+    let up_len = ffn_channels * channels;
+    let down_len = channels * ffn_channels;
+    debug_assert_eq!(weights.len(), row_len + col_len + up_len + down_len);
+    debug_assert_eq!(bias.len(), channels * 3 + ffn_channels + channels);
+    debug_assert_eq!(hidden.len(), ffn_channels * BOARD_PLANES_SIZE);
+    tmp.copy_from_slice(features);
+
+    row_depthwise_linear_layer_generic(features, channels, &weights[..row_len], delta);
+    for channel in 0..channels {
+        let gate = bias[channel];
+        let start = channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            tmp[start + sq] += gate * delta[start + sq];
+        }
+    }
+
+    col_depthwise_linear_layer_generic(
+        features,
+        channels,
+        &weights[row_len..row_len + col_len],
+        delta,
+    );
+    for channel in 0..channels {
+        let gate = bias[channels + channel];
+        let start = channel * BOARD_PLANES_SIZE;
+        for sq in 0..BOARD_PLANES_SIZE {
+            tmp[start + sq] += gate * delta[start + sq];
+        }
+    }
+
+    for channel in 0..channels {
+        let start = channel * BOARD_PLANES_SIZE;
+        let mean = features[start..start + BOARD_PLANES_SIZE]
+            .iter()
+            .sum::<f32>()
+            / BOARD_PLANES_SIZE as f32;
+        let gate = bias[channels * 2 + channel];
+        for sq in 0..BOARD_PLANES_SIZE {
+            tmp[start + sq] = (tmp[start + sq] + gate * mean).max(0.0);
+        }
+    }
+
+    let up_start = row_len + col_len;
+    let up_bias_start = channels * 3;
+    conv1x1_linear_layer_dense_generic(
+        tmp,
+        channels,
+        ffn_channels,
+        &weights[up_start..up_start + up_len],
+        &bias[up_bias_start..up_bias_start + ffn_channels],
+        hidden,
+    );
+    for value in hidden.iter_mut() {
+        *value = value.max(0.0);
+    }
+
+    let down_start = up_start + up_len;
+    let down_bias_start = up_bias_start + ffn_channels;
+    conv1x1_linear_layer_dense_generic(
+        hidden,
+        ffn_channels,
+        channels,
+        &weights[down_start..down_start + down_len],
+        &bias[down_bias_start..down_bias_start + channels],
         delta,
     );
     for (feature, add) in features.iter_mut().zip(delta.iter()) {

@@ -3,12 +3,13 @@ use candle_nn::ops::{log_softmax, softmax};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
+use super::model::{VALUE_RELATION_FFN_MULT, VALUE_RELATION_LAYERS};
 use super::{
     AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
     CNN_KERNEL_AREA, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE,
     VALUE_HEAD_LEAK, VALUE_LOGIT_SCALE, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
     mobile_block_weight_size, policy_move_features, policy_move_from_select, policy_move_to_select,
-    value_head_features, value_head_map_size,
+    value_head_features, value_head_map_size, value_relation_bias_size, value_relation_weight_size,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -51,6 +52,15 @@ struct GpuVars {
     position_embed: Var,
     board_hidden: Var,
     board_hidden_bias: Var,
+    value_relation_row_weights: Vec<Var>,
+    value_relation_row_gates: Vec<Var>,
+    value_relation_col_weights: Vec<Var>,
+    value_relation_col_gates: Vec<Var>,
+    value_relation_global_gates: Vec<Var>,
+    value_relation_ffn_up_weights: Vec<Var>,
+    value_relation_ffn_up_biases: Vec<Var>,
+    value_relation_ffn_down_weights: Vec<Var>,
+    value_relation_ffn_down_biases: Vec<Var>,
     value_tail_conv_weights: Var,
     value_tail_conv_bias: Var,
     value_intermediate_hidden: Var,
@@ -547,7 +557,69 @@ impl GpuReplica {
             .broadcast_add(&self.vars.board_hidden_bias)?
             .relu()?;
 
-        let value_tail = features
+        let mut value_features = features.clone();
+        for layer in 0..VALUE_RELATION_LAYERS {
+            let row_ctx = value_features
+                .unsqueeze(3)?
+                .broadcast_mul(&self.vars.value_relation_row_weights[layer].reshape((
+                    1,
+                    channels,
+                    1,
+                    BOARD_FILES,
+                    BOARD_FILES,
+                ))?)?
+                .sum(4)?
+                .broadcast_mul(
+                    &self.vars.value_relation_row_gates[layer].reshape((1, channels, 1, 1))?,
+                )?;
+            let col_ctx = value_features
+                .unsqueeze(2)?
+                .broadcast_mul(&self.vars.value_relation_col_weights[layer].reshape((
+                    1,
+                    channels,
+                    BOARD_RANKS,
+                    BOARD_RANKS,
+                    1,
+                ))?)?
+                .sum(3)?
+                .broadcast_mul(
+                    &self.vars.value_relation_col_gates[layer].reshape((1, channels, 1, 1))?,
+                )?;
+            let global_ctx = value_features
+                .reshape((bsz, channels, BOARD_PLANES_SIZE))?
+                .mean(2)?
+                .reshape((bsz, channels, 1, 1))?
+                .broadcast_mul(
+                    &self.vars.value_relation_global_gates[layer].reshape((1, channels, 1, 1))?,
+                )?;
+            let relation = ((&value_features + row_ctx)? + col_ctx)?
+                .broadcast_add(&global_ctx)?
+                .relu()?;
+            let hidden = relation
+                .conv2d(&self.vars.value_relation_ffn_up_weights[layer], 0, 1, 1, 1)?
+                .broadcast_add(&self.vars.value_relation_ffn_up_biases[layer].reshape((
+                    1,
+                    channels * VALUE_RELATION_FFN_MULT,
+                    1,
+                    1,
+                ))?)?
+                .relu()?;
+            let delta = hidden
+                .conv2d(
+                    &self.vars.value_relation_ffn_down_weights[layer],
+                    0,
+                    1,
+                    1,
+                    1,
+                )?
+                .broadcast_add(
+                    &self.vars.value_relation_ffn_down_biases[layer]
+                        .reshape((1, channels, 1, 1))?,
+                )?;
+            value_features = (value_features + delta)?.relu()?;
+        }
+
+        let value_tail = value_features
             .conv2d(&self.vars.value_tail_conv_weights, 0, 1, 1, 1)?
             .broadcast_add(
                 &self
@@ -555,6 +627,20 @@ impl GpuReplica {
                     .value_tail_conv_bias
                     .reshape((1, value_channels, 1, 1))?,
             )?;
+        let relation_flat = value_features.reshape((bsz, channels, BOARD_PLANES_SIZE))?;
+        let relation_avg_pool = relation_flat.mean(2)?;
+        let relation_max_pool = relation_flat.max(2)?;
+        let relation_row_line_pool = value_features.mean(3)?.max(2)?;
+        let relation_col_line_pool = value_features.mean(2)?.max(2)?;
+        let relation_global = Tensor::cat(
+            &[
+                relation_avg_pool,
+                relation_max_pool,
+                relation_row_line_pool,
+                relation_col_line_pool,
+            ],
+            1,
+        )?;
         let value_flat = value_tail.reshape((bsz, value_channels, BOARD_PLANES_SIZE))?;
         let attn_logits = value_flat.narrow(1, 0, 1)?.squeeze(1)?;
         let attn_weights = softmax(&attn_logits, 1)?;
@@ -573,6 +659,7 @@ impl GpuReplica {
                 max_pooled,
                 std_pooled,
                 value_flat.reshape((bsz, value_map_size))?,
+                relation_global,
                 cnn_global.clone(),
             ],
             1,
@@ -719,6 +806,8 @@ impl GpuVars {
         let value_features = value_head_features(channels, value_channels);
         let mobile_weight_size = mobile_block_weight_size(channels);
         let mobile_bias_size = mobile_block_bias_size(channels);
+        let value_relation_weight_size = value_relation_weight_size(channels);
+        let value_relation_bias_size = value_relation_bias_size(channels);
         let mut residual_dw_weights = Vec::with_capacity(blocks);
         let mut residual_dw_biases = Vec::with_capacity(blocks);
         let mut residual_row_weights = Vec::with_capacity(blocks);
@@ -778,6 +867,74 @@ impl GpuVars {
                 device,
             )?);
         }
+        let mut value_relation_row_weights = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_row_gates = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_col_weights = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_col_gates = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_global_gates = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_ffn_up_weights = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_ffn_up_biases = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_ffn_down_weights = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let mut value_relation_ffn_down_biases = Vec::with_capacity(VALUE_RELATION_LAYERS);
+        let ffn_channels = channels * VALUE_RELATION_FFN_MULT;
+        let value_row_len = channels * BOARD_FILES * BOARD_FILES;
+        let value_col_len = channels * BOARD_RANKS * BOARD_RANKS;
+        let value_up_len = ffn_channels * channels;
+        let value_down_len = channels * ffn_channels;
+        for layer in 0..VALUE_RELATION_LAYERS {
+            let weight_offset = layer * value_relation_weight_size;
+            let bias_offset = layer * value_relation_bias_size;
+            value_relation_row_weights.push(var_from_slice(
+                &model.value_relation_weights[weight_offset..weight_offset + value_row_len],
+                (channels, BOARD_FILES, BOARD_FILES),
+                device,
+            )?);
+            value_relation_row_gates.push(var_from_slice(
+                &model.value_relation_bias[bias_offset..bias_offset + channels],
+                channels,
+                device,
+            )?);
+            let col_start = weight_offset + value_row_len;
+            value_relation_col_weights.push(var_from_slice(
+                &model.value_relation_weights[col_start..col_start + value_col_len],
+                (channels, BOARD_RANKS, BOARD_RANKS),
+                device,
+            )?);
+            value_relation_col_gates.push(var_from_slice(
+                &model.value_relation_bias[bias_offset + channels..bias_offset + channels * 2],
+                channels,
+                device,
+            )?);
+            value_relation_global_gates.push(var_from_slice(
+                &model.value_relation_bias[bias_offset + channels * 2..bias_offset + channels * 3],
+                channels,
+                device,
+            )?);
+            let up_start = col_start + value_col_len;
+            value_relation_ffn_up_weights.push(var_from_slice(
+                &model.value_relation_weights[up_start..up_start + value_up_len],
+                (ffn_channels, channels, 1, 1),
+                device,
+            )?);
+            let up_bias_start = bias_offset + channels * 3;
+            value_relation_ffn_up_biases.push(var_from_slice(
+                &model.value_relation_bias[up_bias_start..up_bias_start + ffn_channels],
+                ffn_channels,
+                device,
+            )?);
+            let down_start = up_start + value_up_len;
+            value_relation_ffn_down_weights.push(var_from_slice(
+                &model.value_relation_weights[down_start..down_start + value_down_len],
+                (channels, ffn_channels, 1, 1),
+                device,
+            )?);
+            let down_bias_start = up_bias_start + ffn_channels;
+            value_relation_ffn_down_biases.push(var_from_slice(
+                &model.value_relation_bias[down_bias_start..down_bias_start + channels],
+                channels,
+                device,
+            )?);
+        }
         Ok(Self {
             board_conv1_weights: var_from_slice(
                 &model.board_conv1_weights,
@@ -800,6 +957,15 @@ impl GpuVars {
             )?,
             board_hidden: var_from_slice(&model.board_hidden, (hidden, pooled_size), device)?,
             board_hidden_bias: var_from_slice(&model.board_hidden_bias, hidden, device)?,
+            value_relation_row_weights,
+            value_relation_row_gates,
+            value_relation_col_weights,
+            value_relation_col_gates,
+            value_relation_global_gates,
+            value_relation_ffn_up_weights,
+            value_relation_ffn_up_biases,
+            value_relation_ffn_down_weights,
+            value_relation_ffn_down_biases,
             value_tail_conv_weights: var_from_slice(
                 &model.value_tail_conv_weights,
                 (value_channels, channels, 1, 1),
@@ -893,6 +1059,15 @@ impl GpuVars {
         vars.push(self.position_embed.clone());
         vars.push(self.board_hidden.clone());
         vars.push(self.board_hidden_bias.clone());
+        vars.extend(self.value_relation_row_weights.iter().cloned());
+        vars.extend(self.value_relation_row_gates.iter().cloned());
+        vars.extend(self.value_relation_col_weights.iter().cloned());
+        vars.extend(self.value_relation_col_gates.iter().cloned());
+        vars.extend(self.value_relation_global_gates.iter().cloned());
+        vars.extend(self.value_relation_ffn_up_weights.iter().cloned());
+        vars.extend(self.value_relation_ffn_up_biases.iter().cloned());
+        vars.extend(self.value_relation_ffn_down_weights.iter().cloned());
+        vars.extend(self.value_relation_ffn_down_biases.iter().cloned());
         vars.push(self.value_tail_conv_weights.clone());
         vars.push(self.value_tail_conv_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
@@ -918,6 +1093,8 @@ impl GpuVars {
         let blocks = config.model_blocks;
         let mobile_weight_size = mobile_block_weight_size(channels);
         let mobile_bias_size = mobile_block_bias_size(channels);
+        let value_relation_weight_size = value_relation_weight_size(channels);
+        let value_relation_bias_size = value_relation_bias_size(channels);
         copy_var(&self.board_conv1_weights, &mut model.board_conv1_weights)?;
         copy_var(&self.board_conv1_bias, &mut model.board_conv1_bias)?;
         let dw_len = channels * CNN_KERNEL_AREA;
@@ -967,6 +1144,57 @@ impl GpuVars {
         copy_var(&self.position_embed, &mut model.position_embed)?;
         copy_var(&self.board_hidden, &mut model.board_hidden)?;
         copy_var(&self.board_hidden_bias, &mut model.board_hidden_bias)?;
+        let ffn_channels = channels * VALUE_RELATION_FFN_MULT;
+        let value_row_len = channels * BOARD_FILES * BOARD_FILES;
+        let value_col_len = channels * BOARD_RANKS * BOARD_RANKS;
+        let value_up_len = ffn_channels * channels;
+        let value_down_len = channels * ffn_channels;
+        for layer in 0..VALUE_RELATION_LAYERS {
+            let weight_offset = layer * value_relation_weight_size;
+            let bias_offset = layer * value_relation_bias_size;
+            copy_var(
+                &self.value_relation_row_weights[layer],
+                &mut model.value_relation_weights[weight_offset..weight_offset + value_row_len],
+            )?;
+            copy_var(
+                &self.value_relation_row_gates[layer],
+                &mut model.value_relation_bias[bias_offset..bias_offset + channels],
+            )?;
+            let col_start = weight_offset + value_row_len;
+            copy_var(
+                &self.value_relation_col_weights[layer],
+                &mut model.value_relation_weights[col_start..col_start + value_col_len],
+            )?;
+            copy_var(
+                &self.value_relation_col_gates[layer],
+                &mut model.value_relation_bias[bias_offset + channels..bias_offset + channels * 2],
+            )?;
+            copy_var(
+                &self.value_relation_global_gates[layer],
+                &mut model.value_relation_bias
+                    [bias_offset + channels * 2..bias_offset + channels * 3],
+            )?;
+            let up_start = col_start + value_col_len;
+            copy_var(
+                &self.value_relation_ffn_up_weights[layer],
+                &mut model.value_relation_weights[up_start..up_start + value_up_len],
+            )?;
+            let up_bias_start = bias_offset + channels * 3;
+            copy_var(
+                &self.value_relation_ffn_up_biases[layer],
+                &mut model.value_relation_bias[up_bias_start..up_bias_start + ffn_channels],
+            )?;
+            let down_start = up_start + value_up_len;
+            copy_var(
+                &self.value_relation_ffn_down_weights[layer],
+                &mut model.value_relation_weights[down_start..down_start + value_down_len],
+            )?;
+            let down_bias_start = up_bias_start + ffn_channels;
+            copy_var(
+                &self.value_relation_ffn_down_biases[layer],
+                &mut model.value_relation_bias[down_bias_start..down_bias_start + channels],
+            )?;
+        }
         copy_var(
             &self.value_tail_conv_weights,
             &mut model.value_tail_conv_weights,

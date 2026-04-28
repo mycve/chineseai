@@ -560,6 +560,8 @@ fn az_model_parameter_count(model: &AzModel) -> usize {
         + model.position_embed.len()
         + model.board_hidden.len()
         + model.board_hidden_bias.len()
+        + model.value_relation_weights.len()
+        + model.value_relation_bias.len()
         + model.value_tail_conv_weights.len()
         + model.value_tail_conv_bias.len()
         + model.value_intermediate_hidden.len()
@@ -618,7 +620,7 @@ fn az_arch_local_window(config: AzModelConfig) -> usize {
 fn az_arch_value_feature_count(config: AzModelConfig) -> usize {
     let channels = config.model_channels;
     let value_channels = config.value_head_channels;
-    value_channels * BOARD_SIZE + value_channels * 4 + channels * 4
+    value_channels * BOARD_SIZE + value_channels * 4 + channels * 8
 }
 
 fn az_arch_dense64x6_mac_ratio(config: AzModelConfig) -> f64 {
@@ -630,7 +632,14 @@ fn az_arch_dense64x6_mac_ratio(config: AzModelConfig) -> f64 {
     let mobile_blocks = config.model_blocks as f64
         * board
         * (channels * (9.0 + BOARD_FILES as f64 + BOARD_RANKS as f64) + channels * channels);
-    let head = (channels * 4.0) * config.hidden_size as f64
+    let value_relation_layers = 4.0;
+    let value_relation_ffn_mult = 2.0;
+    let value_relation = value_relation_layers
+        * board
+        * (channels * (BOARD_FILES as f64 + BOARD_RANKS as f64)
+            + 2.0 * value_relation_ffn_mult * channels * channels);
+    let head = value_relation
+        + (channels * 4.0) * config.hidden_size as f64
         + az_arch_value_feature_count(config) as f64 * config.value_hidden_size as f64
         + channels * 90.0 * 3.0;
     let mobile_total = stem + mobile_blocks + head;

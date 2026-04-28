@@ -2,11 +2,13 @@ use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
+use super::model::VALUE_RELATION_LAYERS;
 use super::model::{AZ_MODEL_BINARY_HEADER_LEN, AZ_MODEL_BINARY_MAGIC, AZ_MODEL_BINARY_VERSION};
 use super::{
     AzModel, AzModelConfig, BOARD_CHANNELS, BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE,
     DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
-    mobile_block_weight_size, value_head_features,
+    mobile_block_weight_size, value_head_features, value_relation_bias_size,
+    value_relation_weight_size,
 };
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -53,6 +55,8 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.position_embed)?;
         write_f32_slice_le(&mut writer, &self.board_hidden)?;
         write_f32_slice_le(&mut writer, &self.board_hidden_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_relation_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_relation_bias)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_weights)?;
         write_f32_slice_le(&mut writer, &self.value_tail_conv_bias)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
@@ -127,6 +131,9 @@ impl AzModel {
         let position_embed_len = channels * BOARD_PLANES_SIZE;
         let board_hidden_len = hidden_size * pooled_size;
         let board_hidden_bias_len = hidden_size;
+        let value_relation_weights_len =
+            VALUE_RELATION_LAYERS * value_relation_weight_size(channels);
+        let value_relation_bias_len = VALUE_RELATION_LAYERS * value_relation_bias_size(channels);
         let value_tail_conv_weights_len = value_channels * channels;
         let value_tail_conv_bias_len = value_channels;
         let vih_len = value_hidden_size * value_features;
@@ -150,6 +157,8 @@ impl AzModel {
             + position_embed_len
             + board_hidden_len
             + board_hidden_bias_len
+            + value_relation_weights_len
+            + value_relation_bias_len
             + value_tail_conv_weights_len
             + value_tail_conv_bias_len
             + vih_len
@@ -188,6 +197,8 @@ impl AzModel {
             position_embed: read_f32_vec_le(&mut reader, position_embed_len)?,
             board_hidden: read_f32_vec_le(&mut reader, board_hidden_len)?,
             board_hidden_bias: read_f32_vec_le(&mut reader, board_hidden_bias_len)?,
+            value_relation_weights: read_f32_vec_le(&mut reader, value_relation_weights_len)?,
+            value_relation_bias: read_f32_vec_le(&mut reader, value_relation_bias_len)?,
             value_tail_conv_weights: read_f32_vec_le(&mut reader, value_tail_conv_weights_len)?,
             value_tail_conv_bias: read_f32_vec_le(&mut reader, value_tail_conv_bias_len)?,
             value_intermediate_hidden: read_f32_vec_le(&mut reader, vih_len)?,

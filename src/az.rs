@@ -30,6 +30,7 @@ use model::{
     VALUE_SCALE_CP, cnn_pooled_size, dense_move_index, extract_board_planes,
     mobile_block_bias_size, mobile_block_weight_size, policy_move_features,
     policy_move_from_select, policy_move_to_select, value_head_features, value_head_map_size,
+    value_relation_bias_size, value_relation_weight_size,
 };
 #[cfg(test)]
 use model::{canonical_piece_plane, move_map};

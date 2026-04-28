@@ -6,12 +6,13 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKin
 use super::model_config::AzModelConfig;
 use super::model_ops::{
     conv_relu_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic, dot_product,
-    pool_cnn_features, residual_mobile_block_generic, scalar_value_from_logits,
+    pool_cnn_features, residual_mobile_block_generic, residual_value_relation_block_generic,
+    scalar_value_from_logits,
 };
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 8;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 11;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -26,6 +27,8 @@ pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FR
 pub(super) const CNN_CHANNELS: usize = 32;
 pub(super) const RESIDUAL_BLOCKS: usize = 3;
 pub(super) const VALUE_HEAD_CHANNELS: usize = 8;
+pub(super) const VALUE_RELATION_LAYERS: usize = 4;
+pub(super) const VALUE_RELATION_FFN_MULT: usize = 2;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
 pub(super) const CNN_POOL_BLOCKS: usize = 4;
@@ -51,7 +54,18 @@ pub(super) fn value_head_map_size(value_channels: usize) -> usize {
 }
 
 pub(super) fn value_head_features(channels: usize, value_channels: usize) -> usize {
-    value_head_map_size(value_channels) + value_channels * 4 + cnn_pooled_size(channels)
+    value_head_map_size(value_channels) + value_channels * 4 + cnn_pooled_size(channels) * 2
+}
+
+pub(super) fn value_relation_weight_size(channels: usize) -> usize {
+    let ffn_channels = channels * VALUE_RELATION_FFN_MULT;
+    channels * (BOARD_FILES * BOARD_FILES + BOARD_RANKS * BOARD_RANKS)
+        + ffn_channels * channels
+        + channels * ffn_channels
+}
+
+pub(super) fn value_relation_bias_size(channels: usize) -> usize {
+    channels * 3 + channels * VALUE_RELATION_FFN_MULT + channels
 }
 
 pub(super) struct AzEvalScratch {
@@ -61,6 +75,11 @@ pub(super) struct AzEvalScratch {
     pub(super) conv2: Vec<f32>,
     pub(super) conv_residual: Vec<f32>,
     pub(super) cnn_global: Vec<f32>,
+    pub(super) value_features: Vec<f32>,
+    pub(super) value_relation_tmp: Vec<f32>,
+    pub(super) value_relation_hidden: Vec<f32>,
+    pub(super) value_relation_delta: Vec<f32>,
+    pub(super) value_relation_global: Vec<f32>,
     pub(super) value_tail: Vec<f32>,
     pub(super) value_pool: Vec<f32>,
     pub(super) value_hidden: Vec<f32>,
@@ -85,6 +104,14 @@ impl AzEvalScratch {
             conv2: vec![0.0; channels * BOARD_PLANES_SIZE],
             conv_residual: vec![0.0; channels * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; pooled_size],
+            value_features: vec![0.0; channels * BOARD_PLANES_SIZE],
+            value_relation_tmp: vec![0.0; channels * BOARD_PLANES_SIZE],
+            value_relation_hidden: vec![
+                0.0;
+                channels * VALUE_RELATION_FFN_MULT * BOARD_PLANES_SIZE
+            ],
+            value_relation_delta: vec![0.0; channels * BOARD_PLANES_SIZE],
+            value_relation_global: vec![0.0; pooled_size],
             value_tail: vec![0.0; value_map_size],
             value_pool: vec![0.0; value_features],
             value_hidden: vec![0.0; config.value_hidden_size],
@@ -107,6 +134,8 @@ pub struct AzModel {
     pub position_embed: Vec<f32>,
     pub board_hidden: Vec<f32>,
     pub board_hidden_bias: Vec<f32>,
+    pub value_relation_weights: Vec<f32>,
+    pub value_relation_bias: Vec<f32>,
     pub value_tail_conv_weights: Vec<f32>,
     pub value_tail_conv_bias: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
@@ -158,6 +187,8 @@ impl Clone for AzModel {
             position_embed: self.position_embed.clone(),
             board_hidden: self.board_hidden.clone(),
             board_hidden_bias: self.board_hidden_bias.clone(),
+            value_relation_weights: self.value_relation_weights.clone(),
+            value_relation_bias: self.value_relation_bias.clone(),
             value_tail_conv_weights: self.value_tail_conv_weights.clone(),
             value_tail_conv_bias: self.value_tail_conv_bias.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
@@ -197,6 +228,8 @@ impl AzModel {
         let pooled_size = cnn_pooled_size(channels);
         let mobile_weight_size = mobile_block_weight_size(channels);
         let mobile_bias_size = mobile_block_bias_size(channels);
+        let value_relation_weight_size = value_relation_weight_size(channels);
+        let value_relation_bias_size = value_relation_bias_size(channels);
         let value_features = value_head_features(channels, value_channels);
         let mut rng = SplitMix64::new(seed);
         let board_conv1_weights: Vec<f32> = (0..channels
@@ -238,6 +271,33 @@ impl AzModel {
             .map(|_| rng.weight((2.0 / pooled_size as f32).sqrt()))
             .collect();
         let board_hidden_bias = vec![0.0; hidden_size];
+        let value_relation_weights = (0..VALUE_RELATION_LAYERS * value_relation_weight_size)
+            .map(|index| {
+                let block_offset = index % value_relation_weight_size;
+                let row_len = channels * BOARD_FILES * BOARD_FILES;
+                let col_len = channels * BOARD_RANKS * BOARD_RANKS;
+                let up_end = row_len + col_len + channels * channels * VALUE_RELATION_FFN_MULT;
+                let scale = if block_offset < row_len {
+                    (2.0 / BOARD_FILES as f32).sqrt() * 0.20
+                } else if block_offset < row_len + col_len {
+                    (2.0 / BOARD_RANKS as f32).sqrt() * 0.20
+                } else if block_offset < up_end {
+                    (2.0 / channels as f32).sqrt()
+                } else {
+                    (2.0 / (channels * VALUE_RELATION_FFN_MULT) as f32).sqrt()
+                };
+                rng.weight(scale)
+            })
+            .collect();
+        let mut value_relation_bias = vec![0.0; VALUE_RELATION_LAYERS * value_relation_bias_size];
+        for layer in 0..VALUE_RELATION_LAYERS {
+            let bias_start = layer * value_relation_bias_size;
+            for channel in 0..channels {
+                value_relation_bias[bias_start + channel] = 0.1;
+                value_relation_bias[bias_start + channels + channel] = 0.1;
+                value_relation_bias[bias_start + channels * 2 + channel] = 0.1;
+            }
+        }
         let value_tail_conv_weights: Vec<f32> = (0..value_channels * channels)
             .map(|_| rng.weight((2.0 / channels as f32).sqrt()))
             .collect();
@@ -278,6 +338,8 @@ impl AzModel {
             position_embed,
             board_hidden,
             board_hidden_bias,
+            value_relation_weights,
+            value_relation_bias,
             value_tail_conv_weights,
             value_tail_conv_bias,
             value_intermediate_hidden,
@@ -315,9 +377,17 @@ impl AzModel {
             &mut scratch.cnn_global,
         );
         self.board_hidden_into(&scratch.cnn_global, &mut scratch.hidden);
-        self.value_head_into(
+        self.value_relation_into(
             &scratch.conv1,
+            &mut scratch.value_features,
+            &mut scratch.value_relation_tmp,
+            &mut scratch.value_relation_hidden,
+            &mut scratch.value_relation_delta,
+        );
+        self.value_head_into(
+            &scratch.value_features,
             &scratch.cnn_global,
+            &mut scratch.value_relation_global,
             &mut scratch.value_tail,
             &mut scratch.value_pool,
             &mut scratch.value_hidden,
@@ -397,10 +467,43 @@ impl AzModel {
         }
     }
 
+    fn value_relation_into(
+        &self,
+        features: &[f32],
+        value_features: &mut Vec<f32>,
+        tmp: &mut Vec<f32>,
+        hidden: &mut Vec<f32>,
+        delta: &mut Vec<f32>,
+    ) {
+        let channels = self.model_config.model_channels;
+        let ffn_channels = channels * VALUE_RELATION_FFN_MULT;
+        let weight_size = value_relation_weight_size(channels);
+        let bias_size = value_relation_bias_size(channels);
+        value_features.resize(channels * BOARD_PLANES_SIZE, 0.0);
+        value_features.copy_from_slice(features);
+        tmp.resize(channels * BOARD_PLANES_SIZE, 0.0);
+        hidden.resize(ffn_channels * BOARD_PLANES_SIZE, 0.0);
+        delta.resize(channels * BOARD_PLANES_SIZE, 0.0);
+        for layer in 0..VALUE_RELATION_LAYERS {
+            let weight_start = layer * weight_size;
+            let bias_start = layer * bias_size;
+            residual_value_relation_block_generic(
+                value_features,
+                tmp,
+                hidden,
+                delta,
+                channels,
+                &self.value_relation_weights[weight_start..weight_start + weight_size],
+                &self.value_relation_bias[bias_start..bias_start + bias_size],
+            );
+        }
+    }
+
     fn value_head_into(
         &self,
         features: &[f32],
         cnn_global: &[f32],
+        relation_global: &mut Vec<f32>,
         value_tail: &mut Vec<f32>,
         pooled: &mut Vec<f32>,
         hidden: &mut Vec<f32>,
@@ -419,7 +522,16 @@ impl AzModel {
             &self.value_tail_conv_bias,
             value_tail,
         );
-        value_pool_features(value_tail, cnn_global, value_channels, channels, pooled);
+        relation_global.resize(cnn_pooled_size(channels), 0.0);
+        pool_cnn_features(features, channels, relation_global);
+        value_pool_features(
+            value_tail,
+            relation_global,
+            cnn_global,
+            value_channels,
+            channels,
+            pooled,
+        );
         hidden.resize(value_hidden_size, 0.0);
         hidden.copy_from_slice(&self.value_intermediate_bias);
         for (j, value) in hidden.iter_mut().enumerate().take(value_hidden_size) {
@@ -487,6 +599,10 @@ impl AzModel {
             || self.position_embed.len() != channels * BOARD_PLANES_SIZE
             || self.board_hidden.len() != self.hidden_size * pooled_size
             || self.board_hidden_bias.len() != self.hidden_size
+            || self.value_relation_weights.len()
+                != VALUE_RELATION_LAYERS * value_relation_weight_size(channels)
+            || self.value_relation_bias.len()
+                != VALUE_RELATION_LAYERS * value_relation_bias_size(channels)
             || self.value_tail_conv_weights.len() != value_channels * channels
             || self.value_tail_conv_bias.len() != value_channels
             || self.value_intermediate_hidden.len() != value_hidden_size * value_features
@@ -626,6 +742,7 @@ pub(super) fn canonical_piece_plane(side: Color, piece_color: Color, kind: Piece
 
 fn value_pool_features(
     value_tail: &[f32],
+    relation_global: &[f32],
     cnn_global: &[f32],
     value_channels: usize,
     channels: usize,
@@ -634,6 +751,7 @@ fn value_pool_features(
     let value_map_size = value_head_map_size(value_channels);
     let value_features = value_head_features(channels, value_channels);
     debug_assert_eq!(value_tail.len(), value_map_size);
+    debug_assert_eq!(relation_global.len(), cnn_pooled_size(channels));
     debug_assert_eq!(cnn_global.len(), cnn_pooled_size(channels));
     pooled.resize(value_features, 0.0);
     let logits = &value_tail[..BOARD_PLANES_SIZE];
@@ -672,7 +790,10 @@ fn value_pool_features(
     }
     let flat_start = value_channels * 4;
     pooled[flat_start..flat_start + value_map_size].copy_from_slice(value_tail);
-    pooled[flat_start + value_map_size..].copy_from_slice(cnn_global);
+    let relation_start = flat_start + value_map_size;
+    let pooled_size = cnn_pooled_size(channels);
+    pooled[relation_start..relation_start + pooled_size].copy_from_slice(relation_global);
+    pooled[relation_start + pooled_size..].copy_from_slice(cnn_global);
 }
 
 pub struct SplitMix64 {
