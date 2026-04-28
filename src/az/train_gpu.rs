@@ -7,7 +7,7 @@ use super::model::{VALUE_RELATION_FFN_MULT, VALUE_RELATION_LAYERS};
 use super::{
     AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
     CNN_KERNEL_AREA, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE,
-    VALUE_HEAD_LEAK, VALUE_LOGIT_SCALE, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
+    VALUE_HEAD_LEAK, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
     mobile_block_weight_size, policy_move_features, policy_move_from_select, policy_move_to_select,
     value_head_features, value_head_map_size, value_relation_bias_size, value_relation_weight_size,
 };
@@ -68,6 +68,9 @@ struct GpuVars {
     value_logits_weights: Var,
     value_direct_logits_weights: Var,
     value_logits_bias: Var,
+    value_scalar_hidden_weights: Var,
+    value_scalar_direct_weights: Var,
+    value_scalar_bias: Var,
     policy_from_weights: Var,
     policy_from_bias: Var,
     policy_to_weights: Var,
@@ -426,12 +429,7 @@ impl GpuReplica {
     ) -> CandleResult<ShardOutput> {
         let batch_tensors = BatchTensors::new(samples, batch, &self.device)?;
         let forward = self.forward(&batch_tensors)?;
-        let win_logit = forward.value_logits.narrow(1, 0, 1)?;
-        let loss_logit = forward.value_logits.narrow(1, 2, 1)?;
-        let value = ((win_logit - loss_logit)? * VALUE_LOGIT_SCALE as f64)?
-            .squeeze(1)?
-            .tanh()?;
-        let value_error = (&value - &batch_tensors.values)?;
+        let value_error = (&forward.value - &batch_tensors.values)?;
         let value_loss_tensor = value_error.sqr()?.sum_all()?;
 
         let policy_ce = if batch_tensors.has_policy_targets {
@@ -450,8 +448,8 @@ impl GpuReplica {
             loss: value_loss + policy_ce,
             value_loss,
             policy_ce,
-            value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
-            value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
+            value_pred_sum: forward.value.sum_all()?.to_scalar::<f32>()?,
+            value_pred_sq_sum: forward.value.sqr()?.sum_all()?.to_scalar::<f32>()?,
             value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,
             value_target_sq_sum: batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?,
             value_error_sq_sum: value_error.sqr()?.sum_all()?.to_scalar::<f32>()?,
@@ -671,10 +669,24 @@ impl GpuReplica {
         let value_negative_path = (&value_preact * VALUE_HEAD_LEAK as f64)?;
         let value_positive_path = (value_relu * (1.0 - VALUE_HEAD_LEAK as f64))?;
         let value_hidden = (value_negative_path + value_positive_path)?;
-        let value_logits = value_hidden
-            .matmul(&self.vars.value_logits_weights.t()?)?
-            .broadcast_add(&value_features.matmul(&self.vars.value_direct_logits_weights.t()?)?)?
-            .broadcast_add(&self.vars.value_logits_bias)?;
+        let value = value_hidden
+            .matmul(
+                &self
+                    .vars
+                    .value_scalar_hidden_weights
+                    .reshape((self.model_config.value_hidden_size, 1))?,
+            )?
+            .broadcast_add(
+                &value_features.matmul(
+                    &self
+                        .vars
+                        .value_scalar_direct_weights
+                        .reshape((value_head_features(channels, value_channels), 1))?,
+                )?,
+            )?
+            .broadcast_add(&self.vars.value_scalar_bias.reshape((1, 1))?)?
+            .squeeze(1)?
+            .tanh()?;
 
         let from_scores = features
             .conv2d(&self.vars.policy_from_weights, 0, 1, 1, 1)?
@@ -712,7 +724,7 @@ impl GpuReplica {
         let policy_logits = (policy_logits + policy_feature_logits)?;
 
         Ok(ForwardOutput {
-            value_logits,
+            value,
             policy_logits,
         })
     }
@@ -725,7 +737,7 @@ struct ShardOutput {
 }
 
 struct ForwardOutput {
-    value_logits: Tensor,
+    value: Tensor,
     policy_logits: Tensor,
 }
 
@@ -997,6 +1009,17 @@ impl GpuVars {
                 device,
             )?,
             value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
+            value_scalar_hidden_weights: var_from_slice(
+                &model.value_scalar_hidden_weights,
+                value_hidden_size,
+                device,
+            )?,
+            value_scalar_direct_weights: var_from_slice(
+                &model.value_scalar_direct_weights,
+                value_features,
+                device,
+            )?,
+            value_scalar_bias: var_from_slice(&model.value_scalar_bias, 1, device)?,
             policy_from_weights: var_from_slice(
                 &model.policy_from_weights,
                 (1, channels, 1, 1),
@@ -1075,6 +1098,9 @@ impl GpuVars {
         vars.push(self.value_logits_weights.clone());
         vars.push(self.value_direct_logits_weights.clone());
         vars.push(self.value_logits_bias.clone());
+        vars.push(self.value_scalar_hidden_weights.clone());
+        vars.push(self.value_scalar_direct_weights.clone());
+        vars.push(self.value_scalar_bias.clone());
         vars.push(self.policy_from_weights.clone());
         vars.push(self.policy_from_bias.clone());
         vars.push(self.policy_to_weights.clone());
@@ -1214,6 +1240,15 @@ impl GpuVars {
             &mut model.value_direct_logits_weights,
         )?;
         copy_var(&self.value_logits_bias, &mut model.value_logits_bias)?;
+        copy_var(
+            &self.value_scalar_hidden_weights,
+            &mut model.value_scalar_hidden_weights,
+        )?;
+        copy_var(
+            &self.value_scalar_direct_weights,
+            &mut model.value_scalar_direct_weights,
+        )?;
+        copy_var(&self.value_scalar_bias, &mut model.value_scalar_bias)?;
         copy_var(&self.policy_from_weights, &mut model.policy_from_weights)?;
         copy_var(&self.policy_from_bias, &mut model.policy_from_bias)?;
         copy_var(&self.policy_to_weights, &mut model.policy_to_weights)?;

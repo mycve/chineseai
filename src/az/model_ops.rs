@@ -1,7 +1,7 @@
 use super::model::VALUE_RELATION_FFN_MULT;
 use super::{
     BOARD_CHANNELS, BOARD_HISTORY_FRAMES, BOARD_PLANES_SIZE, CNN_KERNEL_AREA, CNN_POOL_BLOCKS,
-    PIECE_BOARD_CHANNELS, VALUE_LOGIT_SCALE, VALUE_LOGITS,
+    PIECE_BOARD_CHANNELS,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -366,13 +366,4 @@ pub(super) fn pool_cnn_features(input: &[f32], channels: usize, output: &mut [f3
 pub(super) fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
     left.iter().zip(right.iter()).map(|(a, b)| a * b).sum()
-}
-
-pub(super) fn scalar_value_from_logits(logits: &[f32]) -> (f32, f32) {
-    if logits.len() < VALUE_LOGITS {
-        return (0.0, 0.0);
-    }
-    let raw = (logits[0] - logits[2]) * VALUE_LOGIT_SCALE;
-    let value = raw.tanh();
-    (value, value.abs())
 }

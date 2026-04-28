@@ -64,6 +64,9 @@ impl AzModel {
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_direct_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_scalar_hidden_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_scalar_direct_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_scalar_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_from_weights)?;
         write_f32_slice_le(&mut writer, &self.policy_from_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_to_weights)?;
@@ -141,6 +144,9 @@ impl AzModel {
         let vlw_len = VALUE_LOGITS * value_hidden_size;
         let vdlw_len = VALUE_LOGITS * value_features;
         let vlb_len = VALUE_LOGITS;
+        let vshw_len = value_hidden_size;
+        let vsdw_len = value_features;
+        let vsb_len = 1;
         let pfw_len = channels;
         let pfbias_len = 1;
         let ptw_len = channels;
@@ -166,6 +172,9 @@ impl AzModel {
             + vlw_len
             + vdlw_len
             + vlb_len
+            + vshw_len
+            + vsdw_len
+            + vsb_len
             + pfw_len
             + pfbias_len
             + ptw_len
@@ -206,6 +215,9 @@ impl AzModel {
             value_logits_weights: read_f32_vec_le(&mut reader, vlw_len)?,
             value_direct_logits_weights: read_f32_vec_le(&mut reader, vdlw_len)?,
             value_logits_bias: read_f32_vec_le(&mut reader, vlb_len)?,
+            value_scalar_hidden_weights: read_f32_vec_le(&mut reader, vshw_len)?,
+            value_scalar_direct_weights: read_f32_vec_le(&mut reader, vsdw_len)?,
+            value_scalar_bias: read_f32_vec_le(&mut reader, vsb_len)?,
             policy_from_weights: read_f32_vec_le(&mut reader, pfw_len)?,
             policy_from_bias: read_f32_vec_le(&mut reader, pfbias_len)?,
             policy_to_weights: read_f32_vec_le(&mut reader, ptw_len)?,

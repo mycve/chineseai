@@ -7,12 +7,11 @@ use super::model_config::AzModelConfig;
 use super::model_ops::{
     conv_relu_board_layer_sparse_3x3, conv1x1_linear_layer_dense_generic, dot_product,
     pool_cnn_features, residual_mobile_block_generic, residual_value_relation_block_generic,
-    scalar_value_from_logits,
 };
 use super::train_gpu;
 
 pub const AZ_MODEL_BINARY_MAGIC: &[u8] = b"AZM1";
-pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 11;
+pub(super) const AZ_MODEL_BINARY_VERSION: u32 = 12;
 pub(super) const AZ_MODEL_BINARY_HEADER_LEN: usize = 40;
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -33,7 +32,6 @@ pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 9;
 pub(super) const CNN_KERNEL_AREA: usize = 9;
 pub(super) const CNN_POOL_BLOCKS: usize = 4;
 pub(super) const VALUE_HEAD_LEAK: f32 = 0.05;
-pub(super) const VALUE_LOGIT_SCALE: f32 = 0.25;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const VALUE_SCALE_CP: f32 = 1000.0;
 
@@ -83,7 +81,6 @@ pub(super) struct AzEvalScratch {
     pub(super) value_tail: Vec<f32>,
     pub(super) value_pool: Vec<f32>,
     pub(super) value_hidden: Vec<f32>,
-    pub(super) value_logits: Vec<f32>,
     pub(super) policy_condition: Vec<f32>,
     pub(super) logits: Vec<f32>,
     pub(super) priors: Vec<f32>,
@@ -115,7 +112,6 @@ impl AzEvalScratch {
             value_tail: vec![0.0; value_map_size],
             value_pool: vec![0.0; value_features],
             value_hidden: vec![0.0; config.value_hidden_size],
-            value_logits: vec![0.0; VALUE_LOGITS],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
@@ -143,6 +139,9 @@ pub struct AzModel {
     pub value_logits_weights: Vec<f32>,
     pub value_direct_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
+    pub value_scalar_hidden_weights: Vec<f32>,
+    pub value_scalar_direct_weights: Vec<f32>,
+    pub value_scalar_bias: Vec<f32>,
     pub policy_from_weights: Vec<f32>,
     pub policy_from_bias: Vec<f32>,
     pub policy_to_weights: Vec<f32>,
@@ -196,6 +195,9 @@ impl Clone for AzModel {
             value_logits_weights: self.value_logits_weights.clone(),
             value_direct_logits_weights: self.value_direct_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
+            value_scalar_hidden_weights: self.value_scalar_hidden_weights.clone(),
+            value_scalar_direct_weights: self.value_scalar_direct_weights.clone(),
+            value_scalar_bias: self.value_scalar_bias.clone(),
             policy_from_weights: self.policy_from_weights.clone(),
             policy_from_bias: self.policy_from_bias.clone(),
             policy_to_weights: self.policy_to_weights.clone(),
@@ -311,6 +313,13 @@ impl AzModel {
             .collect();
         let value_direct_logits_weights = vec![0.0; VALUE_LOGITS * value_features];
         let value_logits_bias = vec![0.0; VALUE_LOGITS];
+        let value_scalar_hidden_weights = (0..value_hidden_size)
+            .map(|_| rng.weight((2.0 / value_hidden_size as f32).sqrt() * 0.5))
+            .collect();
+        let value_scalar_direct_weights = (0..value_features)
+            .map(|_| rng.weight((2.0 / value_features as f32).sqrt() * 0.1))
+            .collect();
+        let value_scalar_bias = vec![0.0; 1];
         let policy_from_weights = (0..channels)
             .map(|_| rng.weight((2.0 / channels as f32).sqrt() * 0.25))
             .collect();
@@ -347,6 +356,9 @@ impl AzModel {
             value_logits_weights,
             value_direct_logits_weights,
             value_logits_bias,
+            value_scalar_hidden_weights,
+            value_scalar_direct_weights,
+            value_scalar_bias,
             policy_from_weights,
             policy_from_bias,
             policy_to_weights,
@@ -546,27 +558,22 @@ impl AzModel {
     }
 
     fn value_from_hidden_scratch(&self, scratch: &mut AzEvalScratch) -> f32 {
-        scratch
-            .value_logits
-            .copy_from_slice(&self.value_logits_bias);
-        let value_hidden_size = self.model_config.value_hidden_size;
-        let value_features = value_head_features(
-            self.model_config.model_channels,
-            self.model_config.value_head_channels,
-        );
-        for out in 0..VALUE_LOGITS {
-            let row =
-                &self.value_logits_weights[out * value_hidden_size..(out + 1) * value_hidden_size];
-            for (hidden, weight) in scratch.value_hidden.iter().zip(row) {
-                scratch.value_logits[out] += hidden * weight;
-            }
-            let direct_row =
-                &self.value_direct_logits_weights[out * value_features..(out + 1) * value_features];
-            for (feature, weight) in scratch.value_pool.iter().zip(direct_row) {
-                scratch.value_logits[out] += feature * weight;
-            }
+        let mut scalar_logit = self.value_scalar_bias[0];
+        for (hidden, weight) in scratch
+            .value_hidden
+            .iter()
+            .zip(self.value_scalar_hidden_weights.iter())
+        {
+            scalar_logit += hidden * weight;
         }
-        scalar_value_from_logits(&scratch.value_logits).0
+        for (feature, weight) in scratch
+            .value_pool
+            .iter()
+            .zip(self.value_scalar_direct_weights.iter())
+        {
+            scalar_logit += feature * weight;
+        }
+        scalar_logit.tanh()
     }
 
     fn policy_condition_into(&self, hidden: &[f32], cnn_global: &[f32], out: &mut Vec<f32>) {
@@ -610,6 +617,9 @@ impl AzModel {
             || self.value_logits_weights.len() != VALUE_LOGITS * value_hidden_size
             || self.value_direct_logits_weights.len() != VALUE_LOGITS * value_features
             || self.value_logits_bias.len() != VALUE_LOGITS
+            || self.value_scalar_hidden_weights.len() != value_hidden_size
+            || self.value_scalar_direct_weights.len() != value_features
+            || self.value_scalar_bias.len() != 1
             || self.policy_from_weights.len() != channels
             || self.policy_from_bias.len() != 1
             || self.policy_to_weights.len() != channels
