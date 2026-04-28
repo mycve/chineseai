@@ -351,7 +351,7 @@ impl AzLoopFileConfig {
 #   model_channels is the hidden width of each board square embedding.
 #   model_blocks are residual 3x3 CNN blocks, each with two dense convolutions.
 #   value_head_channels/value_hidden_size control the value head capacity.
-#   policy_condition_size stays fixed at 32 because the move-geometry feature table is 32-D.
+#   Policy is the standard CNN-style 1x1-conv + dense move-logit head.
 #   Historical sparse/NNUE inputs and value shortcuts are gone.
 
 model_path = "{model_path}"

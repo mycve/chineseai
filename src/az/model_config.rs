@@ -53,7 +53,7 @@ impl AzModelConfig {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "unsupported policy_condition_size {}; this build uses the fixed {}-dim move-geometry feature table",
+                "unsupported policy_condition_size {}; this field is a fixed legacy header slot and must remain {}",
                 config.policy_condition_size, POLICY_CONDITION_SIZE
             ),
         ))

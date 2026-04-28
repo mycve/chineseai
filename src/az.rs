@@ -27,8 +27,7 @@ use model::{
     BOARD_INPUT_KERNEL_AREA, BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_KERNEL_AREA, CNN_POOL_BLOCKS,
     DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE, RESIDUAL_BLOCKS,
     VALUE_HEAD_CHANNELS, VALUE_HEAD_LEAK, VALUE_HIDDEN_SIZE, VALUE_LOGITS, VALUE_SCALE_CP,
-    cnn_pooled_size, dense_move_index, extract_board_planes, mobile_block_bias_size,
-    mobile_block_weight_size, policy_move_features, policy_move_from_select, policy_move_to_select,
+    dense_move_index, extract_board_planes, mobile_block_bias_size, mobile_block_weight_size,
     value_head_features, value_head_map_size, value_relation_bias_size, value_relation_weight_size,
 };
 #[cfg(test)]
@@ -416,8 +415,11 @@ mod tests {
         let loaded = AzModel::load(&path).unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(model.hidden_size, loaded.hidden_size);
-        assert_eq!(model.board_hidden, loaded.board_hidden);
-        assert_eq!(model.policy_pair_weights, loaded.policy_pair_weights);
+        assert_eq!(model.position_embed, loaded.position_embed);
+        assert_eq!(
+            model.policy_tail_conv_weights,
+            loaded.policy_tail_conv_weights
+        );
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
     }
 
@@ -444,8 +446,7 @@ mod tests {
             model.value_intermediate_hidden,
             loaded.value_intermediate_hidden
         );
-        assert_eq!(model.policy_pair_weights, loaded.policy_pair_weights);
-        assert_eq!(model.policy_feature_cnn, loaded.policy_feature_cnn);
+        assert_eq!(model.policy_logits_weights, loaded.policy_logits_weights);
     }
 
     #[test]

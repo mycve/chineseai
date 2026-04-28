@@ -558,8 +558,6 @@ fn az_model_parameter_count(model: &AzModel) -> usize {
         + model.board_conv2_weights.len()
         + model.board_conv2_bias.len()
         + model.position_embed.len()
-        + model.board_hidden.len()
-        + model.board_hidden_bias.len()
         + model.value_relation_weights.len()
         + model.value_relation_bias.len()
         + model.value_tail_conv_weights.len()
@@ -572,15 +570,10 @@ fn az_model_parameter_count(model: &AzModel) -> usize {
         + model.value_scalar_hidden_weights.len()
         + model.value_scalar_direct_weights.len()
         + model.value_scalar_bias.len()
-        + model.policy_from_weights.len()
-        + model.policy_from_bias.len()
-        + model.policy_to_weights.len()
-        + model.policy_to_bias.len()
-        + model.policy_pair_weights.len()
+        + model.policy_tail_conv_weights.len()
+        + model.policy_tail_conv_bias.len()
+        + model.policy_logits_weights.len()
         + model.policy_move_bias.len()
-        + model.policy_feature_hidden.len()
-        + model.policy_feature_cnn.len()
-        + model.policy_feature_bias.len()
 }
 
 fn az_arch_probe_candidates() -> Vec<AzModelConfig> {

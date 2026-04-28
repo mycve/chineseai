@@ -6,10 +6,9 @@ use std::{process::Command, thread};
 use super::model::{VALUE_RELATION_FFN_MULT, VALUE_RELATION_LAYERS};
 use super::{
     AzModel, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE,
-    CNN_KERNEL_AREA, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, POLICY_CONDITION_SIZE,
-    VALUE_HEAD_LEAK, VALUE_LOGITS, cnn_pooled_size, mobile_block_bias_size,
-    mobile_block_weight_size, policy_move_features, policy_move_from_select, policy_move_to_select,
-    value_head_features, value_head_map_size, value_relation_bias_size, value_relation_weight_size,
+    CNN_KERNEL_AREA, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS, VALUE_HEAD_LEAK, VALUE_LOGITS,
+    mobile_block_bias_size, mobile_block_weight_size, value_head_features, value_head_map_size,
+    value_relation_bias_size, value_relation_weight_size,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
 
@@ -46,8 +45,6 @@ struct GpuVars {
     residual_pw_weights: Vec<Var>,
     residual_pw_biases: Vec<Var>,
     position_embed: Var,
-    board_hidden: Var,
-    board_hidden_bias: Var,
     value_relation_row_weights: Vec<Var>,
     value_relation_row_gates: Vec<Var>,
     value_relation_col_weights: Vec<Var>,
@@ -67,18 +64,10 @@ struct GpuVars {
     value_scalar_hidden_weights: Var,
     value_scalar_direct_weights: Var,
     value_scalar_bias: Var,
-    policy_from_weights: Var,
-    policy_from_bias: Var,
-    policy_to_weights: Var,
-    policy_to_bias: Var,
-    policy_pair_weights: Var,
+    policy_tail_conv_weights: Var,
+    policy_tail_conv_bias: Var,
+    policy_logits_weights: Var,
     policy_move_bias: Var,
-    policy_feature_hidden: Var,
-    policy_feature_cnn: Var,
-    policy_feature_bias: Var,
-    policy_move_features: Tensor,
-    policy_move_from_select: Tensor,
-    policy_move_to_select: Tensor,
 }
 
 pub(crate) fn training_cuda_device_count() -> usize {
@@ -519,11 +508,6 @@ impl GpuReplica {
         let col_line_pool = (feature_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
         let cnn_global = Tensor::cat(&[avg_pool, max_pool, row_line_pool, col_line_pool], 1)?;
 
-        let hidden = cnn_global
-            .matmul(&self.vars.board_hidden.t()?)?
-            .broadcast_add(&self.vars.board_hidden_bias)?
-            .relu()?;
-
         let mut value_features = features.clone();
         for layer in 0..VALUE_RELATION_LAYERS {
             let row_ctx = value_features
@@ -657,40 +641,19 @@ impl GpuReplica {
             .squeeze(1)?
             .tanh()?;
 
-        let from_scores = features
-            .conv2d(&self.vars.policy_from_weights, 0, 1, 1, 1)?
-            .broadcast_add(&self.vars.policy_from_bias.reshape((1, 1, 1, 1))?)?
-            .reshape((bsz, BOARD_PLANES_SIZE))?;
-        let to_scores = features
-            .conv2d(&self.vars.policy_to_weights, 0, 1, 1, 1)?
-            .broadcast_add(&self.vars.policy_to_bias.reshape((1, 1, 1, 1))?)?
-            .reshape((bsz, BOARD_PLANES_SIZE))?;
-        let policy_logits = from_scores
-            .matmul(&self.vars.policy_move_from_select)?
-            .broadcast_add(&to_scores.matmul(&self.vars.policy_move_to_select)?)?
+        let policy_tail = features
+            .conv2d(&self.vars.policy_tail_conv_weights, 0, 1, 1, 1)?
+            .broadcast_add(&self.vars.policy_tail_conv_bias.reshape((
+                1,
+                super::model::POLICY_HEAD_CHANNELS,
+                1,
+                1,
+            ))?)?
+            .relu()?
+            .reshape((bsz, super::model::policy_head_map_size()))?;
+        let policy_logits = policy_tail
+            .matmul(&self.vars.policy_logits_weights.t()?)?
             .broadcast_add(&self.vars.policy_move_bias)?;
-        let from_features = feature_flat
-            .reshape((bsz * channels, BOARD_PLANES_SIZE))?
-            .matmul(&self.vars.policy_move_from_select)?
-            .reshape((bsz, channels, DENSE_MOVE_SPACE))?;
-        let to_features = feature_flat
-            .reshape((bsz * channels, BOARD_PLANES_SIZE))?
-            .matmul(&self.vars.policy_move_to_select)?
-            .reshape((bsz, channels, DENSE_MOVE_SPACE))?;
-        let policy_pair_logits = (&from_features * &to_features)?
-            .broadcast_mul(&self.vars.policy_pair_weights.reshape((1, channels, 1))?)?
-            .sum(1)?;
-        let policy_logits = (policy_logits + policy_pair_logits)?;
-        let policy_condition = hidden
-            .matmul(&self.vars.policy_feature_hidden.t()?)?
-            .broadcast_add(
-                &cnn_global
-                    .matmul(&self.vars.policy_feature_cnn.t()?)?
-                    .broadcast_add(&self.vars.policy_feature_bias)?,
-            )?;
-        let policy_feature_logits =
-            policy_condition.matmul(&self.vars.policy_move_features.t()?)?;
-        let policy_logits = (policy_logits + policy_feature_logits)?;
 
         Ok(ForwardOutput {
             value,
@@ -777,13 +740,11 @@ impl BatchTensors {
 
 impl GpuVars {
     fn from_model(model: &AzModel, device: &Device) -> CandleResult<Self> {
-        let hidden = model.hidden_size;
         let config = model.model_config.normalized();
         let channels = config.model_channels;
         let blocks = config.model_blocks;
         let value_channels = config.value_head_channels;
         let value_hidden_size = config.value_hidden_size;
-        let pooled_size = cnn_pooled_size(channels);
         let value_features = value_head_features(channels, value_channels);
         let mobile_weight_size = mobile_block_weight_size(channels);
         let mobile_bias_size = mobile_block_bias_size(channels);
@@ -903,8 +864,6 @@ impl GpuVars {
                 (channels, BOARD_RANKS, BOARD_FILES),
                 device,
             )?,
-            board_hidden: var_from_slice(&model.board_hidden, (hidden, pooled_size), device)?,
-            board_hidden_bias: var_from_slice(&model.board_hidden_bias, hidden, device)?,
             value_relation_row_weights,
             value_relation_row_gates,
             value_relation_col_weights,
@@ -956,50 +915,22 @@ impl GpuVars {
                 device,
             )?,
             value_scalar_bias: var_from_slice(&model.value_scalar_bias, 1, device)?,
-            policy_from_weights: var_from_slice(
-                &model.policy_from_weights,
-                (1, channels, 1, 1),
+            policy_tail_conv_weights: var_from_slice(
+                &model.policy_tail_conv_weights,
+                (super::model::POLICY_HEAD_CHANNELS, channels, 1, 1),
                 device,
             )?,
-            policy_from_bias: var_from_slice(&model.policy_from_bias, 1, device)?,
-            policy_to_weights: var_from_slice(
-                &model.policy_to_weights,
-                (1, channels, 1, 1),
+            policy_tail_conv_bias: var_from_slice(
+                &model.policy_tail_conv_bias,
+                super::model::POLICY_HEAD_CHANNELS,
                 device,
             )?,
-            policy_to_bias: var_from_slice(&model.policy_to_bias, 1, device)?,
-            policy_pair_weights: var_from_slice(&model.policy_pair_weights, channels, device)?,
+            policy_logits_weights: var_from_slice(
+                &model.policy_logits_weights,
+                (DENSE_MOVE_SPACE, super::model::policy_head_map_size()),
+                device,
+            )?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
-            policy_feature_hidden: var_from_slice(
-                &model.policy_feature_hidden,
-                (POLICY_CONDITION_SIZE, hidden),
-                device,
-            )?,
-            policy_feature_cnn: var_from_slice(
-                &model.policy_feature_cnn,
-                (POLICY_CONDITION_SIZE, pooled_size),
-                device,
-            )?,
-            policy_feature_bias: var_from_slice(
-                &model.policy_feature_bias,
-                POLICY_CONDITION_SIZE,
-                device,
-            )?,
-            policy_move_features: Tensor::from_vec(
-                policy_move_features().to_vec(),
-                (DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE),
-                device,
-            )?,
-            policy_move_from_select: Tensor::from_vec(
-                policy_move_from_select().to_vec(),
-                (BOARD_PLANES_SIZE, DENSE_MOVE_SPACE),
-                device,
-            )?,
-            policy_move_to_select: Tensor::from_vec(
-                policy_move_to_select().to_vec(),
-                (BOARD_PLANES_SIZE, DENSE_MOVE_SPACE),
-                device,
-            )?,
         })
     }
 
@@ -1012,8 +943,6 @@ impl GpuVars {
         vars.extend(self.residual_pw_weights.iter().cloned());
         vars.extend(self.residual_pw_biases.iter().cloned());
         vars.push(self.position_embed.clone());
-        vars.push(self.board_hidden.clone());
-        vars.push(self.board_hidden_bias.clone());
         vars.extend(self.value_relation_row_weights.iter().cloned());
         vars.extend(self.value_relation_row_gates.iter().cloned());
         vars.extend(self.value_relation_col_weights.iter().cloned());
@@ -1033,15 +962,10 @@ impl GpuVars {
         vars.push(self.value_scalar_hidden_weights.clone());
         vars.push(self.value_scalar_direct_weights.clone());
         vars.push(self.value_scalar_bias.clone());
-        vars.push(self.policy_from_weights.clone());
-        vars.push(self.policy_from_bias.clone());
-        vars.push(self.policy_to_weights.clone());
-        vars.push(self.policy_to_bias.clone());
-        vars.push(self.policy_pair_weights.clone());
+        vars.push(self.policy_tail_conv_weights.clone());
+        vars.push(self.policy_tail_conv_bias.clone());
+        vars.push(self.policy_logits_weights.clone());
         vars.push(self.policy_move_bias.clone());
-        vars.push(self.policy_feature_hidden.clone());
-        vars.push(self.policy_feature_cnn.clone());
-        vars.push(self.policy_feature_bias.clone());
         vars
     }
 
@@ -1078,8 +1002,6 @@ impl GpuVars {
             )?;
         }
         copy_var(&self.position_embed, &mut model.position_embed)?;
-        copy_var(&self.board_hidden, &mut model.board_hidden)?;
-        copy_var(&self.board_hidden_bias, &mut model.board_hidden_bias)?;
         let ffn_channels = channels * VALUE_RELATION_FFN_MULT;
         let value_row_len = channels * BOARD_FILES * BOARD_FILES;
         let value_col_len = channels * BOARD_RANKS * BOARD_RANKS;
@@ -1159,18 +1081,19 @@ impl GpuVars {
             &mut model.value_scalar_direct_weights,
         )?;
         copy_var(&self.value_scalar_bias, &mut model.value_scalar_bias)?;
-        copy_var(&self.policy_from_weights, &mut model.policy_from_weights)?;
-        copy_var(&self.policy_from_bias, &mut model.policy_from_bias)?;
-        copy_var(&self.policy_to_weights, &mut model.policy_to_weights)?;
-        copy_var(&self.policy_to_bias, &mut model.policy_to_bias)?;
-        copy_var(&self.policy_pair_weights, &mut model.policy_pair_weights)?;
-        copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(
-            &self.policy_feature_hidden,
-            &mut model.policy_feature_hidden,
+            &self.policy_tail_conv_weights,
+            &mut model.policy_tail_conv_weights,
         )?;
-        copy_var(&self.policy_feature_cnn, &mut model.policy_feature_cnn)?;
-        copy_var(&self.policy_feature_bias, &mut model.policy_feature_bias)?;
+        copy_var(
+            &self.policy_tail_conv_bias,
+            &mut model.policy_tail_conv_bias,
+        )?;
+        copy_var(
+            &self.policy_logits_weights,
+            &mut model.policy_logits_weights,
+        )?;
+        copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         Ok(())
     }
 
@@ -1319,6 +1242,7 @@ fn shuffle(values: &mut [usize], rng: &mut super::SplitMix64) {
 #[cfg(test)]
 mod tests {
     use super::super::AzModelConfig;
+    use super::super::model::POLICY_CONDITION_SIZE;
     use super::*;
 
     #[test]
