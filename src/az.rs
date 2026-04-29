@@ -34,7 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 25;
+const AZNNUE_BINARY_VERSION: u32 = 24;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -73,7 +73,7 @@ pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
 pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
 pub(super) const VALUE_SQUARE_INPUT_SIZE: usize = BOARD_CHANNELS * BOARD_PLANES_SIZE;
 const CNN_CHANNELS: usize = 24;
-pub(super) const VALUE_CNN_CHANNELS: usize = 48;
+pub(super) const VALUE_CNN_CHANNELS: usize = 32;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
 const CNN_KERNEL_AREA: usize = 9;
 const CNN_POOL_BLOCKS: usize = 5;
@@ -196,12 +196,9 @@ pub struct AzNnue {
 //   because that recreates the red/black leakage bug.
 // - v23 gave value its own tiny board CNN. v24 removes value-side sparse V4
 //   and hand relation inputs. Value now starts from a learned piece-square
-//   board embedding plus a board-plane residual CNN. This keeps value fully
+//   board embedding plus a 32-channel residual CNN. This keeps value fully
 //   learned from canonical board planes while still giving it a natural way to
 //   learn material/position baselines before local attack/defense patterns.
-// - v25 widens the value-only CNN from 32 to 48 channels. This is a small
-//   perception bump for tactical board relations without making the policy path
-//   heavier or letting the final value MLP dominate learning.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
