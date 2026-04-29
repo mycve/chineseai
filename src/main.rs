@@ -1849,33 +1849,32 @@ fn main() {
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
             let mut model_path_override = cmd.model;
-            let (config_path, simulations_override) = if let Some(value) =
-                cmd.config_model_or_simulations
-            {
-                if let Ok(simulations) = value.parse::<usize>() {
-                    (
-                        DEFAULT_AZ_LOOP_CONFIG.to_string(),
-                        Some(cmd.simulations.unwrap_or(simulations).max(1)),
-                    )
-                } else if Path::new(&value)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
-                {
-                    (value, cmd.simulations.map(|value| value.max(1)))
+            let (config_path, simulations_override) =
+                if let Some(value) = cmd.config_model_or_simulations {
+                    if let Ok(simulations) = value.parse::<usize>() {
+                        (
+                            DEFAULT_AZ_LOOP_CONFIG.to_string(),
+                            Some(cmd.simulations.unwrap_or(simulations).max(1)),
+                        )
+                    } else if Path::new(&value)
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+                    {
+                        (value, cmd.simulations.map(|value| value.max(1)))
+                    } else {
+                        model_path_override = Some(value);
+                        (
+                            DEFAULT_AZ_LOOP_CONFIG.to_string(),
+                            cmd.simulations.map(|value| value.max(1)),
+                        )
+                    }
                 } else {
-                    model_path_override = Some(value);
                     (
                         DEFAULT_AZ_LOOP_CONFIG.to_string(),
                         cmd.simulations.map(|value| value.max(1)),
                     )
-                }
-            } else {
-                (
-                    DEFAULT_AZ_LOOP_CONFIG.to_string(),
-                    cmd.simulations.map(|value| value.max(1)),
-                )
-            };
+                };
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };

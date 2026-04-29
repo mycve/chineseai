@@ -1,5 +1,7 @@
 use crate::nnue::HistoryMove;
-use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
+use std::collections::HashMap;
+
+use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
 
 use super::mctx::{self, ActionStats, AzGumbelConfig};
 use super::{AzEvalScratch, AzNnue, SplitMix64, VALUE_SCALE_CP};
@@ -168,6 +170,7 @@ struct AzTree<'a> {
     root_gumbels: Vec<f32>,
     root_considered_visits: Vec<u32>,
     eval_scratch: AzEvalScratch,
+    eval_cache: HashMap<u64, CachedEval>,
 }
 
 struct AzNode {
@@ -189,6 +192,19 @@ struct AzChild {
     visits: u32,
     value_sum: f32,
     child: Option<usize>,
+}
+
+#[derive(Clone)]
+struct CachedEval {
+    value: f32,
+    children: Vec<CachedEvalChild>,
+}
+
+#[derive(Clone)]
+struct CachedEvalChild {
+    mv: Move,
+    logit: f32,
+    prior: f32,
 }
 
 impl AzChild {
@@ -247,6 +263,7 @@ impl<'a> AzTree<'a> {
             root_gumbels: Vec::new(),
             root_considered_visits: Vec::new(),
             eval_scratch: AzEvalScratch::new(model.hidden_size),
+            eval_cache: HashMap::with_capacity(limits.simulations.saturating_add(1)),
         }
     }
 
@@ -283,6 +300,17 @@ impl<'a> AzTree<'a> {
             return -1.0;
         }
 
+        let cache_key = eval_cache_key(
+            &self.nodes[node_index].position,
+            &self.nodes[node_index].history,
+            &self.nodes[node_index].rule_history,
+            &moves,
+        );
+        if let Some(cached) = self.eval_cache.get(&cache_key).cloned() {
+            self.install_cached_eval(node_index, cached);
+            return self.nodes[node_index].value;
+        }
+
         let value = self.model.evaluate_with_scratch(
             &self.nodes[node_index].position,
             &self.nodes[node_index].history,
@@ -293,31 +321,55 @@ impl<'a> AzTree<'a> {
             &self.eval_scratch.logits[..moves.len()],
             &mut self.eval_scratch.priors,
         );
+        let cached = CachedEval {
+            value,
+            children: moves
+                .into_iter()
+                .zip(priors.drain(..))
+                .enumerate()
+                .map(|(index, (mv, prior))| CachedEvalChild {
+                    mv,
+                    logit: self.eval_scratch.logits[index],
+                    prior,
+                })
+                .collect(),
+        };
+        self.eval_cache.insert(cache_key, cached.clone());
+        self.install_cached_eval(node_index, cached);
+        self.nodes[node_index].value
+    }
+
+    fn install_cached_eval(&mut self, node_index: usize, cached: CachedEval) {
+        let value = cached.value;
+        let mut children = cached
+            .children
+            .into_iter()
+            .map(|child| AzChild {
+                mv: child.mv,
+                logit: child.logit,
+                prior: child.prior,
+                visits: 0,
+                value_sum: 0.0,
+                child: None,
+            })
+            .collect::<Vec<_>>();
         if node_index == self.root
             && self.algorithm == AzSearchAlgorithm::AlphaZero
             && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
         {
+            let mut priors = children.iter().map(|child| child.prior).collect::<Vec<_>>();
             apply_root_dirichlet_noise(
-                priors,
+                &mut priors,
                 self.root_dirichlet_alpha,
                 self.root_exploration_fraction,
                 self.root_noise_seed,
             );
+            for (child, prior) in children.iter_mut().zip(priors) {
+                child.prior = prior;
+            }
         }
-        self.nodes[node_index].children = moves
-            .into_iter()
-            .zip(priors.drain(..))
-            .enumerate()
-            .map(|(index, (mv, prior))| AzChild {
-                mv,
-                logit: self.eval_scratch.logits[index],
-                prior,
-                visits: 0,
-                value_sum: 0.0,
-                child: None,
-            })
-            .collect();
+        self.nodes[node_index].children = children;
         if node_index == self.root && self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
             self.root_gumbels = mctx::sample_gumbels(
                 self.nodes[node_index].children.len(),
@@ -334,7 +386,6 @@ impl<'a> AzTree<'a> {
         }
         self.nodes[node_index].value = value;
         self.nodes[node_index].expanded = true;
-        value
     }
 
     fn simulate(&mut self, node_index: usize) -> f32 {
@@ -521,6 +572,84 @@ impl<'a> AzTree<'a> {
 
 fn puct_score(child: &AzChild, parent_visits_sqrt: f32, cpuct: f32) -> f32 {
     child.q() + cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32)
+}
+
+fn eval_cache_key(
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: &[RuleHistoryEntry],
+    moves: &[Move],
+) -> u64 {
+    let mut key = mix64(position.hash() ^ ((position.halfmove_clock() as u64) << 48));
+    key = mix_with(key, history.len() as u64);
+    for entry in history {
+        key = mix_with(key, move_code(entry.mv));
+        key = mix_with(key, piece_code(entry.piece));
+        key = mix_with(key, entry.captured.map_or(0xFF, piece_code));
+    }
+    key = mix_with(key, rule_history.len() as u64);
+    for entry in rule_history
+        .iter()
+        .rev()
+        .take(crate::nnue::HISTORY_PLIES + 4)
+    {
+        key = mix_with(key, entry.hash);
+        key = mix_with(key, color_code(entry.side_to_move));
+        key = mix_with(key, entry.mover.map_or(3, color_code));
+        key = mix_with(key, entry.gives_check as u64);
+        key = mix_with(key, entry.chased_mask as u64);
+        key = mix_with(key, (entry.chased_mask >> 64) as u64);
+    }
+    key = mix_with(key, moves.len() as u64);
+    for &mv in moves {
+        key = mix_with(key, move_code(mv));
+    }
+    key
+}
+
+#[inline(always)]
+fn mix_with(state: u64, value: u64) -> u64 {
+    mix64(state ^ value.wrapping_add(0x9E37_79B9_7F4A_7C15))
+}
+
+#[inline(always)]
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+#[inline(always)]
+fn move_code(mv: Move) -> u64 {
+    mv.from as u64 | ((mv.to as u64) << 8)
+}
+
+#[inline(always)]
+fn piece_code(piece: Piece) -> u64 {
+    color_code(piece.color) | (piece_kind_code(piece.kind) << 2)
+}
+
+#[inline(always)]
+fn color_code(color: Color) -> u64 {
+    match color {
+        Color::Red => 1,
+        Color::Black => 2,
+    }
+}
+
+#[inline(always)]
+fn piece_kind_code(kind: PieceKind) -> u64 {
+    match kind {
+        PieceKind::General => 1,
+        PieceKind::Advisor => 2,
+        PieceKind::Elephant => 3,
+        PieceKind::Horse => 4,
+        PieceKind::Rook => 5,
+        PieceKind::Cannon => 6,
+        PieceKind::Soldier => 7,
+    }
 }
 
 fn terminal_value(position: &Position, rule_history: &[RuleHistoryEntry]) -> Option<f32> {

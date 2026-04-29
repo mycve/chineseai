@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
@@ -15,9 +15,7 @@ use crate::nnue::{
     HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, canonical_move, canonical_square,
     extract_sparse_features_v4_canonical,
 };
-use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position,
-};
+use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
@@ -1040,10 +1038,9 @@ pub(super) fn extract_board_planes(
     for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
         let piece_plane =
             (canonical_piece_plane(side, entry.piece.color, entry.piece.kind) + 1) as u8;
-        rewound[canonical_square(side, entry.mv.to as usize)] =
-            entry.captured.map_or(0, |piece| {
-                (canonical_piece_plane(side, piece.color, piece.kind) + 1) as u8
-            });
+        rewound[canonical_square(side, entry.mv.to as usize)] = entry.captured.map_or(0, |piece| {
+            (canonical_piece_plane(side, piece.color, piece.kind) + 1) as u8
+        });
         rewound[canonical_square(side, entry.mv.from as usize)] = piece_plane;
         let start = (history_index + 1) * BOARD_PLANES_SIZE;
         board[start..start + BOARD_PLANES_SIZE].copy_from_slice(&rewound);
@@ -1299,16 +1296,24 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     let mut sum1 = 0.0;
     let mut sum2 = 0.0;
     let mut sum3 = 0.0;
-    let chunks = left.len() / 4;
+    let mut sum4 = 0.0;
+    let mut sum5 = 0.0;
+    let mut sum6 = 0.0;
+    let mut sum7 = 0.0;
+    let chunks = left.len() / 8;
     for chunk in 0..chunks {
-        let index = chunk * 4;
+        let index = chunk * 8;
         sum0 += left[index] * right[index];
         sum1 += left[index + 1] * right[index + 1];
         sum2 += left[index + 2] * right[index + 2];
         sum3 += left[index + 3] * right[index + 3];
+        sum4 += left[index + 4] * right[index + 4];
+        sum5 += left[index + 5] * right[index + 5];
+        sum6 += left[index + 6] * right[index + 6];
+        sum7 += left[index + 7] * right[index + 7];
     }
-    let mut sum = (sum0 + sum1) + (sum2 + sum3);
-    for index in (chunks * 4)..left.len() {
+    let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
+    for index in (chunks * 8)..left.len() {
         sum += left[index] * right[index];
     }
     sum
