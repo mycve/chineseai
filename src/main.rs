@@ -259,12 +259,16 @@ struct PerftArgs {
 Examples:
   chineseai vs-pikafish ./tools/pikafish 10000
   chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml -s 10000
-  chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml -s 10000 --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
+  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0200-chineseai.nnue -s 10000
+  chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml --model checkpoints/update-0200-chineseai.nnue -s 10000 --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
-    /// Config path or simulations override. Numeric values use the default config.
-    config_or_simulations: Option<String>,
+    /// Config path, checkpoint/model path, or simulations override. Numeric values use the default config.
+    config_model_or_simulations: Option<String>,
+    /// Override the model/checkpoint path from the config.
+    #[arg(long)]
+    model: Option<String>,
     /// Override config.simulations.
     #[arg(short = 's', long)]
     simulations: Option<usize>,
@@ -1844,15 +1848,27 @@ fn main() {
         }
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
-            let (config_path, simulations_override) = if let Some(value) = cmd.config_or_simulations
+            let mut model_path_override = cmd.model;
+            let (config_path, simulations_override) = if let Some(value) =
+                cmd.config_model_or_simulations
             {
                 if let Ok(simulations) = value.parse::<usize>() {
                     (
                         DEFAULT_AZ_LOOP_CONFIG.to_string(),
                         Some(cmd.simulations.unwrap_or(simulations).max(1)),
                     )
-                } else {
+                } else if Path::new(&value)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+                {
                     (value, cmd.simulations.map(|value| value.max(1)))
+                } else {
+                    model_path_override = Some(value);
+                    (
+                        DEFAULT_AZ_LOOP_CONFIG.to_string(),
+                        cmd.simulations.map(|value| value.max(1)),
+                    )
                 }
             } else {
                 (
@@ -1864,6 +1880,7 @@ fn main() {
                 return;
             };
             let simulations = simulations_override.unwrap_or(config.simulations).max(1);
+            let model_path = model_path_override.unwrap_or_else(|| config.model_path.clone());
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
@@ -1872,7 +1889,7 @@ fn main() {
             let seed = 20260411_u64;
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
-                Path::new(&config.model_path),
+                Path::new(&model_path),
                 &start_positions,
                 VsPikafishConfig {
                     pikafish_depth,
@@ -1890,7 +1907,7 @@ fn main() {
             println!(
                 "vs-pikafish: config={} model={} search={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
                 config_path,
-                config.model_path,
+                model_path,
                 config.search_algorithm.as_str(),
                 summary.total_games,
                 start_positions.len(),
