@@ -28,6 +28,7 @@ pub const V4_INPUT_SIZE: usize =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
+    pub captured: Option<Piece>,
     pub mv: Move,
 }
 
@@ -417,6 +418,7 @@ mod tests {
         let position = Position::startpos();
         let history = [HistoryMove {
             piece: position.piece_at(64).unwrap(),
+            captured: None,
             mv: Move::new(64, 55),
         }];
         let features = extract_sparse_features_v3(&position, &history);
@@ -472,6 +474,7 @@ mod tests {
         let black_to_move = Position::from_fen("4k4/9/9/9/4p4/4P4/9/9/9/4K4 b").unwrap();
         let history = [HistoryMove {
             piece: red_to_move.piece_at(49).unwrap(),
+            captured: None,
             mv: Move::new(49, 40),
         }];
 
@@ -493,10 +496,12 @@ mod tests {
         let right = Position::from_fen("4k4/9/9/9/4pp3/3P5/9/9/9/4K4 w").unwrap();
         let left_history = [HistoryMove {
             piece: left.piece_at(50).unwrap(),
+            captured: None,
             mv: Move::new(50, 41),
         }];
         let right_history = [HistoryMove {
             piece: right.piece_at(48).unwrap(),
+            captured: None,
             mv: Move::new(48, 39),
         }];
         let mut mirrored_left = extract_sparse_features_v3(&left, &left_history);

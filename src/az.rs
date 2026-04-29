@@ -34,7 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 24;
+const AZNNUE_BINARY_VERSION: u32 = 25;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -73,7 +73,7 @@ pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
 pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
 pub(super) const VALUE_SQUARE_INPUT_SIZE: usize = BOARD_CHANNELS * BOARD_PLANES_SIZE;
 const CNN_CHANNELS: usize = 24;
-pub(super) const VALUE_CNN_CHANNELS: usize = 32;
+pub(super) const VALUE_CNN_CHANNELS: usize = 48;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
 const CNN_KERNEL_AREA: usize = 9;
 const CNN_POOL_BLOCKS: usize = 5;
@@ -196,9 +196,12 @@ pub struct AzNnue {
 //   because that recreates the red/black leakage bug.
 // - v23 gave value its own tiny board CNN. v24 removes value-side sparse V4
 //   and hand relation inputs. Value now starts from a learned piece-square
-//   board embedding plus a 32-channel residual CNN. This keeps value fully
+//   board embedding plus a board-plane residual CNN. This keeps value fully
 //   learned from canonical board planes while still giving it a natural way to
 //   learn material/position baselines before local attack/defense patterns.
+// - v25 widens the value-only CNN from 32 to 48 channels. This is a small
+//   perception bump for tactical board relations without making the policy path
+//   heavier or letting the final value MLP dominate learning.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -1040,7 +1043,10 @@ pub(super) fn extract_board_planes(
     for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
         let piece_plane =
             (canonical_piece_plane(side, entry.piece.color, entry.piece.kind) + 1) as u8;
-        rewound[canonical_square(side, entry.mv.to as usize)] = 0;
+        rewound[canonical_square(side, entry.mv.to as usize)] =
+            entry.captured.map_or(0, |piece| {
+                (canonical_piece_plane(side, piece.color, piece.kind) + 1) as u8
+            });
         rewound[canonical_square(side, entry.mv.from as usize)] = piece_plane;
         let start = (history_index + 1) * BOARD_PLANES_SIZE;
         board[start..start + BOARD_PLANES_SIZE].copy_from_slice(&rewound);
@@ -1586,6 +1592,7 @@ mod tests {
         let moved_piece = position.piece_at(mv.from as usize).unwrap();
         let history = vec![HistoryMove {
             piece: moved_piece,
+            captured: None,
             mv,
         }];
         position.make_move(mv);
@@ -1602,6 +1609,35 @@ mod tests {
         assert_eq!(board[to], piece_plane);
         assert_eq!(board[BOARD_PLANES_SIZE + from], piece_plane);
         assert_eq!(board[BOARD_PLANES_SIZE + to], 0);
+    }
+
+    #[test]
+    fn board_history_planes_restore_captured_piece_when_rewound() {
+        let mut position = Position::from_fen("4k4/9/9/9/r3c4/9/9/9/R8/4K4 w").unwrap();
+        let mv = Move::new(72, 36);
+        assert!(position.is_legal_move(mv));
+        let moved_piece = position.piece_at(mv.from as usize).unwrap();
+        let captured_piece = position.piece_at(mv.to as usize).unwrap();
+        let history = vec![HistoryMove {
+            piece: moved_piece,
+            captured: Some(captured_piece),
+            mv,
+        }];
+        position.make_move(mv);
+
+        let mut board = Vec::new();
+        extract_board_planes(&position, &history, &mut board);
+        let side = position.side_to_move();
+        let moved_plane =
+            (canonical_piece_plane(side, moved_piece.color, moved_piece.kind) + 1) as u8;
+        let captured_plane =
+            (canonical_piece_plane(side, captured_piece.color, captured_piece.kind) + 1) as u8;
+        let from = canonical_square(side, mv.from as usize);
+        let to = canonical_square(side, mv.to as usize);
+
+        assert_eq!(board[to], moved_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + from], moved_plane);
+        assert_eq!(board[BOARD_PLANES_SIZE + to], captured_plane);
     }
 
     #[test]
