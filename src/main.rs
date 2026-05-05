@@ -481,6 +481,13 @@ fn build_async_training_report(
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
+        terminal_no_attacking_material: pending.selfplay.terminal.no_attacking_material,
+        terminal_halfmove120: pending.selfplay.terminal.halfmove120,
+        terminal_repetition: pending.selfplay.terminal.repetition,
+        terminal_mutual_long_check: pending.selfplay.terminal.mutual_long_check,
+        terminal_mutual_long_chase: pending.selfplay.terminal.mutual_long_chase,
+        terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
+        terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
     }
 }
@@ -1121,6 +1128,13 @@ fn main() {
                                     terminal_no_legal_moves: 0,
                                     terminal_red_general_missing: 0,
                                     terminal_black_general_missing: 0,
+                                    terminal_no_attacking_material: 0,
+                                    terminal_halfmove120: 0,
+                                    terminal_repetition: 0,
+                                    terminal_mutual_long_check: 0,
+                                    terminal_mutual_long_chase: 0,
+                                    terminal_rule_win_red: 0,
+                                    terminal_rule_win_black: 0,
                                     terminal_max_plies: 0,
                                 };
                             }
@@ -1157,6 +1171,13 @@ fn main() {
                                     terminal_no_legal_moves: 0,
                                     terminal_red_general_missing: 0,
                                     terminal_black_general_missing: 0,
+                                    terminal_no_attacking_material: 0,
+                                    terminal_halfmove120: 0,
+                                    terminal_repetition: 0,
+                                    terminal_mutual_long_check: 0,
+                                    terminal_mutual_long_chase: 0,
+                                    terminal_rule_win_red: 0,
+                                    terminal_rule_win_black: 0,
                                     terminal_max_plies: 0,
                                 };
                             }
@@ -1210,7 +1231,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} aux_mat={:.4} aux_occ={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} aux_mat={:.4} aux_occ={:.4} lr={:.6} tempH={:.3}/{:.3} term=N{} RG{} BG{} NA{} H120{} Rep{} MLC{} MLCs{} Rw{} Bw{} Max{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1236,6 +1257,17 @@ fn main() {
                     config.lr,
                     report.temperature_early_entropy,
                     report.temperature_mid_entropy,
+                    report.terminal_no_legal_moves,
+                    report.terminal_red_general_missing,
+                    report.terminal_black_general_missing,
+                    report.terminal_no_attacking_material,
+                    report.terminal_halfmove120,
+                    report.terminal_repetition,
+                    report.terminal_mutual_long_check,
+                    report.terminal_mutual_long_chase,
+                    report.terminal_rule_win_red,
+                    report.terminal_rule_win_black,
+                    report.terminal_max_plies,
                     report.selfplay_seconds,
                     report.train_seconds,
                     report.games_per_second,
@@ -1377,6 +1409,48 @@ fn main() {
                     "terminal/black_general_missing",
                     update,
                     report.terminal_black_general_missing as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/no_attacking_material",
+                    update,
+                    report.terminal_no_attacking_material as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/halfmove120",
+                    update,
+                    report.terminal_halfmove120 as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/repetition",
+                    update,
+                    report.terminal_repetition as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/mutual_long_check",
+                    update,
+                    report.terminal_mutual_long_check as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/mutual_long_chase",
+                    update,
+                    report.terminal_mutual_long_chase as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_win_red",
+                    update,
+                    report.terminal_rule_win_red as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_win_black",
+                    update,
+                    report.terminal_rule_win_black as f32,
                 );
                 log_scalar(
                     &mut tb,

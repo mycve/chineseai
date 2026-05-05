@@ -403,12 +403,17 @@ impl Position {
     }
 
     pub fn rule_history_entry(&self, mover: Option<Color>) -> RuleHistoryEntry {
+        let has_both_generals = self.has_general(Color::Red) && self.has_general(Color::Black);
         RuleHistoryEntry {
             hash: self.hash,
             side_to_move: self.side_to_move,
             mover,
-            gives_check: self.in_check(self.side_to_move),
-            chased_mask: mover.map_or(0, |_| self.chased_mask()),
+            gives_check: has_both_generals && self.in_check(self.side_to_move),
+            chased_mask: if mover.is_some() && has_both_generals {
+                self.chased_mask()
+            } else {
+                0
+            },
         }
     }
 
@@ -920,10 +925,8 @@ impl Position {
             self.push_if_valid_target(sq, nf as usize, nr as usize, piece.color, mode, moves);
         }
 
-        let enemy_king = self.find_general(piece.color.opposite()).unwrap();
-        if file_of(enemy_king) == file_of(sq) && self.clear_file_between(sq, enemy_king) {
-            moves.push(Move::new(sq, enemy_king));
-        }
+        // Facing generals is an attack/check relation, not a capturable king move.
+        // Game end is decided by the opponent having no legal reply after the move.
     }
 
     fn gen_advisor_moves(&self, sq: usize, piece: Piece, mode: MoveGenMode, moves: &mut Vec<Move>) {
@@ -1017,7 +1020,9 @@ impl Position {
                     }
                     Some(target_piece) => {
                         if !is_cannon {
-                            if target_piece.color != color {
+                            if target_piece.color != color
+                                && target_piece.kind != PieceKind::General
+                            {
                                 moves.push(Move::new(sq, target));
                             }
                             break;
@@ -1026,7 +1031,9 @@ impl Position {
                         if !seen_screen {
                             seen_screen = true;
                         } else {
-                            if target_piece.color != color {
+                            if target_piece.color != color
+                                && target_piece.kind != PieceKind::General
+                            {
                                 moves.push(Move::new(sq, target));
                             }
                             break;
@@ -1084,6 +1091,7 @@ impl Position {
         let to = index(to_file, to_rank);
         match self.board[to] {
             Some(piece) if piece.color == color => {}
+            Some(piece) if piece.kind == PieceKind::General => {}
             Some(_) => moves.push(Move::new(from, to)),
             None if mode == MoveGenMode::All => moves.push(Move::new(from, to)),
             None => {}
@@ -2054,6 +2062,27 @@ mod tests {
                 .iter()
                 .any(|mv| mv.from == index(4, 6) as u8 && mv.to == index(3, 6) as u8)
         );
+    }
+
+    #[test]
+    fn legal_moves_do_not_capture_general() {
+        let position = Position::from_fen("4k4/9/9/9/9/9/4R4/9/9/4K4 w").unwrap();
+        let black_general = index(4, 0) as u8;
+        let capture_general = Move::from_uci("e3e9").unwrap();
+        let moves = position.legal_moves();
+
+        assert!(!moves.contains(&capture_general));
+        assert!(!moves.iter().any(|mv| mv.to == black_general));
+    }
+
+    #[test]
+    fn checkmate_is_no_legal_reply_with_both_generals_present() {
+        let position = Position::from_fen("3rkr3/4R4/9/9/9/9/9/9/9/4K4 b").unwrap();
+
+        assert!(position.find_general(Color::Red).is_some());
+        assert!(position.find_general(Color::Black).is_some());
+        assert!(position.in_check(Color::Black));
+        assert!(position.legal_moves().is_empty());
     }
 
     #[test]

@@ -8,9 +8,9 @@ use crate::nnue::{
 use crate::xiangqi::{BOARD_SIZE, Color, Move, PieceKind, Position, RuleHistoryEntry};
 
 use super::{
-    AUX_MATERIAL_SIZE, AUX_OCCUPANCY_SIZE, AzCandidate, AzEnv, AzLoopConfig, AzNnue, AzRuleSet,
-    AzSearchLimits, AzTrainingSample, SplitMix64, VALUE_SCALE_CP, alphazero_search_env,
-    dense_move_index,
+    AUX_MATERIAL_SIZE, AUX_OCCUPANCY_SIZE, AzCandidate, AzEnv, AzGameEndReason, AzLoopConfig,
+    AzNnue, AzRuleSet, AzSearchLimits, AzTrainingSample, SplitMix64, VALUE_SCALE_CP,
+    alphazero_search_env, dense_move_index,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -18,6 +18,13 @@ pub struct AzTerminalStats {
     pub no_legal_moves: usize,
     pub red_general_missing: usize,
     pub black_general_missing: usize,
+    pub no_attacking_material: usize,
+    pub halfmove120: usize,
+    pub repetition: usize,
+    pub mutual_long_check: usize,
+    pub mutual_long_chase: usize,
+    pub rule_win_red: usize,
+    pub rule_win_black: usize,
     pub max_plies: usize,
 }
 
@@ -26,6 +33,13 @@ impl AzTerminalStats {
         self.no_legal_moves += other.no_legal_moves;
         self.red_general_missing += other.red_general_missing;
         self.black_general_missing += other.black_general_missing;
+        self.no_attacking_material += other.no_attacking_material;
+        self.halfmove120 += other.halfmove120;
+        self.repetition += other.repetition;
+        self.mutual_long_check += other.mutual_long_check;
+        self.mutual_long_chase += other.mutual_long_chase;
+        self.rule_win_red += other.rule_win_red;
+        self.rule_win_black += other.rule_win_black;
         self.max_plies += other.max_plies;
     }
 }
@@ -225,13 +239,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             ));
             env.make_move(mv);
 
-            if let Some(outcome) = env.game_result() {
-                result = Some(outcome);
-                if !env.position().has_general(Color::Red) {
-                    terminal.red_general_missing += 1;
-                } else if !env.position().has_general(Color::Black) {
-                    terminal.black_general_missing += 1;
-                }
+            if let Some(outcome) = env.game_result_details() {
+                result = Some(outcome.result);
+                record_terminal_reason(&mut terminal, outcome.reason);
                 break;
             }
         }
@@ -264,6 +274,21 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         temperature_mid_entropy_sum,
         temperature_mid_entropy_count,
         terminal,
+    }
+}
+
+fn record_terminal_reason(stats: &mut AzTerminalStats, reason: AzGameEndReason) {
+    match reason {
+        AzGameEndReason::RedGeneralMissing => stats.red_general_missing += 1,
+        AzGameEndReason::BlackGeneralMissing => stats.black_general_missing += 1,
+        AzGameEndReason::NoLegalMoves => stats.no_legal_moves += 1,
+        AzGameEndReason::NoAttackingMaterial => stats.no_attacking_material += 1,
+        AzGameEndReason::Halfmove120 => stats.halfmove120 += 1,
+        AzGameEndReason::Repetition => stats.repetition += 1,
+        AzGameEndReason::MutualLongCheck => stats.mutual_long_check += 1,
+        AzGameEndReason::MutualLongChase => stats.mutual_long_chase += 1,
+        AzGameEndReason::RuleWinRed => stats.rule_win_red += 1,
+        AzGameEndReason::RuleWinBlack => stats.rule_win_black += 1,
     }
 }
 

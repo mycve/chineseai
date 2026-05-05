@@ -1036,6 +1036,81 @@ mod tests {
     }
 
     #[test]
+    fn terminal_rule_win_value_is_relative_to_side_to_move() {
+        let position = Position::startpos();
+        let history = vec![
+            position.rule_history_entry(None),
+            RuleHistoryEntry {
+                hash: 2,
+                side_to_move: Color::Black,
+                mover: Some(Color::Red),
+                gives_check: true,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: 3,
+                side_to_move: Color::Red,
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: 4,
+                side_to_move: Color::Black,
+                mover: Some(Color::Red),
+                gives_check: true,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
+        ];
+
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Black))
+        );
+        assert_eq!(
+            terminal_value_for(&position, &history, AzRuleSet::Full),
+            Some(-1.0)
+        );
+    }
+
+    #[test]
+    fn mcts_child_value_is_parent_relative_for_no_reply_mate() {
+        let position = Position::from_fen("3rkr3/9/4R4/9/9/9/9/9/9/4K4 w").unwrap();
+        let mate = Move::from_uci("e7e8").unwrap();
+        let legal = position.legal_moves();
+        assert!(legal.contains(&mate));
+        let quiet = legal
+            .iter()
+            .copied()
+            .find(|mv| *mv != mate)
+            .expect("test position should have a quiet alternative");
+        let model = AzNnue::random(4, 7);
+        let mut tree = AzTree::new(
+            position.clone(),
+            Vec::new(),
+            position.initial_rule_history(),
+            Some(vec![mate, quiet]),
+            &model,
+            AzSearchLimits::default(),
+            AzRuleSet::Full,
+        );
+
+        tree.expand(tree.root);
+        let value = tree.simulate_child(tree.root, 0);
+        assert!(
+            value > 0.99,
+            "a move that leaves black with no legal reply should back up as a parent win, got {value}"
+        );
+    }
+
+    #[test]
     fn simple_terminal_value_ignores_repetition_history() {
         let position = Position::startpos();
         let rule_history = vec![
