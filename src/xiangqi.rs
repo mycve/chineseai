@@ -592,7 +592,14 @@ impl Position {
             }
         }
 
-        (repeated_indices.len() >= 4).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        if repeated_indices.len() >= 4 {
+            if let Some(outcome) = Self::repetition_forcing_outcome(history) {
+                return Some(outcome);
+            }
+            return Some(RuleOutcome::Draw(RuleDrawReason::Repetition));
+        }
+
+        None
     }
 
     fn rule_violation_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
@@ -606,6 +613,37 @@ impl Position {
                 return Some(RuleOutcome::Win(winner));
             }
         }
+        None
+    }
+
+    fn repetition_forcing_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
+        let current = *history.last()?;
+        let mut counters = RuleCounters::default();
+        for entry in history.iter().copied() {
+            let Some(mover) = entry.mover else {
+                continue;
+            };
+            counters.apply(entry, mover);
+        }
+
+        let red_check = counters.check[color_hash_index(Color::Red)];
+        let black_check = counters.check[color_hash_index(Color::Black)];
+        let active_check = red_check >= 2 || black_check >= 2;
+        if current.gives_check || active_check {
+            let violator = if red_check > black_check {
+                Color::Red
+            } else if black_check > red_check {
+                Color::Black
+            } else {
+                current.mover?
+            };
+            return Some(RuleOutcome::Win(violator.opposite()));
+        }
+
+        if current.chased_mask != 0 {
+            return Some(RuleOutcome::Win(current.mover?.opposite()));
+        }
+
         None
     }
 
@@ -2628,6 +2666,48 @@ mod tests {
         assert_eq!(
             Position::rule_outcome(&history),
             Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        );
+    }
+
+    #[test]
+    fn fifth_repetition_with_active_check_loses_for_checker() {
+        let history = vec![
+            test_rule_entry(50, Color::Red, None, false, 0),
+            test_rule_entry(51, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(50, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(52, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(50, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(53, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(50, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(54, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(50, Color::Red, Some(Color::Black), false, 0),
+        ];
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Black))
+        );
+    }
+
+    #[test]
+    fn fifth_repetition_with_current_chase_loses_for_chaser() {
+        let history = vec![
+            test_rule_entry(60, Color::Red, None, false, 0),
+            test_rule_entry(61, Color::Black, Some(Color::Red), false, 0),
+            test_rule_entry(62, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(60, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(61, Color::Black, Some(Color::Red), false, 0),
+            test_rule_entry(62, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(60, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(61, Color::Black, Some(Color::Red), false, 0),
+            test_rule_entry(62, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(60, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(61, Color::Black, Some(Color::Red), false, 0),
+            test_rule_entry(62, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(60, Color::Red, Some(Color::Black), false, 1 << 20),
+        ];
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Red))
         );
     }
 }
