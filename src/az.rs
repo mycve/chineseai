@@ -11,10 +11,12 @@ mod train_gpu;
 
 #[cfg(test)]
 use crate::nnue::canonical_square;
+#[cfg(test)]
+use crate::nnue::extract_sparse_features_v4_canonical;
 use crate::nnue::{
-    HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, canonical_move, extract_sparse_features_v4_canonical,
+    HistoryMove, V4_INPUT_SIZE, canonical_move, extract_sparse_features_v4_canonical_with_rules,
 };
-use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Move, Position};
+use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Move, Position, RuleHistoryEntry};
 #[cfg(test)]
 use crate::xiangqi::{Color, PieceKind};
 
@@ -31,7 +33,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 25;
+const AZNNUE_BINARY_VERSION: u32 = 26;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -63,8 +65,15 @@ pub(super) const VALUE_BRANCH_SIZE: usize = 128;
 pub(super) const VALUE_BRANCH_DEPTH: usize = 2;
 const VALUE_HIDDEN_SIZE: usize = 256;
 const VALUE_LOGITS: usize = 3;
+pub(super) const AUX_MATERIAL_SIZE: usize = 14;
+pub(super) const AUX_OCCUPANCY_SIZE: usize = BOARD_SIZE;
+pub(super) const AUX_MATERIAL_WEIGHT: f32 = 0.02;
+pub(super) const AUX_OCCUPANCY_WEIGHT: f32 = 0.01;
+#[cfg(test)]
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
-pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
+#[cfg(test)]
+pub(super) const BOARD_HISTORY_FRAMES: usize = crate::nnue::HISTORY_PLIES + 1;
+#[cfg(test)]
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 const VALUE_SCALE_CP: f32 = 1000.0;
@@ -112,13 +121,17 @@ pub struct AzNnue {
     pub policy_move_bias: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
     pub policy_feature_bias: Vec<f32>,
+    pub aux_material_weights: Vec<f32>,
+    pub aux_material_bias: Vec<f32>,
+    pub aux_occupancy_weights: Vec<f32>,
+    pub aux_occupancy_bias: Vec<f32>,
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
 // Architecture notes:
-// - v25 is intentionally incompatible with older AZB1 files. It removes the
-//   board CNN branches and goes back to a shared sparse NNUE trunk, then gives
-//   value only a compact private projection plus its residual head.
+// - v26 is intentionally incompatible with older AZB1 files. It keeps the
+//   shared sparse NNUE trunk, adds ZeroForge-style rule/material/region/frame
+//   sparse features, and trains lightweight material/occupancy auxiliary heads.
 // - Do not add a from/to-square factorized policy head on top of this absolute
 //   board representation. A previous v14/v15 experiment mixed absolute board
 //   features with partially relative action-square sharing and immediately
@@ -160,6 +173,10 @@ impl Clone for AzNnue {
             policy_move_bias: self.policy_move_bias.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
             policy_feature_bias: self.policy_feature_bias.clone(),
+            aux_material_weights: self.aux_material_weights.clone(),
+            aux_material_bias: self.aux_material_bias.clone(),
+            aux_occupancy_weights: self.aux_occupancy_weights.clone(),
+            aux_occupancy_bias: self.aux_occupancy_bias.clone(),
             gpu_trainer: None,
         }
     }
@@ -232,6 +249,8 @@ pub struct AzTrainBenchmark {
 pub struct AzTrainingSample {
     pub features: Vec<usize>,
     pub board: Vec<u8>,
+    pub aux_material: Vec<f32>,
+    pub aux_occupancy: Vec<f32>,
     pub move_indices: Vec<usize>,
     pub policy: Vec<f32>,
     pub value: f32,
@@ -258,6 +277,7 @@ pub struct AzTrainLossWeights {
     pub train_shared: bool,
     pub train_value_head: bool,
     pub train_policy_head: bool,
+    pub train_aux_heads: bool,
 }
 
 impl Default for AzTrainLossWeights {
@@ -268,6 +288,7 @@ impl Default for AzTrainLossWeights {
             train_shared: true,
             train_value_head: true,
             train_policy_head: true,
+            train_aux_heads: true,
         }
     }
 }
@@ -318,6 +339,14 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let policy_feature_bias = vec![0.0; POLICY_CONDITION_SIZE];
+        let aux_material_weights = (0..AUX_MATERIAL_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
+            .collect();
+        let aux_material_bias = vec![0.0; AUX_MATERIAL_SIZE];
+        let aux_occupancy_weights = (0..AUX_OCCUPANCY_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
+            .collect();
+        let aux_occupancy_bias = vec![0.0; AUX_OCCUPANCY_SIZE];
         Self {
             hidden_size,
             input_hidden,
@@ -334,6 +363,10 @@ impl AzNnue {
             policy_move_bias,
             policy_feature_hidden,
             policy_feature_bias,
+            aux_material_weights,
+            aux_material_bias,
+            aux_occupancy_weights,
+            aux_occupancy_bias,
             gpu_trainer: None,
         }
     }
@@ -361,6 +394,10 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_hidden)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_bias)?;
+        write_f32_slice_le(&mut writer, &self.aux_material_weights)?;
+        write_f32_slice_le(&mut writer, &self.aux_material_bias)?;
+        write_f32_slice_le(&mut writer, &self.aux_occupancy_weights)?;
+        write_f32_slice_le(&mut writer, &self.aux_occupancy_bias)?;
         writer.flush()?;
         Ok(())
     }
@@ -411,6 +448,10 @@ impl AzNnue {
         let pmb_len = DENSE_MOVE_SPACE;
         let pfh_len = POLICY_CONDITION_SIZE * hidden_size;
         let pfb_len = POLICY_CONDITION_SIZE;
+        let aux_material_weights_len = AUX_MATERIAL_SIZE * hidden_size;
+        let aux_material_bias_len = AUX_MATERIAL_SIZE;
+        let aux_occupancy_weights_len = AUX_OCCUPANCY_SIZE * hidden_size;
+        let aux_occupancy_bias_len = AUX_OCCUPANCY_SIZE;
         let float_count = input_hidden_len
             + hidden_bias_len
             + value_trunk_weights_len
@@ -424,7 +465,11 @@ impl AzNnue {
             + pmh_len
             + pmb_len
             + pfh_len
-            + pfb_len;
+            + pfb_len
+            + aux_material_weights_len
+            + aux_material_bias_len
+            + aux_occupancy_weights_len
+            + aux_occupancy_bias_len;
         let expected_len = AZNNUE_BINARY_HEADER_LEN + float_count * 4;
         if bytes.len() != expected_len {
             return Err(io::Error::new(
@@ -451,6 +496,10 @@ impl AzNnue {
         let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
         let policy_feature_hidden = read_f32_vec_le(&mut reader, pfh_len)?;
         let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
+        let aux_material_weights = read_f32_vec_le(&mut reader, aux_material_weights_len)?;
+        let aux_material_bias = read_f32_vec_le(&mut reader, aux_material_bias_len)?;
+        let aux_occupancy_weights = read_f32_vec_le(&mut reader, aux_occupancy_weights_len)?;
+        let aux_occupancy_bias = read_f32_vec_le(&mut reader, aux_occupancy_bias_len)?;
         let model = Self {
             hidden_size,
             input_hidden,
@@ -467,6 +516,10 @@ impl AzNnue {
             policy_move_bias,
             policy_feature_hidden,
             policy_feature_bias,
+            aux_material_weights,
+            aux_material_bias,
+            aux_occupancy_weights,
+            aux_occupancy_bias,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -477,11 +530,13 @@ impl AzNnue {
         &self,
         position: &Position,
         history: &[HistoryMove],
+        rule_history: &[RuleHistoryEntry],
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         let side = position.side_to_move();
-        let features = extract_sparse_features_v4_canonical(position, history);
+        let features =
+            extract_sparse_features_v4_canonical_with_rules(position, history, Some(rule_history));
         self.input_embedding_into(&features, &mut scratch.hidden);
         self.value_shared_hidden_into(&scratch.hidden, &mut scratch.value_hidden);
         self.forward_value_trunk_into(&mut scratch.value_hidden, &mut scratch.value_next);
@@ -600,6 +655,10 @@ impl AzNnue {
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
             || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * self.hidden_size
             || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
+            || self.aux_material_weights.len() != AUX_MATERIAL_SIZE * self.hidden_size
+            || self.aux_material_bias.len() != AUX_MATERIAL_SIZE
+            || self.aux_occupancy_weights.len() != AUX_OCCUPANCY_SIZE * self.hidden_size
+            || self.aux_occupancy_bias.len() != AUX_OCCUPANCY_SIZE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -640,7 +699,12 @@ pub(super) fn extract_board_planes(
     board[..BOARD_PLANES_SIZE].copy_from_slice(&frame);
 
     let mut rewound = frame;
-    for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
+    for (history_index, entry) in history
+        .iter()
+        .rev()
+        .take(crate::nnue::HISTORY_PLIES)
+        .enumerate()
+    {
         let piece_plane =
             (canonical_piece_plane(side, entry.piece.color, entry.piece.kind) + 1) as u8;
         rewound[canonical_square(side, entry.mv.to as usize)] = entry.captured.map_or(0, |piece| {
@@ -728,7 +792,9 @@ pub fn benchmark_training(
         }
         samples.push(AzTrainingSample {
             features,
-            board: vec![0; BOARD_HISTORY_SIZE],
+            board: Vec::new(),
+            aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+            aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
             move_indices,
             policy,
             value,
@@ -1039,7 +1105,9 @@ fn dense_move_index(mv: Move) -> usize {
 fn replay_pool_test_fixture() -> AzExperiencePool {
     let sample = AzTrainingSample {
         features: vec![1, 2, 3],
-        board: vec![0; BOARD_HISTORY_SIZE],
+        board: Vec::new(),
+        aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+        aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
         move_indices: vec![0, 1],
         policy: vec![0.6, 0.4],
         value: 0.1,
@@ -1147,7 +1215,9 @@ mod tests {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: Vec::new(),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
@@ -1155,7 +1225,9 @@ mod tests {
             },
             AzTrainingSample {
                 features: Vec::new(),
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: Vec::new(),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
@@ -1205,6 +1277,8 @@ mod tests {
             AzTrainingSample {
                 features: vec![0],
                 board: board_with(0, 1),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
@@ -1213,6 +1287,8 @@ mod tests {
             AzTrainingSample {
                 features: vec![1],
                 board: board_with(10, 2),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
@@ -1221,6 +1297,8 @@ mod tests {
             AzTrainingSample {
                 features: vec![2],
                 board: board_with(40, 3),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.75,
@@ -1229,6 +1307,8 @@ mod tests {
             AzTrainingSample {
                 features: vec![3],
                 board: board_with(80, 4),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.75,
@@ -1249,7 +1329,9 @@ mod tests {
         let samples = vec![
             AzTrainingSample {
                 features: vec![0, 4, 8],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: Vec::new(),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
@@ -1257,7 +1339,9 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![1, 5, 9],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: Vec::new(),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
@@ -1265,7 +1349,9 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![2, 6, 10],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: Vec::new(),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: 0.5,
@@ -1273,7 +1359,9 @@ mod tests {
             },
             AzTrainingSample {
                 features: vec![3, 7, 11],
-                board: vec![0; BOARD_HISTORY_SIZE],
+                board: Vec::new(),
+                aux_material: vec![0.0; AUX_MATERIAL_SIZE],
+                aux_occupancy: vec![0.0; AUX_OCCUPANCY_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value: -0.5,

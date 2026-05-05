@@ -2,15 +2,18 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::nnue::{
-    HistoryMove, canonical_move, extract_sparse_features_v4_canonical, mirror_file_move,
-    mirror_sparse_features_file,
+    HistoryMove, canonical_move, extract_sparse_features_v4_canonical_with_rules, mirror_file_move,
+    mirror_file_square, mirror_sparse_features_file,
 };
-use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
+use crate::xiangqi::{
+    BOARD_SIZE, Color, Move, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome,
+};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
-    VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
+    AUX_MATERIAL_SIZE, AUX_OCCUPANCY_SIZE, AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits,
+    AzTrainingSample, SplitMix64, VALUE_SCALE_CP, alphazero_search_with_history_and_rules,
+    dense_move_index,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -236,6 +239,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             game_samples.push(make_training_sample(
                 &position,
                 &history,
+                &rule_history,
                 &search.candidates,
                 search.value_cp as f32 / VALUE_SCALE_CP,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
@@ -315,6 +319,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 fn make_training_sample(
     position: &Position,
     history: &[HistoryMove],
+    rule_history: &[RuleHistoryEntry],
     candidates: &[AzCandidate],
     value: f32,
     mirror_file: bool,
@@ -325,21 +330,30 @@ fn make_training_sample(
         .sum::<f32>()
         .max(1.0);
     let side = position.side_to_move();
-    let mut features = extract_sparse_features_v4_canonical(position, history);
+    let mut features =
+        extract_sparse_features_v4_canonical_with_rules(position, history, Some(rule_history));
     let mut moves = candidates
         .iter()
         .map(|candidate| canonical_move(side, candidate.mv))
         .collect::<Vec<_>>();
+    let aux_material = material_aux_targets(position);
+    let mut aux_occupancy = occupancy_aux_targets(position);
     if mirror_file {
         mirror_sparse_features_file(&mut features);
         for mv in &mut moves {
             *mv = mirror_file_move(*mv);
+        }
+        let original = aux_occupancy.clone();
+        for sq in 0..BOARD_SIZE {
+            aux_occupancy[mirror_file_square(sq)] = original[sq];
         }
     }
     let move_indices = moves.iter().copied().map(dense_move_index).collect();
     AzTrainingSample {
         features,
         board: Vec::new(),
+        aux_material,
+        aux_occupancy,
         move_indices,
         policy: candidates
             .iter()
@@ -452,15 +466,65 @@ mod tests {
             policy: 0.7,
         }];
 
-        let augmented = make_training_sample(&left, &[], &left_candidates, 0.35, true);
-        let explicit = make_training_sample(&right, &[], &right_candidates, 0.35, false);
+        let left_rules = left.initial_rule_history();
+        let right_rules = right.initial_rule_history();
+        let augmented = make_training_sample(&left, &[], &left_rules, &left_candidates, 0.35, true);
+        let explicit =
+            make_training_sample(&right, &[], &right_rules, &right_candidates, 0.35, false);
 
         assert_eq!(augmented.features, explicit.features);
         assert_eq!(augmented.board, explicit.board);
+        assert_eq!(augmented.aux_material, explicit.aux_material);
+        assert_eq!(augmented.aux_occupancy, explicit.aux_occupancy);
         assert_eq!(augmented.move_indices, explicit.move_indices);
         assert_eq!(augmented.policy, explicit.policy);
         assert_eq!(augmented.value, explicit.value);
         assert_eq!(augmented.side_sign, explicit.side_sign);
+    }
+}
+
+fn material_aux_targets(position: &Position) -> Vec<f32> {
+    let side = position.side_to_move();
+    let mut targets = vec![0.0; AUX_MATERIAL_SIZE];
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let side_offset = if piece.color == side { 0 } else { 7 };
+        let kind = match piece.kind {
+            PieceKind::General => 0,
+            PieceKind::Advisor => 1,
+            PieceKind::Elephant => 2,
+            PieceKind::Horse => 3,
+            PieceKind::Rook => 4,
+            PieceKind::Cannon => 5,
+            PieceKind::Soldier => 6,
+        };
+        targets[side_offset + kind] += 1.0 / max_piece_count(kind);
+    }
+    for value in &mut targets {
+        *value = value.clamp(0.0, 1.0);
+    }
+    targets
+}
+
+fn occupancy_aux_targets(position: &Position) -> Vec<f32> {
+    let side = position.side_to_move();
+    let mut targets = vec![0.0; AUX_OCCUPANCY_SIZE];
+    for sq in 0..BOARD_SIZE {
+        if position.piece_at(sq).is_some() {
+            targets[crate::nnue::canonical_square(side, sq)] = 1.0;
+        }
+    }
+    targets
+}
+
+fn max_piece_count(kind: usize) -> f32 {
+    match kind {
+        0 => 1.0,
+        1 | 2 | 3 | 4 | 5 => 2.0,
+        6 => 5.0,
+        _ => 1.0,
     }
 }
 

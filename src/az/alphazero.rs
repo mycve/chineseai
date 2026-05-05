@@ -314,6 +314,7 @@ impl<'a> AzTree<'a> {
         let value = self.model.evaluate_with_scratch(
             &self.nodes[node_index].position,
             &self.nodes[node_index].history,
+            &self.nodes[node_index].rule_history,
             &moves,
             &mut self.eval_scratch,
         );

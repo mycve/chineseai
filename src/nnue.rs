@@ -1,5 +1,5 @@
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, RuleHistoryEntry,
 };
 
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
@@ -27,11 +27,25 @@ const LINE_DIRECTIONS: usize = 4;
 const LINE_DISTANCE_BUCKETS: usize = 10;
 const LINE_RELATION_INPUT_SIZE: usize =
     14 * LINE_DIRECTIONS * LINE_DISTANCE_BUCKETS * NEIGHBOR_STATE_COUNT;
+const REGION_BUCKETS: usize = 5;
+const REGION_INPUT_SIZE: usize = 14 * REGION_BUCKETS;
+const MATERIAL_COUNT_BUCKETS: usize = 6;
+const MATERIAL_COUNT_INPUT_SIZE: usize = 14 * MATERIAL_COUNT_BUCKETS;
+const MATERIAL_DELTA_BUCKETS: usize = 11;
+const MATERIAL_DELTA_INPUT_SIZE: usize = 7 * MATERIAL_DELTA_BUCKETS;
+const FRAME_PRESENCE_INPUT_SIZE: usize = HISTORY_PLIES * 14;
+const RULE_BUCKETS: usize = 12;
+const RULE_INPUT_SIZE: usize = RULE_BUCKETS;
 pub const V4_INPUT_SIZE: usize = V3_INPUT_SIZE
     + ROW_INPUT_SIZE
     + COL_INPUT_SIZE
     + NEIGHBOR_INPUT_SIZE
-    + LINE_RELATION_INPUT_SIZE;
+    + LINE_RELATION_INPUT_SIZE
+    + REGION_INPUT_SIZE
+    + MATERIAL_COUNT_INPUT_SIZE
+    + MATERIAL_DELTA_INPUT_SIZE
+    + FRAME_PRESENCE_INPUT_SIZE
+    + RULE_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -137,6 +151,14 @@ pub fn extract_sparse_features_v4_canonical(
     position: &Position,
     history: &[HistoryMove],
 ) -> Vec<usize> {
+    extract_sparse_features_v4_canonical_with_rules(position, history, None)
+}
+
+pub fn extract_sparse_features_v4_canonical_with_rules(
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: Option<&[RuleHistoryEntry]>,
+) -> Vec<usize> {
     let side = position.side_to_move();
     let own_king_bucket = position
         .general_square(side)
@@ -146,13 +168,15 @@ pub fn extract_sparse_features_v4_canonical(
         .general_square(side.opposite())
         .map(|sq| palace_bucket(orient_square(side, sq)))
         .unwrap_or(4);
-    let mut features = Vec::with_capacity(160);
+    let mut features = Vec::with_capacity(220);
+    let mut counts = [0usize; 14];
 
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
         let piece_index = canonical_piece_index(side, piece);
+        counts[piece_index] += 1;
         let canonical_sq = orient_square(side, sq);
         features.push(piece_index * BOARD_SIZE + canonical_sq);
         features.push(king_aware_feature_index(
@@ -167,10 +191,15 @@ pub fn extract_sparse_features_v4_canonical(
             piece_index,
             canonical_sq,
         ));
+        features.push(region_feature_index(
+            piece_index,
+            region_bucket(canonical_sq),
+        ));
     }
 
     for (age, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
         let piece_index = canonical_piece_index(side, entry.piece);
+        features.push(frame_presence_feature_index(age, piece_index));
         features.push(history_feature_index(
             age,
             0,
@@ -236,6 +265,20 @@ pub fn extract_sparse_features_v4_canonical(
             }
         }
     }
+
+    for (piece_index, &count) in counts.iter().enumerate() {
+        features.push(material_count_feature_index(
+            piece_index,
+            count.min(MATERIAL_COUNT_BUCKETS - 1),
+        ));
+    }
+    for kind in 0..7 {
+        let own = counts[kind];
+        let enemy = counts[7 + kind];
+        let delta = (own as isize - enemy as isize).clamp(-5, 5);
+        features.push(material_delta_feature_index(kind, (delta + 5) as usize));
+    }
+    append_rule_features(position, rule_history, &mut features);
     features.sort_unstable();
     features
 }
@@ -331,18 +374,21 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
             );
         }
         let offset = offset - NEIGHBOR_INPUT_SIZE;
-        let neighbor_state = offset % NEIGHBOR_STATE_COUNT;
-        let partial = offset / NEIGHBOR_STATE_COUNT;
-        let distance = partial % LINE_DISTANCE_BUCKETS;
-        let partial = partial / LINE_DISTANCE_BUCKETS;
-        let direction = partial % LINE_DIRECTIONS;
-        let piece_index = partial / LINE_DIRECTIONS;
-        return line_relation_feature_index(
-            piece_index,
-            mirror_line_direction_index(direction),
-            distance,
-            neighbor_state,
-        );
+        if offset < LINE_RELATION_INPUT_SIZE {
+            let neighbor_state = offset % NEIGHBOR_STATE_COUNT;
+            let partial = offset / NEIGHBOR_STATE_COUNT;
+            let distance = partial % LINE_DISTANCE_BUCKETS;
+            let partial = partial / LINE_DISTANCE_BUCKETS;
+            let direction = partial % LINE_DIRECTIONS;
+            let piece_index = partial / LINE_DIRECTIONS;
+            return line_relation_feature_index(
+                piece_index,
+                mirror_line_direction_index(direction),
+                distance,
+                neighbor_state,
+            );
+        }
+        return feature;
     }
     feature
 }
@@ -392,6 +438,138 @@ fn line_relation_feature_index(
             + neighbor_state)
 }
 
+fn region_feature_index(piece_index: usize, region: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + NEIGHBOR_INPUT_SIZE
+        + LINE_RELATION_INPUT_SIZE
+        + piece_index * REGION_BUCKETS
+        + region
+}
+
+fn material_count_feature_index(piece_index: usize, count_bucket: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + NEIGHBOR_INPUT_SIZE
+        + LINE_RELATION_INPUT_SIZE
+        + REGION_INPUT_SIZE
+        + piece_index * MATERIAL_COUNT_BUCKETS
+        + count_bucket
+}
+
+fn material_delta_feature_index(kind: usize, delta_bucket: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + NEIGHBOR_INPUT_SIZE
+        + LINE_RELATION_INPUT_SIZE
+        + REGION_INPUT_SIZE
+        + MATERIAL_COUNT_INPUT_SIZE
+        + kind * MATERIAL_DELTA_BUCKETS
+        + delta_bucket
+}
+
+fn frame_presence_feature_index(age: usize, piece_index: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + NEIGHBOR_INPUT_SIZE
+        + LINE_RELATION_INPUT_SIZE
+        + REGION_INPUT_SIZE
+        + MATERIAL_COUNT_INPUT_SIZE
+        + MATERIAL_DELTA_INPUT_SIZE
+        + age * 14
+        + piece_index
+}
+
+fn rule_feature_index(rule_bucket: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + NEIGHBOR_INPUT_SIZE
+        + LINE_RELATION_INPUT_SIZE
+        + REGION_INPUT_SIZE
+        + MATERIAL_COUNT_INPUT_SIZE
+        + MATERIAL_DELTA_INPUT_SIZE
+        + FRAME_PRESENCE_INPUT_SIZE
+        + rule_bucket
+}
+
+fn append_rule_features(
+    position: &Position,
+    rule_history: Option<&[RuleHistoryEntry]>,
+    features: &mut Vec<usize>,
+) {
+    let halfmove = position.halfmove_clock();
+    if halfmove >= 60 {
+        features.push(rule_feature_index(0));
+    }
+    if halfmove >= 90 {
+        features.push(rule_feature_index(1));
+    }
+    if halfmove >= 110 {
+        features.push(rule_feature_index(2));
+    }
+    let Some(rule_history) = rule_history else {
+        return;
+    };
+    let Some(current) = rule_history.last() else {
+        return;
+    };
+    let repeats = rule_history
+        .iter()
+        .filter(|entry| entry.hash == current.hash)
+        .count()
+        .saturating_sub(1);
+    if repeats >= 1 {
+        features.push(rule_feature_index(3));
+    }
+    if repeats >= 2 {
+        features.push(rule_feature_index(4));
+    }
+    if repeats >= 3 {
+        features.push(rule_feature_index(5));
+    }
+    let side = position.side_to_move();
+    let recent = rule_history.iter().rev().take(HISTORY_PLIES);
+    let mut own_check = 0usize;
+    let mut enemy_check = 0usize;
+    let mut own_chase = 0usize;
+    let mut enemy_chase = 0usize;
+    for entry in recent {
+        let Some(mover) = entry.mover else {
+            continue;
+        };
+        if mover == side {
+            own_check += usize::from(entry.gives_check);
+            own_chase += usize::from(entry.chased_mask != 0);
+        } else {
+            enemy_check += usize::from(entry.gives_check);
+            enemy_chase += usize::from(entry.chased_mask != 0);
+        }
+    }
+    if own_check >= 2 {
+        features.push(rule_feature_index(6));
+    }
+    if enemy_check >= 2 {
+        features.push(rule_feature_index(7));
+    }
+    if own_chase >= 2 {
+        features.push(rule_feature_index(8));
+    }
+    if enemy_chase >= 2 {
+        features.push(rule_feature_index(9));
+    }
+    if current.gives_check {
+        features.push(rule_feature_index(10));
+    }
+    if current.chased_mask != 0 {
+        features.push(rule_feature_index(11));
+    }
+}
+
 fn mirror_neighbor_offset_index(offset_index: usize) -> usize {
     let (df, dr) = NEIGHBOR_OFFSETS[offset_index];
     neighbor_offset_index(-df, dr).expect("mirrored offset must exist")
@@ -409,6 +587,22 @@ fn mirror_line_direction_index(direction: usize) -> usize {
 
 fn distance_bucket(distance: usize) -> usize {
     distance.saturating_sub(1).min(LINE_DISTANCE_BUCKETS - 1)
+}
+
+fn region_bucket(sq: usize) -> usize {
+    let file = sq % BOARD_FILES;
+    let rank = sq / BOARD_FILES;
+    if (7..=9).contains(&rank) && (3..=5).contains(&file) {
+        0
+    } else if (0..=2).contains(&rank) && (3..=5).contains(&file) {
+        1
+    } else if rank == 4 || rank == 5 {
+        2
+    } else if rank >= 5 {
+        3
+    } else {
+        4
+    }
 }
 
 fn palace_bucket(sq: usize) -> usize {
