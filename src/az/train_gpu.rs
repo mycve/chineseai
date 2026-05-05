@@ -108,6 +108,8 @@ pub(super) fn train_samples_gpu(
         stats.loss /= denom;
         stats.value_loss /= denom;
         stats.policy_ce /= denom;
+        stats.aux_material_loss /= denom;
+        stats.aux_occupancy_loss /= denom;
     }
     let trainer = model
         .gpu_trainer
@@ -460,6 +462,8 @@ impl GpuReplica {
             loss: weighted_loss,
             value_loss,
             policy_ce,
+            aux_material_loss: material_loss,
+            aux_occupancy_loss: occupancy_loss,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
             value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
             value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,

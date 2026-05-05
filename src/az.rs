@@ -214,6 +214,8 @@ pub struct AzLoopReport {
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
     pub policy_ce: f32,
+    pub aux_material_loss: f32,
+    pub aux_occupancy_loss: f32,
     pub temperature_early_entropy: f32,
     pub temperature_mid_entropy: f32,
     pub selfplay_seconds: f32,
@@ -243,6 +245,8 @@ pub struct AzTrainBenchmark {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
+    pub aux_material_loss: f32,
+    pub aux_occupancy_loss: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +266,8 @@ pub struct AzTrainStats {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
+    pub aux_material_loss: f32,
+    pub aux_occupancy_loss: f32,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -298,6 +304,8 @@ impl AzTrainStats {
         self.loss += other.loss;
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
+        self.aux_material_loss += other.aux_material_loss;
+        self.aux_occupancy_loss += other.aux_occupancy_loss;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;
@@ -809,6 +817,8 @@ pub fn benchmark_training(
         loss: stats.loss,
         value_loss: stats.value_loss,
         policy_ce: stats.policy_ce,
+        aux_material_loss: stats.aux_material_loss,
+        aux_occupancy_loss: stats.aux_occupancy_loss,
     }
 }
 

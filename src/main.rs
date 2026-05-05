@@ -463,6 +463,8 @@ fn build_async_training_report(
         value_pred_mean: stats.value_pred_sum / train_stat_samples,
         value_target_mean: stats.value_target_sum / train_stat_samples,
         policy_ce: stats.policy_ce,
+        aux_material_loss: stats.aux_material_loss,
+        aux_occupancy_loss: stats.aux_occupancy_loss,
         temperature_early_entropy: pending.selfplay.temperature_early_entropy_sum
             / pending.selfplay.temperature_early_entropy_count.max(1) as f32,
         temperature_mid_entropy: pending.selfplay.temperature_mid_entropy_sum
@@ -790,6 +792,8 @@ fn main() {
             println!("loss         : {:.4}", stats.loss);
             println!("value_mse    : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
+            println!("aux_material : {:.4}", stats.aux_material_loss);
+            println!("aux_occupancy: {:.4}", stats.aux_occupancy_loss);
         }
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
@@ -1108,6 +1112,8 @@ fn main() {
                                     value_pred_mean: 0.0,
                                     value_target_mean: 0.0,
                                     policy_ce: 0.0,
+                                    aux_material_loss: 0.0,
+                                    aux_occupancy_loss: 0.0,
                                     temperature_early_entropy: 0.0,
                                     temperature_mid_entropy: 0.0,
                                     selfplay_seconds: 0.0,
@@ -1149,6 +1155,8 @@ fn main() {
                                     value_pred_mean: 0.0,
                                     value_target_mean: 0.0,
                                     policy_ce: 0.0,
+                                    aux_material_loss: 0.0,
+                                    aux_occupancy_loss: 0.0,
                                     temperature_early_entropy: 0.0,
                                     temperature_mid_entropy: 0.0,
                                     selfplay_seconds: 0.0,
@@ -1223,7 +1231,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} aux_mat={:.4} aux_occ={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1244,6 +1252,8 @@ fn main() {
                     report.value_pred_mean,
                     report.value_target_mean,
                     report.policy_ce,
+                    report.aux_material_loss,
+                    report.aux_occupancy_loss,
                     config.lr,
                     report.temperature_early_entropy,
                     report.temperature_mid_entropy,
@@ -1276,6 +1286,18 @@ fn main() {
                     report.value_target_mean,
                 );
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
+                log_scalar(
+                    &mut tb,
+                    "train/aux_material_loss",
+                    update,
+                    report.aux_material_loss,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/aux_occupancy_loss",
+                    update,
+                    report.aux_occupancy_loss,
+                );
                 log_scalar(&mut tb, "train/lr", update, config.lr);
                 log_scalar(&mut tb, "train/value_weight", update, config.value_weight);
                 log_scalar(

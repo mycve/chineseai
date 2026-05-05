@@ -47,9 +47,9 @@ impl Default for AzLoopFileConfig {
         Self {
             model_path: "chineseai.nnue".into(),
             simulations: 256,
-            selfplay_batch_games: 512,
+            selfplay_batch_games: 1024,
             epochs: 2,
-            lr: 0.0003,
+            lr: 0.00005,
             value_weight: 0.25,
             batch_size: 2048,
             max_sample_train_count: 2,
