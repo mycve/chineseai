@@ -797,7 +797,10 @@ impl Position {
         match (long_check[0], long_check[1]) {
             (true, false) => return Some(RuleOutcome::Win(Color::Black)),
             (false, true) => return Some(RuleOutcome::Win(Color::Red)),
-            (true, true) => return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck)),
+            (true, true) => {
+                let violator = history[end_index].mover?;
+                return Some(RuleOutcome::Win(violator.opposite()));
+            }
             (false, false) => {}
         }
 
@@ -808,7 +811,10 @@ impl Position {
         match (long_chase[0], long_chase[1]) {
             (true, false) => Some(RuleOutcome::Win(Color::Black)),
             (false, true) => Some(RuleOutcome::Win(Color::Red)),
-            (true, true) => Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase)),
+            (true, true) => {
+                let violator = history[end_index].mover?;
+                Some(RuleOutcome::Win(violator.opposite()))
+            }
             (false, false) => None,
         }
     }
@@ -2258,6 +2264,34 @@ mod tests {
         assert_eq!(
             Position::rule_outcome(&history),
             Some(RuleOutcome::Win(Color::Black))
+        );
+    }
+
+    #[test]
+    fn mutual_long_chase_loses_for_last_mover() {
+        let history = vec![
+            test_rule_entry(30, Color::Red, None, false, 0),
+            test_rule_entry(31, Color::Black, Some(Color::Red), false, 1 << 20),
+            test_rule_entry(32, Color::Red, Some(Color::Black), false, 1 << 40),
+            test_rule_entry(30, Color::Red, Some(Color::Black), false, 1 << 40),
+        ];
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Red))
+        );
+    }
+
+    #[test]
+    fn mutual_long_check_loses_for_last_mover() {
+        let history = vec![
+            test_rule_entry(40, Color::Red, None, false, 0),
+            test_rule_entry(41, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(42, Color::Red, Some(Color::Black), true, 0),
+            test_rule_entry(40, Color::Red, Some(Color::Black), true, 0),
+        ];
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Red))
         );
     }
 
