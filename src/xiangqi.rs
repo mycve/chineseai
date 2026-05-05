@@ -188,19 +188,11 @@ pub struct RuleStateSummary {
     pub enemy_alt: u16,
 }
 
-const PERPETUAL_CHECK_LIMIT_1: u16 = 6;
-const PERPETUAL_CHECK_LIMIT_2: u16 = 12;
-const PERPETUAL_CHECK_LIMIT_3: u16 = 18;
-const PERPETUAL_CHASE_LIMIT: u16 = 6;
-const CHECK_CHASE_ALT_LIMIT_1: u16 = 12;
-const CHECK_CHASE_ALT_LIMIT_N: u16 = 18;
-
 #[derive(Clone, Copy, Debug, Default)]
 struct RuleCounters {
     check: [u16; 2],
     chase: [u16; 2],
     alt: [u16; 2],
-    max_check_pieces: [u8; 2],
 }
 
 impl RuleCounters {
@@ -213,10 +205,8 @@ impl RuleCounters {
         let index = color_hash_index(mover);
         if entry.gives_check {
             self.check[index] = self.check[index].saturating_add(1);
-            self.max_check_pieces[index] = self.max_check_pieces[index].max(entry.checking_pieces);
         } else {
             self.check[index] = 0;
-            self.max_check_pieces[index] = 0;
         }
 
         let gives_chase = entry.chased_mask != 0 && !entry.gives_check;
@@ -231,16 +221,6 @@ impl RuleCounters {
         } else {
             self.alt[index] = 0;
         }
-    }
-
-    fn violation_winner(&self, mover: Color) -> Option<Color> {
-        let index = color_hash_index(mover);
-        let check_limit = perpetual_check_limit(self.max_check_pieces[index]);
-        let alt_limit = check_chase_alt_limit(self.max_check_pieces[index]);
-        let violates = self.check[index] >= check_limit
-            || self.chase[index] >= PERPETUAL_CHASE_LIMIT
-            || (self.alt[index] >= alt_limit && (self.check[index] > 0 || self.chase[index] > 0));
-        violates.then_some(mover.opposite())
     }
 }
 
@@ -570,9 +550,6 @@ impl Position {
     pub fn rule_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         let current_index = history.len().checked_sub(1)?;
         let current = history[current_index];
-        if let Some(outcome) = Self::rule_violation_outcome(history) {
-            return Some(outcome);
-        }
         let repeated_indices = history[..current_index]
             .iter()
             .enumerate()
@@ -599,20 +576,6 @@ impl Position {
             return Some(RuleOutcome::Draw(RuleDrawReason::Repetition));
         }
 
-        None
-    }
-
-    fn rule_violation_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
-        let mut counters = RuleCounters::default();
-        for entry in history.iter().copied() {
-            let Some(mover) = entry.mover else {
-                continue;
-            };
-            counters.apply(entry, mover);
-            if let Some(winner) = counters.violation_winner(mover) {
-                return Some(RuleOutcome::Win(winner));
-            }
-        }
         None
     }
 
@@ -2126,24 +2089,6 @@ fn is_long_chase_target(kind: PieceKind) -> bool {
 }
 
 #[inline(always)]
-fn perpetual_check_limit(num_pieces: u8) -> u16 {
-    match num_pieces {
-        0 | 1 => PERPETUAL_CHECK_LIMIT_1,
-        2 => PERPETUAL_CHECK_LIMIT_2,
-        _ => PERPETUAL_CHECK_LIMIT_3,
-    }
-}
-
-#[inline(always)]
-fn check_chase_alt_limit(num_pieces: u8) -> u16 {
-    if num_pieces <= 1 {
-        CHECK_CHASE_ALT_LIMIT_1
-    } else {
-        CHECK_CHASE_ALT_LIMIT_N
-    }
-}
-
-#[inline(always)]
 fn signed_piece_contrib(piece: Piece, sq: usize) -> i32 {
     SIGNED_PIECE_CONTRIB_TABLE[color_index_const(piece.color)][piece_kind_index(piece.kind)][sq]
 }
@@ -2591,7 +2536,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_long_check_loses_without_waiting_for_repetition() {
+    fn continuous_long_check_does_not_lose_before_repetition() {
         let history = vec![
             test_rule_entry(100, Color::Red, None, false, 0),
             test_rule_entry(101, Color::Black, Some(Color::Red), true, 0),
@@ -2606,14 +2551,11 @@ mod tests {
             test_rule_entry(110, Color::Red, Some(Color::Black), false, 0),
             test_rule_entry(111, Color::Black, Some(Color::Red), true, 0),
         ];
-        assert_eq!(
-            Position::rule_outcome(&history),
-            Some(RuleOutcome::Win(Color::Black))
-        );
+        assert_eq!(Position::rule_outcome(&history), None);
     }
 
     #[test]
-    fn continuous_long_chase_loses_without_waiting_for_repetition() {
+    fn continuous_long_chase_does_not_lose_before_repetition() {
         let history = vec![
             test_rule_entry(200, Color::Red, None, false, 0),
             test_rule_entry(201, Color::Black, Some(Color::Red), false, 1 << 20),
@@ -2628,10 +2570,7 @@ mod tests {
             test_rule_entry(210, Color::Red, Some(Color::Black), false, 0),
             test_rule_entry(211, Color::Black, Some(Color::Red), false, 1 << 25),
         ];
-        assert_eq!(
-            Position::rule_outcome(&history),
-            Some(RuleOutcome::Win(Color::Black))
-        );
+        assert_eq!(Position::rule_outcome(&history), None);
     }
 
     #[test]
