@@ -250,12 +250,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             env.make_move(mv);
 
             if let Some(outcome) = env.game_result_details() {
-                result = Some(adjudicate_selfplay_result(
-                    outcome.result,
-                    outcome.reason,
-                    env.position().side_to_move(),
-                    config.selfplay_repetition_as_loss,
-                ));
+                result = Some(outcome.result);
                 record_terminal_reason(&mut terminal, outcome.reason, env.rule_history());
                 break;
             }
@@ -290,22 +285,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         temperature_mid_entropy_count,
         terminal,
     }
-}
-
-fn adjudicate_selfplay_result(
-    result: f32,
-    reason: AzGameEndReason,
-    side_to_move_after: Color,
-    repetition_as_loss: bool,
-) -> f32 {
-    if repetition_as_loss && reason == AzGameEndReason::Repetition {
-        return if side_to_move_after == Color::Red {
-            1.0
-        } else {
-            -1.0
-        };
-    }
-    result
 }
 
 fn record_terminal_reason(
@@ -523,26 +502,6 @@ mod tests {
         assert_eq!(augmented.policy, explicit.policy);
         assert_eq!(augmented.value, explicit.value);
         assert_eq!(augmented.side_sign, explicit.side_sign);
-    }
-
-    #[test]
-    fn selfplay_repetition_as_loss_penalizes_triggering_side_only() {
-        assert_eq!(
-            adjudicate_selfplay_result(0.0, AzGameEndReason::Repetition, Color::Red, true),
-            1.0
-        );
-        assert_eq!(
-            adjudicate_selfplay_result(0.0, AzGameEndReason::Repetition, Color::Black, true),
-            -1.0
-        );
-        assert_eq!(
-            adjudicate_selfplay_result(0.0, AzGameEndReason::Repetition, Color::Red, false),
-            0.0
-        );
-        assert_eq!(
-            adjudicate_selfplay_result(0.0, AzGameEndReason::Halfmove120, Color::Red, true),
-            0.0
-        );
     }
 }
 

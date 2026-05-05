@@ -28,7 +28,6 @@ pub struct AzLoopFileConfig {
     pub replay_games: usize,
     pub replay_samples: usize,
     pub mirror_probability: f32,
-    pub selfplay_repetition_as_loss: bool,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -69,7 +68,6 @@ impl Default for AzLoopFileConfig {
             replay_games: 2000,
             replay_samples: 20000,
             mirror_probability: 0.3,
-            selfplay_repetition_as_loss: true,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
@@ -113,7 +111,6 @@ struct AzLoopTomlConfig {
     pub replay_games: Option<usize>,
     pub replay_samples: Option<usize>,
     pub mirror_probability: Option<f32>,
-    pub selfplay_repetition_as_loss: Option<bool>,
     pub checkpoint_interval: Option<usize>,
     pub checkpoint_dir: Option<String>,
     pub max_checkpoints: Option<usize>,
@@ -211,9 +208,6 @@ impl AzLoopTomlConfig {
         if let Some(value) = self.mirror_probability {
             config.mirror_probability = value;
         }
-        if let Some(value) = self.selfplay_repetition_as_loss {
-            config.selfplay_repetition_as_loss = value;
-        }
         if let Some(value) = self.checkpoint_interval {
             config.checkpoint_interval = value;
         }
@@ -256,10 +250,6 @@ impl AzLoopFileConfig {
 # Value targets:
 #   Value is trained directly from the final game result, converted to the
 #   side-to-move perspective for each sampled position.
-#   selfplay_repetition_as_loss keeps the board rules simple (ordinary repetition
-#   is still a draw), but in self-play labels the mover that triggers an ordinary
-#   repetition is treated as losing. This prevents zero-value repetition loops
-#   from becoming a policy attractor.
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
@@ -359,7 +349,6 @@ gumbel_use_mixed_value = {gumbel_use_mixed_value}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
-selfplay_repetition_as_loss = {selfplay_repetition_as_loss}
 checkpoint_interval = {checkpoint_interval}
 checkpoint_dir = "{checkpoint_dir}"
 max_checkpoints = {max_checkpoints}
@@ -397,7 +386,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
-            selfplay_repetition_as_loss = self.selfplay_repetition_as_loss,
             checkpoint_interval = self.checkpoint_interval,
             checkpoint_dir = self.checkpoint_dir,
             max_checkpoints = self.max_checkpoints,
