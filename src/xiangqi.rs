@@ -669,9 +669,9 @@ impl Position {
             .into_iter()
             .filter(|&mv| {
                 let mut next = self.clone();
-                next.make_move(mv);
                 let mut next_history = base_history.clone();
-                next_history.push(next.rule_history_entry(Some(mover)));
+                next_history.push(self.rule_history_entry_after_move(mv));
+                next.make_move(mv);
                 !matches!(
                     next.rule_outcome_with_history(&next_history),
                     Some(RuleOutcome::Win(winner)) if winner == mover.opposite()
@@ -2523,6 +2523,37 @@ mod tests {
         assert_eq!(
             position.rule_outcome_with_history(&position.initial_rule_history()),
             Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120))
+        );
+    }
+
+    #[test]
+    fn legal_moves_with_rules_preserves_capture_reset_for_filtering() {
+        let position = Position::from_fen("4k4/9/9/9/4p4/9/9/9/4R4/4K4 w").unwrap();
+        let checking_capture = Move::from_uci("e1e5").unwrap();
+        assert!(position.legal_moves().contains(&checking_capture));
+        let after_move_entry = position.rule_history_entry_after_move(checking_capture);
+        assert!(after_move_entry.is_capture);
+        assert!(after_move_entry.gives_check);
+
+        let history = vec![
+            test_rule_entry(100, Color::Red, None, false, 0),
+            test_rule_entry(101, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(102, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(103, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(104, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(105, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(106, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(107, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(108, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(109, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(position.hash(), Color::Red, Some(Color::Black), false, 0),
+        ];
+
+        assert!(
+            position
+                .legal_moves_with_rules(&history)
+                .contains(&checking_capture),
+            "checking capture should reset rule counters instead of being treated as another long check"
         );
     }
 
