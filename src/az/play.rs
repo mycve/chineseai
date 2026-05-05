@@ -5,7 +5,9 @@ use crate::nnue::{
     HistoryMove, canonical_move, extract_sparse_features_v4_canonical_with_rules, mirror_file_move,
     mirror_file_square, mirror_sparse_features_file,
 };
-use crate::xiangqi::{BOARD_SIZE, Color, Move, PieceKind, Position, RuleHistoryEntry};
+use crate::xiangqi::{
+    BOARD_SIZE, Color, Move, PieceKind, Position, RuleHistoryEntry, summarize_rule_state,
+};
 
 use super::{
     AUX_MATERIAL_SIZE, AUX_OCCUPANCY_SIZE, AzCandidate, AzEnv, AzGameEndReason, AzLoopConfig,
@@ -21,6 +23,10 @@ pub struct AzTerminalStats {
     pub no_attacking_material: usize,
     pub halfmove120: usize,
     pub repetition: usize,
+    pub repetition_quiet: usize,
+    pub repetition_current_check: usize,
+    pub repetition_current_chase: usize,
+    pub repetition_rule_pressure: usize,
     pub mutual_long_check: usize,
     pub mutual_long_chase: usize,
     pub rule_win_red: usize,
@@ -36,6 +42,10 @@ impl AzTerminalStats {
         self.no_attacking_material += other.no_attacking_material;
         self.halfmove120 += other.halfmove120;
         self.repetition += other.repetition;
+        self.repetition_quiet += other.repetition_quiet;
+        self.repetition_current_check += other.repetition_current_check;
+        self.repetition_current_chase += other.repetition_current_chase;
+        self.repetition_rule_pressure += other.repetition_rule_pressure;
         self.mutual_long_check += other.mutual_long_check;
         self.mutual_long_chase += other.mutual_long_chase;
         self.rule_win_red += other.rule_win_red;
@@ -241,7 +251,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
             if let Some(outcome) = env.game_result_details() {
                 result = Some(outcome.result);
-                record_terminal_reason(&mut terminal, outcome.reason);
+                record_terminal_reason(&mut terminal, outcome.reason, env.rule_history());
                 break;
             }
         }
@@ -277,18 +287,54 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     }
 }
 
-fn record_terminal_reason(stats: &mut AzTerminalStats, reason: AzGameEndReason) {
+fn record_terminal_reason(
+    stats: &mut AzTerminalStats,
+    reason: AzGameEndReason,
+    rule_history: &[RuleHistoryEntry],
+) {
     match reason {
         AzGameEndReason::RedGeneralMissing => stats.red_general_missing += 1,
         AzGameEndReason::BlackGeneralMissing => stats.black_general_missing += 1,
         AzGameEndReason::NoLegalMoves => stats.no_legal_moves += 1,
         AzGameEndReason::NoAttackingMaterial => stats.no_attacking_material += 1,
         AzGameEndReason::Halfmove120 => stats.halfmove120 += 1,
-        AzGameEndReason::Repetition => stats.repetition += 1,
+        AzGameEndReason::Repetition => {
+            stats.repetition += 1;
+            record_repetition_detail(stats, rule_history);
+        }
         AzGameEndReason::MutualLongCheck => stats.mutual_long_check += 1,
         AzGameEndReason::MutualLongChase => stats.mutual_long_chase += 1,
         AzGameEndReason::RuleWinRed => stats.rule_win_red += 1,
         AzGameEndReason::RuleWinBlack => stats.rule_win_black += 1,
+    }
+}
+
+fn record_repetition_detail(stats: &mut AzTerminalStats, rule_history: &[RuleHistoryEntry]) {
+    let Some(current) = rule_history.last() else {
+        stats.repetition_quiet += 1;
+        return;
+    };
+    if current.gives_check {
+        stats.repetition_current_check += 1;
+        return;
+    }
+    if current.chased_mask != 0 {
+        stats.repetition_current_chase += 1;
+        return;
+    }
+    let summary = summarize_rule_state(rule_history, current.side_to_move);
+    if summary
+        .own_check
+        .max(summary.own_chase)
+        .max(summary.own_alt)
+        .max(summary.enemy_check)
+        .max(summary.enemy_chase)
+        .max(summary.enemy_alt)
+        >= 2
+    {
+        stats.repetition_rule_pressure += 1;
+    } else {
+        stats.repetition_quiet += 1;
     }
 }
 
