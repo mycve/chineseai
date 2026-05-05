@@ -258,7 +258,7 @@ impl AzLoopFileConfig {
 # Pipeline:
 #   Self-play and training run in separate long-lived threads.
 #   workers controls how many independent self-play threads run in parallel.
-#   The generated default is capped at 32 because this scalar MCTS/CNN code often slows down
+#   The generated default is capped at 32 because scalar MCTS self-play often slows down
 #   when hundreds of tiny self-play threads fight over cache and memory bandwidth.
 #   Self-play batches accumulate globally across workers.
 #   Every time selfplay_batch_games complete, one training update runs and then
@@ -283,6 +283,8 @@ impl AzLoopFileConfig {
 #   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
 #   value_weight scales scalar value MSE in the optimized loss; policy CE stays at 1.0.
+#   Policy CE is computed over the full dense action space, then gathered at the
+#   sparse MCTS target moves. Search/eval still mask illegal moves with the move generator.
 #
 # Augmentation:
 #   mirror_probability mirrors board files a<->i for this fraction of training samples.
@@ -309,11 +311,11 @@ impl AzLoopFileConfig {
 #
 # Model architecture:
 #   hidden_size is the runtime-tunable model width.
-#   The rest of the tensor shapes are fixed by the v24 binary architecture:
-#   policy_trunk_layers=0, board_channels=126, policy_cnn_channels=24,
-#   value_cnn_channels=32, value_cnn_layers=3 residual, policy_condition_size=32,
-#   value_branch=128x2, value_hidden=256. Value uses learned piece-square board
-#   embeddings + board CNN only: no value-side sparse V4 and no hand relation shortcut.
+#   The rest of the tensor shapes are fixed by the v25 binary architecture:
+#   shared sparse NNUE V4 trunk with row/column nearest-piece relation features,
+#   policy_condition_size=32, value_branch=128x2, value_hidden=256.
+#   Policy and value share the same sparse features; value has only a compact
+#   private projection before its residual branch. Old CNN-board .nnue files are incompatible.
 #   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
 
 model_path = "{model_path}"

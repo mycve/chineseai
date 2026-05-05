@@ -23,8 +23,15 @@ const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
 ];
 const NEIGHBOR_STATE_COUNT: usize = 14;
 const NEIGHBOR_INPUT_SIZE: usize = 14 * NEIGHBOR_OFFSETS.len() * NEIGHBOR_STATE_COUNT;
-pub const V4_INPUT_SIZE: usize =
-    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + NEIGHBOR_INPUT_SIZE;
+const LINE_DIRECTIONS: usize = 4;
+const LINE_DISTANCE_BUCKETS: usize = 10;
+const LINE_RELATION_INPUT_SIZE: usize =
+    14 * LINE_DIRECTIONS * LINE_DISTANCE_BUCKETS * NEIGHBOR_STATE_COUNT;
+pub const V4_INPUT_SIZE: usize = V3_INPUT_SIZE
+    + ROW_INPUT_SIZE
+    + COL_INPUT_SIZE
+    + NEIGHBOR_INPUT_SIZE
+    + LINE_RELATION_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -206,6 +213,28 @@ pub fn extract_sparse_features_v4_canonical(
                 canonical_piece_index(side, target_piece),
             ));
         }
+
+        for (direction, (df, dr)) in LINE_DIRECTION_OFFSETS.iter().enumerate() {
+            let mut distance = 1usize;
+            let mut file = center_file + df;
+            let mut rank = center_rank + dr;
+            while inside_board(file, rank) {
+                let canonical_target = index(file as usize, rank as usize);
+                let target = orient_square(side, canonical_target);
+                if let Some(target_piece) = position.piece_at(target) {
+                    features.push(line_relation_feature_index(
+                        piece_index,
+                        direction,
+                        distance_bucket(distance),
+                        canonical_piece_index(side, target_piece),
+                    ));
+                    break;
+                }
+                distance += 1;
+                file += df;
+                rank += dr;
+            }
+        }
     }
     features.sort_unstable();
     features
@@ -290,13 +319,28 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
             return col_feature_index(piece_index, BOARD_FILES - 1 - file);
         }
         let offset = offset - COL_INPUT_SIZE;
+        if offset < NEIGHBOR_INPUT_SIZE {
+            let neighbor_state = offset % NEIGHBOR_STATE_COUNT;
+            let partial = offset / NEIGHBOR_STATE_COUNT;
+            let offset_index = partial % NEIGHBOR_OFFSETS.len();
+            let piece_index = partial / NEIGHBOR_OFFSETS.len();
+            return neighbor_feature_index(
+                piece_index,
+                mirror_neighbor_offset_index(offset_index),
+                neighbor_state,
+            );
+        }
+        let offset = offset - NEIGHBOR_INPUT_SIZE;
         let neighbor_state = offset % NEIGHBOR_STATE_COUNT;
         let partial = offset / NEIGHBOR_STATE_COUNT;
-        let offset_index = partial % NEIGHBOR_OFFSETS.len();
-        let piece_index = partial / NEIGHBOR_OFFSETS.len();
-        return neighbor_feature_index(
+        let distance = partial % LINE_DISTANCE_BUCKETS;
+        let partial = partial / LINE_DISTANCE_BUCKETS;
+        let direction = partial % LINE_DIRECTIONS;
+        let piece_index = partial / LINE_DIRECTIONS;
+        return line_relation_feature_index(
             piece_index,
-            mirror_neighbor_offset_index(offset_index),
+            mirror_line_direction_index(direction),
+            distance,
             neighbor_state,
         );
     }
@@ -333,9 +377,38 @@ fn neighbor_feature_index(piece_index: usize, offset_index: usize, neighbor_stat
             + neighbor_state)
 }
 
+fn line_relation_feature_index(
+    piece_index: usize,
+    direction: usize,
+    distance: usize,
+    neighbor_state: usize,
+) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + NEIGHBOR_INPUT_SIZE
+        + (((piece_index * LINE_DIRECTIONS + direction) * LINE_DISTANCE_BUCKETS + distance)
+            * NEIGHBOR_STATE_COUNT
+            + neighbor_state)
+}
+
 fn mirror_neighbor_offset_index(offset_index: usize) -> usize {
     let (df, dr) = NEIGHBOR_OFFSETS[offset_index];
     neighbor_offset_index(-df, dr).expect("mirrored offset must exist")
+}
+
+const LINE_DIRECTION_OFFSETS: [(i32, i32); LINE_DIRECTIONS] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+
+fn mirror_line_direction_index(direction: usize) -> usize {
+    match direction {
+        2 => 3,
+        3 => 2,
+        _ => direction,
+    }
+}
+
+fn distance_bucket(distance: usize) -> usize {
+    distance.saturating_sub(1).min(LINE_DISTANCE_BUCKETS - 1)
 }
 
 fn palace_bucket(sq: usize) -> usize {
