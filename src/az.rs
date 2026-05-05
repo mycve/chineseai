@@ -3,8 +3,6 @@ use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 mod alphazero;
-#[cfg(feature = "distill")]
-mod distill;
 mod mctx;
 mod play;
 mod replay;
@@ -21,8 +19,6 @@ pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
     alphazero_search_with_history_and_rules,
 };
-#[cfg(feature = "distill")]
-pub use distill::{AzDistillLoadOptions, AzDistillLoadStats, load_distill_npz_samples};
 pub use mctx::AzGumbelConfig;
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -254,7 +250,6 @@ pub struct AzLoopConfig {
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub gumbel: AzGumbelConfig,
-    pub td_lambda: f32,
     pub mirror_probability: f32,
 }
 
@@ -338,7 +333,7 @@ pub struct AzTrainLossWeights {
 impl Default for AzTrainLossWeights {
     fn default() -> Self {
         Self {
-            value: 1.0,
+            value: 0.25,
             policy: 1.0,
             train_shared: true,
             train_value_head: true,
@@ -1551,12 +1546,6 @@ fn dense_move_index(mv: Move) -> usize {
     dense as usize
 }
 
-#[cfg_attr(not(feature = "distill"), allow(dead_code))]
-pub(super) fn dense_move_to_move(index: usize) -> Option<Move> {
-    let sparse = *move_map().dense_to_sparse.get(index)? as usize;
-    Some(Move::new(sparse / BOARD_SIZE, sparse % BOARD_SIZE))
-}
-
 #[cfg(test)]
 fn replay_pool_test_fixture() -> AzExperiencePool {
     let sample = AzTrainingSample {
@@ -1574,7 +1563,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::{assign_td_lambda_value_targets, assign_terminal_value_targets};
+    use super::play::assign_terminal_value_targets;
     use super::*;
 
     #[test]
@@ -1643,6 +1632,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_inputs_match_for_startpos_from_either_side() {
+        let red_to_move =
+            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w")
+                .unwrap();
+        let black_to_move =
+            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b")
+                .unwrap();
+
+        assert_eq!(
+            extract_sparse_features_v4_canonical(&red_to_move, &[]),
+            extract_sparse_features_v4_canonical(&black_to_move, &[])
+        );
+
+        let mut red_board = Vec::new();
+        let mut black_board = Vec::new();
+        extract_board_planes(&red_to_move, &[], &mut red_board);
+        extract_board_planes(&black_to_move, &[], &mut black_board);
+
+        assert_eq!(red_board, black_board);
+    }
+
+    #[test]
     fn terminal_value_targets_match_outcome_for_side_to_move() {
         let mut samples = vec![
             AzTrainingSample {
@@ -1667,42 +1678,6 @@ mod tests {
 
         assert!((samples[0].value - 1.0).abs() < 1e-6);
         assert!((samples[1].value + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn td_lambda_value_targets_mix_future_bootstrap_values() {
-        let mut samples = vec![
-            AzTrainingSample {
-                features: Vec::new(),
-                board: vec![0; BOARD_HISTORY_SIZE],
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: 0.2,
-                side_sign: 1.0,
-            },
-            AzTrainingSample {
-                features: Vec::new(),
-                board: vec![0; BOARD_HISTORY_SIZE],
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: -0.4,
-                side_sign: -1.0,
-            },
-            AzTrainingSample {
-                features: Vec::new(),
-                board: vec![0; BOARD_HISTORY_SIZE],
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value: 0.6,
-                side_sign: 1.0,
-            },
-        ];
-
-        assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
-
-        assert!((samples[2].value - 1.0).abs() < 1e-6);
-        assert!((samples[1].value + 0.8).abs() < 1e-6);
-        assert!((samples[0].value - 0.6).abs() < 1e-6);
     }
 
     #[test]

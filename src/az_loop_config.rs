@@ -10,6 +10,7 @@ pub struct AzLoopFileConfig {
     pub selfplay_batch_games: usize,
     pub epochs: usize,
     pub lr: f32,
+    pub value_weight: f32,
     pub batch_size: usize,
     pub max_sample_train_count: usize,
     pub max_plies: usize,
@@ -24,7 +25,6 @@ pub struct AzLoopFileConfig {
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub gumbel: AzGumbelConfig,
-    pub td_lambda: f32,
     pub replay_games: usize,
     pub replay_samples: usize,
     pub mirror_probability: f32,
@@ -50,6 +50,7 @@ impl Default for AzLoopFileConfig {
             selfplay_batch_games: 512,
             epochs: 2,
             lr: 0.0003,
+            value_weight: 0.25,
             batch_size: 2048,
             max_sample_train_count: 2,
             max_plies: 300,
@@ -64,7 +65,6 @@ impl Default for AzLoopFileConfig {
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
             gumbel,
-            td_lambda: 0.75,
             replay_games: 2000,
             replay_samples: 20000,
             mirror_probability: 0.3,
@@ -88,6 +88,7 @@ struct AzLoopTomlConfig {
     pub selfplay_batch_games: Option<usize>,
     pub epochs: Option<usize>,
     pub lr: Option<f32>,
+    pub value_weight: Option<f32>,
     pub batch_size: Option<usize>,
     pub max_sample_train_count: Option<usize>,
     pub max_plies: Option<usize>,
@@ -107,7 +108,6 @@ struct AzLoopTomlConfig {
     gumbel_maxvisit_init: Option<f32>,
     gumbel_rescale_values: Option<bool>,
     gumbel_use_mixed_value: Option<bool>,
-    pub td_lambda: Option<f32>,
     pub replay_games: Option<usize>,
     pub replay_samples: Option<usize>,
     pub mirror_probability: Option<f32>,
@@ -137,6 +137,9 @@ impl AzLoopTomlConfig {
         }
         if let Some(value) = self.lr {
             config.lr = value;
+        }
+        if let Some(value) = self.value_weight {
+            config.value_weight = value;
         }
         if let Some(value) = self.batch_size {
             config.batch_size = value;
@@ -196,9 +199,6 @@ impl AzLoopTomlConfig {
         if let Some(value) = self.gumbel_use_mixed_value {
             config.gumbel.use_mixed_value = value;
         }
-        if let Some(value) = self.td_lambda {
-            config.td_lambda = value;
-        }
         if let Some(value) = self.replay_games {
             config.replay_games = value;
         }
@@ -248,9 +248,8 @@ impl AzLoopFileConfig {
 #   With multiple workers, batches are accumulated across all workers.
 #
 # Value targets:
-#   td_lambda mixes each position's future MCTS root values with the final game outcome.
-#   0.75 keeps terminal outcomes dominant while adding bootstrap signal from later
-#   MCTS root values, which usually steadies early value learning.
+#   Value is trained directly from the final game result, converted to the
+#   side-to-move perspective for each sampled position.
 #
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
@@ -283,6 +282,7 @@ impl AzLoopFileConfig {
 #   max_sample_train_count removes samples after they have been used this many times.
 #   workers is the number of independent self-play threads.
 #   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
+#   value_weight scales scalar value MSE in the optimized loss; policy CE stays at 1.0.
 #
 # Augmentation:
 #   mirror_probability mirrors board files a<->i for this fraction of training samples.
@@ -321,6 +321,7 @@ simulations = {simulations}
 selfplay_batch_games = {selfplay_batch_games}
 epochs = {epochs}
 lr = {lr}
+value_weight = {value_weight}
 batch_size = {batch_size}
 max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
@@ -340,7 +341,6 @@ gumbel_value_scale = {gumbel_value_scale}
 gumbel_maxvisit_init = {gumbel_maxvisit_init}
 gumbel_rescale_values = {gumbel_rescale_values}
 gumbel_use_mixed_value = {gumbel_use_mixed_value}
-td_lambda = {td_lambda}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
@@ -358,6 +358,7 @@ tensorboard_logdir = "{tensorboard_logdir}"
             selfplay_batch_games = self.selfplay_batch_games,
             epochs = self.epochs,
             lr = self.lr,
+            value_weight = self.value_weight,
             batch_size = self.batch_size,
             max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
@@ -377,7 +378,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
             gumbel_maxvisit_init = self.gumbel.maxvisit_init,
             gumbel_rescale_values = self.gumbel.rescale_values,
             gumbel_use_mixed_value = self.gumbel.use_mixed_value,
-            td_lambda = self.td_lambda,
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
@@ -404,6 +404,7 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.simulations = self.simulations.max(1);
         self.selfplay_batch_games = self.selfplay_batch_games.max(1);
         self.epochs = self.epochs.max(1);
+        self.value_weight = self.value_weight.max(0.0);
         self.batch_size = self.batch_size.max(1);
         self.max_sample_train_count = self.max_sample_train_count.max(1);
         self.max_plies = self.max_plies.max(1);
@@ -418,7 +419,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.gumbel.gumbel_scale = self.gumbel.gumbel_scale.max(0.0);
         self.gumbel.value_scale = self.gumbel.value_scale.max(0.0);
         self.gumbel.maxvisit_init = self.gumbel.maxvisit_init.max(0.0);
-        self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.max_checkpoints = self.max_checkpoints.max(1);

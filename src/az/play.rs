@@ -293,7 +293,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_td_lambda_value_targets(&mut game_samples, result, config.td_lambda);
+        assign_terminal_value_targets(&mut game_samples, result);
         samples.extend(game_samples.clone());
         games.push(game_samples);
     }
@@ -373,36 +373,6 @@ pub(super) fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], ga
     }
 }
 
-pub(super) fn assign_td_lambda_value_targets(
-    samples: &mut [AzTrainingSample],
-    game_result: f32,
-    td_lambda: f32,
-) {
-    if samples.is_empty() {
-        return;
-    }
-
-    let lambda = td_lambda.clamp(0.0, 1.0);
-    if lambda >= 1.0 - 1e-6 {
-        assign_terminal_value_targets(samples, game_result);
-        return;
-    }
-
-    let bootstrap_red = samples
-        .iter()
-        .map(|sample| (sample.value * sample.side_sign).clamp(-1.0, 1.0))
-        .collect::<Vec<_>>();
-    let mut next_return_red = game_result.clamp(-1.0, 1.0);
-    for index in (0..samples.len()).rev() {
-        if index + 1 < samples.len() {
-            next_return_red = ((1.0 - lambda) * bootstrap_red[index + 1]
-                + lambda * next_return_red)
-                .clamp(-1.0, 1.0);
-        }
-        samples[index].value = (next_return_red * samples[index].side_sign).clamp(-1.0, 1.0);
-    }
-}
-
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
     if config.temperature_decay_plies == 0 || ply >= config.temperature_decay_plies {
         return config.temperature_end;
@@ -465,6 +435,46 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
         .filter(|probability| *probability > 1e-9)
         .map(|probability| -probability * probability.ln())
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nnue::mirror_file_move;
+
+    #[test]
+    fn mirror_augmentation_matches_explicitly_mirrored_position() {
+        let left = Position::from_fen("4k4/9/9/9/3pp4/5P3/9/9/9/4K4 w").unwrap();
+        let right = Position::from_fen("4k4/9/9/9/4pp3/3P5/9/9/9/4K4 w").unwrap();
+        let left_move = left.legal_moves()[0];
+        let right_move = mirror_file_move(left_move);
+        assert!(right.is_legal_move(right_move));
+
+        let left_candidates = [AzCandidate {
+            mv: left_move,
+            visits: 8,
+            q: 0.25,
+            prior: 0.4,
+            policy: 0.7,
+        }];
+        let right_candidates = [AzCandidate {
+            mv: right_move,
+            visits: 8,
+            q: 0.25,
+            prior: 0.4,
+            policy: 0.7,
+        }];
+
+        let augmented = make_training_sample(&left, &[], &left_candidates, 0.35, true);
+        let explicit = make_training_sample(&right, &[], &right_candidates, 0.35, false);
+
+        assert_eq!(augmented.features, explicit.features);
+        assert_eq!(augmented.board, explicit.board);
+        assert_eq!(augmented.move_indices, explicit.move_indices);
+        assert_eq!(augmented.policy, explicit.policy);
+        assert_eq!(augmented.value, explicit.value);
+        assert_eq!(augmented.side_sign, explicit.side_sign);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

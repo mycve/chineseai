@@ -438,9 +438,7 @@ impl GpuReplica {
         let loss_prob = value_probs.narrow(1, 2, 1)?;
         let value = (win - loss_prob)?.squeeze(1)?;
         let value_error = (&value - &batch_tensors.values)?;
-        let log_value = log_softmax(&forward.value_logits, 1)?;
-        let value_ce_per_sample = ((&batch_tensors.value_targets * &log_value)? * -1.0)?;
-        let value_loss = value_ce_per_sample.sum_all()?;
+        let value_loss = value_error.sqr()?.sum_all()?;
 
         let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
@@ -454,8 +452,10 @@ impl GpuReplica {
 
         let value_loss = value_loss.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
+        let weighted_loss =
+            value_loss * loss_weights.value.max(0.0) + policy_ce * loss_weights.policy.max(0.0);
         let stats = AzTrainStats {
-            loss: value_loss + policy_ce,
+            loss: weighted_loss,
             value_loss,
             policy_ce,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
@@ -682,7 +682,6 @@ struct BatchTensors {
     board_onehot: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
-    value_targets: Tensor,
     values: Tensor,
 }
 
@@ -700,7 +699,6 @@ impl BatchTensors {
         let mut board_onehot = vec![0.0f32; batch_size * BOARD_CHANNELS * BOARD_PLANES_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * DENSE_MOVE_SPACE];
-        let mut value_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
         let mut values = vec![0.0f32; batch_size];
 
         for (row, &sample_index) in batch.iter().enumerate() {
@@ -734,14 +732,6 @@ impl BatchTensors {
             }
             let value = sample.value.clamp(-1.0, 1.0);
             values[row] = value;
-            let value_target_base = row * VALUE_LOGITS;
-            if value >= 0.0 {
-                value_targets[value_target_base] = value;
-                value_targets[value_target_base + 1] = 1.0 - value;
-            } else {
-                value_targets[value_target_base + 1] = 1.0 + value;
-                value_targets[value_target_base + 2] = -value;
-            }
         }
 
         Ok(Self {
@@ -760,7 +750,6 @@ impl BatchTensors {
                 device,
             )?,
             policy_mask: Tensor::from_vec(policy_mask, (batch_size, DENSE_MOVE_SPACE), device)?,
-            value_targets: Tensor::from_vec(value_targets, (batch_size, VALUE_LOGITS), device)?,
             values: Tensor::from_vec(values, batch_size, device)?,
         })
     }
