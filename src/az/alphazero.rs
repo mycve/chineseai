@@ -1,8 +1,9 @@
 use crate::nnue::HistoryMove;
 use std::collections::HashMap;
 
-use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry};
 
+use super::env::{AzEnv, AzRuleSet, terminal_value_for};
 use super::mctx::{self, ActionStats, AzGumbelConfig};
 use super::{AzEvalScratch, AzNnue, SplitMix64, VALUE_SCALE_CP};
 
@@ -84,6 +85,51 @@ pub fn alphazero_search_with_history_and_rules(
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
+    alphazero_search_impl(
+        position,
+        history,
+        rule_history,
+        root_moves,
+        model,
+        limits,
+        AzRuleSet::Full,
+    )
+}
+
+pub fn alphazero_search(
+    position: &Position,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+) -> AzSearchResult {
+    alphazero_search_with_history_and_rules(position, &[], None, None, model, limits)
+}
+
+pub fn alphazero_search_env(
+    env: &AzEnv,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+) -> AzSearchResult {
+    alphazero_search_impl(
+        env.position(),
+        env.history(),
+        Some(env.rule_history_vec()),
+        root_moves,
+        model,
+        limits,
+        env.rules(),
+    )
+}
+
+fn alphazero_search_impl(
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    rules: AzRuleSet,
+) -> AzSearchResult {
     let mut tree = AzTree::new(
         position.clone(),
         truncate_history(history),
@@ -91,6 +137,7 @@ pub fn alphazero_search_with_history_and_rules(
         root_moves,
         model,
         limits,
+        rules,
     );
     let root = tree.root;
     tree.expand(root);
@@ -147,14 +194,6 @@ pub fn alphazero_search_with_history_and_rules(
     }
 }
 
-pub fn alphazero_search(
-    position: &Position,
-    model: &AzNnue,
-    limits: AzSearchLimits,
-) -> AzSearchResult {
-    alphazero_search_with_history_and_rules(position, &[], None, None, model, limits)
-}
-
 struct AzTree<'a> {
     nodes: Vec<AzNode>,
     model: &'a AzNnue,
@@ -167,6 +206,7 @@ struct AzTree<'a> {
     algorithm: AzSearchAlgorithm,
     gumbel: AzGumbelConfig,
     num_simulations: usize,
+    rules: AzRuleSet,
     root_gumbels: Vec<f32>,
     root_considered_visits: Vec<u32>,
     eval_scratch: AzEvalScratch,
@@ -225,6 +265,7 @@ impl<'a> AzTree<'a> {
         root_moves: Option<Vec<Move>>,
         model: &'a AzNnue,
         limits: AzSearchLimits,
+        rules: AzRuleSet,
     ) -> Self {
         let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1));
         nodes.push(AzNode {
@@ -260,6 +301,7 @@ impl<'a> AzTree<'a> {
                 use_mixed_value: limits.gumbel.use_mixed_value,
             },
             num_simulations: limits.simulations,
+            rules,
             root_gumbels: Vec::new(),
             root_considered_visits: Vec::new(),
             eval_scratch: AzEvalScratch::new(model.hidden_size),
@@ -272,10 +314,7 @@ impl<'a> AzTree<'a> {
             return self.nodes[node_index].value;
         }
 
-        if let Some(value) = terminal_value(
-            &self.nodes[node_index].position,
-            &self.nodes[node_index].rule_history,
-        ) {
+        if let Some(value) = self.terminal_value(node_index) {
             self.nodes[node_index].children.clear();
             self.nodes[node_index].value = value;
             self.nodes[node_index].expanded = true;
@@ -283,15 +322,11 @@ impl<'a> AzTree<'a> {
         }
 
         let moves = if node_index == self.root {
-            self.root_moves.clone().unwrap_or_else(|| {
-                self.nodes[node_index]
-                    .position
-                    .legal_moves_with_rules(&self.nodes[node_index].rule_history)
-            })
+            self.root_moves
+                .clone()
+                .unwrap_or_else(|| self.legal_moves(node_index))
         } else {
-            self.nodes[node_index]
-                .position
-                .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+            self.legal_moves(node_index)
         };
         if moves.is_empty() {
             self.nodes[node_index].children.clear();
@@ -338,6 +373,20 @@ impl<'a> AzTree<'a> {
         self.eval_cache.insert(cache_key, cached.clone());
         self.install_cached_eval(node_index, cached);
         self.nodes[node_index].value
+    }
+
+    fn terminal_value(&self, node_index: usize) -> Option<f32> {
+        let node = &self.nodes[node_index];
+        terminal_value_for(&node.position, &node.rule_history, self.rules)
+    }
+
+    fn legal_moves(&self, node_index: usize) -> Vec<Move> {
+        let node = &self.nodes[node_index];
+        if self.rules == AzRuleSet::Full {
+            node.position.legal_moves_with_rules(&node.rule_history)
+        } else {
+            node.position.legal_moves()
+        }
     }
 
     fn install_cached_eval(&mut self, node_index: usize, cached: CachedEval) {
@@ -653,36 +702,6 @@ fn piece_kind_code(kind: PieceKind) -> u64 {
     }
 }
 
-fn terminal_value(position: &Position, rule_history: &[RuleHistoryEntry]) -> Option<f32> {
-    if !position.has_general(Color::Red) {
-        return Some(if position.side_to_move() == Color::Red {
-            -1.0
-        } else {
-            1.0
-        });
-    }
-    if !position.has_general(Color::Black) {
-        return Some(if position.side_to_move() == Color::Black {
-            -1.0
-        } else {
-            1.0
-        });
-    }
-    if let Some(outcome) = position.rule_outcome_with_history(rule_history) {
-        return Some(match outcome {
-            RuleOutcome::Draw(_) => 0.0,
-            RuleOutcome::Win(color) => {
-                if color == position.side_to_move() {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-        });
-    }
-    None
-}
-
 fn softmax_into<'a>(logits: &[f32], output: &'a mut Vec<f32>) -> &'a mut Vec<f32> {
     output.clear();
     if logits.is_empty() {
@@ -929,6 +948,7 @@ mod tests {
             Some(root_moves.clone()),
             &model,
             AzSearchLimits::default(),
+            AzRuleSet::Full,
         );
 
         tree.expand(tree.root);
@@ -1010,13 +1030,58 @@ mod tests {
         ];
 
         assert_eq!(
-            terminal_value(&position, &rule_history),
+            terminal_value_for(&position, &rule_history, AzRuleSet::Full),
             Some(0.0),
             "repetition outcome should come from rule history even when board is unchanged"
         );
         assert_eq!(
             position.rule_outcome_with_history(&rule_history),
             Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        );
+    }
+
+    #[test]
+    fn simple_terminal_value_ignores_repetition_history() {
+        let position = Position::startpos();
+        let rule_history = vec![
+            position.rule_history_entry(None),
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
+        ];
+
+        assert_eq!(
+            position.rule_outcome_with_history(&rule_history),
+            Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        );
+        assert_eq!(
+            terminal_value_for(&position, &rule_history, AzRuleSet::Simple),
+            None
         );
     }
 }

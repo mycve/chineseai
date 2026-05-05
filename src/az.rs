@@ -3,6 +3,7 @@ use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 mod alphazero;
+mod env;
 mod mctx;
 mod play;
 mod replay;
@@ -22,8 +23,9 @@ use crate::xiangqi::{Color, PieceKind};
 
 pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
-    alphazero_search_with_history_and_rules,
+    alphazero_search_env, alphazero_search_with_history_and_rules,
 };
+pub use env::{AzEnv, AzRuleSet};
 pub use mctx::AzGumbelConfig;
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -230,13 +232,6 @@ pub struct AzLoopReport {
     pub terminal_no_legal_moves: usize,
     pub terminal_red_general_missing: usize,
     pub terminal_black_general_missing: usize,
-    pub terminal_rule_draw: usize,
-    pub terminal_rule_draw_halfmove120: usize,
-    pub terminal_rule_draw_repetition: usize,
-    pub terminal_rule_draw_mutual_long_check: usize,
-    pub terminal_rule_draw_mutual_long_chase: usize,
-    pub terminal_rule_win_red: usize,
-    pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
 }
 

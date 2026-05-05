@@ -481,13 +481,6 @@ fn build_async_training_report(
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
-        terminal_rule_draw: pending.selfplay.terminal.rule_draw,
-        terminal_rule_draw_halfmove120: pending.selfplay.terminal.rule_draw_halfmove120,
-        terminal_rule_draw_repetition: pending.selfplay.terminal.rule_draw_repetition,
-        terminal_rule_draw_mutual_long_check: pending.selfplay.terminal.rule_draw_mutual_long_check,
-        terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
-        terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
-        terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
     }
 }
@@ -1128,13 +1121,6 @@ fn main() {
                                     terminal_no_legal_moves: 0,
                                     terminal_red_general_missing: 0,
                                     terminal_black_general_missing: 0,
-                                    terminal_rule_draw: 0,
-                                    terminal_rule_draw_halfmove120: 0,
-                                    terminal_rule_draw_repetition: 0,
-                                    terminal_rule_draw_mutual_long_check: 0,
-                                    terminal_rule_draw_mutual_long_chase: 0,
-                                    terminal_rule_win_red: 0,
-                                    terminal_rule_win_black: 0,
                                     terminal_max_plies: 0,
                                 };
                             }
@@ -1171,13 +1157,6 @@ fn main() {
                                     terminal_no_legal_moves: 0,
                                     terminal_red_general_missing: 0,
                                     terminal_black_general_missing: 0,
-                                    terminal_rule_draw: 0,
-                                    terminal_rule_draw_halfmove120: 0,
-                                    terminal_rule_draw_repetition: 0,
-                                    terminal_rule_draw_mutual_long_check: 0,
-                                    terminal_rule_draw_mutual_long_chase: 0,
-                                    terminal_rule_win_red: 0,
-                                    terminal_rule_win_black: 0,
                                     terminal_max_plies: 0,
                                 };
                             }
@@ -1398,48 +1377,6 @@ fn main() {
                     "terminal/black_general_missing",
                     update,
                     report.terminal_black_general_missing as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw",
-                    update,
-                    report.terminal_rule_draw as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_halfmove120",
-                    update,
-                    report.terminal_rule_draw_halfmove120 as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_repetition",
-                    update,
-                    report.terminal_rule_draw_repetition as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_mutual_long_check",
-                    update,
-                    report.terminal_rule_draw_mutual_long_check as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_mutual_long_chase",
-                    update,
-                    report.terminal_rule_draw_mutual_long_chase as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_win_red",
-                    update,
-                    report.terminal_rule_win_red as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_win_black",
-                    update,
-                    report.terminal_rule_win_black as f32,
                 );
                 log_scalar(
                     &mut tb,

@@ -5,14 +5,11 @@ use crate::nnue::{
     HistoryMove, canonical_move, extract_sparse_features_v4_canonical_with_rules, mirror_file_move,
     mirror_file_square, mirror_sparse_features_file,
 };
-use crate::xiangqi::{
-    BOARD_SIZE, Color, Move, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome,
-};
+use crate::xiangqi::{BOARD_SIZE, Color, Move, PieceKind, Position, RuleHistoryEntry};
 
-use super::alphazero::append_history;
 use super::{
-    AUX_MATERIAL_SIZE, AUX_OCCUPANCY_SIZE, AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits,
-    AzTrainingSample, SplitMix64, VALUE_SCALE_CP, alphazero_search_with_history_and_rules,
+    AUX_MATERIAL_SIZE, AUX_OCCUPANCY_SIZE, AzCandidate, AzEnv, AzLoopConfig, AzNnue, AzRuleSet,
+    AzSearchLimits, AzTrainingSample, SplitMix64, VALUE_SCALE_CP, alphazero_search_env,
     dense_move_index,
 };
 
@@ -21,13 +18,6 @@ pub struct AzTerminalStats {
     pub no_legal_moves: usize,
     pub red_general_missing: usize,
     pub black_general_missing: usize,
-    pub rule_draw: usize,
-    pub rule_draw_halfmove120: usize,
-    pub rule_draw_repetition: usize,
-    pub rule_draw_mutual_long_check: usize,
-    pub rule_draw_mutual_long_chase: usize,
-    pub rule_win_red: usize,
-    pub rule_win_black: usize,
     pub max_plies: usize,
 }
 
@@ -36,13 +26,6 @@ impl AzTerminalStats {
         self.no_legal_moves += other.no_legal_moves;
         self.red_general_missing += other.red_general_missing;
         self.black_general_missing += other.black_general_missing;
-        self.rule_draw += other.rule_draw;
-        self.rule_draw_halfmove120 += other.rule_draw_halfmove120;
-        self.rule_draw_repetition += other.rule_draw_repetition;
-        self.rule_draw_mutual_long_check += other.rule_draw_mutual_long_check;
-        self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
-        self.rule_win_red += other.rule_win_red;
-        self.rule_win_black += other.rule_win_black;
         self.max_plies += other.max_plies;
     }
 }
@@ -179,18 +162,16 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
-        let mut position = Position::startpos();
-        let mut history = Vec::new();
-        let mut rule_history = position.initial_rule_history();
+        let mut env = AzEnv::startpos(AzRuleSet::Simple);
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            let legal = legal_moves_avoiding_voluntary_rule_draws(&position, &rule_history);
+            let legal = env.legal_moves();
             if legal.is_empty() {
-                result = Some(if position.side_to_move() == Color::Red {
+                result = Some(if env.position().side_to_move() == Color::Red {
                     -1.0
                 } else {
                     1.0
@@ -199,10 +180,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search = alphazero_search_with_history_and_rules(
-                &position,
-                &history,
-                Some(rule_history.clone()),
+            let search = alphazero_search_env(
+                &env,
                 Some(legal),
                 model,
                 AzSearchLimits {
@@ -237,50 +216,23 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             };
             game_samples.push(make_training_sample(
-                &position,
-                &history,
-                &rule_history,
+                env.position(),
+                env.history(),
+                env.rule_history(),
                 &search.candidates,
                 search.value_cp as f32 / VALUE_SCALE_CP,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
-            append_history(&mut history, &position, mv);
-            rule_history.push(position.rule_history_entry_after_move(mv));
-            position.make_move(mv);
+            env.make_move(mv);
 
-            if !position.has_general(Color::Red) {
+            if !env.position().has_general(Color::Red) {
                 result = Some(-1.0);
                 terminal.red_general_missing += 1;
                 break;
             }
-            if !position.has_general(Color::Black) {
+            if !env.position().has_general(Color::Black) {
                 result = Some(1.0);
                 terminal.black_general_missing += 1;
-                break;
-            }
-            if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
-                result = Some(match rule_outcome {
-                    RuleOutcome::Draw(_) => 0.0,
-                    RuleOutcome::Win(Color::Red) => 1.0,
-                    RuleOutcome::Win(Color::Black) => -1.0,
-                });
-                match rule_outcome {
-                    RuleOutcome::Draw(reason) => {
-                        terminal.rule_draw += 1;
-                        match reason {
-                            RuleDrawReason::Halfmove120 => terminal.rule_draw_halfmove120 += 1,
-                            RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
-                            RuleDrawReason::MutualLongCheck => {
-                                terminal.rule_draw_mutual_long_check += 1
-                            }
-                            RuleDrawReason::MutualLongChase => {
-                                terminal.rule_draw_mutual_long_chase += 1
-                            }
-                        }
-                    }
-                    RuleOutcome::Win(Color::Red) => terminal.rule_win_red += 1,
-                    RuleOutcome::Win(Color::Black) => terminal.rule_win_black += 1,
-                }
                 break;
             }
         }
@@ -481,36 +433,6 @@ mod tests {
         assert_eq!(augmented.value, explicit.value);
         assert_eq!(augmented.side_sign, explicit.side_sign);
     }
-
-    #[test]
-    fn selfplay_root_moves_avoid_voluntary_rule_draws_when_alternatives_exist() {
-        let mut position = Position::startpos();
-        let mut history = position.initial_rule_history();
-        let cycle = [
-            Move::from_uci("b0c2").unwrap(),
-            Move::from_uci("b9c7").unwrap(),
-            Move::from_uci("c2b0").unwrap(),
-            Move::from_uci("c7b9").unwrap(),
-        ];
-
-        for index in 0..15 {
-            let mv = cycle[index % cycle.len()];
-            assert!(position.is_legal_move(mv), "illegal cycle move {mv:?}");
-            let mover = position.side_to_move();
-            position.make_move(mv);
-            history.push(position.rule_history_entry(Some(mover)));
-        }
-
-        let repeating_move = cycle[15 % cycle.len()];
-        assert!(
-            position
-                .legal_moves_with_rules(&history)
-                .contains(&repeating_move)
-        );
-        let filtered = legal_moves_avoiding_voluntary_rule_draws(&position, &history);
-        assert!(!filtered.is_empty());
-        assert!(!filtered.contains(&repeating_move));
-    }
 }
 
 fn material_aux_targets(position: &Position) -> Vec<f32> {
@@ -638,46 +560,6 @@ fn arena_start_position(positions: &[Position], seed: u64, game_index: usize) ->
     }
 }
 
-fn legal_moves_avoiding_voluntary_rule_draws(
-    position: &Position,
-    rule_history: &[RuleHistoryEntry],
-) -> Vec<Move> {
-    let legal = position.legal_moves_with_rules(rule_history);
-    if legal.len() <= 1 {
-        return legal;
-    }
-
-    let base_history = if rule_history.last().is_some_and(|entry| {
-        entry.hash == position.hash() && entry.side_to_move == position.side_to_move()
-    }) {
-        rule_history.to_vec()
-    } else {
-        let mut normalized = rule_history.to_vec();
-        normalized.push(position.rule_history_entry(None));
-        normalized
-    };
-    let mover = position.side_to_move();
-    let mut non_draws = Vec::with_capacity(legal.len());
-    for &mv in &legal {
-        let mut next = position.clone();
-        next.make_move(mv);
-        let mut next_history = base_history.clone();
-        next_history.push(next.rule_history_entry(Some(mover)));
-        if !matches!(
-            next.rule_outcome_with_history(&next_history),
-            Some(RuleOutcome::Draw(_))
-        ) {
-            non_draws.push(mv);
-        }
-    }
-
-    if non_draws.is_empty() {
-        legal
-    } else {
-        non_draws
-    }
-}
-
 fn play_arena_game(
     initial_position: &Position,
     red_model: &AzNnue,
@@ -687,27 +569,23 @@ fn play_arena_game(
     seed: u64,
     cpuct: f32,
 ) -> f32 {
-    let mut position = initial_position.clone();
-    let mut history = Vec::new();
-    let mut rule_history = position.initial_rule_history();
+    let mut env = AzEnv::from_position(initial_position.clone(), AzRuleSet::Simple);
     for ply in 0..max_plies {
-        let legal = legal_moves_avoiding_voluntary_rule_draws(&position, &rule_history);
+        let legal = env.legal_moves();
         if legal.is_empty() {
-            return if position.side_to_move() == Color::Red {
+            return if env.position().side_to_move() == Color::Red {
                 -1.0
             } else {
                 1.0
             };
         }
-        let model = if position.side_to_move() == Color::Red {
+        let model = if env.position().side_to_move() == Color::Red {
             red_model
         } else {
             black_model
         };
-        let result = alphazero_search_with_history_and_rules(
-            &position,
-            &history,
-            Some(rule_history.clone()),
+        let result = alphazero_search_env(
+            &env,
             Some(legal),
             model,
             AzSearchLimits {
@@ -723,22 +601,13 @@ fn play_arena_game(
         let Some(mv) = result.best_move else {
             return 0.0;
         };
-        append_history(&mut history, &position, mv);
-        rule_history.push(position.rule_history_entry_after_move(mv));
-        position.make_move(mv);
+        env.make_move(mv);
 
-        if !position.has_general(Color::Red) {
+        if !env.position().has_general(Color::Red) {
             return -1.0;
         }
-        if !position.has_general(Color::Black) {
+        if !env.position().has_general(Color::Black) {
             return 1.0;
-        }
-        if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
-            return match rule_outcome {
-                RuleOutcome::Draw(_) => 0.0,
-                RuleOutcome::Win(Color::Red) => 1.0,
-                RuleOutcome::Win(Color::Black) => -1.0,
-            };
         }
     }
     0.0
