@@ -115,6 +115,9 @@ pub(super) fn terminal_value_for(
             1.0
         });
     }
+    if position.legal_moves().is_empty() {
+        return Some(-1.0);
+    }
     if !position.has_dynamic_material(Color::Red) && !position.has_dynamic_material(Color::Black) {
         return Some(0.0);
     }

@@ -625,7 +625,11 @@ fn eval_cache_key(
     rule_history: &[RuleHistoryEntry],
     moves: &[Move],
 ) -> u64 {
-    let mut key = mix64(position.hash() ^ ((position.halfmove_clock() as u64) << 48));
+    let mut key = mix64(
+        position.hash()
+            ^ ((position.halfmove_clock() as u64) << 48)
+            ^ ((position.check_in_no_capture() as u64) << 32),
+    );
     key = mix_with(key, history.len() as u64);
     for entry in history {
         key = mix_with(key, move_code(entry.mv));
@@ -641,7 +645,9 @@ fn eval_cache_key(
         key = mix_with(key, entry.hash);
         key = mix_with(key, color_code(entry.side_to_move));
         key = mix_with(key, entry.mover.map_or(3, color_code));
+        key = mix_with(key, entry.is_capture as u64);
         key = mix_with(key, entry.gives_check as u64);
+        key = mix_with(key, entry.checking_pieces as u64);
         key = mix_with(key, entry.chased_mask as u64);
         key = mix_with(key, (entry.chased_mask >> 64) as u64);
     }
@@ -998,28 +1004,36 @@ mod tests {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
         ];
@@ -1044,28 +1058,89 @@ mod tests {
                 hash: 2,
                 side_to_move: Color::Black,
                 mover: Some(Color::Red),
+                is_capture: false,
                 gives_check: true,
+                checking_pieces: 1,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: 3,
                 side_to_move: Color::Red,
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: 4,
                 side_to_move: Color::Black,
                 mover: Some(Color::Red),
+                is_capture: false,
                 gives_check: true,
+                checking_pieces: 1,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
+                chased_mask: 0,
+            },
+        ];
+
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Black))
+        );
+        assert_eq!(
+            terminal_value_for(&position, &history, AzRuleSet::Full),
+            Some(-1.0)
+        );
+    }
+
+    #[test]
+    fn terminal_mate_takes_priority_over_long_check_violation() {
+        let position = Position::from_fen("3rkr3/4R4/9/9/9/9/9/9/9/4K4 b").unwrap();
+        assert!(position.legal_moves().is_empty());
+        let history = vec![
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: None,
+                is_capture: false,
+                gives_check: false,
+                checking_pieces: 0,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: 8,
+                side_to_move: Color::Black,
+                mover: Some(Color::Red),
+                is_capture: false,
+                gives_check: true,
+                checking_pieces: 1,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: 9,
+                side_to_move: Color::Red,
+                mover: Some(Color::Black),
+                is_capture: false,
+                gives_check: false,
+                checking_pieces: 0,
+                chased_mask: 0,
+            },
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Red),
+                is_capture: false,
+                gives_check: true,
+                checking_pieces: 1,
                 chased_mask: 0,
             },
         ];
@@ -1119,28 +1194,36 @@ mod tests {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
                 side_to_move: position.side_to_move(),
                 mover: Some(Color::Black),
+                is_capture: false,
                 gives_check: false,
+                checking_pieces: 0,
                 chased_mask: 0,
             },
         ];

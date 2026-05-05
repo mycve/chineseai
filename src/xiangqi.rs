@@ -144,6 +144,7 @@ pub struct Undo {
     captured: Option<Piece>,
     side_to_move: Color,
     halfmove_clock: u16,
+    check_in_no_capture: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,7 +157,9 @@ pub struct RuleHistoryEntry {
     pub hash: u64,
     pub side_to_move: Color,
     pub mover: Option<Color>,
+    pub is_capture: bool,
     pub gives_check: bool,
+    pub checking_pieces: u8,
     pub chased_mask: u128,
 }
 
@@ -174,6 +177,62 @@ pub enum RuleOutcome {
     Win(Color),
 }
 
+const PERPETUAL_CHECK_LIMIT_1: u16 = 6;
+const PERPETUAL_CHECK_LIMIT_2: u16 = 12;
+const PERPETUAL_CHECK_LIMIT_3: u16 = 18;
+const PERPETUAL_CHASE_LIMIT: u16 = 6;
+const CHECK_CHASE_ALT_LIMIT_1: u16 = 12;
+const CHECK_CHASE_ALT_LIMIT_N: u16 = 18;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuleCounters {
+    check: [u16; 2],
+    chase: [u16; 2],
+    alt: [u16; 2],
+    max_check_pieces: [u8; 2],
+}
+
+impl RuleCounters {
+    fn apply(&mut self, entry: RuleHistoryEntry, mover: Color) {
+        if entry.is_capture {
+            *self = Self::default();
+            return;
+        }
+
+        let index = color_hash_index(mover);
+        if entry.gives_check {
+            self.check[index] = self.check[index].saturating_add(1);
+            self.max_check_pieces[index] = self.max_check_pieces[index].max(entry.checking_pieces);
+        } else {
+            self.check[index] = 0;
+            self.max_check_pieces[index] = 0;
+        }
+
+        let gives_chase = entry.chased_mask != 0 && !entry.gives_check;
+        if gives_chase {
+            self.chase[index] = self.chase[index].saturating_add(1);
+        } else {
+            self.chase[index] = 0;
+        }
+
+        if entry.gives_check || gives_chase {
+            self.alt[index] = self.alt[index].saturating_add(1);
+        } else {
+            self.alt[index] = 0;
+        }
+    }
+
+    fn violation_winner(&self, mover: Color) -> Option<Color> {
+        let index = color_hash_index(mover);
+        let check_limit = perpetual_check_limit(self.max_check_pieces[index]);
+        let alt_limit = check_chase_alt_limit(self.max_check_pieces[index]);
+        let violates = self.check[index] >= check_limit
+            || self.chase[index] >= PERPETUAL_CHASE_LIMIT
+            || (self.alt[index] >= alt_limit && (self.check[index] > 0 || self.chase[index] > 0));
+        violates.then_some(mover.opposite())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Position {
     board: [Option<Piece>; BOARD_SIZE],
@@ -185,6 +244,7 @@ pub struct Position {
     dynamic_material_counts: [u8; 2],
     general_squares: [Option<usize>; 2],
     halfmove_clock: u16,
+    check_in_no_capture: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,6 +320,7 @@ impl Position {
             dynamic_material_counts: [0; 2],
             general_squares: [None; 2],
             halfmove_clock,
+            check_in_no_capture: 0,
         };
         let state = position.compute_state();
         let position = Self {
@@ -348,6 +409,15 @@ impl Position {
         self.halfmove_clock
     }
 
+    pub fn check_in_no_capture(&self) -> u16 {
+        self.check_in_no_capture
+    }
+
+    fn effective_no_capture_clock(&self) -> u16 {
+        self.halfmove_clock
+            .saturating_sub(self.check_in_no_capture.saturating_sub(40))
+    }
+
     pub fn is_piece_protected(&self, sq: usize, color: Color) -> bool {
         self.visit_attacker_origins_to(sq, color, |from| from != sq)
     }
@@ -408,24 +478,48 @@ impl Position {
             hash: self.hash,
             side_to_move: self.side_to_move,
             mover,
+            is_capture: false,
             gives_check: has_both_generals && self.in_check(self.side_to_move),
-            chased_mask: if mover.is_some() && has_both_generals {
-                self.chased_mask()
-            } else {
-                0
-            },
+            checking_pieces: 0,
+            chased_mask: 0,
         }
     }
 
     pub fn rule_history_entry_after_move(&self, mv: Move) -> RuleHistoryEntry {
         let mut next = self.clone();
         let mover = self.side_to_move;
+        let is_capture = self.board[mv.to as usize].is_some();
         next.make_move(mv);
-        next.rule_history_entry(Some(mover))
+        let has_both_generals = next.has_general(Color::Red) && next.has_general(Color::Black);
+        let gives_check = has_both_generals && next.in_check(next.side_to_move);
+        let checking_pieces = if gives_check {
+            next.checkers_to(
+                next.find_general(next.side_to_move)
+                    .expect("checked side must have a general"),
+                mover,
+            )
+            .len()
+            .min(u8::MAX as usize) as u8
+        } else {
+            0
+        };
+        RuleHistoryEntry {
+            hash: next.hash,
+            side_to_move: next.side_to_move,
+            mover: Some(mover),
+            is_capture,
+            gives_check,
+            checking_pieces,
+            chased_mask: if has_both_generals && !gives_check {
+                self.chased_mask_after_move(mv, &next)
+            } else {
+                0
+            },
+        }
     }
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
-        if self.halfmove_clock >= 120 {
+        if self.effective_no_capture_clock() >= 120 {
             return Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120));
         }
         Self::rule_outcome(history)
@@ -434,6 +528,9 @@ impl Position {
     pub fn rule_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         let current_index = history.len().checked_sub(1)?;
         let current = history[current_index];
+        if let Some(outcome) = Self::rule_violation_outcome(history) {
+            return Some(outcome);
+        }
         let repeated_indices = history[..current_index]
             .iter()
             .enumerate()
@@ -454,6 +551,20 @@ impl Position {
         }
 
         (repeated_indices.len() >= 4).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+    }
+
+    fn rule_violation_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
+        let mut counters = RuleCounters::default();
+        for entry in history.iter().copied() {
+            let Some(mover) = entry.mover else {
+                continue;
+            };
+            counters.apply(entry, mover);
+            if let Some(winner) = counters.violation_winner(mover) {
+                return Some(RuleOutcome::Win(winner));
+            }
+        }
+        None
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -552,6 +663,7 @@ impl Position {
             captured: self.board[to],
             side_to_move: self.side_to_move,
             halfmove_clock: self.halfmove_clock,
+            check_in_no_capture: self.check_in_no_capture,
         };
 
         self.hash ^= zobrist_piece_key(from, moving);
@@ -575,10 +687,20 @@ impl Position {
         self.base_eval += signed_piece_contrib(moving, to);
         self.side_to_move = self.side_to_move.opposite();
         self.hash ^= SIDE_TO_MOVE_KEY;
-        self.halfmove_clock = if undo.captured.is_some() || moving.kind == PieceKind::Soldier {
+        let gives_check = self.has_general(Color::Red)
+            && self.has_general(Color::Black)
+            && self.in_check(self.side_to_move);
+        self.halfmove_clock = if undo.captured.is_some() {
             0
         } else {
             self.halfmove_clock.saturating_add(1)
+        };
+        self.check_in_no_capture = if undo.captured.is_some() {
+            0
+        } else if gives_check {
+            self.check_in_no_capture.saturating_add(1)
+        } else {
+            self.check_in_no_capture
         };
         undo
     }
@@ -608,6 +730,7 @@ impl Position {
         }
         self.side_to_move = undo.side_to_move;
         self.halfmove_clock = undo.halfmove_clock;
+        self.check_in_no_capture = undo.check_in_no_capture;
     }
 
     pub fn make_null_move(&mut self) -> NullUndo {
@@ -819,47 +942,109 @@ impl Position {
         }
     }
 
-    fn chased_mask(&self) -> u128 {
-        let defender = self.side_to_move;
-        let mut attacker_view = self.clone();
-        attacker_view.make_null_move();
+    fn chased_mask_after_move(&self, mv: Move, after: &Position) -> u128 {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        let Some(attacker) = after.board[to] else {
+            return 0;
+        };
+        if !is_long_chase_attacker(attacker.kind) || after.is_piece_pinned(to, attacker.color) {
+            return 0;
+        }
+
+        let defender = attacker.color.opposite();
         let mut mask = 0u128;
+        let mut threat_count = 0usize;
 
         for target in 0..BOARD_SIZE {
-            let Some(target_piece) = self.board[target] else {
+            let Some(target_piece) = after.board[target] else {
                 continue;
             };
             if target_piece.color != defender || !is_long_chase_target(target_piece.kind) {
                 continue;
             }
-            if attacker_view.is_square_chased(target, target_piece) {
+            if !after.piece_attacks_square(to, attacker, target) {
+                continue;
+            }
+            if self
+                .board
+                .get(target)
+                .and_then(|piece| *piece)
+                .is_some_and(|before_target| before_target.color == defender)
+                && self
+                    .board
+                    .get(from)
+                    .and_then(|piece| *piece)
+                    .is_some_and(|before_attacker| {
+                        self.piece_attacks_square(from, before_attacker, target)
+                    })
+            {
+                continue;
+            }
+            if target_piece.kind == PieceKind::Soldier
+                && !soldier_crossed_river(target_piece.color, rank_of(target))
+            {
+                continue;
+            }
+            if attacker.kind == target_piece.kind
+                && after.piece_attacks_square(target, target_piece, to)
+                && !after.is_piece_pinned(target, target_piece.color)
+            {
+                continue;
+            }
+            let special_rook_chase = target_piece.kind == PieceKind::Rook
+                && !matches!(attacker.kind, PieceKind::Rook | PieceKind::Soldier);
+            if special_rook_chase || !after.has_real_protector(target, to, defender) {
+                threat_count += 1;
                 mask |= 1u128 << target;
             }
         }
 
-        mask
+        if threat_count == 1 { mask } else { 0 }
     }
 
-    fn is_square_chased(&self, target: usize, target_piece: Piece) -> bool {
-        self.legal_capture_moves_to(target)
-            .into_iter()
-            .any(|mv| self.capture_is_true_chase(mv, target_piece))
+    fn is_piece_pinned(&self, sq: usize, color: Color) -> bool {
+        if !self.board[sq].is_some_and(|piece| piece.color == color) {
+            return false;
+        }
+        let mut work = self.clone();
+        work.board[sq] = None;
+        work.in_check(color)
     }
 
-    fn capture_is_true_chase(&self, mv: Move, target_piece: Piece) -> bool {
-        let Some(attacker) = self.board[mv.from as usize] else {
-            return false;
-        };
-        if !is_long_chase_attacker(attacker.kind) {
-            return false;
+    fn has_real_protector(&self, target: usize, attacker_sq: usize, defender: Color) -> bool {
+        for protector_sq in 0..BOARD_SIZE {
+            if protector_sq == target {
+                continue;
+            }
+            let Some(protector) = self.board[protector_sq] else {
+                continue;
+            };
+            if protector.color != defender
+                || !self.piece_attacks_square(protector_sq, protector, target)
+            {
+                continue;
+            }
+            if self.is_piece_pinned(protector_sq, defender) {
+                continue;
+            }
+            let Some(attacker) = self.board[attacker_sq] else {
+                continue;
+            };
+            let mut after_capture = self.clone();
+            after_capture.board[target] = Some(attacker);
+            after_capture.board[attacker_sq] = None;
+            if !after_capture.piece_attacks_square(protector_sq, protector, target) {
+                continue;
+            }
+            let mut after_recapture = after_capture;
+            after_recapture.board[target] = Some(protector);
+            after_recapture.board[protector_sq] = None;
+            if !after_recapture.in_check(defender) {
+                return true;
+            }
         }
-        if piece_base_value(attacker.kind) < piece_base_value(target_piece.kind) {
-            return true;
-        }
-
-        let mut next = self.clone();
-        next.make_move(mv);
-        next.legal_capture_moves_to(mv.to as usize).is_empty()
+        false
     }
 
     fn pseudo_legal_evasions(&self) -> Vec<Move> {
@@ -1861,13 +2046,26 @@ fn is_long_chase_target(kind: PieceKind) -> bool {
 }
 
 #[inline(always)]
-fn signed_piece_contrib(piece: Piece, sq: usize) -> i32 {
-    SIGNED_PIECE_CONTRIB_TABLE[color_index_const(piece.color)][piece_kind_index(piece.kind)][sq]
+fn perpetual_check_limit(num_pieces: u8) -> u16 {
+    match num_pieces {
+        0 | 1 => PERPETUAL_CHECK_LIMIT_1,
+        2 => PERPETUAL_CHECK_LIMIT_2,
+        _ => PERPETUAL_CHECK_LIMIT_3,
+    }
 }
 
 #[inline(always)]
-pub(crate) fn piece_base_value(kind: PieceKind) -> i32 {
-    PIECE_BASE_VALUES[piece_kind_index(kind)]
+fn check_chase_alt_limit(num_pieces: u8) -> u16 {
+    if num_pieces <= 1 {
+        CHECK_CHASE_ALT_LIMIT_1
+    } else {
+        CHECK_CHASE_ALT_LIMIT_N
+    }
+}
+
+#[inline(always)]
+fn signed_piece_contrib(piece: Piece, sq: usize) -> i32 {
+    SIGNED_PIECE_CONTRIB_TABLE[color_index_const(piece.color)][piece_kind_index(piece.kind)][sq]
 }
 
 const PIECE_BASE_VALUES: [i32; 7] = [0, 110, 110, 420, 900, 460, 110];
@@ -2118,6 +2316,16 @@ mod tests {
     }
 
     #[test]
+    fn no_capture_clock_resets_only_on_capture() {
+        let mut position = Position::from_fen("4k4/9/9/9/9/9/4P4/9/9/4K4 w").unwrap();
+        let mv = Move::from_uci("e3e4").unwrap();
+
+        position.make_move(mv);
+
+        assert_eq!(position.halfmove_clock(), 1);
+    }
+
+    #[test]
     fn incremental_hash_matches_full_recomputation() {
         let mut position = Position::startpos();
         for mv in position.legal_moves().into_iter().take(8) {
@@ -2221,6 +2429,23 @@ mod tests {
         assert!(moves.contains(&Move::from_uci("e2a2").unwrap()));
     }
 
+    #[test]
+    fn excess_checks_do_not_advance_effective_no_capture_draw() {
+        let mut position = Position::from_fen("4k4/4R4/9/9/9/9/9/9/9/4K4 b 120").unwrap();
+        position.check_in_no_capture = 41;
+
+        assert_eq!(
+            position.rule_outcome_with_history(&position.initial_rule_history()),
+            None
+        );
+
+        position.check_in_no_capture = 40;
+        assert_eq!(
+            position.rule_outcome_with_history(&position.initial_rule_history()),
+            Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120))
+        );
+    }
+
     fn test_rule_entry(
         hash: u64,
         side_to_move: Color,
@@ -2232,7 +2457,9 @@ mod tests {
             hash,
             side_to_move,
             mover,
+            is_capture: false,
             gives_check,
+            checking_pieces: u8::from(gives_check),
             chased_mask,
         }
     }
@@ -2245,6 +2472,50 @@ mod tests {
             test_rule_entry(3, Color::Red, Some(Color::Black), false, 0),
             test_rule_entry(4, Color::Black, Some(Color::Red), true, 0),
             test_rule_entry(1, Color::Red, Some(Color::Black), false, 0),
+        ];
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Black))
+        );
+    }
+
+    #[test]
+    fn continuous_long_check_loses_without_waiting_for_repetition() {
+        let history = vec![
+            test_rule_entry(100, Color::Red, None, false, 0),
+            test_rule_entry(101, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(102, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(103, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(104, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(105, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(106, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(107, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(108, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(109, Color::Black, Some(Color::Red), true, 0),
+            test_rule_entry(110, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(111, Color::Black, Some(Color::Red), true, 0),
+        ];
+        assert_eq!(
+            Position::rule_outcome(&history),
+            Some(RuleOutcome::Win(Color::Black))
+        );
+    }
+
+    #[test]
+    fn continuous_long_chase_loses_without_waiting_for_repetition() {
+        let history = vec![
+            test_rule_entry(200, Color::Red, None, false, 0),
+            test_rule_entry(201, Color::Black, Some(Color::Red), false, 1 << 20),
+            test_rule_entry(202, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(203, Color::Black, Some(Color::Red), false, 1 << 21),
+            test_rule_entry(204, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(205, Color::Black, Some(Color::Red), false, 1 << 22),
+            test_rule_entry(206, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(207, Color::Black, Some(Color::Red), false, 1 << 23),
+            test_rule_entry(208, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(209, Color::Black, Some(Color::Red), false, 1 << 24),
+            test_rule_entry(210, Color::Red, Some(Color::Black), false, 0),
+            test_rule_entry(211, Color::Black, Some(Color::Red), false, 1 << 25),
         ];
         assert_eq!(
             Position::rule_outcome(&history),
