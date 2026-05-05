@@ -53,14 +53,15 @@ impl AzEnv {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
-        match self.rules {
-            AzRuleSet::Simple => self.position.legal_moves(),
-            AzRuleSet::Full => self.position.legal_moves_with_rules(&self.rule_history),
-        }
+        self.position.legal_moves()
     }
 
     pub fn terminal_value(&self) -> Option<f32> {
         terminal_value_for(&self.position, &self.rule_history, self.rules)
+    }
+
+    pub fn game_result(&self) -> Option<f32> {
+        game_result_for(&self.position, &self.rule_history, self.rules)
     }
 
     pub fn make_move(&mut self, mv: Move) {
@@ -90,6 +91,9 @@ pub(super) fn terminal_value_for(
             1.0
         });
     }
+    if !position.has_dynamic_material(Color::Red) && !position.has_dynamic_material(Color::Black) {
+        return Some(0.0);
+    }
     if rules == AzRuleSet::Full {
         if let Some(outcome) = position.rule_outcome_with_history(rule_history) {
             return Some(match outcome {
@@ -101,6 +105,39 @@ pub(super) fn terminal_value_for(
                         -1.0
                     }
                 }
+            });
+        }
+    }
+    None
+}
+
+pub(super) fn game_result_for(
+    position: &Position,
+    rule_history: &[RuleHistoryEntry],
+    rules: AzRuleSet,
+) -> Option<f32> {
+    if !position.has_general(Color::Red) {
+        return Some(-1.0);
+    }
+    if !position.has_general(Color::Black) {
+        return Some(1.0);
+    }
+    if position.legal_moves().is_empty() {
+        return Some(if position.side_to_move() == Color::Red {
+            -1.0
+        } else {
+            1.0
+        });
+    }
+    if !position.has_dynamic_material(Color::Red) && !position.has_dynamic_material(Color::Black) {
+        return Some(0.0);
+    }
+    if rules == AzRuleSet::Full {
+        if let Some(outcome) = position.rule_outcome_with_history(rule_history) {
+            return Some(match outcome {
+                RuleOutcome::Draw(_) => 0.0,
+                RuleOutcome::Win(Color::Red) => 1.0,
+                RuleOutcome::Win(Color::Black) => -1.0,
             });
         }
     }

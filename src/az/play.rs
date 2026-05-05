@@ -162,7 +162,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
-        let mut env = AzEnv::startpos(AzRuleSet::Simple);
+        let mut env = AzEnv::startpos(AzRuleSet::Full);
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
@@ -225,14 +225,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             ));
             env.make_move(mv);
 
-            if !env.position().has_general(Color::Red) {
-                result = Some(-1.0);
-                terminal.red_general_missing += 1;
-                break;
-            }
-            if !env.position().has_general(Color::Black) {
-                result = Some(1.0);
-                terminal.black_general_missing += 1;
+            if let Some(outcome) = env.game_result() {
+                result = Some(outcome);
+                if !env.position().has_general(Color::Red) {
+                    terminal.red_general_missing += 1;
+                } else if !env.position().has_general(Color::Black) {
+                    terminal.black_general_missing += 1;
+                }
                 break;
             }
         }
@@ -569,7 +568,7 @@ fn play_arena_game(
     seed: u64,
     cpuct: f32,
 ) -> f32 {
-    let mut env = AzEnv::from_position(initial_position.clone(), AzRuleSet::Simple);
+    let mut env = AzEnv::from_position(initial_position.clone(), AzRuleSet::Full);
     for ply in 0..max_plies {
         let legal = env.legal_moves();
         if legal.is_empty() {
@@ -603,11 +602,8 @@ fn play_arena_game(
         };
         env.make_move(mv);
 
-        if !env.position().has_general(Color::Red) {
-            return -1.0;
-        }
-        if !env.position().has_general(Color::Black) {
-            return 1.0;
+        if let Some(outcome) = env.game_result() {
+            return outcome;
         }
     }
     0.0

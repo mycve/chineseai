@@ -381,12 +381,7 @@ impl<'a> AzTree<'a> {
     }
 
     fn legal_moves(&self, node_index: usize) -> Vec<Move> {
-        let node = &self.nodes[node_index];
-        if self.rules == AzRuleSet::Full {
-            node.position.legal_moves_with_rules(&node.rule_history)
-        } else {
-            node.position.legal_moves()
-        }
+        self.nodes[node_index].position.legal_moves()
     }
 
     fn install_cached_eval(&mut self, node_index: usize, cached: CachedEval) {
