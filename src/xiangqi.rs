@@ -177,6 +177,17 @@ pub enum RuleOutcome {
     Win(Color),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuleStateSummary {
+    pub prior_repetitions: usize,
+    pub own_check: u16,
+    pub own_chase: u16,
+    pub own_alt: u16,
+    pub enemy_check: u16,
+    pub enemy_chase: u16,
+    pub enemy_alt: u16,
+}
+
 const PERPETUAL_CHECK_LIMIT_1: u16 = 6;
 const PERPETUAL_CHECK_LIMIT_2: u16 = 12;
 const PERPETUAL_CHECK_LIMIT_3: u16 = 18;
@@ -231,6 +242,37 @@ impl RuleCounters {
             || (self.alt[index] >= alt_limit && (self.check[index] > 0 || self.chase[index] > 0));
         violates.then_some(mover.opposite())
     }
+}
+
+pub fn summarize_rule_state(history: &[RuleHistoryEntry], side_to_move: Color) -> RuleStateSummary {
+    let mut summary = RuleStateSummary::default();
+    let Some(current) = history.last() else {
+        return summary;
+    };
+
+    summary.prior_repetitions = history
+        .iter()
+        .take(history.len().saturating_sub(1))
+        .filter(|entry| entry.hash == current.hash && entry.side_to_move == current.side_to_move)
+        .count();
+
+    let mut counters = RuleCounters::default();
+    for entry in history.iter().copied() {
+        let Some(mover) = entry.mover else {
+            continue;
+        };
+        counters.apply(entry, mover);
+    }
+
+    let own = color_hash_index(side_to_move);
+    let enemy = color_hash_index(side_to_move.opposite());
+    summary.own_check = counters.check[own];
+    summary.own_chase = counters.chase[own];
+    summary.own_alt = counters.alt[own];
+    summary.enemy_check = counters.check[enemy];
+    summary.enemy_chase = counters.chase[enemy];
+    summary.enemy_alt = counters.alt[enemy];
+    summary
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

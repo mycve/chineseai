@@ -1,5 +1,6 @@
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, RuleHistoryEntry,
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
+    RuleHistoryEntry, summarize_rule_state,
 };
 
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
@@ -515,53 +516,41 @@ fn append_rule_features(
     let Some(rule_history) = rule_history else {
         return;
     };
+    let summary = summarize_rule_state(rule_history, position.side_to_move());
+    if summary.prior_repetitions >= 2 {
+        features.push(rule_feature_index(3));
+    }
+    if summary.prior_repetitions >= 3 {
+        features.push(rule_feature_index(4));
+    }
+    if summary.prior_repetitions >= 4 {
+        features.push(rule_feature_index(5));
+    }
+    if summary
+        .own_check
+        .max(summary.own_chase)
+        .max(summary.own_alt)
+        >= 2
+    {
+        features.push(rule_feature_index(6));
+    }
+    if summary
+        .enemy_check
+        .max(summary.enemy_chase)
+        .max(summary.enemy_alt)
+        >= 2
+    {
+        features.push(rule_feature_index(7));
+    }
+    if summary.own_chase >= 2 {
+        features.push(rule_feature_index(8));
+    }
+    if summary.enemy_chase >= 2 {
+        features.push(rule_feature_index(9));
+    }
     let Some(current) = rule_history.last() else {
         return;
     };
-    let repeats = rule_history
-        .iter()
-        .filter(|entry| entry.hash == current.hash)
-        .count()
-        .saturating_sub(1);
-    if repeats >= 1 {
-        features.push(rule_feature_index(3));
-    }
-    if repeats >= 2 {
-        features.push(rule_feature_index(4));
-    }
-    if repeats >= 3 {
-        features.push(rule_feature_index(5));
-    }
-    let side = position.side_to_move();
-    let recent = rule_history.iter().rev().take(HISTORY_PLIES);
-    let mut own_check = 0usize;
-    let mut enemy_check = 0usize;
-    let mut own_chase = 0usize;
-    let mut enemy_chase = 0usize;
-    for entry in recent {
-        let Some(mover) = entry.mover else {
-            continue;
-        };
-        if mover == side {
-            own_check += usize::from(entry.gives_check);
-            own_chase += usize::from(entry.chased_mask != 0);
-        } else {
-            enemy_check += usize::from(entry.gives_check);
-            enemy_chase += usize::from(entry.chased_mask != 0);
-        }
-    }
-    if own_check >= 2 {
-        features.push(rule_feature_index(6));
-    }
-    if enemy_check >= 2 {
-        features.push(rule_feature_index(7));
-    }
-    if own_chase >= 2 {
-        features.push(rule_feature_index(8));
-    }
-    if enemy_chase >= 2 {
-        features.push(rule_feature_index(9));
-    }
     if current.gives_check {
         features.push(rule_feature_index(10));
     }
