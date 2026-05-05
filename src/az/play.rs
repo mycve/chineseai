@@ -188,7 +188,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            let legal = position.legal_moves_with_rules(&rule_history);
+            let legal = legal_moves_avoiding_voluntary_rule_draws(&position, &rule_history);
             if legal.is_empty() {
                 result = Some(if position.side_to_move() == Color::Red {
                     -1.0
@@ -481,6 +481,36 @@ mod tests {
         assert_eq!(augmented.value, explicit.value);
         assert_eq!(augmented.side_sign, explicit.side_sign);
     }
+
+    #[test]
+    fn selfplay_root_moves_avoid_voluntary_rule_draws_when_alternatives_exist() {
+        let mut position = Position::startpos();
+        let mut history = position.initial_rule_history();
+        let cycle = [
+            Move::from_uci("b0c2").unwrap(),
+            Move::from_uci("b9c7").unwrap(),
+            Move::from_uci("c2b0").unwrap(),
+            Move::from_uci("c7b9").unwrap(),
+        ];
+
+        for index in 0..15 {
+            let mv = cycle[index % cycle.len()];
+            assert!(position.is_legal_move(mv), "illegal cycle move {mv:?}");
+            let mover = position.side_to_move();
+            position.make_move(mv);
+            history.push(position.rule_history_entry(Some(mover)));
+        }
+
+        let repeating_move = cycle[15 % cycle.len()];
+        assert!(
+            position
+                .legal_moves_with_rules(&history)
+                .contains(&repeating_move)
+        );
+        let filtered = legal_moves_avoiding_voluntary_rule_draws(&position, &history);
+        assert!(!filtered.is_empty());
+        assert!(!filtered.contains(&repeating_move));
+    }
 }
 
 fn material_aux_targets(position: &Position) -> Vec<f32> {
@@ -608,6 +638,46 @@ fn arena_start_position(positions: &[Position], seed: u64, game_index: usize) ->
     }
 }
 
+fn legal_moves_avoiding_voluntary_rule_draws(
+    position: &Position,
+    rule_history: &[RuleHistoryEntry],
+) -> Vec<Move> {
+    let legal = position.legal_moves_with_rules(rule_history);
+    if legal.len() <= 1 {
+        return legal;
+    }
+
+    let base_history = if rule_history.last().is_some_and(|entry| {
+        entry.hash == position.hash() && entry.side_to_move == position.side_to_move()
+    }) {
+        rule_history.to_vec()
+    } else {
+        let mut normalized = rule_history.to_vec();
+        normalized.push(position.rule_history_entry(None));
+        normalized
+    };
+    let mover = position.side_to_move();
+    let mut non_draws = Vec::with_capacity(legal.len());
+    for &mv in &legal {
+        let mut next = position.clone();
+        next.make_move(mv);
+        let mut next_history = base_history.clone();
+        next_history.push(next.rule_history_entry(Some(mover)));
+        if !matches!(
+            next.rule_outcome_with_history(&next_history),
+            Some(RuleOutcome::Draw(_))
+        ) {
+            non_draws.push(mv);
+        }
+    }
+
+    if non_draws.is_empty() {
+        legal
+    } else {
+        non_draws
+    }
+}
+
 fn play_arena_game(
     initial_position: &Position,
     red_model: &AzNnue,
@@ -621,7 +691,7 @@ fn play_arena_game(
     let mut history = Vec::new();
     let mut rule_history = position.initial_rule_history();
     for ply in 0..max_plies {
-        let legal = position.legal_moves_with_rules(&rule_history);
+        let legal = legal_moves_avoiding_voluntary_rule_draws(&position, &rule_history);
         if legal.is_empty() {
             return if position.side_to_move() == Color::Red {
                 -1.0
