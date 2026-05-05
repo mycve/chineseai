@@ -285,7 +285,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_mxp{}_wk{}_",
             "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_vw{}_cpi{}_",
-            "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
+            "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_rep{}_sd{}"
         ),
         config.simulations,
         config.batch_size,
@@ -313,6 +313,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.gumbel.gumbel_scale),
         f32_slug(config.gumbel.value_scale),
         f32_slug(config.gumbel.maxvisit_init),
+        u8::from(config.selfplay_repetition_as_loss),
         config.seed,
     )
 }
@@ -427,6 +428,7 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         root_exploration_fraction: config.root_exploration_fraction,
         gumbel: config.gumbel,
         mirror_probability: config.mirror_probability,
+        selfplay_repetition_as_loss: config.selfplay_repetition_as_loss,
     }
 }
 
@@ -881,7 +883,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} value_weight={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) value_target=terminal replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} value_weight={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) value_target=terminal repetition_as_loss={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -904,6 +906,7 @@ fn main() {
                 config.gumbel.maxvisit_init,
                 config.gumbel.rescale_values,
                 config.gumbel.use_mixed_value,
+                config.selfplay_repetition_as_loss,
                 config.replay_games,
                 config.replay_samples,
                 config.mirror_probability,

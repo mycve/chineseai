@@ -200,6 +200,7 @@ pub struct AzLoopConfig {
     pub root_exploration_fraction: f32,
     pub gumbel: AzGumbelConfig,
     pub mirror_probability: f32,
+    pub selfplay_repetition_as_loss: bool,
 }
 
 #[derive(Clone, Debug)]
