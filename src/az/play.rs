@@ -18,8 +18,6 @@ use super::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
     pub no_legal_moves: usize,
-    pub red_general_missing: usize,
-    pub black_general_missing: usize,
     pub no_attacking_material: usize,
     pub halfmove120: usize,
     pub repetition: usize,
@@ -37,8 +35,6 @@ pub struct AzTerminalStats {
 impl AzTerminalStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.no_legal_moves += other.no_legal_moves;
-        self.red_general_missing += other.red_general_missing;
-        self.black_general_missing += other.black_general_missing;
         self.no_attacking_material += other.no_attacking_material;
         self.halfmove120 += other.halfmove120;
         self.repetition += other.repetition;
@@ -293,8 +289,6 @@ fn record_terminal_reason(
     rule_history: &[RuleHistoryEntry],
 ) {
     match reason {
-        AzGameEndReason::RedGeneralMissing => stats.red_general_missing += 1,
-        AzGameEndReason::BlackGeneralMissing => stats.black_general_missing += 1,
         AzGameEndReason::NoLegalMoves => stats.no_legal_moves += 1,
         AzGameEndReason::NoAttackingMaterial => stats.no_attacking_material += 1,
         AzGameEndReason::Halfmove120 => stats.halfmove120 += 1,

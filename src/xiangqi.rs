@@ -471,7 +471,7 @@ impl Position {
         let Some(target_piece) = self.board.get(target).and_then(|piece| *piece) else {
             return Vec::new();
         };
-        if target_piece.color == self.side_to_move {
+        if target_piece.color == self.side_to_move || target_piece.kind == PieceKind::General {
             return Vec::new();
         }
 
@@ -657,13 +657,10 @@ impl Position {
         if piece.color != self.side_to_move {
             return false;
         }
-        if self
-            .board
-            .get(to)
-            .and_then(|target| *target)
-            .is_some_and(|target| target.color == self.side_to_move)
-        {
-            return false;
+        if let Some(target) = self.board.get(to).and_then(|target| *target) {
+            if target.color == self.side_to_move || target.kind == PieceKind::General {
+                return false;
+            }
         }
 
         let mut pseudo = Vec::with_capacity(16);
@@ -918,6 +915,14 @@ impl Position {
 
         for read_index in 0..moves.len() {
             let mv = moves[read_index];
+            if self
+                .board
+                .get(mv.to as usize)
+                .and_then(|target| *target)
+                .is_some_and(|target| target.kind == PieceKind::General)
+            {
+                continue;
+            }
             let undo = work.make_move(mv);
             if !work.in_check(self.side_to_move) && (!needs_capture_filter || self.is_capture(mv)) {
                 moves[legal_len] = mv;

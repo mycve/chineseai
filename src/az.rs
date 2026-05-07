@@ -230,8 +230,6 @@ pub struct AzLoopReport {
     pub pool_games: usize,
     pub pool_samples: usize,
     pub terminal_no_legal_moves: usize,
-    pub terminal_red_general_missing: usize,
-    pub terminal_black_general_missing: usize,
     pub terminal_no_attacking_material: usize,
     pub terminal_halfmove120: usize,
     pub terminal_repetition: usize,

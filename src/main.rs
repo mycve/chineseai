@@ -479,8 +479,6 @@ fn build_async_training_report(
         pool_games,
         pool_samples,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
-        terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
-        terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
         terminal_no_attacking_material: pending.selfplay.terminal.no_attacking_material,
         terminal_halfmove120: pending.selfplay.terminal.halfmove120,
         terminal_repetition: pending.selfplay.terminal.repetition,
@@ -1130,8 +1128,6 @@ fn main() {
                                     pool_games: 0,
                                     pool_samples: 0,
                                     terminal_no_legal_moves: 0,
-                                    terminal_red_general_missing: 0,
-                                    terminal_black_general_missing: 0,
                                     terminal_no_attacking_material: 0,
                                     terminal_halfmove120: 0,
                                     terminal_repetition: 0,
@@ -1177,8 +1173,6 @@ fn main() {
                                     pool_games: 0,
                                     pool_samples: 0,
                                     terminal_no_legal_moves: 0,
-                                    terminal_red_general_missing: 0,
-                                    terminal_black_general_missing: 0,
                                     terminal_no_attacking_material: 0,
                                     terminal_halfmove120: 0,
                                     terminal_repetition: 0,
@@ -1243,7 +1237,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} aux_mat={:.4} aux_occ={:.4} lr={:.6} tempH={:.3}/{:.3} term=N{} RG{} BG{} NA{} H120{} Rep{}(Q{} C{} Ch{} P{}) MLC{} MLCs{} Rw{} Bw{} Max{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} aux_mat={:.4} aux_occ={:.4} lr={:.6} tempH={:.3}/{:.3} term=N{} NA{} H120{} Rep{}(Q{} C{} Ch{} P{}) MLC{} MLCs{} Rw{} Bw{} Max{} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1270,8 +1264,6 @@ fn main() {
                     report.temperature_early_entropy,
                     report.temperature_mid_entropy,
                     report.terminal_no_legal_moves,
-                    report.terminal_red_general_missing,
-                    report.terminal_black_general_missing,
                     report.terminal_no_attacking_material,
                     report.terminal_halfmove120,
                     report.terminal_repetition,
@@ -1413,18 +1405,6 @@ fn main() {
                     "terminal/no_legal_moves",
                     update,
                     report.terminal_no_legal_moves as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/red_general_missing",
-                    update,
-                    report.terminal_red_general_missing as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/black_general_missing",
-                    update,
-                    report.terminal_black_general_missing as f32,
                 );
                 log_scalar(
                     &mut tb,

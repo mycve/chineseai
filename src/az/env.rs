@@ -78,8 +78,6 @@ impl AzEnv {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AzGameEndReason {
-    RedGeneralMissing,
-    BlackGeneralMissing,
     NoLegalMoves,
     NoAttackingMaterial,
     Halfmove120,
@@ -101,20 +99,8 @@ pub(super) fn terminal_value_for(
     rule_history: &[RuleHistoryEntry],
     rules: AzRuleSet,
 ) -> Option<f32> {
-    if !position.has_general(Color::Red) {
-        return Some(if position.side_to_move() == Color::Red {
-            -1.0
-        } else {
-            1.0
-        });
-    }
-    if !position.has_general(Color::Black) {
-        return Some(if position.side_to_move() == Color::Black {
-            -1.0
-        } else {
-            1.0
-        });
-    }
+    debug_assert!(position.has_general(Color::Red));
+    debug_assert!(position.has_general(Color::Black));
     if position.legal_moves().is_empty() {
         return Some(-1.0);
     }
@@ -143,18 +129,8 @@ pub(super) fn game_result_for(
     rule_history: &[RuleHistoryEntry],
     rules: AzRuleSet,
 ) -> Option<AzGameResult> {
-    if !position.has_general(Color::Red) {
-        return Some(AzGameResult {
-            result: -1.0,
-            reason: AzGameEndReason::RedGeneralMissing,
-        });
-    }
-    if !position.has_general(Color::Black) {
-        return Some(AzGameResult {
-            result: 1.0,
-            reason: AzGameEndReason::BlackGeneralMissing,
-        });
-    }
+    debug_assert!(position.has_general(Color::Red));
+    debug_assert!(position.has_general(Color::Black));
     if position.legal_moves().is_empty() {
         return Some(AzGameResult {
             result: if position.side_to_move() == Color::Red {
