@@ -12,10 +12,8 @@ mod train_gpu;
 
 #[cfg(test)]
 use crate::nnue::canonical_square;
-#[cfg(test)]
-use crate::nnue::extract_sparse_features_v4_canonical;
 use crate::nnue::{
-    HistoryMove, V4_INPUT_SIZE, canonical_move, extract_sparse_features_v4_canonical_with_rules,
+    HistoryMove, V4_INPUT_SIZE, canonical_move, extract_sparse_features_v4_canonical,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Move, Position, RuleHistoryEntry};
 #[cfg(test)]
@@ -35,7 +33,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 26;
+const AZNNUE_BINARY_VERSION: u32 = 28;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -156,6 +154,10 @@ pub struct AzNnue {
 //   are rotated 180 degrees with colors swapped. The old side-to-move board
 //   channel is removed; do not feed canonical boards with absolute move labels,
 //   because that recreates the red/black leakage bug.
+// - v27 replaces from/to history events with full sparse board-history frames
+//   for the previous HISTORY_PLIES positions.
+// - v28 removes explicit rule-history buckets from the NN input; rules remain
+//   exact environment/MCTS state, while the model sees only board/history frames.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -542,13 +544,12 @@ impl AzNnue {
         &self,
         position: &Position,
         history: &[HistoryMove],
-        rule_history: &[RuleHistoryEntry],
+        _rule_history: &[RuleHistoryEntry],
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         let side = position.side_to_move();
-        let features =
-            extract_sparse_features_v4_canonical_with_rules(position, history, Some(rule_history));
+        let features = extract_sparse_features_v4_canonical(position, history);
         self.input_embedding_into(&features, &mut scratch.hidden);
         self.value_shared_hidden_into(&scratch.hidden, &mut scratch.value_hidden);
         self.forward_value_trunk_into(&mut scratch.value_hidden, &mut scratch.value_next);

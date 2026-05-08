@@ -1,14 +1,12 @@
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
-    RuleHistoryEntry, summarize_rule_state,
 };
 
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
 pub const V2_KING_BUCKETS: usize = 9;
 pub const V2_INPUT_SIZE: usize = INPUT_SIZE + 2 * V2_KING_BUCKETS * 14 * BOARD_SIZE;
 pub const HISTORY_PLIES: usize = 8;
-const HISTORY_EVENT_TYPES: usize = 2;
-const HISTORY_INPUT_SIZE: usize = HISTORY_PLIES * HISTORY_EVENT_TYPES * 14 * BOARD_SIZE;
+const HISTORY_INPUT_SIZE: usize = HISTORY_PLIES * 14 * BOARD_SIZE;
 pub const V3_INPUT_SIZE: usize = V2_INPUT_SIZE + HISTORY_INPUT_SIZE;
 const ROW_INPUT_SIZE: usize = 14 * BOARD_RANKS;
 const COL_INPUT_SIZE: usize = 14 * BOARD_FILES;
@@ -35,8 +33,6 @@ const MATERIAL_COUNT_INPUT_SIZE: usize = 14 * MATERIAL_COUNT_BUCKETS;
 const MATERIAL_DELTA_BUCKETS: usize = 11;
 const MATERIAL_DELTA_INPUT_SIZE: usize = 7 * MATERIAL_DELTA_BUCKETS;
 const FRAME_PRESENCE_INPUT_SIZE: usize = HISTORY_PLIES * 14;
-const RULE_BUCKETS: usize = 12;
-const RULE_INPUT_SIZE: usize = RULE_BUCKETS;
 pub const V4_INPUT_SIZE: usize = V3_INPUT_SIZE
     + ROW_INPUT_SIZE
     + COL_INPUT_SIZE
@@ -45,8 +41,7 @@ pub const V4_INPUT_SIZE: usize = V3_INPUT_SIZE
     + REGION_INPUT_SIZE
     + MATERIAL_COUNT_INPUT_SIZE
     + MATERIAL_DELTA_INPUT_SIZE
-    + FRAME_PRESENCE_INPUT_SIZE
-    + RULE_INPUT_SIZE;
+    + FRAME_PRESENCE_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -94,22 +89,7 @@ pub fn extract_sparse_features_v2(position: &Position) -> Vec<usize> {
 
 pub fn extract_sparse_features_v3(position: &Position, history: &[HistoryMove]) -> Vec<usize> {
     let mut features = extract_sparse_features_v2(position);
-    features.reserve(history.len().min(HISTORY_PLIES) * HISTORY_EVENT_TYPES);
-    for (age, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
-        let piece_index = absolute_piece_index(entry.piece.color, entry.piece.kind);
-        features.push(history_feature_index(
-            age,
-            0,
-            piece_index,
-            entry.mv.from as usize,
-        ));
-        features.push(history_feature_index(
-            age,
-            1,
-            piece_index,
-            entry.mv.to as usize,
-        ));
-    }
+    append_history_frame_features(position, history, false, &mut features);
     features.sort_unstable();
     features
 }
@@ -152,14 +132,6 @@ pub fn extract_sparse_features_v4_canonical(
     position: &Position,
     history: &[HistoryMove],
 ) -> Vec<usize> {
-    extract_sparse_features_v4_canonical_with_rules(position, history, None)
-}
-
-pub fn extract_sparse_features_v4_canonical_with_rules(
-    position: &Position,
-    history: &[HistoryMove],
-    rule_history: Option<&[RuleHistoryEntry]>,
-) -> Vec<usize> {
     let side = position.side_to_move();
     let own_king_bucket = position
         .general_square(side)
@@ -198,22 +170,7 @@ pub fn extract_sparse_features_v4_canonical_with_rules(
         ));
     }
 
-    for (age, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
-        let piece_index = canonical_piece_index(side, entry.piece);
-        features.push(frame_presence_feature_index(age, piece_index));
-        features.push(history_feature_index(
-            age,
-            0,
-            piece_index,
-            orient_square(side, entry.mv.from as usize),
-        ));
-        features.push(history_feature_index(
-            age,
-            1,
-            piece_index,
-            orient_square(side, entry.mv.to as usize),
-        ));
-    }
+    append_history_frame_features(position, history, true, &mut features);
 
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
@@ -279,9 +236,53 @@ pub fn extract_sparse_features_v4_canonical_with_rules(
         let delta = (own as isize - enemy as isize).clamp(-5, 5);
         features.push(material_delta_feature_index(kind, (delta + 5) as usize));
     }
-    append_rule_features(position, rule_history, &mut features);
     features.sort_unstable();
     features
+}
+
+fn append_history_frame_features(
+    position: &Position,
+    history: &[HistoryMove],
+    canonical: bool,
+    features: &mut Vec<usize>,
+) {
+    let side = position.side_to_move();
+    let mut frame = [None; BOARD_SIZE];
+    for (sq, slot) in frame.iter_mut().enumerate() {
+        *slot = position.piece_at(sq);
+    }
+
+    for (age, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
+        frame[entry.mv.to as usize] = entry.captured;
+        frame[entry.mv.from as usize] = Some(entry.piece);
+
+        let mut present = [false; 14];
+        for (sq, piece) in frame.iter().enumerate() {
+            let Some(piece) = *piece else {
+                continue;
+            };
+            let piece_index = if canonical {
+                canonical_piece_index(side, piece)
+            } else {
+                absolute_piece_index(piece.color, piece.kind)
+            };
+            let history_sq = if canonical {
+                orient_square(side, sq)
+            } else {
+                sq
+            };
+            features.push(history_feature_index(age, piece_index, history_sq));
+            present[piece_index] = true;
+        }
+
+        if canonical {
+            for (piece_index, is_present) in present.into_iter().enumerate() {
+                if is_present {
+                    features.push(frame_presence_feature_index(age, piece_index));
+                }
+            }
+        }
+    }
 }
 
 pub fn mirror_file_square(sq: usize) -> usize {
@@ -345,9 +346,8 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
         let partial = offset / BOARD_SIZE;
         let piece_index = partial % 14;
         let partial = partial / 14;
-        let event = partial % HISTORY_EVENT_TYPES;
-        let age = partial / HISTORY_EVENT_TYPES;
-        return history_feature_index(age, event, piece_index, mirror_file_square(sq));
+        let age = partial / 14;
+        return history_feature_index(age, piece_index, mirror_file_square(sq));
     }
     if feature < V4_INPUT_SIZE {
         let offset = feature - V3_INPUT_SIZE;
@@ -404,8 +404,8 @@ fn king_aware_feature_index(
         + (((perspective * V2_KING_BUCKETS + king_bucket) * 14 + piece_index) * BOARD_SIZE + sq)
 }
 
-fn history_feature_index(age: usize, event: usize, piece_index: usize, sq: usize) -> usize {
-    V2_INPUT_SIZE + (((age * HISTORY_EVENT_TYPES + event) * 14 + piece_index) * BOARD_SIZE + sq)
+fn history_feature_index(age: usize, piece_index: usize, sq: usize) -> usize {
+    V2_INPUT_SIZE + ((age * 14 + piece_index) * BOARD_SIZE + sq)
 }
 
 fn row_feature_index(piece_index: usize, rank: usize) -> usize {
@@ -483,80 +483,6 @@ fn frame_presence_feature_index(age: usize, piece_index: usize) -> usize {
         + MATERIAL_DELTA_INPUT_SIZE
         + age * 14
         + piece_index
-}
-
-fn rule_feature_index(rule_bucket: usize) -> usize {
-    V3_INPUT_SIZE
-        + ROW_INPUT_SIZE
-        + COL_INPUT_SIZE
-        + NEIGHBOR_INPUT_SIZE
-        + LINE_RELATION_INPUT_SIZE
-        + REGION_INPUT_SIZE
-        + MATERIAL_COUNT_INPUT_SIZE
-        + MATERIAL_DELTA_INPUT_SIZE
-        + FRAME_PRESENCE_INPUT_SIZE
-        + rule_bucket
-}
-
-fn append_rule_features(
-    position: &Position,
-    rule_history: Option<&[RuleHistoryEntry]>,
-    features: &mut Vec<usize>,
-) {
-    let halfmove = position.halfmove_clock();
-    if halfmove >= 60 {
-        features.push(rule_feature_index(0));
-    }
-    if halfmove >= 90 {
-        features.push(rule_feature_index(1));
-    }
-    if halfmove >= 110 {
-        features.push(rule_feature_index(2));
-    }
-    let Some(rule_history) = rule_history else {
-        return;
-    };
-    let summary = summarize_rule_state(rule_history, position.side_to_move());
-    if summary.prior_repetitions >= 2 {
-        features.push(rule_feature_index(3));
-    }
-    if summary.prior_repetitions >= 3 {
-        features.push(rule_feature_index(4));
-    }
-    if summary.prior_repetitions >= 4 {
-        features.push(rule_feature_index(5));
-    }
-    if summary
-        .own_check
-        .max(summary.own_chase)
-        .max(summary.own_alt)
-        >= 2
-    {
-        features.push(rule_feature_index(6));
-    }
-    if summary
-        .enemy_check
-        .max(summary.enemy_chase)
-        .max(summary.enemy_alt)
-        >= 2
-    {
-        features.push(rule_feature_index(7));
-    }
-    if summary.own_chase >= 2 {
-        features.push(rule_feature_index(8));
-    }
-    if summary.enemy_chase >= 2 {
-        features.push(rule_feature_index(9));
-    }
-    let Some(current) = rule_history.last() else {
-        return;
-    };
-    if current.gives_check {
-        features.push(rule_feature_index(10));
-    }
-    if current.chased_mask != 0 {
-        features.push(rule_feature_index(11));
-    }
 }
 
 fn mirror_neighbor_offset_index(offset_index: usize) -> usize {
@@ -670,7 +596,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v3_features_include_base_king_aware_and_history_inputs() {
+    fn v3_features_include_base_king_aware_and_history_frames() {
         let position = Position::startpos();
         let history = [HistoryMove {
             piece: position.piece_at(64).unwrap(),
@@ -679,7 +605,7 @@ mod tests {
         }];
         let features = extract_sparse_features_v3(&position, &history);
 
-        assert_eq!(features.len(), 32 * 3 + 2);
+        assert_eq!(features.len(), 32 * 3 + 32);
         assert!(features.iter().all(|feature| *feature < V3_INPUT_SIZE));
         assert!(!features.contains(&(INPUT_SIZE - 1)));
         assert!(features.iter().any(|feature| *feature >= INPUT_SIZE));

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::nnue::{
-    HistoryMove, canonical_move, extract_sparse_features_v4_canonical_with_rules, mirror_file_move,
+    HistoryMove, canonical_move, extract_sparse_features_v4_canonical, mirror_file_move,
     mirror_file_square, mirror_sparse_features_file,
 };
 use crate::xiangqi::{
@@ -335,7 +335,7 @@ fn record_repetition_detail(stats: &mut AzTerminalStats, rule_history: &[RuleHis
 fn make_training_sample(
     position: &Position,
     history: &[HistoryMove],
-    rule_history: &[RuleHistoryEntry],
+    _rule_history: &[RuleHistoryEntry],
     candidates: &[AzCandidate],
     value: f32,
     mirror_file: bool,
@@ -346,8 +346,7 @@ fn make_training_sample(
         .sum::<f32>()
         .max(1.0);
     let side = position.side_to_move();
-    let mut features =
-        extract_sparse_features_v4_canonical_with_rules(position, history, Some(rule_history));
+    let mut features = extract_sparse_features_v4_canonical(position, history);
     let mut moves = candidates
         .iter()
         .map(|candidate| canonical_move(side, candidate.mv))
