@@ -575,6 +575,13 @@ fn parse_arena_report(text: &str) -> AzArenaReport {
             "losses_as_red" => report.losses_as_red = parsed,
             "wins_as_black" => report.wins_as_black = parsed,
             "losses_as_black" => report.losses_as_black = parsed,
+            "draw_max_plies" => report.draw_max_plies = parsed,
+            "draw_no_attacking_material" => report.draw_no_attacking_material = parsed,
+            "draw_halfmove120" => report.draw_halfmove120 = parsed,
+            "draw_repetition" => report.draw_repetition = parsed,
+            "draw_mutual_long_check" => report.draw_mutual_long_check = parsed,
+            "draw_mutual_long_chase" => report.draw_mutual_long_chase = parsed,
+            "draw_search_empty" => report.draw_search_empty = parsed,
             _ => {}
         }
     }
@@ -1490,7 +1497,7 @@ fn main() {
                         });
                     }
                     println!(
-                        "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} elo={:.1} best={}{}",
+                        "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} draw=max{} na{} h120{} rep{} mlc{} mlcs{} empty{} score={:.1} rate={:.3} elo={:.1} best={}{}",
                         arena.total_games(),
                         arena_eval_fens,
                         arena.wins,
@@ -1500,6 +1507,13 @@ fn main() {
                         arena.losses_as_red,
                         arena.wins_as_black,
                         arena.losses_as_black,
+                        arena.draw_max_plies,
+                        arena.draw_no_attacking_material,
+                        arena.draw_halfmove120,
+                        arena.draw_repetition,
+                        arena.draw_mutual_long_check,
+                        arena.draw_mutual_long_chase,
+                        arena.draw_search_empty,
                         arena.score(),
                         arena.score_rate(),
                         arena.elo(),
@@ -1509,6 +1523,48 @@ fn main() {
                     log_scalar(&mut tb, "arena/wins", update, arena.wins as f32);
                     log_scalar(&mut tb, "arena/losses", update, arena.losses as f32);
                     log_scalar(&mut tb, "arena/draws", update, arena.draws as f32);
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_max_plies",
+                        update,
+                        arena.draw_max_plies as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_no_attacking_material",
+                        update,
+                        arena.draw_no_attacking_material as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_halfmove120",
+                        update,
+                        arena.draw_halfmove120 as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_repetition",
+                        update,
+                        arena.draw_repetition as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_mutual_long_check",
+                        update,
+                        arena.draw_mutual_long_check as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_mutual_long_chase",
+                        update,
+                        arena.draw_mutual_long_chase as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "arena/draw_search_empty",
+                        update,
+                        arena.draw_search_empty as f32,
+                    );
                     log_scalar(&mut tb, "arena/score", update, arena.score());
                     log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
                     log_scalar(&mut tb, "arena/elo", update, arena.elo());
@@ -1613,14 +1669,21 @@ fn main() {
                 },
             );
             println!(
-                "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={}",
+                "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={} draw_max_plies={} draw_no_attacking_material={} draw_halfmove120={} draw_repetition={} draw_mutual_long_check={} draw_mutual_long_chase={} draw_search_empty={}",
                 report.wins,
                 report.losses,
                 report.draws,
                 report.wins_as_red,
                 report.losses_as_red,
                 report.wins_as_black,
-                report.losses_as_black
+                report.losses_as_black,
+                report.draw_max_plies,
+                report.draw_no_attacking_material,
+                report.draw_halfmove120,
+                report.draw_repetition,
+                report.draw_mutual_long_check,
+                report.draw_mutual_long_chase,
+                report.draw_search_empty
             );
         }
         Some(CliCommand::Perft(cmd)) => {

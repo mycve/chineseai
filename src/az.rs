@@ -344,7 +344,7 @@ impl AzNnue {
         let value_logits_weights = (0..VALUE_LOGITS * VALUE_HIDDEN_SIZE)
             .map(|_| rng.weight((2.0 / VALUE_HIDDEN_SIZE as f32).sqrt()))
             .collect();
-        let value_logits_bias = vec![-0.25, 0.5, -0.25];
+        let value_logits_bias = vec![0.0; VALUE_LOGITS];
         let policy_move_hidden = (0..DENSE_MOVE_SPACE * hidden_size)
             .map(|_| rng.weight(0.01))
             .collect();

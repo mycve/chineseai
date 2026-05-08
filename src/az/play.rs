@@ -59,6 +59,13 @@ pub struct AzArenaReport {
     pub losses_as_red: usize,
     pub wins_as_black: usize,
     pub losses_as_black: usize,
+    pub draw_max_plies: usize,
+    pub draw_no_attacking_material: usize,
+    pub draw_halfmove120: usize,
+    pub draw_repetition: usize,
+    pub draw_mutual_long_check: usize,
+    pub draw_mutual_long_chase: usize,
+    pub draw_search_empty: usize,
 }
 
 impl AzArenaReport {
@@ -70,6 +77,13 @@ impl AzArenaReport {
         self.losses_as_red += other.losses_as_red;
         self.wins_as_black += other.wins_as_black;
         self.losses_as_black += other.losses_as_black;
+        self.draw_max_plies += other.draw_max_plies;
+        self.draw_no_attacking_material += other.draw_no_attacking_material;
+        self.draw_halfmove120 += other.draw_halfmove120;
+        self.draw_repetition += other.draw_repetition;
+        self.draw_mutual_long_check += other.draw_mutual_long_check;
+        self.draw_mutual_long_chase += other.draw_mutual_long_chase;
+        self.draw_search_empty += other.draw_search_empty;
     }
 
     pub fn total_games(&self) -> usize {
@@ -92,6 +106,23 @@ impl AzArenaReport {
         let score_rate = ((self.score() + 0.5) / (total as f32 + 1.0)).clamp(1e-6, 1.0 - 1e-6);
         400.0 * (score_rate / (1.0 - score_rate)).log10()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AzArenaDrawReason {
+    MaxPlies,
+    NoAttackingMaterial,
+    Halfmove120,
+    Repetition,
+    MutualLongCheck,
+    MutualLongChase,
+    SearchEmpty,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AzArenaGameOutcome {
+    result: f32,
+    draw_reason: Option<AzArenaDrawReason>,
 }
 
 #[derive(Clone, Default)]
@@ -572,7 +603,7 @@ pub fn play_arena_games_from_positions(
             game_seed,
             config.cpuct,
         );
-        match outcome.total_cmp(&0.0) {
+        match outcome.result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
                 report.wins += 1;
                 report.wins_as_red += 1;
@@ -581,7 +612,7 @@ pub fn play_arena_games_from_positions(
                 report.losses += 1;
                 report.losses_as_red += 1;
             }
-            std::cmp::Ordering::Equal => report.draws += 1,
+            std::cmp::Ordering::Equal => record_arena_draw(&mut report, outcome.draw_reason),
         }
         game_seed = game_seed.wrapping_add(1);
     }
@@ -596,7 +627,7 @@ pub fn play_arena_games_from_positions(
             game_seed,
             config.cpuct,
         );
-        match outcome.total_cmp(&0.0) {
+        match outcome.result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
                 report.losses += 1;
                 report.losses_as_black += 1;
@@ -605,11 +636,24 @@ pub fn play_arena_games_from_positions(
                 report.wins += 1;
                 report.wins_as_black += 1;
             }
-            std::cmp::Ordering::Equal => report.draws += 1,
+            std::cmp::Ordering::Equal => record_arena_draw(&mut report, outcome.draw_reason),
         }
         game_seed = game_seed.wrapping_add(1);
     }
     report
+}
+
+fn record_arena_draw(report: &mut AzArenaReport, reason: Option<AzArenaDrawReason>) {
+    report.draws += 1;
+    match reason.unwrap_or(AzArenaDrawReason::MaxPlies) {
+        AzArenaDrawReason::MaxPlies => report.draw_max_plies += 1,
+        AzArenaDrawReason::NoAttackingMaterial => report.draw_no_attacking_material += 1,
+        AzArenaDrawReason::Halfmove120 => report.draw_halfmove120 += 1,
+        AzArenaDrawReason::Repetition => report.draw_repetition += 1,
+        AzArenaDrawReason::MutualLongCheck => report.draw_mutual_long_check += 1,
+        AzArenaDrawReason::MutualLongChase => report.draw_mutual_long_chase += 1,
+        AzArenaDrawReason::SearchEmpty => report.draw_search_empty += 1,
+    }
 }
 
 fn arena_start_position(positions: &[Position], seed: u64, game_index: usize) -> Position {
@@ -631,15 +675,18 @@ fn play_arena_game(
     max_plies: usize,
     seed: u64,
     cpuct: f32,
-) -> f32 {
+) -> AzArenaGameOutcome {
     let mut env = AzEnv::from_position(initial_position.clone(), AzRuleSet::Full);
     for ply in 0..max_plies {
         let legal = env.legal_moves();
         if legal.is_empty() {
-            return if env.position().side_to_move() == Color::Red {
-                -1.0
-            } else {
-                1.0
+            return AzArenaGameOutcome {
+                result: if env.position().side_to_move() == Color::Red {
+                    -1.0
+                } else {
+                    1.0
+                },
+                draw_reason: None,
             };
         }
         let model = if env.position().side_to_move() == Color::Red {
@@ -662,13 +709,33 @@ fn play_arena_game(
             },
         );
         let Some(mv) = result.best_move else {
-            return 0.0;
+            return AzArenaGameOutcome {
+                result: 0.0,
+                draw_reason: Some(AzArenaDrawReason::SearchEmpty),
+            };
         };
         env.make_move(mv);
 
-        if let Some(outcome) = env.game_result() {
-            return outcome;
+        if let Some(outcome) = env.game_result_details() {
+            return AzArenaGameOutcome {
+                result: outcome.result,
+                draw_reason: arena_draw_reason(outcome.reason),
+            };
         }
     }
-    0.0
+    AzArenaGameOutcome {
+        result: 0.0,
+        draw_reason: Some(AzArenaDrawReason::MaxPlies),
+    }
+}
+
+fn arena_draw_reason(reason: AzGameEndReason) -> Option<AzArenaDrawReason> {
+    match reason {
+        AzGameEndReason::NoAttackingMaterial => Some(AzArenaDrawReason::NoAttackingMaterial),
+        AzGameEndReason::Halfmove120 => Some(AzArenaDrawReason::Halfmove120),
+        AzGameEndReason::Repetition => Some(AzArenaDrawReason::Repetition),
+        AzGameEndReason::MutualLongCheck => Some(AzArenaDrawReason::MutualLongCheck),
+        AzGameEndReason::MutualLongChase => Some(AzArenaDrawReason::MutualLongChase),
+        _ => None,
+    }
 }

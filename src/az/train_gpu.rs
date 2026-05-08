@@ -423,7 +423,9 @@ impl GpuReplica {
         let loss_prob = value_probs.narrow(1, 2, 1)?;
         let value = (win - loss_prob)?.squeeze(1)?;
         let value_error = (&value - &batch_tensors.values)?;
-        let value_loss = value_error.sqr()?.sum_all()?;
+        let log_value = log_softmax(&forward.value_logits, 1)?;
+        let value_wdl_ce_per_sample = ((&batch_tensors.value_wdl_targets * &log_value)? * -1.0)?;
+        let value_loss = value_wdl_ce_per_sample.sum_all()?;
 
         let log_policy = log_softmax(&forward.policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -579,6 +581,7 @@ struct BatchTensors {
     aux_occupancy: Tensor,
     policy_targets: Tensor,
     values: Tensor,
+    value_wdl_targets: Tensor,
 }
 
 impl BatchTensors {
@@ -596,6 +599,7 @@ impl BatchTensors {
         let mut aux_occupancy = vec![0.0f32; batch_size * AUX_OCCUPANCY_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut values = vec![0.0f32; batch_size];
+        let mut value_wdl_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
 
         for (row, &sample_index) in batch.iter().enumerate() {
             let sample = &samples[sample_index];
@@ -633,6 +637,14 @@ impl BatchTensors {
             }
             let value = sample.value.clamp(-1.0, 1.0);
             values[row] = value;
+            let value_class = if value > 0.0 {
+                0
+            } else if value < 0.0 {
+                2
+            } else {
+                1
+            };
+            value_wdl_targets[row * VALUE_LOGITS + value_class] = 1.0;
         }
 
         Ok(Self {
@@ -652,6 +664,11 @@ impl BatchTensors {
                 device,
             )?,
             values: Tensor::from_vec(values, batch_size, device)?,
+            value_wdl_targets: Tensor::from_vec(
+                value_wdl_targets,
+                (batch_size, VALUE_LOGITS),
+                device,
+            )?,
         })
     }
 }
