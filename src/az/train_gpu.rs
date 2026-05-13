@@ -4,10 +4,10 @@ use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
 use super::{
-    AUX_MATERIAL_SIZE, AUX_MATERIAL_WEIGHT, AUX_OCCUPANCY_SIZE, AUX_OCCUPANCY_WEIGHT, AzNnue,
-    AzTrainLossWeights, AzTrainStats, AzTrainingSample, DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE,
-    RESIDUAL_TRUNK_SCALE, VALUE_BRANCH_DEPTH, VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
-    policy_move_features,
+    AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, DENSE_MOVE_SPACE,
+    POLICY_CONDITION_SIZE, POLICY_TEMPLATE_SIZE, RESIDUAL_TRUNK_SCALE, VALUE_BRANCH_DEPTH,
+    VALUE_BRANCH_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS, policy_move_features,
+    policy_template_features,
 };
 use crate::nnue::V4_INPUT_SIZE;
 
@@ -49,11 +49,10 @@ struct GpuVars {
     policy_move_bias: Var,
     policy_feature_hidden: Var,
     policy_feature_bias: Var,
-    aux_material_weights: Var,
-    aux_material_bias: Var,
-    aux_occupancy_weights: Var,
-    aux_occupancy_bias: Var,
+    policy_template_hidden: Var,
+    policy_template_bias: Var,
     policy_move_features: Tensor,
+    policy_template_features: Tensor,
 }
 
 /// 与 `GpuTrainer` 使用的 `cuda_device_indices()` 一致。配置里「每卡 batch」× 本值 = 单步训练总 micro-batch 样本数。
@@ -108,8 +107,6 @@ pub(super) fn train_samples_gpu(
         stats.loss /= denom;
         stats.value_loss /= denom;
         stats.policy_ce /= denom;
-        stats.aux_material_loss /= denom;
-        stats.aux_occupancy_loss /= denom;
     }
     let trainer = model
         .gpu_trainer
@@ -432,40 +429,19 @@ impl GpuReplica {
         let policy_ce = policy_ce_per_sample.sum_all()?;
         let weighted_value_loss = (&value_loss * loss_weights.value.max(0.0) as f64)?;
         let weighted_policy_ce = (&policy_ce * loss_weights.policy.max(0.0) as f64)?;
-        let material_error = (&forward.aux_material - &batch_tensors.aux_material)?;
-        let material_loss = material_error.sqr()?.sum_all()?;
-        let occupancy_error = (&forward.aux_occupancy - &batch_tensors.aux_occupancy)?;
-        let occupancy_loss = occupancy_error.sqr()?.sum_all()?;
-        let aux_weight = if loss_weights.train_aux_heads {
-            1.0
-        } else {
-            0.0
-        };
-        let weighted_material_loss =
-            (&material_loss * (AUX_MATERIAL_WEIGHT * aux_weight).max(0.0) as f64)?;
-        let weighted_occupancy_loss =
-            (&occupancy_loss * (AUX_OCCUPANCY_WEIGHT * aux_weight).max(0.0) as f64)?;
-        let weighted_loss_sum =
-            ((weighted_value_loss + weighted_policy_ce)? + weighted_material_loss)?;
-        let weighted_loss_sum = (weighted_loss_sum + weighted_occupancy_loss)?;
+        let weighted_loss_sum = (weighted_value_loss + weighted_policy_ce)?;
         let loss_tensor = (weighted_loss_sum / global_batch_len as f64)?;
         let mut grads = loss_tensor.backward()?;
         self.vars.remove_frozen_grads(&mut grads, loss_weights);
 
         let value_loss = value_loss.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
-        let material_loss = material_loss.to_scalar::<f32>()?;
-        let occupancy_loss = occupancy_loss.to_scalar::<f32>()?;
-        let weighted_loss = value_loss * loss_weights.value.max(0.0)
-            + policy_ce * loss_weights.policy.max(0.0)
-            + material_loss * AUX_MATERIAL_WEIGHT * aux_weight
-            + occupancy_loss * AUX_OCCUPANCY_WEIGHT * aux_weight;
+        let weighted_loss =
+            value_loss * loss_weights.value.max(0.0) + policy_ce * loss_weights.policy.max(0.0);
         let stats = AzTrainStats {
             loss: weighted_loss,
             value_loss,
             policy_ce,
-            aux_material_loss: material_loss,
-            aux_occupancy_loss: occupancy_loss,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
             value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
             value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,
@@ -542,19 +518,16 @@ impl GpuReplica {
             .broadcast_add(&self.vars.policy_feature_bias)?;
         let policy_feature_logits =
             policy_condition.matmul(&self.vars.policy_move_features.t()?)?;
-        let policy_logits = (policy_logits + policy_feature_logits)?;
-        let aux_material = hidden
-            .matmul(&self.vars.aux_material_weights.t()?)?
-            .broadcast_add(&self.vars.aux_material_bias)?;
-        let aux_occupancy = hidden
-            .matmul(&self.vars.aux_occupancy_weights.t()?)?
-            .broadcast_add(&self.vars.aux_occupancy_bias)?;
+        let policy_template_condition = hidden
+            .matmul(&self.vars.policy_template_hidden.t()?)?
+            .broadcast_add(&self.vars.policy_template_bias)?;
+        let policy_template_logits =
+            policy_template_condition.matmul(&self.vars.policy_template_features.t()?)?;
+        let policy_logits = ((policy_logits + policy_feature_logits)? + policy_template_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
             policy_logits,
-            aux_material,
-            aux_occupancy,
         })
     }
 }
@@ -568,8 +541,6 @@ struct ShardOutput {
 struct ForwardOutput {
     value_logits: Tensor,
     policy_logits: Tensor,
-    aux_material: Tensor,
-    aux_occupancy: Tensor,
 }
 
 struct BatchTensors {
@@ -577,8 +548,6 @@ struct BatchTensors {
     max_features: usize,
     feature_indices: Tensor,
     feature_mask: Tensor,
-    aux_material: Tensor,
-    aux_occupancy: Tensor,
     policy_targets: Tensor,
     values: Tensor,
     value_wdl_targets: Tensor,
@@ -595,8 +564,6 @@ impl BatchTensors {
             .max(1);
         let mut feature_indices = vec![0u32; batch_size * max_features];
         let mut feature_mask = vec![0.0f32; batch_size * max_features];
-        let mut aux_material = vec![0.0f32; batch_size * AUX_MATERIAL_SIZE];
-        let mut aux_occupancy = vec![0.0f32; batch_size * AUX_OCCUPANCY_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut values = vec![0.0f32; batch_size];
         let mut value_wdl_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
@@ -609,24 +576,6 @@ impl BatchTensors {
                     feature_indices[feature_base + feature_offset] = feature as u32;
                     feature_mask[feature_base + feature_offset] = 1.0;
                 }
-            }
-            let material_base = row * AUX_MATERIAL_SIZE;
-            for (idx, &value) in sample
-                .aux_material
-                .iter()
-                .take(AUX_MATERIAL_SIZE)
-                .enumerate()
-            {
-                aux_material[material_base + idx] = value.clamp(0.0, 1.0);
-            }
-            let occupancy_base = row * AUX_OCCUPANCY_SIZE;
-            for (idx, &value) in sample
-                .aux_occupancy
-                .iter()
-                .take(AUX_OCCUPANCY_SIZE)
-                .enumerate()
-            {
-                aux_occupancy[occupancy_base + idx] = value.clamp(0.0, 1.0);
             }
 
             let policy_base = row * DENSE_MOVE_SPACE;
@@ -652,12 +601,6 @@ impl BatchTensors {
             max_features,
             feature_indices: Tensor::from_vec(feature_indices, (batch_size, max_features), device)?,
             feature_mask: Tensor::from_vec(feature_mask, (batch_size, max_features, 1), device)?,
-            aux_material: Tensor::from_vec(aux_material, (batch_size, AUX_MATERIAL_SIZE), device)?,
-            aux_occupancy: Tensor::from_vec(
-                aux_occupancy,
-                (batch_size, AUX_OCCUPANCY_SIZE),
-                device,
-            )?,
             policy_targets: Tensor::from_vec(
                 policy_targets,
                 (batch_size, DENSE_MOVE_SPACE),
@@ -740,25 +683,24 @@ impl GpuVars {
                 POLICY_CONDITION_SIZE,
                 device,
             )?,
-            aux_material_weights: var_from_slice(
-                &model.aux_material_weights,
-                (AUX_MATERIAL_SIZE, hidden),
+            policy_template_hidden: var_from_slice(
+                &model.policy_template_hidden,
+                (POLICY_TEMPLATE_SIZE, hidden),
                 device,
             )?,
-            aux_material_bias: var_from_slice(&model.aux_material_bias, AUX_MATERIAL_SIZE, device)?,
-            aux_occupancy_weights: var_from_slice(
-                &model.aux_occupancy_weights,
-                (AUX_OCCUPANCY_SIZE, hidden),
-                device,
-            )?,
-            aux_occupancy_bias: var_from_slice(
-                &model.aux_occupancy_bias,
-                AUX_OCCUPANCY_SIZE,
+            policy_template_bias: var_from_slice(
+                &model.policy_template_bias,
+                POLICY_TEMPLATE_SIZE,
                 device,
             )?,
             policy_move_features: Tensor::from_vec(
                 policy_move_features().to_vec(),
                 (DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE),
+                device,
+            )?,
+            policy_template_features: Tensor::from_vec(
+                policy_template_features().to_vec(),
+                (DENSE_MOVE_SPACE, POLICY_TEMPLATE_SIZE),
                 device,
             )?,
         })
@@ -780,10 +722,8 @@ impl GpuVars {
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_feature_hidden.clone());
         vars.push(self.policy_feature_bias.clone());
-        vars.push(self.aux_material_weights.clone());
-        vars.push(self.aux_material_bias.clone());
-        vars.push(self.aux_occupancy_weights.clone());
-        vars.push(self.aux_occupancy_bias.clone());
+        vars.push(self.policy_template_hidden.clone());
+        vars.push(self.policy_template_bias.clone());
         vars
     }
 
@@ -814,15 +754,8 @@ impl GpuVars {
             self.policy_move_bias.clone(),
             self.policy_feature_hidden.clone(),
             self.policy_feature_bias.clone(),
-        ]
-    }
-
-    fn aux_head_vars(&self) -> Vec<Var> {
-        vec![
-            self.aux_material_weights.clone(),
-            self.aux_material_bias.clone(),
-            self.aux_occupancy_weights.clone(),
-            self.aux_occupancy_bias.clone(),
+            self.policy_template_hidden.clone(),
+            self.policy_template_bias.clone(),
         ]
     }
 
@@ -839,11 +772,6 @@ impl GpuVars {
         }
         if !loss_weights.train_policy_head {
             for var in self.policy_head_vars() {
-                grads.remove(&var);
-            }
-        }
-        if !loss_weights.train_aux_heads {
-            for var in self.aux_head_vars() {
                 grads.remove(&var);
             }
         }
@@ -887,13 +815,11 @@ impl GpuVars {
             &mut model.policy_feature_hidden,
         )?;
         copy_var(&self.policy_feature_bias, &mut model.policy_feature_bias)?;
-        copy_var(&self.aux_material_weights, &mut model.aux_material_weights)?;
-        copy_var(&self.aux_material_bias, &mut model.aux_material_bias)?;
         copy_var(
-            &self.aux_occupancy_weights,
-            &mut model.aux_occupancy_weights,
+            &self.policy_template_hidden,
+            &mut model.policy_template_hidden,
         )?;
-        copy_var(&self.aux_occupancy_bias, &mut model.aux_occupancy_bias)?;
+        copy_var(&self.policy_template_bias, &mut model.policy_template_bias)?;
         Ok(())
     }
 

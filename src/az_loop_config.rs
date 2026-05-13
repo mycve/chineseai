@@ -309,18 +309,6 @@ impl AzLoopFileConfig {
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
 #
-# Model architecture:
-#   hidden_size is the runtime-tunable model width.
-#   The rest of the tensor shapes are fixed by the v26 binary architecture:
-#   shared sparse NNUE V4 trunk with row/column nearest-piece relation features,
-#   ZeroForge-style rule/material/region/frame sparse factors,
-#   policy_condition_size=32, value_branch=128x2, value_hidden=256.
-#   Policy and value share the same sparse features; value has only a compact
-#   private projection before its residual branch. Training also uses material
-#   and occupancy auxiliary heads; search/eval do not call them.
-#   Old CNN-board .nnue files are incompatible.
-#   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
-
 model_path = "{model_path}"
 simulations = {simulations}
 selfplay_batch_games = {selfplay_batch_games}
