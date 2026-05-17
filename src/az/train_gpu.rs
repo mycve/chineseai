@@ -574,12 +574,14 @@ impl GpuReplica {
             .broadcast_add(
                 &cnn_global
                     .narrow(1, CNN_CHANNELS * 3, CNN_CHANNELS * 2)?
+                    .contiguous()?
                     .matmul(
                         &self
                             .vars
                             .policy_move_cnn
                             .narrow(1, CNN_CHANNELS * 3, CNN_CHANNELS * 2)?
-                            .t()?,
+                            .t()?
+                            .contiguous()?,
                     )?
                     .broadcast_add(&self.vars.policy_move_bias)?,
             )?;
