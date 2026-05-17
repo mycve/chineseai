@@ -542,6 +542,7 @@ impl GpuReplica {
                 .relu()?
                 .reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?
                 .transpose(1, 2)?
+                .contiguous()?
         };
         let cnn_global = Tensor::cat(
             &[avg_pool, max_pool, attn_pool, row_line_pool, col_line_pool],
@@ -594,17 +595,27 @@ impl GpuReplica {
             )?;
         let policy_feature_logits =
             policy_condition.matmul(&self.vars.policy_move_features.t()?)?;
-        let from_nodes = policy_nodes.index_select(&self.vars.policy_from_map, 1)?;
-        let to_nodes = policy_nodes.index_select(&self.vars.policy_to_map, 1)?;
-        let from_weights = self.vars.policy_move_cnn.narrow(1, 0, CNN_CHANNELS)?;
+        let from_nodes = policy_nodes
+            .index_select(&self.vars.policy_from_map, 1)?
+            .contiguous()?;
+        let to_nodes = policy_nodes
+            .index_select(&self.vars.policy_to_map, 1)?
+            .contiguous()?;
+        let from_weights = self
+            .vars
+            .policy_move_cnn
+            .narrow(1, 0, CNN_CHANNELS)?
+            .contiguous()?;
         let to_weights = self
             .vars
             .policy_move_cnn
-            .narrow(1, CNN_CHANNELS, CNN_CHANNELS)?;
+            .narrow(1, CNN_CHANNELS, CNN_CHANNELS)?
+            .contiguous()?;
         let pair_weights = self
             .vars
             .policy_move_cnn
-            .narrow(1, CNN_CHANNELS * 2, CNN_CHANNELS)?;
+            .narrow(1, CNN_CHANNELS * 2, CNN_CHANNELS)?
+            .contiguous()?;
         let from_logits = from_nodes
             .broadcast_mul(&from_weights.unsqueeze(0)?)?
             .sum(2)?;
