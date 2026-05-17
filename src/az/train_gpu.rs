@@ -572,8 +572,13 @@ impl GpuReplica {
         let value_logits = value_intermediate
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
-        let policy_q_nodes = policy_nodes.matmul(&self.vars.policy_node_query.t()?)?;
-        let policy_k_nodes = policy_nodes.matmul(&self.vars.policy_node_key.t()?)?;
+        let policy_nodes_2d = policy_nodes.reshape((bsz * BOARD_PLANES_SIZE, CNN_CHANNELS))?;
+        let policy_q_nodes = policy_nodes_2d
+            .matmul(&self.vars.policy_node_query.t()?)?
+            .reshape((bsz, BOARD_PLANES_SIZE, super::POLICY_NODE_PROJ_SIZE))?;
+        let policy_k_nodes = policy_nodes_2d
+            .matmul(&self.vars.policy_node_key.t()?)?
+            .reshape((bsz, BOARD_PLANES_SIZE, super::POLICY_NODE_PROJ_SIZE))?;
         let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
         let policy_condition = hidden
             .matmul(&self.vars.policy_feature_hidden.t()?)?
@@ -605,7 +610,8 @@ impl GpuReplica {
         let pair_logits = (from_q.broadcast_mul(&to_k)?.sum(2)?
             * (1.0 / (super::POLICY_NODE_PROJ_SIZE as f64).sqrt()))?;
         let policy_logits =
-            ((((policy_bias + policy_feature_logits)? + from_logits)? + to_logits)? + pair_logits)?;
+            (((policy_feature_logits.broadcast_add(&policy_bias)? + from_logits)? + to_logits)?
+                + pair_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
