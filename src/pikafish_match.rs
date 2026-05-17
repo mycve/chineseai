@@ -21,6 +21,12 @@ pub struct VsPikafishResult {
     pub draws: usize,
     pub chinese_wins_as_red: usize,
     pub chinese_wins_as_black: usize,
+    pub chinese_win_by_general_capture: usize,
+    pub chinese_win_by_no_legal_moves: usize,
+    pub chinese_win_by_rule: usize,
+    pub chinese_win_by_pikafish_no_bestmove: usize,
+    pub chinese_win_by_pikafish_invalid_move: usize,
+    pub chinese_win_by_pikafish_illegal_move: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -38,9 +44,21 @@ pub struct VsPikafishConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GameEnd {
-    RedWin,
-    BlackWin,
-    Draw,
+    RedWin(GameEndReason),
+    BlackWin(GameEndReason),
+    Draw(GameEndReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GameEndReason {
+    GeneralCaptured,
+    NoLegalMoves,
+    Rule,
+    MaxPlies,
+    SearchNoMove,
+    PikafishNoBestMove,
+    PikafishInvalidMove,
+    PikafishIllegalMove,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,22 +221,22 @@ fn terminal_before_side_selects(
     max_plies: usize,
 ) -> Option<GameEnd> {
     if ply_count >= max_plies {
-        return Some(GameEnd::Draw);
+        return Some(GameEnd::Draw(GameEndReason::MaxPlies));
     }
     if !position.has_general(Color::Red) {
-        return Some(GameEnd::BlackWin);
+        return Some(GameEnd::BlackWin(GameEndReason::GeneralCaptured));
     }
     if !position.has_general(Color::Black) {
-        return Some(GameEnd::RedWin);
+        return Some(GameEnd::RedWin(GameEndReason::GeneralCaptured));
     }
     if let Some(outcome) = position.rule_outcome_with_history(rule_history) {
         return Some(match outcome {
-            RuleOutcome::Draw(_) => GameEnd::Draw,
+            RuleOutcome::Draw(_) => GameEnd::Draw(GameEndReason::Rule),
             RuleOutcome::Win(c) => {
                 if c == Color::Red {
-                    GameEnd::RedWin
+                    GameEnd::RedWin(GameEndReason::Rule)
                 } else {
-                    GameEnd::BlackWin
+                    GameEnd::BlackWin(GameEndReason::Rule)
                 }
             }
         });
@@ -226,8 +244,8 @@ fn terminal_before_side_selects(
     let legal = position.legal_moves_with_rules(rule_history);
     if legal.is_empty() {
         return Some(match position.side_to_move() {
-            Color::Red => GameEnd::BlackWin,
-            Color::Black => GameEnd::RedWin,
+            Color::Red => GameEnd::BlackWin(GameEndReason::NoLegalMoves),
+            Color::Black => GameEnd::RedWin(GameEndReason::NoLegalMoves),
         });
     }
     None
@@ -281,8 +299,8 @@ fn play_one_game(
             seed = seed.wrapping_add(1);
             let Some(mv) = search.best_move else {
                 return Ok(match side {
-                    Color::Red => GameEnd::BlackWin,
-                    Color::Black => GameEnd::RedWin,
+                    Color::Red => GameEnd::BlackWin(GameEndReason::SearchNoMove),
+                    Color::Black => GameEnd::RedWin(GameEndReason::SearchNoMove),
                 });
             };
             let uci = mv.to_string();
@@ -293,20 +311,20 @@ fn play_one_game(
                 external.query_move(initial_fen.as_deref(), &moves_uci, config.pikafish_depth)?;
             if token.is_empty() || token == "(none)" || token == "0000" {
                 return Ok(match side {
-                    Color::Red => GameEnd::BlackWin,
-                    Color::Black => GameEnd::RedWin,
+                    Color::Red => GameEnd::BlackWin(GameEndReason::PikafishNoBestMove),
+                    Color::Black => GameEnd::RedWin(GameEndReason::PikafishNoBestMove),
                 });
             }
             let Some(mv) = position.parse_uci_move(&token) else {
                 return Ok(match side {
-                    Color::Red => GameEnd::BlackWin,
-                    Color::Black => GameEnd::RedWin,
+                    Color::Red => GameEnd::BlackWin(GameEndReason::PikafishInvalidMove),
+                    Color::Black => GameEnd::RedWin(GameEndReason::PikafishInvalidMove),
                 });
             };
             if !legal.contains(&mv) {
                 return Ok(match side {
-                    Color::Red => GameEnd::BlackWin,
-                    Color::Black => GameEnd::RedWin,
+                    Color::Red => GameEnd::BlackWin(GameEndReason::PikafishIllegalMove),
+                    Color::Black => GameEnd::RedWin(GameEndReason::PikafishIllegalMove),
                 });
             }
             apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
@@ -384,16 +402,17 @@ pub fn run_vs_pikafish(
                 .map_err(|_| std::io::Error::other("vs-pikafish: worker thread panicked"))?;
             let (chinese_red, end) = join?;
             match (end, chinese_red) {
-                (GameEnd::Draw, _) => out.draws += 1,
-                (GameEnd::RedWin, true) | (GameEnd::BlackWin, false) => {
+                (GameEnd::Draw(_), _) => out.draws += 1,
+                (GameEnd::RedWin(reason), true) | (GameEnd::BlackWin(reason), false) => {
                     out.chinese_wins += 1;
+                    out.record_chinese_win_reason(reason);
                     if chinese_red {
                         out.chinese_wins_as_red += 1;
                     } else {
                         out.chinese_wins_as_black += 1;
                     }
                 }
-                (GameEnd::RedWin, false) | (GameEnd::BlackWin, true) => {
+                (GameEnd::RedWin(_), false) | (GameEnd::BlackWin(_), true) => {
                     out.chinese_losses += 1;
                 }
             }
@@ -401,4 +420,18 @@ pub fn run_vs_pikafish(
     }
 
     Ok(out)
+}
+
+impl VsPikafishResult {
+    fn record_chinese_win_reason(&mut self, reason: GameEndReason) {
+        match reason {
+            GameEndReason::GeneralCaptured => self.chinese_win_by_general_capture += 1,
+            GameEndReason::NoLegalMoves => self.chinese_win_by_no_legal_moves += 1,
+            GameEndReason::Rule => self.chinese_win_by_rule += 1,
+            GameEndReason::PikafishNoBestMove => self.chinese_win_by_pikafish_no_bestmove += 1,
+            GameEndReason::PikafishInvalidMove => self.chinese_win_by_pikafish_invalid_move += 1,
+            GameEndReason::PikafishIllegalMove => self.chinese_win_by_pikafish_illegal_move += 1,
+            GameEndReason::MaxPlies | GameEndReason::SearchNoMove => {}
+        }
+    }
 }

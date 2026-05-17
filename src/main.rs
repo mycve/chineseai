@@ -1888,7 +1888,7 @@ fn main() {
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
-                "vs-pikafish: config={} model={} search={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) | pikafish_depth={} max_plies={} sims={}",
+                "vs-pikafish: config={} model={} search={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={}",
                 config_path,
                 config.model_path,
                 config.search_algorithm.as_str(),
@@ -1900,6 +1900,12 @@ fn main() {
                 summary.draws,
                 summary.chinese_wins_as_red,
                 summary.chinese_wins_as_black,
+                summary.chinese_win_by_general_capture,
+                summary.chinese_win_by_no_legal_moves,
+                summary.chinese_win_by_rule,
+                summary.chinese_win_by_pikafish_no_bestmove,
+                summary.chinese_win_by_pikafish_invalid_move,
+                summary.chinese_win_by_pikafish_illegal_move,
                 pikafish_depth,
                 config.max_plies,
                 simulations

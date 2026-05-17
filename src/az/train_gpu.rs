@@ -51,8 +51,10 @@ struct GpuVars {
     value_intermediate_bias: Var,
     value_logits_weights: Var,
     value_logits_bias: Var,
-    policy_move_hidden: Var,
-    policy_move_cnn: Var,
+    policy_node_query: Var,
+    policy_node_key: Var,
+    policy_from_bias: Var,
+    policy_to_bias: Var,
     policy_move_bias: Var,
     policy_feature_hidden: Var,
     policy_feature_cnn: Var,
@@ -570,22 +572,9 @@ impl GpuReplica {
         let value_logits = value_intermediate
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
-        let policy_hidden_logits = hidden
-            .matmul(&self.vars.policy_move_hidden.t()?)?
-            .broadcast_add(
-                &cnn_global
-                    .narrow(1, CNN_CHANNELS * 3, CNN_CHANNELS * 2)?
-                    .contiguous()?
-                    .matmul(
-                        &self
-                            .vars
-                            .policy_move_cnn
-                            .narrow(1, CNN_CHANNELS * 3, CNN_CHANNELS * 2)?
-                            .t()?
-                            .contiguous()?,
-                    )?
-                    .broadcast_add(&self.vars.policy_move_bias)?,
-            )?;
+        let policy_q_nodes = policy_nodes.matmul(&self.vars.policy_node_query.t()?)?;
+        let policy_k_nodes = policy_nodes.matmul(&self.vars.policy_node_key.t()?)?;
+        let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
         let policy_condition = hidden
             .matmul(&self.vars.policy_feature_hidden.t()?)?
             .broadcast_add(
@@ -601,32 +590,22 @@ impl GpuReplica {
         let to_nodes = policy_nodes
             .index_select(&self.vars.policy_to_map, 1)?
             .contiguous()?;
-        let from_weights = self
-            .vars
-            .policy_move_cnn
-            .narrow(1, 0, CNN_CHANNELS)?
+        let from_q = policy_q_nodes
+            .index_select(&self.vars.policy_from_map, 1)?
             .contiguous()?;
-        let to_weights = self
-            .vars
-            .policy_move_cnn
-            .narrow(1, CNN_CHANNELS, CNN_CHANNELS)?
-            .contiguous()?;
-        let pair_weights = self
-            .vars
-            .policy_move_cnn
-            .narrow(1, CNN_CHANNELS * 2, CNN_CHANNELS)?
+        let to_k = policy_k_nodes
+            .index_select(&self.vars.policy_to_map, 1)?
             .contiguous()?;
         let from_logits = from_nodes
-            .broadcast_mul(&from_weights.unsqueeze(0)?)?
+            .broadcast_mul(&self.vars.policy_from_bias.reshape((1, 1, CNN_CHANNELS))?)?
             .sum(2)?;
-        let to_logits = to_nodes.broadcast_mul(&to_weights.unsqueeze(0)?)?.sum(2)?;
-        let pair_logits = from_nodes
-            .broadcast_mul(&to_nodes)?
-            .broadcast_mul(&pair_weights.unsqueeze(0)?)?
+        let to_logits = to_nodes
+            .broadcast_mul(&self.vars.policy_to_bias.reshape((1, 1, CNN_CHANNELS))?)?
             .sum(2)?;
-        let policy_logits = ((((policy_hidden_logits + policy_feature_logits)? + from_logits)?
-            + to_logits)?
-            + pair_logits)?;
+        let pair_logits = (from_q.broadcast_mul(&to_k)?.sum(2)?
+            * (1.0 / (super::POLICY_NODE_PROJ_SIZE as f64).sqrt()))?;
+        let policy_logits =
+            ((((policy_bias + policy_feature_logits)? + from_logits)? + to_logits)? + pair_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -779,16 +758,18 @@ impl GpuVars {
                 device,
             )?,
             value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
-            policy_move_hidden: var_from_slice(
-                &model.policy_move_hidden,
-                (DENSE_MOVE_SPACE, hidden),
+            policy_node_query: var_from_slice(
+                &model.policy_node_query,
+                (super::POLICY_NODE_PROJ_SIZE, CNN_CHANNELS),
                 device,
             )?,
-            policy_move_cnn: var_from_slice(
-                &model.policy_move_cnn,
-                (DENSE_MOVE_SPACE, CNN_POOLED_SIZE),
+            policy_node_key: var_from_slice(
+                &model.policy_node_key,
+                (super::POLICY_NODE_PROJ_SIZE, CNN_CHANNELS),
                 device,
             )?,
+            policy_from_bias: var_from_slice(&model.policy_from_bias, CNN_CHANNELS, device)?,
+            policy_to_bias: var_from_slice(&model.policy_to_bias, CNN_CHANNELS, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_feature_hidden: var_from_slice(
                 &model.policy_feature_hidden,
@@ -834,8 +815,10 @@ impl GpuVars {
         vars.push(self.value_intermediate_bias.clone());
         vars.push(self.value_logits_weights.clone());
         vars.push(self.value_logits_bias.clone());
-        vars.push(self.policy_move_hidden.clone());
-        vars.push(self.policy_move_cnn.clone());
+        vars.push(self.policy_node_query.clone());
+        vars.push(self.policy_node_key.clone());
+        vars.push(self.policy_from_bias.clone());
+        vars.push(self.policy_to_bias.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_feature_hidden.clone());
         vars.push(self.policy_feature_cnn.clone());
@@ -868,8 +851,10 @@ impl GpuVars {
 
     fn policy_head_vars(&self) -> Vec<Var> {
         vec![
-            self.policy_move_hidden.clone(),
-            self.policy_move_cnn.clone(),
+            self.policy_node_query.clone(),
+            self.policy_node_key.clone(),
+            self.policy_from_bias.clone(),
+            self.policy_to_bias.clone(),
             self.policy_move_bias.clone(),
             self.policy_feature_hidden.clone(),
             self.policy_feature_cnn.clone(),
@@ -918,8 +903,10 @@ impl GpuVars {
         )?;
         copy_var(&self.value_logits_weights, &mut model.value_logits_weights)?;
         copy_var(&self.value_logits_bias, &mut model.value_logits_bias)?;
-        copy_var(&self.policy_move_hidden, &mut model.policy_move_hidden)?;
-        copy_var(&self.policy_move_cnn, &mut model.policy_move_cnn)?;
+        copy_var(&self.policy_node_query, &mut model.policy_node_query)?;
+        copy_var(&self.policy_node_key, &mut model.policy_node_key)?;
+        copy_var(&self.policy_from_bias, &mut model.policy_from_bias)?;
+        copy_var(&self.policy_to_bias, &mut model.policy_to_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(
             &self.policy_feature_hidden,

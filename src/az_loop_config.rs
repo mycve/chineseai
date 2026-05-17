@@ -309,11 +309,12 @@ impl AzLoopFileConfig {
 #
 # Model architecture:
 #   hidden_size is the runtime-tunable model width.
-#   The rest of the tensor shapes are fixed by the v28 binary architecture:
+#   The rest of the tensor shapes are fixed by the v30 binary architecture:
 #   policy_trunk_layers=0, board_channels=126, policy_cnn_channels=24,
 #   policy_condition_size=32, value_hidden=256. Policy uses a fixed-topology
-#   GNN-style from/to/pair head; value has no independent CNN or NNUE branch
-#   and reads the shared RMS-normalized hidden representation directly.
+#   GNN-style shared from/to projection head without a dense per-move node or
+#   hidden table; value has no independent CNN or NNUE branch and reads the
+#   shared RMS-normalized hidden representation directly.
 #   If those fixed constants change, initialize a new model; old .nnue files are incompatible.
 
 model_path = "{model_path}"
