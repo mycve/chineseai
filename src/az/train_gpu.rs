@@ -8,7 +8,8 @@ use super::{
     BOARD_PLANES_SIZE, CNN_CHANNELS, CNN_POOLED_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
     POLICY_CONDITION_SIZE, RESIDUAL_TRUNK_SCALE, VALUE_BRANCH_DEPTH, VALUE_BRANCH_SIZE,
     VALUE_CNN_CHANNELS, VALUE_CNN_POOLED_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
-    VALUE_SQUARE_INPUT_SIZE, policy_move_features,
+    VALUE_SQUARE_INPUT_SIZE, policy_move_features, policy_move_from_indices,
+    policy_move_to_indices,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -71,6 +72,8 @@ struct GpuVars {
     policy_feature_cnn: Var,
     policy_feature_bias: Var,
     policy_move_features: Tensor,
+    policy_from_map: Tensor,
+    policy_to_map: Tensor,
 }
 
 /// 与 `GpuTrainer` 使用的 `cuda_device_indices()` 一致。配置里「每卡 batch」× 本值 = 单步训练总 micro-batch 样本数。
@@ -543,6 +546,16 @@ impl GpuReplica {
         let conv2_grid = conv2.reshape((bsz, CNN_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
         let row_line_pool = (conv2_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
         let col_line_pool = (conv2_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
+        let policy_nodes = {
+            let row_mean = conv2_grid.mean(3)?.unsqueeze(3)?;
+            let col_mean = conv2_grid.mean(2)?.unsqueeze(2)?;
+            conv2_grid
+                .broadcast_add(&row_mean)?
+                .broadcast_add(&col_mean)?
+                .relu()?
+                .reshape((bsz, CNN_CHANNELS, BOARD_PLANES_SIZE))?
+                .transpose(1, 2)?
+        };
         let cnn_global = Tensor::cat(
             &[avg_pool, max_pool, attn_pool, row_line_pool, col_line_pool],
             1,
@@ -638,11 +651,17 @@ impl GpuReplica {
         let value_logits = value_intermediate
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
-        let policy_logits = hidden
+        let policy_hidden_logits = hidden
             .matmul(&self.vars.policy_move_hidden.t()?)?
             .broadcast_add(
                 &cnn_global
-                    .matmul(&self.vars.policy_move_cnn.t()?)?
+                    .matmul(
+                        &self
+                            .vars
+                            .policy_move_cnn
+                            .narrow(1, CNN_CHANNELS * 3, CNN_CHANNELS * 2)?
+                            .t()?,
+                    )?
                     .broadcast_add(&self.vars.policy_move_bias)?,
             )?;
         let policy_condition = hidden
@@ -654,7 +673,28 @@ impl GpuReplica {
             )?;
         let policy_feature_logits =
             policy_condition.matmul(&self.vars.policy_move_features.t()?)?;
-        let policy_logits = (policy_logits + policy_feature_logits)?;
+        let from_nodes = policy_nodes.index_select(&self.vars.policy_from_map, 1)?;
+        let to_nodes = policy_nodes.index_select(&self.vars.policy_to_map, 1)?;
+        let from_weights = self.vars.policy_move_cnn.narrow(1, 0, CNN_CHANNELS)?;
+        let to_weights = self
+            .vars
+            .policy_move_cnn
+            .narrow(1, CNN_CHANNELS, CNN_CHANNELS)?;
+        let pair_weights = self
+            .vars
+            .policy_move_cnn
+            .narrow(1, CNN_CHANNELS * 2, CNN_CHANNELS)?;
+        let from_logits = from_nodes
+            .broadcast_mul(&from_weights.unsqueeze(0)?)?
+            .sum(2)?;
+        let to_logits = to_nodes.broadcast_mul(&to_weights.unsqueeze(0)?)?.sum(2)?;
+        let pair_logits = from_nodes
+            .broadcast_mul(&to_nodes)?
+            .broadcast_mul(&pair_weights.unsqueeze(0)?)?
+            .sum(2)?;
+        let policy_logits = ((((policy_hidden_logits + policy_feature_logits)? + from_logits)?
+            + to_logits)?
+            + pair_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -912,6 +952,12 @@ impl GpuVars {
                 (DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE),
                 device,
             )?,
+            policy_from_map: Tensor::from_vec(
+                policy_move_from_indices(),
+                DENSE_MOVE_SPACE,
+                device,
+            )?,
+            policy_to_map: Tensor::from_vec(policy_move_to_indices(), DENSE_MOVE_SPACE, device)?,
         })
     }
 

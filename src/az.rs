@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
@@ -15,9 +15,7 @@ use crate::nnue::{
     HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, canonical_move, canonical_square,
     extract_sparse_features_v4_canonical,
 };
-use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position,
-};
+use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
@@ -34,7 +32,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 25;
+const AZNNUE_BINARY_VERSION: u32 = 26;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -88,6 +86,7 @@ pub(super) struct AzEvalScratch {
     board: Vec<u8>,
     conv1: Vec<f32>,
     conv2: Vec<f32>,
+    policy_nodes: Vec<f32>,
     cnn_global: Vec<f32>,
     value_conv1: Vec<f32>,
     value_conv2: Vec<f32>,
@@ -110,6 +109,7 @@ impl AzEvalScratch {
             board: vec![0; BOARD_HISTORY_SIZE],
             conv1: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             conv2: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
+            policy_nodes: vec![0.0; CNN_CHANNELS * BOARD_PLANES_SIZE],
             cnn_global: vec![0.0; CNN_POOLED_SIZE],
             value_conv1: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
             value_conv2: vec![0.0; VALUE_CNN_CHANNELS * BOARD_PLANES_SIZE],
@@ -202,6 +202,10 @@ pub struct AzNnue {
 // - v25 widens the value-only CNN from 32 to 48 channels. This is a small
 //   perception bump for tactical board relations without making the policy path
 //   heavier or letting the final value MLP dominate learning.
+// - v26 changes policy scoring to a GNN-style node head. The policy board CNN
+//   becomes the node encoder, then fixed Local/Row/Col graph aggregation builds
+//   per-square features. Action logits use from-node, to-node, pair, and global
+//   terms; value keeps the v25 NNUE/CNN branch.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -724,6 +728,7 @@ impl AzNnue {
             &scratch.board,
             &mut scratch.conv1,
             &mut scratch.conv2,
+            &mut scratch.policy_nodes,
             &mut scratch.cnn_global,
         );
         self.board_hidden_into(&scratch.cnn_global, &mut scratch.next);
@@ -753,6 +758,7 @@ impl AzNnue {
         for (index, mv) in moves.iter().enumerate() {
             scratch.logits[index] = self.policy_logit_from_hidden_index(
                 &scratch.hidden,
+                &scratch.policy_nodes,
                 &scratch.cnn_global,
                 &scratch.policy_condition,
                 dense_move_index(canonical_move(side, *mv)),
@@ -829,6 +835,7 @@ impl AzNnue {
         board: &[u8],
         conv1: &mut Vec<f32>,
         conv2: &mut Vec<f32>,
+        policy_nodes: &mut Vec<f32>,
         cnn_global: &mut Vec<f32>,
     ) {
         conv1.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
@@ -849,6 +856,7 @@ impl AzNnue {
             &self.board_conv2_bias,
             conv2,
         );
+        policy_graph_nodes(conv2, policy_nodes);
         pool_cnn_features(conv2, CNN_CHANNELS, &self.board_attention_query, cnn_global);
     }
 
@@ -1009,10 +1017,14 @@ impl AzNnue {
     fn policy_logit_from_hidden_index(
         &self,
         hidden: &[f32],
+        policy_nodes: &[f32],
         cnn_global: &[f32],
         policy_condition: &[f32],
         move_index: usize,
     ) -> f32 {
+        let sparse = move_map().dense_to_sparse[move_index] as usize;
+        let from = sparse / BOARD_SIZE;
+        let to = sparse % BOARD_SIZE;
         let hidden_offset = move_index * self.hidden_size;
         let hidden_row = &self.policy_move_hidden[hidden_offset..hidden_offset + self.hidden_size];
         let cnn_offset = move_index * CNN_POOLED_SIZE;
@@ -1020,10 +1032,19 @@ impl AzNnue {
         let feature_offset = move_index * POLICY_CONDITION_SIZE;
         let move_features =
             &policy_move_features()[feature_offset..feature_offset + POLICY_CONDITION_SIZE];
-        self.policy_move_bias[move_index]
+        let mut logit = self.policy_move_bias[move_index]
             + dot_product(hidden, hidden_row)
-            + dot_product(cnn_global, cnn_row)
-            + dot_product(policy_condition, move_features)
+            + dot_product(policy_condition, move_features);
+        for channel in 0..CNN_CHANNELS {
+            let from_value = policy_nodes[channel * BOARD_PLANES_SIZE + from];
+            let to_value = policy_nodes[channel * BOARD_PLANES_SIZE + to];
+            logit += from_value * cnn_row[channel];
+            logit += to_value * cnn_row[CNN_CHANNELS + channel];
+            logit += (from_value * to_value) * cnn_row[CNN_CHANNELS * 2 + channel];
+            logit += cnn_global[CNN_CHANNELS * 3 + channel] * cnn_row[CNN_CHANNELS * 3 + channel];
+            logit += cnn_global[CNN_CHANNELS * 4 + channel] * cnn_row[CNN_CHANNELS * 4 + channel];
+        }
+        logit
     }
 }
 
@@ -1043,10 +1064,9 @@ pub(super) fn extract_board_planes(
     for (history_index, entry) in history.iter().rev().take(HISTORY_PLIES).enumerate() {
         let piece_plane =
             (canonical_piece_plane(side, entry.piece.color, entry.piece.kind) + 1) as u8;
-        rewound[canonical_square(side, entry.mv.to as usize)] =
-            entry.captured.map_or(0, |piece| {
-                (canonical_piece_plane(side, piece.color, piece.kind) + 1) as u8
-            });
+        rewound[canonical_square(side, entry.mv.to as usize)] = entry.captured.map_or(0, |piece| {
+            (canonical_piece_plane(side, piece.color, piece.kind) + 1) as u8
+        });
         rewound[canonical_square(side, entry.mv.from as usize)] = piece_plane;
         let start = (history_index + 1) * BOARD_PLANES_SIZE;
         board[start..start + BOARD_PLANES_SIZE].copy_from_slice(&rewound);
@@ -1209,6 +1229,37 @@ fn pool_cnn_features(input: &[f32], channels: usize, attention_query: &[f32], ou
         }
         output[channels * 3 + channel] = best_row_sum / BOARD_FILES as f32;
         output[channels * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
+    }
+}
+
+fn policy_graph_nodes(input: &[f32], output: &mut Vec<f32>) {
+    debug_assert_eq!(input.len(), CNN_CHANNELS * BOARD_PLANES_SIZE);
+    output.resize(CNN_CHANNELS * BOARD_PLANES_SIZE, 0.0);
+    for channel in 0..CNN_CHANNELS {
+        let channel_start = channel * BOARD_PLANES_SIZE;
+        let input_row = &input[channel_start..channel_start + BOARD_PLANES_SIZE];
+        let output_row = &mut output[channel_start..channel_start + BOARD_PLANES_SIZE];
+        let mut row_mean = [0.0f32; BOARD_RANKS];
+        let mut col_mean = [0.0f32; BOARD_FILES];
+        for rank in 0..BOARD_RANKS {
+            for file in 0..BOARD_FILES {
+                let value = input_row[rank * BOARD_FILES + file];
+                row_mean[rank] += value;
+                col_mean[file] += value;
+            }
+        }
+        for value in &mut row_mean {
+            *value /= BOARD_FILES as f32;
+        }
+        for value in &mut col_mean {
+            *value /= BOARD_RANKS as f32;
+        }
+        for sq in 0..BOARD_PLANES_SIZE {
+            let file = sq % BOARD_FILES;
+            let rank = sq / BOARD_FILES;
+            let value = input_row[sq] + row_mean[rank] + col_mean[file];
+            output_row[sq] = value.max(0.0);
+        }
     }
 }
 
@@ -1467,6 +1518,22 @@ fn move_map() -> &'static MoveMap {
             dense_to_sparse,
         }
     })
+}
+
+pub(super) fn policy_move_from_indices() -> Vec<u32> {
+    move_map()
+        .dense_to_sparse
+        .iter()
+        .map(|&sparse| (sparse as usize / BOARD_SIZE) as u32)
+        .collect()
+}
+
+pub(super) fn policy_move_to_indices() -> Vec<u32> {
+    move_map()
+        .dense_to_sparse
+        .iter()
+        .map(|&sparse| (sparse as usize % BOARD_SIZE) as u32)
+        .collect()
 }
 
 pub(super) fn policy_move_features() -> &'static [f32] {
