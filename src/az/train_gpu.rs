@@ -46,6 +46,7 @@ struct GpuVars {
     node_hidden: Var,
     node_hidden_bias: Var,
     value_intermediate_hidden: Var,
+    value_intermediate_nodes: Var,
     value_intermediate_bias: Var,
     value_logits_weights: Var,
     value_logits_bias: Var,
@@ -523,6 +524,12 @@ impl GpuReplica {
         let policy_nodes_by_channel = policy_nodes.transpose(1, 2)?.contiguous()?;
         let avg_pool = policy_nodes_by_channel.mean(2)?;
         let max_pool = policy_nodes_by_channel.max(2)?;
+        let centered_nodes = policy_nodes_by_channel.broadcast_sub(&avg_pool.unsqueeze(2)?)?;
+        let std_pool = centered_nodes
+            .sqr()?
+            .mean(2)?
+            .affine(1.0, RMS_NORM_EPS)?
+            .sqrt()?;
         let attn_query = self
             .vars
             .node_attention_query
@@ -537,7 +544,14 @@ impl GpuReplica {
         let row_line_pool = (policy_node_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
         let col_line_pool = (policy_node_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
         let node_global = Tensor::cat(
-            &[avg_pool, max_pool, attn_pool, row_line_pool, col_line_pool],
+            &[
+                avg_pool,
+                max_pool,
+                attn_pool,
+                row_line_pool,
+                col_line_pool,
+                std_pool,
+            ],
             1,
         )?;
 
@@ -557,6 +571,7 @@ impl GpuReplica {
 
         let value_intermediate = hidden
             .matmul(&self.vars.value_intermediate_hidden.t()?)?
+            .broadcast_add(&node_global.matmul(&self.vars.value_intermediate_nodes.t()?)?)?
             .broadcast_add(&self.vars.value_intermediate_bias)?
             .relu()?;
         let value_logits = value_intermediate
@@ -761,6 +776,11 @@ impl GpuVars {
                 (VALUE_HIDDEN_SIZE, hidden),
                 device,
             )?,
+            value_intermediate_nodes: var_from_slice(
+                &model.value_intermediate_nodes,
+                (VALUE_HIDDEN_SIZE, NODE_POOL_SIZE),
+                device,
+            )?,
             value_intermediate_bias: var_from_slice(
                 &model.value_intermediate_bias,
                 VALUE_HIDDEN_SIZE,
@@ -834,6 +854,7 @@ impl GpuVars {
         vars.push(self.node_hidden.clone());
         vars.push(self.node_hidden_bias.clone());
         vars.push(self.value_intermediate_hidden.clone());
+        vars.push(self.value_intermediate_nodes.clone());
         vars.push(self.value_intermediate_bias.clone());
         vars.push(self.value_logits_weights.clone());
         vars.push(self.value_logits_bias.clone());
@@ -863,6 +884,7 @@ impl GpuVars {
     fn value_head_vars(&self) -> Vec<Var> {
         vec![
             self.value_intermediate_hidden.clone(),
+            self.value_intermediate_nodes.clone(),
             self.value_intermediate_bias.clone(),
             self.value_logits_weights.clone(),
             self.value_logits_bias.clone(),
@@ -911,6 +933,10 @@ impl GpuVars {
         copy_var(
             &self.value_intermediate_hidden,
             &mut model.value_intermediate_hidden,
+        )?;
+        copy_var(
+            &self.value_intermediate_nodes,
+            &mut model.value_intermediate_nodes,
         )?;
         copy_var(
             &self.value_intermediate_bias,

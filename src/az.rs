@@ -32,7 +32,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 32;
+const AZNNUE_BINARY_VERSION: u32 = 33;
 const AZNNUE_BINARY_HEADER_LEN: usize = 24;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -70,7 +70,7 @@ pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FR
 const GNN_NODE_CHANNELS: usize = 32;
 const GNN_NODE_LAYERS: usize = 2;
 pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
-const NODE_POOL_BLOCKS: usize = 5;
+const NODE_POOL_BLOCKS: usize = 6;
 pub(super) const NODE_POOL_SIZE: usize = GNN_NODE_CHANNELS * NODE_POOL_BLOCKS;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 pub(super) const POLICY_NODE_PROJ_SIZE: usize = 32;
@@ -125,6 +125,7 @@ pub struct AzNnue {
     pub node_hidden: Vec<f32>,
     pub node_hidden_bias: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
+    pub value_intermediate_nodes: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
@@ -200,6 +201,7 @@ impl Clone for AzNnue {
             node_hidden: self.node_hidden.clone(),
             node_hidden_bias: self.node_hidden_bias.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
+            value_intermediate_nodes: self.value_intermediate_nodes.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
@@ -359,6 +361,9 @@ impl AzNnue {
         let value_intermediate_hidden = (0..VALUE_HIDDEN_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
+        let value_intermediate_nodes = (0..VALUE_HIDDEN_SIZE * NODE_POOL_SIZE)
+            .map(|_| rng.weight((2.0 / NODE_POOL_SIZE as f32).sqrt() * 0.5))
+            .collect();
         let value_intermediate_bias = vec![0.0; VALUE_HIDDEN_SIZE];
         let value_logits_weights = (0..VALUE_LOGITS * VALUE_HIDDEN_SIZE)
             .map(|_| rng.weight((2.0 / VALUE_HIDDEN_SIZE as f32).sqrt()))
@@ -390,6 +395,7 @@ impl AzNnue {
             node_hidden,
             node_hidden_bias,
             value_intermediate_hidden,
+            value_intermediate_nodes,
             value_intermediate_bias,
             value_logits_weights,
             value_logits_bias,
@@ -422,6 +428,7 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.node_hidden)?;
         write_f32_slice_le(&mut writer, &self.node_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
+        write_f32_slice_le(&mut writer, &self.value_intermediate_nodes)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
@@ -477,6 +484,7 @@ impl AzNnue {
         let node_hidden_len = hidden_size * NODE_POOL_SIZE;
         let node_hidden_bias_len = hidden_size;
         let vih_len = VALUE_HIDDEN_SIZE * hidden_size;
+        let vin_len = VALUE_HIDDEN_SIZE * NODE_POOL_SIZE;
         let vib_len = VALUE_HIDDEN_SIZE;
         let vlw_len = VALUE_LOGITS * VALUE_HIDDEN_SIZE;
         let vlb_len = VALUE_LOGITS;
@@ -496,6 +504,7 @@ impl AzNnue {
             + node_hidden_len
             + node_hidden_bias_len
             + vih_len
+            + vin_len
             + vib_len
             + vlw_len
             + vlb_len
@@ -527,6 +536,7 @@ impl AzNnue {
         let node_hidden = read_f32_vec_le(&mut reader, node_hidden_len)?;
         let node_hidden_bias = read_f32_vec_le(&mut reader, node_hidden_bias_len)?;
         let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
+        let value_intermediate_nodes = read_f32_vec_le(&mut reader, vin_len)?;
         let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
         let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
@@ -548,6 +558,7 @@ impl AzNnue {
             node_hidden,
             node_hidden_bias,
             value_intermediate_hidden,
+            value_intermediate_nodes,
             value_intermediate_bias,
             value_logits_weights,
             value_logits_bias,
@@ -600,6 +611,7 @@ impl AzNnue {
         );
         let value = self.value_from_hidden_into(
             &scratch.hidden,
+            &scratch.node_global,
             &mut scratch.value_intermediate,
             &mut scratch.value_logits,
         );
@@ -689,6 +701,7 @@ impl AzNnue {
     fn value_from_hidden_into(
         &self,
         hidden: &[f32],
+        node_global: &[f32],
         value_intermediate: &mut Vec<f32>,
         value_logits: &mut Vec<f32>,
     ) -> f32 {
@@ -702,6 +715,11 @@ impl AzNnue {
                 &self.value_intermediate_hidden[j * self.hidden_size..(j + 1) * self.hidden_size];
             for (hidden_value, weight) in hidden.iter().zip(h_row) {
                 *value += hidden_value * weight;
+            }
+            let node_row =
+                &self.value_intermediate_nodes[j * NODE_POOL_SIZE..(j + 1) * NODE_POOL_SIZE];
+            for (node_value, weight) in node_global.iter().zip(node_row) {
+                *value += node_value * weight;
             }
             *value = (*value).max(0.0);
         }
@@ -753,6 +771,7 @@ impl AzNnue {
             || self.node_hidden.len() != self.hidden_size * NODE_POOL_SIZE
             || self.node_hidden_bias.len() != self.hidden_size
             || self.value_intermediate_hidden.len() != VALUE_HIDDEN_SIZE * self.hidden_size
+            || self.value_intermediate_nodes.len() != VALUE_HIDDEN_SIZE * NODE_POOL_SIZE
             || self.value_intermediate_bias.len() != VALUE_HIDDEN_SIZE
             || self.value_logits_weights.len() != VALUE_LOGITS * VALUE_HIDDEN_SIZE
             || self.value_logits_bias.len() != VALUE_LOGITS
@@ -915,16 +934,20 @@ fn pool_node_features(input: &[f32], channels: usize, attention_query: &[f32], o
         let start = channel * BOARD_PLANES_SIZE;
         let row = &input[start..start + BOARD_PLANES_SIZE];
         let mut sum = 0.0;
+        let mut sum_sq = 0.0;
         let mut max_value = 0.0;
         let mut attn_sum = 0.0;
         for (idx, value) in row.iter().enumerate() {
             sum += *value;
+            sum_sq += *value * *value;
             if idx == 0 || *value > max_value {
                 max_value = *value;
             }
             attn_sum += (*value) * attention_logits[idx] / denom.max(1e-12);
         }
-        output[channel] = sum * scale;
+        let mean = sum * scale;
+        let var = (sum_sq * scale - mean * mean).max(0.0);
+        output[channel] = mean;
         output[channels + channel] = max_value;
         output[channels * 2 + channel] = attn_sum;
 
@@ -946,6 +969,7 @@ fn pool_node_features(input: &[f32], channels: usize, attention_query: &[f32], o
         }
         output[channels * 3 + channel] = best_row_sum / BOARD_FILES as f32;
         output[channels * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
+        output[channels * 5 + channel] = (var + RMS_NORM_EPS).sqrt();
     }
 }
 
