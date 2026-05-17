@@ -255,6 +255,7 @@ impl AzLoopFileConfig {
 # Self-play policy temperature (linear in ply index, 0-based before each search):
 #   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
 #   Defaults: 1.0 -> 0.1 by ply 40; raise decay_plies or temperature_end if openings collapse too early.
+#   熵监控开局/中后盘分界与此相同：ply < temperature_decay_plies 为开局熵，否则为中后盘熵。
 #
 # Pipeline:
 #   Self-play and training run in separate long-lived threads.

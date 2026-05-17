@@ -251,8 +251,12 @@ pub struct AzLoopReport {
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
     pub policy_ce: f32,
-    pub temperature_early_entropy: f32,
-    pub temperature_mid_entropy: f32,
+    /// 根 visit 策略分布熵（全局半步均值），TensorBoard：`stats/root_visit_entropy`。
+    pub root_visit_entropy: f32,
+    /// 开局阶段熵均值，`stats/entropy_opening`。
+    pub entropy_opening: f32,
+    /// 中后盘熵均值，`stats/entropy_mid`。
+    pub entropy_mid: f32,
     pub selfplay_seconds: f32,
     pub train_seconds: f32,
     pub total_seconds: f32,
@@ -1548,7 +1552,8 @@ mod tests {
     }
 
     #[test]
-    fn arena_report_elo_tracks_score_rate_direction() {
+    fn arena_report_anchored_elo_tracks_score_vs_reference() {
+        let reference = 1500.0f32;
         let stronger = AzArenaReport {
             wins: 6,
             losses: 3,
@@ -1563,9 +1568,9 @@ mod tests {
         };
 
         assert!(stronger.score_rate() > 0.5);
-        assert!(stronger.elo() > 0.0);
+        assert!(stronger.anchored_elo(reference) > reference);
         assert!(weaker.score_rate() < 0.5);
-        assert!(weaker.elo() < 0.0);
+        assert!(weaker.anchored_elo(reference) < reference);
     }
 
     #[test]

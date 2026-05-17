@@ -299,9 +299,28 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-fn read_az_loop_next_update(config_path: &str) -> Option<usize> {
+/// `.progress` 文件状态：`next_update` 用于断点续训，`best_elo` 为竞技场 baseline 锚定分（ZeroForge 风格）。
+#[derive(Clone, Debug)]
+struct AzLoopProgressState {
+    next_update: usize,
+    best_elo: f32,
+}
+
+impl Default for AzLoopProgressState {
+    fn default() -> Self {
+        Self {
+            next_update: 1,
+            best_elo: 1500.0,
+        }
+    }
+}
+
+fn load_az_loop_progress(config_path: &str) -> AzLoopProgressState {
     let path = az_loop_progress_path(config_path);
-    let text = fs::read_to_string(&path).ok()?;
+    let Ok(text) = fs::read_to_string(&path) else {
+        return AzLoopProgressState::default();
+    };
+    let mut state = AzLoopProgressState::default();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -310,13 +329,51 @@ fn read_az_loop_next_update(config_path: &str) -> Option<usize> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() == "next_update" {
-            return value.trim().parse().ok();
+        match key.trim() {
+            "next_update" => {
+                if let Ok(v) = value.trim().parse::<usize>() {
+                    state.next_update = v.max(1);
+                }
+            }
+            "best_elo" => {
+                if let Ok(v) = value.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        state.best_elo = v;
+                    } else {
+                        eprintln!(
+                            "progress : ignoring non-finite best_elo in `{}`",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    None
+    state
 }
 
+fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
+    let path = az_loop_progress_path(config_path);
+    fs::write(
+        path,
+        format!(
+            "next_update={}\nbest_elo={:.6}\n",
+            state.next_update, state.best_elo
+        ),
+    )
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", az_loop_progress_path(config_path).display()));
+}
+
+fn save_az_loop_progress_pair(config_path: &str, next_update: usize, best_elo: f32) {
+    save_az_loop_progress(
+        config_path,
+        &AzLoopProgressState {
+            next_update,
+            best_elo,
+        },
+    );
+}
 #[cfg(feature = "distill")]
 fn distill_shard_paths(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(data_dir)?
@@ -342,13 +399,6 @@ fn add_train_stats(total: &mut AzTrainStats, stats: &AzTrainStats) {
     total.value_target_sq_sum += stats.value_target_sq_sum;
     total.value_error_sq_sum += stats.value_error_sq_sum;
     total.samples += stats.samples;
-}
-
-fn write_az_loop_next_update(config_path: &str, next: usize) {
-    let path = az_loop_progress_path(config_path);
-    fs::write(&path, format!("next_update={next}\n")).unwrap_or_else(|err| {
-        panic!("failed to write resume cursor `{}`: {err}", path.display());
-    });
 }
 
 fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
@@ -549,10 +599,12 @@ fn build_async_training_report(
         value_pred_mean: stats.value_pred_sum / train_stat_samples,
         value_target_mean: stats.value_target_sum / train_stat_samples,
         policy_ce: stats.policy_ce,
-        temperature_early_entropy: pending.selfplay.temperature_early_entropy_sum
-            / pending.selfplay.temperature_early_entropy_count.max(1) as f32,
-        temperature_mid_entropy: pending.selfplay.temperature_mid_entropy_sum
-            / pending.selfplay.temperature_mid_entropy_count.max(1) as f32,
+        root_visit_entropy: pending.selfplay.entropy_all_sum
+            / pending.selfplay.entropy_all_count.max(1) as f32,
+        entropy_opening: pending.selfplay.entropy_opening_sum
+            / pending.selfplay.entropy_opening_count.max(1) as f32,
+        entropy_mid: pending.selfplay.entropy_mid_sum
+            / pending.selfplay.entropy_mid_count.max(1) as f32,
         selfplay_seconds: pending.selfplay_seconds,
         train_seconds,
         total_seconds,
@@ -1040,12 +1092,15 @@ fn main() {
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
                 return;
             };
-            let start_update = read_az_loop_next_update(&config_path).unwrap_or(1).max(1);
+            let progress_boot = load_az_loop_progress(&config_path);
+            let start_update = progress_boot.next_update.max(1);
+            let mut arena_best_elo = progress_boot.best_elo;
             if start_update > 1 {
                 println!(
-                    "resume   : update starts at {} (from `{}`)",
+                    "resume   : update starts at {} (from `{}`) arena_ref_elo={:.1}",
                     start_update,
-                    az_loop_progress_path(&config_path).display()
+                    az_loop_progress_path(&config_path).display(),
+                    arena_best_elo
                 );
             }
             let best_path = best_model_path(&config.model_path);
@@ -1348,8 +1403,9 @@ fn main() {
                                     value_pred_mean: 0.0,
                                     value_target_mean: 0.0,
                                     policy_ce: 0.0,
-                                    temperature_early_entropy: 0.0,
-                                    temperature_mid_entropy: 0.0,
+                                    root_visit_entropy: 0.0,
+                                    entropy_opening: 0.0,
+                                    entropy_mid: 0.0,
                                     selfplay_seconds: 0.0,
                                     train_seconds: 0.0,
                                     total_seconds: 0.0,
@@ -1389,8 +1445,9 @@ fn main() {
                                     value_pred_mean: 0.0,
                                     value_target_mean: 0.0,
                                     policy_ce: 0.0,
-                                    temperature_early_entropy: 0.0,
-                                    temperature_mid_entropy: 0.0,
+                                    root_visit_entropy: 0.0,
+                                    entropy_opening: 0.0,
+                                    entropy_mid: 0.0,
                                     selfplay_seconds: 0.0,
                                     train_seconds: 0.0,
                                     total_seconds: 0.0,
@@ -1420,7 +1477,11 @@ fn main() {
                 if exited_after_ctrl_c {
                     break;
                 }
-                write_az_loop_next_update(&config_path, update.saturating_add(1));
+                save_az_loop_progress_pair(
+                    &config_path,
+                    update.saturating_add(1),
+                    arena_best_elo,
+                );
                 if !best_path.exists() {
                     fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
                         panic!(
@@ -1463,7 +1524,7 @@ fn main() {
                     None
                 };
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_ce={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} lr={:.6} tempH={:.3}/{:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_ce={:.4} value_mse={:.4} v_mu={:.3}/{:.3} policy_ce={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -1486,8 +1547,9 @@ fn main() {
                     report.value_target_mean,
                     report.policy_ce,
                     config.lr,
-                    report.temperature_early_entropy,
-                    report.temperature_mid_entropy,
+                    report.root_visit_entropy,
+                    report.entropy_opening,
+                    report.entropy_mid,
                     report.selfplay_seconds,
                     report.train_seconds,
                     report.games_per_second,
@@ -1533,16 +1595,17 @@ fn main() {
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
                 log_scalar(
                     &mut tb,
-                    "selfplay/temp_entropy_early",
+                    "stats/root_visit_entropy",
                     update,
-                    report.temperature_early_entropy,
+                    report.root_visit_entropy,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/temp_entropy_mid",
+                    "stats/entropy_opening",
                     update,
-                    report.temperature_mid_entropy,
+                    report.entropy_opening,
                 );
+                log_scalar(&mut tb, "stats/entropy_mid", update, report.entropy_mid);
                 log_scalar(
                     &mut tb,
                     "selfplay/games_per_second",
@@ -1690,6 +1753,9 @@ fn main() {
                         process_count: config.arena_processes,
                         seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     });
+                    let ref_elo = arena_best_elo;
+                    let candidate_elo = arena.anchored_elo(ref_elo);
+                    let elo_diff = arena.elo_diff_vs_even();
                     let promoted = arena.score_rate() > 0.5;
                     if promoted {
                         fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
@@ -1699,9 +1765,15 @@ fn main() {
                                 best_path.display()
                             );
                         });
+                        arena_best_elo = candidate_elo;
+                        save_az_loop_progress_pair(
+                            &config_path,
+                            update.saturating_add(1),
+                            arena_best_elo,
+                        );
                     }
                     println!(
-                        "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} elo={:.1} best={}{}",
+                        "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best={}{}",
                         arena.total_games(),
                         arena_eval_fens,
                         arena.wins,
@@ -1713,7 +1785,9 @@ fn main() {
                         arena.losses_as_black,
                         arena.score(),
                         arena.score_rate(),
-                        arena.elo(),
+                        ref_elo,
+                        candidate_elo,
+                        elo_diff,
                         best_path.display(),
                         if promoted { " promoted=current" } else { "" }
                     );
@@ -1722,7 +1796,9 @@ fn main() {
                     log_scalar(&mut tb, "arena/draws", update, arena.draws as f32);
                     log_scalar(&mut tb, "arena/score", update, arena.score());
                     log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
-                    log_scalar(&mut tb, "arena/elo", update, arena.elo());
+                    log_scalar(&mut tb, "arena/ref_elo", update, ref_elo);
+                    log_scalar(&mut tb, "arena/elo", update, candidate_elo);
+                    log_scalar(&mut tb, "arena/elo_diff", update, elo_diff);
                     log_scalar(
                         &mut tb,
                         "arena/win_rate",

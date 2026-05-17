@@ -79,13 +79,25 @@ impl AzArenaReport {
         self.score() / self.total_games().max(1) as f32
     }
 
-    pub fn elo(&self) -> f32 {
+    /// ZeroForge 风格：相对参考分 `ref_elo` 的锚定 ELO（得分率无 Laplace 平滑）。
+    pub fn anchored_elo(&self, ref_elo: f32) -> f32 {
+        ref_elo + self.elo_diff_vs_even()
+    }
+
+    /// `400 * log10(score/(1-score))`，与 ZeroForge `train.py` 评估一致；胜负边界为 ±400。
+    pub fn elo_diff_vs_even(&self) -> f32 {
         let total = self.total_games();
         if total == 0 {
             return 0.0;
         }
-        let score_rate = ((self.score() + 0.5) / (total as f32 + 1.0)).clamp(1e-6, 1.0 - 1e-6);
-        400.0 * (score_rate / (1.0 - score_rate)).log10()
+        let score = self.score() / total as f32;
+        if score <= 0.0 {
+            -400.0
+        } else if score >= 1.0 {
+            400.0
+        } else {
+            400.0 * (score / (1.0 - score)).log10()
+        }
     }
 }
 
@@ -97,10 +109,15 @@ pub struct AzSelfplayData {
     pub black_wins: usize,
     pub draws: usize,
     pub plies_total: usize,
-    pub temperature_early_entropy_sum: f32,
-    pub temperature_early_entropy_count: usize,
-    pub temperature_mid_entropy_sum: f32,
-    pub temperature_mid_entropy_count: usize,
+    /// 所有半步的根策略分布熵之和（Shannon，与 ZeroForge `root_visit_entropy` 同公式）。
+    pub entropy_all_sum: f32,
+    pub entropy_all_count: usize,
+    /// `ply < temperature_decay_plies` 的熵之和（与温度线性退火区间一致，用于开局监控）。
+    pub entropy_opening_sum: f32,
+    pub entropy_opening_count: usize,
+    /// `ply >= temperature_decay_plies` 的熵之和（温度已达下限之后的中后盘）。
+    pub entropy_mid_sum: f32,
+    pub entropy_mid_count: usize,
     pub terminal: AzTerminalStats,
 }
 
@@ -112,10 +129,12 @@ impl AzSelfplayData {
         self.black_wins += other.black_wins;
         self.draws += other.draws;
         self.plies_total += other.plies_total;
-        self.temperature_early_entropy_sum += other.temperature_early_entropy_sum;
-        self.temperature_early_entropy_count += other.temperature_early_entropy_count;
-        self.temperature_mid_entropy_sum += other.temperature_mid_entropy_sum;
-        self.temperature_mid_entropy_count += other.temperature_mid_entropy_count;
+        self.entropy_all_sum += other.entropy_all_sum;
+        self.entropy_all_count += other.entropy_all_count;
+        self.entropy_opening_sum += other.entropy_opening_sum;
+        self.entropy_opening_count += other.entropy_opening_count;
+        self.entropy_mid_sum += other.entropy_mid_sum;
+        self.entropy_mid_count += other.entropy_mid_count;
         self.terminal.add_assign(&other.terminal);
     }
 }
@@ -153,10 +172,12 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.black_wins += chunk.black_wins;
         merged.draws += chunk.draws;
         merged.plies_total += chunk.plies_total;
-        merged.temperature_early_entropy_sum += chunk.temperature_early_entropy_sum;
-        merged.temperature_early_entropy_count += chunk.temperature_early_entropy_count;
-        merged.temperature_mid_entropy_sum += chunk.temperature_mid_entropy_sum;
-        merged.temperature_mid_entropy_count += chunk.temperature_mid_entropy_count;
+        merged.entropy_all_sum += chunk.entropy_all_sum;
+        merged.entropy_all_count += chunk.entropy_all_count;
+        merged.entropy_opening_sum += chunk.entropy_opening_sum;
+        merged.entropy_opening_count += chunk.entropy_opening_count;
+        merged.entropy_mid_sum += chunk.entropy_mid_sum;
+        merged.entropy_mid_count += chunk.entropy_mid_count;
         merged.terminal.add_assign(&chunk.terminal);
     }
     merged
@@ -170,10 +191,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut draws = 0usize;
     let mut plies_total = 0usize;
     let mut games = Vec::with_capacity(config.games);
-    let mut temperature_early_entropy_sum = 0.0f32;
-    let mut temperature_early_entropy_count = 0usize;
-    let mut temperature_mid_entropy_sum = 0.0f32;
-    let mut temperature_mid_entropy_count = 0usize;
+    let mut entropy_all_sum = 0.0f32;
+    let mut entropy_all_count = 0usize;
+    let mut entropy_opening_sum = 0.0f32;
+    let mut entropy_opening_count = 0usize;
+    let mut entropy_mid_sum = 0.0f32;
+    let mut entropy_mid_count = 0usize;
     let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
@@ -214,13 +237,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 },
             );
             let entropy = policy_entropy(&search.candidates);
-            let split = config.temperature_decay_plies.max(2).div_ceil(2);
-            if ply < split {
-                temperature_early_entropy_sum += entropy;
-                temperature_early_entropy_count += 1;
-            } else if ply < config.temperature_decay_plies.max(split + 1) {
-                temperature_mid_entropy_sum += entropy;
-                temperature_mid_entropy_count += 1;
+            entropy_all_sum += entropy;
+            entropy_all_count += 1;
+            // 分段与温度日程一致：`temperature_decay_plies` 之前为开局，之后为中后盘。
+            if ply < config.temperature_decay_plies {
+                entropy_opening_sum += entropy;
+                entropy_opening_count += 1;
+            } else {
+                entropy_mid_sum += entropy;
+                entropy_mid_count += 1;
             }
             let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
@@ -305,10 +330,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         black_wins,
         draws,
         plies_total,
-        temperature_early_entropy_sum,
-        temperature_early_entropy_count,
-        temperature_mid_entropy_sum,
-        temperature_mid_entropy_count,
+        entropy_all_sum,
+        entropy_all_count,
+        entropy_opening_sum,
+        entropy_opening_count,
+        entropy_mid_sum,
+        entropy_mid_count,
         terminal,
     }
 }
@@ -452,6 +479,8 @@ fn choose_selfplay_move(
 }
 
 fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
+    // 与 ZeroForge `train.py` 中 `p * log(p + 1e-10)` 数值形式对齐。
+    const EPS: f32 = 1e-10;
     let total = candidates
         .iter()
         .map(|candidate| candidate.policy.max(0.0))
@@ -461,9 +490,14 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
     }
     candidates
         .iter()
-        .map(|candidate| candidate.policy.max(0.0) / total)
-        .filter(|probability| *probability > 1e-9)
-        .map(|probability| -probability * probability.ln())
+        .map(|candidate| {
+            let p = (candidate.policy.max(0.0) / total).max(0.0);
+            if p <= 0.0 {
+                0.0
+            } else {
+                -p * (p + EPS).ln()
+            }
+        })
         .sum()
 }
 
