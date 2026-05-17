@@ -573,6 +573,7 @@ impl GpuReplica {
             .matmul(&self.vars.policy_move_hidden.t()?)?
             .broadcast_add(
                 &cnn_global
+                    .narrow(1, CNN_CHANNELS * 3, CNN_CHANNELS * 2)?
                     .matmul(
                         &self
                             .vars
