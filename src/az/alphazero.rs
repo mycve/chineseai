@@ -365,12 +365,13 @@ impl<'a> AzTree<'a> {
                     &child_position,
                     mv,
                 );
-                let child_rule_history = clone_rule_history_with_appended_move(
-                    &self.nodes[node_index].rule_history,
-                    &child_position,
-                    mv,
-                );
+                let mover = child_position.side_to_move();
                 child_position.make_move(mv);
+                let child_rule_entry = child_position.rule_history_entry(Some(mover));
+                let child_rule_history = clone_rule_history_with_appended_entry(
+                    &self.nodes[node_index].rule_history,
+                    child_rule_entry,
+                );
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
@@ -659,14 +660,13 @@ fn clone_history_with_appended_move(
     out
 }
 
-fn clone_rule_history_with_appended_move(
+fn clone_rule_history_with_appended_entry(
     rule_history: &[RuleHistoryEntry],
-    position: &Position,
-    mv: Move,
+    entry: RuleHistoryEntry,
 ) -> Vec<RuleHistoryEntry> {
     let mut out = Vec::with_capacity(rule_history.len() + 1);
     out.extend_from_slice(rule_history);
-    out.push(position.rule_history_entry_after_move(mv));
+    out.push(entry);
     out
 }
 
