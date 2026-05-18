@@ -509,11 +509,7 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
         .iter()
         .map(|candidate| {
             let p = (candidate.policy.max(0.0) / total).max(0.0);
-            if p <= 0.0 {
-                0.0
-            } else {
-                -p * (p + EPS).ln()
-            }
+            if p <= 0.0 { 0.0 } else { -p * (p + EPS).ln() }
         })
         .sum()
 }

@@ -32,10 +32,12 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
+// v36：policy global condition 增加一层小 MLP，上游共享表征先映射到
+//   policy_context，再输出到 move-feature condition。
 // v35：给每层 Local/Row/Col 图聚合增加 per-channel 可训练 gate/bias。
 // v34：把 trunk 4 个容量旋钮（gnn_node_channels/layers, value_hidden_size, policy_node_proj_size）
 //   从编译期常量改为 nnue 二进制头里携带的运行时字段。旧 v33 文件不再兼容。
-const AZNNUE_BINARY_VERSION: u32 = 35;
+const AZNNUE_BINARY_VERSION: u32 = 36;
 // 头部布局（小端 u32 依次）：
 //   magic(4 字节) | version | input_size | hidden_size | gnn_node_channels |
 //   gnn_node_layers | value_hidden_size | policy_node_proj_size
@@ -82,6 +84,7 @@ pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
 // pool_node_features 内部硬编码 6 种聚合（mean/max/attn/row/col/std），
 //   该常量与代码强耦合，不开放为配置项。
 pub(super) const NODE_POOL_BLOCKS: usize = 6;
+pub(super) const POLICY_CONTEXT_SIZE: usize = 64;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
@@ -176,6 +179,7 @@ pub(super) struct AzEvalScratch {
     node_global: Vec<f32>,
     value_intermediate: Vec<f32>,
     value_logits: Vec<f32>,
+    policy_context: Vec<f32>,
     policy_condition: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
@@ -200,6 +204,7 @@ impl AzEvalScratch {
             node_global: vec![0.0; pool],
             value_intermediate: vec![0.0; arch.value_hidden_size],
             value_logits: vec![0.0; VALUE_LOGITS],
+            policy_context: vec![0.0; POLICY_CONTEXT_SIZE],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
@@ -236,6 +241,10 @@ pub struct AzNnue {
     pub policy_from_bias: Vec<f32>,
     pub policy_to_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
+    pub policy_context_hidden: Vec<f32>,
+    pub policy_context_nodes: Vec<f32>,
+    pub policy_context_bias: Vec<f32>,
+    pub policy_context_feature: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
     pub policy_feature_nodes: Vec<f32>,
     pub policy_feature_bias: Vec<f32>,
@@ -322,6 +331,10 @@ impl Clone for AzNnue {
             policy_from_bias: self.policy_from_bias.clone(),
             policy_to_bias: self.policy_to_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
+            policy_context_hidden: self.policy_context_hidden.clone(),
+            policy_context_nodes: self.policy_context_nodes.clone(),
+            policy_context_bias: self.policy_context_bias.clone(),
+            policy_context_feature: self.policy_context_feature.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
             policy_feature_nodes: self.policy_feature_nodes.clone(),
             policy_feature_bias: self.policy_feature_bias.clone(),
@@ -485,8 +498,7 @@ impl AzNnue {
         let graph_row_gate = vec![0.25; graph_gate_len];
         let graph_col_gate = vec![0.25; graph_gate_len];
         let graph_bias = vec![0.0; graph_gate_len];
-        let node_attention_query: Vec<f32> =
-            (0..gnn_channels).map(|_| rng.weight(0.08)).collect();
+        let node_attention_query: Vec<f32> = (0..gnn_channels).map(|_| rng.weight(0.08)).collect();
         let node_hidden: Vec<f32> = (0..hidden_size * pool)
             .map(|_| rng.weight((2.0 / pool as f32).sqrt()))
             .collect();
@@ -511,6 +523,16 @@ impl AzNnue {
         let policy_from_bias = (0..gnn_channels).map(|_| rng.weight(0.01)).collect();
         let policy_to_bias = (0..gnn_channels).map(|_| rng.weight(0.01)).collect();
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
+        let policy_context_hidden = (0..POLICY_CONTEXT_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
+            .collect();
+        let policy_context_nodes = (0..POLICY_CONTEXT_SIZE * pool)
+            .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
+            .collect();
+        let policy_context_bias = vec![0.0; POLICY_CONTEXT_SIZE];
+        let policy_context_feature = (0..POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE)
+            .map(|_| rng.weight((2.0 / POLICY_CONTEXT_SIZE as f32).sqrt() * 0.5))
+            .collect();
         let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
@@ -543,6 +565,10 @@ impl AzNnue {
             policy_from_bias,
             policy_to_bias,
             policy_move_bias,
+            policy_context_hidden,
+            policy_context_nodes,
+            policy_context_bias,
+            policy_context_feature,
             policy_feature_hidden,
             policy_feature_nodes,
             policy_feature_bias,
@@ -588,6 +614,9 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.policy_from_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_to_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_context_hidden)?;
+        write_f32_slice_le(&mut writer, &self.policy_context_nodes)?;
+        write_f32_slice_le(&mut writer, &self.policy_context_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_hidden)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_nodes)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_bias)?;
@@ -645,8 +674,7 @@ impl AzNnue {
         let pool_size = arch.node_pool_size();
         let input_hidden_len = V4_INPUT_SIZE * hidden_size;
         let hidden_bias_len = hidden_size;
-        let node_input_weights_len =
-            gnn_node_channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
+        let node_input_weights_len = gnn_node_channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
         let node_input_bias_len = gnn_node_channels;
         let graph_gate_len = gnn_node_layers * gnn_node_channels;
         let node_attention_query_len = gnn_node_channels;
@@ -662,7 +690,10 @@ impl AzNnue {
         let pfbias_len = gnn_node_channels;
         let ptbias_len = gnn_node_channels;
         let pmb_len = DENSE_MOVE_SPACE;
-        let pfh_len = POLICY_CONDITION_SIZE * hidden_size;
+        let pch_len = POLICY_CONTEXT_SIZE * hidden_size;
+        let pcn_len = POLICY_CONTEXT_SIZE * pool_size;
+        let pcb_len = POLICY_CONTEXT_SIZE;
+        let pfh_len = POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE;
         let pfc_len = POLICY_CONDITION_SIZE * pool_size;
         let pfb_len = POLICY_CONDITION_SIZE;
         let float_count = input_hidden_len
@@ -683,6 +714,9 @@ impl AzNnue {
             + pfbias_len
             + ptbias_len
             + pmb_len
+            + pch_len
+            + pcn_len
+            + pcb_len
             + pfh_len
             + pfc_len
             + pfb_len;
@@ -720,6 +754,9 @@ impl AzNnue {
         let policy_from_bias = read_f32_vec_le(&mut reader, pfbias_len)?;
         let policy_to_bias = read_f32_vec_le(&mut reader, ptbias_len)?;
         let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
+        let policy_context_hidden = read_f32_vec_le(&mut reader, pch_len)?;
+        let policy_context_nodes = read_f32_vec_le(&mut reader, pcn_len)?;
+        let policy_context_bias = read_f32_vec_le(&mut reader, pcb_len)?;
         let policy_feature_hidden = read_f32_vec_le(&mut reader, pfh_len)?;
         let policy_feature_nodes = read_f32_vec_le(&mut reader, pfc_len)?;
         let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
@@ -748,6 +785,9 @@ impl AzNnue {
             policy_from_bias,
             policy_to_bias,
             policy_move_bias,
+            policy_context_hidden,
+            policy_context_nodes,
+            policy_context_bias,
             policy_feature_hidden,
             policy_feature_nodes,
             policy_feature_bias,
@@ -755,6 +795,16 @@ impl AzNnue {
         };
         model.validate()?;
         Ok(model)
+    }
+
+    pub fn evaluate_value(
+        &self,
+        position: &Position,
+        history: &[HistoryMove],
+        moves: &[Move],
+    ) -> f32 {
+        let mut scratch = AzEvalScratch::new(self.arch);
+        self.evaluate_with_scratch(position, history, moves, &mut scratch)
     }
 
     pub(super) fn evaluate_with_scratch(
@@ -799,6 +849,7 @@ impl AzNnue {
         self.policy_condition_into(
             &scratch.hidden,
             &scratch.node_global,
+            &mut scratch.policy_context,
             &mut scratch.policy_condition,
         );
         scratch.logits.resize(moves.len(), 0.0);
@@ -895,11 +946,7 @@ impl AzNnue {
         let value_hidden = self.arch.value_hidden_size;
         let pool = self.arch.node_pool_size();
         value_intermediate.copy_from_slice(&self.value_intermediate_bias);
-        for (j, value) in value_intermediate
-            .iter_mut()
-            .enumerate()
-            .take(value_hidden)
-        {
+        for (j, value) in value_intermediate.iter_mut().enumerate().take(value_hidden) {
             let h_row =
                 &self.value_intermediate_hidden[j * self.hidden_size..(j + 1) * self.hidden_size];
             for (hidden_value, weight) in hidden.iter().zip(h_row) {
@@ -921,14 +968,30 @@ impl AzNnue {
         scalar_value_from_logits(value_logits).0
     }
 
-    fn policy_condition_into(&self, hidden: &[f32], node_global: &[f32], out: &mut Vec<f32>) {
+    fn policy_condition_into(
+        &self,
+        hidden: &[f32],
+        node_global: &[f32],
+        context: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) {
         let pool = self.arch.node_pool_size();
+        context.resize(POLICY_CONTEXT_SIZE, 0.0);
+        context.copy_from_slice(&self.policy_context_bias);
+        for (feature, value) in context.iter_mut().enumerate().take(POLICY_CONTEXT_SIZE) {
+            let hidden_row = &self.policy_context_hidden
+                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            *value += dot_product(hidden, hidden_row);
+            let node_row = &self.policy_context_nodes[feature * pool..(feature + 1) * pool];
+            *value += dot_product(node_global, node_row);
+            *value = (*value).max(0.0);
+        }
         out.resize(POLICY_CONDITION_SIZE, 0.0);
         out.copy_from_slice(&self.policy_feature_bias);
         for (feature, value) in out.iter_mut().enumerate().take(POLICY_CONDITION_SIZE) {
             let hidden_row = &self.policy_feature_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            *value += dot_product(hidden, hidden_row);
+                [feature * POLICY_CONTEXT_SIZE..(feature + 1) * POLICY_CONTEXT_SIZE];
+            *value += dot_product(context, hidden_row);
             let node_row = &self.policy_feature_nodes[feature * pool..(feature + 1) * pool];
             *value += dot_product(node_global, node_row);
         }
@@ -992,7 +1055,10 @@ impl AzNnue {
             || self.policy_from_bias.len() != channels
             || self.policy_to_bias.len() != channels
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
-            || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * hidden
+            || self.policy_context_hidden.len() != POLICY_CONTEXT_SIZE * hidden
+            || self.policy_context_nodes.len() != POLICY_CONTEXT_SIZE * pool
+            || self.policy_context_bias.len() != POLICY_CONTEXT_SIZE
+            || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE
             || self.policy_feature_nodes.len() != POLICY_CONDITION_SIZE * pool
             || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
         {

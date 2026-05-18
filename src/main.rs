@@ -10,8 +10,8 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
         AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, alphazero_search,
-        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples,
+        alphazero_search_with_history_and_rules, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -63,6 +63,8 @@ enum CliCommand {
     AzInit(AzInitArgs),
     /// Search one position and print policy/debug details.
     AzSearch(AzSearchArgs),
+    /// Diagnose policy/search/value on one position.
+    AzDiagnose(AzDiagnoseArgs),
     /// Benchmark fixed-position search speed.
     AzBench(AzBenchArgs),
     /// Benchmark a synthetic training workload.
@@ -384,6 +386,48 @@ fn parse_search_algorithm(text: &str) -> Result<AzSearchAlgorithm, String> {
         .ok_or_else(|| "expected `alphazero` or `gumbel_alphazero`".to_string())
 }
 
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai az-diagnose chineseai.nnue 512 --algorithm gumbel_alphazero --topk 64 --gumbel-scale 0 \"5k3/9/9/9/9/9/4r4/4R4/4R1r2/4K4 w - - 0 1\"")]
+struct AzDiagnoseArgs {
+    /// AZ-NNUE model path.
+    model: String,
+    /// Number of MCTS simulations.
+    #[arg(default_value_t = 512)]
+    simulations: usize,
+    /// PUCT constant for AlphaZero search.
+    #[arg(default_value_t = 0.0)]
+    cpuct: f32,
+    /// Search algorithm: alphazero or gumbel_alphazero.
+    #[arg(long, value_parser = parse_search_algorithm)]
+    algorithm: Option<AzSearchAlgorithm>,
+    /// Gumbel root top-k considered actions.
+    #[arg(long, default_value_t = 64)]
+    topk: usize,
+    /// Gumbel noise scale.
+    #[arg(long, default_value_t = 0.0)]
+    gumbel_scale: f32,
+    /// Gumbel completed-q value scale.
+    #[arg(long, default_value_t = 0.1)]
+    gumbel_value_scale: f32,
+    /// Gumbel max-visit initialization.
+    #[arg(long, default_value_t = 50.0)]
+    gumbel_maxvisit_init: f32,
+    /// Rescale completed values in Gumbel search.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_rescale_values: bool,
+    /// Mix root value into unvisited Gumbel action values.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_use_mixed_value: bool,
+    /// Print child reply diagnostics for this many top static moves.
+    #[arg(long, default_value_t = 3)]
+    replies: usize,
+    /// FEN string, or startpos if omitted.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    fen: Vec<String>,
+}
+
 fn build_gumbel_config(
     topk: usize,
     gumbel_scale: f32,
@@ -477,7 +521,12 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
             state.next_update, state.best_elo
         ),
     )
-    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", az_loop_progress_path(config_path).display()));
+    .unwrap_or_else(|err| {
+        panic!(
+            "failed to write `{}`: {err}",
+            az_loop_progress_path(config_path).display()
+        )
+    });
 }
 
 fn save_az_loop_progress_pair(config_path: &str, next_update: usize, best_elo: f32) {
@@ -864,6 +913,12 @@ fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
 
+fn piece_label(piece: Option<chineseai::xiangqi::Piece>) -> String {
+    piece
+        .map(|piece| format!("{:?}{:?}", piece.color, piece.kind))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -971,6 +1026,182 @@ fn main() {
                     "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
                     candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
                 );
+            }
+        }
+        Some(CliCommand::AzDiagnose(cmd)) => {
+            let model_path = cmd.model;
+            let simulations = cmd.simulations.max(1);
+            let cpuct = cmd.cpuct.max(0.0);
+            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::GumbelAlphaZero);
+            let gumbel = build_gumbel_config(
+                cmd.topk,
+                cmd.gumbel_scale,
+                cmd.gumbel_value_scale,
+                cmd.gumbel_maxvisit_init,
+                cmd.gumbel_rescale_values,
+                cmd.gumbel_use_mixed_value,
+            );
+            let fen = cmd.fen.join(" ");
+            let position = parse_position(&fen);
+            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+                panic!("failed to load `{model_path}`: {err}");
+            });
+            let rule_history = position.initial_rule_history();
+            let legal = position.legal_moves_with_rules(&rule_history);
+            let root_static = model.evaluate_value(&position, &[], &legal);
+            let search = alphazero_search_with_history_and_rules(
+                &position,
+                &[],
+                Some(rule_history.clone()),
+                Some(legal.clone()),
+                &model,
+                AzSearchLimits {
+                    simulations,
+                    seed: 0,
+                    cpuct,
+                    root_dirichlet_alpha: 0.0,
+                    root_exploration_fraction: 0.0,
+                    algorithm,
+                    gumbel,
+                },
+            );
+            println!("fen          : {}", position.to_fen());
+            println!("model        : {model_path}");
+            println!("side         : {:?}", position.side_to_move());
+            println!("legal_moves  : {}", legal.len());
+            println!(
+                "root_static  : {:.4} cp={:.0}",
+                root_static,
+                root_static * 1000.0
+            );
+            println!(
+                "search       : {} sims={} cpuct={} gumbel_topk={} gumbel_scale={}",
+                algorithm.as_str(),
+                search.simulations,
+                cpuct,
+                gumbel.max_num_considered_actions,
+                gumbel.gumbel_scale
+            );
+            println!("search_value : cp={}", search.value_cp);
+            println!(
+                "bestmove     : {}",
+                search
+                    .best_move
+                    .map(|mv| mv.to_string())
+                    .unwrap_or_else(|| "(none)".into())
+            );
+
+            let mut rows = Vec::new();
+            for mv in legal {
+                let captured = position.piece_at(mv.to as usize);
+                let moved = position.piece_at(mv.from as usize);
+                let mut child = position.clone();
+                let mut child_history = Vec::new();
+                if let Some(piece) = moved {
+                    child_history.push(chineseai::nnue::HistoryMove {
+                        piece,
+                        captured,
+                        mv,
+                    });
+                }
+                let mut child_rule_history = rule_history.clone();
+                child_rule_history.push(position.rule_history_entry_after_move(mv));
+                child.make_move(mv);
+                let child_legal = child.legal_moves_with_rules(&child_rule_history);
+                let child_value_for_child =
+                    model.evaluate_value(&child, &child_history, &child_legal);
+                let child_value_for_root = -child_value_for_child;
+                let candidate = search
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.mv == mv);
+                rows.push((
+                    mv,
+                    captured,
+                    child_value_for_root,
+                    child_legal.len(),
+                    candidate.map(|candidate| candidate.visits).unwrap_or(0),
+                    candidate.map(|candidate| candidate.q).unwrap_or(0.0),
+                    candidate.map(|candidate| candidate.prior).unwrap_or(0.0),
+                    candidate.map(|candidate| candidate.policy).unwrap_or(0.0),
+                ));
+            }
+            rows.sort_by(|left, right| {
+                right
+                    .2
+                    .total_cmp(&left.2)
+                    .then_with(|| right.4.cmp(&left.4))
+                    .then_with(|| right.7.total_cmp(&left.7))
+            });
+            println!("children_by_static_value:");
+            println!("move capture child_static_cp child_legal visits q prior policy");
+            for (mv, captured, child_value, child_legal, visits, q, prior, policy) in &rows {
+                println!(
+                    "{} {} {:.0} {} {} {:.4} {:.6} {:.6}",
+                    mv,
+                    piece_label(*captured),
+                    child_value * 1000.0,
+                    child_legal,
+                    visits,
+                    q,
+                    prior,
+                    policy
+                );
+            }
+            for (mv, _, _, _, _, _, _, _) in rows.iter().take(cmd.replies) {
+                let moved = position.piece_at(mv.from as usize);
+                let captured = position.piece_at(mv.to as usize);
+                let mut child = position.clone();
+                let mut child_history = Vec::new();
+                if let Some(piece) = moved {
+                    child_history.push(chineseai::nnue::HistoryMove {
+                        piece,
+                        captured,
+                        mv: *mv,
+                    });
+                }
+                let mut child_rule_history = rule_history.clone();
+                child_rule_history.push(position.rule_history_entry_after_move(*mv));
+                child.make_move(*mv);
+                let child_legal = child.legal_moves_with_rules(&child_rule_history);
+                println!("replies_after {} fen={}", mv, child.to_fen());
+                let mut reply_rows = Vec::new();
+                for reply in child_legal {
+                    let reply_captured = child.piece_at(reply.to as usize);
+                    let mut grandchild = child.clone();
+                    let mut reply_history = child_history.clone();
+                    if let Some(piece) = child.piece_at(reply.from as usize) {
+                        reply_history.push(chineseai::nnue::HistoryMove {
+                            piece,
+                            captured: reply_captured,
+                            mv: reply,
+                        });
+                    }
+                    let mut grandchild_rule_history = child_rule_history.clone();
+                    grandchild_rule_history.push(child.rule_history_entry_after_move(reply));
+                    grandchild.make_move(reply);
+                    let grandchild_legal =
+                        grandchild.legal_moves_with_rules(&grandchild_rule_history);
+                    let grandchild_value_for_grandchild =
+                        model.evaluate_value(&grandchild, &reply_history, &grandchild_legal);
+                    let reply_value_for_child = -grandchild_value_for_grandchild;
+                    reply_rows.push((
+                        reply,
+                        reply_captured,
+                        reply_value_for_child,
+                        grandchild.to_fen(),
+                    ));
+                }
+                reply_rows.sort_by(|left, right| right.2.total_cmp(&left.2));
+                for (reply, reply_captured, reply_value, reply_fen) in reply_rows {
+                    println!(
+                        "  reply {} capture={} child_static_cp={:.0} fen={}",
+                        reply,
+                        piece_label(reply_captured),
+                        reply_value * 1000.0,
+                        reply_fen
+                    );
+                }
             }
         }
         Some(CliCommand::AzBench(cmd)) => {
@@ -1108,8 +1339,7 @@ fn main() {
                     panic!("failed to load `{}`: {err}", cmd.model.display());
                 })
             } else {
-                let mut arch =
-                    chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
+                let mut arch = chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
                 if let Some(value) = cmd.gnn_node_channels {
                     arch.gnn_node_channels = value.max(1);
                 }
@@ -1667,11 +1897,7 @@ fn main() {
                 if exited_after_ctrl_c {
                     break;
                 }
-                save_az_loop_progress_pair(
-                    &config_path,
-                    update.saturating_add(1),
-                    arena_best_elo,
-                );
+                save_az_loop_progress_pair(&config_path, update.saturating_add(1), arena_best_elo);
                 if !best_path.exists() {
                     fs::copy(&config.model_path, &best_path).unwrap_or_else(|err| {
                         panic!(

@@ -6,8 +6,8 @@ use std::{process::Command, thread};
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS,
     BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
-    POLICY_CONDITION_SIZE, VALUE_LOGITS, policy_move_features, policy_move_from_indices,
-    policy_move_to_indices,
+    POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, VALUE_LOGITS, policy_move_features,
+    policy_move_from_indices, policy_move_to_indices,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -60,6 +60,9 @@ struct GpuVars {
     policy_from_bias: Var,
     policy_to_bias: Var,
     policy_move_bias: Var,
+    policy_context_hidden: Var,
+    policy_context_nodes: Var,
+    policy_context_bias: Var,
     policy_feature_hidden: Var,
     policy_feature_nodes: Var,
     policy_feature_bias: Var,
@@ -590,7 +593,12 @@ impl GpuReplica {
             .matmul(&self.vars.policy_node_key.t()?)?
             .reshape((bsz, BOARD_PLANES_SIZE, proj))?;
         let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
-        let policy_condition = hidden
+        let policy_context = hidden
+            .matmul(&self.vars.policy_context_hidden.t()?)?
+            .broadcast_add(&node_global.matmul(&self.vars.policy_context_nodes.t()?)?)?
+            .broadcast_add(&self.vars.policy_context_bias)?
+            .relu()?;
+        let policy_condition = policy_context
             .matmul(&self.vars.policy_feature_hidden.t()?)?
             .broadcast_add(
                 &node_global
@@ -617,8 +625,7 @@ impl GpuReplica {
         let to_logits = to_nodes
             .broadcast_mul(&self.vars.policy_to_bias.reshape((1, 1, channels))?)?
             .sum(2)?;
-        let pair_logits =
-            (from_q.broadcast_mul(&to_k)?.sum(2)? * (1.0 / (proj as f64).sqrt()))?;
+        let pair_logits = (from_q.broadcast_mul(&to_k)?.sum(2)? * (1.0 / (proj as f64).sqrt()))?;
         let policy_logits =
             (((policy_feature_logits.broadcast_add(&policy_bias)? + from_logits)? + to_logits)?
                 + pair_logits)?;
@@ -816,11 +823,7 @@ impl GpuVars {
                 arch.gnn_node_layers * channels,
                 device,
             )?,
-            graph_bias: var_from_slice(
-                &model.graph_bias,
-                arch.gnn_node_layers * channels,
-                device,
-            )?,
+            graph_bias: var_from_slice(&model.graph_bias, arch.gnn_node_layers * channels, device)?,
             node_attention_query: var_from_slice(&model.node_attention_query, channels, device)?,
             node_hidden: var_from_slice(&model.node_hidden, (hidden, pool), device)?,
             node_hidden_bias: var_from_slice(&model.node_hidden_bias, hidden, device)?,
@@ -845,18 +848,29 @@ impl GpuVars {
                 device,
             )?,
             value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
-            policy_node_query: var_from_slice(
-                &model.policy_node_query,
-                (proj, channels),
-                device,
-            )?,
+            policy_node_query: var_from_slice(&model.policy_node_query, (proj, channels), device)?,
             policy_node_key: var_from_slice(&model.policy_node_key, (proj, channels), device)?,
             policy_from_bias: var_from_slice(&model.policy_from_bias, channels, device)?,
             policy_to_bias: var_from_slice(&model.policy_to_bias, channels, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
+            policy_context_hidden: var_from_slice(
+                &model.policy_context_hidden,
+                (POLICY_CONTEXT_SIZE, hidden),
+                device,
+            )?,
+            policy_context_nodes: var_from_slice(
+                &model.policy_context_nodes,
+                (POLICY_CONTEXT_SIZE, pool),
+                device,
+            )?,
+            policy_context_bias: var_from_slice(
+                &model.policy_context_bias,
+                POLICY_CONTEXT_SIZE,
+                device,
+            )?,
             policy_feature_hidden: var_from_slice(
                 &model.policy_feature_hidden,
-                (POLICY_CONDITION_SIZE, hidden),
+                (POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE),
                 device,
             )?,
             policy_feature_nodes: var_from_slice(
@@ -917,6 +931,9 @@ impl GpuVars {
         vars.push(self.policy_from_bias.clone());
         vars.push(self.policy_to_bias.clone());
         vars.push(self.policy_move_bias.clone());
+        vars.push(self.policy_context_hidden.clone());
+        vars.push(self.policy_context_nodes.clone());
+        vars.push(self.policy_context_bias.clone());
         vars.push(self.policy_feature_hidden.clone());
         vars.push(self.policy_feature_nodes.clone());
         vars.push(self.policy_feature_bias.clone());
@@ -957,6 +974,9 @@ impl GpuVars {
             self.policy_from_bias.clone(),
             self.policy_to_bias.clone(),
             self.policy_move_bias.clone(),
+            self.policy_context_hidden.clone(),
+            self.policy_context_nodes.clone(),
+            self.policy_context_bias.clone(),
             self.policy_feature_hidden.clone(),
             self.policy_feature_nodes.clone(),
             self.policy_feature_bias.clone(),
@@ -1013,6 +1033,12 @@ impl GpuVars {
         copy_var(&self.policy_from_bias, &mut model.policy_from_bias)?;
         copy_var(&self.policy_to_bias, &mut model.policy_to_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
+        copy_var(
+            &self.policy_context_hidden,
+            &mut model.policy_context_hidden,
+        )?;
+        copy_var(&self.policy_context_nodes, &mut model.policy_context_nodes)?;
+        copy_var(&self.policy_context_bias, &mut model.policy_context_bias)?;
         copy_var(
             &self.policy_feature_hidden,
             &mut model.policy_feature_hidden,
