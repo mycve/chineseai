@@ -69,7 +69,7 @@ enum CliCommand {
     AzBench(AzBenchArgs),
     /// Benchmark a synthetic training workload.
     AzTrainBench(AzTrainBenchArgs),
-    /// Distill GNN npz policy/value shards into an AZ-NNUE model.
+    /// Distill npz policy/value shards into an AZ-NNUE model.
     #[cfg(feature = "distill")]
     AzDistill(AzDistillArgs),
     /// Run self-play training from a TOML config.
@@ -91,34 +91,16 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// trunk GNN 每层节点通道数（`AzNnueArch::gnn_node_channels`）。默认与 v33 行为一致。
-    #[arg(long)]
-    gnn_node_channels: Option<usize>,
-    /// trunk GNN 固定聚合层数（`AzNnueArch::gnn_node_layers`）。
-    #[arg(long)]
-    gnn_node_layers: Option<usize>,
     /// value 头中间隐藏维度（`AzNnueArch::value_hidden_size`）。
     #[arg(long)]
     value_hidden_size: Option<usize>,
-    /// policy node q/k 投影维度（`AzNnueArch::policy_node_proj_size`）。
-    #[arg(long)]
-    policy_node_proj_size: Option<usize>,
 }
 
 impl AzInitArgs {
     fn arch(&self) -> chineseai::az::AzNnueArch {
         let mut arch = chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1));
-        if let Some(value) = self.gnn_node_channels {
-            arch.gnn_node_channels = value.max(1);
-        }
-        if let Some(value) = self.gnn_node_layers {
-            arch.gnn_node_layers = value.max(1);
-        }
         if let Some(value) = self.value_hidden_size {
             arch.value_hidden_size = value.max(1);
-        }
-        if let Some(value) = self.policy_node_proj_size {
-            arch.policy_node_proj_size = value.max(1);
         }
         arch
     }
@@ -244,18 +226,9 @@ struct AzDistillArgs {
     /// Hidden size used when creating a missing model.
     #[arg(long, default_value_t = 128)]
     hidden: usize,
-    /// trunk GNN 每层节点通道数（init 新模型时用，老模型沿用其自身 arch）。
-    #[arg(long)]
-    gnn_node_channels: Option<usize>,
-    /// trunk GNN 固定聚合层数。
-    #[arg(long)]
-    gnn_node_layers: Option<usize>,
     /// value 头中间隐藏维度。
     #[arg(long)]
     value_hidden_size: Option<usize>,
-    /// policy node q/k 投影维度。
-    #[arg(long)]
-    policy_node_proj_size: Option<usize>,
     /// Training epochs over all shards.
     #[arg(long, default_value_t = 1)]
     epochs: usize,
@@ -268,7 +241,7 @@ struct AzDistillArgs {
     /// Weight for the policy cross-entropy during distillation.
     #[arg(long, default_value_t = 1.0)]
     policy_weight: f32,
-    /// Update shared sparse/CNN/trunk parameters during distillation.
+    /// Update shared sparse NNUE parameters during distillation.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     train_shared: bool,
     /// Update the value head during distillation.
@@ -934,12 +907,9 @@ fn main() {
             });
             println!("aznnue   : initialized (nnue binary, magic AZB1)");
             println!(
-                "arch     : hidden={} gnn_channels={} gnn_layers={} value_hidden={} policy_proj={}",
+                "arch     : hidden={} value_hidden={}",
                 arch.hidden_size,
-                arch.gnn_node_channels,
-                arch.gnn_node_layers,
                 arch.value_hidden_size,
-                arch.policy_node_proj_size,
             );
             println!("seed     : {seed}");
             println!("output   : {output}");
@@ -1340,17 +1310,8 @@ fn main() {
                 })
             } else {
                 let mut arch = chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
-                if let Some(value) = cmd.gnn_node_channels {
-                    arch.gnn_node_channels = value.max(1);
-                }
-                if let Some(value) = cmd.gnn_node_layers {
-                    arch.gnn_node_layers = value.max(1);
-                }
                 if let Some(value) = cmd.value_hidden_size {
                     arch.value_hidden_size = value.max(1);
-                }
-                if let Some(value) = cmd.policy_node_proj_size {
-                    arch.policy_node_proj_size = value.max(1);
                 }
                 println!(
                     "distill  : init random model {} arch={:?}",
@@ -1509,7 +1470,7 @@ fn main() {
             }
             let best_path = best_model_path(&config.model_path);
 
-            // 模型形状全部由 config.arch() 决定（包含 hidden_size 和 4 个 trunk 旋钮）。
+            // 模型形状全部由 config.arch() 决定（hidden_size/value_hidden_size）。
             // 已有 .nnue 加载后，自身二进制头里的 arch 才是真实形状（可能与本次 config 不同）。
             let config_arch = config.arch();
             let model = if Path::new(&config.model_path).exists() {

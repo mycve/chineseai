@@ -12,10 +12,10 @@ mod train;
 mod train_gpu;
 
 use crate::nnue::{
-    HISTORY_PLIES, HistoryMove, V4_INPUT_SIZE, canonical_move, canonical_square,
-    extract_sparse_features_v4_canonical,
+    HISTORY_PLIES, HistoryMove, PURE_NNUE_INPUT_SIZE, canonical_move, canonical_square,
+    extract_sparse_features_pure_canonical,
 };
-use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, PieceKind, Position};
+use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
 pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
@@ -32,18 +32,12 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-// v37：value head 增加 value adapter + 第二层 MLP。Value 仍只读取共享
-//   hidden/node_global，不引入任何手工战术特征。
-// v36：policy global condition 增加一层小 MLP，上游共享表征先映射到
-//   policy_context，再输出到 move-feature condition。
-// v35：给每层 Local/Row/Col 图聚合增加 per-channel 可训练 gate/bias。
-// v34：把 trunk 4 个容量旋钮（gnn_node_channels/layers, value_hidden_size, policy_node_proj_size）
-//   从编译期常量改为 nnue 二进制头里携带的运行时字段。旧 v33 文件不再兼容。
-const AZNNUE_BINARY_VERSION: u32 = 37;
+// v38：纯稀疏 NNUE。输入只保留棋子/王位桶/历史/行列特征；
+//   模型文件只保存 sparse accumulator、value MLP、move-feature policy MLP。
+const AZNNUE_BINARY_VERSION: u32 = 38;
 // 头部布局（小端 u32 依次）：
-//   magic(4 字节) | version | input_size | hidden_size | gnn_node_channels |
-//   gnn_node_layers | value_hidden_size | policy_node_proj_size
-const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 7;
+//   magic(4 字节) | version | input_size | hidden_size | value_hidden_size
+const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 4;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
     for &value in slice {
@@ -70,94 +64,51 @@ fn read_f32_vec_le(reader: &mut impl Read, len: usize) -> io::Result<Vec<f32>> {
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
-// v34 起，下列原 trunk 常量已改为 AzNnue 上的运行时字段，但仍提供同名 DEFAULT_*
-//   作为 AzNnueArch::default() 与配置文件默认值的来源，保持与 v33 行为一致。
-pub(super) const DEFAULT_GNN_NODE_CHANNELS: usize = 32;
-pub(super) const DEFAULT_GNN_NODE_LAYERS: usize = 2;
 pub(super) const DEFAULT_VALUE_HIDDEN_SIZE: usize = 256;
-pub(super) const DEFAULT_POLICY_NODE_PROJ_SIZE: usize = 32;
 const VALUE_LOGITS: usize = 3;
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
-pub(super) const PIECE_BOARD_CHANNELS: usize = 14;
-pub(super) const BOARD_CHANNELS: usize = PIECE_BOARD_CHANNELS * BOARD_HISTORY_FRAMES;
-pub(super) const BOARD_INPUT_KERNEL_AREA: usize = 1;
-// pool_node_features 内部硬编码 6 种聚合（mean/max/attn/row/col/std），
-//   该常量与代码强耦合，不开放为配置项。
-pub(super) const NODE_POOL_BLOCKS: usize = 6;
 pub(super) const POLICY_CONTEXT_SIZE: usize = 64;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 
-/// 模型 trunk 容量配置：与 hidden_size 一样，全部由配置/二进制头驱动。
+/// 纯 NNUE 模型容量配置：全部由配置/二进制头驱动。
 /// 改这些值会改变模型形状，不能与已有 nnue 文件兼容，需要重新初始化。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AzNnueArch {
     /// 共享 hidden 向量宽度。
     pub hidden_size: usize,
-    /// GNN 每层节点通道数（trunk 主要宽度旋钮）。
-    pub gnn_node_channels: usize,
-    /// GNN 聚合层数；每层带轻量 per-channel Local/Row/Col gate。
-    pub gnn_node_layers: usize,
     /// value 头中间隐藏宽度。
     pub value_hidden_size: usize,
-    /// policy node q/k 投影维度。
-    pub policy_node_proj_size: usize,
 }
 
 impl AzNnueArch {
-    /// 与 v33 行为一致的默认 trunk 容量。
+    /// 默认纯 NNUE 容量。
     pub const fn default_const() -> Self {
         Self {
             hidden_size: 256,
-            gnn_node_channels: DEFAULT_GNN_NODE_CHANNELS,
-            gnn_node_layers: DEFAULT_GNN_NODE_LAYERS,
             value_hidden_size: DEFAULT_VALUE_HIDDEN_SIZE,
-            policy_node_proj_size: DEFAULT_POLICY_NODE_PROJ_SIZE,
         }
     }
 
-    /// 仅指定 hidden_size，其他 trunk 旋钮取默认。便于命令行/测试场景。
+    /// 仅指定 hidden_size，其他旋钮取默认。便于命令行/测试场景。
     pub const fn with_hidden_size(hidden_size: usize) -> Self {
         let mut arch = Self::default_const();
         arch.hidden_size = hidden_size;
         arch
     }
 
-    /// 节点池尺寸（mean/max/attn/row/col/std 共 6 块）。
-    pub const fn node_pool_size(&self) -> usize {
-        self.gnn_node_channels * NODE_POOL_BLOCKS
-    }
-
-    /// 形状合法性自检：任一字段为 0 或层数 < 1 都视为非法配置。
+    /// 形状合法性自检：任一字段为 0 都视为非法配置。
     pub fn validate(&self) -> Result<(), String> {
         if self.hidden_size == 0 {
             return Err(format!("invalid hidden_size {}", self.hidden_size));
-        }
-        if self.gnn_node_channels == 0 {
-            return Err(format!(
-                "invalid gnn_node_channels {}",
-                self.gnn_node_channels
-            ));
-        }
-        if self.gnn_node_layers == 0 {
-            return Err(format!(
-                "invalid gnn_node_layers {} (must be >= 1)",
-                self.gnn_node_layers
-            ));
         }
         if self.value_hidden_size == 0 {
             return Err(format!(
                 "invalid value_hidden_size {}",
                 self.value_hidden_size
-            ));
-        }
-        if self.policy_node_proj_size == 0 {
-            return Err(format!(
-                "invalid policy_node_proj_size {}",
-                self.policy_node_proj_size
             ));
         }
         Ok(())
@@ -171,14 +122,6 @@ impl Default for AzNnueArch {
 }
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
-    next: Vec<f32>,
-    board: Vec<u8>,
-    node_input: Vec<f32>,
-    graph_tmp: Vec<f32>,
-    policy_nodes: Vec<f32>,
-    policy_q_nodes: Vec<f32>,
-    policy_k_nodes: Vec<f32>,
-    node_global: Vec<f32>,
     value_intermediate: Vec<f32>,
     value_hidden: Vec<f32>,
     value_logits: Vec<f32>,
@@ -189,22 +132,11 @@ pub(super) struct AzEvalScratch {
 }
 
 impl AzEvalScratch {
-    /// 按当前 arch 一次性预分配前向缓冲。所有依赖 trunk 容量的尺寸都在此固化。
+    /// 按当前 arch 一次性预分配前向缓冲。所有依赖模型容量的尺寸都在此固化。
     pub(super) fn new(arch: AzNnueArch) -> Self {
         let hidden_size = arch.hidden_size;
-        let gnn_channels = arch.gnn_node_channels;
-        let proj = arch.policy_node_proj_size;
-        let pool = arch.node_pool_size();
         Self {
             hidden: vec![0.0; hidden_size],
-            next: vec![0.0; hidden_size],
-            board: vec![0; BOARD_HISTORY_SIZE],
-            node_input: vec![0.0; gnn_channels * BOARD_PLANES_SIZE],
-            graph_tmp: vec![0.0; gnn_channels * BOARD_PLANES_SIZE],
-            policy_nodes: vec![0.0; gnn_channels * BOARD_PLANES_SIZE],
-            policy_q_nodes: vec![0.0; proj * BOARD_PLANES_SIZE],
-            policy_k_nodes: vec![0.0; proj * BOARD_PLANES_SIZE],
-            node_global: vec![0.0; pool],
             value_intermediate: vec![0.0; arch.value_hidden_size],
             value_hidden: vec![0.0; arch.value_hidden_size],
             value_logits: vec![0.0; VALUE_LOGITS],
@@ -219,96 +151,30 @@ impl AzEvalScratch {
 #[derive(Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
-    /// trunk 的可配置容量旋钮（与 hidden_size 一起决定模型形状）。
+    /// 可配置容量旋钮（与 hidden_size 一起决定模型形状）。
     /// `hidden_size` 字段保留用于历史调用方（uci/main 等）的兼容访问，
     /// 与 `arch.hidden_size` 始终保持同步。
     pub arch: AzNnueArch,
     pub input_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
-    pub node_input_weights: Vec<f32>,
-    pub node_input_bias: Vec<f32>,
-    pub graph_self_gate: Vec<f32>,
-    pub graph_local_gate: Vec<f32>,
-    pub graph_row_gate: Vec<f32>,
-    pub graph_col_gate: Vec<f32>,
-    pub graph_bias: Vec<f32>,
-    pub node_attention_query: Vec<f32>,
-    pub node_hidden: Vec<f32>,
-    pub node_hidden_bias: Vec<f32>,
     pub value_intermediate_hidden: Vec<f32>,
-    pub value_intermediate_nodes: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
     pub value_hidden_weights: Vec<f32>,
-    pub value_hidden_nodes: Vec<f32>,
     pub value_hidden_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
-    pub policy_node_query: Vec<f32>,
-    pub policy_node_key: Vec<f32>,
-    pub policy_from_bias: Vec<f32>,
-    pub policy_to_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
-    pub policy_context_nodes: Vec<f32>,
     pub policy_context_bias: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
-    pub policy_feature_nodes: Vec<f32>,
     pub policy_feature_bias: Vec<f32>,
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
 // Architecture notes:
-// - v27 removes the independent value CNN / value NNUE branch. Value now reads
-//   the same shared hidden representation used by policy, then applies only a
-//   small MLP head. This keeps the evaluator cheaper and prevents value from
-//   learning a separate board model from policy.
-// - v28 adds parameter-free RMSNorm on the shared hidden vector before both
-//   value and policy heads. The GNN node path keeps only fixed /3 aggregation
-//   scaling to stay cheap during CPU MCTS.
-// - v29 removes the dense per-move hidden table from policy. Policy is now
-//   driven by GNN from/to/pair node terms plus small shared move-geometry
-//   conditioning, which shares better across similar moves.
-// - v30 removes the remaining dense per-move node-weight table. Policy now uses
-//   shared from/to node projections: q(from) dot k(to), plus shared from/to
-//   node bias terms, move geometry conditioning, and a small dense move bias.
-//   v31 removes the old trainable 3x3 board convolution from the model file
-//   entirely. The board path follows the ZeroForge-style cheap GNN pattern:
-//   a per-square input channel projection feeds Local8 + Row + Col graph
-//   aggregation, then node pooling feeds the shared hidden/value path.
-// - v35 keeps that cheap aggregation but gives each layer/channel trainable
-//   self/local/row/col gates and a bias. This is intentionally much lighter
-//   than a learned 3x3 convolution while letting training choose how much each
-//   information path matters per channel.
-// - Do not add a from/to-square factorized policy head on top of this absolute
-//   board representation. A previous v14/v15 experiment mixed absolute board
-//   features with partially relative action-square sharing and immediately
-//   produced a severe red/black bias in self-play. Factorized policy should
-//   wait until the whole model has a consistent per-square or canonical view.
-// - The board summary deliberately keeps cheap row/column line pools. This is
-//   the safe part borrowed from GNN-style row/column attention: it helps long
-//   rook/cannon/general files without changing action semantics.
-// - v18 removes the expensive first 3x3 input-board convolution. The first
-//   board layer is now a 1x1 channel mixer, then the second layer handles local
-//   3x3 patterns. This keeps local tactics while cutting the worst early CPU
-//   eval cost.
-// - v18 adds a static geometry-conditioned policy residual. It shares policy
-//   knowledge across similar move shapes without resurrecting the bad v14/v15
-//   from/to factorization or changing the absolute board view.
-// - v20 removes the old policy residual trunk completely. It was not a useful
-//   runtime knob: width, cheap board summaries, and move-conditioned policy
-//   sharing were more valuable than hidden->hidden depth for this CPU MCTS net.
-// - v21 tried a value-only relation/move encoder. It helped loss in places but
-//   made the value experiment muddy: hand summaries can become shortcuts and
-//   hide whether the board model itself understands positions.
-// - v22 switches the net to side-to-move canonical inputs and canonical policy
-//   actions: the mover is always represented as Red, and Black-to-move boards
-//   are rotated 180 degrees with colors swapped. The old side-to-move board
-//   channel is removed; do not feed canonical boards with absolute move labels,
-//   because that recreates the red/black leakage bug.
-// - v26 changes policy scoring to a GNN-style node head. The policy board CNN
-//   becomes the node encoder, then Local/Row/Col graph aggregation builds
-//   per-square features. Action logits use from-node, to-node, pair, and global
-//   terms.
+// - v38 is intentionally clean: sparse canonical features -> ReLU accumulator
+//   -> RMSNorm -> small value and policy heads. Row/column context is encoded
+//   as sparse input features, not a board network.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -317,34 +183,16 @@ impl Clone for AzNnue {
             arch: self.arch,
             input_hidden: self.input_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
-            node_input_weights: self.node_input_weights.clone(),
-            node_input_bias: self.node_input_bias.clone(),
-            graph_self_gate: self.graph_self_gate.clone(),
-            graph_local_gate: self.graph_local_gate.clone(),
-            graph_row_gate: self.graph_row_gate.clone(),
-            graph_col_gate: self.graph_col_gate.clone(),
-            graph_bias: self.graph_bias.clone(),
-            node_attention_query: self.node_attention_query.clone(),
-            node_hidden: self.node_hidden.clone(),
-            node_hidden_bias: self.node_hidden_bias.clone(),
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
-            value_intermediate_nodes: self.value_intermediate_nodes.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
             value_hidden_weights: self.value_hidden_weights.clone(),
-            value_hidden_nodes: self.value_hidden_nodes.clone(),
             value_hidden_bias: self.value_hidden_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
-            policy_node_query: self.policy_node_query.clone(),
-            policy_node_key: self.policy_node_key.clone(),
-            policy_from_bias: self.policy_from_bias.clone(),
-            policy_to_bias: self.policy_to_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
-            policy_context_nodes: self.policy_context_nodes.clone(),
             policy_context_bias: self.policy_context_bias.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
-            policy_feature_nodes: self.policy_feature_nodes.clone(),
             policy_feature_bias: self.policy_feature_bias.clone(),
             gpu_trainer: None,
         }
@@ -480,76 +328,37 @@ impl AzTrainStats {
 }
 
 impl AzNnue {
-    /// 用指定 trunk 容量随机初始化模型。所有形状均由 `arch` 驱动。
+    /// 用指定容量随机初始化模型。所有形状均由 `arch` 驱动。
     pub fn random_with_arch(arch: AzNnueArch, seed: u64) -> Self {
         if let Err(err) = arch.validate() {
             panic!("AzNnue::random_with_arch: invalid arch ({err})");
         }
         let hidden_size = arch.hidden_size;
-        let gnn_channels = arch.gnn_node_channels;
         let value_hidden = arch.value_hidden_size;
-        let proj = arch.policy_node_proj_size;
-        let pool = arch.node_pool_size();
         let mut rng = SplitMix64::new(seed);
-        let input_hidden: Vec<f32> = (0..V4_INPUT_SIZE * hidden_size)
+        let input_hidden: Vec<f32> = (0..PURE_NNUE_INPUT_SIZE * hidden_size)
             .map(|_| rng.weight(0.015))
             .collect();
         let hidden_bias = vec![0.0; hidden_size];
-        let node_input_weights: Vec<f32> =
-            (0..gnn_channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA)
-                .map(|_| rng.weight(0.08))
-                .collect();
-        let node_input_bias = vec![0.0; gnn_channels];
-        let graph_gate_len = arch.gnn_node_layers * gnn_channels;
-        let graph_self_gate = vec![0.25; graph_gate_len];
-        let graph_local_gate = vec![0.25; graph_gate_len];
-        let graph_row_gate = vec![0.25; graph_gate_len];
-        let graph_col_gate = vec![0.25; graph_gate_len];
-        let graph_bias = vec![0.0; graph_gate_len];
-        let node_attention_query: Vec<f32> = (0..gnn_channels).map(|_| rng.weight(0.08)).collect();
-        let node_hidden: Vec<f32> = (0..hidden_size * pool)
-            .map(|_| rng.weight((2.0 / pool as f32).sqrt()))
-            .collect();
-        let node_hidden_bias = vec![0.0; hidden_size];
         let value_intermediate_hidden = (0..value_hidden * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        let value_intermediate_nodes = (0..value_hidden * pool)
-            .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
             .collect();
         let value_intermediate_bias = vec![0.0; value_hidden];
         let value_hidden_weights = (0..value_hidden * value_hidden)
             .map(|_| rng.weight((2.0 / value_hidden as f32).sqrt() * 0.5))
-            .collect();
-        let value_hidden_nodes = (0..value_hidden * pool)
-            .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.25))
             .collect();
         let value_hidden_bias = vec![0.0; value_hidden];
         let value_logits_weights = (0..VALUE_LOGITS * value_hidden)
             .map(|_| rng.weight((2.0 / value_hidden as f32).sqrt()))
             .collect();
         let value_logits_bias = vec![0.0; VALUE_LOGITS];
-        let policy_node_query = (0..proj * gnn_channels)
-            .map(|_| rng.weight((2.0 / gnn_channels as f32).sqrt() * 0.5))
-            .collect();
-        let policy_node_key = (0..proj * gnn_channels)
-            .map(|_| rng.weight((2.0 / gnn_channels as f32).sqrt() * 0.5))
-            .collect();
-        let policy_from_bias = (0..gnn_channels).map(|_| rng.weight(0.01)).collect();
-        let policy_to_bias = (0..gnn_channels).map(|_| rng.weight(0.01)).collect();
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_context_hidden = (0..POLICY_CONTEXT_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
-        let policy_context_nodes = (0..POLICY_CONTEXT_SIZE * pool)
-            .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
-            .collect();
         let policy_context_bias = vec![0.0; POLICY_CONTEXT_SIZE];
         let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE)
             .map(|_| rng.weight((2.0 / POLICY_CONTEXT_SIZE as f32).sqrt() * 0.5))
-            .collect();
-        let policy_feature_nodes = (0..POLICY_CONDITION_SIZE * pool)
-            .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
             .collect();
         let policy_feature_bias = vec![0.0; POLICY_CONDITION_SIZE];
         Self {
@@ -557,40 +366,22 @@ impl AzNnue {
             arch,
             input_hidden,
             hidden_bias,
-            node_input_weights,
-            node_input_bias,
-            graph_self_gate,
-            graph_local_gate,
-            graph_row_gate,
-            graph_col_gate,
-            graph_bias,
-            node_attention_query,
-            node_hidden,
-            node_hidden_bias,
             value_intermediate_hidden,
-            value_intermediate_nodes,
             value_intermediate_bias,
             value_hidden_weights,
-            value_hidden_nodes,
             value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
-            policy_node_query,
-            policy_node_key,
-            policy_from_bias,
-            policy_to_bias,
             policy_move_bias,
             policy_context_hidden,
-            policy_context_nodes,
             policy_context_bias,
             policy_feature_hidden,
-            policy_feature_nodes,
             policy_feature_bias,
             gpu_trainer: None,
         }
     }
 
-    /// 仅指定 hidden_size 的便捷构造（其余 trunk 旋钮取默认）。
+    /// 仅指定 hidden_size 的便捷构造（其余旋钮取默认）。
     pub fn random(hidden_size: usize, seed: u64) -> Self {
         Self::random_with_arch(AzNnueArch::with_hidden_size(hidden_size), seed)
     }
@@ -600,42 +391,21 @@ impl AzNnue {
         let mut writer = BufWriter::new(file);
         writer.write_all(AZNNUE_BINARY_MAGIC)?;
         writer.write_all(&AZNNUE_BINARY_VERSION.to_le_bytes())?;
-        writer.write_all(&(V4_INPUT_SIZE as u32).to_le_bytes())?;
+        writer.write_all(&(PURE_NNUE_INPUT_SIZE as u32).to_le_bytes())?;
         writer.write_all(&(self.arch.hidden_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.arch.gnn_node_channels as u32).to_le_bytes())?;
-        writer.write_all(&(self.arch.gnn_node_layers as u32).to_le_bytes())?;
         writer.write_all(&(self.arch.value_hidden_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.arch.policy_node_proj_size as u32).to_le_bytes())?;
         write_f32_slice_le(&mut writer, &self.input_hidden)?;
         write_f32_slice_le(&mut writer, &self.hidden_bias)?;
-        write_f32_slice_le(&mut writer, &self.node_input_weights)?;
-        write_f32_slice_le(&mut writer, &self.node_input_bias)?;
-        write_f32_slice_le(&mut writer, &self.graph_self_gate)?;
-        write_f32_slice_le(&mut writer, &self.graph_local_gate)?;
-        write_f32_slice_le(&mut writer, &self.graph_row_gate)?;
-        write_f32_slice_le(&mut writer, &self.graph_col_gate)?;
-        write_f32_slice_le(&mut writer, &self.graph_bias)?;
-        write_f32_slice_le(&mut writer, &self.node_attention_query)?;
-        write_f32_slice_le(&mut writer, &self.node_hidden)?;
-        write_f32_slice_le(&mut writer, &self.node_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
-        write_f32_slice_le(&mut writer, &self.value_intermediate_nodes)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
         write_f32_slice_le(&mut writer, &self.value_hidden_weights)?;
-        write_f32_slice_le(&mut writer, &self.value_hidden_nodes)?;
         write_f32_slice_le(&mut writer, &self.value_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
-        write_f32_slice_le(&mut writer, &self.policy_node_query)?;
-        write_f32_slice_le(&mut writer, &self.policy_node_key)?;
-        write_f32_slice_le(&mut writer, &self.policy_from_bias)?;
-        write_f32_slice_le(&mut writer, &self.policy_to_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_context_hidden)?;
-        write_f32_slice_le(&mut writer, &self.policy_context_nodes)?;
         write_f32_slice_le(&mut writer, &self.policy_context_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_hidden)?;
-        write_f32_slice_le(&mut writer, &self.policy_feature_nodes)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_bias)?;
         writer.flush()?;
         Ok(())
@@ -665,22 +435,16 @@ impl AzNnue {
         }
         let input_size = read_u32_le(&mut reader)? as usize;
         let hidden_size = read_u32_le(&mut reader)? as usize;
-        let gnn_node_channels = read_u32_le(&mut reader)? as usize;
-        let gnn_node_layers = read_u32_le(&mut reader)? as usize;
         let value_hidden_size = read_u32_le(&mut reader)? as usize;
-        let policy_node_proj_size = read_u32_le(&mut reader)? as usize;
-        if input_size != V4_INPUT_SIZE {
+        if input_size != PURE_NNUE_INPUT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "binary input_size does not match this build (V4_INPUT_SIZE)",
+                "binary input_size does not match this build (PURE_NNUE_INPUT_SIZE)",
             ));
         }
         let arch = AzNnueArch {
             hidden_size,
-            gnn_node_channels,
-            gnn_node_layers,
             value_hidden_size,
-            policy_node_proj_size,
         };
         if let Err(err) = arch.validate() {
             return Err(io::Error::new(
@@ -688,60 +452,31 @@ impl AzNnue {
                 format!("AZNNUE binary header arch invalid: {err}"),
             ));
         }
-        let pool_size = arch.node_pool_size();
-        let input_hidden_len = V4_INPUT_SIZE * hidden_size;
+        let input_hidden_len = PURE_NNUE_INPUT_SIZE * hidden_size;
         let hidden_bias_len = hidden_size;
-        let node_input_weights_len = gnn_node_channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
-        let node_input_bias_len = gnn_node_channels;
-        let graph_gate_len = gnn_node_layers * gnn_node_channels;
-        let node_attention_query_len = gnn_node_channels;
-        let node_hidden_len = hidden_size * pool_size;
-        let node_hidden_bias_len = hidden_size;
         let vih_len = value_hidden_size * hidden_size;
-        let vin_len = value_hidden_size * pool_size;
         let vib_len = value_hidden_size;
         let vhw_len = value_hidden_size * value_hidden_size;
-        let vhn_len = value_hidden_size * pool_size;
         let vhb_len = value_hidden_size;
         let vlw_len = VALUE_LOGITS * value_hidden_size;
         let vlb_len = VALUE_LOGITS;
-        let pnq_len = policy_node_proj_size * gnn_node_channels;
-        let pnk_len = policy_node_proj_size * gnn_node_channels;
-        let pfbias_len = gnn_node_channels;
-        let ptbias_len = gnn_node_channels;
         let pmb_len = DENSE_MOVE_SPACE;
         let pch_len = POLICY_CONTEXT_SIZE * hidden_size;
-        let pcn_len = POLICY_CONTEXT_SIZE * pool_size;
         let pcb_len = POLICY_CONTEXT_SIZE;
         let pfh_len = POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE;
-        let pfc_len = POLICY_CONDITION_SIZE * pool_size;
         let pfb_len = POLICY_CONDITION_SIZE;
         let float_count = input_hidden_len
             + hidden_bias_len
-            + node_input_weights_len
-            + node_input_bias_len
-            + graph_gate_len * 5
-            + node_attention_query_len
-            + node_hidden_len
-            + node_hidden_bias_len
             + vih_len
-            + vin_len
             + vib_len
             + vhw_len
-            + vhn_len
             + vhb_len
             + vlw_len
             + vlb_len
-            + pnq_len
-            + pnk_len
-            + pfbias_len
-            + ptbias_len
             + pmb_len
             + pch_len
-            + pcn_len
             + pcb_len
             + pfh_len
-            + pfc_len
             + pfb_len;
         let expected_len = AZNNUE_BINARY_HEADER_LEN + float_count * 4;
         if bytes.len() != expected_len {
@@ -757,68 +492,32 @@ impl AzNnue {
         }
         let input_hidden = read_f32_vec_le(&mut reader, input_hidden_len)?;
         let hidden_bias = read_f32_vec_le(&mut reader, hidden_bias_len)?;
-        let node_input_weights = read_f32_vec_le(&mut reader, node_input_weights_len)?;
-        let node_input_bias = read_f32_vec_le(&mut reader, node_input_bias_len)?;
-        let graph_self_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
-        let graph_local_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
-        let graph_row_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
-        let graph_col_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
-        let graph_bias = read_f32_vec_le(&mut reader, graph_gate_len)?;
-        let node_attention_query = read_f32_vec_le(&mut reader, node_attention_query_len)?;
-        let node_hidden = read_f32_vec_le(&mut reader, node_hidden_len)?;
-        let node_hidden_bias = read_f32_vec_le(&mut reader, node_hidden_bias_len)?;
         let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
-        let value_intermediate_nodes = read_f32_vec_le(&mut reader, vin_len)?;
         let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
         let value_hidden_weights = read_f32_vec_le(&mut reader, vhw_len)?;
-        let value_hidden_nodes = read_f32_vec_le(&mut reader, vhn_len)?;
         let value_hidden_bias = read_f32_vec_le(&mut reader, vhb_len)?;
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
         let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
-        let policy_node_query = read_f32_vec_le(&mut reader, pnq_len)?;
-        let policy_node_key = read_f32_vec_le(&mut reader, pnk_len)?;
-        let policy_from_bias = read_f32_vec_le(&mut reader, pfbias_len)?;
-        let policy_to_bias = read_f32_vec_le(&mut reader, ptbias_len)?;
         let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
         let policy_context_hidden = read_f32_vec_le(&mut reader, pch_len)?;
-        let policy_context_nodes = read_f32_vec_le(&mut reader, pcn_len)?;
         let policy_context_bias = read_f32_vec_le(&mut reader, pcb_len)?;
         let policy_feature_hidden = read_f32_vec_le(&mut reader, pfh_len)?;
-        let policy_feature_nodes = read_f32_vec_le(&mut reader, pfc_len)?;
         let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
         let model = Self {
             hidden_size,
             arch,
             input_hidden,
             hidden_bias,
-            node_input_weights,
-            node_input_bias,
-            graph_self_gate,
-            graph_local_gate,
-            graph_row_gate,
-            graph_col_gate,
-            graph_bias,
-            node_attention_query,
-            node_hidden,
-            node_hidden_bias,
             value_intermediate_hidden,
-            value_intermediate_nodes,
             value_intermediate_bias,
             value_hidden_weights,
-            value_hidden_nodes,
             value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
-            policy_node_query,
-            policy_node_key,
-            policy_from_bias,
-            policy_to_bias,
             policy_move_bias,
             policy_context_hidden,
-            policy_context_nodes,
             policy_context_bias,
             policy_feature_hidden,
-            policy_feature_nodes,
             policy_feature_bias,
             gpu_trainer: None,
         };
@@ -844,50 +543,23 @@ impl AzNnue {
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         let side = position.side_to_move();
-        let features = extract_sparse_features_v4_canonical(position, history);
-        extract_board_planes(position, history, &mut scratch.board);
+        let features = extract_sparse_features_pure_canonical(position, history);
         self.input_embedding_into(&features, &mut scratch.hidden);
-        self.board_forward_into(
-            &scratch.board,
-            &mut scratch.node_input,
-            &mut scratch.graph_tmp,
-            &mut scratch.policy_nodes,
-            &mut scratch.node_global,
-        );
-        self.node_hidden_into(&scratch.node_global, &mut scratch.next);
-        for idx in 0..self.hidden_size {
-            scratch.hidden[idx] += scratch.next[idx];
-        }
         rms_norm_in_place(&mut scratch.hidden);
-        self.policy_node_projection_into(
-            &scratch.policy_nodes,
-            &self.policy_node_query,
-            &mut scratch.policy_q_nodes,
-        );
-        self.policy_node_projection_into(
-            &scratch.policy_nodes,
-            &self.policy_node_key,
-            &mut scratch.policy_k_nodes,
-        );
         let value = self.value_from_hidden_into(
             &scratch.hidden,
-            &scratch.node_global,
             &mut scratch.value_intermediate,
             &mut scratch.value_hidden,
             &mut scratch.value_logits,
         );
         self.policy_condition_into(
             &scratch.hidden,
-            &scratch.node_global,
             &mut scratch.policy_context,
             &mut scratch.policy_condition,
         );
         scratch.logits.resize(moves.len(), 0.0);
         for (index, mv) in moves.iter().enumerate() {
             scratch.logits[index] = self.policy_logit_from_hidden_index(
-                &scratch.policy_nodes,
-                &scratch.policy_q_nodes,
-                &scratch.policy_k_nodes,
                 &scratch.policy_condition,
                 dense_move_index(canonical_move(side, *mv)),
             );
@@ -910,82 +582,20 @@ impl AzNnue {
         }
     }
 
-    fn node_hidden_into(&self, node_global: &[f32], hidden: &mut Vec<f32>) {
-        let pool = self.arch.node_pool_size();
-        hidden.resize(self.hidden_size, 0.0);
-        hidden.copy_from_slice(&self.node_hidden_bias);
-        for (out, hidden_value) in hidden.iter_mut().enumerate().take(self.hidden_size) {
-            let row = &self.node_hidden[out * pool..(out + 1) * pool];
-            for (node_value, weight) in node_global.iter().zip(row) {
-                *hidden_value += node_value * weight;
-            }
-            *hidden_value = (*hidden_value).max(0.0);
-        }
-    }
-
-    fn board_forward_into(
-        &self,
-        board: &[u8],
-        node_input: &mut Vec<f32>,
-        graph_tmp: &mut Vec<f32>,
-        policy_nodes: &mut Vec<f32>,
-        node_global: &mut Vec<f32>,
-    ) {
-        let channels = self.arch.gnn_node_channels;
-        let pool = self.arch.node_pool_size();
-        let layers = self.arch.gnn_node_layers;
-        node_input.resize(channels * BOARD_PLANES_SIZE, 0.0);
-        graph_tmp.resize(channels * BOARD_PLANES_SIZE, 0.0);
-        node_global.resize(pool, 0.0);
-        node_input_layer_into(
-            board,
-            channels,
-            &self.node_input_weights,
-            &self.node_input_bias,
-            node_input,
-        );
-        // 至少跑一次图聚合（layers >= 1，已在 arch.validate 校验）。
-        graph_node_layer_into(node_input, graph_tmp, self, 0);
-        if layers == 1 {
-            policy_nodes.resize(channels * BOARD_PLANES_SIZE, 0.0);
-            policy_nodes.copy_from_slice(graph_tmp);
-        } else {
-            graph_node_layer_into(graph_tmp, policy_nodes, self, 1);
-            // 第 3 层及以后：在 policy_nodes 与 graph_tmp 之间反复聚合。
-            for layer in 2..layers {
-                graph_node_layer_into(policy_nodes, graph_tmp, self, layer);
-                policy_nodes.resize(channels * BOARD_PLANES_SIZE, 0.0);
-                policy_nodes.copy_from_slice(graph_tmp);
-            }
-        }
-        pool_node_features(
-            policy_nodes,
-            channels,
-            &self.node_attention_query,
-            node_global,
-        );
-    }
-
     fn value_from_hidden_into(
         &self,
         hidden: &[f32],
-        node_global: &[f32],
         value_intermediate: &mut Vec<f32>,
         value_hidden_out: &mut Vec<f32>,
         value_logits: &mut Vec<f32>,
     ) -> f32 {
         let value_hidden = self.arch.value_hidden_size;
-        let pool = self.arch.node_pool_size();
         value_intermediate.copy_from_slice(&self.value_intermediate_bias);
         for (j, value) in value_intermediate.iter_mut().enumerate().take(value_hidden) {
             let h_row =
                 &self.value_intermediate_hidden[j * self.hidden_size..(j + 1) * self.hidden_size];
             for (hidden_value, weight) in hidden.iter().zip(h_row) {
                 *value += hidden_value * weight;
-            }
-            let node_row = &self.value_intermediate_nodes[j * pool..(j + 1) * pool];
-            for (node_value, weight) in node_global.iter().zip(node_row) {
-                *value += node_value * weight;
             }
             *value = (*value).max(0.0);
         }
@@ -994,10 +604,6 @@ impl AzNnue {
             let h_row = &self.value_hidden_weights[j * value_hidden..(j + 1) * value_hidden];
             for (intermediate, weight) in value_intermediate.iter().zip(h_row) {
                 *value += intermediate * weight;
-            }
-            let node_row = &self.value_hidden_nodes[j * pool..(j + 1) * pool];
-            for (node_value, weight) in node_global.iter().zip(node_row) {
-                *value += node_value * weight;
             }
             *value = (*value).max(0.0);
         }
@@ -1014,19 +620,15 @@ impl AzNnue {
     fn policy_condition_into(
         &self,
         hidden: &[f32],
-        node_global: &[f32],
         context: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) {
-        let pool = self.arch.node_pool_size();
         context.resize(POLICY_CONTEXT_SIZE, 0.0);
         context.copy_from_slice(&self.policy_context_bias);
         for (feature, value) in context.iter_mut().enumerate().take(POLICY_CONTEXT_SIZE) {
             let hidden_row = &self.policy_context_hidden
                 [feature * self.hidden_size..(feature + 1) * self.hidden_size];
             *value += dot_product(hidden, hidden_row);
-            let node_row = &self.policy_context_nodes[feature * pool..(feature + 1) * pool];
-            *value += dot_product(node_global, node_row);
             *value = (*value).max(0.0);
         }
         out.resize(POLICY_CONDITION_SIZE, 0.0);
@@ -1035,24 +637,6 @@ impl AzNnue {
             let hidden_row = &self.policy_feature_hidden
                 [feature * POLICY_CONTEXT_SIZE..(feature + 1) * POLICY_CONTEXT_SIZE];
             *value += dot_product(context, hidden_row);
-            let node_row = &self.policy_feature_nodes[feature * pool..(feature + 1) * pool];
-            *value += dot_product(node_global, node_row);
-        }
-    }
-
-    fn policy_node_projection_into(&self, nodes: &[f32], weights: &[f32], out: &mut Vec<f32>) {
-        let proj = self.arch.policy_node_proj_size;
-        let channels = self.arch.gnn_node_channels;
-        out.resize(proj * BOARD_PLANES_SIZE, 0.0);
-        for p in 0..proj {
-            let weight_row = &weights[p * channels..(p + 1) * channels];
-            for sq in 0..BOARD_PLANES_SIZE {
-                let mut value = 0.0;
-                for channel in 0..channels {
-                    value += nodes[channel * BOARD_PLANES_SIZE + sq] * weight_row[channel];
-                }
-                out[p * BOARD_PLANES_SIZE + sq] = value;
-            }
         }
     }
 
@@ -1071,41 +655,19 @@ impl AzNnue {
             ));
         }
         let hidden = arch.hidden_size;
-        let channels = arch.gnn_node_channels;
-        let layers = arch.gnn_node_layers;
-        let pool = arch.node_pool_size();
         let value_hidden = arch.value_hidden_size;
-        let proj = arch.policy_node_proj_size;
-        if self.input_hidden.len() != V4_INPUT_SIZE * hidden
+        if self.input_hidden.len() != PURE_NNUE_INPUT_SIZE * hidden
             || self.hidden_bias.len() != hidden
-            || self.node_input_weights.len() != channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
-            || self.node_input_bias.len() != channels
-            || self.graph_self_gate.len() != layers * channels
-            || self.graph_local_gate.len() != layers * channels
-            || self.graph_row_gate.len() != layers * channels
-            || self.graph_col_gate.len() != layers * channels
-            || self.graph_bias.len() != layers * channels
-            || self.node_attention_query.len() != channels
-            || self.node_hidden.len() != hidden * pool
-            || self.node_hidden_bias.len() != hidden
             || self.value_intermediate_hidden.len() != value_hidden * hidden
-            || self.value_intermediate_nodes.len() != value_hidden * pool
             || self.value_intermediate_bias.len() != value_hidden
             || self.value_hidden_weights.len() != value_hidden * value_hidden
-            || self.value_hidden_nodes.len() != value_hidden * pool
             || self.value_hidden_bias.len() != value_hidden
             || self.value_logits_weights.len() != VALUE_LOGITS * value_hidden
             || self.value_logits_bias.len() != VALUE_LOGITS
-            || self.policy_node_query.len() != proj * channels
-            || self.policy_node_key.len() != proj * channels
-            || self.policy_from_bias.len() != channels
-            || self.policy_to_bias.len() != channels
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
             || self.policy_context_hidden.len() != POLICY_CONTEXT_SIZE * hidden
-            || self.policy_context_nodes.len() != POLICY_CONTEXT_SIZE * pool
             || self.policy_context_bias.len() != POLICY_CONTEXT_SIZE
             || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE
-            || self.policy_feature_nodes.len() != POLICY_CONDITION_SIZE * pool
             || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
         {
             return Err(io::Error::new(
@@ -1118,35 +680,13 @@ impl AzNnue {
 
     fn policy_logit_from_hidden_index(
         &self,
-        policy_nodes: &[f32],
-        policy_q_nodes: &[f32],
-        policy_k_nodes: &[f32],
         policy_condition: &[f32],
         move_index: usize,
     ) -> f32 {
-        let proj = self.arch.policy_node_proj_size;
-        let channels = self.arch.gnn_node_channels;
-        let sparse = move_map().dense_to_sparse[move_index] as usize;
-        let from = sparse / BOARD_SIZE;
-        let to = sparse % BOARD_SIZE;
         let feature_offset = move_index * POLICY_CONDITION_SIZE;
         let move_features =
             &policy_move_features()[feature_offset..feature_offset + POLICY_CONDITION_SIZE];
-        let mut logit =
-            self.policy_move_bias[move_index] + dot_product(policy_condition, move_features);
-        let mut pair = 0.0;
-        for p in 0..proj {
-            pair += policy_q_nodes[p * BOARD_PLANES_SIZE + from]
-                * policy_k_nodes[p * BOARD_PLANES_SIZE + to];
-        }
-        logit += pair * (proj as f32).sqrt().recip();
-        for channel in 0..channels {
-            let from_value = policy_nodes[channel * BOARD_PLANES_SIZE + from];
-            let to_value = policy_nodes[channel * BOARD_PLANES_SIZE + to];
-            logit += from_value * self.policy_from_bias[channel];
-            logit += to_value * self.policy_to_bias[channel];
-        }
-        logit
+        self.policy_move_bias[move_index] + dot_product(policy_condition, move_features)
     }
 }
 
@@ -1210,158 +750,6 @@ fn canonical_piece_plane(side: Color, piece_color: Color, kind: PieceKind) -> us
     absolute_piece_plane(canonical_color, kind)
 }
 
-fn node_input_layer_into(
-    board: &[u8],
-    output_channels: usize,
-    weights: &[f32],
-    bias: &[f32],
-    output: &mut [f32],
-) {
-    debug_assert_eq!(BOARD_INPUT_KERNEL_AREA, 1);
-    for (out_channel, bias_value) in bias.iter().copied().enumerate().take(output_channels) {
-        let out_start = out_channel * BOARD_PLANES_SIZE;
-        for sq in 0..BOARD_PLANES_SIZE {
-            let mut value = bias_value;
-            for frame in 0..BOARD_HISTORY_FRAMES {
-                let plane = board[frame * BOARD_PLANES_SIZE + sq];
-                if plane == 0 {
-                    continue;
-                }
-                let in_channel = frame * PIECE_BOARD_CHANNELS + plane as usize - 1;
-                debug_assert!(in_channel < BOARD_CHANNELS);
-                value += weights[out_channel * BOARD_CHANNELS + in_channel];
-            }
-            output[out_start + sq] = value.max(0.0);
-        }
-    }
-}
-
-fn pool_node_features(input: &[f32], channels: usize, attention_query: &[f32], output: &mut [f32]) {
-    debug_assert_eq!(input.len(), channels * BOARD_PLANES_SIZE);
-    debug_assert_eq!(attention_query.len(), channels);
-    debug_assert_eq!(output.len(), channels * NODE_POOL_BLOCKS);
-    let mut attention_logits = [0.0f32; BOARD_PLANES_SIZE];
-    let mut max_logit = f32::NEG_INFINITY;
-    for sq in 0..BOARD_PLANES_SIZE {
-        let mut logit = 0.0;
-        for channel in 0..channels {
-            logit += input[channel * BOARD_PLANES_SIZE + sq] * attention_query[channel];
-        }
-        attention_logits[sq] = logit;
-        max_logit = max_logit.max(logit);
-    }
-    let mut denom = 0.0;
-    for logit in &mut attention_logits {
-        *logit = (*logit - max_logit).exp();
-        denom += *logit;
-    }
-    let scale = 1.0 / BOARD_PLANES_SIZE as f32;
-    for channel in 0..channels {
-        let start = channel * BOARD_PLANES_SIZE;
-        let row = &input[start..start + BOARD_PLANES_SIZE];
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-        let mut max_value = 0.0;
-        let mut attn_sum = 0.0;
-        for (idx, value) in row.iter().enumerate() {
-            sum += *value;
-            sum_sq += *value * *value;
-            if idx == 0 || *value > max_value {
-                max_value = *value;
-            }
-            attn_sum += (*value) * attention_logits[idx] / denom.max(1e-12);
-        }
-        let mean = sum * scale;
-        let var = (sum_sq * scale - mean * mean).max(0.0);
-        output[channel] = mean;
-        output[channels + channel] = max_value;
-        output[channels * 2 + channel] = attn_sum;
-
-        let mut best_row_sum = 0.0f32;
-        for rank in 0..BOARD_RANKS {
-            let mut row_sum = 0.0f32;
-            for file in 0..BOARD_FILES {
-                row_sum += row[rank * BOARD_FILES + file];
-            }
-            best_row_sum = best_row_sum.max(row_sum);
-        }
-        let mut best_col_sum = 0.0f32;
-        for file in 0..BOARD_FILES {
-            let mut col_sum = 0.0f32;
-            for rank in 0..BOARD_RANKS {
-                col_sum += row[rank * BOARD_FILES + file];
-            }
-            best_col_sum = best_col_sum.max(col_sum);
-        }
-        output[channels * 3 + channel] = best_row_sum / BOARD_FILES as f32;
-        output[channels * 4 + channel] = best_col_sum / BOARD_RANKS as f32;
-        output[channels * 5 + channel] = (var + RMS_NORM_EPS).sqrt();
-    }
-}
-
-fn graph_node_layer_into(input: &[f32], output: &mut Vec<f32>, model: &AzNnue, layer: usize) {
-    let channels = model.arch.gnn_node_channels;
-    debug_assert_eq!(input.len(), channels * BOARD_PLANES_SIZE);
-    debug_assert!(layer < model.arch.gnn_node_layers);
-    output.resize(channels * BOARD_PLANES_SIZE, 0.0);
-    let gate_base = layer * channels;
-    for channel in 0..channels {
-        let channel_start = channel * BOARD_PLANES_SIZE;
-        let input_row = &input[channel_start..channel_start + BOARD_PLANES_SIZE];
-        let output_row = &mut output[channel_start..channel_start + BOARD_PLANES_SIZE];
-        let gate_index = gate_base + channel;
-        let self_gate = model.graph_self_gate[gate_index];
-        let local_gate = model.graph_local_gate[gate_index];
-        let row_gate = model.graph_row_gate[gate_index];
-        let col_gate = model.graph_col_gate[gate_index];
-        let bias = model.graph_bias[gate_index];
-        let mut row_mean = [0.0f32; BOARD_RANKS];
-        let mut col_mean = [0.0f32; BOARD_FILES];
-        let mut local_sum = [0.0f32; BOARD_PLANES_SIZE];
-        let mut local_count = [0.0f32; BOARD_PLANES_SIZE];
-        for rank in 0..BOARD_RANKS {
-            for file in 0..BOARD_FILES {
-                let sq = rank * BOARD_FILES + file;
-                let value = input_row[sq];
-                row_mean[rank] += value;
-                col_mean[file] += value;
-                for dr in -1i32..=1 {
-                    for df in -1i32..=1 {
-                        if dr == 0 && df == 0 {
-                            continue;
-                        }
-                        let nr = rank as i32 + dr;
-                        let nf = file as i32 + df;
-                        if (0..BOARD_RANKS as i32).contains(&nr)
-                            && (0..BOARD_FILES as i32).contains(&nf)
-                        {
-                            local_sum[sq] += input_row[nr as usize * BOARD_FILES + nf as usize];
-                            local_count[sq] += 1.0;
-                        }
-                    }
-                }
-            }
-        }
-        for value in &mut row_mean {
-            *value /= BOARD_FILES as f32;
-        }
-        for value in &mut col_mean {
-            *value /= BOARD_RANKS as f32;
-        }
-        for sq in 0..BOARD_PLANES_SIZE {
-            let file = sq % BOARD_FILES;
-            let rank = sq / BOARD_FILES;
-            let local_mean = local_sum[sq] / local_count[sq].max(1.0);
-            let value = input_row[sq] * self_gate
-                + local_mean * local_gate
-                + row_mean[rank] * row_gate
-                + col_mean[file] * col_gate
-                + bias;
-            output_row[sq] = value.max(0.0);
-        }
-    }
-}
-
 /// `batch_size` is the per-device training batch size.
 pub fn benchmark_training(
     model: &mut AzNnue,
@@ -1377,7 +765,7 @@ pub fn benchmark_training(
         let feature_count = 24 + (rng.next_u64() as usize % 16);
         let mut features = Vec::with_capacity(feature_count);
         for _ in 0..feature_count {
-            features.push((rng.next_u64() as usize) % V4_INPUT_SIZE);
+            features.push((rng.next_u64() as usize) % PURE_NNUE_INPUT_SIZE);
         }
         features.sort_unstable();
         features.dedup();
@@ -1633,22 +1021,6 @@ fn move_map() -> &'static MoveMap {
             dense_to_sparse,
         }
     })
-}
-
-pub(super) fn policy_move_from_indices() -> Vec<u32> {
-    move_map()
-        .dense_to_sparse
-        .iter()
-        .map(|&sparse| (sparse as usize / BOARD_SIZE) as u32)
-        .collect()
-}
-
-pub(super) fn policy_move_to_indices() -> Vec<u32> {
-    move_map()
-        .dense_to_sparse
-        .iter()
-        .map(|&sparse| (sparse as usize % BOARD_SIZE) as u32)
-        .collect()
 }
 
 pub(super) fn policy_move_features() -> &'static [f32] {

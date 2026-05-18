@@ -14,14 +14,8 @@ pub struct AzLoopFileConfig {
     pub max_sample_train_count: usize,
     pub max_plies: usize,
     pub hidden_size: usize,
-    /// trunk GNN 节点通道数（决定 trunk 主要宽度）。
-    pub gnn_node_channels: usize,
-    /// trunk GNN 聚合层数；每层带轻量 per-channel gate。
-    pub gnn_node_layers: usize,
     /// value 头中间隐藏维度。
     pub value_hidden_size: usize,
-    /// policy node q/k 投影维度。
-    pub policy_node_proj_size: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -54,7 +48,6 @@ impl Default for AzLoopFileConfig {
             max_num_considered_actions: 32,
             ..AzGumbelConfig::default()
         };
-        // trunk 默认值与 v33 行为一致；扩容时直接改 toml。
         let arch = AzNnueArch::default();
         Self {
             model_path: "chineseai.nnue".into(),
@@ -66,10 +59,7 @@ impl Default for AzLoopFileConfig {
             max_sample_train_count: 2,
             max_plies: 300,
             hidden_size: 256,
-            gnn_node_channels: arch.gnn_node_channels,
-            gnn_node_layers: arch.gnn_node_layers,
             value_hidden_size: arch.value_hidden_size,
-            policy_node_proj_size: arch.policy_node_proj_size,
             seed: 20260409,
             workers: 240,
             temperature_start: 1.0,
@@ -110,10 +100,7 @@ struct AzLoopTomlConfig {
     pub max_sample_train_count: Option<usize>,
     pub max_plies: Option<usize>,
     pub hidden_size: Option<usize>,
-    pub gnn_node_channels: Option<usize>,
-    pub gnn_node_layers: Option<usize>,
     pub value_hidden_size: Option<usize>,
-    pub policy_node_proj_size: Option<usize>,
     pub seed: Option<u64>,
     pub workers: Option<usize>,
     pub temperature_start: Option<f32>,
@@ -174,17 +161,8 @@ impl AzLoopTomlConfig {
         if let Some(value) = self.hidden_size {
             config.hidden_size = value;
         }
-        if let Some(value) = self.gnn_node_channels {
-            config.gnn_node_channels = value;
-        }
-        if let Some(value) = self.gnn_node_layers {
-            config.gnn_node_layers = value;
-        }
         if let Some(value) = self.value_hidden_size {
             config.value_hidden_size = value;
-        }
-        if let Some(value) = self.policy_node_proj_size {
-            config.policy_node_proj_size = value;
         }
         if let Some(value) = self.seed {
             config.seed = value;
@@ -302,7 +280,7 @@ impl AzLoopFileConfig {
 # Pipeline:
 #   Self-play and training run in separate long-lived threads.
 #   workers controls how many independent self-play threads run in parallel.
-#   The generated default is capped at 32 because this scalar MCTS/CNN code often slows down
+#   The generated default is capped at 32 because scalar CPU MCTS often slows down
 #   when hundreds of tiny self-play threads fight over cache and memory bandwidth.
 #   Self-play batches accumulate globally across workers.
 #   Every time selfplay_batch_games complete, one training update runs and then
@@ -354,19 +332,12 @@ impl AzLoopFileConfig {
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
 #
-# Model architecture (v35, .nnue 自描述):
-#   hidden_size 与下方 4 个 trunk 旋钮一同写入 .nnue 二进制头，每个文件自带形状描述。
+# Model architecture (v38, .nnue 自描述):
+#   hidden_size 与 value_hidden_size 写入 .nnue 二进制头，每个文件自带形状描述。
 #   修改任一项都会改变模型形状，老 .nnue 文件不再兼容、必须 re-init 新模型。
-#   - hidden_size：共享 hidden 向量宽度（默认 256）
-#   - gnn_node_channels：trunk GNN 每层节点通道数；trunk 主要宽度旋钮（默认 32）
-#   - gnn_node_layers：trunk GNN 聚合层数；每层有 per-channel self/local/row/col gate 与 bias
-#       （默认 2；提升到 3~4 可加深 trunk 信息传播，每层 forward 成本同步增加）
+#   - hidden_size：纯 NNUE accumulator hidden 向量宽度（默认 256）
 #   - value_hidden_size：value 头中间隐藏维度（默认 256）
-#   - policy_node_proj_size：policy node q/k 投影维度（默认 32）
-#   其余形状仍为编译期常量：board_channels=126, node_pool_blocks=6,
-#       policy_condition_size=32, value_logits=3。
-#   trunk 容量天花板诊断：先翻倍 gnn_node_channels（32→64）或加深 gnn_node_layers
-#       (2→3)；两者同时改更激进。一定要重新 az-init 模型。
+#   固定头部形状：policy_condition_size=32, policy_context_size=64, value_logits=3。
 
 model_path = "{model_path}"
 simulations = {simulations}
@@ -377,10 +348,7 @@ batch_size = {batch_size}
 max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
-gnn_node_channels = {gnn_node_channels}
-gnn_node_layers = {gnn_node_layers}
 value_hidden_size = {value_hidden_size}
-policy_node_proj_size = {policy_node_proj_size}
 seed = {seed}
 workers = {workers}
 temperature_start = {temperature_start}
@@ -420,10 +388,7 @@ tensorboard_logdir = "{tensorboard_logdir}"
             max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
-            gnn_node_channels = self.gnn_node_channels,
-            gnn_node_layers = self.gnn_node_layers,
             value_hidden_size = self.value_hidden_size,
-            policy_node_proj_size = self.policy_node_proj_size,
             seed = self.seed,
             workers = self.workers,
             temperature_start = self.temperature_start,
@@ -464,14 +429,11 @@ tensorboard_logdir = "{tensorboard_logdir}"
         config.normalize()
     }
 
-    /// 把 toml 中的 trunk 配置打包成 `AzNnueArch`，方便创建/校验模型。
+    /// 把 toml 中的模型容量配置打包成 `AzNnueArch`，方便创建/校验模型。
     pub fn arch(&self) -> AzNnueArch {
         AzNnueArch {
             hidden_size: self.hidden_size,
-            gnn_node_channels: self.gnn_node_channels,
-            gnn_node_layers: self.gnn_node_layers,
             value_hidden_size: self.value_hidden_size,
-            policy_node_proj_size: self.policy_node_proj_size,
         }
     }
 
@@ -483,10 +445,7 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.max_sample_train_count = self.max_sample_train_count.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
-        self.gnn_node_channels = self.gnn_node_channels.max(1);
-        self.gnn_node_layers = self.gnn_node_layers.max(1);
         self.value_hidden_size = self.value_hidden_size.max(1);
-        self.policy_node_proj_size = self.policy_node_proj_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::nnue::{
-    HistoryMove, canonical_move, extract_sparse_features_v4_canonical, mirror_file_move,
+    HistoryMove, canonical_move, extract_sparse_features_pure_canonical, mirror_file_move,
     mirror_sparse_features_file,
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
@@ -359,7 +359,7 @@ fn make_training_sample(
         .sum::<f32>()
         .max(1.0);
     let side = position.side_to_move();
-    let mut features = extract_sparse_features_v4_canonical(position, history);
+    let mut features = extract_sparse_features_pure_canonical(position, history);
     let mut moves = candidates
         .iter()
         .map(|candidate| canonical_move(side, candidate.mv))
