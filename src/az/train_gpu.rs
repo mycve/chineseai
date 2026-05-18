@@ -4,10 +4,10 @@ use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
 use super::{
-    AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS, BOARD_HISTORY_SIZE,
-    BOARD_PLANES_SIZE, DENSE_MOVE_SPACE, GNN_NODE_CHANNELS, NODE_POOL_SIZE, PIECE_BOARD_CHANNELS,
-    POLICY_CONDITION_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS, policy_move_features,
-    policy_move_from_indices, policy_move_to_indices,
+    AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, BOARD_CHANNELS,
+    BOARD_HISTORY_SIZE, BOARD_PLANES_SIZE, DENSE_MOVE_SPACE, PIECE_BOARD_CHANNELS,
+    POLICY_CONDITION_SIZE, VALUE_LOGITS, policy_move_features, policy_move_from_indices,
+    policy_move_to_indices,
 };
 use crate::nnue::V4_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS};
@@ -21,7 +21,7 @@ const DEFAULT_MIN_SAMPLES_PER_GPU: usize = 1;
 
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
-    hidden_size: usize,
+    arch: AzNnueArch,
     device_indices: Vec<usize>,
     replicas: Vec<GpuReplica>,
     optimizers: Vec<AdamW>,
@@ -32,7 +32,7 @@ pub(super) struct GpuTrainer {
 #[derive(Debug)]
 struct GpuReplica {
     device: Device,
-    hidden_size: usize,
+    arch: AzNnueArch,
     vars: GpuVars,
 }
 
@@ -162,7 +162,7 @@ impl GpuTrainer {
             );
         }
         Ok(Self {
-            hidden_size: model.hidden_size,
+            arch: model.arch,
             device_indices,
             replicas,
             optimizers,
@@ -172,7 +172,8 @@ impl GpuTrainer {
     }
 
     fn matches(&self, model: &AzNnue) -> bool {
-        self.hidden_size == model.hidden_size
+        // 任一 trunk 旋钮变化都强制重建 GpuTrainer，避免 Tensor 形状错配。
+        self.arch == model.arch
             && self.device_indices == cuda_device_indices()
             && self.sync_every == multi_gpu_sync_every()
     }
@@ -410,7 +411,7 @@ impl GpuReplica {
         let vars = GpuVars::from_model(model, &device)?;
         Ok(Self {
             device,
-            hidden_size: model.hidden_size,
+            arch: model.arch,
             vars,
         })
     }
@@ -488,11 +489,15 @@ impl GpuReplica {
 
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
+        let hidden_size = self.arch.hidden_size;
+        let channels = self.arch.gnn_node_channels;
+        let proj = self.arch.policy_node_proj_size;
+        let layers = self.arch.gnn_node_layers;
         let feature_embeddings = self
             .vars
             .input_hidden
             .index_select(&batch.feature_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, self.hidden_size))?;
+            .reshape((bsz, batch.max_features, hidden_size))?;
         let sparse_hidden = feature_embeddings
             .broadcast_mul(&batch.feature_mask)?
             .sum(1)?
@@ -505,20 +510,18 @@ impl GpuReplica {
             .transpose(1, 2)?
             .reshape((bsz * BOARD_PLANES_SIZE, BOARD_CHANNELS))?
             .matmul(&self.vars.node_input_weights.t()?)?
-            .reshape((bsz, BOARD_PLANES_SIZE, GNN_NODE_CHANNELS))?
-            .broadcast_add(
-                &self
-                    .vars
-                    .node_input_bias
-                    .reshape((1, 1, GNN_NODE_CHANNELS))?,
-            )?
+            .reshape((bsz, BOARD_PLANES_SIZE, channels))?
+            .broadcast_add(&self.vars.node_input_bias.reshape((1, 1, channels))?)?
             .transpose(1, 2)?
-            .reshape((bsz, GNN_NODE_CHANNELS, BOARD_RANKS, BOARD_FILES))?
+            .reshape((bsz, channels, BOARD_RANKS, BOARD_FILES))?
             .relu()?;
-        let graph_1 = self.graph_node_layer(&node_input)?;
-        let graph_2 = self.graph_node_layer(&graph_1)?;
-        let policy_nodes = graph_2
-            .reshape((bsz, GNN_NODE_CHANNELS, BOARD_PLANES_SIZE))?
+        // 至少跑一层（已在 arch.validate 处保证 layers >= 1）。
+        let mut graph = self.graph_node_layer(&node_input)?;
+        for _ in 1..layers {
+            graph = self.graph_node_layer(&graph)?;
+        }
+        let policy_nodes = graph
+            .reshape((bsz, channels, BOARD_PLANES_SIZE))?
             .transpose(1, 2)?
             .contiguous()?;
         let policy_nodes_by_channel = policy_nodes.transpose(1, 2)?.contiguous()?;
@@ -530,17 +533,14 @@ impl GpuReplica {
             .mean(2)?
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
-        let attn_query = self
-            .vars
-            .node_attention_query
-            .reshape((1, GNN_NODE_CHANNELS, 1))?;
+        let attn_query = self.vars.node_attention_query.reshape((1, channels, 1))?;
         let attn_logits = policy_nodes_by_channel.broadcast_mul(&attn_query)?.sum(1)?;
         let attn_weights = softmax(&attn_logits, 1)?;
         let attn_pool = policy_nodes_by_channel
             .broadcast_mul(&attn_weights.unsqueeze(1)?)?
             .sum(2)?;
         let policy_node_grid =
-            policy_nodes_by_channel.reshape((bsz, GNN_NODE_CHANNELS, BOARD_RANKS, BOARD_FILES))?;
+            policy_nodes_by_channel.reshape((bsz, channels, BOARD_RANKS, BOARD_FILES))?;
         let row_line_pool = (policy_node_grid.sum(3)?.max(2)? * (1.0 / BOARD_FILES as f64))?;
         let col_line_pool = (policy_node_grid.sum(2)?.max(2)? * (1.0 / BOARD_RANKS as f64))?;
         let node_global = Tensor::cat(
@@ -577,13 +577,13 @@ impl GpuReplica {
         let value_logits = value_intermediate
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
-        let policy_nodes_2d = policy_nodes.reshape((bsz * BOARD_PLANES_SIZE, GNN_NODE_CHANNELS))?;
+        let policy_nodes_2d = policy_nodes.reshape((bsz * BOARD_PLANES_SIZE, channels))?;
         let policy_q_nodes = policy_nodes_2d
             .matmul(&self.vars.policy_node_query.t()?)?
-            .reshape((bsz, BOARD_PLANES_SIZE, super::POLICY_NODE_PROJ_SIZE))?;
+            .reshape((bsz, BOARD_PLANES_SIZE, proj))?;
         let policy_k_nodes = policy_nodes_2d
             .matmul(&self.vars.policy_node_key.t()?)?
-            .reshape((bsz, BOARD_PLANES_SIZE, super::POLICY_NODE_PROJ_SIZE))?;
+            .reshape((bsz, BOARD_PLANES_SIZE, proj))?;
         let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
         let policy_condition = hidden
             .matmul(&self.vars.policy_feature_hidden.t()?)?
@@ -607,23 +607,13 @@ impl GpuReplica {
             .index_select(&self.vars.policy_to_map, 1)?
             .contiguous()?;
         let from_logits = from_nodes
-            .broadcast_mul(
-                &self
-                    .vars
-                    .policy_from_bias
-                    .reshape((1, 1, GNN_NODE_CHANNELS))?,
-            )?
+            .broadcast_mul(&self.vars.policy_from_bias.reshape((1, 1, channels))?)?
             .sum(2)?;
         let to_logits = to_nodes
-            .broadcast_mul(
-                &self
-                    .vars
-                    .policy_to_bias
-                    .reshape((1, 1, GNN_NODE_CHANNELS))?,
-            )?
+            .broadcast_mul(&self.vars.policy_to_bias.reshape((1, 1, channels))?)?
             .sum(2)?;
-        let pair_logits = (from_q.broadcast_mul(&to_k)?.sum(2)?
-            * (1.0 / (super::POLICY_NODE_PROJ_SIZE as f64).sqrt()))?;
+        let pair_logits =
+            (from_q.broadcast_mul(&to_k)?.sum(2)? * (1.0 / (proj as f64).sqrt()))?;
         let policy_logits =
             (((policy_feature_logits.broadcast_add(&policy_bias)? + from_logits)? + to_logits)?
                 + pair_logits)?;
@@ -754,56 +744,53 @@ impl BatchTensors {
 
 impl GpuVars {
     fn from_model(model: &AzNnue, device: &Device) -> CandleResult<Self> {
-        let hidden = model.hidden_size;
+        let arch = model.arch;
+        let hidden = arch.hidden_size;
+        let channels = arch.gnn_node_channels;
+        let pool = arch.node_pool_size();
+        let value_hidden = arch.value_hidden_size;
+        let proj = arch.policy_node_proj_size;
         Ok(Self {
             input_hidden: var_from_slice(&model.input_hidden, (V4_INPUT_SIZE, hidden), device)?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
             node_input_weights: var_from_slice(
                 &model.node_input_weights,
-                (GNN_NODE_CHANNELS, BOARD_CHANNELS),
+                (channels, BOARD_CHANNELS),
                 device,
             )?,
-            node_input_bias: var_from_slice(&model.node_input_bias, GNN_NODE_CHANNELS, device)?,
-            node_attention_query: var_from_slice(
-                &model.node_attention_query,
-                GNN_NODE_CHANNELS,
-                device,
-            )?,
-            node_hidden: var_from_slice(&model.node_hidden, (hidden, NODE_POOL_SIZE), device)?,
+            node_input_bias: var_from_slice(&model.node_input_bias, channels, device)?,
+            node_attention_query: var_from_slice(&model.node_attention_query, channels, device)?,
+            node_hidden: var_from_slice(&model.node_hidden, (hidden, pool), device)?,
             node_hidden_bias: var_from_slice(&model.node_hidden_bias, hidden, device)?,
             value_intermediate_hidden: var_from_slice(
                 &model.value_intermediate_hidden,
-                (VALUE_HIDDEN_SIZE, hidden),
+                (value_hidden, hidden),
                 device,
             )?,
             value_intermediate_nodes: var_from_slice(
                 &model.value_intermediate_nodes,
-                (VALUE_HIDDEN_SIZE, NODE_POOL_SIZE),
+                (value_hidden, pool),
                 device,
             )?,
             value_intermediate_bias: var_from_slice(
                 &model.value_intermediate_bias,
-                VALUE_HIDDEN_SIZE,
+                value_hidden,
                 device,
             )?,
             value_logits_weights: var_from_slice(
                 &model.value_logits_weights,
-                (VALUE_LOGITS, VALUE_HIDDEN_SIZE),
+                (VALUE_LOGITS, value_hidden),
                 device,
             )?,
             value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
             policy_node_query: var_from_slice(
                 &model.policy_node_query,
-                (super::POLICY_NODE_PROJ_SIZE, GNN_NODE_CHANNELS),
+                (proj, channels),
                 device,
             )?,
-            policy_node_key: var_from_slice(
-                &model.policy_node_key,
-                (super::POLICY_NODE_PROJ_SIZE, GNN_NODE_CHANNELS),
-                device,
-            )?,
-            policy_from_bias: var_from_slice(&model.policy_from_bias, GNN_NODE_CHANNELS, device)?,
-            policy_to_bias: var_from_slice(&model.policy_to_bias, GNN_NODE_CHANNELS, device)?,
+            policy_node_key: var_from_slice(&model.policy_node_key, (proj, channels), device)?,
+            policy_from_bias: var_from_slice(&model.policy_from_bias, channels, device)?,
+            policy_to_bias: var_from_slice(&model.policy_to_bias, channels, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_feature_hidden: var_from_slice(
                 &model.policy_feature_hidden,
@@ -812,7 +799,7 @@ impl GpuVars {
             )?,
             policy_feature_nodes: var_from_slice(
                 &model.policy_feature_nodes,
-                (POLICY_CONDITION_SIZE, NODE_POOL_SIZE),
+                (POLICY_CONDITION_SIZE, pool),
                 device,
             )?,
             policy_feature_bias: var_from_slice(
@@ -832,8 +819,8 @@ impl GpuVars {
             )?,
             policy_to_map: Tensor::from_vec(policy_move_to_indices(), DENSE_MOVE_SPACE, device)?,
             graph_local_kernel: Tensor::from_vec(
-                graph_local_kernel_values(),
-                (GNN_NODE_CHANNELS, GNN_NODE_CHANNELS, 3, 3),
+                graph_local_kernel_values(channels),
+                (channels, channels, 3, 3),
                 device,
             )?,
             graph_local_count: Tensor::from_vec(
@@ -1044,15 +1031,17 @@ fn parse_cuda_device_env(name: &str) -> Option<usize> {
         .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
-fn graph_local_kernel_values() -> Vec<f32> {
-    let mut values = vec![0.0f32; GNN_NODE_CHANNELS * GNN_NODE_CHANNELS * 3 * 3];
-    for channel in 0..GNN_NODE_CHANNELS {
+/// 构造 `[channels, channels, 3, 3]` 的固定卷积核：仅在 (c, c, 3, 3) 对角通道位置上、
+/// 除中心 (1,1) 外的 8 个邻域位置写 1.0，相当于按通道分别求 8 邻域之和。
+fn graph_local_kernel_values(channels: usize) -> Vec<f32> {
+    let mut values = vec![0.0f32; channels * channels * 3 * 3];
+    for channel in 0..channels {
         for kr in 0..3 {
             for kf in 0..3 {
                 if kr == 1 && kf == 1 {
                     continue;
                 }
-                let idx = ((channel * GNN_NODE_CHANNELS + channel) * 3 + kr) * 3 + kf;
+                let idx = ((channel * channels + channel) * 3 + kr) * 3 + kf;
                 values[idx] = 1.0;
             }
         }

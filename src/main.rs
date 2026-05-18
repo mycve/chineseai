@@ -91,6 +91,37 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
+    /// trunk GNN 每层节点通道数（`AzNnueArch::gnn_node_channels`）。默认与 v33 行为一致。
+    #[arg(long)]
+    gnn_node_channels: Option<usize>,
+    /// trunk GNN 固定聚合层数（`AzNnueArch::gnn_node_layers`）。
+    #[arg(long)]
+    gnn_node_layers: Option<usize>,
+    /// value 头中间隐藏维度（`AzNnueArch::value_hidden_size`）。
+    #[arg(long)]
+    value_hidden_size: Option<usize>,
+    /// policy node q/k 投影维度（`AzNnueArch::policy_node_proj_size`）。
+    #[arg(long)]
+    policy_node_proj_size: Option<usize>,
+}
+
+impl AzInitArgs {
+    fn arch(&self) -> chineseai::az::AzNnueArch {
+        let mut arch = chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1));
+        if let Some(value) = self.gnn_node_channels {
+            arch.gnn_node_channels = value.max(1);
+        }
+        if let Some(value) = self.gnn_node_layers {
+            arch.gnn_node_layers = value.max(1);
+        }
+        if let Some(value) = self.value_hidden_size {
+            arch.value_hidden_size = value.max(1);
+        }
+        if let Some(value) = self.policy_node_proj_size {
+            arch.policy_node_proj_size = value.max(1);
+        }
+        arch
+    }
 }
 
 #[derive(Args, Debug)]
@@ -177,6 +208,18 @@ struct AzDistillArgs {
     /// Hidden size used when creating a missing model.
     #[arg(long, default_value_t = 128)]
     hidden: usize,
+    /// trunk GNN 每层节点通道数（init 新模型时用，老模型沿用其自身 arch）。
+    #[arg(long)]
+    gnn_node_channels: Option<usize>,
+    /// trunk GNN 固定聚合层数。
+    #[arg(long)]
+    gnn_node_layers: Option<usize>,
+    /// value 头中间隐藏维度。
+    #[arg(long)]
+    value_hidden_size: Option<usize>,
+    /// policy node q/k 投影维度。
+    #[arg(long)]
+    policy_node_proj_size: Option<usize>,
     /// Training epochs over all shards.
     #[arg(long, default_value_t = 1)]
     epochs: usize,
@@ -751,15 +794,22 @@ fn main() {
         None => run_uci(),
         Some(CliCommand::Uci) => run_uci(),
         Some(CliCommand::AzInit(cmd)) => {
-            let hidden = cmd.hidden;
+            let arch = cmd.arch();
             let output = cmd.output;
             let seed = cmd.seed;
-            let model = AzNnue::random(hidden, seed);
+            let model = AzNnue::random_with_arch(arch, seed);
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
             println!("aznnue   : initialized (nnue binary, magic AZB1)");
-            println!("hidden   : {hidden}");
+            println!(
+                "arch     : hidden={} gnn_channels={} gnn_layers={} value_hidden={} policy_proj={}",
+                arch.hidden_size,
+                arch.gnn_node_channels,
+                arch.gnn_node_layers,
+                arch.value_hidden_size,
+                arch.policy_node_proj_size,
+            );
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
@@ -948,12 +998,26 @@ fn main() {
                     panic!("failed to load `{}`: {err}", cmd.model.display());
                 })
             } else {
+                let mut arch =
+                    chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
+                if let Some(value) = cmd.gnn_node_channels {
+                    arch.gnn_node_channels = value.max(1);
+                }
+                if let Some(value) = cmd.gnn_node_layers {
+                    arch.gnn_node_layers = value.max(1);
+                }
+                if let Some(value) = cmd.value_hidden_size {
+                    arch.value_hidden_size = value.max(1);
+                }
+                if let Some(value) = cmd.policy_node_proj_size {
+                    arch.policy_node_proj_size = value.max(1);
+                }
                 println!(
-                    "distill  : init random model {} hidden={}",
+                    "distill  : init random model {} arch={:?}",
                     cmd.model.display(),
-                    cmd.hidden.max(1)
+                    arch
                 );
-                AzNnue::random(cmd.hidden.max(1), cmd.seed)
+                AzNnue::random_with_arch(arch, cmd.seed)
             };
 
             let epochs = cmd.epochs.max(1);
@@ -1105,21 +1169,33 @@ fn main() {
             }
             let best_path = best_model_path(&config.model_path);
 
+            // 模型形状全部由 config.arch() 决定（包含 hidden_size 和 4 个 trunk 旋钮）。
+            // 已有 .nnue 加载后，自身二进制头里的 arch 才是真实形状（可能与本次 config 不同）。
+            let config_arch = config.arch();
             let model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
                 match AzNnue::load(&config.model_path) {
-                    Ok(model) => model,
+                    Ok(model) => {
+                        if model.arch != config_arch {
+                            println!(
+                                "model    : 警告：加载到的 .nnue arch={:?} 与 config arch={:?} 不一致，\
+                                 后续仍按 .nnue 自带 arch 训练（不会自动 re-init）",
+                                model.arch, config_arch
+                            );
+                        }
+                        model
+                    }
                     Err(err) => {
                         println!(
                             "model    : reinit {} as random nnue ({err})",
                             config.model_path
                         );
-                        AzNnue::random(config.hidden_size, config.seed)
+                        AzNnue::random_with_arch(config_arch, config.seed)
                     }
                 }
             } else {
                 println!("model    : init {}", config.model_path);
-                AzNnue::random(config.hidden_size, config.seed)
+                AzNnue::random_with_arch(config_arch, config.seed)
             };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
@@ -1225,8 +1301,10 @@ fn main() {
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    let mut local_model = AzNnue::random(
-                        selfplay_config.hidden_size,
+                    // worker 临时模型仅用作 RwLock 中权重写入前的占位，
+                    //   首轮拷贝主模型时会被整体覆盖，所以 arch 直接随 config 取就可以。
+                    let mut local_model = AzNnue::random_with_arch(
+                        selfplay_config.arch(),
                         selfplay_config.seed ^ worker_id as u64,
                     );
                     while !selfplay_stop.load(Ordering::SeqCst) {
