@@ -244,7 +244,6 @@ pub struct AzNnue {
     pub policy_context_hidden: Vec<f32>,
     pub policy_context_nodes: Vec<f32>,
     pub policy_context_bias: Vec<f32>,
-    pub policy_context_feature: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
     pub policy_feature_nodes: Vec<f32>,
     pub policy_feature_bias: Vec<f32>,
@@ -334,7 +333,6 @@ impl Clone for AzNnue {
             policy_context_hidden: self.policy_context_hidden.clone(),
             policy_context_nodes: self.policy_context_nodes.clone(),
             policy_context_bias: self.policy_context_bias.clone(),
-            policy_context_feature: self.policy_context_feature.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
             policy_feature_nodes: self.policy_feature_nodes.clone(),
             policy_feature_bias: self.policy_feature_bias.clone(),
@@ -530,11 +528,8 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
             .collect();
         let policy_context_bias = vec![0.0; POLICY_CONTEXT_SIZE];
-        let policy_context_feature = (0..POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE)
+        let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE)
             .map(|_| rng.weight((2.0 / POLICY_CONTEXT_SIZE as f32).sqrt() * 0.5))
-            .collect();
-        let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let policy_feature_nodes = (0..POLICY_CONDITION_SIZE * pool)
             .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
@@ -568,7 +563,6 @@ impl AzNnue {
             policy_context_hidden,
             policy_context_nodes,
             policy_context_bias,
-            policy_context_feature,
             policy_feature_hidden,
             policy_feature_nodes,
             policy_feature_bias,
