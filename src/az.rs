@@ -32,9 +32,10 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
+// v35：给每层 Local/Row/Col 图聚合增加 per-channel 可训练 gate/bias。
 // v34：把 trunk 4 个容量旋钮（gnn_node_channels/layers, value_hidden_size, policy_node_proj_size）
 //   从编译期常量改为 nnue 二进制头里携带的运行时字段。旧 v33 文件不再兼容。
-const AZNNUE_BINARY_VERSION: u32 = 34;
+const AZNNUE_BINARY_VERSION: u32 = 35;
 // 头部布局（小端 u32 依次）：
 //   magic(4 字节) | version | input_size | hidden_size | gnn_node_channels |
 //   gnn_node_layers | value_hidden_size | policy_node_proj_size
@@ -93,7 +94,7 @@ pub struct AzNnueArch {
     pub hidden_size: usize,
     /// GNN 每层节点通道数（trunk 主要宽度旋钮）。
     pub gnn_node_channels: usize,
-    /// GNN 固定聚合层数（无可训练参数，仅控制层数）。
+    /// GNN 聚合层数；每层带轻量 per-channel Local/Row/Col gate。
     pub gnn_node_layers: usize,
     /// value 头中间隐藏宽度。
     pub value_hidden_size: usize,
@@ -217,6 +218,11 @@ pub struct AzNnue {
     pub hidden_bias: Vec<f32>,
     pub node_input_weights: Vec<f32>,
     pub node_input_bias: Vec<f32>,
+    pub graph_self_gate: Vec<f32>,
+    pub graph_local_gate: Vec<f32>,
+    pub graph_row_gate: Vec<f32>,
+    pub graph_col_gate: Vec<f32>,
+    pub graph_bias: Vec<f32>,
     pub node_attention_query: Vec<f32>,
     pub node_hidden: Vec<f32>,
     pub node_hidden_bias: Vec<f32>,
@@ -252,8 +258,12 @@ pub struct AzNnue {
 //   node bias terms, move geometry conditioning, and a small dense move bias.
 //   v31 removes the old trainable 3x3 board convolution from the model file
 //   entirely. The board path follows the ZeroForge-style cheap GNN pattern:
-//   a per-square input channel projection feeds fixed Local8 + Row + Col graph
+//   a per-square input channel projection feeds Local8 + Row + Col graph
 //   aggregation, then node pooling feeds the shared hidden/value path.
+// - v35 keeps that cheap aggregation but gives each layer/channel trainable
+//   self/local/row/col gates and a bias. This is intentionally much lighter
+//   than a learned 3x3 convolution while letting training choose how much each
+//   information path matters per channel.
 // - Do not add a from/to-square factorized policy head on top of this absolute
 //   board representation. A previous v14/v15 experiment mixed absolute board
 //   features with partially relative action-square sharing and immediately
@@ -281,7 +291,7 @@ pub struct AzNnue {
 //   channel is removed; do not feed canonical boards with absolute move labels,
 //   because that recreates the red/black leakage bug.
 // - v26 changes policy scoring to a GNN-style node head. The policy board CNN
-//   becomes the node encoder, then fixed Local/Row/Col graph aggregation builds
+//   becomes the node encoder, then Local/Row/Col graph aggregation builds
 //   per-square features. Action logits use from-node, to-node, pair, and global
 //   terms.
 
@@ -294,6 +304,11 @@ impl Clone for AzNnue {
             hidden_bias: self.hidden_bias.clone(),
             node_input_weights: self.node_input_weights.clone(),
             node_input_bias: self.node_input_bias.clone(),
+            graph_self_gate: self.graph_self_gate.clone(),
+            graph_local_gate: self.graph_local_gate.clone(),
+            graph_row_gate: self.graph_row_gate.clone(),
+            graph_col_gate: self.graph_col_gate.clone(),
+            graph_bias: self.graph_bias.clone(),
             node_attention_query: self.node_attention_query.clone(),
             node_hidden: self.node_hidden.clone(),
             node_hidden_bias: self.node_hidden_bias.clone(),
@@ -462,6 +477,12 @@ impl AzNnue {
                 .map(|_| rng.weight(0.08))
                 .collect();
         let node_input_bias = vec![0.0; gnn_channels];
+        let graph_gate_len = arch.gnn_node_layers * gnn_channels;
+        let graph_self_gate = vec![0.25; graph_gate_len];
+        let graph_local_gate = vec![0.25; graph_gate_len];
+        let graph_row_gate = vec![0.25; graph_gate_len];
+        let graph_col_gate = vec![0.25; graph_gate_len];
+        let graph_bias = vec![0.0; graph_gate_len];
         let node_attention_query: Vec<f32> =
             (0..gnn_channels).map(|_| rng.weight(0.08)).collect();
         let node_hidden: Vec<f32> = (0..hidden_size * pool)
@@ -502,6 +523,11 @@ impl AzNnue {
             hidden_bias,
             node_input_weights,
             node_input_bias,
+            graph_self_gate,
+            graph_local_gate,
+            graph_row_gate,
+            graph_col_gate,
+            graph_bias,
             node_attention_query,
             node_hidden,
             node_hidden_bias,
@@ -542,6 +568,11 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.node_input_weights)?;
         write_f32_slice_le(&mut writer, &self.node_input_bias)?;
+        write_f32_slice_le(&mut writer, &self.graph_self_gate)?;
+        write_f32_slice_le(&mut writer, &self.graph_local_gate)?;
+        write_f32_slice_le(&mut writer, &self.graph_row_gate)?;
+        write_f32_slice_le(&mut writer, &self.graph_col_gate)?;
+        write_f32_slice_le(&mut writer, &self.graph_bias)?;
         write_f32_slice_le(&mut writer, &self.node_attention_query)?;
         write_f32_slice_le(&mut writer, &self.node_hidden)?;
         write_f32_slice_le(&mut writer, &self.node_hidden_bias)?;
@@ -615,6 +646,7 @@ impl AzNnue {
         let node_input_weights_len =
             gnn_node_channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA;
         let node_input_bias_len = gnn_node_channels;
+        let graph_gate_len = gnn_node_layers * gnn_node_channels;
         let node_attention_query_len = gnn_node_channels;
         let node_hidden_len = hidden_size * pool_size;
         let node_hidden_bias_len = hidden_size;
@@ -635,6 +667,7 @@ impl AzNnue {
             + hidden_bias_len
             + node_input_weights_len
             + node_input_bias_len
+            + graph_gate_len * 5
             + node_attention_query_len
             + node_hidden_len
             + node_hidden_bias_len
@@ -667,6 +700,11 @@ impl AzNnue {
         let hidden_bias = read_f32_vec_le(&mut reader, hidden_bias_len)?;
         let node_input_weights = read_f32_vec_le(&mut reader, node_input_weights_len)?;
         let node_input_bias = read_f32_vec_le(&mut reader, node_input_bias_len)?;
+        let graph_self_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
+        let graph_local_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
+        let graph_row_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
+        let graph_col_gate = read_f32_vec_le(&mut reader, graph_gate_len)?;
+        let graph_bias = read_f32_vec_le(&mut reader, graph_gate_len)?;
         let node_attention_query = read_f32_vec_le(&mut reader, node_attention_query_len)?;
         let node_hidden = read_f32_vec_le(&mut reader, node_hidden_len)?;
         let node_hidden_bias = read_f32_vec_le(&mut reader, node_hidden_bias_len)?;
@@ -690,6 +728,11 @@ impl AzNnue {
             hidden_bias,
             node_input_weights,
             node_input_bias,
+            graph_self_gate,
+            graph_local_gate,
+            graph_row_gate,
+            graph_col_gate,
+            graph_bias,
             node_attention_query,
             node_hidden,
             node_hidden_bias,
@@ -818,16 +861,16 @@ impl AzNnue {
             &self.node_input_bias,
             node_input,
         );
-        // 至少跑一次固定聚合（layers >= 1，已在 arch.validate 校验）。
-        graph_node_layer_into(node_input, graph_tmp, channels);
+        // 至少跑一次图聚合（layers >= 1，已在 arch.validate 校验）。
+        graph_node_layer_into(node_input, graph_tmp, self, 0);
         if layers == 1 {
             policy_nodes.resize(channels * BOARD_PLANES_SIZE, 0.0);
             policy_nodes.copy_from_slice(graph_tmp);
         } else {
-            graph_node_layer_into(graph_tmp, policy_nodes, channels);
+            graph_node_layer_into(graph_tmp, policy_nodes, self, 1);
             // 第 3 层及以后：在 policy_nodes 与 graph_tmp 之间反复聚合。
-            for _ in 2..layers {
-                graph_node_layer_into(policy_nodes, graph_tmp, channels);
+            for layer in 2..layers {
+                graph_node_layer_into(policy_nodes, graph_tmp, self, layer);
                 policy_nodes.resize(channels * BOARD_PLANES_SIZE, 0.0);
                 policy_nodes.copy_from_slice(graph_tmp);
             }
@@ -921,6 +964,7 @@ impl AzNnue {
         }
         let hidden = arch.hidden_size;
         let channels = arch.gnn_node_channels;
+        let layers = arch.gnn_node_layers;
         let pool = arch.node_pool_size();
         let value_hidden = arch.value_hidden_size;
         let proj = arch.policy_node_proj_size;
@@ -928,6 +972,11 @@ impl AzNnue {
             || self.hidden_bias.len() != hidden
             || self.node_input_weights.len() != channels * BOARD_CHANNELS * BOARD_INPUT_KERNEL_AREA
             || self.node_input_bias.len() != channels
+            || self.graph_self_gate.len() != layers * channels
+            || self.graph_local_gate.len() != layers * channels
+            || self.graph_row_gate.len() != layers * channels
+            || self.graph_col_gate.len() != layers * channels
+            || self.graph_bias.len() != layers * channels
             || self.node_attention_query.len() != channels
             || self.node_hidden.len() != hidden * pool
             || self.node_hidden_bias.len() != hidden
@@ -1136,13 +1185,22 @@ fn pool_node_features(input: &[f32], channels: usize, attention_query: &[f32], o
     }
 }
 
-fn graph_node_layer_into(input: &[f32], output: &mut Vec<f32>, channels: usize) {
+fn graph_node_layer_into(input: &[f32], output: &mut Vec<f32>, model: &AzNnue, layer: usize) {
+    let channels = model.arch.gnn_node_channels;
     debug_assert_eq!(input.len(), channels * BOARD_PLANES_SIZE);
+    debug_assert!(layer < model.arch.gnn_node_layers);
     output.resize(channels * BOARD_PLANES_SIZE, 0.0);
+    let gate_base = layer * channels;
     for channel in 0..channels {
         let channel_start = channel * BOARD_PLANES_SIZE;
         let input_row = &input[channel_start..channel_start + BOARD_PLANES_SIZE];
         let output_row = &mut output[channel_start..channel_start + BOARD_PLANES_SIZE];
+        let gate_index = gate_base + channel;
+        let self_gate = model.graph_self_gate[gate_index];
+        let local_gate = model.graph_local_gate[gate_index];
+        let row_gate = model.graph_row_gate[gate_index];
+        let col_gate = model.graph_col_gate[gate_index];
+        let bias = model.graph_bias[gate_index];
         let mut row_mean = [0.0f32; BOARD_RANKS];
         let mut col_mean = [0.0f32; BOARD_FILES];
         let mut local_sum = [0.0f32; BOARD_PLANES_SIZE];
@@ -1180,8 +1238,11 @@ fn graph_node_layer_into(input: &[f32], output: &mut Vec<f32>, channels: usize) 
             let file = sq % BOARD_FILES;
             let rank = sq / BOARD_FILES;
             let local_mean = local_sum[sq] / local_count[sq].max(1.0);
-            let value =
-                (input_row[sq] + local_mean + row_mean[rank] + col_mean[file]) * (1.0 / 4.0);
+            let value = input_row[sq] * self_gate
+                + local_mean * local_gate
+                + row_mean[rank] * row_gate
+                + col_mean[file] * col_gate
+                + bias;
             output_row[sq] = value.max(0.0);
         }
     }

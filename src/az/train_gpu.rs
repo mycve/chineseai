@@ -42,6 +42,11 @@ struct GpuVars {
     hidden_bias: Var,
     node_input_weights: Var,
     node_input_bias: Var,
+    graph_self_gate: Var,
+    graph_local_gate: Var,
+    graph_row_gate: Var,
+    graph_col_gate: Var,
+    graph_bias: Var,
     node_attention_query: Var,
     node_hidden: Var,
     node_hidden_bias: Var,
@@ -516,9 +521,9 @@ impl GpuReplica {
             .reshape((bsz, channels, BOARD_RANKS, BOARD_FILES))?
             .relu()?;
         // 至少跑一层（已在 arch.validate 处保证 layers >= 1）。
-        let mut graph = self.graph_node_layer(&node_input)?;
-        for _ in 1..layers {
-            graph = self.graph_node_layer(&graph)?;
+        let mut graph = self.graph_node_layer(&node_input, 0)?;
+        for layer in 1..layers {
+            graph = self.graph_node_layer(&graph, layer)?;
         }
         let policy_nodes = graph
             .reshape((bsz, channels, BOARD_PLANES_SIZE))?
@@ -624,17 +629,44 @@ impl GpuReplica {
         })
     }
 
-    fn graph_node_layer(&self, node_grid: &Tensor) -> CandleResult<Tensor> {
+    fn graph_node_layer(&self, node_grid: &Tensor, layer: usize) -> CandleResult<Tensor> {
+        let channels = self.arch.gnn_node_channels;
+        let gate_range = layer * channels..(layer + 1) * channels;
         let local_mean = node_grid
             .conv2d(&self.vars.graph_local_kernel, 1, 1, 1, 1)?
             .broadcast_div(&self.vars.graph_local_count)?;
         let row_mean = node_grid.mean(3)?.unsqueeze(3)?;
         let col_mean = node_grid.mean(2)?.unsqueeze(2)?;
-        node_grid
-            .broadcast_add(&row_mean)?
-            .broadcast_add(&col_mean)?
-            .broadcast_add(&local_mean)?
-            .affine(1.0 / 4.0, 0.0)?
+        let gate_shape = (1, channels, 1, 1);
+        let self_gate = self
+            .vars
+            .graph_self_gate
+            .narrow(0, gate_range.start, channels)?
+            .reshape(gate_shape)?;
+        let local_gate = self
+            .vars
+            .graph_local_gate
+            .narrow(0, gate_range.start, channels)?
+            .reshape(gate_shape)?;
+        let row_gate = self
+            .vars
+            .graph_row_gate
+            .narrow(0, gate_range.start, channels)?
+            .reshape(gate_shape)?;
+        let col_gate = self
+            .vars
+            .graph_col_gate
+            .narrow(0, gate_range.start, channels)?
+            .reshape(gate_shape)?;
+        let bias = self
+            .vars
+            .graph_bias
+            .narrow(0, gate_range.start, channels)?
+            .reshape(gate_shape)?;
+        (((node_grid.broadcast_mul(&self_gate)? + local_mean.broadcast_mul(&local_gate)?)?
+            + row_mean.broadcast_mul(&row_gate)?)?
+            + col_mean.broadcast_mul(&col_gate)?)?
+            .broadcast_add(&bias)?
             .relu()
     }
 }
@@ -759,6 +791,31 @@ impl GpuVars {
                 device,
             )?,
             node_input_bias: var_from_slice(&model.node_input_bias, channels, device)?,
+            graph_self_gate: var_from_slice(
+                &model.graph_self_gate,
+                arch.gnn_node_layers * channels,
+                device,
+            )?,
+            graph_local_gate: var_from_slice(
+                &model.graph_local_gate,
+                arch.gnn_node_layers * channels,
+                device,
+            )?,
+            graph_row_gate: var_from_slice(
+                &model.graph_row_gate,
+                arch.gnn_node_layers * channels,
+                device,
+            )?,
+            graph_col_gate: var_from_slice(
+                &model.graph_col_gate,
+                arch.gnn_node_layers * channels,
+                device,
+            )?,
+            graph_bias: var_from_slice(
+                &model.graph_bias,
+                arch.gnn_node_layers * channels,
+                device,
+            )?,
             node_attention_query: var_from_slice(&model.node_attention_query, channels, device)?,
             node_hidden: var_from_slice(&model.node_hidden, (hidden, pool), device)?,
             node_hidden_bias: var_from_slice(&model.node_hidden_bias, hidden, device)?,
@@ -837,6 +894,11 @@ impl GpuVars {
         vars.push(self.hidden_bias.clone());
         vars.push(self.node_input_weights.clone());
         vars.push(self.node_input_bias.clone());
+        vars.push(self.graph_self_gate.clone());
+        vars.push(self.graph_local_gate.clone());
+        vars.push(self.graph_row_gate.clone());
+        vars.push(self.graph_col_gate.clone());
+        vars.push(self.graph_bias.clone());
         vars.push(self.node_attention_query.clone());
         vars.push(self.node_hidden.clone());
         vars.push(self.node_hidden_bias.clone());
@@ -862,6 +924,11 @@ impl GpuVars {
         vars.push(self.hidden_bias.clone());
         vars.push(self.node_input_weights.clone());
         vars.push(self.node_input_bias.clone());
+        vars.push(self.graph_self_gate.clone());
+        vars.push(self.graph_local_gate.clone());
+        vars.push(self.graph_row_gate.clone());
+        vars.push(self.graph_col_gate.clone());
+        vars.push(self.graph_bias.clone());
         vars.push(self.node_attention_query.clone());
         vars.push(self.node_hidden.clone());
         vars.push(self.node_hidden_bias.clone());
@@ -914,6 +981,11 @@ impl GpuVars {
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(&self.node_input_weights, &mut model.node_input_weights)?;
         copy_var(&self.node_input_bias, &mut model.node_input_bias)?;
+        copy_var(&self.graph_self_gate, &mut model.graph_self_gate)?;
+        copy_var(&self.graph_local_gate, &mut model.graph_local_gate)?;
+        copy_var(&self.graph_row_gate, &mut model.graph_row_gate)?;
+        copy_var(&self.graph_col_gate, &mut model.graph_col_gate)?;
+        copy_var(&self.graph_bias, &mut model.graph_bias)?;
         copy_var(&self.node_attention_query, &mut model.node_attention_query)?;
         copy_var(&self.node_hidden, &mut model.node_hidden)?;
         copy_var(&self.node_hidden_bias, &mut model.node_hidden_bias)?;

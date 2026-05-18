@@ -16,7 +16,7 @@ pub struct AzLoopFileConfig {
     pub hidden_size: usize,
     /// trunk GNN 节点通道数（决定 trunk 主要宽度）。
     pub gnn_node_channels: usize,
-    /// trunk GNN 固定聚合层数（无可训练参数，仅控制深度）。
+    /// trunk GNN 聚合层数；每层带轻量 per-channel gate。
     pub gnn_node_layers: usize,
     /// value 头中间隐藏维度。
     pub value_hidden_size: usize,
@@ -338,12 +338,12 @@ impl AzLoopFileConfig {
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
 #
-# Model architecture (v34, .nnue 自描述):
+# Model architecture (v35, .nnue 自描述):
 #   hidden_size 与下方 4 个 trunk 旋钮一同写入 .nnue 二进制头，每个文件自带形状描述。
 #   修改任一项都会改变模型形状，老 .nnue 文件不再兼容、必须 re-init 新模型。
 #   - hidden_size：共享 hidden 向量宽度（默认 256）
 #   - gnn_node_channels：trunk GNN 每层节点通道数；trunk 主要宽度旋钮（默认 32）
-#   - gnn_node_layers：trunk GNN 固定聚合层数；无可训练参数，仅决定信息传播步数
+#   - gnn_node_layers：trunk GNN 聚合层数；每层有 per-channel self/local/row/col gate 与 bias
 #       （默认 2；提升到 3~4 可加深 trunk 信息传播，每层 forward 成本同步增加）
 #   - value_hidden_size：value 头中间隐藏维度（默认 256）
 #   - policy_node_proj_size：policy node q/k 投影维度（默认 32）

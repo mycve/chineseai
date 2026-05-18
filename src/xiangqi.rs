@@ -520,25 +520,6 @@ impl Position {
         legal
     }
 
-    pub fn perft(&self, depth: u32) -> u64 {
-        if depth == 0 {
-            return 1;
-        }
-
-        let moves = self.legal_moves();
-        if depth == 1 {
-            return moves.len() as u64;
-        }
-
-        let mut nodes = 0u64;
-        for mv in moves {
-            let mut next = self.clone();
-            next.make_move(mv);
-            nodes += next.perft(depth - 1);
-        }
-        nodes
-    }
-
     pub fn make_move(&mut self, mv: Move) -> Undo {
         let from = mv.from as usize;
         let to = mv.to as usize;
@@ -1999,14 +1980,6 @@ mod tests {
         assert_eq!(square_name(index(8, 0)), "i9");
         assert_eq!(parse_square("a0"), Some(index(0, 9)));
         assert_eq!(parse_square("i9"), Some(index(8, 0)));
-    }
-
-    #[test]
-    fn startpos_perft_matches_reference_depths_1_to_3() {
-        let position = Position::startpos();
-        assert_eq!(position.perft(1), 44);
-        assert_eq!(position.perft(2), 1_920);
-        assert_eq!(position.perft(3), 79_666);
     }
 
     #[test]

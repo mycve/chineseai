@@ -74,8 +74,6 @@ enum CliCommand {
     AzLoop(AzLoopArgs),
     /// Internal arena worker process.
     AzArenaWorker(AzArenaWorkerArgs),
-    /// Count legal move tree nodes for a position.
-    Perft(PerftArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
 }
@@ -288,29 +286,49 @@ struct AzArenaWorkerArgs {
 }
 
 #[derive(Args, Debug)]
-struct PerftArgs {
-    /// Search depth.
-    #[arg(default_value_t = 1)]
-    depth: u32,
-    /// FEN string, or startpos if omitted.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    fen: Vec<String>,
-}
-
-#[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai vs-pikafish ./tools/pikafish 10000
-  chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml -s 10000
-  chineseai vs-pikafish ./tools/pikafish chineseai.azloop.toml -s 10000 --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
+  chineseai vs-pikafish ./tools/pikafish chineseai.nnue
+  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-chineseai.nnue --simulations 192 --topk 32
+  chineseai vs-pikafish ./tools/pikafish chineseai.nnue --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
-    /// Config path or simulations override. Numeric values use the default config.
-    config_or_simulations: Option<String>,
-    /// Override config.simulations.
+    /// ChineseAI AZ-NNUE model path.
+    model: String,
+    /// ChineseAI MCTS simulations per move.
     #[arg(short = 's', long)]
     simulations: Option<usize>,
+    /// Gumbel root top-k considered actions.
+    #[arg(long, default_value_t = 32)]
+    topk: usize,
+    /// ChineseAI search algorithm: alphazero or gumbel_alphazero.
+    #[arg(long, value_parser = parse_search_algorithm)]
+    algorithm: Option<AzSearchAlgorithm>,
+    /// ChineseAI PUCT constant.
+    #[arg(long, default_value_t = 1.5)]
+    cpuct: f32,
+    /// Draw after this many plies.
+    #[arg(long, default_value_t = 300)]
+    max_plies: usize,
+    /// Random seed.
+    #[arg(long, default_value_t = 20260411)]
+    seed: u64,
+    /// Gumbel noise scale.
+    #[arg(long, default_value_t = 1.0)]
+    gumbel_scale: f32,
+    /// Gumbel completed-q value scale.
+    #[arg(long, default_value_t = 0.1)]
+    gumbel_value_scale: f32,
+    /// Gumbel max-visit initialization.
+    #[arg(long, default_value_t = 50.0)]
+    gumbel_maxvisit_init: f32,
+    /// Rescale completed values in Gumbel search.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_rescale_values: bool,
+    /// Mix root value into unvisited Gumbel action values.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_use_mixed_value: bool,
     /// Pikafish search depth.
     #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_DEPTH)]
     pikafish_depth: u32,
@@ -1988,64 +2006,49 @@ fn main() {
                 report.losses_as_black
             );
         }
-        Some(CliCommand::Perft(cmd)) => {
-            let depth = cmd.depth;
-            let fen = cmd.fen.join(" ");
-            let position = parse_position(&fen);
-            println!("fen   : {}", position.to_fen());
-            println!("depth : {depth}");
-            println!("nodes : {}", position.perft(depth));
-        }
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
-            let (config_path, simulations_override) = if let Some(value) = cmd.config_or_simulations
-            {
-                if let Ok(simulations) = value.parse::<usize>() {
-                    (
-                        DEFAULT_AZ_LOOP_CONFIG.to_string(),
-                        Some(cmd.simulations.unwrap_or(simulations).max(1)),
-                    )
-                } else {
-                    (value, cmd.simulations.map(|value| value.max(1)))
-                }
-            } else {
-                (
-                    DEFAULT_AZ_LOOP_CONFIG.to_string(),
-                    cmd.simulations.map(|value| value.max(1)),
-                )
+            let model_path = cmd.model;
+            let simulations = cmd.simulations.unwrap_or(192).max(1);
+            let topk = cmd.topk.max(1);
+            let search_algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::GumbelAlphaZero);
+            let cpuct = cmd.cpuct.max(0.0);
+            let max_plies = cmd.max_plies.max(1);
+            let gumbel = AzGumbelConfig {
+                max_num_considered_actions: topk,
+                gumbel_scale: cmd.gumbel_scale.max(0.0),
+                value_scale: cmd.gumbel_value_scale.max(0.0),
+                maxvisit_init: cmd.gumbel_maxvisit_init.max(0.0),
+                rescale_values: cmd.gumbel_rescale_values,
+                use_mixed_value: cmd.gumbel_use_mixed_value,
             };
-            let Some(config) = load_or_create_az_loop_config(&config_path) else {
-                return;
-            };
-            let simulations = simulations_override.unwrap_or(config.simulations).max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
             let eval_fens_path = cmd.eval_fens_path;
             let start_positions = load_arena_eval_positions(&eval_fens_path);
-            let seed = 20260411_u64;
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
-                Path::new(&config.model_path),
+                Path::new(&model_path),
                 &start_positions,
                 VsPikafishConfig {
                     pikafish_depth,
                     total_games: games,
-                    max_plies: config.max_plies,
+                    max_plies,
                     simulations,
-                    seed: seed ^ config.seed,
+                    seed: cmd.seed,
                     parallel_games,
-                    search_algorithm: config.search_algorithm,
-                    cpuct: config.cpuct,
-                    gumbel: config.gumbel,
+                    search_algorithm,
+                    cpuct,
+                    gumbel,
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             println!(
-                "vs-pikafish: config={} model={} search={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={}",
-                config_path,
-                config.model_path,
-                config.search_algorithm.as_str(),
+                "vs-pikafish: model={} search={} topk={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}",
+                model_path,
+                search_algorithm.as_str(),
+                topk,
                 summary.total_games,
                 start_positions.len(),
                 parallel_games.min(games),
@@ -2061,8 +2064,9 @@ fn main() {
                 summary.chinese_win_by_pikafish_invalid_move,
                 summary.chinese_win_by_pikafish_illegal_move,
                 pikafish_depth,
-                config.max_plies,
-                simulations
+                max_plies,
+                simulations,
+                cpuct
             );
         }
     }

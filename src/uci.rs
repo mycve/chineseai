@@ -76,7 +76,10 @@ impl Default for UciState {
             threads: 1,
             cpuct: 1.5,
             search_algorithm: AzSearchAlgorithm::AlphaZero,
-            gumbel: AzGumbelConfig::default(),
+            gumbel: AzGumbelConfig {
+                gumbel_scale: 0.0,
+                ..AzGumbelConfig::default()
+            },
             policy_debug: false,
             policy_debug_limit: 16,
             seed: 20260409,
@@ -136,7 +139,7 @@ fn print_uci_id() {
         "option name SearchAlgorithm type combo default alphazero var alphazero var gumbel_alphazero"
     );
     println!("option name GumbelMaxActions type spin default 16 min 1 max 512");
-    println!("option name GumbelScale type string default 1.0");
+    println!("option name GumbelScale type string default 0.0");
     println!("option name PolicyDebug type check default false");
     println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
