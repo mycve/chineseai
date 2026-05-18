@@ -32,12 +32,14 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
+// v37：value head 增加 value adapter + 第二层 MLP。Value 仍只读取共享
+//   hidden/node_global，不引入任何手工战术特征。
 // v36：policy global condition 增加一层小 MLP，上游共享表征先映射到
 //   policy_context，再输出到 move-feature condition。
 // v35：给每层 Local/Row/Col 图聚合增加 per-channel 可训练 gate/bias。
 // v34：把 trunk 4 个容量旋钮（gnn_node_channels/layers, value_hidden_size, policy_node_proj_size）
 //   从编译期常量改为 nnue 二进制头里携带的运行时字段。旧 v33 文件不再兼容。
-const AZNNUE_BINARY_VERSION: u32 = 36;
+const AZNNUE_BINARY_VERSION: u32 = 37;
 // 头部布局（小端 u32 依次）：
 //   magic(4 字节) | version | input_size | hidden_size | gnn_node_channels |
 //   gnn_node_layers | value_hidden_size | policy_node_proj_size
@@ -178,6 +180,7 @@ pub(super) struct AzEvalScratch {
     policy_k_nodes: Vec<f32>,
     node_global: Vec<f32>,
     value_intermediate: Vec<f32>,
+    value_hidden: Vec<f32>,
     value_logits: Vec<f32>,
     policy_context: Vec<f32>,
     policy_condition: Vec<f32>,
@@ -203,6 +206,7 @@ impl AzEvalScratch {
             policy_k_nodes: vec![0.0; proj * BOARD_PLANES_SIZE],
             node_global: vec![0.0; pool],
             value_intermediate: vec![0.0; arch.value_hidden_size],
+            value_hidden: vec![0.0; arch.value_hidden_size],
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_context: vec![0.0; POLICY_CONTEXT_SIZE],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
@@ -234,6 +238,9 @@ pub struct AzNnue {
     pub value_intermediate_hidden: Vec<f32>,
     pub value_intermediate_nodes: Vec<f32>,
     pub value_intermediate_bias: Vec<f32>,
+    pub value_hidden_weights: Vec<f32>,
+    pub value_hidden_nodes: Vec<f32>,
+    pub value_hidden_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
     pub policy_node_query: Vec<f32>,
@@ -323,6 +330,9 @@ impl Clone for AzNnue {
             value_intermediate_hidden: self.value_intermediate_hidden.clone(),
             value_intermediate_nodes: self.value_intermediate_nodes.clone(),
             value_intermediate_bias: self.value_intermediate_bias.clone(),
+            value_hidden_weights: self.value_hidden_weights.clone(),
+            value_hidden_nodes: self.value_hidden_nodes.clone(),
+            value_hidden_bias: self.value_hidden_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
             policy_node_query: self.policy_node_query.clone(),
@@ -508,6 +518,13 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.5))
             .collect();
         let value_intermediate_bias = vec![0.0; value_hidden];
+        let value_hidden_weights = (0..value_hidden * value_hidden)
+            .map(|_| rng.weight((2.0 / value_hidden as f32).sqrt() * 0.5))
+            .collect();
+        let value_hidden_nodes = (0..value_hidden * pool)
+            .map(|_| rng.weight((2.0 / pool as f32).sqrt() * 0.25))
+            .collect();
+        let value_hidden_bias = vec![0.0; value_hidden];
         let value_logits_weights = (0..VALUE_LOGITS * value_hidden)
             .map(|_| rng.weight((2.0 / value_hidden as f32).sqrt()))
             .collect();
@@ -553,6 +570,9 @@ impl AzNnue {
             value_intermediate_hidden,
             value_intermediate_nodes,
             value_intermediate_bias,
+            value_hidden_weights,
+            value_hidden_nodes,
+            value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
             policy_node_query,
@@ -601,6 +621,9 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_nodes)?;
         write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
+        write_f32_slice_le(&mut writer, &self.value_hidden_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_hidden_nodes)?;
+        write_f32_slice_le(&mut writer, &self.value_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_node_query)?;
@@ -677,6 +700,9 @@ impl AzNnue {
         let vih_len = value_hidden_size * hidden_size;
         let vin_len = value_hidden_size * pool_size;
         let vib_len = value_hidden_size;
+        let vhw_len = value_hidden_size * value_hidden_size;
+        let vhn_len = value_hidden_size * pool_size;
+        let vhb_len = value_hidden_size;
         let vlw_len = VALUE_LOGITS * value_hidden_size;
         let vlb_len = VALUE_LOGITS;
         let pnq_len = policy_node_proj_size * gnn_node_channels;
@@ -701,6 +727,9 @@ impl AzNnue {
             + vih_len
             + vin_len
             + vib_len
+            + vhw_len
+            + vhn_len
+            + vhb_len
             + vlw_len
             + vlb_len
             + pnq_len
@@ -741,6 +770,9 @@ impl AzNnue {
         let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
         let value_intermediate_nodes = read_f32_vec_le(&mut reader, vin_len)?;
         let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
+        let value_hidden_weights = read_f32_vec_le(&mut reader, vhw_len)?;
+        let value_hidden_nodes = read_f32_vec_le(&mut reader, vhn_len)?;
+        let value_hidden_bias = read_f32_vec_le(&mut reader, vhb_len)?;
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
         let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
         let policy_node_query = read_f32_vec_le(&mut reader, pnq_len)?;
@@ -772,6 +804,9 @@ impl AzNnue {
             value_intermediate_hidden,
             value_intermediate_nodes,
             value_intermediate_bias,
+            value_hidden_weights,
+            value_hidden_nodes,
+            value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
             policy_node_query,
@@ -838,6 +873,7 @@ impl AzNnue {
             &scratch.hidden,
             &scratch.node_global,
             &mut scratch.value_intermediate,
+            &mut scratch.value_hidden,
             &mut scratch.value_logits,
         );
         self.policy_condition_into(
@@ -935,6 +971,7 @@ impl AzNnue {
         hidden: &[f32],
         node_global: &[f32],
         value_intermediate: &mut Vec<f32>,
+        value_hidden_out: &mut Vec<f32>,
         value_logits: &mut Vec<f32>,
     ) -> f32 {
         let value_hidden = self.arch.value_hidden_size;
@@ -952,11 +989,23 @@ impl AzNnue {
             }
             *value = (*value).max(0.0);
         }
+        value_hidden_out.copy_from_slice(&self.value_hidden_bias);
+        for (j, value) in value_hidden_out.iter_mut().enumerate().take(value_hidden) {
+            let h_row = &self.value_hidden_weights[j * value_hidden..(j + 1) * value_hidden];
+            for (intermediate, weight) in value_intermediate.iter().zip(h_row) {
+                *value += intermediate * weight;
+            }
+            let node_row = &self.value_hidden_nodes[j * pool..(j + 1) * pool];
+            for (node_value, weight) in node_global.iter().zip(node_row) {
+                *value += node_value * weight;
+            }
+            *value = (*value).max(0.0);
+        }
         value_logits.copy_from_slice(&self.value_logits_bias);
         for out in 0..VALUE_LOGITS {
             let row = &self.value_logits_weights[out * value_hidden..(out + 1) * value_hidden];
-            for (intermediate, weight) in value_intermediate.iter().zip(row) {
-                value_logits[out] += intermediate * weight;
+            for (value_hidden, weight) in value_hidden_out.iter().zip(row) {
+                value_logits[out] += value_hidden * weight;
             }
         }
         scalar_value_from_logits(value_logits).0
@@ -1042,6 +1091,9 @@ impl AzNnue {
             || self.value_intermediate_hidden.len() != value_hidden * hidden
             || self.value_intermediate_nodes.len() != value_hidden * pool
             || self.value_intermediate_bias.len() != value_hidden
+            || self.value_hidden_weights.len() != value_hidden * value_hidden
+            || self.value_hidden_nodes.len() != value_hidden * pool
+            || self.value_hidden_bias.len() != value_hidden
             || self.value_logits_weights.len() != VALUE_LOGITS * value_hidden
             || self.value_logits_bias.len() != VALUE_LOGITS
             || self.policy_node_query.len() != proj * channels

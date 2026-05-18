@@ -53,6 +53,9 @@ struct GpuVars {
     value_intermediate_hidden: Var,
     value_intermediate_nodes: Var,
     value_intermediate_bias: Var,
+    value_hidden_weights: Var,
+    value_hidden_nodes: Var,
+    value_hidden_bias: Var,
     value_logits_weights: Var,
     value_logits_bias: Var,
     policy_node_query: Var,
@@ -582,7 +585,12 @@ impl GpuReplica {
             .broadcast_add(&node_global.matmul(&self.vars.value_intermediate_nodes.t()?)?)?
             .broadcast_add(&self.vars.value_intermediate_bias)?
             .relu()?;
-        let value_logits = value_intermediate
+        let value_hidden = value_intermediate
+            .matmul(&self.vars.value_hidden_weights.t()?)?
+            .broadcast_add(&node_global.matmul(&self.vars.value_hidden_nodes.t()?)?)?
+            .broadcast_add(&self.vars.value_hidden_bias)?
+            .relu()?;
+        let value_logits = value_hidden
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
         let policy_nodes_2d = policy_nodes.reshape((bsz * BOARD_PLANES_SIZE, channels))?;
@@ -842,6 +850,17 @@ impl GpuVars {
                 value_hidden,
                 device,
             )?,
+            value_hidden_weights: var_from_slice(
+                &model.value_hidden_weights,
+                (value_hidden, value_hidden),
+                device,
+            )?,
+            value_hidden_nodes: var_from_slice(
+                &model.value_hidden_nodes,
+                (value_hidden, pool),
+                device,
+            )?,
+            value_hidden_bias: var_from_slice(&model.value_hidden_bias, value_hidden, device)?,
             value_logits_weights: var_from_slice(
                 &model.value_logits_weights,
                 (VALUE_LOGITS, value_hidden),
@@ -924,6 +943,9 @@ impl GpuVars {
         vars.push(self.value_intermediate_hidden.clone());
         vars.push(self.value_intermediate_nodes.clone());
         vars.push(self.value_intermediate_bias.clone());
+        vars.push(self.value_hidden_weights.clone());
+        vars.push(self.value_hidden_nodes.clone());
+        vars.push(self.value_hidden_bias.clone());
         vars.push(self.value_logits_weights.clone());
         vars.push(self.value_logits_bias.clone());
         vars.push(self.policy_node_query.clone());
@@ -962,6 +984,9 @@ impl GpuVars {
             self.value_intermediate_hidden.clone(),
             self.value_intermediate_nodes.clone(),
             self.value_intermediate_bias.clone(),
+            self.value_hidden_weights.clone(),
+            self.value_hidden_nodes.clone(),
+            self.value_hidden_bias.clone(),
             self.value_logits_weights.clone(),
             self.value_logits_bias.clone(),
         ]
@@ -1026,6 +1051,9 @@ impl GpuVars {
             &self.value_intermediate_bias,
             &mut model.value_intermediate_bias,
         )?;
+        copy_var(&self.value_hidden_weights, &mut model.value_hidden_weights)?;
+        copy_var(&self.value_hidden_nodes, &mut model.value_hidden_nodes)?;
+        copy_var(&self.value_hidden_bias, &mut model.value_hidden_bias)?;
         copy_var(&self.value_logits_weights, &mut model.value_logits_weights)?;
         copy_var(&self.value_logits_bias, &mut model.value_logits_bias)?;
         copy_var(&self.policy_node_query, &mut model.policy_node_query)?;
