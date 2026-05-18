@@ -663,9 +663,14 @@ impl GpuReplica {
             .graph_bias
             .narrow(0, gate_range.start, channels)?
             .reshape(gate_shape)?;
-        (((node_grid.broadcast_mul(&self_gate)? + local_mean.broadcast_mul(&local_gate)?)?
-            + row_mean.broadcast_mul(&row_gate)?)?
-            + col_mean.broadcast_mul(&col_gate)?)?
+        let local_term = local_mean.broadcast_mul(&local_gate)?;
+        let row_term = row_mean.broadcast_mul(&row_gate)?;
+        let col_term = col_mean.broadcast_mul(&col_gate)?;
+        node_grid
+            .broadcast_mul(&self_gate)?
+            .broadcast_add(&local_term)?
+            .broadcast_add(&row_term)?
+            .broadcast_add(&col_term)?
             .broadcast_add(&bias)?
             .relu()
     }
