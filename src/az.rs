@@ -347,6 +347,8 @@ pub struct AzLoopConfig {
     pub gumbel: AzGumbelConfig,
     pub td_lambda: f32,
     pub mirror_probability: f32,
+    pub opening_policy_smoothing_plies: usize,
+    pub opening_policy_smoothing: f32,
 }
 
 #[derive(Clone, Debug)]

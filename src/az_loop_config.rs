@@ -36,6 +36,8 @@ pub struct AzLoopFileConfig {
     pub replay_games: usize,
     pub replay_samples: usize,
     pub mirror_probability: f32,
+    pub opening_policy_smoothing_plies: usize,
+    pub opening_policy_smoothing: f32,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -82,6 +84,8 @@ impl Default for AzLoopFileConfig {
             replay_games: 2000,
             replay_samples: 20000,
             mirror_probability: 0.3,
+            opening_policy_smoothing_plies: 4,
+            opening_policy_smoothing: 0.20,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
@@ -129,6 +133,8 @@ struct AzLoopTomlConfig {
     pub replay_games: Option<usize>,
     pub replay_samples: Option<usize>,
     pub mirror_probability: Option<f32>,
+    pub opening_policy_smoothing_plies: Option<usize>,
+    pub opening_policy_smoothing: Option<f32>,
     pub checkpoint_interval: Option<usize>,
     pub checkpoint_dir: Option<String>,
     pub max_checkpoints: Option<usize>,
@@ -238,6 +244,12 @@ impl AzLoopTomlConfig {
         if let Some(value) = self.mirror_probability {
             config.mirror_probability = value;
         }
+        if let Some(value) = self.opening_policy_smoothing_plies {
+            config.opening_policy_smoothing_plies = value;
+        }
+        if let Some(value) = self.opening_policy_smoothing {
+            config.opening_policy_smoothing = value;
+        }
         if let Some(value) = self.checkpoint_interval {
             config.checkpoint_interval = value;
         }
@@ -318,6 +330,10 @@ impl AzLoopFileConfig {
 # Augmentation:
 #   mirror_probability mirrors board files a<->i for this fraction of training samples.
 #   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
+#   opening_policy_smoothing applies only to the first N plies of each self-play game:
+#       target = (1-eps) * MCTS_policy + eps * uniform_legal
+#   This keeps early opening priors from collapsing to one fixed book move while leaving
+#   tactical middlegame/endgame policy targets sharp.
 #
 # Checkpoints & Arena:
 #   Training appends "<this_conf_filename>.progress" with next_update=... after each weight update.
@@ -384,6 +400,8 @@ td_lambda = {td_lambda}
 replay_games = {replay_games}
 replay_samples = {replay_samples}
 mirror_probability = {mirror_probability}
+opening_policy_smoothing_plies = {opening_policy_smoothing_plies}
+opening_policy_smoothing = {opening_policy_smoothing}
 checkpoint_interval = {checkpoint_interval}
 checkpoint_dir = "{checkpoint_dir}"
 max_checkpoints = {max_checkpoints}
@@ -425,6 +443,8 @@ tensorboard_logdir = "{tensorboard_logdir}"
             replay_games = self.replay_games,
             replay_samples = self.replay_samples,
             mirror_probability = self.mirror_probability,
+            opening_policy_smoothing_plies = self.opening_policy_smoothing_plies,
+            opening_policy_smoothing = self.opening_policy_smoothing,
             checkpoint_interval = self.checkpoint_interval,
             checkpoint_dir = self.checkpoint_dir,
             max_checkpoints = self.max_checkpoints,
@@ -480,6 +500,7 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
+        self.opening_policy_smoothing = self.opening_policy_smoothing.clamp(0.0, 1.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_games_per_side = self.arena_games_per_side.max(1);
         self.arena_processes = self.arena_processes.max(1);

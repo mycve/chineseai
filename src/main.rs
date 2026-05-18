@@ -534,7 +534,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     format!(
         concat!(
             "sim{}_bs{}_lr{}_ep{}_mx{}_h{}_mxp{}_wk{}_",
-            "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_tl{}_cpi{}_",
+            "sa{}_gsm{}_tb{}_te{}_tde{}_rg{}_rs{}_mp{}_ops{}_opp{}_tl{}_cpi{}_",
             "ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
         config.simulations,
@@ -553,6 +553,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.replay_games,
         config.replay_samples,
         f32_slug(config.mirror_probability),
+        f32_slug(config.opening_policy_smoothing),
+        config.opening_policy_smoothing_plies,
         f32_slug(config.td_lambda),
         config.checkpoint_interval,
         config.arena_interval,
@@ -678,6 +680,8 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         gumbel: config.gumbel,
         td_lambda: config.td_lambda,
         mirror_probability: config.mirror_probability,
+        opening_policy_smoothing_plies: config.opening_policy_smoothing_plies,
+        opening_policy_smoothing: config.opening_policy_smoothing,
     }
 }
 
@@ -1354,7 +1358,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) td_lambda={} replay_games={} replay_samples={} mirror_probability={} checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_batch_games={} epochs/update={} lr={} batch_size(per_gpu)={} global_step_samples={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) td_lambda={} replay_games={} replay_samples={} mirror_probability={} opening_smoothing={}/{}ply checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_processes={} tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -1380,6 +1384,8 @@ fn main() {
                 config.replay_games,
                 config.replay_samples,
                 config.mirror_probability,
+                config.opening_policy_smoothing,
+                config.opening_policy_smoothing_plies,
                 config.checkpoint_interval,
                 config.max_checkpoints,
                 config.arena_interval,

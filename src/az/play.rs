@@ -265,6 +265,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &search.candidates,
                 search.value_cp as f32 / VALUE_SCALE_CP,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                if ply < config.opening_policy_smoothing_plies {
+                    config.opening_policy_smoothing
+                } else {
+                    0.0
+                },
             ));
             append_history(&mut history, &position, mv);
             rule_history.push(position.rule_history_entry_after_move(mv));
@@ -346,6 +351,7 @@ fn make_training_sample(
     candidates: &[AzCandidate],
     value: f32,
     mirror_file: bool,
+    policy_smoothing: f32,
 ) -> AzTrainingSample {
     let total_policy = candidates
         .iter()
@@ -377,14 +383,25 @@ fn make_training_sample(
         }
         board = mirrored;
     }
+    let uniform = if candidates.is_empty() {
+        0.0
+    } else {
+        1.0 / candidates.len() as f32
+    };
+    let smooth = policy_smoothing.clamp(0.0, 1.0);
+    let policy = candidates
+        .iter()
+        .map(|candidate| {
+            let p = candidate.policy.max(0.0) / total_policy;
+            (1.0 - smooth) * p + smooth * uniform
+        })
+        .collect();
+
     AzTrainingSample {
         features,
         board,
         move_indices,
-        policy: candidates
-            .iter()
-            .map(|candidate| candidate.policy.max(0.0) / total_policy)
-            .collect(),
+        policy,
         value: value.clamp(-1.0, 1.0),
         side_sign: if position.side_to_move() == Color::Red {
             1.0
