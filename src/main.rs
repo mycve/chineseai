@@ -127,7 +127,7 @@ impl AzInitArgs {
 Examples:
   chineseai az-search chineseai.nnue
   chineseai az-search chineseai.nnue 10000 1.5 startpos
-  chineseai az-search chineseai.nnue 10000 1.5 --algorithm gumbel_alphazero startpos")]
+  chineseai az-search chineseai.nnue 10000 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -140,6 +140,24 @@ struct AzSearchArgs {
     /// Search algorithm: alphazero or gumbel_alphazero.
     #[arg(long, value_parser = parse_search_algorithm)]
     algorithm: Option<AzSearchAlgorithm>,
+    /// Gumbel root top-k considered actions.
+    #[arg(long, default_value_t = 16)]
+    topk: usize,
+    /// Gumbel noise scale.
+    #[arg(long, default_value_t = 1.0)]
+    gumbel_scale: f32,
+    /// Gumbel completed-q value scale.
+    #[arg(long, default_value_t = 0.1)]
+    gumbel_value_scale: f32,
+    /// Gumbel max-visit initialization.
+    #[arg(long, default_value_t = 50.0)]
+    gumbel_maxvisit_init: f32,
+    /// Rescale completed values in Gumbel search.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_rescale_values: bool,
+    /// Mix root value into unvisited Gumbel action values.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_use_mixed_value: bool,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -149,7 +167,7 @@ struct AzSearchArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-bench chineseai.nnue 512 100 1.5 startpos
-  chineseai az-bench chineseai.nnue 512 100 1.5 --algorithm gumbel_alphazero startpos")]
+  chineseai az-bench chineseai.nnue 512 100 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
 struct AzBenchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -165,6 +183,24 @@ struct AzBenchArgs {
     /// Search algorithm: alphazero or gumbel_alphazero.
     #[arg(long, value_parser = parse_search_algorithm)]
     algorithm: Option<AzSearchAlgorithm>,
+    /// Gumbel root top-k considered actions.
+    #[arg(long, default_value_t = 16)]
+    topk: usize,
+    /// Gumbel noise scale.
+    #[arg(long, default_value_t = 1.0)]
+    gumbel_scale: f32,
+    /// Gumbel completed-q value scale.
+    #[arg(long, default_value_t = 0.1)]
+    gumbel_value_scale: f32,
+    /// Gumbel max-visit initialization.
+    #[arg(long, default_value_t = 50.0)]
+    gumbel_maxvisit_init: f32,
+    /// Rescale completed values in Gumbel search.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_rescale_values: bool,
+    /// Mix root value into unvisited Gumbel action values.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    gumbel_use_mixed_value: bool,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -346,6 +382,24 @@ struct VsPikafishArgs {
 fn parse_search_algorithm(text: &str) -> Result<AzSearchAlgorithm, String> {
     AzSearchAlgorithm::parse(text)
         .ok_or_else(|| "expected `alphazero` or `gumbel_alphazero`".to_string())
+}
+
+fn build_gumbel_config(
+    topk: usize,
+    gumbel_scale: f32,
+    gumbel_value_scale: f32,
+    gumbel_maxvisit_init: f32,
+    gumbel_rescale_values: bool,
+    gumbel_use_mixed_value: bool,
+) -> AzGumbelConfig {
+    AzGumbelConfig {
+        max_num_considered_actions: topk.max(1),
+        gumbel_scale: gumbel_scale.max(0.0),
+        value_scale: gumbel_value_scale.max(0.0),
+        maxvisit_init: gumbel_maxvisit_init.max(0.0),
+        rescale_values: gumbel_rescale_values,
+        use_mixed_value: gumbel_use_mixed_value,
+    }
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
@@ -836,6 +890,14 @@ fn main() {
             let simulations = cmd.simulations.max(1);
             let cpuct = cmd.cpuct.max(0.0);
             let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
+            let gumbel = build_gumbel_config(
+                cmd.topk,
+                cmd.gumbel_scale,
+                cmd.gumbel_value_scale,
+                cmd.gumbel_maxvisit_init,
+                cmd.gumbel_rescale_values,
+                cmd.gumbel_use_mixed_value,
+            );
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -851,13 +913,22 @@ fn main() {
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
                     algorithm,
-                    gumbel: AzGumbelConfig::default(),
+                    gumbel,
                 },
             );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
             println!("search   : {}", algorithm.as_str());
+            println!(
+                "gumbel   : topk={} scale={} value_scale={} maxvisit_init={} rescale={} mixed={}",
+                gumbel.max_num_considered_actions,
+                gumbel.gumbel_scale,
+                gumbel.value_scale,
+                gumbel.maxvisit_init,
+                gumbel.rescale_values,
+                gumbel.use_mixed_value
+            );
             println!("cpuct    : {cpuct}");
             println!("value_cp : {}", result.value_cp);
             println!(
@@ -904,6 +975,14 @@ fn main() {
             let repeat = cmd.repeat.max(1);
             let cpuct = cmd.cpuct.max(0.0);
             let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
+            let gumbel = build_gumbel_config(
+                cmd.topk,
+                cmd.gumbel_scale,
+                cmd.gumbel_value_scale,
+                cmd.gumbel_maxvisit_init,
+                cmd.gumbel_rescale_values,
+                cmd.gumbel_use_mixed_value,
+            );
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -920,7 +999,7 @@ fn main() {
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
                     algorithm,
-                    gumbel: AzGumbelConfig::default(),
+                    gumbel,
                 },
             );
 
@@ -938,7 +1017,7 @@ fn main() {
                         root_dirichlet_alpha: 0.0,
                         root_exploration_fraction: 0.0,
                         algorithm,
-                        gumbel: AzGumbelConfig::default(),
+                        gumbel,
                     },
                 );
                 total_sims += result.simulations;
@@ -952,6 +1031,15 @@ fn main() {
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
             println!("search       : {}", algorithm.as_str());
+            println!(
+                "gumbel       : topk={} scale={} value_scale={} maxvisit_init={} rescale={} mixed={}",
+                gumbel.max_num_considered_actions,
+                gumbel.gumbel_scale,
+                gumbel.value_scale,
+                gumbel.maxvisit_init,
+                gumbel.rescale_values,
+                gumbel.use_mixed_value
+            );
             println!("cpuct        : {cpuct}");
             println!("total_sims   : {total_sims}");
             println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
@@ -2014,14 +2102,14 @@ fn main() {
             let search_algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::GumbelAlphaZero);
             let cpuct = cmd.cpuct.max(0.0);
             let max_plies = cmd.max_plies.max(1);
-            let gumbel = AzGumbelConfig {
-                max_num_considered_actions: topk,
-                gumbel_scale: cmd.gumbel_scale.max(0.0),
-                value_scale: cmd.gumbel_value_scale.max(0.0),
-                maxvisit_init: cmd.gumbel_maxvisit_init.max(0.0),
-                rescale_values: cmd.gumbel_rescale_values,
-                use_mixed_value: cmd.gumbel_use_mixed_value,
-            };
+            let gumbel = build_gumbel_config(
+                topk,
+                cmd.gumbel_scale,
+                cmd.gumbel_value_scale,
+                cmd.gumbel_maxvisit_init,
+                cmd.gumbel_rescale_values,
+                cmd.gumbel_use_mixed_value,
+            );
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
