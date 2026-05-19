@@ -82,6 +82,7 @@ pub fn alphazero_search_with_history_and_rules(
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
+    crate::scope_profile!("az.alphazero_search");
     let mut tree = AzTree::new(
         position.clone(),
         truncate_history(history),

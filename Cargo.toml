@@ -15,6 +15,7 @@ toml = "0.8"
 
 [features]
 default = []
+profile = []
 
 # Enable jemalloc on Linux glibc. musl targets skip this dependency and are
 # rejected by build.rs.

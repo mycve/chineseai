@@ -81,6 +81,7 @@ impl Position {
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
+        crate::scope_profile!("xiangqi.legal_moves_with_rules");
         let legal = self.legal_moves();
         if legal.is_empty() {
             return legal;
@@ -114,6 +115,7 @@ impl Position {
     }
 
     fn chased_mask_by(&self, color: Color) -> u128 {
+        crate::scope_profile!("xiangqi.chased_mask_by");
         let mut work = self.clone();
         work.side_to_move = color;
         work.legal_moves()

@@ -503,6 +503,7 @@ impl AzNnue {
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
+        crate::scope_profile!("az.evaluate_with_scratch");
         let side = position.side_to_move();
         let features = extract_sparse_features_pure_canonical(position, history);
         self.input_embedding_into(&features, &mut scratch.hidden);

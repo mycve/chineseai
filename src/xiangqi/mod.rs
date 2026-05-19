@@ -184,6 +184,7 @@ impl Position {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
+        crate::scope_profile!("xiangqi.legal_moves");
         self.collect_legal_moves(false, self.in_check(self.side_to_move))
     }
 
@@ -253,6 +254,7 @@ impl Position {
     }
 
     pub fn make_move(&mut self, mv: Move) -> Undo {
+        crate::scope_profile!("xiangqi.make_move");
         let from = mv.from as usize;
         let to = mv.to as usize;
         let moving = self.board[from].expect("move from occupied square");
@@ -319,6 +321,7 @@ impl Position {
     }
 
     pub fn in_check(&self, color: Color) -> bool {
+        crate::scope_profile!("xiangqi.in_check");
         let king_sq = self
             .find_general(color)
             .expect("every valid position must contain both generals");
@@ -433,6 +436,7 @@ impl Position {
     }
 
     fn collect_legal_moves(&self, captures_only: bool, in_check: bool) -> Vec<Move> {
+        crate::scope_profile!("xiangqi.collect_legal_moves");
         let mut moves = if in_check {
             self.pseudo_legal_evasions()
         } else if captures_only {

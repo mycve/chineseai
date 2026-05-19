@@ -2085,7 +2085,8 @@ fn main() {
                 cpuct
             );
         }
-    }
+    };
+    chineseai::profile::print_report();
 }
 
 fn parse_position(text: &str) -> Position {
