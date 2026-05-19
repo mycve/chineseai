@@ -62,6 +62,18 @@ fn facing_generals_exposure_is_illegal() {
 }
 
 #[test]
+fn legal_moves_do_not_capture_general() {
+    let position = Position::from_fen("4k4/9/9/9/9/9/4R4/9/9/4K4 w").unwrap();
+    assert!(position.in_check(Color::Black));
+    assert!(
+        !position
+            .legal_moves()
+            .iter()
+            .any(|mv| { mv.from == index(4, 6) as u8 && mv.to == index(4, 0) as u8 })
+    );
+}
+
+#[test]
 fn facing_generals_position_is_rejected() {
     let position = Position::from_fen("4k4/9/9/9/9/9/9/9/9/4K4 w").unwrap_err();
     assert_eq!(position, "illegal position: generals are facing");

@@ -1968,7 +1968,7 @@ fn main() {
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
             for item in &summary.abnormal_ends {
                 println!(
-                    "vs-pikafish-final: game={} chinese={} end={} {}",
+                    "vs-pikafish-final: game={} chinese={} end={} final_fen=\"{}\" {}",
                     item.game_index,
                     if item.chinese_plays_red {
                         "red"
@@ -1976,6 +1976,7 @@ fn main() {
                         "black"
                     },
                     item.end,
+                    item.final_fen,
                     item.position_command
                 );
             }

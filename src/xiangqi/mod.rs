@@ -198,7 +198,7 @@ impl Position {
         let Some(target_piece) = self.board.get(target).and_then(|piece| *piece) else {
             return Vec::new();
         };
-        if target_piece.color == self.side_to_move {
+        if target_piece.color == self.side_to_move || target_piece.kind == PieceKind::General {
             return Vec::new();
         }
 
@@ -235,7 +235,9 @@ impl Position {
             .board
             .get(to)
             .and_then(|target| *target)
-            .is_some_and(|target| target.color == self.side_to_move)
+            .is_some_and(|target| {
+                target.color == self.side_to_move || target.kind == PieceKind::General
+            })
         {
             return false;
         }
@@ -530,11 +532,6 @@ impl Position {
             }
             self.push_if_valid_target(sq, nf as usize, nr as usize, piece.color, mode, moves);
         }
-
-        let enemy_king = self.find_general(piece.color.opposite()).unwrap();
-        if file_of(enemy_king) == file_of(sq) && self.clear_file_between(sq, enemy_king) {
-            moves.push(Move::new(sq, enemy_king));
-        }
     }
 
     fn gen_advisor_moves(&self, sq: usize, piece: Piece, mode: MoveGenMode, moves: &mut Vec<Move>) {
@@ -628,7 +625,9 @@ impl Position {
                     }
                     Some(target_piece) => {
                         if !is_cannon {
-                            if target_piece.color != color {
+                            if target_piece.color != color
+                                && target_piece.kind != PieceKind::General
+                            {
                                 moves.push(Move::new(sq, target));
                             }
                             break;
@@ -637,7 +636,9 @@ impl Position {
                         if !seen_screen {
                             seen_screen = true;
                         } else {
-                            if target_piece.color != color {
+                            if target_piece.color != color
+                                && target_piece.kind != PieceKind::General
+                            {
                                 moves.push(Move::new(sq, target));
                             }
                             break;
@@ -695,6 +696,7 @@ impl Position {
         let to = index(to_file, to_rank);
         match self.board[to] {
             Some(piece) if piece.color == color => {}
+            Some(piece) if piece.kind == PieceKind::General => {}
             Some(_) => moves.push(Move::new(from, to)),
             None if mode == MoveGenMode::All => moves.push(Move::new(from, to)),
             None => {}
