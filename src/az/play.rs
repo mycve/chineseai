@@ -11,7 +11,7 @@ use super::alphazero::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, BOARD_HISTORY_FRAMES,
     BOARD_PLANES_SIZE, SplitMix64, VALUE_SCALE_CP, alphazero_search_with_history_and_rules,
-    dense_move_index, extract_board_planes,
+    dense_move_index, extract_board_planes, move_tactical_features,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -371,6 +371,11 @@ fn make_training_sample(
         }
     }
     let move_indices = moves.iter().copied().map(dense_move_index).collect();
+    let mut tactical_features =
+        Vec::with_capacity(candidates.len() * super::MOVE_TACTICAL_FEATURES);
+    for candidate in candidates {
+        tactical_features.extend_from_slice(&move_tactical_features(position, candidate.mv));
+    }
     let mut board = Vec::new();
     extract_board_planes(position, history, &mut board);
     if mirror_file {
@@ -401,6 +406,7 @@ fn make_training_sample(
         features,
         board,
         move_indices,
+        move_tactical_features: tactical_features,
         policy,
         value: value.clamp(-1.0, 1.0),
         side_sign: if position.side_to_move() == Color::Red {

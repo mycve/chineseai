@@ -5,8 +5,8 @@ use std::{process::Command, thread};
 
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, DENSE_MOVE_SPACE,
-    POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, VALUE_LOGITS, policy_move_features,
-    policy_move_from_features, policy_move_to_features,
+    MOVE_TACTICAL_FEATURES, POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, VALUE_LOGITS,
+    policy_move_features, policy_move_from_features, policy_move_to_features,
 };
 use crate::nnue::PURE_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
@@ -48,6 +48,7 @@ struct GpuVars {
     policy_feature_bias: Var,
     policy_from_hidden: Var,
     policy_to_hidden: Var,
+    policy_tactical_hidden: Var,
     policy_move_features: Tensor,
     policy_move_from_features: Tensor,
     policy_move_to_features: Tensor,
@@ -513,7 +514,14 @@ impl GpuReplica {
         let policy_from_logits =
             policy_from_scores.matmul(&self.vars.policy_move_from_features.t()?)?;
         let policy_to_logits = policy_to_scores.matmul(&self.vars.policy_move_to_features.t()?)?;
-        let policy_logits = (((policy_feature_logits + policy_from_logits)? + policy_to_logits)?
+        let policy_tactical_scores = hidden.matmul(&self.vars.policy_tactical_hidden.t()?)?;
+        let policy_tactical_logits = batch
+            .policy_tactical_features
+            .broadcast_mul(&policy_tactical_scores.unsqueeze(1)?)?
+            .sum(2)?;
+        let policy_logits = ((((policy_feature_logits + policy_from_logits)?
+            + policy_to_logits)?
+            + policy_tactical_logits)?
             .broadcast_add(&policy_bias))?;
 
         Ok(ForwardOutput {
@@ -541,6 +549,7 @@ struct BatchTensors {
     feature_mask: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
+    policy_tactical_features: Tensor,
     value_targets: Tensor,
     values: Tensor,
 }
@@ -558,6 +567,8 @@ impl BatchTensors {
         let mut feature_mask = vec![0.0f32; batch_size * max_features];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * DENSE_MOVE_SPACE];
+        let mut policy_tactical_features =
+            vec![0.0f32; batch_size * DENSE_MOVE_SPACE * MOVE_TACTICAL_FEATURES];
         let mut value_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
         let mut values = vec![0.0f32; batch_size];
 
@@ -572,10 +583,23 @@ impl BatchTensors {
             }
 
             let policy_base = row * DENSE_MOVE_SPACE;
-            for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
+            for (move_offset, (&move_index, &target)) in sample
+                .move_indices
+                .iter()
+                .zip(sample.policy.iter())
+                .enumerate()
+            {
                 if move_index < DENSE_MOVE_SPACE {
                     policy_targets[policy_base + move_index] = target.max(0.0);
                     policy_mask[policy_base + move_index] = 0.0;
+                    let src = move_offset * MOVE_TACTICAL_FEATURES;
+                    let dst = (policy_base + move_index) * MOVE_TACTICAL_FEATURES;
+                    if src + MOVE_TACTICAL_FEATURES <= sample.move_tactical_features.len() {
+                        policy_tactical_features[dst..dst + MOVE_TACTICAL_FEATURES]
+                            .copy_from_slice(
+                                &sample.move_tactical_features[src..src + MOVE_TACTICAL_FEATURES],
+                            );
+                    }
                 }
             }
             let value = sample.value.clamp(-1.0, 1.0);
@@ -601,6 +625,11 @@ impl BatchTensors {
                 device,
             )?,
             policy_mask: Tensor::from_vec(policy_mask, (batch_size, DENSE_MOVE_SPACE), device)?,
+            policy_tactical_features: Tensor::from_vec(
+                policy_tactical_features,
+                (batch_size, DENSE_MOVE_SPACE, MOVE_TACTICAL_FEATURES),
+                device,
+            )?,
             value_targets: Tensor::from_vec(value_targets, (batch_size, VALUE_LOGITS), device)?,
             values: Tensor::from_vec(values, batch_size, device)?,
         })
@@ -655,6 +684,11 @@ impl GpuVars {
                 (BOARD_SIZE, hidden),
                 device,
             )?,
+            policy_tactical_hidden: var_from_slice(
+                &model.policy_tactical_hidden,
+                (MOVE_TACTICAL_FEATURES, hidden),
+                device,
+            )?,
             policy_move_features: Tensor::from_vec(
                 policy_move_features().to_vec(),
                 (DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE),
@@ -686,6 +720,7 @@ impl GpuVars {
         vars.push(self.policy_feature_bias.clone());
         vars.push(self.policy_from_hidden.clone());
         vars.push(self.policy_to_hidden.clone());
+        vars.push(self.policy_tactical_hidden.clone());
         vars
     }
 
@@ -712,6 +747,7 @@ impl GpuVars {
             self.policy_feature_bias.clone(),
             self.policy_from_hidden.clone(),
             self.policy_to_hidden.clone(),
+            self.policy_tactical_hidden.clone(),
         ]
     }
 
@@ -751,6 +787,10 @@ impl GpuVars {
         copy_var(&self.policy_feature_bias, &mut model.policy_feature_bias)?;
         copy_var(&self.policy_from_hidden, &mut model.policy_from_hidden)?;
         copy_var(&self.policy_to_hidden, &mut model.policy_to_hidden)?;
+        copy_var(
+            &self.policy_tactical_hidden,
+            &mut model.policy_tactical_hidden,
+        )?;
         Ok(())
     }
 

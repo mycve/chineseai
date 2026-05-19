@@ -167,6 +167,7 @@ pub fn load_distill_npz_samples(
             features: extract_sparse_features_pure_canonical(&position, &[]),
             board,
             move_indices: legal_moves,
+            move_tactical_features: vec![0.0; policy.len() * super::MOVE_TACTICAL_FEATURES],
             policy,
             value: value_tgt[row].clamp(-1.0, 1.0),
             side_sign: -1.0,
