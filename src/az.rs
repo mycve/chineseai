@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
@@ -32,7 +32,12 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 43;
+// v39：value head 直接由 accumulator 输出 3 logits，删除 value MLP。
+// v38：纯稀疏 NNUE。输入只保留棋子/王位桶/历史/行列特征；
+//   模型文件只保存 sparse accumulator、direct value logits、move-feature policy MLP。
+const AZNNUE_BINARY_VERSION: u32 = 42;
+// 头部布局（小端 u32 依次）：
+//   magic(4 字节) | version | input_size | hidden_size
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -66,26 +71,31 @@ pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const POLICY_CONTEXT_SIZE: usize = 64;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
-pub(super) const MOVE_TACTICAL_FEATURES: usize = 8;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 
+/// 纯 NNUE 模型容量配置：全部由配置/二进制头驱动。
+/// 改这些值会改变模型形状，不能与已有 nnue 文件兼容，需要重新初始化。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AzNnueArch {
+    /// 共享 hidden 向量宽度。
     pub hidden_size: usize,
 }
 
 impl AzNnueArch {
+    /// 默认纯 NNUE 容量。
     pub const fn default_const() -> Self {
         Self { hidden_size: 256 }
     }
 
+    /// 仅指定 hidden_size，其他旋钮取默认。便于命令行/测试场景。
     pub const fn with_hidden_size(hidden_size: usize) -> Self {
         let mut arch = Self::default_const();
         arch.hidden_size = hidden_size;
         arch
     }
 
+    /// 形状合法性自检：任一字段为 0 都视为非法配置。
     pub fn validate(&self) -> Result<(), String> {
         if self.hidden_size == 0 {
             return Err(format!("invalid hidden_size {}", self.hidden_size));
@@ -106,12 +116,12 @@ pub(super) struct AzEvalScratch {
     policy_condition: Vec<f32>,
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
-    move_tactical: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
 }
 
 impl AzEvalScratch {
+    /// 按当前 arch 一次性预分配前向缓冲。所有依赖模型容量的尺寸都在此固化。
     pub(super) fn new(arch: AzNnueArch) -> Self {
         let hidden_size = arch.hidden_size;
         Self {
@@ -121,7 +131,6 @@ impl AzEvalScratch {
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
-            move_tactical: vec![0.0; MOVE_TACTICAL_FEATURES],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -131,6 +140,9 @@ impl AzEvalScratch {
 #[derive(Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
+    /// 可配置容量旋钮（与 hidden_size 一起决定模型形状）。
+    /// `hidden_size` 字段保留用于历史调用方（uci/main 等）的兼容访问，
+    /// 与 `arch.hidden_size` 始终保持同步。
     pub arch: AzNnueArch,
     pub input_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
@@ -143,7 +155,6 @@ pub struct AzNnue {
     pub policy_feature_bias: Vec<f32>,
     pub policy_from_hidden: Vec<f32>,
     pub policy_to_hidden: Vec<f32>,
-    pub policy_tactical_hidden: Vec<f32>,
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
@@ -168,7 +179,6 @@ impl Clone for AzNnue {
             policy_feature_bias: self.policy_feature_bias.clone(),
             policy_from_hidden: self.policy_from_hidden.clone(),
             policy_to_hidden: self.policy_to_hidden.clone(),
-            policy_tactical_hidden: self.policy_tactical_hidden.clone(),
             gpu_trainer: None,
         }
     }
@@ -209,8 +219,11 @@ pub struct AzLoopReport {
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
     pub policy_ce: f32,
+    /// 根 visit 策略分布熵（全局半步均值），TensorBoard：`stats/root_visit_entropy`。
     pub root_visit_entropy: f32,
+    /// 开局阶段熵均值，`stats/entropy_opening`。
     pub entropy_opening: f32,
+    /// 中后盘熵均值，`stats/entropy_mid`。
     pub entropy_mid: f32,
     pub selfplay_seconds: f32,
     pub train_seconds: f32,
@@ -246,7 +259,6 @@ pub struct AzTrainingSample {
     pub features: Vec<usize>,
     pub board: Vec<u8>,
     pub move_indices: Vec<usize>,
-    pub move_tactical_features: Vec<f32>,
     pub policy: Vec<f32>,
     pub value: f32,
     pub side_sign: f32,
@@ -301,6 +313,7 @@ impl AzTrainStats {
 }
 
 impl AzNnue {
+    /// 用指定容量随机初始化模型。所有形状均由 `arch` 驱动。
     pub fn random_with_arch(arch: AzNnueArch, seed: u64) -> Self {
         if let Err(err) = arch.validate() {
             panic!("AzNnue::random_with_arch: invalid arch ({err})");
@@ -330,9 +343,6 @@ impl AzNnue {
         let policy_to_hidden = (0..BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
-        let policy_tactical_hidden = (0..MOVE_TACTICAL_FEATURES * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.2))
-            .collect();
         Self {
             hidden_size,
             arch,
@@ -347,11 +357,11 @@ impl AzNnue {
             policy_feature_bias,
             policy_from_hidden,
             policy_to_hidden,
-            policy_tactical_hidden,
             gpu_trainer: None,
         }
     }
 
+    /// 仅指定 hidden_size 的便捷构造（其余旋钮取默认）。
     pub fn random(hidden_size: usize, seed: u64) -> Self {
         Self::random_with_arch(AzNnueArch::with_hidden_size(hidden_size), seed)
     }
@@ -374,7 +384,6 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.policy_feature_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_from_hidden)?;
         write_f32_slice_le(&mut writer, &self.policy_to_hidden)?;
-        write_f32_slice_le(&mut writer, &self.policy_tactical_hidden)?;
         writer.flush()?;
         Ok(())
     }
@@ -427,7 +436,6 @@ impl AzNnue {
         let pfb_len = POLICY_CONDITION_SIZE;
         let pfrom_len = BOARD_SIZE * hidden_size;
         let pto_len = BOARD_SIZE * hidden_size;
-        let ptac_len = MOVE_TACTICAL_FEATURES * hidden_size;
         let float_count = input_hidden_len
             + hidden_bias_len
             + vlw_len
@@ -438,8 +446,7 @@ impl AzNnue {
             + pfh_len
             + pfb_len
             + pfrom_len
-            + pto_len
-            + ptac_len;
+            + pto_len;
         let expected_len = AZNNUE_BINARY_HEADER_LEN + float_count * 4;
         if bytes.len() != expected_len {
             return Err(io::Error::new(
@@ -463,7 +470,6 @@ impl AzNnue {
         let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
         let policy_from_hidden = read_f32_vec_le(&mut reader, pfrom_len)?;
         let policy_to_hidden = read_f32_vec_le(&mut reader, pto_len)?;
-        let policy_tactical_hidden = read_f32_vec_le(&mut reader, ptac_len)?;
         let model = Self {
             hidden_size,
             arch,
@@ -478,7 +484,6 @@ impl AzNnue {
             policy_feature_bias,
             policy_from_hidden,
             policy_to_hidden,
-            policy_tactical_hidden,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -519,14 +524,10 @@ impl AzNnue {
         );
         scratch.logits.resize(moves.len(), 0.0);
         for (index, mv) in moves.iter().enumerate() {
-            let tactical = move_tactical_features(position, *mv);
-            scratch.move_tactical.copy_from_slice(&tactical);
             scratch.logits[index] = self.policy_logit_from_hidden_index(
-                &scratch.hidden,
                 &scratch.policy_condition,
                 &scratch.policy_from_scores,
                 &scratch.policy_to_scores,
-                &scratch.move_tactical,
                 dense_move_index(canonical_move(side, *mv)),
             );
         }
@@ -620,7 +621,6 @@ impl AzNnue {
             || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
             || self.policy_from_hidden.len() != BOARD_SIZE * hidden
             || self.policy_to_hidden.len() != BOARD_SIZE * hidden
-            || self.policy_tactical_hidden.len() != MOVE_TACTICAL_FEATURES * hidden
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -632,11 +632,9 @@ impl AzNnue {
 
     fn policy_logit_from_hidden_index(
         &self,
-        hidden: &[f32],
         policy_condition: &[f32],
         from_scores: &[f32],
         to_scores: &[f32],
-        tactical_features: &[f32],
         move_index: usize,
     ) -> f32 {
         let feature_offset = move_index * POLICY_CONDITION_SIZE;
@@ -645,54 +643,11 @@ impl AzNnue {
         let sparse = move_map().dense_to_sparse[move_index] as usize;
         let from = sparse / BOARD_SIZE;
         let to = sparse % BOARD_SIZE;
-        let mut tactical_logit = 0.0;
-        for (feature, &active) in tactical_features.iter().enumerate() {
-            if active == 0.0 {
-                continue;
-            }
-            let start = feature * self.hidden_size;
-            tactical_logit += active
-                * dot_product(
-                    hidden,
-                    &self.policy_tactical_hidden[start..start + self.hidden_size],
-                );
-        }
         self.policy_move_bias[move_index]
             + dot_product(policy_condition, move_features)
             + from_scores[from]
             + to_scores[to]
-            + tactical_logit
     }
-}
-
-pub(super) fn move_tactical_features(
-    position: &Position,
-    mv: Move,
-) -> [f32; MOVE_TACTICAL_FEATURES] {
-    let side = position.side_to_move();
-    let moving_piece_attacked = position
-        .piece_at(mv.from as usize)
-        .is_some_and(|piece| piece.color == side)
-        && position.is_piece_protected(mv.from as usize, side.opposite());
-    let capture = position.is_capture(mv);
-    let in_check = position.in_check(side);
-    let mut next = position.clone();
-    next.make_move(mv);
-    let gives_check = next.in_check(side.opposite());
-    let to_attacked = next.is_piece_protected(mv.to as usize, side.opposite());
-    let to_protected = next.is_piece_protected(mv.to as usize, side);
-    let quiet = !capture && !gives_check;
-    let safer_relocation = moving_piece_attacked && !to_attacked;
-    [
-        quiet as u8 as f32,
-        capture as u8 as f32,
-        gives_check as u8 as f32,
-        in_check as u8 as f32,
-        moving_piece_attacked as u8 as f32,
-        to_attacked as u8 as f32,
-        to_protected as u8 as f32,
-        safer_relocation as u8 as f32,
-    ]
 }
 
 pub(super) fn extract_board_planes(
@@ -794,7 +749,6 @@ pub fn benchmark_training(
         samples.push(AzTrainingSample {
             features,
             board: vec![0; BOARD_HISTORY_SIZE],
-            move_tactical_features: vec![0.0; move_indices.len() * MOVE_TACTICAL_FEATURES],
             move_indices,
             policy,
             value,
@@ -1147,7 +1101,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
         features: vec![1, 2, 3],
         board: vec![0; BOARD_HISTORY_SIZE],
         move_indices: vec![0, 1],
-        move_tactical_features: vec![0.0; 2 * MOVE_TACTICAL_FEATURES],
         policy: vec![0.6, 0.4],
         value: 0.1,
         side_sign: 1.0,
@@ -1234,7 +1187,6 @@ mod tests {
                 features: Vec::new(),
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
                 side_sign: 1.0,
@@ -1243,7 +1195,6 @@ mod tests {
                 features: Vec::new(),
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 0.0,
                 side_sign: -1.0,
@@ -1263,7 +1214,6 @@ mod tests {
                 features: Vec::new(),
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 0.2,
                 side_sign: 1.0,
@@ -1272,7 +1222,6 @@ mod tests {
                 features: Vec::new(),
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: -0.4,
                 side_sign: -1.0,
@@ -1281,7 +1230,6 @@ mod tests {
                 features: Vec::new(),
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 0.6,
                 side_sign: 1.0,
@@ -1333,7 +1281,6 @@ mod tests {
                 features: vec![0],
                 board: board_with(0, 1),
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
                 side_sign: 1.0,
@@ -1342,7 +1289,6 @@ mod tests {
                 features: vec![1],
                 board: board_with(10, 2),
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
                 side_sign: 1.0,
@@ -1351,7 +1297,6 @@ mod tests {
                 features: vec![2],
                 board: board_with(40, 3),
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 0.75,
                 side_sign: 1.0,
@@ -1360,7 +1305,6 @@ mod tests {
                 features: vec![3],
                 board: board_with(80, 4),
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: -0.75,
                 side_sign: 1.0,
@@ -1382,7 +1326,6 @@ mod tests {
                 features: vec![0, 4, 8],
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 1.0,
                 side_sign: 1.0,
@@ -1391,7 +1334,6 @@ mod tests {
                 features: vec![1, 5, 9],
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: -1.0,
                 side_sign: 1.0,
@@ -1400,7 +1342,6 @@ mod tests {
                 features: vec![2, 6, 10],
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: 0.5,
                 side_sign: 1.0,
@@ -1409,7 +1350,6 @@ mod tests {
                 features: vec![3, 7, 11],
                 board: vec![0; BOARD_HISTORY_SIZE],
                 move_indices: Vec::new(),
-                move_tactical_features: Vec::new(),
                 policy: Vec::new(),
                 value: -0.5,
                 side_sign: 1.0,
@@ -1449,7 +1389,6 @@ mod tests {
         assert_eq!(model.hidden_size, loaded.hidden_size);
         assert_eq!(model.input_hidden, loaded.input_hidden);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
-        assert_eq!(model.policy_tactical_hidden, loaded.policy_tactical_hidden);
     }
 
     #[test]

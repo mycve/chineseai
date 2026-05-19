@@ -5,14 +5,12 @@ use std::path::{Path, PathBuf};
 
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
-use super::{
-    AzTrainingSample, BOARD_HISTORY_SIZE, DENSE_MOVE_SPACE, MOVE_TACTICAL_FEATURES, SplitMix64,
-};
+use super::{AzTrainingSample, BOARD_HISTORY_SIZE, DENSE_MOVE_SPACE, SplitMix64};
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 9;
+const REPLAY_FILE_VERSION: u32 = 8;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -57,11 +55,10 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
         || sample.policy.len() != sample.move_indices.len()
-        || sample.move_tactical_features.len() != sample.move_indices.len() * MOVE_TACTICAL_FEATURES
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "replay encode: move_indices/policy/tactical mismatch or too long",
+            "replay encode: move_indices/policy mismatch or too long",
         ));
     }
     replay_push_u32(out, sample.features.len() as u32);
@@ -78,9 +75,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_u32(out, sample.move_indices.len() as u32);
     for &m in &sample.move_indices {
         replay_push_u32(out, m as u32);
-    }
-    for &feature in &sample.move_tactical_features {
-        replay_push_f32(out, feature);
     }
     for &p in &sample.policy {
         replay_push_f32(out, p);
@@ -136,11 +130,6 @@ fn decode_az_training_sample<R: Read>(
     for _ in 0..nm {
         move_indices.push(replay_read_u32(reader)? as usize);
     }
-    let tactical_len = nm as usize * MOVE_TACTICAL_FEATURES;
-    let mut move_tactical_features = Vec::with_capacity(tactical_len);
-    for _ in 0..tactical_len {
-        move_tactical_features.push(replay_read_f32(reader)?);
-    }
     let mut policy = Vec::with_capacity(nm as usize);
     for _ in 0..nm {
         policy.push(replay_read_f32(reader)?);
@@ -151,7 +140,6 @@ fn decode_az_training_sample<R: Read>(
         features,
         board,
         move_indices,
-        move_tactical_features,
         policy,
         value,
         side_sign,
