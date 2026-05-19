@@ -250,87 +250,7 @@ impl AzLoopTomlConfig {
 impl AzLoopFileConfig {
     fn to_file_text(&self) -> String {
         format!(
-            r#"# ChineseAI AZ self-play training config.
-# Run: ./target/release/chineseai az-loop {DEFAULT_AZ_LOOP_CONFIG}
-#
-# model_path: AzNnue binary (magic AZB1, little-endian f32), e.g. chineseai.nnue
-#
-# selfplay_batch_games:
-#   Generate this many self-play games, then run one training update.
-#   With multiple workers, batches are accumulated across all workers.
-#
-# Value targets:
-#   td_lambda mixes each position's future MCTS root values with the final game outcome.
-#   0.75 keeps terminal outcomes dominant while adding bootstrap signal from later
-#   MCTS root values, which usually steadies early value learning.
-#
-# Self-play policy temperature (linear in ply index, 0-based before each search):
-#   temperature_start -> temperature_end over plies [0, temperature_decay_plies), then constant.
-#   Defaults: 1.0 -> 0.1 by ply 40; raise decay_plies or temperature_end if openings collapse too early.
-#   熵监控开局/中后盘分界与此相同：ply < temperature_decay_plies 为开局熵，否则为中后盘熵。
-#
-# Pipeline:
-#   Self-play and training run in separate long-lived threads.
-#   workers controls how many independent self-play threads run in parallel.
-#   The generated default is capped at 32 because scalar CPU MCTS often slows down
-#   when hundreds of tiny self-play threads fight over cache and memory bandwidth.
-#   Self-play batches accumulate globally across workers.
-#   Every time selfplay_batch_games complete, one training update runs and then
-#   the fresh weights are published back to all self-play threads.
-#
-# Replay:
-#   replay_games keeps the most recent N complete games in memory.
-#   Each training update always includes all fresh samples collected since the previous update.
-#   replay_samples adds this many extra old samples from replay; replay_samples=0 means fresh-only.
-#   The current fresh games are excluded from replay sampling for that same update.
-#   Ctrl+C writes "<this_conf_filename>.replay.lz4" (LZ4); next az-loop loads it into the pool then
-#   deletes the file. A full run without interrupt removes any leftover snapshot at exit.
-#   Replay snapshot format is versioned; older .replay.lz4 files from previous formats are rejected.
-#
-# Optimizer:
-#   AdamW is used with mini-batch gradient accumulation.
-#   epochs means how many passes to make over each fresh training window; 2-3 is a good range.
-#   batch_size is per GPU per training step. Effective global batch size is
-#   batch_size multiplied by the number of visible CUDA devices.
-#   Example: with 4 GPUs, batch_size=256 processes 1024 samples per step.
-#   max_sample_train_count removes samples after they have been used this many times.
-#   workers is the number of independent self-play threads.
-#   lr=0.0003 is a safer default than the old SGD-style 0.001 for self-play targets.
-#
-# Augmentation:
-#   mirror_probability mirrors board files a<->i for this fraction of training samples.
-#   Xiangqi rules are left/right symmetric, so value stays unchanged and policy moves are mirrored.
-#   opening_policy_smoothing applies only to the first N plies of each self-play game:
-#       target = (1-eps) * MCTS_policy + eps * uniform_legal
-#   This keeps early opening priors from collapsing to one fixed book move while leaving
-#   tactical middlegame/endgame policy targets sharp.
-#
-# Checkpoints & Arena:
-#   Training appends "<this_conf_filename>.progress" with next_update=... after each weight update.
-#   Delete that file to reset the update counter to 1 (TensorBoard/checkpoint numbering).
-#   checkpoint_interval saves a timestamp-free numbered copy every N updates.
-#   max_checkpoints keeps only the newest N checkpoint files in checkpoint_dir.
-#   arena_interval runs current-vs-best evaluation every N updates.
-#   arena_games_per_side=50 means 50 games as Red and 50 as Black.
-#   search_algorithm="alphazero" keeps the original PUCT search; "gumbel_alphazero" uses
-#   mctx-style root Gumbel top-k, Sequential Halving, deterministic interior selection, and
-#   softmax(policy_logits + completed_qvalues) policy targets.
-#   cpuct/root_dirichlet_* are used only by AlphaZero self-play search.
-#   gumbel_* follows mctx defaults except max_num_considered_actions=32 here:
-#   gumbel_scale=1.0,
-#   value_scale=0.1, maxvisit_init=50.0, rescale_values=true, use_mixed_value=true.
-#   For perfect-information eval you can set gumbel_scale=0.0.
-#   arena_cpuct applies during arena search.
-#   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
-#   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
-#
-# Model architecture (v39, .nnue 自描述):
-#   hidden_size 写入 .nnue 二进制头，每个文件自带形状描述。
-#   修改它会改变模型形状，老 .nnue 文件不再兼容、必须 re-init 新模型。
-#   - hidden_size：纯 NNUE accumulator hidden 向量宽度（默认 256）
-#   固定头部形状：policy_condition_size=32, policy_context_size=64, value_logits=3。
-
-model_path = "{model_path}"
+            r#"model_path = "{model_path}"
 simulations = {simulations}
 selfplay_batch_games = {selfplay_batch_games}
 epochs = {epochs}
@@ -418,7 +338,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
         config.normalize()
     }
 
-    /// 把 toml 中的模型容量配置打包成 `AzNnueArch`，方便创建/校验模型。
     pub fn arch(&self) -> AzNnueArch {
         AzNnueArch {
             hidden_size: self.hidden_size,

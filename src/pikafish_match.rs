@@ -27,6 +27,15 @@ pub struct VsPikafishResult {
     pub chinese_win_by_pikafish_no_bestmove: usize,
     pub chinese_win_by_pikafish_invalid_move: usize,
     pub chinese_win_by_pikafish_illegal_move: usize,
+    pub abnormal_ends: Vec<VsPikafishAbnormalEnd>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VsPikafishAbnormalEnd {
+    pub game_index: usize,
+    pub chinese_plays_red: bool,
+    pub end: String,
+    pub position_command: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,7 +265,7 @@ fn play_one_game(
     external: &mut ExternalUci,
     initial_position: &Position,
     config: GameConfig,
-) -> std::io::Result<GameEnd> {
+) -> std::io::Result<(GameEnd, String)> {
     let _ = external.write_line("ucinewgame");
     let mut position = initial_position.clone();
     let initial_fen =
@@ -271,7 +280,7 @@ fn play_one_game(
         if let Some(end) =
             terminal_before_side_selects(&position, &rule_history, ply_count, config.max_plies)
         {
-            return Ok(end);
+            return Ok((end, position_command(initial_fen.as_deref(), &moves_uci)));
         }
 
         let side = position.side_to_move();
@@ -298,10 +307,13 @@ fn play_one_game(
             );
             seed = seed.wrapping_add(1);
             let Some(mv) = search.best_move else {
-                return Ok(match side {
-                    Color::Red => GameEnd::BlackWin(GameEndReason::SearchNoMove),
-                    Color::Black => GameEnd::RedWin(GameEndReason::SearchNoMove),
-                });
+                return Ok((
+                    match side {
+                        Color::Red => GameEnd::BlackWin(GameEndReason::SearchNoMove),
+                        Color::Black => GameEnd::RedWin(GameEndReason::SearchNoMove),
+                    },
+                    position_command(initial_fen.as_deref(), &moves_uci),
+                ));
             };
             let uci = mv.to_string();
             apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
@@ -310,22 +322,31 @@ fn play_one_game(
             let token =
                 external.query_move(initial_fen.as_deref(), &moves_uci, config.pikafish_depth)?;
             if token.is_empty() || token == "(none)" || token == "0000" {
-                return Ok(match side {
-                    Color::Red => GameEnd::BlackWin(GameEndReason::PikafishNoBestMove),
-                    Color::Black => GameEnd::RedWin(GameEndReason::PikafishNoBestMove),
-                });
+                return Ok((
+                    match side {
+                        Color::Red => GameEnd::BlackWin(GameEndReason::PikafishNoBestMove),
+                        Color::Black => GameEnd::RedWin(GameEndReason::PikafishNoBestMove),
+                    },
+                    position_command(initial_fen.as_deref(), &moves_uci),
+                ));
             }
             let Some(mv) = position.parse_uci_move(&token) else {
-                return Ok(match side {
-                    Color::Red => GameEnd::BlackWin(GameEndReason::PikafishInvalidMove),
-                    Color::Black => GameEnd::RedWin(GameEndReason::PikafishInvalidMove),
-                });
+                return Ok((
+                    match side {
+                        Color::Red => GameEnd::BlackWin(GameEndReason::PikafishInvalidMove),
+                        Color::Black => GameEnd::RedWin(GameEndReason::PikafishInvalidMove),
+                    },
+                    position_command(initial_fen.as_deref(), &moves_uci),
+                ));
             };
             if !legal.contains(&mv) {
-                return Ok(match side {
-                    Color::Red => GameEnd::BlackWin(GameEndReason::PikafishIllegalMove),
-                    Color::Black => GameEnd::RedWin(GameEndReason::PikafishIllegalMove),
-                });
+                return Ok((
+                    match side {
+                        Color::Red => GameEnd::BlackWin(GameEndReason::PikafishIllegalMove),
+                        Color::Black => GameEnd::RedWin(GameEndReason::PikafishIllegalMove),
+                    },
+                    position_command(initial_fen.as_deref(), &moves_uci),
+                ));
             }
             apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
             moves_uci.push(token);
@@ -368,7 +389,7 @@ pub fn run_vs_pikafish(
             let m = Arc::clone(&model);
             let positions = Arc::clone(&start_positions);
             handles.push(thread::spawn(
-                move || -> std::io::Result<(bool, GameEnd)> {
+                move || -> std::io::Result<(usize, bool, GameEnd, String)> {
                     let mut ext = ExternalUci::spawn(&exe)?;
                     ext.handshake()?;
                     let chinese_red = game_index % 2 == 0;
@@ -376,7 +397,7 @@ pub fn run_vs_pikafish(
                         .get(game_index % positions.len().max(1))
                         .cloned()
                         .unwrap_or_else(Position::startpos);
-                    let end = play_one_game(
+                    let (end, position_command) = play_one_game(
                         m.as_ref(),
                         &mut ext,
                         &start_position,
@@ -392,7 +413,7 @@ pub fn run_vs_pikafish(
                             gumbel: config.gumbel,
                         },
                     )?;
-                    Ok((chinese_red, end))
+                    Ok((game_index, chinese_red, end, position_command))
                 },
             ));
         }
@@ -400,7 +421,15 @@ pub fn run_vs_pikafish(
             let join = handle
                 .join()
                 .map_err(|_| std::io::Error::other("vs-pikafish: worker thread panicked"))?;
-            let (chinese_red, end) = join?;
+            let (game_index, chinese_red, end, position_command) = join?;
+            if end.reason() != GameEndReason::GeneralCaptured {
+                out.abnormal_ends.push(VsPikafishAbnormalEnd {
+                    game_index,
+                    chinese_plays_red: chinese_red,
+                    end: format!("{end:?}"),
+                    position_command,
+                });
+            }
             match (end, chinese_red) {
                 (GameEnd::Draw(_), _) => out.draws += 1,
                 (GameEnd::RedWin(reason), true) | (GameEnd::BlackWin(reason), false) => {
@@ -422,6 +451,14 @@ pub fn run_vs_pikafish(
     Ok(out)
 }
 
+impl GameEnd {
+    fn reason(self) -> GameEndReason {
+        match self {
+            Self::RedWin(reason) | Self::BlackWin(reason) | Self::Draw(reason) => reason,
+        }
+    }
+}
+
 impl VsPikafishResult {
     fn record_chinese_win_reason(&mut self, reason: GameEndReason) {
         match reason {
@@ -434,4 +471,17 @@ impl VsPikafishResult {
             GameEndReason::MaxPlies | GameEndReason::SearchNoMove => {}
         }
     }
+}
+
+fn position_command(initial_fen: Option<&str>, moves_uci: &[String]) -> String {
+    let mut command = if let Some(fen) = initial_fen {
+        format!("position fen {fen}")
+    } else {
+        "position startpos".to_string()
+    };
+    if !moves_uci.is_empty() {
+        command.push_str(" moves ");
+        command.push_str(&moves_uci.join(" "));
+    }
+    command
 }

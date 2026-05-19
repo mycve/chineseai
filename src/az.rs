@@ -7,10 +7,13 @@ mod mctx;
 mod play;
 mod replay;
 mod train;
-#[cfg(any(feature = "gpu-train", all(target_os = "linux", not(target_env = "musl"))))]
+mod train_gpu;
+#[cfg(any(
+    feature = "gpu-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
 #[path = "az/train_gpu_candle.rs"]
 mod train_gpu_candle;
-mod train_gpu;
 
 use crate::nnue::{
     HISTORY_PLIES, HistoryMove, PURE_NNUE_INPUT_SIZE, canonical_move, canonical_square,
@@ -31,12 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-// v39：value head 直接由 accumulator 输出 3 logits，删除 value MLP。
-// v38：纯稀疏 NNUE。输入只保留棋子/王位桶/历史/行列特征；
-//   模型文件只保存 sparse accumulator、direct value logits、move-feature policy MLP。
 const AZNNUE_BINARY_VERSION: u32 = 42;
-// 头部布局（小端 u32 依次）：
-//   magic(4 字节) | version | input_size | hidden_size
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -73,28 +71,22 @@ pub(super) const POLICY_CONDITION_SIZE: usize = 32;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 
-/// 纯 NNUE 模型容量配置：全部由配置/二进制头驱动。
-/// 改这些值会改变模型形状，不能与已有 nnue 文件兼容，需要重新初始化。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AzNnueArch {
-    /// 共享 hidden 向量宽度。
     pub hidden_size: usize,
 }
 
 impl AzNnueArch {
-    /// 默认纯 NNUE 容量。
     pub const fn default_const() -> Self {
         Self { hidden_size: 256 }
     }
 
-    /// 仅指定 hidden_size，其他旋钮取默认。便于命令行/测试场景。
     pub const fn with_hidden_size(hidden_size: usize) -> Self {
         let mut arch = Self::default_const();
         arch.hidden_size = hidden_size;
         arch
     }
 
-    /// 形状合法性自检：任一字段为 0 都视为非法配置。
     pub fn validate(&self) -> Result<(), String> {
         if self.hidden_size == 0 {
             return Err(format!("invalid hidden_size {}", self.hidden_size));
@@ -120,7 +112,6 @@ pub(super) struct AzEvalScratch {
 }
 
 impl AzEvalScratch {
-    /// 按当前 arch 一次性预分配前向缓冲。所有依赖模型容量的尺寸都在此固化。
     pub(super) fn new(arch: AzNnueArch) -> Self {
         let hidden_size = arch.hidden_size;
         Self {
@@ -139,9 +130,6 @@ impl AzEvalScratch {
 #[derive(Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
-    /// 可配置容量旋钮（与 hidden_size 一起决定模型形状）。
-    /// `hidden_size` 字段保留用于历史调用方（uci/main 等）的兼容访问，
-    /// 与 `arch.hidden_size` 始终保持同步。
     pub arch: AzNnueArch,
     pub input_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
@@ -157,11 +145,6 @@ pub struct AzNnue {
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
-
-// Architecture notes:
-// - v40 stays pure NNUE: sparse canonical features -> ReLU accumulator ->
-//   RMSNorm -> direct value logits. Policy keeps the small move-feature head
-//   and adds from/to square scores from the same hidden state.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -219,11 +202,8 @@ pub struct AzLoopReport {
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
     pub policy_ce: f32,
-    /// 根 visit 策略分布熵（全局半步均值），TensorBoard：`stats/root_visit_entropy`。
     pub root_visit_entropy: f32,
-    /// 开局阶段熵均值，`stats/entropy_opening`。
     pub entropy_opening: f32,
-    /// 中后盘熵均值，`stats/entropy_mid`。
     pub entropy_mid: f32,
     pub selfplay_seconds: f32,
     pub train_seconds: f32,
@@ -314,7 +294,6 @@ impl AzTrainStats {
 }
 
 impl AzNnue {
-    /// 用指定容量随机初始化模型。所有形状均由 `arch` 驱动。
     pub fn random_with_arch(arch: AzNnueArch, seed: u64) -> Self {
         if let Err(err) = arch.validate() {
             panic!("AzNnue::random_with_arch: invalid arch ({err})");
@@ -362,7 +341,6 @@ impl AzNnue {
         }
     }
 
-    /// 仅指定 hidden_size 的便捷构造（其余旋钮取默认）。
     pub fn random(hidden_size: usize, seed: u64) -> Self {
         Self::random_with_arch(AzNnueArch::with_hidden_size(hidden_size), seed)
     }
@@ -712,7 +690,6 @@ fn canonical_piece_plane(side: Color, piece_color: Color, kind: PieceKind) -> us
     absolute_piece_plane(canonical_color, kind)
 }
 
-/// `batch_size` is the per-device training batch size.
 pub fn benchmark_training(
     model: &mut AzNnue,
     sample_count: usize,

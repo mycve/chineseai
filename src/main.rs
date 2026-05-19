@@ -21,7 +21,6 @@ use clap::{Args, Parser, Subcommand};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -65,8 +64,6 @@ enum CliCommand {
     AzTrainBench(AzTrainBenchArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
-    /// Internal arena worker process.
-    AzArenaWorker(AzArenaWorkerArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
 }
@@ -200,28 +197,6 @@ struct AzLoopArgs {
     /// Training config path.
     #[arg(default_value = DEFAULT_AZ_LOOP_CONFIG)]
     config: String,
-}
-
-#[derive(Args, Debug)]
-struct AzArenaWorkerArgs {
-    /// Candidate model path.
-    candidate: String,
-    /// Baseline model path.
-    baseline: String,
-    /// Games with candidate as Red.
-    red_games: usize,
-    /// Games with candidate as Black.
-    black_games: usize,
-    /// Simulations per move.
-    simulations: usize,
-    /// Draw after this many plies.
-    max_plies: usize,
-    /// PUCT constant for arena search.
-    arena_cpuct: f32,
-    /// Start-position file.
-    eval_fens_path: String,
-    /// Random seed.
-    seed: u64,
 }
 
 #[derive(Args, Debug)]
@@ -359,7 +334,6 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-/// `.progress` 文件状态：`next_update` 用于断点续训，`best_elo` 为竞技场 baseline 锚定分（ZeroForge 风格）。
 #[derive(Clone, Debug)]
 struct AzLoopProgressState {
     next_update: usize,
@@ -670,91 +644,62 @@ fn build_async_training_report(
     }
 }
 
-struct ArenaProcessConfig<'a> {
-    candidate_path: &'a str,
-    baseline_path: &'a str,
+struct ArenaThreadConfig {
+    candidate: Arc<AzNnue>,
+    baseline: Arc<AzNnue>,
+    eval_positions: Arc<Vec<Position>>,
     games_per_side: usize,
     simulations: usize,
     max_plies: usize,
     cpuct: f32,
-    eval_fens_path: &'a str,
-    process_count: usize,
+    thread_count: usize,
     seed: u64,
 }
 
-fn run_arena_processes(config: ArenaProcessConfig<'_>) -> AzArenaReport {
-    let process_count = config
-        .process_count
-        .max(1)
-        .min(config.games_per_side.max(1));
-    let exe = std::env::current_exe().unwrap_or_else(|err| {
-        panic!("failed to locate current executable: {err}");
-    });
-    let mut merged = AzArenaReport::default();
-    let mut children: Vec<(usize, Child)> = Vec::new();
-    for index in 0..process_count {
-        let red_games = config.games_per_side / process_count
-            + usize::from(index < config.games_per_side % process_count);
-        let black_games = config.games_per_side / process_count
-            + usize::from(index < config.games_per_side % process_count);
+fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
+    let thread_count = config.thread_count.max(1).min(config.games_per_side.max(1));
+    let mut handles = Vec::with_capacity(thread_count);
+    for index in 0..thread_count {
+        let red_games = config.games_per_side / thread_count
+            + usize::from(index < config.games_per_side % thread_count);
+        let black_games = config.games_per_side / thread_count
+            + usize::from(index < config.games_per_side % thread_count);
         if red_games == 0 && black_games == 0 {
             continue;
         }
-        let child = Command::new(&exe)
-            .arg("az-arena-worker")
-            .arg(config.candidate_path)
-            .arg(config.baseline_path)
-            .arg(red_games.to_string())
-            .arg(black_games.to_string())
-            .arg(config.simulations.to_string())
-            .arg(config.max_plies.to_string())
-            .arg(config.cpuct.to_string())
-            .arg(config.eval_fens_path)
-            .arg((config.seed ^ index as u64).to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|err| {
-                panic!("failed to spawn arena worker process: {err}");
-            });
-        children.push((index, child));
+        let candidate = Arc::clone(&config.candidate);
+        let baseline = Arc::clone(&config.baseline);
+        let eval_positions = Arc::clone(&config.eval_positions);
+        let simulations = config.simulations;
+        let max_plies = config.max_plies;
+        let cpuct = config.cpuct;
+        let seed = config.seed ^ index as u64;
+        handles.push(thread::spawn(move || {
+            play_arena_games_from_positions(
+                candidate.as_ref(),
+                baseline.as_ref(),
+                eval_positions.as_slice(),
+                AzArenaConfig {
+                    simulations,
+                    max_plies,
+                    games_as_red: red_games,
+                    games_as_black: black_games,
+                    seed,
+                    cpuct,
+                },
+            )
+        }));
     }
 
-    for (index, child) in children {
-        let output = child.wait_with_output().unwrap_or_else(|err| {
-            panic!("failed to wait for arena worker {index}: {err}");
-        });
-        if !output.status.success() {
-            panic!(
-                "arena worker {index} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        merged.add_assign(&parse_arena_report(&text));
+    let mut merged = AzArenaReport::default();
+    for handle in handles {
+        merged.add_assign(
+            &handle
+                .join()
+                .unwrap_or_else(|_| panic!("arena thread panicked")),
+        );
     }
     merged
-}
-
-fn parse_arena_report(text: &str) -> AzArenaReport {
-    let mut report = AzArenaReport::default();
-    for token in text.split_whitespace() {
-        let Some((key, value)) = token.split_once('=') else {
-            continue;
-        };
-        let parsed = value.parse::<usize>().unwrap_or(0);
-        match key {
-            "wins" => report.wins = parsed,
-            "losses" => report.losses = parsed,
-            "draws" => report.draws = parsed,
-            "wins_as_red" => report.wins_as_red = parsed,
-            "losses_as_red" => report.losses_as_red = parsed,
-            "wins_as_black" => report.wins_as_black = parsed,
-            "losses_as_black" => report.losses_as_black = parsed,
-            _ => {}
-        }
-    }
-    report
 }
 
 fn load_arena_eval_positions(path: &str) -> Vec<Position> {
@@ -1205,8 +1150,6 @@ fn main() {
             }
             let best_path = best_model_path(&config.model_path);
 
-            // 模型形状全部由 config.arch() 决定（hidden_size）。
-            // 已有 .nnue 加载后，自身二进制头里的 arch 才是真实形状（可能与本次 config 不同）。
             let config_arch = config.arch();
             let model = if Path::new(&config.model_path).exists() {
                 println!("model    : load {}", config.model_path);
@@ -1339,8 +1282,6 @@ fn main() {
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    // worker 临时模型仅用作 RwLock 中权重写入前的占位，
-                    //   首轮拷贝主模型时会被整体覆盖，所以 arch 直接随 config 取就可以。
                     let mut local_model = AzNnue::random_with_arch(
                         selfplay_config.arch(),
                         selfplay_config.seed ^ worker_id as u64,
@@ -1851,18 +1792,24 @@ fn main() {
                     println!("pause    : selfplay paused for arena");
                     let arena_eval_positions = load_arena_eval_positions(DEFAULT_ARENA_EVAL_FENS);
                     let arena_eval_fens = arena_eval_positions.len();
-                    drop(arena_eval_positions);
-                    let arena = run_arena_processes(ArenaProcessConfig {
-                        candidate_path: &config.model_path,
-                        baseline_path: best_path
-                            .to_str()
-                            .unwrap_or_else(|| panic!("best model path is not valid UTF-8")),
+                    let candidate = {
+                        let shared = shared_model
+                            .read()
+                            .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                        Arc::new(shared.model.clone())
+                    };
+                    let baseline = Arc::new(AzNnue::load(&best_path).unwrap_or_else(|err| {
+                        panic!("failed to load `{}`: {err}", best_path.display());
+                    }));
+                    let arena = run_arena_threads(ArenaThreadConfig {
+                        candidate,
+                        baseline,
+                        eval_positions: Arc::new(arena_eval_positions),
                         games_per_side: config.arena_games_per_side,
                         simulations: config.simulations,
                         max_plies: config.max_plies,
                         cpuct: config.arena_cpuct,
-                        eval_fens_path: DEFAULT_ARENA_EVAL_FENS,
-                        process_count: config.arena_processes,
+                        thread_count: config.arena_processes,
                         seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     });
                     let ref_elo = arena_best_elo;
@@ -1981,47 +1928,6 @@ fn main() {
                 let _ = fs::remove_file(&replay_snapshot_path);
             }
         }
-        Some(CliCommand::AzArenaWorker(cmd)) => {
-            let candidate_path = cmd.candidate;
-            let baseline_path = cmd.baseline;
-            let red_games = cmd.red_games;
-            let black_games = cmd.black_games;
-            let simulations = cmd.simulations.max(1);
-            let max_plies = cmd.max_plies.max(1);
-            let arena_cpuct = cmd.arena_cpuct.max(0.0);
-            let eval_fens_path = cmd.eval_fens_path;
-            let seed = cmd.seed;
-            let candidate = AzNnue::load(&candidate_path).unwrap_or_else(|err| {
-                panic!("failed to load `{candidate_path}`: {err}");
-            });
-            let baseline = AzNnue::load(&baseline_path).unwrap_or_else(|err| {
-                panic!("failed to load `{baseline_path}`: {err}");
-            });
-            let eval_positions = load_arena_eval_positions(&eval_fens_path);
-            let report = play_arena_games_from_positions(
-                &candidate,
-                &baseline,
-                &eval_positions,
-                AzArenaConfig {
-                    simulations,
-                    max_plies,
-                    games_as_red: red_games,
-                    games_as_black: black_games,
-                    seed,
-                    cpuct: arena_cpuct,
-                },
-            );
-            println!(
-                "wins={} losses={} draws={} wins_as_red={} losses_as_red={} wins_as_black={} losses_as_black={}",
-                report.wins,
-                report.losses,
-                report.draws,
-                report.wins_as_red,
-                report.losses_as_red,
-                report.wins_as_black,
-                report.losses_as_black
-            );
-        }
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
             let model_path = cmd.model;
@@ -2060,6 +1966,19 @@ fn main() {
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
+            for item in &summary.abnormal_ends {
+                println!(
+                    "vs-pikafish-final: game={} chinese={} end={} {}",
+                    item.game_index,
+                    if item.chinese_plays_red {
+                        "red"
+                    } else {
+                        "black"
+                    },
+                    item.end,
+                    item.position_command
+                );
+            }
             println!(
                 "vs-pikafish: model={} search={} topk={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}",
                 model_path,

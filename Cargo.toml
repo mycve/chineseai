@@ -16,8 +16,6 @@ default = []
 gpu-train = ["dep:candle-core", "dep:candle-nn"]
 profile = []
 
-# Linux glibc is the training target: compile CUDA/Candle by default there.
-# Windows stays light by default; use `--features gpu-train` to opt in.
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 candle-core = { version = "0.10.2", features = ["cuda"] }
 candle-nn = "0.10.2"

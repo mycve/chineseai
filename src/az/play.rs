@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use std::thread;
 
 use crate::nnue::{
@@ -79,12 +79,10 @@ impl AzArenaReport {
         self.score() / self.total_games().max(1) as f32
     }
 
-    /// ZeroForge 风格：相对参考分 `ref_elo` 的锚定 ELO（得分率无 Laplace 平滑）。
     pub fn anchored_elo(&self, ref_elo: f32) -> f32 {
         ref_elo + self.elo_diff_vs_even()
     }
 
-    /// `400 * log10(score/(1-score))`，与 ZeroForge `train.py` 评估一致；胜负边界为 ±400。
     pub fn elo_diff_vs_even(&self) -> f32 {
         let total = self.total_games();
         if total == 0 {
@@ -109,13 +107,10 @@ pub struct AzSelfplayData {
     pub black_wins: usize,
     pub draws: usize,
     pub plies_total: usize,
-    /// 所有半步的根策略分布熵之和（Shannon，与 ZeroForge `root_visit_entropy` 同公式）。
     pub entropy_all_sum: f32,
     pub entropy_all_count: usize,
-    /// `ply < temperature_decay_plies` 的熵之和（与温度线性退火区间一致，用于开局监控）。
     pub entropy_opening_sum: f32,
     pub entropy_opening_count: usize,
-    /// `ply >= temperature_decay_plies` 的熵之和（温度已达下限之后的中后盘）。
     pub entropy_mid_sum: f32,
     pub entropy_mid_count: usize,
     pub terminal: AzTerminalStats,
@@ -239,7 +234,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let entropy = policy_entropy(&search.candidates);
             entropy_all_sum += entropy;
             entropy_all_count += 1;
-            // 分段与温度日程一致：`temperature_decay_plies` 之前为开局，之后为中后盘。
             if ply < config.temperature_decay_plies {
                 entropy_opening_sum += entropy;
                 entropy_opening_count += 1;
@@ -496,7 +490,6 @@ fn choose_selfplay_move(
 }
 
 fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
-    // 与 ZeroForge `train.py` 中 `p * log(p + 1e-10)` 数值形式对齐。
     const EPS: f32 = 1e-10;
     let total = candidates
         .iter()

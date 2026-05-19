@@ -104,9 +104,10 @@ impl Position {
             .filter(|&mv| {
                 let mut next = self.clone();
                 next.make_move(mv);
-                if !base_history.iter().any(|entry| {
-                    entry.hash == next.hash && entry.side_to_move == next.side_to_move
-                }) {
+                if !base_history
+                    .iter()
+                    .any(|entry| entry.hash == next.hash && entry.side_to_move == next.side_to_move)
+                {
                     return true;
                 }
                 let mut next_history = base_history.clone();
