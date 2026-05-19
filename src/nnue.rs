@@ -1,5 +1,5 @@
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, piece_base_value,
 };
 
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
@@ -13,8 +13,11 @@ const ROW_INPUT_SIZE: usize = 14 * BOARD_RANKS;
 const COL_INPUT_SIZE: usize = 14 * BOARD_FILES;
 const TACTICAL_STATES: usize = 6;
 const TACTICAL_INPUT_SIZE: usize = TACTICAL_STATES * 14 * BOARD_SIZE;
+const STRATEGIC_STATES: usize = 9;
+const STRATEGIC_BUCKETS: usize = 16;
+const STRATEGIC_INPUT_SIZE: usize = STRATEGIC_STATES * STRATEGIC_BUCKETS;
 pub const PURE_NNUE_INPUT_SIZE: usize =
-    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + TACTICAL_INPUT_SIZE;
+    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + TACTICAL_INPUT_SIZE + STRATEGIC_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -144,7 +147,8 @@ pub fn extract_sparse_features_pure_canonical(
         features.push(col_feature_index(piece_index, file_of(canonical_sq)));
     }
 
-    add_tactical_features(position, side, &mut features);
+    let tactical_counts = add_tactical_features(position, side, &mut features);
+    add_strategic_features(position, side, tactical_counts, &mut features);
 
     features.sort_unstable();
     features
@@ -236,6 +240,10 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
             let state = partial / 14;
             return tactical_feature_index(state, piece_index, mirror_file_square(sq));
         }
+        let offset = offset - TACTICAL_INPUT_SIZE;
+        if offset < STRATEGIC_INPUT_SIZE {
+            return feature;
+        }
     }
     feature
 }
@@ -266,7 +274,31 @@ fn tactical_feature_index(state: usize, piece_index: usize, sq: usize) -> usize 
     V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + (state * 14 + piece_index) * BOARD_SIZE + sq
 }
 
-fn add_tactical_features(position: &Position, side: Color, features: &mut Vec<usize>) {
+fn strategic_feature_index(state: usize, bucket: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + TACTICAL_INPUT_SIZE
+        + state * STRATEGIC_BUCKETS
+        + bucket.min(STRATEGIC_BUCKETS - 1)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TacticalCounts {
+    own_attacked: usize,
+    enemy_attacked: usize,
+    own_protected: usize,
+    enemy_protected: usize,
+    own_hanging: usize,
+    enemy_hanging: usize,
+}
+
+fn add_tactical_features(
+    position: &Position,
+    side: Color,
+    features: &mut Vec<usize>,
+) -> TacticalCounts {
+    let mut counts = TacticalCounts::default();
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
             continue;
@@ -312,7 +344,74 @@ fn add_tactical_features(position: &Position, side: Color, features: &mut Vec<us
                 canonical_sq,
             ));
         }
+        if own_piece {
+            counts.own_attacked += attacked as usize;
+            counts.own_protected += protected as usize;
+            counts.own_hanging += hanging as usize;
+        } else {
+            counts.enemy_attacked += attacked as usize;
+            counts.enemy_protected += protected as usize;
+            counts.enemy_hanging += hanging as usize;
+        }
     }
+    counts
+}
+
+fn add_strategic_features(
+    position: &Position,
+    side: Color,
+    tactical: TacticalCounts,
+    features: &mut Vec<usize>,
+) {
+    let mut own_material = 0;
+    let mut enemy_material = 0;
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let value = piece_base_value(piece.kind);
+        if piece.color == side {
+            own_material += value;
+        } else {
+            enemy_material += value;
+        }
+    }
+    let total_material = own_material + enemy_material;
+    let material_balance = own_material - enemy_material;
+
+    features.push(strategic_feature_index(
+        0,
+        bucket_div(position.halfmove_clock() as usize, 8),
+    ));
+    features.push(strategic_feature_index(
+        1,
+        bucket_scaled(total_material.max(0) as usize, 6220),
+    ));
+    features.push(strategic_feature_index(
+        2,
+        bucket_signed(material_balance, 1200),
+    ));
+    features.push(strategic_feature_index(3, tactical.own_attacked));
+    features.push(strategic_feature_index(4, tactical.enemy_attacked));
+    features.push(strategic_feature_index(5, tactical.own_hanging));
+    features.push(strategic_feature_index(6, tactical.enemy_hanging));
+    features.push(strategic_feature_index(7, tactical.own_protected));
+    features.push(strategic_feature_index(8, tactical.enemy_protected));
+}
+
+fn bucket_div(value: usize, div: usize) -> usize {
+    (value / div.max(1)).min(STRATEGIC_BUCKETS - 1)
+}
+
+fn bucket_scaled(value: usize, max_value: usize) -> usize {
+    ((value.min(max_value) * (STRATEGIC_BUCKETS - 1)) / max_value.max(1)).min(STRATEGIC_BUCKETS - 1)
+}
+
+fn bucket_signed(value: i32, max_abs: i32) -> usize {
+    let clamped = value.clamp(-max_abs, max_abs);
+    let shifted = (clamped + max_abs) as usize;
+    let scale = (max_abs as usize).saturating_mul(2).max(1);
+    ((shifted * (STRATEGIC_BUCKETS - 1)) / scale).min(STRATEGIC_BUCKETS - 1)
 }
 
 fn palace_bucket(sq: usize) -> usize {

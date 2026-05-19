@@ -35,7 +35,7 @@ pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
 // v39：value head 直接由 accumulator 输出 3 logits，删除 value MLP。
 // v38：纯稀疏 NNUE。输入只保留棋子/王位桶/历史/行列特征；
 //   模型文件只保存 sparse accumulator、direct value logits、move-feature policy MLP。
-const AZNNUE_BINARY_VERSION: u32 = 41;
+const AZNNUE_BINARY_VERSION: u32 = 42;
 // 头部布局（小端 u32 依次）：
 //   magic(4 字节) | version | input_size | hidden_size
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
