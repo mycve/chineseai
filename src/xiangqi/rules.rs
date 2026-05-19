@@ -15,20 +15,36 @@ impl Position {
     }
 
     pub fn rule_history_entry(&self, mover: Option<Color>) -> RuleHistoryEntry {
+        let (chased_mask, chased_piece_mask) =
+            mover.map_or((0, 0), |color| self.chased_masks_by(color));
         RuleHistoryEntry {
             hash: self.hash,
             side_to_move: self.side_to_move,
             mover,
             gives_check: self.in_check(self.side_to_move),
-            chased_mask: mover.map_or(0, |color| self.chased_mask_by(color)),
+            chased_mask,
+            chased_piece_mask,
         }
     }
 
     pub fn rule_history_entry_after_move(&self, mv: Move) -> RuleHistoryEntry {
         let mut next = self.clone();
         let mover = self.side_to_move;
+        let moved_piece_was_chased = self.square_is_chased_by(mv.from as usize, mover.opposite());
         next.make_move(mv);
-        next.rule_history_entry(Some(mover))
+        let (chased_mask, chased_piece_mask) = if moved_piece_was_chased {
+            (0, 0)
+        } else {
+            next.chased_masks_by_origin(mover, mv.to as usize)
+        };
+        RuleHistoryEntry {
+            hash: next.hash,
+            side_to_move: next.side_to_move,
+            mover: Some(mover),
+            gives_check: next.in_check(next.side_to_move),
+            chased_mask,
+            chased_piece_mask,
+        }
     }
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
@@ -53,7 +69,7 @@ impl Position {
             return None;
         }
 
-        if repeated_indices.len() < 5 {
+        if repeated_indices.len() < 3 {
             return None;
         }
 
@@ -111,7 +127,7 @@ impl Position {
                     return true;
                 }
                 let mut next_history = base_history.clone();
-                next_history.push(next.rule_history_entry(Some(mover)));
+                next_history.push(self.rule_history_entry_after_move(mv));
                 !matches!(
                     next.rule_outcome_with_history(&next_history),
                     Some(RuleOutcome::Win(winner)) if winner == mover.opposite()
@@ -120,12 +136,13 @@ impl Position {
             .collect()
     }
 
-    fn chased_mask_by(&self, color: Color) -> u128 {
+    fn chased_masks_by(&self, color: Color) -> (u128, u16) {
         crate::scope_profile!("xiangqi.chased_mask_by");
         let mut work = self.clone();
         work.side_to_move = color;
 
-        let mut mask = 0u128;
+        let mut square_mask = 0u128;
+        let mut piece_mask = 0u16;
         for target in 0..super::BOARD_SIZE {
             let Some(target_piece) = self.board[target] else {
                 continue;
@@ -145,13 +162,78 @@ impl Position {
                 let legal = !work.in_check(color);
                 work.unmake_move(mv, undo);
                 if legal {
-                    mask |= 1u128 << target;
+                    square_mask |= 1u128 << target;
+                    piece_mask |= 1u16 << chased_piece_index(target_piece);
                     return true;
                 }
                 false
             });
         }
-        mask
+        (square_mask, piece_mask)
+    }
+
+    fn square_is_chased_by(&self, target: usize, color: Color) -> bool {
+        let Some(target_piece) = self.board[target] else {
+            return false;
+        };
+        if target_piece.color == color || target_piece.kind == PieceKind::General {
+            return false;
+        }
+        if target_piece.kind == PieceKind::Soldier
+            && !soldier_crossed_river(target_piece.color, super::geom::rank_of(target))
+        {
+            return false;
+        }
+
+        let mut work = self.clone();
+        work.side_to_move = color;
+        let mut chased = false;
+        self.visit_attacker_origins_to(target, color, |from| {
+            let mv = Move::new(from, target);
+            let undo = work.make_move(mv);
+            chased = !work.in_check(color);
+            work.unmake_move(mv, undo);
+            chased
+        });
+        chased
+    }
+
+    fn chased_masks_by_origin(&self, color: Color, origin: usize) -> (u128, u16) {
+        crate::scope_profile!("xiangqi.chased_mask_by");
+        let mut work = self.clone();
+        work.side_to_move = color;
+
+        let mut square_mask = 0u128;
+        let mut piece_mask = 0u16;
+        for target in 0..super::BOARD_SIZE {
+            let Some(target_piece) = self.board[target] else {
+                continue;
+            };
+            if target_piece.color == color || target_piece.kind == PieceKind::General {
+                continue;
+            }
+            if target_piece.kind == PieceKind::Soldier
+                && !soldier_crossed_river(target_piece.color, super::geom::rank_of(target))
+            {
+                continue;
+            }
+
+            self.visit_attacker_origins_to(target, color, |from| {
+                if from != origin {
+                    return false;
+                }
+                let mv = Move::new(from, target);
+                let undo = work.make_move(mv);
+                let legal = !work.in_check(color);
+                work.unmake_move(mv, undo);
+                if legal {
+                    square_mask |= 1u128 << target;
+                    piece_mask |= 1u16 << chased_piece_index(target_piece);
+                }
+                true
+            });
+        }
+        (square_mask, piece_mask)
     }
 }
 
@@ -173,5 +255,27 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
         .map(|entry| entry.chased_mask)
         .reduce(|a, b| a & b)
         .unwrap_or(0);
-    (chased_intersection != 0).then_some(RuleViolation::LongChase)
+    let chased_piece_intersection = mover_entries
+        .iter()
+        .map(|entry| entry.chased_piece_mask)
+        .reduce(|a, b| a & b)
+        .unwrap_or(0);
+    (chased_intersection != 0 || chased_piece_intersection != 0).then_some(RuleViolation::LongChase)
+}
+
+fn chased_piece_index(piece: super::Piece) -> usize {
+    let color_offset = match piece.color {
+        Color::Red => 0,
+        Color::Black => 7,
+    };
+    let kind_offset = match piece.kind {
+        PieceKind::General => 0,
+        PieceKind::Advisor => 1,
+        PieceKind::Elephant => 2,
+        PieceKind::Horse => 3,
+        PieceKind::Rook => 4,
+        PieceKind::Cannon => 5,
+        PieceKind::Soldier => 6,
+    };
+    color_offset + kind_offset
 }

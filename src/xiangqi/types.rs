@@ -150,6 +150,7 @@ pub struct RuleHistoryEntry {
     pub mover: Option<Color>,
     pub gives_check: bool,
     pub chased_mask: u128,
+    pub chased_piece_mask: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

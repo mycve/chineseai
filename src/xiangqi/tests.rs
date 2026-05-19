@@ -230,6 +230,7 @@ fn test_rule_entry(
         mover,
         gives_check,
         chased_mask,
+        chased_piece_mask: 0,
     }
 }
 
@@ -237,6 +238,21 @@ fn test_rule_entry(
 fn five_long_check_cycles_lose() {
     let mut history = vec![test_rule_entry(1, Color::Red, None, false, 0)];
     for _ in 0..5 {
+        history.push(test_rule_entry(2, Color::Black, Some(Color::Red), true, 0));
+        history.push(test_rule_entry(3, Color::Red, Some(Color::Black), false, 0));
+        history.push(test_rule_entry(4, Color::Black, Some(Color::Red), true, 0));
+        history.push(test_rule_entry(1, Color::Red, Some(Color::Black), false, 0));
+    }
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
+fn three_long_check_cycles_lose() {
+    let mut history = vec![test_rule_entry(1, Color::Red, None, false, 0)];
+    for _ in 0..3 {
         history.push(test_rule_entry(2, Color::Black, Some(Color::Red), true, 0));
         history.push(test_rule_entry(3, Color::Red, Some(Color::Black), false, 0));
         history.push(test_rule_entry(4, Color::Black, Some(Color::Red), true, 0));
@@ -298,6 +314,71 @@ fn five_long_chase_cycles_lose() {
     }
     assert_eq!(
         Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
+fn three_long_chase_cycles_lose() {
+    let mut history = vec![test_rule_entry(10, Color::Red, None, false, 0)];
+    for _ in 0..3 {
+        history.push(test_rule_entry(
+            11,
+            Color::Black,
+            Some(Color::Red),
+            false,
+            1 << 20,
+        ));
+        history.push(test_rule_entry(
+            12,
+            Color::Red,
+            Some(Color::Black),
+            false,
+            0,
+        ));
+        history.push(test_rule_entry(
+            13,
+            Color::Black,
+            Some(Color::Red),
+            false,
+            1 << 20,
+        ));
+        history.push(test_rule_entry(
+            10,
+            Color::Red,
+            Some(Color::Black),
+            false,
+            0,
+        ));
+    }
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
+fn chased_piece_escape_does_not_make_mutual_long_chase() {
+    let mut position =
+        Position::from_fen("r3kab1r/4a4/2n1bc2n/p1p1p1pc1/8p/5NP2/P1P1P3P/2N1C2C1/8R/1RBAKAB2 w")
+            .unwrap();
+    let mut history = position.initial_rule_history();
+    for text in [
+        "f4d5", "c6c5", "d5c7", "f7c7", "i1d1", "a9d9", "d1d9", "e8d9", "b0b4", "i9i8", "c3c4",
+        "i8d8", "c4c5", "e7c5", "b4f4", "i7h5", "f4f5", "h6h2", "f5h5", "c7c2", "h5c5", "d8d3",
+        "e3e4", "d3e3", "a3a4", "c2c3", "c5i5", "e3e4", "i5c5", "c3b3", "c5c3", "b3b5", "c3c5",
+        "b5b0", "c5h5", "h2f2", "h5b5", "b0a0", "b5b0", "a0a3", "b0b3", "a3a0", "b3a3", "a0b0",
+        "a3b3", "b0a0", "b3a3", "a0b0", "a3b3", "b0a0", "b3a3", "a0b0", "a3b3", "b0a0",
+    ] {
+        assert_eq!(position.rule_outcome_with_history(&history), None);
+        let mv = position.parse_uci_move(text).unwrap();
+        assert!(position.legal_moves_with_rules(&history).contains(&mv));
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+    }
+
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
         Some(RuleOutcome::Win(Color::Black))
     );
 }

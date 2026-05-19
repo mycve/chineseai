@@ -856,6 +856,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
+                chased_piece_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -863,6 +864,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
+                chased_piece_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -870,6 +872,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
+                chased_piece_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -877,6 +880,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
+                chased_piece_mask: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -884,6 +888,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
+                chased_piece_mask: 0,
             },
         ];
 
