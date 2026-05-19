@@ -34,7 +34,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 46;
+const AZNNUE_BINARY_VERSION: u32 = 45;
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -68,7 +68,7 @@ pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const POLICY_CONTEXT_SIZE: usize = 64;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
-pub(super) const MOVE_TACTICAL_FEATURES: usize = 17;
+pub(super) const MOVE_TACTICAL_FEATURES: usize = 19;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 
@@ -673,6 +673,7 @@ pub(super) fn move_tactical_features(
 ) -> [f32; MOVE_TACTICAL_FEATURES] {
     let side = position.side_to_move();
     let before = MoveRiskCounts::from_position(position, side);
+    let line_before = MoveLinePressureCounts::from_position(position, side);
     let moving_piece_attacked = position
         .piece_at(mv.from as usize)
         .is_some_and(|piece| piece.color == side)
@@ -686,12 +687,15 @@ pub(super) fn move_tactical_features(
     let to_attacked = next.is_piece_protected(mv.to as usize, side.opposite());
     let to_protected = next.is_piece_protected(mv.to as usize, side);
     let after = MoveRiskCounts::from_position(&next, side);
+    let line_after = MoveLinePressureCounts::from_position(&next, side);
     let quiet = !capture && !gives_check;
     let safer_relocation = moving_piece_attacked && !to_attacked;
     let own_hanging_delta = before.own_hanging as i32 - after.own_hanging as i32;
     let own_attacked_delta = before.own_attacked as i32 - after.own_attacked as i32;
     let enemy_hanging_delta = after.enemy_hanging as i32 - before.enemy_hanging as i32;
     let enemy_attacked_delta = after.enemy_attacked as i32 - before.enemy_attacked as i32;
+    let own_line_delta = line_before.own_pressure as i32 - line_after.own_pressure as i32;
+    let enemy_line_delta = line_after.enemy_pressure as i32 - line_before.enemy_pressure as i32;
     [
         quiet as u8 as f32,
         capture as u8 as f32,
@@ -710,6 +714,8 @@ pub(super) fn move_tactical_features(
         (capture && see == 0) as u8 as f32,
         (capture && see < 0 && see > -500) as u8 as f32,
         (capture && see <= -500) as u8 as f32,
+        positive_delta(own_line_delta),
+        positive_delta(enemy_line_delta),
     ]
 }
 
@@ -719,6 +725,33 @@ struct MoveRiskCounts {
     own_hanging: usize,
     enemy_attacked: usize,
     enemy_hanging: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MoveLinePressureCounts {
+    own_pressure: usize,
+    enemy_pressure: usize,
+}
+
+impl MoveLinePressureCounts {
+    fn from_position(position: &Position, side: Color) -> Self {
+        let mut counts = Self::default();
+        for target in 0..BOARD_SIZE {
+            let Some(piece) = position.piece_at(target) else {
+                continue;
+            };
+            let pressured = has_line_attacker(position, target, piece.color.opposite());
+            if !pressured {
+                continue;
+            }
+            if piece.color == side {
+                counts.own_pressure += 1;
+            } else {
+                counts.enemy_pressure += 1;
+            }
+        }
+        counts
+    }
 }
 
 impl MoveRiskCounts {
@@ -744,6 +777,28 @@ impl MoveRiskCounts {
 
 fn positive_delta(delta: i32) -> f32 {
     (delta.max(0) as f32 / 3.0).min(1.0)
+}
+
+fn has_line_attacker(position: &Position, target: usize, by: Color) -> bool {
+    for from in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(from) else {
+            continue;
+        };
+        if piece.color == by
+            && is_line_pressure_piece(piece.kind)
+            && position.piece_attacks_square_from(from, target)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_line_pressure_piece(kind: PieceKind) -> bool {
+    matches!(
+        kind,
+        PieceKind::Rook | PieceKind::Cannon | PieceKind::General
+    )
 }
 
 fn static_exchange_eval(position: &Position, mv: Move) -> i32 {

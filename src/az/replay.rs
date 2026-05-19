@@ -12,7 +12,7 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 12;
+const REPLAY_FILE_VERSION: u32 = 11;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
