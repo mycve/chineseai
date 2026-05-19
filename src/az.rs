@@ -35,7 +35,7 @@ pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
 // v39：value head 直接由 accumulator 输出 3 logits，删除 value MLP。
 // v38：纯稀疏 NNUE。输入只保留棋子/王位桶/历史/行列特征；
 //   模型文件只保存 sparse accumulator、direct value logits、move-feature policy MLP。
-const AZNNUE_BINARY_VERSION: u32 = 39;
+const AZNNUE_BINARY_VERSION: u32 = 40;
 // 头部布局（小端 u32 依次）：
 //   magic(4 字节) | version | input_size | hidden_size
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
@@ -114,6 +114,8 @@ pub(super) struct AzEvalScratch {
     value_logits: Vec<f32>,
     policy_context: Vec<f32>,
     policy_condition: Vec<f32>,
+    policy_from_scores: Vec<f32>,
+    policy_to_scores: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
 }
@@ -127,6 +129,8 @@ impl AzEvalScratch {
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_context: vec![0.0; POLICY_CONTEXT_SIZE],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
+            policy_from_scores: vec![0.0; BOARD_SIZE],
+            policy_to_scores: vec![0.0; BOARD_SIZE],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -149,13 +153,15 @@ pub struct AzNnue {
     pub policy_context_bias: Vec<f32>,
     pub policy_feature_hidden: Vec<f32>,
     pub policy_feature_bias: Vec<f32>,
+    pub policy_from_hidden: Vec<f32>,
+    pub policy_to_hidden: Vec<f32>,
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
 // Architecture notes:
-// - v39 is intentionally clean: sparse canonical features -> ReLU accumulator
-//   -> RMSNorm -> direct value logits and a small policy head. Row/column
-//   context is encoded as sparse input features, not a board network.
+// - v40 stays pure NNUE: sparse canonical features -> ReLU accumulator ->
+//   RMSNorm -> direct value logits. Policy keeps the small move-feature head
+//   and adds from/to square scores from the same hidden state.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -171,6 +177,8 @@ impl Clone for AzNnue {
             policy_context_bias: self.policy_context_bias.clone(),
             policy_feature_hidden: self.policy_feature_hidden.clone(),
             policy_feature_bias: self.policy_feature_bias.clone(),
+            policy_from_hidden: self.policy_from_hidden.clone(),
+            policy_to_hidden: self.policy_to_hidden.clone(),
             gpu_trainer: None,
         }
     }
@@ -329,6 +337,12 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / POLICY_CONTEXT_SIZE as f32).sqrt() * 0.5))
             .collect();
         let policy_feature_bias = vec![0.0; POLICY_CONDITION_SIZE];
+        let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
+            .collect();
+        let policy_to_hidden = (0..BOARD_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
+            .collect();
         Self {
             hidden_size,
             arch,
@@ -341,6 +355,8 @@ impl AzNnue {
             policy_context_bias,
             policy_feature_hidden,
             policy_feature_bias,
+            policy_from_hidden,
+            policy_to_hidden,
             gpu_trainer: None,
         }
     }
@@ -366,6 +382,8 @@ impl AzNnue {
         write_f32_slice_le(&mut writer, &self.policy_context_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_hidden)?;
         write_f32_slice_le(&mut writer, &self.policy_feature_bias)?;
+        write_f32_slice_le(&mut writer, &self.policy_from_hidden)?;
+        write_f32_slice_le(&mut writer, &self.policy_to_hidden)?;
         writer.flush()?;
         Ok(())
     }
@@ -416,6 +434,8 @@ impl AzNnue {
         let pcb_len = POLICY_CONTEXT_SIZE;
         let pfh_len = POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE;
         let pfb_len = POLICY_CONDITION_SIZE;
+        let pfrom_len = BOARD_SIZE * hidden_size;
+        let pto_len = BOARD_SIZE * hidden_size;
         let float_count = input_hidden_len
             + hidden_bias_len
             + vlw_len
@@ -424,7 +444,9 @@ impl AzNnue {
             + pch_len
             + pcb_len
             + pfh_len
-            + pfb_len;
+            + pfb_len
+            + pfrom_len
+            + pto_len;
         let expected_len = AZNNUE_BINARY_HEADER_LEN + float_count * 4;
         if bytes.len() != expected_len {
             return Err(io::Error::new(
@@ -446,6 +468,8 @@ impl AzNnue {
         let policy_context_bias = read_f32_vec_le(&mut reader, pcb_len)?;
         let policy_feature_hidden = read_f32_vec_le(&mut reader, pfh_len)?;
         let policy_feature_bias = read_f32_vec_le(&mut reader, pfb_len)?;
+        let policy_from_hidden = read_f32_vec_le(&mut reader, pfrom_len)?;
+        let policy_to_hidden = read_f32_vec_le(&mut reader, pto_len)?;
         let model = Self {
             hidden_size,
             arch,
@@ -458,6 +482,8 @@ impl AzNnue {
             policy_context_bias,
             policy_feature_hidden,
             policy_feature_bias,
+            policy_from_hidden,
+            policy_to_hidden,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -491,10 +517,17 @@ impl AzNnue {
             &mut scratch.policy_context,
             &mut scratch.policy_condition,
         );
+        self.policy_square_scores_into(
+            &scratch.hidden,
+            &mut scratch.policy_from_scores,
+            &mut scratch.policy_to_scores,
+        );
         scratch.logits.resize(moves.len(), 0.0);
         for (index, mv) in moves.iter().enumerate() {
             scratch.logits[index] = self.policy_logit_from_hidden_index(
                 &scratch.policy_condition,
+                &scratch.policy_from_scores,
+                &scratch.policy_to_scores,
                 dense_move_index(canonical_move(side, *mv)),
             );
         }
@@ -546,6 +579,22 @@ impl AzNnue {
         }
     }
 
+    fn policy_square_scores_into(
+        &self,
+        hidden: &[f32],
+        from_scores: &mut Vec<f32>,
+        to_scores: &mut Vec<f32>,
+    ) {
+        from_scores.resize(BOARD_SIZE, 0.0);
+        to_scores.resize(BOARD_SIZE, 0.0);
+        for square in 0..BOARD_SIZE {
+            let start = square * self.hidden_size;
+            let end = start + self.hidden_size;
+            from_scores[square] = dot_product(hidden, &self.policy_from_hidden[start..end]);
+            to_scores[square] = dot_product(hidden, &self.policy_to_hidden[start..end]);
+        }
+    }
+
     fn validate(&self) -> io::Result<()> {
         let arch = &self.arch;
         if arch.hidden_size != self.hidden_size {
@@ -570,6 +619,8 @@ impl AzNnue {
             || self.policy_context_bias.len() != POLICY_CONTEXT_SIZE
             || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE
             || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
+            || self.policy_from_hidden.len() != BOARD_SIZE * hidden
+            || self.policy_to_hidden.len() != BOARD_SIZE * hidden
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -579,11 +630,23 @@ impl AzNnue {
         Ok(())
     }
 
-    fn policy_logit_from_hidden_index(&self, policy_condition: &[f32], move_index: usize) -> f32 {
+    fn policy_logit_from_hidden_index(
+        &self,
+        policy_condition: &[f32],
+        from_scores: &[f32],
+        to_scores: &[f32],
+        move_index: usize,
+    ) -> f32 {
         let feature_offset = move_index * POLICY_CONDITION_SIZE;
         let move_features =
             &policy_move_features()[feature_offset..feature_offset + POLICY_CONDITION_SIZE];
-        self.policy_move_bias[move_index] + dot_product(policy_condition, move_features)
+        let sparse = move_map().dense_to_sparse[move_index] as usize;
+        let from = sparse / BOARD_SIZE;
+        let to = sparse % BOARD_SIZE;
+        self.policy_move_bias[move_index]
+            + dot_product(policy_condition, move_features)
+            + from_scores[from]
+            + to_scores[to]
     }
 }
 
@@ -983,6 +1046,32 @@ pub(super) fn policy_move_features() -> &'static [f32] {
             ];
             debug_assert_eq!(raw.len(), POLICY_CONDITION_SIZE);
             features.extend_from_slice(&raw);
+        }
+        features
+    })
+}
+
+pub(super) fn policy_move_from_features() -> &'static [f32] {
+    use std::sync::OnceLock;
+    static FEATURES: OnceLock<Vec<f32>> = OnceLock::new();
+    FEATURES.get_or_init(|| {
+        let mut features = vec![0.0; DENSE_MOVE_SPACE * BOARD_SIZE];
+        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
+            let from = sparse as usize / BOARD_SIZE;
+            features[move_index * BOARD_SIZE + from] = 1.0;
+        }
+        features
+    })
+}
+
+pub(super) fn policy_move_to_features() -> &'static [f32] {
+    use std::sync::OnceLock;
+    static FEATURES: OnceLock<Vec<f32>> = OnceLock::new();
+    FEATURES.get_or_init(|| {
+        let mut features = vec![0.0; DENSE_MOVE_SPACE * BOARD_SIZE];
+        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
+            let to = sparse as usize % BOARD_SIZE;
+            features[move_index * BOARD_SIZE + to] = 1.0;
         }
         features
     })

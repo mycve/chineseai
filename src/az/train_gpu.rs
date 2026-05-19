@@ -6,8 +6,10 @@ use std::{process::Command, thread};
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, DENSE_MOVE_SPACE,
     POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, VALUE_LOGITS, policy_move_features,
+    policy_move_from_features, policy_move_to_features,
 };
 use crate::nnue::PURE_NNUE_INPUT_SIZE;
+use crate::xiangqi::BOARD_SIZE;
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
 const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
@@ -44,7 +46,11 @@ struct GpuVars {
     policy_context_bias: Var,
     policy_feature_hidden: Var,
     policy_feature_bias: Var,
+    policy_from_hidden: Var,
+    policy_to_hidden: Var,
     policy_move_features: Tensor,
+    policy_move_from_features: Tensor,
+    policy_move_to_features: Tensor,
 }
 
 /// 与 `GpuTrainer` 使用的 `cuda_device_indices()` 一致。配置里「每卡 batch」× 本值 = 单步训练总 micro-batch 样本数。
@@ -502,7 +508,13 @@ impl GpuReplica {
             .broadcast_add(&self.vars.policy_feature_bias)?;
         let policy_feature_logits =
             policy_condition.matmul(&self.vars.policy_move_features.t()?)?;
-        let policy_logits = policy_feature_logits.broadcast_add(&policy_bias)?;
+        let policy_from_scores = hidden.matmul(&self.vars.policy_from_hidden.t()?)?;
+        let policy_to_scores = hidden.matmul(&self.vars.policy_to_hidden.t()?)?;
+        let policy_from_logits =
+            policy_from_scores.matmul(&self.vars.policy_move_from_features.t()?)?;
+        let policy_to_logits = policy_to_scores.matmul(&self.vars.policy_move_to_features.t()?)?;
+        let policy_logits = (((policy_feature_logits + policy_from_logits)? + policy_to_logits)?
+            .broadcast_add(&policy_bias))?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -633,9 +645,29 @@ impl GpuVars {
                 POLICY_CONDITION_SIZE,
                 device,
             )?,
+            policy_from_hidden: var_from_slice(
+                &model.policy_from_hidden,
+                (BOARD_SIZE, hidden),
+                device,
+            )?,
+            policy_to_hidden: var_from_slice(
+                &model.policy_to_hidden,
+                (BOARD_SIZE, hidden),
+                device,
+            )?,
             policy_move_features: Tensor::from_vec(
                 policy_move_features().to_vec(),
                 (DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE),
+                device,
+            )?,
+            policy_move_from_features: Tensor::from_vec(
+                policy_move_from_features().to_vec(),
+                (DENSE_MOVE_SPACE, BOARD_SIZE),
+                device,
+            )?,
+            policy_move_to_features: Tensor::from_vec(
+                policy_move_to_features().to_vec(),
+                (DENSE_MOVE_SPACE, BOARD_SIZE),
                 device,
             )?,
         })
@@ -652,6 +684,8 @@ impl GpuVars {
         vars.push(self.policy_context_bias.clone());
         vars.push(self.policy_feature_hidden.clone());
         vars.push(self.policy_feature_bias.clone());
+        vars.push(self.policy_from_hidden.clone());
+        vars.push(self.policy_to_hidden.clone());
         vars
     }
 
@@ -676,6 +710,8 @@ impl GpuVars {
             self.policy_context_bias.clone(),
             self.policy_feature_hidden.clone(),
             self.policy_feature_bias.clone(),
+            self.policy_from_hidden.clone(),
+            self.policy_to_hidden.clone(),
         ]
     }
 
@@ -713,6 +749,8 @@ impl GpuVars {
             &mut model.policy_feature_hidden,
         )?;
         copy_var(&self.policy_feature_bias, &mut model.policy_feature_bias)?;
+        copy_var(&self.policy_from_hidden, &mut model.policy_from_hidden)?;
+        copy_var(&self.policy_to_hidden, &mut model.policy_to_hidden)?;
         Ok(())
     }
 
