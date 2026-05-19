@@ -11,7 +11,10 @@ const HISTORY_INPUT_SIZE: usize = HISTORY_PLIES * HISTORY_EVENT_TYPES * 14 * BOA
 pub const V3_INPUT_SIZE: usize = V2_INPUT_SIZE + HISTORY_INPUT_SIZE;
 const ROW_INPUT_SIZE: usize = 14 * BOARD_RANKS;
 const COL_INPUT_SIZE: usize = 14 * BOARD_FILES;
-pub const PURE_NNUE_INPUT_SIZE: usize = V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE;
+const TACTICAL_STATES: usize = 6;
+const TACTICAL_INPUT_SIZE: usize = TACTICAL_STATES * 14 * BOARD_SIZE;
+pub const PURE_NNUE_INPUT_SIZE: usize =
+    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + TACTICAL_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -141,6 +144,8 @@ pub fn extract_sparse_features_pure_canonical(
         features.push(col_feature_index(piece_index, file_of(canonical_sq)));
     }
 
+    add_tactical_features(position, side, &mut features);
+
     features.sort_unstable();
     features
 }
@@ -223,6 +228,14 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
             let file = offset % BOARD_FILES;
             return col_feature_index(piece_index, BOARD_FILES - 1 - file);
         }
+        let offset = offset - COL_INPUT_SIZE;
+        if offset < TACTICAL_INPUT_SIZE {
+            let sq = offset % BOARD_SIZE;
+            let partial = offset / BOARD_SIZE;
+            let piece_index = partial % 14;
+            let state = partial / 14;
+            return tactical_feature_index(state, piece_index, mirror_file_square(sq));
+        }
     }
     feature
 }
@@ -247,6 +260,59 @@ fn row_feature_index(piece_index: usize, rank: usize) -> usize {
 
 fn col_feature_index(piece_index: usize, file: usize) -> usize {
     V3_INPUT_SIZE + ROW_INPUT_SIZE + piece_index * BOARD_FILES + file
+}
+
+fn tactical_feature_index(state: usize, piece_index: usize, sq: usize) -> usize {
+    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + (state * 14 + piece_index) * BOARD_SIZE + sq
+}
+
+fn add_tactical_features(position: &Position, side: Color, features: &mut Vec<usize>) {
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let own_piece = piece.color == side;
+        let canonical_sq = orient_square(side, sq);
+        let piece_index = canonical_piece_index(side, piece);
+        let attacked_by_own = position.is_piece_protected(sq, side);
+        let attacked_by_enemy = position.is_piece_protected(sq, side.opposite());
+        let (attacked, protected, hanging, base_state) = if own_piece {
+            (
+                attacked_by_enemy,
+                attacked_by_own,
+                attacked_by_enemy && !attacked_by_own,
+                0,
+            )
+        } else {
+            (
+                attacked_by_own,
+                attacked_by_enemy,
+                attacked_by_own && !attacked_by_enemy,
+                3,
+            )
+        };
+        if attacked {
+            features.push(tactical_feature_index(
+                base_state,
+                piece_index,
+                canonical_sq,
+            ));
+        }
+        if protected {
+            features.push(tactical_feature_index(
+                base_state + 1,
+                piece_index,
+                canonical_sq,
+            ));
+        }
+        if hanging {
+            features.push(tactical_feature_index(
+                base_state + 2,
+                piece_index,
+                canonical_sq,
+            ));
+        }
+    }
 }
 
 fn palace_bucket(sq: usize) -> usize {
