@@ -3,8 +3,6 @@ use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 mod alphazero;
-#[cfg(feature = "distill")]
-mod distill;
 mod mctx;
 mod play;
 mod replay;
@@ -21,8 +19,6 @@ pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
     alphazero_search_with_history_and_rules,
 };
-#[cfg(feature = "distill")]
-pub use distill::{AzDistillLoadOptions, AzDistillLoadStats, load_distill_npz_samples};
 pub use mctx::AzGumbelConfig;
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -1087,12 +1083,6 @@ fn dense_move_index(mv: Move) -> usize {
         mv.to
     );
     dense as usize
-}
-
-#[cfg_attr(not(feature = "distill"), allow(dead_code))]
-pub(super) fn dense_move_to_move(index: usize) -> Option<Move> {
-    let sparse = *move_map().dense_to_sparse.get(index)? as usize;
-    Some(Move::new(sparse / BOARD_SIZE, sparse % BOARD_SIZE))
 }
 
 #[cfg(test)]
