@@ -877,6 +877,13 @@ mod tests {
                 gives_check: false,
                 chased_mask: 0,
             },
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+            },
         ];
 
         assert_eq!(
