@@ -37,10 +37,6 @@ struct GpuReplica {
 struct GpuVars {
     input_hidden: Var,
     hidden_bias: Var,
-    value_intermediate_hidden: Var,
-    value_intermediate_bias: Var,
-    value_hidden_weights: Var,
-    value_hidden_bias: Var,
     value_logits_weights: Var,
     value_logits_bias: Var,
     policy_move_bias: Var,
@@ -493,15 +489,7 @@ impl GpuReplica {
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
 
-        let value_intermediate = hidden
-            .matmul(&self.vars.value_intermediate_hidden.t()?)?
-            .broadcast_add(&self.vars.value_intermediate_bias)?
-            .relu()?;
-        let value_hidden = value_intermediate
-            .matmul(&self.vars.value_hidden_weights.t()?)?
-            .broadcast_add(&self.vars.value_hidden_bias)?
-            .relu()?;
-        let value_logits = value_hidden
+        let value_logits = hidden
             .matmul(&self.vars.value_logits_weights.t()?)?
             .broadcast_add(&self.vars.value_logits_bias)?;
         let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
@@ -521,7 +509,6 @@ impl GpuReplica {
             policy_logits,
         })
     }
-
 }
 
 struct ShardOutput {
@@ -612,7 +599,6 @@ impl GpuVars {
     fn from_model(model: &AzNnue, device: &Device) -> CandleResult<Self> {
         let arch = model.arch;
         let hidden = arch.hidden_size;
-        let value_hidden = arch.value_hidden_size;
         Ok(Self {
             input_hidden: var_from_slice(
                 &model.input_hidden,
@@ -620,25 +606,9 @@ impl GpuVars {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            value_intermediate_hidden: var_from_slice(
-                &model.value_intermediate_hidden,
-                (value_hidden, hidden),
-                device,
-            )?,
-            value_intermediate_bias: var_from_slice(
-                &model.value_intermediate_bias,
-                value_hidden,
-                device,
-            )?,
-            value_hidden_weights: var_from_slice(
-                &model.value_hidden_weights,
-                (value_hidden, value_hidden),
-                device,
-            )?,
-            value_hidden_bias: var_from_slice(&model.value_hidden_bias, value_hidden, device)?,
             value_logits_weights: var_from_slice(
                 &model.value_logits_weights,
-                (VALUE_LOGITS, value_hidden),
+                (VALUE_LOGITS, hidden),
                 device,
             )?,
             value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
@@ -675,10 +645,6 @@ impl GpuVars {
         let mut vars = Vec::new();
         vars.push(self.input_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.value_intermediate_hidden.clone());
-        vars.push(self.value_intermediate_bias.clone());
-        vars.push(self.value_hidden_weights.clone());
-        vars.push(self.value_hidden_bias.clone());
         vars.push(self.value_logits_weights.clone());
         vars.push(self.value_logits_bias.clone());
         vars.push(self.policy_move_bias.clone());
@@ -698,10 +664,6 @@ impl GpuVars {
 
     fn value_head_vars(&self) -> Vec<Var> {
         vec![
-            self.value_intermediate_hidden.clone(),
-            self.value_intermediate_bias.clone(),
-            self.value_hidden_weights.clone(),
-            self.value_hidden_bias.clone(),
             self.value_logits_weights.clone(),
             self.value_logits_bias.clone(),
         ]
@@ -738,16 +700,6 @@ impl GpuVars {
     fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
         copy_var(&self.input_hidden, &mut model.input_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
-        copy_var(
-            &self.value_intermediate_hidden,
-            &mut model.value_intermediate_hidden,
-        )?;
-        copy_var(
-            &self.value_intermediate_bias,
-            &mut model.value_intermediate_bias,
-        )?;
-        copy_var(&self.value_hidden_weights, &mut model.value_hidden_weights)?;
-        copy_var(&self.value_hidden_bias, &mut model.value_hidden_bias)?;
         copy_var(&self.value_logits_weights, &mut model.value_logits_weights)?;
         copy_var(&self.value_logits_bias, &mut model.value_logits_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;

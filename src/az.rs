@@ -32,12 +32,13 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
+// v39：value head 直接由 accumulator 输出 3 logits，删除 value MLP。
 // v38：纯稀疏 NNUE。输入只保留棋子/王位桶/历史/行列特征；
-//   模型文件只保存 sparse accumulator、value MLP、move-feature policy MLP。
-const AZNNUE_BINARY_VERSION: u32 = 38;
+//   模型文件只保存 sparse accumulator、direct value logits、move-feature policy MLP。
+const AZNNUE_BINARY_VERSION: u32 = 39;
 // 头部布局（小端 u32 依次）：
-//   magic(4 字节) | version | input_size | hidden_size | value_hidden_size
-const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 4;
+//   magic(4 字节) | version | input_size | hidden_size
+const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
     for &value in slice {
@@ -64,7 +65,6 @@ fn read_f32_vec_le(reader: &mut impl Read, len: usize) -> io::Result<Vec<f32>> {
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
-pub(super) const DEFAULT_VALUE_HIDDEN_SIZE: usize = 256;
 const VALUE_LOGITS: usize = 3;
 pub(super) const BOARD_PLANES_SIZE: usize = BOARD_SIZE;
 pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
@@ -80,17 +80,12 @@ const RMS_NORM_EPS: f32 = 1.0e-6;
 pub struct AzNnueArch {
     /// 共享 hidden 向量宽度。
     pub hidden_size: usize,
-    /// value 头中间隐藏宽度。
-    pub value_hidden_size: usize,
 }
 
 impl AzNnueArch {
     /// 默认纯 NNUE 容量。
     pub const fn default_const() -> Self {
-        Self {
-            hidden_size: 256,
-            value_hidden_size: DEFAULT_VALUE_HIDDEN_SIZE,
-        }
+        Self { hidden_size: 256 }
     }
 
     /// 仅指定 hidden_size，其他旋钮取默认。便于命令行/测试场景。
@@ -105,12 +100,6 @@ impl AzNnueArch {
         if self.hidden_size == 0 {
             return Err(format!("invalid hidden_size {}", self.hidden_size));
         }
-        if self.value_hidden_size == 0 {
-            return Err(format!(
-                "invalid value_hidden_size {}",
-                self.value_hidden_size
-            ));
-        }
         Ok(())
     }
 }
@@ -122,8 +111,6 @@ impl Default for AzNnueArch {
 }
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
-    value_intermediate: Vec<f32>,
-    value_hidden: Vec<f32>,
     value_logits: Vec<f32>,
     policy_context: Vec<f32>,
     policy_condition: Vec<f32>,
@@ -137,8 +124,6 @@ impl AzEvalScratch {
         let hidden_size = arch.hidden_size;
         Self {
             hidden: vec![0.0; hidden_size],
-            value_intermediate: vec![0.0; arch.value_hidden_size],
-            value_hidden: vec![0.0; arch.value_hidden_size],
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_context: vec![0.0; POLICY_CONTEXT_SIZE],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
@@ -157,10 +142,6 @@ pub struct AzNnue {
     pub arch: AzNnueArch,
     pub input_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
-    pub value_intermediate_hidden: Vec<f32>,
-    pub value_intermediate_bias: Vec<f32>,
-    pub value_hidden_weights: Vec<f32>,
-    pub value_hidden_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
@@ -172,9 +153,9 @@ pub struct AzNnue {
 }
 
 // Architecture notes:
-// - v38 is intentionally clean: sparse canonical features -> ReLU accumulator
-//   -> RMSNorm -> small value and policy heads. Row/column context is encoded
-//   as sparse input features, not a board network.
+// - v39 is intentionally clean: sparse canonical features -> ReLU accumulator
+//   -> RMSNorm -> direct value logits and a small policy head. Row/column
+//   context is encoded as sparse input features, not a board network.
 
 impl Clone for AzNnue {
     fn clone(&self) -> Self {
@@ -183,10 +164,6 @@ impl Clone for AzNnue {
             arch: self.arch,
             input_hidden: self.input_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
-            value_intermediate_hidden: self.value_intermediate_hidden.clone(),
-            value_intermediate_bias: self.value_intermediate_bias.clone(),
-            value_hidden_weights: self.value_hidden_weights.clone(),
-            value_hidden_bias: self.value_hidden_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
@@ -334,22 +311,13 @@ impl AzNnue {
             panic!("AzNnue::random_with_arch: invalid arch ({err})");
         }
         let hidden_size = arch.hidden_size;
-        let value_hidden = arch.value_hidden_size;
         let mut rng = SplitMix64::new(seed);
         let input_hidden: Vec<f32> = (0..PURE_NNUE_INPUT_SIZE * hidden_size)
             .map(|_| rng.weight(0.015))
             .collect();
         let hidden_bias = vec![0.0; hidden_size];
-        let value_intermediate_hidden = (0..value_hidden * hidden_size)
+        let value_logits_weights = (0..VALUE_LOGITS * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        let value_intermediate_bias = vec![0.0; value_hidden];
-        let value_hidden_weights = (0..value_hidden * value_hidden)
-            .map(|_| rng.weight((2.0 / value_hidden as f32).sqrt() * 0.5))
-            .collect();
-        let value_hidden_bias = vec![0.0; value_hidden];
-        let value_logits_weights = (0..VALUE_LOGITS * value_hidden)
-            .map(|_| rng.weight((2.0 / value_hidden as f32).sqrt()))
             .collect();
         let value_logits_bias = vec![0.0; VALUE_LOGITS];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
@@ -366,10 +334,6 @@ impl AzNnue {
             arch,
             input_hidden,
             hidden_bias,
-            value_intermediate_hidden,
-            value_intermediate_bias,
-            value_hidden_weights,
-            value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
             policy_move_bias,
@@ -393,13 +357,8 @@ impl AzNnue {
         writer.write_all(&AZNNUE_BINARY_VERSION.to_le_bytes())?;
         writer.write_all(&(PURE_NNUE_INPUT_SIZE as u32).to_le_bytes())?;
         writer.write_all(&(self.arch.hidden_size as u32).to_le_bytes())?;
-        writer.write_all(&(self.arch.value_hidden_size as u32).to_le_bytes())?;
         write_f32_slice_le(&mut writer, &self.input_hidden)?;
         write_f32_slice_le(&mut writer, &self.hidden_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_intermediate_hidden)?;
-        write_f32_slice_le(&mut writer, &self.value_intermediate_bias)?;
-        write_f32_slice_le(&mut writer, &self.value_hidden_weights)?;
-        write_f32_slice_le(&mut writer, &self.value_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
@@ -435,17 +394,13 @@ impl AzNnue {
         }
         let input_size = read_u32_le(&mut reader)? as usize;
         let hidden_size = read_u32_le(&mut reader)? as usize;
-        let value_hidden_size = read_u32_le(&mut reader)? as usize;
         if input_size != PURE_NNUE_INPUT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "binary input_size does not match this build (PURE_NNUE_INPUT_SIZE)",
             ));
         }
-        let arch = AzNnueArch {
-            hidden_size,
-            value_hidden_size,
-        };
+        let arch = AzNnueArch { hidden_size };
         if let Err(err) = arch.validate() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -454,11 +409,7 @@ impl AzNnue {
         }
         let input_hidden_len = PURE_NNUE_INPUT_SIZE * hidden_size;
         let hidden_bias_len = hidden_size;
-        let vih_len = value_hidden_size * hidden_size;
-        let vib_len = value_hidden_size;
-        let vhw_len = value_hidden_size * value_hidden_size;
-        let vhb_len = value_hidden_size;
-        let vlw_len = VALUE_LOGITS * value_hidden_size;
+        let vlw_len = VALUE_LOGITS * hidden_size;
         let vlb_len = VALUE_LOGITS;
         let pmb_len = DENSE_MOVE_SPACE;
         let pch_len = POLICY_CONTEXT_SIZE * hidden_size;
@@ -467,10 +418,6 @@ impl AzNnue {
         let pfb_len = POLICY_CONDITION_SIZE;
         let float_count = input_hidden_len
             + hidden_bias_len
-            + vih_len
-            + vib_len
-            + vhw_len
-            + vhb_len
             + vlw_len
             + vlb_len
             + pmb_len
@@ -492,10 +439,6 @@ impl AzNnue {
         }
         let input_hidden = read_f32_vec_le(&mut reader, input_hidden_len)?;
         let hidden_bias = read_f32_vec_le(&mut reader, hidden_bias_len)?;
-        let value_intermediate_hidden = read_f32_vec_le(&mut reader, vih_len)?;
-        let value_intermediate_bias = read_f32_vec_le(&mut reader, vib_len)?;
-        let value_hidden_weights = read_f32_vec_le(&mut reader, vhw_len)?;
-        let value_hidden_bias = read_f32_vec_le(&mut reader, vhb_len)?;
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
         let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
         let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
@@ -508,10 +451,6 @@ impl AzNnue {
             arch,
             input_hidden,
             hidden_bias,
-            value_intermediate_hidden,
-            value_intermediate_bias,
-            value_hidden_weights,
-            value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
             policy_move_bias,
@@ -546,12 +485,7 @@ impl AzNnue {
         let features = extract_sparse_features_pure_canonical(position, history);
         self.input_embedding_into(&features, &mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
-        let value = self.value_from_hidden_into(
-            &scratch.hidden,
-            &mut scratch.value_intermediate,
-            &mut scratch.value_hidden,
-            &mut scratch.value_logits,
-        );
+        let value = self.value_from_hidden_into(&scratch.hidden, &mut scratch.value_logits);
         self.policy_condition_into(
             &scratch.hidden,
             &mut scratch.policy_context,
@@ -582,47 +516,19 @@ impl AzNnue {
         }
     }
 
-    fn value_from_hidden_into(
-        &self,
-        hidden: &[f32],
-        value_intermediate: &mut Vec<f32>,
-        value_hidden_out: &mut Vec<f32>,
-        value_logits: &mut Vec<f32>,
-    ) -> f32 {
-        let value_hidden = self.arch.value_hidden_size;
-        value_intermediate.copy_from_slice(&self.value_intermediate_bias);
-        for (j, value) in value_intermediate.iter_mut().enumerate().take(value_hidden) {
-            let h_row =
-                &self.value_intermediate_hidden[j * self.hidden_size..(j + 1) * self.hidden_size];
-            for (hidden_value, weight) in hidden.iter().zip(h_row) {
-                *value += hidden_value * weight;
-            }
-            *value = (*value).max(0.0);
-        }
-        value_hidden_out.copy_from_slice(&self.value_hidden_bias);
-        for (j, value) in value_hidden_out.iter_mut().enumerate().take(value_hidden) {
-            let h_row = &self.value_hidden_weights[j * value_hidden..(j + 1) * value_hidden];
-            for (intermediate, weight) in value_intermediate.iter().zip(h_row) {
-                *value += intermediate * weight;
-            }
-            *value = (*value).max(0.0);
-        }
+    fn value_from_hidden_into(&self, hidden: &[f32], value_logits: &mut Vec<f32>) -> f32 {
         value_logits.copy_from_slice(&self.value_logits_bias);
         for out in 0..VALUE_LOGITS {
-            let row = &self.value_logits_weights[out * value_hidden..(out + 1) * value_hidden];
-            for (value_hidden, weight) in value_hidden_out.iter().zip(row) {
-                value_logits[out] += value_hidden * weight;
+            let row =
+                &self.value_logits_weights[out * self.hidden_size..(out + 1) * self.hidden_size];
+            for (hidden_value, weight) in hidden.iter().zip(row) {
+                value_logits[out] += hidden_value * weight;
             }
         }
         scalar_value_from_logits(value_logits).0
     }
 
-    fn policy_condition_into(
-        &self,
-        hidden: &[f32],
-        context: &mut Vec<f32>,
-        out: &mut Vec<f32>,
-    ) {
+    fn policy_condition_into(&self, hidden: &[f32], context: &mut Vec<f32>, out: &mut Vec<f32>) {
         context.resize(POLICY_CONTEXT_SIZE, 0.0);
         context.copy_from_slice(&self.policy_context_bias);
         for (feature, value) in context.iter_mut().enumerate().take(POLICY_CONTEXT_SIZE) {
@@ -655,14 +561,9 @@ impl AzNnue {
             ));
         }
         let hidden = arch.hidden_size;
-        let value_hidden = arch.value_hidden_size;
         if self.input_hidden.len() != PURE_NNUE_INPUT_SIZE * hidden
             || self.hidden_bias.len() != hidden
-            || self.value_intermediate_hidden.len() != value_hidden * hidden
-            || self.value_intermediate_bias.len() != value_hidden
-            || self.value_hidden_weights.len() != value_hidden * value_hidden
-            || self.value_hidden_bias.len() != value_hidden
-            || self.value_logits_weights.len() != VALUE_LOGITS * value_hidden
+            || self.value_logits_weights.len() != VALUE_LOGITS * hidden
             || self.value_logits_bias.len() != VALUE_LOGITS
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
             || self.policy_context_hidden.len() != POLICY_CONTEXT_SIZE * hidden
@@ -678,11 +579,7 @@ impl AzNnue {
         Ok(())
     }
 
-    fn policy_logit_from_hidden_index(
-        &self,
-        policy_condition: &[f32],
-        move_index: usize,
-    ) -> f32 {
+    fn policy_logit_from_hidden_index(&self, policy_condition: &[f32], move_index: usize) -> f32 {
         let feature_offset = move_index * POLICY_CONDITION_SIZE;
         let move_features =
             &policy_move_features()[feature_offset..feature_offset + POLICY_CONDITION_SIZE];

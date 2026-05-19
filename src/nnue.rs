@@ -336,7 +336,11 @@ mod tests {
         let position = Position::from_fen("4k4/9/9/9/4p4/4R4/9/9/9/4K4 w").unwrap();
         let features = extract_sparse_features_pure_canonical(&position, &[]);
 
-        assert!(features.iter().all(|feature| *feature < PURE_NNUE_INPUT_SIZE));
+        assert!(
+            features
+                .iter()
+                .all(|feature| *feature < PURE_NNUE_INPUT_SIZE)
+        );
         assert!(features.iter().any(|feature| *feature >= V3_INPUT_SIZE));
         assert!(
             features
@@ -358,8 +362,16 @@ mod tests {
 
         let red_pure = extract_sparse_features_pure_canonical(&red_to_move, &[]);
         let black_pure = extract_sparse_features_pure_canonical(&black_to_move, &[]);
-        assert!(red_pure.iter().all(|feature| *feature < PURE_NNUE_INPUT_SIZE));
-        assert!(black_pure.iter().all(|feature| *feature < PURE_NNUE_INPUT_SIZE));
+        assert!(
+            red_pure
+                .iter()
+                .all(|feature| *feature < PURE_NNUE_INPUT_SIZE)
+        );
+        assert!(
+            black_pure
+                .iter()
+                .all(|feature| *feature < PURE_NNUE_INPUT_SIZE)
+        );
         assert!(!red_pure.contains(&(INPUT_SIZE - 1)));
         assert!(!black_pure.contains(&(INPUT_SIZE - 1)));
     }

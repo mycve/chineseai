@@ -91,18 +91,11 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// value 头中间隐藏维度（`AzNnueArch::value_hidden_size`）。
-    #[arg(long)]
-    value_hidden_size: Option<usize>,
 }
 
 impl AzInitArgs {
     fn arch(&self) -> chineseai::az::AzNnueArch {
-        let mut arch = chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1));
-        if let Some(value) = self.value_hidden_size {
-            arch.value_hidden_size = value.max(1);
-        }
-        arch
+        chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1))
     }
 }
 
@@ -226,9 +219,6 @@ struct AzDistillArgs {
     /// Hidden size used when creating a missing model.
     #[arg(long, default_value_t = 128)]
     hidden: usize,
-    /// value 头中间隐藏维度。
-    #[arg(long)]
-    value_hidden_size: Option<usize>,
     /// Training epochs over all shards.
     #[arg(long, default_value_t = 1)]
     epochs: usize,
@@ -906,11 +896,7 @@ fn main() {
                 panic!("failed to write `{output}`: {err}");
             });
             println!("aznnue   : initialized (nnue binary, magic AZB1)");
-            println!(
-                "arch     : hidden={} value_hidden={}",
-                arch.hidden_size,
-                arch.value_hidden_size,
-            );
+            println!("arch     : hidden={}", arch.hidden_size,);
             println!("seed     : {seed}");
             println!("output   : {output}");
         }
@@ -1309,10 +1295,7 @@ fn main() {
                     panic!("failed to load `{}`: {err}", cmd.model.display());
                 })
             } else {
-                let mut arch = chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
-                if let Some(value) = cmd.value_hidden_size {
-                    arch.value_hidden_size = value.max(1);
-                }
+                let arch = chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
                 println!(
                     "distill  : init random model {} arch={:?}",
                     cmd.model.display(),
@@ -1470,7 +1453,7 @@ fn main() {
             }
             let best_path = best_model_path(&config.model_path);
 
-            // 模型形状全部由 config.arch() 决定（hidden_size/value_hidden_size）。
+            // 模型形状全部由 config.arch() 决定（hidden_size）。
             // 已有 .nnue 加载后，自身二进制头里的 arch 才是真实形状（可能与本次 config 不同）。
             let config_arch = config.arch();
             let model = if Path::new(&config.model_path).exists() {

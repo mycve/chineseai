@@ -14,8 +14,6 @@ pub struct AzLoopFileConfig {
     pub max_sample_train_count: usize,
     pub max_plies: usize,
     pub hidden_size: usize,
-    /// value 头中间隐藏维度。
-    pub value_hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -48,7 +46,6 @@ impl Default for AzLoopFileConfig {
             max_num_considered_actions: 32,
             ..AzGumbelConfig::default()
         };
-        let arch = AzNnueArch::default();
         Self {
             model_path: "chineseai.nnue".into(),
             simulations: 256,
@@ -59,7 +56,6 @@ impl Default for AzLoopFileConfig {
             max_sample_train_count: 2,
             max_plies: 300,
             hidden_size: 256,
-            value_hidden_size: arch.value_hidden_size,
             seed: 20260409,
             workers: 240,
             temperature_start: 1.0,
@@ -100,7 +96,6 @@ struct AzLoopTomlConfig {
     pub max_sample_train_count: Option<usize>,
     pub max_plies: Option<usize>,
     pub hidden_size: Option<usize>,
-    pub value_hidden_size: Option<usize>,
     pub seed: Option<u64>,
     pub workers: Option<usize>,
     pub temperature_start: Option<f32>,
@@ -160,9 +155,6 @@ impl AzLoopTomlConfig {
         }
         if let Some(value) = self.hidden_size {
             config.hidden_size = value;
-        }
-        if let Some(value) = self.value_hidden_size {
-            config.value_hidden_size = value;
         }
         if let Some(value) = self.seed {
             config.seed = value;
@@ -332,11 +324,10 @@ impl AzLoopFileConfig {
 #   tensorboard_logdir is the ROOT; each run writes under a subdir whose name encodes it_*,
 #   sim_*, bs_*, lr_*, so TensorBoard Web can compare experiments side by side.
 #
-# Model architecture (v38, .nnue 自描述):
-#   hidden_size 与 value_hidden_size 写入 .nnue 二进制头，每个文件自带形状描述。
-#   修改任一项都会改变模型形状，老 .nnue 文件不再兼容、必须 re-init 新模型。
+# Model architecture (v39, .nnue 自描述):
+#   hidden_size 写入 .nnue 二进制头，每个文件自带形状描述。
+#   修改它会改变模型形状，老 .nnue 文件不再兼容、必须 re-init 新模型。
 #   - hidden_size：纯 NNUE accumulator hidden 向量宽度（默认 256）
-#   - value_hidden_size：value 头中间隐藏维度（默认 256）
 #   固定头部形状：policy_condition_size=32, policy_context_size=64, value_logits=3。
 
 model_path = "{model_path}"
@@ -348,7 +339,6 @@ batch_size = {batch_size}
 max_sample_train_count = {max_sample_train_count}
 max_plies = {max_plies}
 hidden_size = {hidden_size}
-value_hidden_size = {value_hidden_size}
 seed = {seed}
 workers = {workers}
 temperature_start = {temperature_start}
@@ -388,7 +378,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
             max_sample_train_count = self.max_sample_train_count,
             max_plies = self.max_plies,
             hidden_size = self.hidden_size,
-            value_hidden_size = self.value_hidden_size,
             seed = self.seed,
             workers = self.workers,
             temperature_start = self.temperature_start,
@@ -433,7 +422,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
     pub fn arch(&self) -> AzNnueArch {
         AzNnueArch {
             hidden_size: self.hidden_size,
-            value_hidden_size: self.value_hidden_size,
         }
     }
 
@@ -445,7 +433,6 @@ tensorboard_logdir = "{tensorboard_logdir}"
         self.max_sample_train_count = self.max_sample_train_count.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
-        self.value_hidden_size = self.value_hidden_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_end = self.temperature_end.max(0.0);
