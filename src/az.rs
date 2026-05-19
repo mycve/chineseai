@@ -7,6 +7,9 @@ mod mctx;
 mod play;
 mod replay;
 mod train;
+#[cfg(any(feature = "gpu-train", all(target_os = "linux", not(target_env = "musl"))))]
+#[path = "az/train_gpu_candle.rs"]
+mod train_gpu_candle;
 mod train_gpu;
 
 use crate::nnue::{
@@ -151,6 +154,7 @@ pub struct AzNnue {
     pub policy_feature_bias: Vec<f32>,
     pub policy_from_hidden: Vec<f32>,
     pub policy_to_hidden: Vec<f32>,
+    #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
 
@@ -295,6 +299,7 @@ impl Default for AzTrainLossWeights {
 }
 
 impl AzTrainStats {
+    #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     fn add_assign(&mut self, other: &Self) {
         self.loss += other.loss;
         self.value_loss += other.value_loss;
@@ -1048,6 +1053,7 @@ pub(super) fn policy_move_features() -> &'static [f32] {
     })
 }
 
+#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) fn policy_move_from_features() -> &'static [f32] {
     use std::sync::OnceLock;
     static FEATURES: OnceLock<Vec<f32>> = OnceLock::new();
@@ -1061,6 +1067,7 @@ pub(super) fn policy_move_from_features() -> &'static [f32] {
     })
 }
 
+#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) fn policy_move_to_features() -> &'static [f32] {
     use std::sync::OnceLock;
     static FEATURES: OnceLock<Vec<f32>> = OnceLock::new();
@@ -1256,6 +1263,7 @@ mod tests {
         assert!(weaker.anchored_elo(reference) < reference);
     }
 
+    #[cfg(feature = "gpu-train")]
     #[test]
     fn value_head_can_overfit_tiny_fixed_dataset() {
         let mut model = AzNnue::random(16, 7);
@@ -1310,6 +1318,7 @@ mod tests {
         assert!(after < 0.35, "after={after}");
     }
 
+    #[cfg(feature = "gpu-train")]
     #[test]
     fn batched_training_is_deterministic() {
         let samples = vec![

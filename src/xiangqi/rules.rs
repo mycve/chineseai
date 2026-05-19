@@ -104,6 +104,11 @@ impl Position {
             .filter(|&mv| {
                 let mut next = self.clone();
                 next.make_move(mv);
+                if !base_history.iter().any(|entry| {
+                    entry.hash == next.hash && entry.side_to_move == next.side_to_move
+                }) {
+                    return true;
+                }
                 let mut next_history = base_history.clone();
                 next_history.push(next.rule_history_entry(Some(mover)));
                 !matches!(
@@ -118,22 +123,34 @@ impl Position {
         crate::scope_profile!("xiangqi.chased_mask_by");
         let mut work = self.clone();
         work.side_to_move = color;
-        work.legal_moves()
-            .into_iter()
-            .filter_map(|mv| {
-                let target = mv.to as usize;
-                let target_piece = self.board[target]?;
-                if target_piece.color == color || target_piece.kind == PieceKind::General {
-                    return None;
+
+        let mut mask = 0u128;
+        for target in 0..super::BOARD_SIZE {
+            let Some(target_piece) = self.board[target] else {
+                continue;
+            };
+            if target_piece.color == color || target_piece.kind == PieceKind::General {
+                continue;
+            }
+            if target_piece.kind == PieceKind::Soldier
+                && !soldier_crossed_river(target_piece.color, super::geom::rank_of(target))
+            {
+                continue;
+            }
+
+            self.visit_attacker_origins_to(target, color, |from| {
+                let mv = Move::new(from, target);
+                let undo = work.make_move(mv);
+                let legal = !work.in_check(color);
+                work.unmake_move(mv, undo);
+                if legal {
+                    mask |= 1u128 << target;
+                    return true;
                 }
-                if target_piece.kind == PieceKind::Soldier
-                    && !soldier_crossed_river(target_piece.color, super::geom::rank_of(target))
-                {
-                    return None;
-                }
-                Some(1u128 << target)
-            })
-            .fold(0u128, |mask, bit| mask | bit)
+                false
+            });
+        }
+        mask
     }
 }
 

@@ -189,7 +189,7 @@ impl Position {
     }
 
     #[cfg(test)]
-    fn legal_capture_moves(&self) -> Vec<Move> {
+    pub(super) fn legal_capture_moves(&self) -> Vec<Move> {
         self.collect_legal_moves(true, self.in_check(self.side_to_move))
     }
 
@@ -935,7 +935,12 @@ impl Position {
         screen
     }
 
-    fn visit_attacker_origins_to<F>(&self, target: usize, by: Color, mut visitor: F) -> bool
+    pub(super) fn visit_attacker_origins_to<F>(
+        &self,
+        target: usize,
+        by: Color,
+        mut visitor: F,
+    ) -> bool
     where
         F: FnMut(usize) -> bool,
     {
