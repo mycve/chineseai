@@ -32,7 +32,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 43;
+const AZNNUE_BINARY_VERSION: u32 = 44;
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -66,7 +66,7 @@ pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const POLICY_CONTEXT_SIZE: usize = 64;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
-pub(super) const MOVE_TACTICAL_FEATURES: usize = 8;
+pub(super) const MOVE_TACTICAL_FEATURES: usize = 12;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 
@@ -670,6 +670,7 @@ pub(super) fn move_tactical_features(
     mv: Move,
 ) -> [f32; MOVE_TACTICAL_FEATURES] {
     let side = position.side_to_move();
+    let before = MoveRiskCounts::from_position(position, side);
     let moving_piece_attacked = position
         .piece_at(mv.from as usize)
         .is_some_and(|piece| piece.color == side)
@@ -681,8 +682,13 @@ pub(super) fn move_tactical_features(
     let gives_check = next.in_check(side.opposite());
     let to_attacked = next.is_piece_protected(mv.to as usize, side.opposite());
     let to_protected = next.is_piece_protected(mv.to as usize, side);
+    let after = MoveRiskCounts::from_position(&next, side);
     let quiet = !capture && !gives_check;
     let safer_relocation = moving_piece_attacked && !to_attacked;
+    let own_hanging_delta = before.own_hanging as i32 - after.own_hanging as i32;
+    let own_attacked_delta = before.own_attacked as i32 - after.own_attacked as i32;
+    let enemy_hanging_delta = after.enemy_hanging as i32 - before.enemy_hanging as i32;
+    let enemy_attacked_delta = after.enemy_attacked as i32 - before.enemy_attacked as i32;
     [
         quiet as u8 as f32,
         capture as u8 as f32,
@@ -692,7 +698,44 @@ pub(super) fn move_tactical_features(
         to_attacked as u8 as f32,
         to_protected as u8 as f32,
         safer_relocation as u8 as f32,
+        positive_delta(own_hanging_delta),
+        positive_delta(own_attacked_delta),
+        positive_delta(enemy_hanging_delta),
+        positive_delta(enemy_attacked_delta),
     ]
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MoveRiskCounts {
+    own_attacked: usize,
+    own_hanging: usize,
+    enemy_attacked: usize,
+    enemy_hanging: usize,
+}
+
+impl MoveRiskCounts {
+    fn from_position(position: &Position, side: Color) -> Self {
+        let mut counts = Self::default();
+        for sq in 0..BOARD_SIZE {
+            let Some(piece) = position.piece_at(sq) else {
+                continue;
+            };
+            let attacked_by_own = position.is_piece_protected(sq, side);
+            let attacked_by_enemy = position.is_piece_protected(sq, side.opposite());
+            if piece.color == side {
+                counts.own_attacked += attacked_by_enemy as usize;
+                counts.own_hanging += (attacked_by_enemy && !attacked_by_own) as usize;
+            } else {
+                counts.enemy_attacked += attacked_by_own as usize;
+                counts.enemy_hanging += (attacked_by_own && !attacked_by_enemy) as usize;
+            }
+        }
+        counts
+    }
+}
+
+fn positive_delta(delta: i32) -> f32 {
+    (delta.max(0) as f32 / 3.0).min(1.0)
 }
 
 pub(super) fn extract_board_planes(
