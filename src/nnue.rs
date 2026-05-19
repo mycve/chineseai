@@ -11,13 +11,50 @@ const HISTORY_INPUT_SIZE: usize = HISTORY_PLIES * HISTORY_EVENT_TYPES * 14 * BOA
 pub const V3_INPUT_SIZE: usize = V2_INPUT_SIZE + HISTORY_INPUT_SIZE;
 const ROW_INPUT_SIZE: usize = 14 * BOARD_RANKS;
 const COL_INPUT_SIZE: usize = 14 * BOARD_FILES;
+const KING_ATTACK_BUCKETS: usize = 16;
+const KING_ATTACK_INPUT_SIZE: usize = 2 * KING_ATTACK_BUCKETS;
 const TACTICAL_STATES: usize = 6;
 const TACTICAL_INPUT_SIZE: usize = TACTICAL_STATES * 14 * BOARD_SIZE;
 const STRATEGIC_STATES: usize = 9;
 const STRATEGIC_BUCKETS: usize = 16;
 const STRATEGIC_INPUT_SIZE: usize = STRATEGIC_STATES * STRATEGIC_BUCKETS;
-pub const PURE_NNUE_INPUT_SIZE: usize =
-    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + TACTICAL_INPUT_SIZE + STRATEGIC_INPUT_SIZE;
+const THREAT_TARGET_PIECES: usize = 14;
+const THREAT_KIND_SLOTS: [usize; 7] = [4, 4, 4, 8, 17, 17, 3];
+const THREAT_PIECE_SLOTS: usize = threat_piece_slots();
+pub const THREAT_INPUT_SIZE: usize = THREAT_PIECE_SLOTS * THREAT_TARGET_PIECES;
+pub const POSITIONAL_NNUE_INPUT_SIZE: usize = V3_INPUT_SIZE
+    + ROW_INPUT_SIZE
+    + COL_INPUT_SIZE
+    + KING_ATTACK_INPUT_SIZE
+    + TACTICAL_INPUT_SIZE
+    + STRATEGIC_INPUT_SIZE;
+pub const THREAT_FEATURE_START: usize = POSITIONAL_NNUE_INPUT_SIZE;
+pub const PURE_NNUE_INPUT_SIZE: usize = POSITIONAL_NNUE_INPUT_SIZE + THREAT_INPUT_SIZE;
+
+pub fn layer_stack_bucket(position: &Position, side: Color) -> usize {
+    let us_rook = piece_count(position, side, PieceKind::Rook).min(2);
+    let opp_rook = piece_count(position, side.opposite(), PieceKind::Rook).min(2);
+    let us_knight_cannon = (piece_count(position, side, PieceKind::Horse)
+        + piece_count(position, side, PieceKind::Cannon))
+    .min(4);
+    let opp_knight_cannon = (piece_count(position, side.opposite(), PieceKind::Horse)
+        + piece_count(position, side.opposite(), PieceKind::Cannon))
+    .min(4);
+
+    if us_rook == opp_rook {
+        us_rook * 4
+            + usize::from(us_knight_cannon + opp_knight_cannon >= 4) * 2
+            + usize::from(us_knight_cannon == opp_knight_cannon)
+    } else if us_rook == 2 && opp_rook == 1 {
+        12
+    } else if us_rook == 1 && opp_rook == 2 {
+        13
+    } else if us_rook > 0 && opp_rook == 0 {
+        14
+    } else {
+        15
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -98,7 +135,7 @@ pub fn extract_sparse_features_pure_canonical(
         .general_square(side.opposite())
         .map(|sq| palace_bucket(orient_square(side, sq)))
         .unwrap_or(4);
-    let mut features = Vec::with_capacity(128);
+    let mut features = Vec::with_capacity(192);
 
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
@@ -148,7 +185,9 @@ pub fn extract_sparse_features_pure_canonical(
     }
 
     let tactical_counts = add_tactical_features(position, side, &mut features);
+    add_king_attack_features(position, side, tactical_counts, &mut features);
     add_strategic_features(position, side, tactical_counts, &mut features);
+    add_full_threat_features(position, side, &mut features);
 
     features.sort_unstable();
     features
@@ -233,6 +272,10 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
             return col_feature_index(piece_index, BOARD_FILES - 1 - file);
         }
         let offset = offset - COL_INPUT_SIZE;
+        if offset < KING_ATTACK_INPUT_SIZE {
+            return feature;
+        }
+        let offset = offset - KING_ATTACK_INPUT_SIZE;
         if offset < TACTICAL_INPUT_SIZE {
             let sq = offset % BOARD_SIZE;
             let partial = offset / BOARD_SIZE;
@@ -243,6 +286,10 @@ fn mirror_sparse_feature_file(feature: usize) -> usize {
         let offset = offset - TACTICAL_INPUT_SIZE;
         if offset < STRATEGIC_INPUT_SIZE {
             return feature;
+        }
+        let offset = offset - STRATEGIC_INPUT_SIZE;
+        if offset < THREAT_INPUT_SIZE {
+            return mirror_threat_feature(offset);
         }
     }
     feature
@@ -270,17 +317,106 @@ fn col_feature_index(piece_index: usize, file: usize) -> usize {
     V3_INPUT_SIZE + ROW_INPUT_SIZE + piece_index * BOARD_FILES + file
 }
 
+fn king_attack_feature_index(perspective: usize, bucket: usize) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + perspective * KING_ATTACK_BUCKETS
+        + bucket.min(KING_ATTACK_BUCKETS - 1)
+}
+
 fn tactical_feature_index(state: usize, piece_index: usize, sq: usize) -> usize {
-    V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + (state * 14 + piece_index) * BOARD_SIZE + sq
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + KING_ATTACK_INPUT_SIZE
+        + (state * 14 + piece_index) * BOARD_SIZE
+        + sq
 }
 
 fn strategic_feature_index(state: usize, bucket: usize) -> usize {
     V3_INPUT_SIZE
         + ROW_INPUT_SIZE
         + COL_INPUT_SIZE
+        + KING_ATTACK_INPUT_SIZE
         + TACTICAL_INPUT_SIZE
         + state * STRATEGIC_BUCKETS
         + bucket.min(STRATEGIC_BUCKETS - 1)
+}
+
+fn threat_feature_index(
+    attacker_piece: usize,
+    from: usize,
+    slot: usize,
+    target_piece: usize,
+) -> usize {
+    V3_INPUT_SIZE
+        + ROW_INPUT_SIZE
+        + COL_INPUT_SIZE
+        + KING_ATTACK_INPUT_SIZE
+        + TACTICAL_INPUT_SIZE
+        + STRATEGIC_INPUT_SIZE
+        + (((threat_piece_offset(attacker_piece)
+            + from * threat_slots_for_piece(attacker_piece)
+            + slot)
+            * THREAT_TARGET_PIECES)
+            + target_piece)
+}
+
+const fn threat_piece_slots() -> usize {
+    let mut total = 0;
+    let mut piece = 0;
+    while piece < 14 {
+        total += BOARD_SIZE * THREAT_KIND_SLOTS[piece % 7];
+        piece += 1;
+    }
+    total
+}
+
+fn threat_piece_offset(piece_index: usize) -> usize {
+    let mut offset = 0;
+    for piece in 0..piece_index {
+        offset += BOARD_SIZE * threat_slots_for_piece(piece);
+    }
+    offset
+}
+
+fn threat_slots_for_piece(piece_index: usize) -> usize {
+    THREAT_KIND_SLOTS[piece_index % 7]
+}
+
+fn mirror_threat_feature(offset: usize) -> usize {
+    let target_piece = offset % THREAT_TARGET_PIECES;
+    let mut geometry = offset / THREAT_TARGET_PIECES;
+    for attacker_piece in 0..14 {
+        let slots = threat_slots_for_piece(attacker_piece);
+        let piece_size = BOARD_SIZE * slots;
+        if geometry < piece_size {
+            let from = geometry / slots;
+            let slot = geometry % slots;
+            if let Some(to) = threat_slot_to_square(attacker_piece, from, slot) {
+                return threat_feature_index(
+                    attacker_piece,
+                    mirror_file_square(from),
+                    threat_slot_for(
+                        attacker_piece,
+                        mirror_file_square(from),
+                        mirror_file_square(to),
+                    )
+                    .unwrap_or(slot),
+                    target_piece,
+                );
+            }
+            return threat_feature_index(
+                attacker_piece,
+                mirror_file_square(from),
+                slot,
+                target_piece,
+            );
+        }
+        geometry -= piece_size;
+    }
+    THREAT_FEATURE_START + offset
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -399,6 +535,412 @@ fn add_strategic_features(
     features.push(strategic_feature_index(8, tactical.enemy_protected));
 }
 
+fn add_king_attack_features(
+    position: &Position,
+    side: Color,
+    tactical: TacticalCounts,
+    features: &mut Vec<usize>,
+) {
+    features.push(king_attack_feature_index(
+        0,
+        king_attack_bucket(position, side, side, tactical.own_attacked),
+    ));
+    features.push(king_attack_feature_index(
+        1,
+        king_attack_bucket(position, side, side.opposite(), tactical.enemy_attacked),
+    ));
+}
+
+fn king_attack_bucket(
+    position: &Position,
+    perspective: Color,
+    king_color: Color,
+    attacked_count: usize,
+) -> usize {
+    let Some(general) = position.general_square(king_color) else {
+        return 0;
+    };
+    let mut attacked_palace = 0usize;
+    let enemy = king_color.opposite();
+    for rank in 0..BOARD_RANKS {
+        for file in 3..=5 {
+            if !inside_palace(king_color, file, rank) {
+                continue;
+            }
+            let sq = square(file, rank);
+            if square_attacked_by(position, sq, enemy) {
+                attacked_palace += 1;
+            }
+        }
+    }
+    let canonical_general = orient_square(perspective, general);
+    let center_distance =
+        file_of(canonical_general).abs_diff(4) + rank_of(canonical_general).abs_diff(8);
+    (attacked_palace * 3 + attacked_count.min(3) + center_distance.min(3))
+        .min(KING_ATTACK_BUCKETS - 1)
+}
+
+fn piece_count(position: &Position, color: Color, kind: PieceKind) -> usize {
+    let mut count = 0;
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        if piece.color == color && piece.kind == kind {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn add_full_threat_features(position: &Position, side: Color, features: &mut Vec<usize>) {
+    for from in 0..BOARD_SIZE {
+        let Some(attacker) = position.piece_at(from) else {
+            continue;
+        };
+        let attacker_piece = canonical_piece_index(side, attacker);
+        let canonical_from = orient_square(side, from);
+        visit_piece_attacks(position, from, attacker, |to| {
+            let Some(target) = position.piece_at(to) else {
+                return;
+            };
+            if target.color == attacker.color {
+                return;
+            }
+            let canonical_to = orient_square(side, to);
+            let Some(slot) = threat_slot_for(attacker_piece, canonical_from, canonical_to) else {
+                return;
+            };
+            features.push(threat_feature_index(
+                attacker_piece,
+                canonical_from,
+                slot,
+                canonical_piece_index(side, target),
+            ));
+        });
+    }
+}
+
+fn square_attacked_by(position: &Position, target: usize, by: Color) -> bool {
+    for from in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(from) else {
+            continue;
+        };
+        if piece.color != by {
+            continue;
+        }
+        let mut attacked = false;
+        visit_piece_attacks(position, from, piece, |to| {
+            if to == target {
+                attacked = true;
+            }
+        });
+        if attacked {
+            return true;
+        }
+    }
+    false
+}
+
+fn visit_piece_attacks(
+    position: &Position,
+    from: usize,
+    piece: Piece,
+    mut visit: impl FnMut(usize),
+) {
+    match piece.kind {
+        PieceKind::General => visit_general_attacks(position, from, piece.color, visit),
+        PieceKind::Advisor => {
+            for (df, dr) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                let nf = file_of(from) as i32 + df;
+                let nr = rank_of(from) as i32 + dr;
+                if inside_board(nf, nr) && inside_palace(piece.color, nf as usize, nr as usize) {
+                    visit(square(nf as usize, nr as usize));
+                }
+            }
+        }
+        PieceKind::Elephant => {
+            for (eye_df, eye_dr, df, dr) in [
+                (-1, -1, -2, -2),
+                (1, -1, 2, -2),
+                (-1, 1, -2, 2),
+                (1, 1, 2, 2),
+            ] {
+                let file = file_of(from) as i32;
+                let rank = rank_of(from) as i32;
+                let eye_f = file + eye_df;
+                let eye_r = rank + eye_dr;
+                let nf = file + df;
+                let nr = rank + dr;
+                if inside_board(eye_f, eye_r)
+                    && inside_board(nf, nr)
+                    && elephant_stays_home(piece.color, nr as usize)
+                    && position
+                        .piece_at(square(eye_f as usize, eye_r as usize))
+                        .is_none()
+                {
+                    visit(square(nf as usize, nr as usize));
+                }
+            }
+        }
+        PieceKind::Horse => {
+            for (leg_df, leg_dr, df, dr) in [
+                (0, -1, -1, -2),
+                (0, -1, 1, -2),
+                (0, 1, -1, 2),
+                (0, 1, 1, 2),
+                (-1, 0, -2, -1),
+                (-1, 0, -2, 1),
+                (1, 0, 2, -1),
+                (1, 0, 2, 1),
+            ] {
+                let file = file_of(from) as i32;
+                let rank = rank_of(from) as i32;
+                let leg_f = file + leg_df;
+                let leg_r = rank + leg_dr;
+                let nf = file + df;
+                let nr = rank + dr;
+                if inside_board(leg_f, leg_r)
+                    && inside_board(nf, nr)
+                    && position
+                        .piece_at(square(leg_f as usize, leg_r as usize))
+                        .is_none()
+                {
+                    visit(square(nf as usize, nr as usize));
+                }
+            }
+        }
+        PieceKind::Rook => visit_slider_attacks(position, from, false, visit),
+        PieceKind::Cannon => visit_slider_attacks(position, from, true, visit),
+        PieceKind::Soldier => {
+            let file = file_of(from) as i32;
+            let rank = rank_of(from) as i32;
+            let forward = rank + piece.color.forward_step();
+            if inside_board(file, forward) {
+                visit(square(file as usize, forward as usize));
+            }
+            if soldier_crossed_river(piece.color, rank as usize) {
+                for df in [-1, 1] {
+                    let nf = file + df;
+                    if inside_board(nf, rank) {
+                        visit(square(nf as usize, rank as usize));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn visit_general_attacks(
+    position: &Position,
+    from: usize,
+    color: Color,
+    mut visit: impl FnMut(usize),
+) {
+    for (df, dr) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
+        let nf = file_of(from) as i32 + df;
+        let nr = rank_of(from) as i32 + dr;
+        if inside_board(nf, nr) && inside_palace(color, nf as usize, nr as usize) {
+            visit(square(nf as usize, nr as usize));
+        }
+    }
+    if let Some(enemy_general) = position.general_square(color.opposite())
+        && file_of(enemy_general) == file_of(from)
+    {
+        let file = file_of(from);
+        let start = rank_of(from).min(rank_of(enemy_general)) + 1;
+        let end = rank_of(from).max(rank_of(enemy_general));
+        if (start..end).all(|rank| position.piece_at(square(file, rank)).is_none()) {
+            visit(enemy_general);
+        }
+    }
+}
+
+fn visit_slider_attacks(
+    position: &Position,
+    from: usize,
+    is_cannon: bool,
+    mut visit: impl FnMut(usize),
+) {
+    for (df, dr) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
+        let mut nf = file_of(from) as i32 + df;
+        let mut nr = rank_of(from) as i32 + dr;
+        let mut seen_screen = false;
+        while inside_board(nf, nr) {
+            let to = square(nf as usize, nr as usize);
+            if position.piece_at(to).is_some() {
+                if !is_cannon || seen_screen {
+                    visit(to);
+                    break;
+                }
+                seen_screen = true;
+            }
+            nf += df;
+            nr += dr;
+        }
+    }
+}
+
+fn threat_slot_for(piece_index: usize, from: usize, to: usize) -> Option<usize> {
+    let kind = piece_index % 7;
+    let from_file = file_of(from);
+    let from_rank = rank_of(from);
+    let to_file = file_of(to);
+    let to_rank = rank_of(to);
+    match kind {
+        0 => match (
+            to_file as i32 - from_file as i32,
+            to_rank as i32 - from_rank as i32,
+        ) {
+            (0, -1) => Some(0),
+            (0, 1) => Some(1),
+            (-1, 0) => Some(2),
+            (1, 0) => Some(3),
+            _ => None,
+        },
+        1 => match (
+            to_file as i32 - from_file as i32,
+            to_rank as i32 - from_rank as i32,
+        ) {
+            (-1, -1) => Some(0),
+            (1, -1) => Some(1),
+            (-1, 1) => Some(2),
+            (1, 1) => Some(3),
+            _ => None,
+        },
+        2 => match (
+            to_file as i32 - from_file as i32,
+            to_rank as i32 - from_rank as i32,
+        ) {
+            (-2, -2) => Some(0),
+            (2, -2) => Some(1),
+            (-2, 2) => Some(2),
+            (2, 2) => Some(3),
+            _ => None,
+        },
+        3 => match (
+            to_file as i32 - from_file as i32,
+            to_rank as i32 - from_rank as i32,
+        ) {
+            (-1, -2) => Some(0),
+            (1, -2) => Some(1),
+            (-1, 2) => Some(2),
+            (1, 2) => Some(3),
+            (-2, -1) => Some(4),
+            (-2, 1) => Some(5),
+            (2, -1) => Some(6),
+            (2, 1) => Some(7),
+            _ => None,
+        },
+        4 | 5 => {
+            if from_file == to_file && from_rank != to_rank {
+                Some(if to_rank < from_rank {
+                    to_rank
+                } else {
+                    to_rank - 1
+                })
+            } else if from_rank == to_rank && from_file != to_file {
+                Some(
+                    9 + if to_file < from_file {
+                        to_file
+                    } else {
+                        to_file - 1
+                    },
+                )
+            } else {
+                None
+            }
+        }
+        6 => {
+            let forward = if piece_index < 7 { -1 } else { 1 };
+            match (
+                to_file as i32 - from_file as i32,
+                to_rank as i32 - from_rank as i32,
+            ) {
+                (0, dr) if dr == forward => Some(0),
+                (-1, 0) => Some(1),
+                (1, 0) => Some(2),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn threat_slot_to_square(piece_index: usize, from: usize, slot: usize) -> Option<usize> {
+    let file = file_of(from);
+    let rank = rank_of(from);
+    match piece_index % 7 {
+        0 => match slot {
+            0 if rank > 0 => Some(square(file, rank - 1)),
+            1 if rank + 1 < BOARD_RANKS => Some(square(file, rank + 1)),
+            2 if file > 0 => Some(square(file - 1, rank)),
+            3 if file + 1 < BOARD_FILES => Some(square(file + 1, rank)),
+            _ => None,
+        },
+        1 => match slot {
+            0 if file > 0 && rank > 0 => Some(square(file - 1, rank - 1)),
+            1 if file + 1 < BOARD_FILES && rank > 0 => Some(square(file + 1, rank - 1)),
+            2 if file > 0 && rank + 1 < BOARD_RANKS => Some(square(file - 1, rank + 1)),
+            3 if file + 1 < BOARD_FILES && rank + 1 < BOARD_RANKS => {
+                Some(square(file + 1, rank + 1))
+            }
+            _ => None,
+        },
+        2 => match slot {
+            0 if file >= 2 && rank >= 2 => Some(square(file - 2, rank - 2)),
+            1 if file + 2 < BOARD_FILES && rank >= 2 => Some(square(file + 2, rank - 2)),
+            2 if file >= 2 && rank + 2 < BOARD_RANKS => Some(square(file - 2, rank + 2)),
+            3 if file + 2 < BOARD_FILES && rank + 2 < BOARD_RANKS => {
+                Some(square(file + 2, rank + 2))
+            }
+            _ => None,
+        },
+        3 => match slot {
+            0 if file > 0 && rank >= 2 => Some(square(file - 1, rank - 2)),
+            1 if file + 1 < BOARD_FILES && rank >= 2 => Some(square(file + 1, rank - 2)),
+            2 if file > 0 && rank + 2 < BOARD_RANKS => Some(square(file - 1, rank + 2)),
+            3 if file + 1 < BOARD_FILES && rank + 2 < BOARD_RANKS => {
+                Some(square(file + 1, rank + 2))
+            }
+            4 if file >= 2 && rank > 0 => Some(square(file - 2, rank - 1)),
+            5 if file >= 2 && rank + 1 < BOARD_RANKS => Some(square(file - 2, rank + 1)),
+            6 if file + 2 < BOARD_FILES && rank > 0 => Some(square(file + 2, rank - 1)),
+            7 if file + 2 < BOARD_FILES && rank + 1 < BOARD_RANKS => {
+                Some(square(file + 2, rank + 1))
+            }
+            _ => None,
+        },
+        4 | 5 => {
+            if slot < 9 {
+                let to_rank = if slot < rank { slot } else { slot + 1 };
+                (to_rank < BOARD_RANKS).then_some(square(file, to_rank))
+            } else {
+                let file_slot = slot - 9;
+                let to_file = if file_slot < file {
+                    file_slot
+                } else {
+                    file_slot + 1
+                };
+                (to_file < BOARD_FILES).then_some(square(to_file, rank))
+            }
+        }
+        6 => {
+            let forward = if piece_index < 7 { -1 } else { 1 };
+            match slot {
+                0 => {
+                    let to_rank = rank as i32 + forward;
+                    inside_board(file as i32, to_rank).then_some(square(file, to_rank as usize))
+                }
+                1 if file > 0 => Some(square(file - 1, rank)),
+                2 if file + 1 < BOARD_FILES => Some(square(file + 1, rank)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn bucket_div(value: usize, div: usize) -> usize {
     (value / div.max(1)).min(STRATEGIC_BUCKETS - 1)
 }
@@ -412,6 +954,36 @@ fn bucket_signed(value: i32, max_abs: i32) -> usize {
     let shifted = (clamped + max_abs) as usize;
     let scale = (max_abs as usize).saturating_mul(2).max(1);
     ((shifted * (STRATEGIC_BUCKETS - 1)) / scale).min(STRATEGIC_BUCKETS - 1)
+}
+
+fn square(file: usize, rank: usize) -> usize {
+    rank * BOARD_FILES + file
+}
+
+fn inside_board(file: i32, rank: i32) -> bool {
+    (0..BOARD_FILES as i32).contains(&file) && (0..BOARD_RANKS as i32).contains(&rank)
+}
+
+fn inside_palace(color: Color, file: usize, rank: usize) -> bool {
+    (3..=5).contains(&file)
+        && match color {
+            Color::Black => rank <= 2,
+            Color::Red => rank >= 7,
+        }
+}
+
+fn elephant_stays_home(color: Color, rank: usize) -> bool {
+    match color {
+        Color::Black => rank <= 4,
+        Color::Red => rank >= 5,
+    }
+}
+
+fn soldier_crossed_river(color: Color, rank: usize) -> bool {
+    match color {
+        Color::Black => rank >= 5,
+        Color::Red => rank <= 4,
+    }
 }
 
 fn palace_bucket(sq: usize) -> usize {
@@ -512,6 +1084,55 @@ mod tests {
                 .iter()
                 .any(|feature| *feature >= V3_INPUT_SIZE + ROW_INPUT_SIZE)
         );
+        assert!(features.iter().any(|feature| *feature
+            >= V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + KING_ATTACK_INPUT_SIZE));
+        assert!(features.iter().any(|feature| *feature
+            >= V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE
+            && *feature
+                < V3_INPUT_SIZE + ROW_INPUT_SIZE + COL_INPUT_SIZE + KING_ATTACK_INPUT_SIZE));
+        assert!(features.iter().any(|feature| *feature
+            >= V3_INPUT_SIZE
+                + ROW_INPUT_SIZE
+                + COL_INPUT_SIZE
+                + KING_ATTACK_INPUT_SIZE
+                + TACTICAL_INPUT_SIZE
+                + STRATEGIC_INPUT_SIZE));
+        assert!(features.iter().any(|feature| *feature
+            >= V3_INPUT_SIZE
+                + ROW_INPUT_SIZE
+                + COL_INPUT_SIZE
+                + KING_ATTACK_INPUT_SIZE
+                + TACTICAL_INPUT_SIZE
+                + STRATEGIC_INPUT_SIZE));
+    }
+
+    #[test]
+    fn full_threat_features_encode_attacker_from_target_to() {
+        let position = Position::from_fen("4k4/9/9/9/4p4/4R4/9/9/9/4K4 w").unwrap();
+        let features = extract_sparse_features_pure_canonical(&position, &[]);
+        let attacker = canonical_piece_index(
+            Color::Red,
+            Piece {
+                color: Color::Red,
+                kind: PieceKind::Rook,
+            },
+        );
+        let target = canonical_piece_index(
+            Color::Red,
+            Piece {
+                color: Color::Black,
+                kind: PieceKind::Soldier,
+            },
+        );
+        let from = square(4, 5);
+        let to = square(4, 4);
+        let threat = threat_feature_index(
+            attacker,
+            from,
+            threat_slot_for(attacker, from, to).unwrap(),
+            target,
+        );
+        assert!(features.contains(&threat));
     }
 
     #[test]

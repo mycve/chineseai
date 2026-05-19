@@ -16,8 +16,9 @@ mod train_gpu;
 mod train_gpu_candle;
 
 use crate::nnue::{
-    HISTORY_PLIES, HistoryMove, PURE_NNUE_INPUT_SIZE, canonical_move, canonical_square,
-    extract_sparse_features_pure_canonical,
+    HISTORY_PLIES, HistoryMove, POSITIONAL_NNUE_INPUT_SIZE, PURE_NNUE_INPUT_SIZE,
+    THREAT_FEATURE_START, THREAT_INPUT_SIZE, canonical_move, canonical_square,
+    extract_sparse_features_pure_canonical, layer_stack_bucket,
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position};
 
@@ -34,7 +35,7 @@ pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 pub const AZNNUE_BINARY_MAGIC: &[u8] = b"AZB1";
-const AZNNUE_BINARY_VERSION: u32 = 42;
+const AZNNUE_BINARY_VERSION: u32 = 47;
 const AZNNUE_BINARY_HEADER_LEN: usize = 4 + 4 * 3;
 
 fn write_f32_slice_le<W: Write>(writer: &mut W, slice: &[f32]) -> io::Result<()> {
@@ -68,6 +69,8 @@ pub(super) const BOARD_HISTORY_FRAMES: usize = HISTORY_PLIES + 1;
 pub(super) const BOARD_HISTORY_SIZE: usize = BOARD_HISTORY_FRAMES * BOARD_PLANES_SIZE;
 pub(super) const POLICY_CONTEXT_SIZE: usize = 64;
 pub(super) const POLICY_CONDITION_SIZE: usize = 32;
+pub(super) const VALUE_HIDDEN_SIZE: usize = 128;
+pub(super) const LAYER_STACKS: usize = 16;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 
@@ -102,6 +105,7 @@ impl Default for AzNnueArch {
 }
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
+    value_hidden: Vec<f32>,
     value_logits: Vec<f32>,
     policy_context: Vec<f32>,
     policy_condition: Vec<f32>,
@@ -116,6 +120,7 @@ impl AzEvalScratch {
         let hidden_size = arch.hidden_size;
         Self {
             hidden: vec![0.0; hidden_size],
+            value_hidden: vec![0.0; VALUE_HIDDEN_SIZE],
             value_logits: vec![0.0; VALUE_LOGITS],
             policy_context: vec![0.0; POLICY_CONTEXT_SIZE],
             policy_condition: vec![0.0; POLICY_CONDITION_SIZE],
@@ -132,7 +137,12 @@ pub struct AzNnue {
     pub hidden_size: usize,
     pub arch: AzNnueArch,
     pub input_hidden: Vec<f32>,
+    pub threat_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
+    pub psqt_weights: Vec<f32>,
+    pub threat_psqt_weights: Vec<f32>,
+    pub value_hidden_weights: Vec<f32>,
+    pub value_hidden_bias: Vec<f32>,
     pub value_logits_weights: Vec<f32>,
     pub value_logits_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
@@ -152,7 +162,12 @@ impl Clone for AzNnue {
             hidden_size: self.hidden_size,
             arch: self.arch,
             input_hidden: self.input_hidden.clone(),
+            threat_hidden: self.threat_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
+            psqt_weights: self.psqt_weights.clone(),
+            threat_psqt_weights: self.threat_psqt_weights.clone(),
+            value_hidden_weights: self.value_hidden_weights.clone(),
+            value_hidden_bias: self.value_hidden_bias.clone(),
             value_logits_weights: self.value_logits_weights.clone(),
             value_logits_bias: self.value_logits_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
@@ -300,34 +315,48 @@ impl AzNnue {
         }
         let hidden_size = arch.hidden_size;
         let mut rng = SplitMix64::new(seed);
-        let input_hidden: Vec<f32> = (0..PURE_NNUE_INPUT_SIZE * hidden_size)
+        let input_hidden: Vec<f32> = (0..POSITIONAL_NNUE_INPUT_SIZE * hidden_size)
+            .map(|_| rng.weight(0.015))
+            .collect();
+        let threat_hidden: Vec<f32> = (0..THREAT_INPUT_SIZE * hidden_size)
             .map(|_| rng.weight(0.015))
             .collect();
         let hidden_bias = vec![0.0; hidden_size];
-        let value_logits_weights = (0..VALUE_LOGITS * hidden_size)
+        let psqt_weights = vec![0.0; LAYER_STACKS * POSITIONAL_NNUE_INPUT_SIZE];
+        let threat_psqt_weights = vec![0.0; LAYER_STACKS * THREAT_INPUT_SIZE];
+        let value_hidden_weights = (0..LAYER_STACKS * VALUE_HIDDEN_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
-        let value_logits_bias = vec![0.0; VALUE_LOGITS];
+        let value_hidden_bias = vec![0.0; LAYER_STACKS * VALUE_HIDDEN_SIZE];
+        let value_logits_weights = (0..LAYER_STACKS * VALUE_LOGITS * VALUE_HIDDEN_SIZE)
+            .map(|_| rng.weight((2.0 / VALUE_HIDDEN_SIZE as f32).sqrt()))
+            .collect();
+        let value_logits_bias = vec![0.0; LAYER_STACKS * VALUE_LOGITS];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
-        let policy_context_hidden = (0..POLICY_CONTEXT_SIZE * hidden_size)
+        let policy_context_hidden = (0..LAYER_STACKS * POLICY_CONTEXT_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
-        let policy_context_bias = vec![0.0; POLICY_CONTEXT_SIZE];
-        let policy_feature_hidden = (0..POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE)
+        let policy_context_bias = vec![0.0; LAYER_STACKS * POLICY_CONTEXT_SIZE];
+        let policy_feature_hidden = (0..LAYER_STACKS * POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE)
             .map(|_| rng.weight((2.0 / POLICY_CONTEXT_SIZE as f32).sqrt() * 0.5))
             .collect();
-        let policy_feature_bias = vec![0.0; POLICY_CONDITION_SIZE];
-        let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
+        let policy_feature_bias = vec![0.0; LAYER_STACKS * POLICY_CONDITION_SIZE];
+        let policy_from_hidden = (0..LAYER_STACKS * BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
-        let policy_to_hidden = (0..BOARD_SIZE * hidden_size)
+        let policy_to_hidden = (0..LAYER_STACKS * BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
         Self {
             hidden_size,
             arch,
             input_hidden,
+            threat_hidden,
             hidden_bias,
+            psqt_weights,
+            threat_psqt_weights,
+            value_hidden_weights,
+            value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
             policy_move_bias,
@@ -353,7 +382,12 @@ impl AzNnue {
         writer.write_all(&(PURE_NNUE_INPUT_SIZE as u32).to_le_bytes())?;
         writer.write_all(&(self.arch.hidden_size as u32).to_le_bytes())?;
         write_f32_slice_le(&mut writer, &self.input_hidden)?;
+        write_f32_slice_le(&mut writer, &self.threat_hidden)?;
         write_f32_slice_le(&mut writer, &self.hidden_bias)?;
+        write_f32_slice_le(&mut writer, &self.psqt_weights)?;
+        write_f32_slice_le(&mut writer, &self.threat_psqt_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_hidden_weights)?;
+        write_f32_slice_le(&mut writer, &self.value_hidden_bias)?;
         write_f32_slice_le(&mut writer, &self.value_logits_weights)?;
         write_f32_slice_le(&mut writer, &self.value_logits_bias)?;
         write_f32_slice_le(&mut writer, &self.policy_move_bias)?;
@@ -404,19 +438,29 @@ impl AzNnue {
                 format!("AZNNUE binary header arch invalid: {err}"),
             ));
         }
-        let input_hidden_len = PURE_NNUE_INPUT_SIZE * hidden_size;
+        let input_hidden_len = POSITIONAL_NNUE_INPUT_SIZE * hidden_size;
+        let threat_hidden_len = THREAT_INPUT_SIZE * hidden_size;
         let hidden_bias_len = hidden_size;
-        let vlw_len = VALUE_LOGITS * hidden_size;
-        let vlb_len = VALUE_LOGITS;
+        let psqt_len = LAYER_STACKS * POSITIONAL_NNUE_INPUT_SIZE;
+        let threat_psqt_len = LAYER_STACKS * THREAT_INPUT_SIZE;
+        let vhw_len = LAYER_STACKS * VALUE_HIDDEN_SIZE * hidden_size;
+        let vhb_len = LAYER_STACKS * VALUE_HIDDEN_SIZE;
+        let vlw_len = LAYER_STACKS * VALUE_LOGITS * VALUE_HIDDEN_SIZE;
+        let vlb_len = LAYER_STACKS * VALUE_LOGITS;
         let pmb_len = DENSE_MOVE_SPACE;
-        let pch_len = POLICY_CONTEXT_SIZE * hidden_size;
-        let pcb_len = POLICY_CONTEXT_SIZE;
-        let pfh_len = POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE;
-        let pfb_len = POLICY_CONDITION_SIZE;
-        let pfrom_len = BOARD_SIZE * hidden_size;
-        let pto_len = BOARD_SIZE * hidden_size;
+        let pch_len = LAYER_STACKS * POLICY_CONTEXT_SIZE * hidden_size;
+        let pcb_len = LAYER_STACKS * POLICY_CONTEXT_SIZE;
+        let pfh_len = LAYER_STACKS * POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE;
+        let pfb_len = LAYER_STACKS * POLICY_CONDITION_SIZE;
+        let pfrom_len = LAYER_STACKS * BOARD_SIZE * hidden_size;
+        let pto_len = LAYER_STACKS * BOARD_SIZE * hidden_size;
         let float_count = input_hidden_len
+            + threat_hidden_len
             + hidden_bias_len
+            + psqt_len
+            + threat_psqt_len
+            + vhw_len
+            + vhb_len
             + vlw_len
             + vlb_len
             + pmb_len
@@ -439,7 +483,12 @@ impl AzNnue {
             ));
         }
         let input_hidden = read_f32_vec_le(&mut reader, input_hidden_len)?;
+        let threat_hidden = read_f32_vec_le(&mut reader, threat_hidden_len)?;
         let hidden_bias = read_f32_vec_le(&mut reader, hidden_bias_len)?;
+        let psqt_weights = read_f32_vec_le(&mut reader, psqt_len)?;
+        let threat_psqt_weights = read_f32_vec_le(&mut reader, threat_psqt_len)?;
+        let value_hidden_weights = read_f32_vec_le(&mut reader, vhw_len)?;
+        let value_hidden_bias = read_f32_vec_le(&mut reader, vhb_len)?;
         let value_logits_weights = read_f32_vec_le(&mut reader, vlw_len)?;
         let value_logits_bias = read_f32_vec_le(&mut reader, vlb_len)?;
         let policy_move_bias = read_f32_vec_le(&mut reader, pmb_len)?;
@@ -453,7 +502,12 @@ impl AzNnue {
             hidden_size,
             arch,
             input_hidden,
+            threat_hidden,
             hidden_bias,
+            psqt_weights,
+            threat_psqt_weights,
+            value_hidden_weights,
+            value_hidden_bias,
             value_logits_weights,
             value_logits_bias,
             policy_move_bias,
@@ -488,16 +542,26 @@ impl AzNnue {
     ) -> f32 {
         crate::scope_profile!("az.evaluate_with_scratch");
         let side = position.side_to_move();
+        let stack = layer_stack_bucket(position, side).min(LAYER_STACKS - 1);
         let features = extract_sparse_features_pure_canonical(position, history);
+        let psqt = self.psqt_from_features(stack, &features);
         self.input_embedding_into(&features, &mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
-        let value = self.value_from_hidden_into(&scratch.hidden, &mut scratch.value_logits);
+        let value = self.value_from_hidden_into(
+            stack,
+            psqt,
+            &scratch.hidden,
+            &mut scratch.value_hidden,
+            &mut scratch.value_logits,
+        );
         self.policy_condition_into(
+            stack,
             &scratch.hidden,
             &mut scratch.policy_context,
             &mut scratch.policy_condition,
         );
         self.policy_square_scores_into(
+            stack,
             &scratch.hidden,
             &mut scratch.policy_from_scores,
             &mut scratch.policy_to_scores,
@@ -518,8 +582,12 @@ impl AzNnue {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.hidden_bias);
         for &feature in features {
-            let row =
-                &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            let row = if feature >= THREAT_FEATURE_START {
+                let threat = feature - THREAT_FEATURE_START;
+                &self.threat_hidden[threat * self.hidden_size..(threat + 1) * self.hidden_size]
+            } else {
+                &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size]
+            };
             for idx in 0..self.hidden_size {
                 hidden[idx] += row[idx];
             }
@@ -529,38 +597,91 @@ impl AzNnue {
         }
     }
 
-    fn value_from_hidden_into(&self, hidden: &[f32], value_logits: &mut Vec<f32>) -> f32 {
-        value_logits.copy_from_slice(&self.value_logits_bias);
+    fn value_from_hidden_into(
+        &self,
+        stack: usize,
+        psqt: f32,
+        hidden: &[f32],
+        value_hidden: &mut Vec<f32>,
+        value_logits: &mut Vec<f32>,
+    ) -> f32 {
+        value_hidden.resize(VALUE_HIDDEN_SIZE, 0.0);
+        let value_hidden_bias_start = stack * VALUE_HIDDEN_SIZE;
+        value_hidden.copy_from_slice(
+            &self.value_hidden_bias
+                [value_hidden_bias_start..value_hidden_bias_start + VALUE_HIDDEN_SIZE],
+        );
+        for (feature, value) in value_hidden.iter_mut().enumerate().take(VALUE_HIDDEN_SIZE) {
+            let row_start = (stack * VALUE_HIDDEN_SIZE + feature) * self.hidden_size;
+            let row = &self.value_hidden_weights[row_start..row_start + self.hidden_size];
+            *value += dot_product(hidden, row);
+            *value = (*value).max(0.0);
+        }
+        let value_logits_bias_start = stack * VALUE_LOGITS;
+        value_logits.copy_from_slice(
+            &self.value_logits_bias
+                [value_logits_bias_start..value_logits_bias_start + VALUE_LOGITS],
+        );
         for out in 0..VALUE_LOGITS {
-            let row =
-                &self.value_logits_weights[out * self.hidden_size..(out + 1) * self.hidden_size];
-            for (hidden_value, weight) in hidden.iter().zip(row) {
+            let row_start = (stack * VALUE_LOGITS + out) * VALUE_HIDDEN_SIZE;
+            let row = &self.value_logits_weights[row_start..row_start + VALUE_HIDDEN_SIZE];
+            for (hidden_value, weight) in value_hidden.iter().zip(row) {
                 value_logits[out] += hidden_value * weight;
             }
         }
+        value_logits[0] += psqt;
+        value_logits[2] -= psqt;
         scalar_value_from_logits(value_logits).0
     }
 
-    fn policy_condition_into(&self, hidden: &[f32], context: &mut Vec<f32>, out: &mut Vec<f32>) {
+    fn psqt_from_features(&self, stack: usize, features: &[usize]) -> f32 {
+        let mut psqt = 0.0;
+        for &feature in features {
+            if feature >= THREAT_FEATURE_START {
+                let threat = feature - THREAT_FEATURE_START;
+                psqt += self.threat_psqt_weights[stack * THREAT_INPUT_SIZE + threat];
+            } else {
+                psqt += self.psqt_weights[stack * POSITIONAL_NNUE_INPUT_SIZE + feature];
+            }
+        }
+        psqt
+    }
+
+    fn policy_condition_into(
+        &self,
+        stack: usize,
+        hidden: &[f32],
+        context: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) {
         context.resize(POLICY_CONTEXT_SIZE, 0.0);
-        context.copy_from_slice(&self.policy_context_bias);
+        let context_bias_start = stack * POLICY_CONTEXT_SIZE;
+        context.copy_from_slice(
+            &self.policy_context_bias[context_bias_start..context_bias_start + POLICY_CONTEXT_SIZE],
+        );
         for (feature, value) in context.iter_mut().enumerate().take(POLICY_CONTEXT_SIZE) {
-            let hidden_row = &self.policy_context_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            let row_start = (stack * POLICY_CONTEXT_SIZE + feature) * self.hidden_size;
+            let hidden_row = &self.policy_context_hidden[row_start..row_start + self.hidden_size];
             *value += dot_product(hidden, hidden_row);
             *value = (*value).max(0.0);
         }
         out.resize(POLICY_CONDITION_SIZE, 0.0);
-        out.copy_from_slice(&self.policy_feature_bias);
+        let feature_bias_start = stack * POLICY_CONDITION_SIZE;
+        out.copy_from_slice(
+            &self.policy_feature_bias
+                [feature_bias_start..feature_bias_start + POLICY_CONDITION_SIZE],
+        );
         for (feature, value) in out.iter_mut().enumerate().take(POLICY_CONDITION_SIZE) {
-            let hidden_row = &self.policy_feature_hidden
-                [feature * POLICY_CONTEXT_SIZE..(feature + 1) * POLICY_CONTEXT_SIZE];
+            let row_start = (stack * POLICY_CONDITION_SIZE + feature) * POLICY_CONTEXT_SIZE;
+            let hidden_row =
+                &self.policy_feature_hidden[row_start..row_start + POLICY_CONTEXT_SIZE];
             *value += dot_product(context, hidden_row);
         }
     }
 
     fn policy_square_scores_into(
         &self,
+        stack: usize,
         hidden: &[f32],
         from_scores: &mut Vec<f32>,
         to_scores: &mut Vec<f32>,
@@ -568,7 +689,7 @@ impl AzNnue {
         from_scores.resize(BOARD_SIZE, 0.0);
         to_scores.resize(BOARD_SIZE, 0.0);
         for square in 0..BOARD_SIZE {
-            let start = square * self.hidden_size;
+            let start = (stack * BOARD_SIZE + square) * self.hidden_size;
             let end = start + self.hidden_size;
             from_scores[square] = dot_product(hidden, &self.policy_from_hidden[start..end]);
             to_scores[square] = dot_product(hidden, &self.policy_to_hidden[start..end]);
@@ -590,17 +711,23 @@ impl AzNnue {
             ));
         }
         let hidden = arch.hidden_size;
-        if self.input_hidden.len() != PURE_NNUE_INPUT_SIZE * hidden
+        if self.input_hidden.len() != POSITIONAL_NNUE_INPUT_SIZE * hidden
+            || self.threat_hidden.len() != THREAT_INPUT_SIZE * hidden
             || self.hidden_bias.len() != hidden
-            || self.value_logits_weights.len() != VALUE_LOGITS * hidden
-            || self.value_logits_bias.len() != VALUE_LOGITS
+            || self.psqt_weights.len() != LAYER_STACKS * POSITIONAL_NNUE_INPUT_SIZE
+            || self.threat_psqt_weights.len() != LAYER_STACKS * THREAT_INPUT_SIZE
+            || self.value_hidden_weights.len() != LAYER_STACKS * VALUE_HIDDEN_SIZE * hidden
+            || self.value_hidden_bias.len() != LAYER_STACKS * VALUE_HIDDEN_SIZE
+            || self.value_logits_weights.len() != LAYER_STACKS * VALUE_LOGITS * VALUE_HIDDEN_SIZE
+            || self.value_logits_bias.len() != LAYER_STACKS * VALUE_LOGITS
             || self.policy_move_bias.len() != DENSE_MOVE_SPACE
-            || self.policy_context_hidden.len() != POLICY_CONTEXT_SIZE * hidden
-            || self.policy_context_bias.len() != POLICY_CONTEXT_SIZE
-            || self.policy_feature_hidden.len() != POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE
-            || self.policy_feature_bias.len() != POLICY_CONDITION_SIZE
-            || self.policy_from_hidden.len() != BOARD_SIZE * hidden
-            || self.policy_to_hidden.len() != BOARD_SIZE * hidden
+            || self.policy_context_hidden.len() != LAYER_STACKS * POLICY_CONTEXT_SIZE * hidden
+            || self.policy_context_bias.len() != LAYER_STACKS * POLICY_CONTEXT_SIZE
+            || self.policy_feature_hidden.len()
+                != LAYER_STACKS * POLICY_CONDITION_SIZE * POLICY_CONTEXT_SIZE
+            || self.policy_feature_bias.len() != LAYER_STACKS * POLICY_CONDITION_SIZE
+            || self.policy_from_hidden.len() != LAYER_STACKS * BOARD_SIZE * hidden
+            || self.policy_to_hidden.len() != LAYER_STACKS * BOARD_SIZE * hidden
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

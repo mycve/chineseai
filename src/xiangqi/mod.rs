@@ -38,6 +38,36 @@ impl Position {
         Self::from_fen(STARTPOS_FEN).expect("valid start position")
     }
 
+    pub fn empty_for_features(side_to_move: Color) -> Self {
+        let mut position = Self {
+            board: [None; BOARD_SIZE],
+            side_to_move,
+            hash: 0,
+            base_eval: 0,
+            advisor_counts: [0; 2],
+            elephant_counts: [0; 2],
+            dynamic_material_counts: [0; 2],
+            general_squares: [None; 2],
+            halfmove_clock: 0,
+        };
+        position.hash = position.compute_state().hash;
+        position
+    }
+
+    pub fn set_piece_for_features(&mut self, sq: usize, piece: Piece) {
+        if sq >= BOARD_SIZE {
+            return;
+        }
+        self.board[sq] = Some(piece);
+        let state = self.compute_state();
+        self.hash = state.hash;
+        self.base_eval = state.base_eval;
+        self.advisor_counts = state.advisor_counts;
+        self.elephant_counts = state.elephant_counts;
+        self.dynamic_material_counts = state.dynamic_material_counts;
+        self.general_squares = state.general_squares;
+    }
+
     pub fn from_fen(fen: &str) -> Result<Self, String> {
         let mut parts = fen.split_whitespace();
         let board_part = parts.next().ok_or("missing board description")?;
