@@ -149,6 +149,7 @@ scale = (50 + 480) * 0.1 = 53
 - 在 `1024/2048` sims 下，优先试 `gumbel_value_scale = 0.01`。
 - 如果 policy CE 仍不稳或 target 偏尖，再试 `0.005`。
 - 暂时避免用 `0.1` 搭配高 sims。
+- 代码默认值已从 `0.1` 改为 `0.01`，UCI 中也可通过 `GumbelValueScale` 显式覆盖。
 
 经验结论：
 

@@ -15,7 +15,7 @@ impl Default for AzGumbelConfig {
         Self {
             max_num_considered_actions: 16,
             gumbel_scale: 1.0,
-            value_scale: 0.1,
+            value_scale: 0.01,
             maxvisit_init: 50.0,
             rescale_values: true,
             use_mixed_value: true,

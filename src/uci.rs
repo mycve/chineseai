@@ -140,6 +140,10 @@ fn print_uci_id() {
     );
     println!("option name GumbelMaxActions type spin default 16 min 1 max 512");
     println!("option name GumbelScale type string default 0.0");
+    println!("option name GumbelValueScale type string default 0.01");
+    println!("option name GumbelMaxVisitInit type string default 50.0");
+    println!("option name GumbelRescaleValues type check default true");
+    println!("option name GumbelUseMixedValue type check default true");
     println!("option name PolicyDebug type check default false");
     println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
@@ -206,8 +210,26 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .unwrap_or(state.gumbel.gumbel_scale)
                 .max(0.0);
         }
+        "gumbelvaluescale" => {
+            state.gumbel.value_scale = value
+                .parse::<f32>()
+                .unwrap_or(state.gumbel.value_scale)
+                .max(0.0);
+        }
+        "gumbelmaxvisitinit" => {
+            state.gumbel.maxvisit_init = value
+                .parse::<f32>()
+                .unwrap_or(state.gumbel.maxvisit_init)
+                .max(0.0);
+        }
+        "gumbelrescalevalues" => {
+            state.gumbel.rescale_values = parse_uci_bool(&value, state.gumbel.rescale_values);
+        }
+        "gumbelusemixedvalue" => {
+            state.gumbel.use_mixed_value = parse_uci_bool(&value, state.gumbel.use_mixed_value);
+        }
         "policydebug" => {
-            state.policy_debug = matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on");
+            state.policy_debug = parse_uci_bool(&value, state.policy_debug);
         }
         "policydebuglimit" => {
             state.policy_debug_limit = value
@@ -216,6 +238,14 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .clamp(1, 256);
         }
         _ => {}
+    }
+}
+
+fn parse_uci_bool(value: &str, fallback: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => true,
+        "false" | "0" | "off" | "no" => false,
+        _ => fallback,
     }
 }
 
