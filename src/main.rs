@@ -112,7 +112,7 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 1.0)]
     gumbel_scale: f32,
     /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.1)]
     gumbel_value_scale: f32,
     /// Gumbel max-visit initialization.
     #[arg(long, default_value_t = 50.0)]
@@ -155,7 +155,7 @@ struct AzBenchArgs {
     #[arg(long, default_value_t = 1.0)]
     gumbel_scale: f32,
     /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.1)]
     gumbel_value_scale: f32,
     /// Gumbel max-visit initialization.
     #[arg(long, default_value_t = 50.0)]
@@ -232,7 +232,7 @@ struct VsPikafishArgs {
     #[arg(long, default_value_t = 1.0)]
     gumbel_scale: f32,
     /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.1)]
     gumbel_value_scale: f32,
     /// Gumbel max-visit initialization.
     #[arg(long, default_value_t = 50.0)]
@@ -285,7 +285,7 @@ struct AzDiagnoseArgs {
     #[arg(long, default_value_t = 0.0)]
     gumbel_scale: f32,
     /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.1)]
     gumbel_value_scale: f32,
     /// Gumbel max-visit initialization.
     #[arg(long, default_value_t = 50.0)]

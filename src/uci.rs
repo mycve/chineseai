@@ -140,7 +140,7 @@ fn print_uci_id() {
     );
     println!("option name GumbelMaxActions type spin default 16 min 1 max 512");
     println!("option name GumbelScale type string default 0.0");
-    println!("option name GumbelValueScale type string default 0.01");
+    println!("option name GumbelValueScale type string default 0.1");
     println!("option name GumbelMaxVisitInit type string default 50.0");
     println!("option name GumbelRescaleValues type check default true");
     println!("option name GumbelUseMixedValue type check default true");
