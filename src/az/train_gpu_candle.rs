@@ -1,17 +1,14 @@
-use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
+﻿use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 use candle_nn::ops::{log_softmax, softmax};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, thread};
 
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, DENSE_MOVE_SPACE,
-    LAYER_STACKS, POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, VALUE_HIDDEN_SIZE, VALUE_LOGITS,
-    policy_move_features, policy_move_from_features, policy_move_to_features,
+    POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, VALUE_LOGITS, policy_move_features,
+    policy_move_from_features, policy_move_to_features,
 };
-use crate::nnue::{
-    POSITIONAL_NNUE_INPUT_SIZE, PURE_NNUE_INPUT_SIZE, THREAT_FEATURE_START, THREAT_INPUT_SIZE,
-    layer_stack_bucket,
-};
+use crate::nnue::PURE_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -40,12 +37,7 @@ struct GpuReplica {
 #[derive(Debug)]
 struct GpuVars {
     input_hidden: Var,
-    threat_hidden: Var,
     hidden_bias: Var,
-    psqt_weights: Var,
-    threat_psqt_weights: Var,
-    value_hidden_weights: Var,
-    value_hidden_bias: Var,
     value_logits_weights: Var,
     value_logits_bias: Var,
     policy_move_bias: Var,
@@ -58,7 +50,6 @@ struct GpuVars {
     policy_move_features: Tensor,
     policy_move_from_features: Tensor,
     policy_move_to_features: Tensor,
-    value_psqt_direction: Tensor,
 }
 
 pub(crate) fn training_cuda_device_count() -> usize {
@@ -479,23 +470,14 @@ impl GpuReplica {
     fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
         let hidden_size = self.arch.hidden_size;
-        let positional_embeddings = self
+        let feature_embeddings = self
             .vars
             .input_hidden
-            .index_select(&batch.positional_feature_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_positional_features, hidden_size))?;
-        let threat_embeddings = self
-            .vars
-            .threat_hidden
-            .index_select(&batch.threat_feature_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_threat_features, hidden_size))?;
-        let positional_hidden = positional_embeddings
-            .broadcast_mul(&batch.positional_feature_mask)?
-            .sum(1)?;
-        let threat_hidden = threat_embeddings
-            .broadcast_mul(&batch.threat_feature_mask)?
-            .sum(1)?;
-        let sparse_hidden = (positional_hidden + threat_hidden)?
+            .index_select(&batch.feature_indices.flatten_all()?, 0)?
+            .reshape((bsz, batch.max_features, hidden_size))?;
+        let sparse_hidden = feature_embeddings
+            .broadcast_mul(&batch.feature_mask)?
+            .sum(1)?
             .broadcast_add(&self.vars.hidden_bias)?
             .relu()?;
         let rms = sparse_hidden
@@ -504,67 +486,22 @@ impl GpuReplica {
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
-        let psqt = self.psqt_output(batch)?;
 
-        let value_hidden_weights = self
-            .vars
-            .value_hidden_weights
-            .index_select(&batch.stack_indices, 0)?;
-        let value_hidden_bias = self
-            .vars
-            .value_hidden_bias
-            .index_select(&batch.stack_indices, 0)?;
-        let value_hidden = stacked_linear(&hidden, &value_hidden_weights)?
-            .broadcast_add(&value_hidden_bias)?
-            .relu()?;
-        let value_logits_weights = self
-            .vars
-            .value_logits_weights
-            .index_select(&batch.stack_indices, 0)?;
-        let value_logits_bias = self
-            .vars
-            .value_logits_bias
-            .index_select(&batch.stack_indices, 0)?;
-        let value_logits = stacked_linear(&value_hidden, &value_logits_weights)?
-            .broadcast_add(&value_logits_bias)?;
-        let value_logits = (value_logits
-            + psqt
-                .unsqueeze(1)?
-                .broadcast_mul(&self.vars.value_psqt_direction)?)?;
+        let value_logits = hidden
+            .matmul(&self.vars.value_logits_weights.t()?)?
+            .broadcast_add(&self.vars.value_logits_bias)?;
         let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
-        let policy_context_hidden = self
-            .vars
-            .policy_context_hidden
-            .index_select(&batch.stack_indices, 0)?;
-        let policy_context_bias = self
-            .vars
-            .policy_context_bias
-            .index_select(&batch.stack_indices, 0)?;
-        let policy_context = stacked_linear(&hidden, &policy_context_hidden)?
-            .broadcast_add(&policy_context_bias)?
+        let policy_context = hidden
+            .matmul(&self.vars.policy_context_hidden.t()?)?
+            .broadcast_add(&self.vars.policy_context_bias)?
             .relu()?;
-        let policy_feature_hidden = self
-            .vars
-            .policy_feature_hidden
-            .index_select(&batch.stack_indices, 0)?;
-        let policy_feature_bias = self
-            .vars
-            .policy_feature_bias
-            .index_select(&batch.stack_indices, 0)?;
-        let policy_condition = stacked_linear(&policy_context, &policy_feature_hidden)?
-            .broadcast_add(&policy_feature_bias)?;
+        let policy_condition = policy_context
+            .matmul(&self.vars.policy_feature_hidden.t()?)?
+            .broadcast_add(&self.vars.policy_feature_bias)?;
         let policy_feature_logits =
             policy_condition.matmul(&self.vars.policy_move_features.t()?)?;
-        let policy_from_hidden = self
-            .vars
-            .policy_from_hidden
-            .index_select(&batch.stack_indices, 0)?;
-        let policy_to_hidden = self
-            .vars
-            .policy_to_hidden
-            .index_select(&batch.stack_indices, 0)?;
-        let policy_from_scores = stacked_linear(&hidden, &policy_from_hidden)?;
-        let policy_to_scores = stacked_linear(&hidden, &policy_to_hidden)?;
+        let policy_from_scores = hidden.matmul(&self.vars.policy_from_hidden.t()?)?;
+        let policy_to_scores = hidden.matmul(&self.vars.policy_to_hidden.t()?)?;
         let policy_from_logits =
             policy_from_scores.matmul(&self.vars.policy_move_from_features.t()?)?;
         let policy_to_logits = policy_to_scores.matmul(&self.vars.policy_move_to_features.t()?)?;
@@ -576,31 +513,6 @@ impl GpuReplica {
             policy_logits,
         })
     }
-
-    fn psqt_output(&self, batch: &BatchTensors) -> CandleResult<Tensor> {
-        let bsz = batch.batch_size;
-        let positional = self
-            .vars
-            .psqt_weights
-            .index_select(&batch.positional_psqt_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_positional_features))?;
-        let threat = self
-            .vars
-            .threat_psqt_weights
-            .index_select(&batch.threat_psqt_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_threat_features))?;
-        let positional = positional
-            .broadcast_mul(&batch.positional_feature_mask.squeeze(2)?)?
-            .sum(1)?;
-        let threat = threat
-            .broadcast_mul(&batch.threat_feature_mask.squeeze(2)?)?
-            .sum(1)?;
-        positional + threat
-    }
-}
-
-fn stacked_linear(input: &Tensor, weights: &Tensor) -> CandleResult<Tensor> {
-    input.unsqueeze(1)?.broadcast_mul(weights)?.sum(2)
 }
 
 struct ShardOutput {
@@ -616,15 +528,9 @@ struct ForwardOutput {
 
 struct BatchTensors {
     batch_size: usize,
-    max_positional_features: usize,
-    positional_feature_indices: Tensor,
-    positional_psqt_indices: Tensor,
-    positional_feature_mask: Tensor,
-    max_threat_features: usize,
-    threat_feature_indices: Tensor,
-    threat_psqt_indices: Tensor,
-    threat_feature_mask: Tensor,
-    stack_indices: Tensor,
+    max_features: usize,
+    feature_indices: Tensor,
+    feature_mask: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
     value_targets: Tensor,
@@ -634,39 +540,14 @@ struct BatchTensors {
 impl BatchTensors {
     fn new(samples: &[AzTrainingSample], batch: &[usize], device: &Device) -> CandleResult<Self> {
         let batch_size = batch.len();
-        let max_positional_features = batch
+        let max_features = batch
             .iter()
-            .map(|&sample_index| {
-                samples[sample_index]
-                    .features
-                    .iter()
-                    .filter(|&&feature| feature < THREAT_FEATURE_START)
-                    .count()
-            })
+            .map(|&sample_index| samples[sample_index].features.len())
             .max()
             .unwrap_or(0)
             .max(1);
-        let max_threat_features = batch
-            .iter()
-            .map(|&sample_index| {
-                samples[sample_index]
-                    .features
-                    .iter()
-                    .filter(|&&feature| {
-                        (THREAT_FEATURE_START..PURE_NNUE_INPUT_SIZE).contains(&feature)
-                    })
-                    .count()
-            })
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let mut positional_feature_indices = vec![0u32; batch_size * max_positional_features];
-        let mut positional_psqt_indices = vec![0u32; batch_size * max_positional_features];
-        let mut positional_feature_mask = vec![0.0f32; batch_size * max_positional_features];
-        let mut threat_feature_indices = vec![0u32; batch_size * max_threat_features];
-        let mut threat_psqt_indices = vec![0u32; batch_size * max_threat_features];
-        let mut threat_feature_mask = vec![0.0f32; batch_size * max_threat_features];
-        let mut stack_indices = vec![0u32; batch_size];
+        let mut feature_indices = vec![0u32; batch_size * max_features];
+        let mut feature_mask = vec![0.0f32; batch_size * max_features];
         let mut policy_targets = vec![0.0f32; batch_size * DENSE_MOVE_SPACE];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * DENSE_MOVE_SPACE];
         let mut value_targets = vec![0.0f32; batch_size * VALUE_LOGITS];
@@ -674,28 +555,11 @@ impl BatchTensors {
 
         for (row, &sample_index) in batch.iter().enumerate() {
             let sample = &samples[sample_index];
-            let stack = board_stack_bucket(sample);
-            stack_indices[row] = stack as u32;
-            let positional_feature_base = row * max_positional_features;
-            let threat_feature_base = row * max_threat_features;
-            let mut positional_offset = 0usize;
-            let mut threat_offset = 0usize;
-            for &feature in sample.features.iter() {
-                if feature < THREAT_FEATURE_START {
-                    positional_feature_indices[positional_feature_base + positional_offset] =
-                        feature as u32;
-                    positional_psqt_indices[positional_feature_base + positional_offset] =
-                        (stack * POSITIONAL_NNUE_INPUT_SIZE + feature) as u32;
-                    positional_feature_mask[positional_feature_base + positional_offset] = 1.0;
-                    positional_offset += 1;
-                } else if feature < PURE_NNUE_INPUT_SIZE {
-                    let threat_feature = feature - THREAT_FEATURE_START;
-                    threat_feature_indices[threat_feature_base + threat_offset] =
-                        threat_feature as u32;
-                    threat_psqt_indices[threat_feature_base + threat_offset] =
-                        (stack * THREAT_INPUT_SIZE + threat_feature) as u32;
-                    threat_feature_mask[threat_feature_base + threat_offset] = 1.0;
-                    threat_offset += 1;
+            let feature_base = row * max_features;
+            for (feature_offset, &feature) in sample.features.iter().enumerate() {
+                if feature < PURE_NNUE_INPUT_SIZE {
+                    feature_indices[feature_base + feature_offset] = feature as u32;
+                    feature_mask[feature_base + feature_offset] = 1.0;
                 }
             }
 
@@ -720,39 +584,9 @@ impl BatchTensors {
 
         Ok(Self {
             batch_size,
-            max_positional_features,
-            positional_feature_indices: Tensor::from_vec(
-                positional_feature_indices,
-                (batch_size, max_positional_features),
-                device,
-            )?,
-            positional_psqt_indices: Tensor::from_vec(
-                positional_psqt_indices,
-                (batch_size, max_positional_features),
-                device,
-            )?,
-            positional_feature_mask: Tensor::from_vec(
-                positional_feature_mask,
-                (batch_size, max_positional_features, 1),
-                device,
-            )?,
-            max_threat_features,
-            threat_feature_indices: Tensor::from_vec(
-                threat_feature_indices,
-                (batch_size, max_threat_features),
-                device,
-            )?,
-            threat_psqt_indices: Tensor::from_vec(
-                threat_psqt_indices,
-                (batch_size, max_threat_features),
-                device,
-            )?,
-            threat_feature_mask: Tensor::from_vec(
-                threat_feature_mask,
-                (batch_size, max_threat_features, 1),
-                device,
-            )?,
-            stack_indices: Tensor::from_vec(stack_indices, batch_size, device)?,
+            max_features,
+            feature_indices: Tensor::from_vec(feature_indices, (batch_size, max_features), device)?,
+            feature_mask: Tensor::from_vec(feature_mask, (batch_size, max_features, 1), device)?,
             policy_targets: Tensor::from_vec(
                 policy_targets,
                 (batch_size, DENSE_MOVE_SPACE),
@@ -765,37 +599,6 @@ impl BatchTensors {
     }
 }
 
-fn board_stack_bucket(sample: &AzTrainingSample) -> usize {
-    use crate::xiangqi::{Color, Position};
-
-    let mut position = Position::empty_for_features(Color::Red);
-    for (sq, &plane) in sample.board.iter().take(BOARD_SIZE).enumerate() {
-        let Some(piece) = piece_from_plane(plane) else {
-            continue;
-        };
-        position.set_piece_for_features(sq, piece);
-    }
-    layer_stack_bucket(&position, Color::Red).min(LAYER_STACKS - 1)
-}
-
-fn piece_from_plane(plane: u8) -> Option<crate::xiangqi::Piece> {
-    use crate::xiangqi::{Color, Piece, PieceKind};
-
-    let index = plane.checked_sub(1)? as usize;
-    let color = if index < 7 { Color::Red } else { Color::Black };
-    let kind = match index % 7 {
-        0 => PieceKind::General,
-        1 => PieceKind::Advisor,
-        2 => PieceKind::Elephant,
-        3 => PieceKind::Horse,
-        4 => PieceKind::Rook,
-        5 => PieceKind::Cannon,
-        6 => PieceKind::Soldier,
-        _ => return None,
-    };
-    Some(Piece { color, kind })
-}
-
 impl GpuVars {
     fn from_model(model: &AzNnue, device: &Device) -> CandleResult<Self> {
         let arch = model.arch;
@@ -803,74 +606,45 @@ impl GpuVars {
         Ok(Self {
             input_hidden: var_from_slice(
                 &model.input_hidden,
-                (POSITIONAL_NNUE_INPUT_SIZE, hidden),
-                device,
-            )?,
-            threat_hidden: var_from_slice(
-                &model.threat_hidden,
-                (THREAT_INPUT_SIZE, hidden),
+                (PURE_NNUE_INPUT_SIZE, hidden),
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            psqt_weights: var_from_slice(
-                &model.psqt_weights,
-                LAYER_STACKS * POSITIONAL_NNUE_INPUT_SIZE,
-                device,
-            )?,
-            threat_psqt_weights: var_from_slice(
-                &model.threat_psqt_weights,
-                LAYER_STACKS * THREAT_INPUT_SIZE,
-                device,
-            )?,
-            value_hidden_weights: var_from_slice(
-                &model.value_hidden_weights,
-                (LAYER_STACKS, VALUE_HIDDEN_SIZE, hidden),
-                device,
-            )?,
-            value_hidden_bias: var_from_slice(
-                &model.value_hidden_bias,
-                (LAYER_STACKS, VALUE_HIDDEN_SIZE),
-                device,
-            )?,
             value_logits_weights: var_from_slice(
                 &model.value_logits_weights,
-                (LAYER_STACKS, VALUE_LOGITS, VALUE_HIDDEN_SIZE),
+                (VALUE_LOGITS, hidden),
                 device,
             )?,
-            value_logits_bias: var_from_slice(
-                &model.value_logits_bias,
-                (LAYER_STACKS, VALUE_LOGITS),
-                device,
-            )?,
+            value_logits_bias: var_from_slice(&model.value_logits_bias, VALUE_LOGITS, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_context_hidden: var_from_slice(
                 &model.policy_context_hidden,
-                (LAYER_STACKS, POLICY_CONTEXT_SIZE, hidden),
+                (POLICY_CONTEXT_SIZE, hidden),
                 device,
             )?,
             policy_context_bias: var_from_slice(
                 &model.policy_context_bias,
-                (LAYER_STACKS, POLICY_CONTEXT_SIZE),
+                POLICY_CONTEXT_SIZE,
                 device,
             )?,
             policy_feature_hidden: var_from_slice(
                 &model.policy_feature_hidden,
-                (LAYER_STACKS, POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE),
+                (POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE),
                 device,
             )?,
             policy_feature_bias: var_from_slice(
                 &model.policy_feature_bias,
-                (LAYER_STACKS, POLICY_CONDITION_SIZE),
+                POLICY_CONDITION_SIZE,
                 device,
             )?,
             policy_from_hidden: var_from_slice(
                 &model.policy_from_hidden,
-                (LAYER_STACKS, BOARD_SIZE, hidden),
+                (BOARD_SIZE, hidden),
                 device,
             )?,
             policy_to_hidden: var_from_slice(
                 &model.policy_to_hidden,
-                (LAYER_STACKS, BOARD_SIZE, hidden),
+                (BOARD_SIZE, hidden),
                 device,
             )?,
             policy_move_features: Tensor::from_vec(
@@ -888,23 +662,13 @@ impl GpuVars {
                 (DENSE_MOVE_SPACE, BOARD_SIZE),
                 device,
             )?,
-            value_psqt_direction: Tensor::from_vec(
-                vec![1.0f32, 0.0, -1.0],
-                (1, VALUE_LOGITS),
-                device,
-            )?,
         })
     }
 
     fn all_vars(&self) -> Vec<Var> {
         let mut vars = Vec::new();
         vars.push(self.input_hidden.clone());
-        vars.push(self.threat_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.psqt_weights.clone());
-        vars.push(self.threat_psqt_weights.clone());
-        vars.push(self.value_hidden_weights.clone());
-        vars.push(self.value_hidden_bias.clone());
         vars.push(self.value_logits_weights.clone());
         vars.push(self.value_logits_bias.clone());
         vars.push(self.policy_move_bias.clone());
@@ -920,17 +684,12 @@ impl GpuVars {
     fn shared_vars(&self) -> Vec<Var> {
         let mut vars = Vec::new();
         vars.push(self.input_hidden.clone());
-        vars.push(self.threat_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.psqt_weights.clone());
-        vars.push(self.threat_psqt_weights.clone());
         vars
     }
 
     fn value_head_vars(&self) -> Vec<Var> {
         vec![
-            self.value_hidden_weights.clone(),
-            self.value_hidden_bias.clone(),
             self.value_logits_weights.clone(),
             self.value_logits_bias.clone(),
         ]
@@ -968,12 +727,7 @@ impl GpuVars {
 
     fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
         copy_var(&self.input_hidden, &mut model.input_hidden)?;
-        copy_var(&self.threat_hidden, &mut model.threat_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
-        copy_var(&self.psqt_weights, &mut model.psqt_weights)?;
-        copy_var(&self.threat_psqt_weights, &mut model.threat_psqt_weights)?;
-        copy_var(&self.value_hidden_weights, &mut model.value_hidden_weights)?;
-        copy_var(&self.value_hidden_bias, &mut model.value_hidden_bias)?;
         copy_var(&self.value_logits_weights, &mut model.value_logits_weights)?;
         copy_var(&self.value_logits_bias, &mut model.value_logits_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
