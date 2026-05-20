@@ -107,3 +107,51 @@
 - 固定墙钟时间下的 arena/vs-pikafish，而不是只看同 update 的 loss。
 
 注意：policy target smoothing 会改变训练目标分布，不是无代价操作。若要试，建议从很小的 `eps = 0.01` 或 `0.02` 开始，并用 arena 验证是否真的提升棋力。
+
+## Gumbel value scale 经验
+
+当前自对弈样本里的 policy target 使用的是 `candidate.policy`。在 Gumbel AlphaZero 模式下，它不是简单的 `visits / sum(visits)`，而是 Gumbel MuZero 风格的 improved policy：
+
+```text
+policy = softmax(policy_logit + completed_qvalue)
+```
+
+其中 completed Q 会经过缩放：
+
+```text
+scale = (maxvisit_init + max_visit) * gumbel_value_scale
+```
+
+因此 `gumbel_value_scale` 必须和模拟次数一起看。之前使用：
+
+```text
+sims = 1024 或 2048
+gumbel_value_scale = 0.1
+maxvisit_init = 50
+```
+
+在根节点 `max_visit` 达到几百时，`scale` 会变成几十。例如 `max_visit = 480` 时：
+
+```text
+scale = (50 + 480) * 0.1 = 53
+```
+
+这会让 `softmax(policy_logit + completed_qvalue)` 接近 one-hot。实际 visits 可能仍然分散，但训练 target 会非常尖，导致 policy head 学习困难、输出过度自信，也会掩盖模型结构实验的收益。
+
+实测同一局面：
+
+- `gumbel_value_scale = 0.1` 时，top policy 可接近 `0.997`，其它动作接近 0。
+- `gumbel_value_scale = 0.005` 时，top policy 约 `0.216`，分布更接近 visits。
+- `gumbel_value_scale = 0.01` 时，top policy 约 `0.17`，仍保持较软分布，同时保留 Q 改善信号。
+
+后续训练建议：
+
+- 在 `1024/2048` sims 下，优先试 `gumbel_value_scale = 0.01`。
+- 如果 policy CE 仍不稳或 target 偏尖，再试 `0.005`。
+- 暂时避免用 `0.1` 搭配高 sims。
+
+经验结论：
+
+- 之前 policy 拟合差，不一定是模型结构容量不足。
+- 更可能是 Gumbel improved policy 的 value scale 与模拟次数不匹配，导致 target 过尖。
+- 先校准 `gumbel_value_scale`，再重新判断是否需要模型结构改动。
