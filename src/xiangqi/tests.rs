@@ -493,3 +493,16 @@ fn five_repetition_cycles_without_forcing_draw() {
         Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
     );
 }
+
+#[test]
+fn double_check_can_be_evaded_by_moving_cannon_screen_to_capture_checker() {
+    let position = Position::from_fen(
+        "4k4/4a1c2/b1nN1a3/2C5p/7r1/2P1C4/P3P1n1P/4B1N2/4A4/2BAK4 b",
+    )
+    .unwrap();
+    assert!(position.in_check(Color::Black));
+
+    let mv = Move::from_uci("e8d7").unwrap();
+    assert!(position.is_legal_move(mv));
+    assert!(position.legal_moves().contains(&mv));
+}

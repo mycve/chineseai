@@ -506,7 +506,7 @@ impl Position {
         let mut evasions = Vec::with_capacity(24);
         self.gen_general_moves(king_sq, king_piece, MoveGenMode::All, &mut evasions);
         if checkers.len() != 1 {
-            return evasions;
+            return self.pseudo_legal_moves();
         }
 
         let checker = checkers[0];
