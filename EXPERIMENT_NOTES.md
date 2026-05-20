@@ -136,7 +136,9 @@ maxvisit_init = 50
 scale = (50 + 480) * 0.1 = 53
 ```
 
-这会让 `softmax(policy_logit + completed_qvalue)` 接近 one-hot。实际 visits 可能仍然分散，但训练 target 会非常尖，导致 policy head 学习困难、输出过度自信，也会掩盖模型结构实验的收益。
+这会让 `softmax(policy_logit + completed_qvalue)` 变得很尖。实际 visits 可能仍然分散，但 improved policy 会更接近单一最优动作。
+
+注意：分布变尖不等于一定更差。后续 vs-pikafish 测试显示，`0.1` 在当前模型和部分搜索设置下对弈更强；`0.01` 虽然 target 更软，但直接用于搜索/评估会明显变弱，甚至会改变 search value 判断。因此不能仅凭 target 接近 one-hot 就判断 `0.1` 不适合。
 
 实测同一局面：
 
@@ -146,13 +148,14 @@ scale = (50 + 480) * 0.1 = 53
 
 后续训练建议：
 
-- 在 `1024/2048` sims 下，优先试 `gumbel_value_scale = 0.01`。
-- 如果 policy CE 仍不稳或 target 偏尖，再试 `0.005`。
-- 暂时避免用 `0.1` 搭配高 sims。
-- UCI 中可通过 `GumbelValueScale` 显式覆盖。当前默认仍保留 `0.1`，避免直接影响对弈/评估强度。
+- 默认继续保留 `gumbel_value_scale = 0.1`，因为当前证据显示它在对弈/评估中性价比更高。
+- `0.005` 和 `0.01` 可作为诊断参数，用来观察 improved policy 的软硬程度，但不应直接假设更软就更强。
+- 如果未来要解决 target 过尖问题，应优先考虑把“搜索/选招 scale”和“训练 target scale”拆开，而不是直接把全局默认改小。
+- UCI 中可通过 `GumbelValueScale` 显式覆盖，便于评估不同搜索强度。
 
 经验结论：
 
 - 之前 policy 拟合差，不一定是模型结构容量不足。
-- 更可能是 Gumbel improved policy 的 value scale 与模拟次数不匹配，导致 target 过尖。
-- 先校准 `gumbel_value_scale`，再重新判断是否需要模型结构改动。
+- `gumbel_value_scale` 同时影响对弈搜索强度和训练 target 形状，不能只从 policy CE 或 one-hot 程度单独判断好坏。
+- 当前证据不足以说明 `0.1` 的 one-hot target 会导致棋力变差；相反，直接搜索时 `0.1` 往往更强。
+- 后续若再调结构或 target，应先固定 `0.1` 基线，并用 arena/vs-pikafish 验证真实棋力。
