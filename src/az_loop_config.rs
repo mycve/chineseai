@@ -1,0 +1,518 @@
+﻿use chineseai::az::{AzGumbelConfig, AzNnueArch, AzSearchAlgorithm};
+use serde::Deserialize;
+use std::{fs, path::Path};
+
+pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
+#[derive(Clone, Debug)]
+pub struct AzLoopFileConfig {
+    pub model_path: String,
+    pub simulations: usize,
+    pub selfplay_samples_per_update: usize,
+    pub lr: f32,
+    pub lr_min: f32,
+    pub lr_decay_start_update: usize,
+    pub lr_decay_interval: usize,
+    pub lr_decay_factor: f32,
+    pub batch_size: usize,
+    pub max_plies: usize,
+    pub hidden_size: usize,
+    pub seed: u64,
+    pub workers: usize,
+    pub temperature_start: f32,
+    pub temperature_end: f32,
+    pub temperature_decay_plies: usize,
+    pub search_algorithm: AzSearchAlgorithm,
+    pub cpuct: f32,
+    pub root_dirichlet_alpha: f32,
+    pub root_exploration_fraction: f32,
+    pub gumbel: AzGumbelConfig,
+    pub replay_capacity: usize,
+    pub train_warmup_samples: usize,
+    pub train_samples_per_update: usize,
+    pub train_epochs_per_update: usize,
+    pub max_sample_train_count: u32,
+    pub mirror_probability: f32,
+    pub train_value_weight: f32,
+    pub train_policy_weight: f32,
+    pub train_value_head: bool,
+    pub train_policy_head: bool,
+    pub checkpoint_interval: usize,
+    pub checkpoint_dir: String,
+    pub max_checkpoints: usize,
+    pub arena_interval: usize,
+    pub arena_games_per_side: usize,
+    pub arena_cpuct: f32,
+    pub arena_promotion_rate: f32,
+    pub arena_processes: usize,
+    pub arena_pikafish_exe: String,
+    pub arena_pikafish_start_update: usize,
+    pub arena_pikafish_depth: u32,
+    pub arena_pikafish_games: usize,
+    pub arena_pikafish_parallel_games: usize,
+    pub arena_pikafish_promotion_rate: f32,
+    pub arena_pikafish_eval_fens: String,
+    pub tensorboard_logdir: String,
+}
+
+impl Default for AzLoopFileConfig {
+    fn default() -> Self {
+        let gumbel = AzGumbelConfig {
+            max_num_considered_actions: 32,
+            ..AzGumbelConfig::default()
+        };
+        Self {
+            model_path: "chineseai.nnue".into(),
+            simulations: 512,
+            selfplay_samples_per_update: 40000,
+            lr: 0.001,
+            lr_min: 0.00003,
+            lr_decay_start_update: 400,
+            lr_decay_interval: 600,
+            lr_decay_factor: 0.33333334,
+            batch_size: 4096,
+            max_plies: 300,
+            hidden_size: 192,
+            seed: 20260411,
+            workers: 240,
+            temperature_start: 1.0,
+            temperature_end: 0.1,
+            temperature_decay_plies: 40,
+            search_algorithm: AzSearchAlgorithm::AlphaZero,
+            cpuct: 1.5,
+            root_dirichlet_alpha: 0.3,
+            root_exploration_fraction: 0.25,
+            gumbel: AzGumbelConfig {
+                gumbel_scale: 1.0,
+                value_scale: 0.1,
+                maxvisit_init: 50.0,
+                ..gumbel
+            },
+            replay_capacity: 200000,
+            train_warmup_samples: 60000,
+            train_samples_per_update: 60000,
+            train_epochs_per_update: 3,
+            max_sample_train_count: 4,
+            mirror_probability: 0.3,
+            train_value_weight: 1.0,
+            train_policy_weight: 1.0,
+            train_value_head: true,
+            train_policy_head: true,
+            checkpoint_interval: 20,
+            checkpoint_dir: "checkpoints".into(),
+            max_checkpoints: 50,
+            arena_interval: 0,
+            arena_games_per_side: 50,
+            arena_cpuct: 1.5,
+            arena_promotion_rate: 0.55,
+            arena_processes: 100,
+            arena_pikafish_exe: String::new(),
+            arena_pikafish_start_update: 1,
+            arena_pikafish_depth: 1,
+            arena_pikafish_games: 200,
+            arena_pikafish_parallel_games: 100,
+            arena_pikafish_promotion_rate: 0.60,
+            arena_pikafish_eval_fens: "eval_fens.txt".into(),
+            tensorboard_logdir: "runs/chineseai".into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AzLoopTomlConfig {
+    pub model_path: Option<String>,
+    pub simulations: Option<usize>,
+    pub selfplay_samples_per_update: Option<usize>,
+    pub lr: Option<f32>,
+    pub lr_min: Option<f32>,
+    pub lr_decay_start_update: Option<usize>,
+    pub lr_decay_interval: Option<usize>,
+    pub lr_decay_factor: Option<f32>,
+    pub batch_size: Option<usize>,
+    pub max_plies: Option<usize>,
+    pub hidden_size: Option<usize>,
+    pub seed: Option<u64>,
+    pub workers: Option<usize>,
+    pub temperature_start: Option<f32>,
+    pub temperature_end: Option<f32>,
+    pub temperature_decay_plies: Option<usize>,
+    pub search_algorithm: Option<String>,
+    pub cpuct: Option<f32>,
+    pub root_dirichlet_alpha: Option<f32>,
+    pub root_exploration_fraction: Option<f32>,
+    gumbel_max_num_considered_actions: Option<usize>,
+    gumbel_scale: Option<f32>,
+    gumbel_value_scale: Option<f32>,
+    gumbel_maxvisit_init: Option<f32>,
+    gumbel_rescale_values: Option<bool>,
+    gumbel_use_mixed_value: Option<bool>,
+    pub replay_capacity: Option<usize>,
+    pub train_warmup_samples: Option<usize>,
+    pub train_samples_per_update: Option<usize>,
+    pub train_epochs_per_update: Option<usize>,
+    pub max_sample_train_count: Option<u32>,
+    pub mirror_probability: Option<f32>,
+    pub train_value_weight: Option<f32>,
+    pub train_policy_weight: Option<f32>,
+    pub train_value_head: Option<bool>,
+    pub train_policy_head: Option<bool>,
+    pub checkpoint_interval: Option<usize>,
+    pub checkpoint_dir: Option<String>,
+    pub max_checkpoints: Option<usize>,
+    pub arena_interval: Option<usize>,
+    pub arena_games_per_side: Option<usize>,
+    pub arena_cpuct: Option<f32>,
+    pub arena_promotion_rate: Option<f32>,
+    pub arena_processes: Option<usize>,
+    pub arena_pikafish_exe: Option<String>,
+    pub arena_pikafish_start_update: Option<usize>,
+    pub arena_pikafish_depth: Option<u32>,
+    pub arena_pikafish_games: Option<usize>,
+    pub arena_pikafish_parallel_games: Option<usize>,
+    pub arena_pikafish_promotion_rate: Option<f32>,
+    pub arena_pikafish_eval_fens: Option<String>,
+    pub tensorboard_logdir: Option<String>,
+}
+
+impl AzLoopTomlConfig {
+    fn apply_to(self, config: &mut AzLoopFileConfig) {
+        if let Some(value) = self.model_path {
+            config.model_path = value;
+        }
+        if let Some(value) = self.simulations {
+            config.simulations = value;
+        }
+        if let Some(value) = self.selfplay_samples_per_update {
+            config.selfplay_samples_per_update = value;
+        }
+        if let Some(value) = self.lr {
+            config.lr = value;
+        }
+        if let Some(value) = self.lr_min {
+            config.lr_min = value;
+        }
+        if let Some(value) = self.lr_decay_start_update {
+            config.lr_decay_start_update = value;
+        }
+        if let Some(value) = self.lr_decay_interval {
+            config.lr_decay_interval = value;
+        }
+        if let Some(value) = self.lr_decay_factor {
+            config.lr_decay_factor = value;
+        }
+        if let Some(value) = self.batch_size {
+            config.batch_size = value;
+        }
+        if let Some(value) = self.max_plies {
+            config.max_plies = value;
+        }
+        if let Some(value) = self.hidden_size {
+            config.hidden_size = value;
+        }
+        if let Some(value) = self.seed {
+            config.seed = value;
+        }
+        if let Some(value) = self.workers {
+            config.workers = value;
+        }
+        if let Some(value) = self.temperature_start {
+            config.temperature_start = value;
+        }
+        if let Some(value) = self.temperature_end {
+            config.temperature_end = value;
+        }
+        if let Some(value) = self.temperature_decay_plies {
+            config.temperature_decay_plies = value;
+        }
+        if let Some(value) = self.search_algorithm {
+            config.search_algorithm = AzSearchAlgorithm::parse(&value)
+                .unwrap_or_else(|| panic!("invalid search_algorithm `{value}`"));
+        }
+        if let Some(value) = self.cpuct {
+            config.cpuct = value;
+        }
+        if let Some(value) = self.root_dirichlet_alpha {
+            config.root_dirichlet_alpha = value;
+        }
+        if let Some(value) = self.root_exploration_fraction {
+            config.root_exploration_fraction = value;
+        }
+        if let Some(value) = self.gumbel_max_num_considered_actions {
+            config.gumbel.max_num_considered_actions = value;
+        }
+        if let Some(value) = self.gumbel_scale {
+            config.gumbel.gumbel_scale = value;
+        }
+        if let Some(value) = self.gumbel_value_scale {
+            config.gumbel.value_scale = value;
+        }
+        if let Some(value) = self.gumbel_maxvisit_init {
+            config.gumbel.maxvisit_init = value;
+        }
+        if let Some(value) = self.gumbel_rescale_values {
+            config.gumbel.rescale_values = value;
+        }
+        if let Some(value) = self.gumbel_use_mixed_value {
+            config.gumbel.use_mixed_value = value;
+        }
+        if let Some(value) = self.replay_capacity {
+            config.replay_capacity = value;
+        }
+        if let Some(value) = self.train_warmup_samples {
+            config.train_warmup_samples = value;
+        }
+        if let Some(value) = self.train_samples_per_update {
+            config.train_samples_per_update = value;
+        }
+        if let Some(value) = self.train_epochs_per_update {
+            config.train_epochs_per_update = value;
+        }
+        if let Some(value) = self.max_sample_train_count {
+            config.max_sample_train_count = value;
+        }
+        if let Some(value) = self.mirror_probability {
+            config.mirror_probability = value;
+        }
+        if let Some(value) = self.train_value_weight {
+            config.train_value_weight = value;
+        }
+        if let Some(value) = self.train_policy_weight {
+            config.train_policy_weight = value;
+        }
+        if let Some(value) = self.train_value_head {
+            config.train_value_head = value;
+        }
+        if let Some(value) = self.train_policy_head {
+            config.train_policy_head = value;
+        }
+        if let Some(value) = self.checkpoint_interval {
+            config.checkpoint_interval = value;
+        }
+        if let Some(value) = self.checkpoint_dir {
+            config.checkpoint_dir = value;
+        }
+        if let Some(value) = self.max_checkpoints {
+            config.max_checkpoints = value;
+        }
+        if let Some(value) = self.arena_interval {
+            config.arena_interval = value;
+        }
+        if let Some(value) = self.arena_games_per_side {
+            config.arena_games_per_side = value;
+        }
+        if let Some(value) = self.arena_cpuct {
+            config.arena_cpuct = value;
+        }
+        if let Some(value) = self.arena_promotion_rate {
+            config.arena_promotion_rate = value;
+        }
+        if let Some(value) = self.arena_processes {
+            config.arena_processes = value;
+        }
+        if let Some(value) = self.arena_pikafish_exe {
+            config.arena_pikafish_exe = value;
+        }
+        if let Some(value) = self.arena_pikafish_start_update {
+            config.arena_pikafish_start_update = value;
+        }
+        if let Some(value) = self.arena_pikafish_depth {
+            config.arena_pikafish_depth = value;
+        }
+        if let Some(value) = self.arena_pikafish_games {
+            config.arena_pikafish_games = value;
+        }
+        if let Some(value) = self.arena_pikafish_parallel_games {
+            config.arena_pikafish_parallel_games = value;
+        }
+        if let Some(value) = self.arena_pikafish_promotion_rate {
+            config.arena_pikafish_promotion_rate = value;
+        }
+        if let Some(value) = self.arena_pikafish_eval_fens {
+            config.arena_pikafish_eval_fens = value;
+        }
+        if let Some(value) = self.tensorboard_logdir {
+            config.tensorboard_logdir = value;
+        }
+    }
+}
+
+impl AzLoopFileConfig {
+    pub fn to_file_text(&self) -> String {
+        format!(
+            r#"model_path = "{model_path}"
+simulations = {simulations}
+selfplay_samples_per_update = {selfplay_samples_per_update}
+lr = {lr}
+lr_min = {lr_min}
+lr_decay_start_update = {lr_decay_start_update}
+lr_decay_interval = {lr_decay_interval}
+lr_decay_factor = {lr_decay_factor}
+batch_size = {batch_size}
+max_plies = {max_plies}
+hidden_size = {hidden_size}
+seed = {seed}
+workers = {workers}
+temperature_start = {temperature_start}
+temperature_end = {temperature_end}
+temperature_decay_plies = {temperature_decay_plies}
+search_algorithm = "{search_algorithm}"
+cpuct = {cpuct}
+root_dirichlet_alpha = {root_dirichlet_alpha}
+root_exploration_fraction = {root_exploration_fraction}
+gumbel_max_num_considered_actions = {gumbel_max_num_considered_actions}
+gumbel_scale = {gumbel_scale}
+gumbel_value_scale = {gumbel_value_scale}
+gumbel_maxvisit_init = {gumbel_maxvisit_init}
+gumbel_rescale_values = {gumbel_rescale_values}
+gumbel_use_mixed_value = {gumbel_use_mixed_value}
+replay_capacity = {replay_capacity}
+train_warmup_samples = {train_warmup_samples}
+train_samples_per_update = {train_samples_per_update}
+train_epochs_per_update = {train_epochs_per_update}
+max_sample_train_count = {max_sample_train_count}
+mirror_probability = {mirror_probability}
+train_value_weight = {train_value_weight}
+train_policy_weight = {train_policy_weight}
+train_value_head = {train_value_head}
+train_policy_head = {train_policy_head}
+checkpoint_interval = {checkpoint_interval}
+checkpoint_dir = "{checkpoint_dir}"
+max_checkpoints = {max_checkpoints}
+arena_interval = {arena_interval}
+arena_games_per_side = {arena_games_per_side}
+arena_cpuct = {arena_cpuct}
+arena_promotion_rate = {arena_promotion_rate}
+arena_processes = {arena_processes}
+arena_pikafish_exe = "{arena_pikafish_exe}"
+arena_pikafish_start_update = {arena_pikafish_start_update}
+arena_pikafish_depth = {arena_pikafish_depth}
+arena_pikafish_games = {arena_pikafish_games}
+arena_pikafish_parallel_games = {arena_pikafish_parallel_games}
+arena_pikafish_promotion_rate = {arena_pikafish_promotion_rate}
+arena_pikafish_eval_fens = "{arena_pikafish_eval_fens}"
+tensorboard_logdir = "{tensorboard_logdir}"
+"#,
+            model_path = self.model_path,
+            simulations = self.simulations,
+            selfplay_samples_per_update = self.selfplay_samples_per_update,
+            lr = self.lr,
+            lr_min = self.lr_min,
+            lr_decay_start_update = self.lr_decay_start_update,
+            lr_decay_interval = self.lr_decay_interval,
+            lr_decay_factor = self.lr_decay_factor,
+            batch_size = self.batch_size,
+            max_plies = self.max_plies,
+            hidden_size = self.hidden_size,
+            seed = self.seed,
+            workers = self.workers,
+            temperature_start = self.temperature_start,
+            temperature_end = self.temperature_end,
+            temperature_decay_plies = self.temperature_decay_plies,
+            search_algorithm = self.search_algorithm.as_str(),
+            cpuct = self.cpuct,
+            root_dirichlet_alpha = self.root_dirichlet_alpha,
+            root_exploration_fraction = self.root_exploration_fraction,
+            gumbel_max_num_considered_actions = self.gumbel.max_num_considered_actions,
+            gumbel_scale = self.gumbel.gumbel_scale,
+            gumbel_value_scale = self.gumbel.value_scale,
+            gumbel_maxvisit_init = self.gumbel.maxvisit_init,
+            gumbel_rescale_values = self.gumbel.rescale_values,
+            gumbel_use_mixed_value = self.gumbel.use_mixed_value,
+            replay_capacity = self.replay_capacity,
+            train_warmup_samples = self.train_warmup_samples,
+            train_samples_per_update = self.train_samples_per_update,
+            train_epochs_per_update = self.train_epochs_per_update,
+            max_sample_train_count = self.max_sample_train_count,
+            mirror_probability = self.mirror_probability,
+            train_value_weight = self.train_value_weight,
+            train_policy_weight = self.train_policy_weight,
+            train_value_head = self.train_value_head,
+            train_policy_head = self.train_policy_head,
+            checkpoint_interval = self.checkpoint_interval,
+            checkpoint_dir = self.checkpoint_dir,
+            max_checkpoints = self.max_checkpoints,
+            arena_interval = self.arena_interval,
+            arena_games_per_side = self.arena_games_per_side,
+            arena_cpuct = self.arena_cpuct,
+            arena_promotion_rate = self.arena_promotion_rate,
+            arena_processes = self.arena_processes,
+            arena_pikafish_exe = self.arena_pikafish_exe,
+            arena_pikafish_start_update = self.arena_pikafish_start_update,
+            arena_pikafish_depth = self.arena_pikafish_depth,
+            arena_pikafish_games = self.arena_pikafish_games,
+            arena_pikafish_parallel_games = self.arena_pikafish_parallel_games,
+            arena_pikafish_promotion_rate = self.arena_pikafish_promotion_rate,
+            arena_pikafish_eval_fens = self.arena_pikafish_eval_fens,
+            tensorboard_logdir = self.tensorboard_logdir,
+        )
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut config = Self::default();
+        toml::from_str::<AzLoopTomlConfig>(text)
+            .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"))
+            .apply_to(&mut config);
+        config.normalize()
+    }
+
+    pub fn arch(&self) -> AzNnueArch {
+        AzNnueArch {
+            hidden_size: self.hidden_size,
+        }
+    }
+
+    fn normalize(mut self) -> Self {
+        self.simulations = self.simulations.max(1);
+        self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
+        self.lr = self.lr.max(0.0);
+        self.lr_min = self.lr_min.max(0.0).min(self.lr);
+        self.lr_decay_interval = self.lr_decay_interval.max(1);
+        self.lr_decay_factor = self.lr_decay_factor.clamp(0.0, 1.0);
+        self.batch_size = self.batch_size.max(1);
+        self.max_plies = self.max_plies.max(1);
+        self.hidden_size = self.hidden_size.max(1);
+        self.workers = self.workers.max(1);
+        self.temperature_start = self.temperature_start.max(0.0);
+        self.temperature_end = self.temperature_end.max(0.0);
+        self.cpuct = self.cpuct.max(0.0);
+        self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
+        self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.train_warmup_samples = self.train_warmup_samples.max(1);
+        self.train_samples_per_update = self.train_samples_per_update.max(1);
+        self.train_epochs_per_update = self.train_epochs_per_update.max(1);
+        self.gumbel.max_num_considered_actions = self.gumbel.max_num_considered_actions.max(1);
+        self.gumbel.gumbel_scale = self.gumbel.gumbel_scale.max(0.0);
+        self.gumbel.value_scale = self.gumbel.value_scale.max(0.0);
+        self.gumbel.maxvisit_init = self.gumbel.maxvisit_init.max(0.0);
+        self.arena_cpuct = self.arena_cpuct.max(0.0);
+        self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
+        self.train_value_weight = self.train_value_weight.max(0.0);
+        self.train_policy_weight = self.train_policy_weight.max(0.0);
+        self.max_checkpoints = self.max_checkpoints.max(1);
+        self.arena_games_per_side = self.arena_games_per_side.max(1);
+        self.arena_processes = self.arena_processes.max(1);
+        self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
+        self.arena_pikafish_start_update = self.arena_pikafish_start_update.max(1);
+        self.arena_pikafish_depth = self.arena_pikafish_depth.max(1);
+        self.arena_pikafish_games = self.arena_pikafish_games.max(1);
+        self.arena_pikafish_parallel_games = self.arena_pikafish_parallel_games.max(1);
+        self.arena_pikafish_promotion_rate = self.arena_pikafish_promotion_rate.clamp(0.0, 1.0);
+        self
+    }
+}
+
+pub fn load_or_create_az_loop_config(path: &str) -> Option<AzLoopFileConfig> {
+    if !Path::new(path).exists() {
+        let config = AzLoopFileConfig::default();
+        fs::write(path, config.to_file_text()).unwrap_or_else(|err| {
+            panic!("failed to create `{path}`: {err}");
+        });
+        println!("created config: {path}");
+        println!("edit it, then run: ./target/release/chineseai az-loop {path}");
+        return None;
+    }
+    let text = fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("failed to read `{path}`: {err}");
+    });
+    Some(AzLoopFileConfig::parse(&text))
+}

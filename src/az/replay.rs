@@ -1,0 +1,421 @@
+use std::fs;
+use std::io::{self, Cursor, Read};
+use std::path::{Path, PathBuf};
+
+use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
+
+use super::{AzTrainingSample, DENSE_MOVE_SPACE, POLICY_DYNAMIC_FEATURE_SIZE, SplitMix64};
+
+/// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
+const REPLAY_MAGIC: &[u8] = b"AZRP";
+/// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
+const REPLAY_FILE_VERSION: u32 = 19;
+/// 解压后体积极限（防恶意或损坏文件占满内存）。
+const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
+const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
+const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
+
+fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn replay_push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn replay_push_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+fn replay_read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn replay_read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn replay_read_f32<R: Read>(reader: &mut R) -> io::Result<f32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(f32::from_bits(u32::from_le_bytes(buf)))
+}
+
+fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io::Result<()> {
+    if sample.features.len() > REPLAY_MAX_FEATURES_PER_SAMPLE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay encode: too many features",
+        ));
+    }
+    if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
+        || sample.policy.len() != sample.move_indices.len()
+        || sample.policy_dynamic_features.len()
+            != sample.move_indices.len() * POLICY_DYNAMIC_FEATURE_SIZE
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay encode: move_indices/policy/dynamic mismatch or too long",
+        ));
+    }
+    replay_push_u32(out, sample.features.len() as u32);
+    for &f in &sample.features {
+        replay_push_u32(out, f as u32);
+    }
+    replay_push_u32(out, sample.move_indices.len() as u32);
+    for &m in &sample.move_indices {
+        replay_push_u32(out, m as u32);
+    }
+    for &p in &sample.policy {
+        replay_push_f32(out, p);
+    }
+    for &feature in &sample.policy_dynamic_features {
+        replay_push_f32(out, feature);
+    }
+    replay_push_f32(out, sample.value);
+    replay_push_f32(out, sample.side_sign);
+    replay_push_f32(out, sample.moves_left);
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ReplayEntry {
+    sample: AzTrainingSample,
+    train_count: u32,
+}
+
+fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()> {
+    encode_az_training_sample(out, &entry.sample)?;
+    replay_push_u32(out, entry.train_count);
+    Ok(())
+}
+
+fn decode_az_training_sample<R: Read>(
+    reader: &mut R,
+    version: u32,
+) -> io::Result<AzTrainingSample> {
+    if version != REPLAY_FILE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay decode: incompatible replay sample version",
+        ));
+    }
+    let nf = replay_read_u32(reader)?;
+    if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay decode: feature count out of range",
+        ));
+    }
+    let mut features = Vec::with_capacity(nf as usize);
+    for _ in 0..nf {
+        features.push(replay_read_u32(reader)? as usize);
+    }
+    let nm = replay_read_u32(reader)?;
+    if nm > REPLAY_MAX_MOVES_PER_SAMPLE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay decode: move count out of range",
+        ));
+    }
+    let mut move_indices = Vec::with_capacity(nm as usize);
+    for _ in 0..nm {
+        move_indices.push(replay_read_u32(reader)? as usize);
+    }
+    let mut policy = Vec::with_capacity(nm as usize);
+    for _ in 0..nm {
+        policy.push(replay_read_f32(reader)?);
+    }
+    let mut policy_dynamic_features = Vec::with_capacity(nm as usize * POLICY_DYNAMIC_FEATURE_SIZE);
+    for _ in 0..(nm as usize * POLICY_DYNAMIC_FEATURE_SIZE) {
+        policy_dynamic_features.push(replay_read_f32(reader)?);
+    }
+    let value = replay_read_f32(reader)?;
+    let side_sign = replay_read_f32(reader)?;
+    let moves_left = replay_read_f32(reader)?;
+    Ok(AzTrainingSample {
+        features,
+        move_indices,
+        policy_dynamic_features,
+        policy,
+        value,
+        side_sign,
+        moves_left,
+    })
+}
+
+fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
+    let sample = decode_az_training_sample(reader, version)?;
+    let train_count = replay_read_u32(reader)?;
+    Ok(ReplayEntry {
+        sample,
+        train_count,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct AzExperiencePool {
+    capacity: usize,
+    samples: Vec<ReplayEntry>,
+    next: usize,
+    train_count_sum: u64,
+}
+
+impl AzExperiencePool {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            samples: Vec::with_capacity(capacity),
+            next: 0,
+            train_count_sum: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn average_train_count(&self) -> f32 {
+        if self.samples.is_empty() {
+            0.0
+        } else {
+            self.train_count_sum as f32 / self.samples.len() as f32
+        }
+    }
+
+    pub fn add_samples<I>(&mut self, samples: I)
+    where
+        I: IntoIterator<Item = AzTrainingSample>,
+    {
+        if self.capacity == 0 {
+            return;
+        }
+        for sample in samples {
+            let entry = ReplayEntry {
+                sample,
+                train_count: 0,
+            };
+            if self.samples.len() < self.capacity {
+                self.samples.push(entry);
+            } else {
+                let old = std::mem::replace(&mut self.samples[self.next], entry);
+                self.train_count_sum = self.train_count_sum.saturating_sub(old.train_count as u64);
+                self.next = (self.next + 1) % self.capacity;
+            }
+        }
+    }
+
+    pub fn add_games(&mut self, games: Vec<Vec<AzTrainingSample>>) {
+        self.add_samples(games.into_iter().flatten());
+    }
+
+    pub fn sample_uniform_marked(
+        &mut self,
+        count: usize,
+        rng: &mut SplitMix64,
+    ) -> Vec<AzTrainingSample> {
+        self.sample_uniform_marked_capped(count, 0, rng)
+    }
+
+    pub fn sample_uniform_marked_capped(
+        &mut self,
+        count: usize,
+        max_train_count: u32,
+        rng: &mut SplitMix64,
+    ) -> Vec<AzTrainingSample> {
+        self.sample_uniform_marked_capped_by(count, 1, max_train_count, rng)
+    }
+
+    pub fn sample_uniform_marked_capped_by(
+        &mut self,
+        count: usize,
+        train_count_increment: u32,
+        max_train_count: u32,
+        rng: &mut SplitMix64,
+    ) -> Vec<AzTrainingSample> {
+        if self.samples.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let train_count_increment = train_count_increment.max(1);
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count && !self.samples.is_empty() {
+            let index = (rng.next_u64() as usize) % self.samples.len();
+            let entry = &mut self.samples[index];
+            entry.train_count = entry.train_count.saturating_add(train_count_increment);
+            self.train_count_sum = self
+                .train_count_sum
+                .saturating_add(train_count_increment as u64);
+            out.push(entry.sample.clone());
+            if max_train_count > 0 && entry.train_count >= max_train_count {
+                self.remove_entry(index);
+            }
+        }
+        out
+    }
+
+    fn remove_entry(&mut self, index: usize) {
+        if index >= self.samples.len() {
+            return;
+        }
+        let removed = self.samples.swap_remove(index);
+        self.train_count_sum = self
+            .train_count_sum
+            .saturating_sub(removed.train_count as u64);
+        if self.samples.is_empty() {
+            self.next = 0;
+        } else if self.next >= self.samples.len() {
+            self.next %= self.samples.len();
+        }
+    }
+
+    pub fn sample_uniform(&self, count: usize, rng: &mut SplitMix64) -> Vec<AzTrainingSample> {
+        if self.samples.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let index = (rng.next_u64() as usize) % self.samples.len();
+            out.push(self.samples[index].sample.clone());
+        }
+        out
+    }
+
+    pub fn all_samples(&self) -> Vec<AzTrainingSample> {
+        self.samples
+            .iter()
+            .map(|entry| entry.sample.clone())
+            .collect()
+    }
+
+    pub fn all_sample_groups(&self) -> Vec<Vec<AzTrainingSample>> {
+        self.samples
+            .iter()
+            .map(|entry| vec![entry.sample.clone()])
+            .collect()
+    }
+
+    fn encode_replay_payload(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        replay_push_u64(&mut out, self.capacity as u64);
+        replay_push_u64(&mut out, self.next as u64);
+        replay_push_u64(&mut out, self.samples.len() as u64);
+        for entry in &self.samples {
+            encode_replay_entry(&mut out, entry)?;
+        }
+        Ok(out)
+    }
+
+    fn decode_replay_payload(data: &[u8], capacity: usize, version: u32) -> io::Result<Self> {
+        let mut reader = Cursor::new(data);
+        let _stored_capacity = replay_read_u64(&mut reader)? as usize;
+        let stored_next = replay_read_u64(&mut reader)? as usize;
+        let n_samples = replay_read_u64(&mut reader)? as usize;
+        if n_samples > 100_000_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay decode: absurd sample count",
+            ));
+        }
+
+        let mut entries: Vec<ReplayEntry> = Vec::with_capacity(n_samples.min(capacity));
+        let mut train_count_sum = 0u64;
+        for _ in 0..n_samples {
+            let entry = decode_replay_entry(&mut reader, version)?;
+            if capacity == 0 {
+                continue;
+            }
+            if entries.len() == capacity {
+                let removed = entries.remove(0);
+                train_count_sum = train_count_sum.saturating_sub(removed.train_count as u64);
+            }
+            train_count_sum = train_count_sum.saturating_add(entry.train_count as u64);
+            entries.push(entry);
+        }
+
+        let next = if entries.len() < capacity || capacity == 0 {
+            entries.len()
+        } else {
+            stored_next % capacity
+        };
+        Ok(Self {
+            capacity,
+            samples: entries,
+            next,
+            train_count_sum,
+        })
+    }
+
+    pub fn save_snapshot_lz4(&self, path: &Path) -> io::Result<()> {
+        if self.capacity == 0 || self.samples.is_empty() {
+            let _ = fs::remove_file(path);
+            return Ok(());
+        }
+        let inner = self.encode_replay_payload()?;
+        if inner.len() > REPLAY_MAX_DECOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "replay snapshot raw size {} exceeds {}",
+                    inner.len(),
+                    REPLAY_MAX_DECOMPRESSED_BYTES
+                ),
+            ));
+        }
+        let compressed = compress_prepend_size(&inner);
+        let mut file_blob = Vec::with_capacity(8 + compressed.len());
+        file_blob.extend_from_slice(REPLAY_MAGIC);
+        replay_push_u32(&mut file_blob, REPLAY_FILE_VERSION);
+        file_blob.extend_from_slice(&compressed);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        fs::write(&tmp, &file_blob)?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load_snapshot_lz4(path: &Path, capacity: usize) -> io::Result<Self> {
+        let file_blob = fs::read(path)?;
+        if file_blob.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay file too small",
+            ));
+        }
+        if &file_blob[0..4] != REPLAY_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay bad magic",
+            ));
+        }
+        let ver = u32::from_le_bytes(file_blob[4..8].try_into().unwrap());
+        if ver != REPLAY_FILE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("replay unsupported version {ver} (expected v{REPLAY_FILE_VERSION})"),
+            ));
+        }
+        let inner = decompress_size_prepended(&file_blob[8..]).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("replay lz4 decompress: {err:?}"),
+            )
+        })?;
+        if inner.len() > REPLAY_MAX_DECOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay decompressed size over cap",
+            ));
+        }
+        Self::decode_replay_payload(&inner, capacity, ver)
+    }
+}

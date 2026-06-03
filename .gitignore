@@ -1,0 +1,13 @@
+/target
+.idea
+pikafish*
+pikafish.nnue
+/Cargo.lock
+*.nnue
+chineseai*
+*.toml.progress
+*.replay.lz4
+distill_data
+runs
+*azloop*
+*.log
