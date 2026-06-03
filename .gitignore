@@ -1,6 +1,6 @@
 /target
 .idea
-pikafish*
+pikafish.exe
 pikafish.nnue
 /Cargo.lock
 *.nnue
