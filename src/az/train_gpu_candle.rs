@@ -6,12 +6,10 @@ use std::{process::Command, thread};
 use super::{
     AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample,
     DENSE_MOVE_SPACE, LINE_COUNT, LINE_MIXER_RANK, MOVES_LEFT_AUX_WEIGHT, PIECE_ATTENTION_SIZE,
-    POLICY_ACTION_SIZE, POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE, POLICY_DYNAMIC_FEATURE_SIZE,
-    POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, POLICY_RELATION_SIZE, SQUARE_TOKEN_PIECES,
-    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    TRUNK_LAYERS, VALUE_HEAD_SIZE, canonical_general_buckets_from_features,
-    decode_current_piece_square_feature, policy_move_features, policy_move_from_features,
-    policy_move_to_features, structural_king_piece_index,
+    POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, SQUARE_TOKEN_PIECES, STRUCTURAL_FILE_SIZE,
+    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS,
+    VALUE_HEAD_SIZE, canonical_general_buckets_from_features, decode_current_piece_square_feature,
+    policy_move_from_features, policy_move_to_features, structural_king_piece_index,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE};
@@ -32,11 +30,11 @@ pub(super) struct GpuTrainer {
 struct GpuReplica {
     device: Device,
     arch: AzNnueArch,
-    vars: GpuVars,
+    vars: AzCandleModel,
 }
 
 #[derive(Debug)]
-struct GpuVars {
+struct AzCandleModel {
     input_hidden: Var,
     input_piece_hidden: Var,
     input_rank_hidden: Var,
@@ -64,16 +62,6 @@ struct GpuVars {
     moves_left_output: Var,
     moves_left_bias: Var,
     policy_move_bias: Var,
-    policy_context_hidden: Var,
-    policy_context_bias: Var,
-    policy_feature_hidden: Var,
-    policy_feature_bias: Var,
-    policy_dynamic_hidden: Var,
-    policy_action_context_hidden: Var,
-    policy_action_context_bias: Var,
-    policy_action_static_hidden: Var,
-    policy_action_dynamic_hidden: Var,
-    policy_action_output: Var,
     policy_from_hidden: Var,
     policy_to_hidden: Var,
     policy_pair_context_hidden: Var,
@@ -81,13 +69,7 @@ struct GpuVars {
     policy_pair_embedding: Var,
     policy_move_context_hidden: Var,
     policy_move_embedding: Var,
-    policy_relation_context_hidden: Var,
-    policy_relation_context_bias: Var,
-    policy_relation_from_embedding: Var,
-    policy_relation_to_embedding: Var,
-    policy_relation_output: Var,
     line_square_mask: Tensor,
-    policy_move_features: Tensor,
     policy_move_from_features: Tensor,
     policy_move_to_features: Tensor,
 }
@@ -326,7 +308,7 @@ impl GpuTrainer {
 impl GpuReplica {
     fn new(model: &AzNnue, device_index: usize) -> CandleResult<Self> {
         let device = Device::new_cuda(device_index)?;
-        let vars = GpuVars::from_model(model, &device)?;
+        let vars = AzCandleModel::from_model(model, &device)?;
         Ok(Self {
             device,
             arch: model.arch,
@@ -386,101 +368,6 @@ impl GpuReplica {
         let legal_policy_logits = forward
             .policy_logits
             .gather(&batch_tensors.policy_indices, 1)?;
-        let dynamic_logits = forward
-            .policy_dynamic_condition
-            .unsqueeze(1)?
-            .broadcast_mul(&batch_tensors.policy_dynamic_features)?
-            .sum(2)?;
-        let legal_static_features = self
-            .vars
-            .policy_move_features
-            .index_select(&batch_tensors.policy_indices.flatten_all()?, 0)?
-            .reshape((
-                batch_tensors.batch_size,
-                batch_tensors.max_policy_moves,
-                POLICY_CONDITION_SIZE,
-            ))?;
-        let action_static = legal_static_features
-            .flatten_to(1)?
-            .matmul(&self.vars.policy_action_static_hidden.t()?)?
-            .reshape((
-                batch_tensors.batch_size,
-                batch_tensors.max_policy_moves,
-                POLICY_ACTION_SIZE,
-            ))?;
-        let action_dynamic = batch_tensors
-            .policy_dynamic_features
-            .flatten_to(1)?
-            .matmul(&self.vars.policy_action_dynamic_hidden.t()?)?
-            .reshape((
-                batch_tensors.batch_size,
-                batch_tensors.max_policy_moves,
-                POLICY_ACTION_SIZE,
-            ))?;
-        let action_context = forward.policy_action_context.unsqueeze(1)?.broadcast_as((
-            batch_tensors.batch_size,
-            batch_tensors.max_policy_moves,
-            POLICY_ACTION_SIZE,
-        ))?;
-        let move_action = (action_static + action_dynamic)?;
-        let additive = (&move_action + &action_context)?.relu()?;
-        let interaction = (&move_action * &action_context)?;
-        let interaction_low = interaction.affine(1.0, 10.0)?.relu()?;
-        let interaction_high = interaction.affine(1.0, -10.0)?.relu()?;
-        let interaction = (interaction_low - interaction_high)?.affine(1.0, -10.0)?;
-        let action_hidden = (additive + (interaction * 0.25)?)?;
-        let action_logits = action_hidden
-            .flatten_to(1)?
-            .matmul(
-                &self
-                    .vars
-                    .policy_action_output
-                    .reshape((POLICY_ACTION_SIZE, 1))?,
-            )?
-            .reshape((batch_tensors.batch_size, batch_tensors.max_policy_moves))?;
-        let flat_policy_indices = batch_tensors.policy_indices.flatten_all()?;
-        let legal_from_features = self
-            .vars
-            .policy_move_from_features
-            .index_select(&flat_policy_indices, 0)?;
-        let legal_to_features = self
-            .vars
-            .policy_move_to_features
-            .index_select(&flat_policy_indices, 0)?;
-        let relation_from = legal_from_features
-            .matmul(&self.vars.policy_relation_from_embedding)?
-            .reshape((
-                batch_tensors.batch_size,
-                batch_tensors.max_policy_moves,
-                POLICY_RELATION_SIZE,
-            ))?;
-        let relation_to = legal_to_features
-            .matmul(&self.vars.policy_relation_to_embedding)?
-            .reshape((
-                batch_tensors.batch_size,
-                batch_tensors.max_policy_moves,
-                POLICY_RELATION_SIZE,
-            ))?;
-        let relation_context = forward
-            .policy_relation_context
-            .unsqueeze(1)?
-            .broadcast_as((
-                batch_tensors.batch_size,
-                batch_tensors.max_policy_moves,
-                POLICY_RELATION_SIZE,
-            ))?;
-        let relation_hidden = ((relation_from + relation_to)? + relation_context)?.relu()?;
-        let relation_logits = relation_hidden
-            .flatten_to(1)?
-            .matmul(
-                &self
-                    .vars
-                    .policy_relation_output
-                    .reshape((POLICY_RELATION_SIZE, 1))?,
-            )?
-            .reshape((batch_tensors.batch_size, batch_tensors.max_policy_moves))?;
-        let legal_policy_logits =
-            (((legal_policy_logits + dynamic_logits)? + action_logits)? + relation_logits)?;
         let masked_policy_logits = (&legal_policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -643,10 +530,6 @@ impl GpuReplica {
             .broadcast_add(&self.vars.moves_left_bias)?;
         let values = value_head_output.tanh()?;
         let policy_bias = self.vars.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
-        let policy_dynamic_condition = hidden.matmul(&self.vars.policy_dynamic_hidden.t()?)?;
-        let policy_action_context = hidden
-            .matmul(&self.vars.policy_action_context_hidden.t()?)?
-            .broadcast_add(&self.vars.policy_action_context_bias)?;
         let policy_from_scores = hidden.matmul(&self.vars.policy_from_hidden.t()?)?;
         let policy_to_scores = hidden.matmul(&self.vars.policy_to_hidden.t()?)?;
         let policy_from_logits =
@@ -661,10 +544,6 @@ impl GpuReplica {
         let policy_move_context = hidden.matmul(&self.vars.policy_move_context_hidden.t()?)?;
         let policy_move_logits =
             policy_move_context.matmul(&self.vars.policy_move_embedding.t()?)?;
-        let policy_relation_context = hidden
-            .matmul(&self.vars.policy_relation_context_hidden.t()?)?
-            .broadcast_add(&self.vars.policy_relation_context_bias)?
-            .relu()?;
         let policy_logits = ((((policy_from_logits + policy_to_logits)? + policy_pair_logits)?
             + policy_move_logits)?
             .broadcast_add(&policy_bias))?;
@@ -672,9 +551,6 @@ impl GpuReplica {
         Ok(ForwardOutput {
             values,
             policy_logits,
-            policy_dynamic_condition,
-            policy_action_context,
-            policy_relation_context,
             moves_left_logits,
         })
     }
@@ -689,9 +565,6 @@ struct ShardOutput {
 struct ForwardOutput {
     values: Tensor,
     policy_logits: Tensor,
-    policy_dynamic_condition: Tensor,
-    policy_action_context: Tensor,
-    policy_relation_context: Tensor,
     moves_left_logits: Tensor,
 }
 
@@ -703,7 +576,6 @@ struct BatchLossOutput {
 struct BatchTensors {
     batch_size: usize,
     max_features: usize,
-    max_policy_moves: usize,
     feature_indices: Tensor,
     feature_mask: Tensor,
     structural_piece_indices: Tensor,
@@ -714,7 +586,6 @@ struct BatchTensors {
     structural_mask: Tensor,
     line_piece_counts: Tensor,
     policy_indices: Tensor,
-    policy_dynamic_features: Tensor,
     policy_targets: Tensor,
     policy_mask: Tensor,
     values: Tensor,
@@ -752,8 +623,6 @@ impl BatchTensors {
         let mut structural_mask = vec![0.0f32; batch_size * max_features];
         let mut line_piece_counts = vec![0.0f32; batch_size * LINE_COUNT * SQUARE_TOKEN_PIECES];
         let mut policy_indices = vec![0u32; batch_size * max_policy_moves];
-        let mut policy_dynamic_features =
-            vec![0.0f32; batch_size * max_policy_moves * POLICY_DYNAMIC_FEATURE_SIZE];
         let mut policy_targets = vec![0.0f32; batch_size * max_policy_moves];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * max_policy_moves];
         let mut values = vec![0.0f32; batch_size];
@@ -793,30 +662,12 @@ impl BatchTensors {
             }
 
             let policy_base = row * max_policy_moves;
-            let dynamic_base = policy_base * POLICY_DYNAMIC_FEATURE_SIZE;
             let mut policy_offset = 0;
-            for (sample_policy_offset, (&move_index, &target)) in sample
-                .move_indices
-                .iter()
-                .zip(sample.policy.iter())
-                .enumerate()
-            {
+            for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
                 if move_index < DENSE_MOVE_SPACE {
                     policy_indices[policy_base + policy_offset] = move_index as u32;
                     policy_targets[policy_base + policy_offset] = target.max(0.0);
                     policy_mask[policy_base + policy_offset] = 0.0;
-                    let sample_dynamic_start = sample_policy_offset * POLICY_DYNAMIC_FEATURE_SIZE;
-                    let sample_dynamic_end = sample_dynamic_start + POLICY_DYNAMIC_FEATURE_SIZE;
-                    if let Some(dynamic) = sample
-                        .policy_dynamic_features
-                        .get(sample_dynamic_start..sample_dynamic_end)
-                    {
-                        let batch_dynamic_start =
-                            dynamic_base + policy_offset * POLICY_DYNAMIC_FEATURE_SIZE;
-                        policy_dynamic_features[batch_dynamic_start
-                            ..batch_dynamic_start + POLICY_DYNAMIC_FEATURE_SIZE]
-                            .copy_from_slice(dynamic);
-                    }
                     policy_offset += 1;
                 }
             }
@@ -831,7 +682,6 @@ impl BatchTensors {
         Ok(Self {
             batch_size,
             max_features,
-            max_policy_moves,
             feature_indices: Tensor::from_vec(feature_indices, (batch_size, max_features), device)?,
             feature_mask: Tensor::from_vec(feature_mask, (batch_size, max_features, 1), device)?,
             structural_piece_indices: Tensor::from_vec(
@@ -872,11 +722,6 @@ impl BatchTensors {
             policy_indices: Tensor::from_vec(
                 policy_indices,
                 (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_dynamic_features: Tensor::from_vec(
-                policy_dynamic_features,
-                (batch_size, max_policy_moves, POLICY_DYNAMIC_FEATURE_SIZE),
                 device,
             )?,
             policy_targets: Tensor::from_vec(
@@ -927,7 +772,7 @@ fn line_square_mask() -> &'static [f32] {
     })
 }
 
-impl GpuVars {
+impl AzCandleModel {
     fn from_model(model: &AzNnue, device: &Device) -> CandleResult<Self> {
         let arch = model.arch;
         let hidden = arch.hidden_size;
@@ -1019,56 +864,6 @@ impl GpuVars {
             moves_left_output: var_from_slice(&model.moves_left_output, VALUE_HEAD_SIZE, device)?,
             moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
-            policy_context_hidden: var_from_slice(
-                &model.policy_context_hidden,
-                (POLICY_CONTEXT_SIZE, hidden),
-                device,
-            )?,
-            policy_context_bias: var_from_slice(
-                &model.policy_context_bias,
-                POLICY_CONTEXT_SIZE,
-                device,
-            )?,
-            policy_feature_hidden: var_from_slice(
-                &model.policy_feature_hidden,
-                (POLICY_CONDITION_SIZE, POLICY_CONTEXT_SIZE),
-                device,
-            )?,
-            policy_feature_bias: var_from_slice(
-                &model.policy_feature_bias,
-                POLICY_CONDITION_SIZE,
-                device,
-            )?,
-            policy_dynamic_hidden: var_from_slice(
-                &model.policy_dynamic_hidden,
-                (POLICY_DYNAMIC_FEATURE_SIZE, hidden),
-                device,
-            )?,
-            policy_action_context_hidden: var_from_slice(
-                &model.policy_action_context_hidden,
-                (POLICY_ACTION_SIZE, hidden),
-                device,
-            )?,
-            policy_action_context_bias: var_from_slice(
-                &model.policy_action_context_bias,
-                POLICY_ACTION_SIZE,
-                device,
-            )?,
-            policy_action_static_hidden: var_from_slice(
-                &model.policy_action_static_hidden,
-                (POLICY_ACTION_SIZE, POLICY_CONDITION_SIZE),
-                device,
-            )?,
-            policy_action_dynamic_hidden: var_from_slice(
-                &model.policy_action_dynamic_hidden,
-                (POLICY_ACTION_SIZE, POLICY_DYNAMIC_FEATURE_SIZE),
-                device,
-            )?,
-            policy_action_output: var_from_slice(
-                &model.policy_action_output,
-                POLICY_ACTION_SIZE,
-                device,
-            )?,
             policy_from_hidden: var_from_slice(
                 &model.policy_from_hidden,
                 (BOARD_SIZE, hidden),
@@ -1104,39 +899,9 @@ impl GpuVars {
                 (DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE),
                 device,
             )?,
-            policy_relation_context_hidden: var_from_slice(
-                &model.policy_relation_context_hidden,
-                (POLICY_RELATION_SIZE, hidden),
-                device,
-            )?,
-            policy_relation_context_bias: var_from_slice(
-                &model.policy_relation_context_bias,
-                POLICY_RELATION_SIZE,
-                device,
-            )?,
-            policy_relation_from_embedding: var_from_slice(
-                &model.policy_relation_from_embedding,
-                (BOARD_SIZE, POLICY_RELATION_SIZE),
-                device,
-            )?,
-            policy_relation_to_embedding: var_from_slice(
-                &model.policy_relation_to_embedding,
-                (BOARD_SIZE, POLICY_RELATION_SIZE),
-                device,
-            )?,
-            policy_relation_output: var_from_slice(
-                &model.policy_relation_output,
-                POLICY_RELATION_SIZE,
-                device,
-            )?,
             line_square_mask: Tensor::from_vec(
                 line_square_mask().to_vec(),
                 (LINE_COUNT, BOARD_SIZE),
-                device,
-            )?,
-            policy_move_features: Tensor::from_vec(
-                policy_move_features().to_vec(),
-                (DENSE_MOVE_SPACE, POLICY_CONDITION_SIZE),
                 device,
             )?,
             policy_move_from_features: Tensor::from_vec(
@@ -1181,16 +946,6 @@ impl GpuVars {
         vars.push(self.moves_left_output.clone());
         vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
-        vars.push(self.policy_context_hidden.clone());
-        vars.push(self.policy_context_bias.clone());
-        vars.push(self.policy_feature_hidden.clone());
-        vars.push(self.policy_feature_bias.clone());
-        vars.push(self.policy_dynamic_hidden.clone());
-        vars.push(self.policy_action_context_hidden.clone());
-        vars.push(self.policy_action_context_bias.clone());
-        vars.push(self.policy_action_static_hidden.clone());
-        vars.push(self.policy_action_dynamic_hidden.clone());
-        vars.push(self.policy_action_output.clone());
         vars.push(self.policy_from_hidden.clone());
         vars.push(self.policy_to_hidden.clone());
         vars.push(self.policy_pair_context_hidden.clone());
@@ -1198,11 +953,6 @@ impl GpuVars {
         vars.push(self.policy_pair_embedding.clone());
         vars.push(self.policy_move_context_hidden.clone());
         vars.push(self.policy_move_embedding.clone());
-        vars.push(self.policy_relation_context_hidden.clone());
-        vars.push(self.policy_relation_context_bias.clone());
-        vars.push(self.policy_relation_from_embedding.clone());
-        vars.push(self.policy_relation_to_embedding.clone());
-        vars.push(self.policy_relation_output.clone());
         vars
     }
 
@@ -1219,16 +969,6 @@ impl GpuVars {
     fn policy_head_vars(&self) -> Vec<Var> {
         vec![
             self.policy_move_bias.clone(),
-            self.policy_context_hidden.clone(),
-            self.policy_context_bias.clone(),
-            self.policy_feature_hidden.clone(),
-            self.policy_feature_bias.clone(),
-            self.policy_dynamic_hidden.clone(),
-            self.policy_action_context_hidden.clone(),
-            self.policy_action_context_bias.clone(),
-            self.policy_action_static_hidden.clone(),
-            self.policy_action_dynamic_hidden.clone(),
-            self.policy_action_output.clone(),
             self.policy_from_hidden.clone(),
             self.policy_to_hidden.clone(),
             self.policy_pair_context_hidden.clone(),
@@ -1236,11 +976,6 @@ impl GpuVars {
             self.policy_pair_embedding.clone(),
             self.policy_move_context_hidden.clone(),
             self.policy_move_embedding.clone(),
-            self.policy_relation_context_hidden.clone(),
-            self.policy_relation_context_bias.clone(),
-            self.policy_relation_from_embedding.clone(),
-            self.policy_relation_to_embedding.clone(),
-            self.policy_relation_output.clone(),
         ]
     }
 
@@ -1344,37 +1079,6 @@ impl GpuVars {
         copy_var(&self.moves_left_output, &mut model.moves_left_output)?;
         copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
-        copy_var(
-            &self.policy_context_hidden,
-            &mut model.policy_context_hidden,
-        )?;
-        copy_var(&self.policy_context_bias, &mut model.policy_context_bias)?;
-        copy_var(
-            &self.policy_feature_hidden,
-            &mut model.policy_feature_hidden,
-        )?;
-        copy_var(&self.policy_feature_bias, &mut model.policy_feature_bias)?;
-        copy_var(
-            &self.policy_dynamic_hidden,
-            &mut model.policy_dynamic_hidden,
-        )?;
-        copy_var(
-            &self.policy_action_context_hidden,
-            &mut model.policy_action_context_hidden,
-        )?;
-        copy_var(
-            &self.policy_action_context_bias,
-            &mut model.policy_action_context_bias,
-        )?;
-        copy_var(
-            &self.policy_action_static_hidden,
-            &mut model.policy_action_static_hidden,
-        )?;
-        copy_var(
-            &self.policy_action_dynamic_hidden,
-            &mut model.policy_action_dynamic_hidden,
-        )?;
-        copy_var(&self.policy_action_output, &mut model.policy_action_output)?;
         copy_var(&self.policy_from_hidden, &mut model.policy_from_hidden)?;
         copy_var(&self.policy_to_hidden, &mut model.policy_to_hidden)?;
         copy_var(
@@ -1396,26 +1100,6 @@ impl GpuVars {
         copy_var(
             &self.policy_move_embedding,
             &mut model.policy_move_embedding,
-        )?;
-        copy_var(
-            &self.policy_relation_context_hidden,
-            &mut model.policy_relation_context_hidden,
-        )?;
-        copy_var(
-            &self.policy_relation_context_bias,
-            &mut model.policy_relation_context_bias,
-        )?;
-        copy_var(
-            &self.policy_relation_from_embedding,
-            &mut model.policy_relation_from_embedding,
-        )?;
-        copy_var(
-            &self.policy_relation_to_embedding,
-            &mut model.policy_relation_to_embedding,
-        )?;
-        copy_var(
-            &self.policy_relation_output,
-            &mut model.policy_relation_output,
         )?;
         model.refresh_policy_derived_caches();
         Ok(())

@@ -20,6 +20,7 @@ use chineseai::{
     xiangqi::{Move, Position},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -99,7 +100,7 @@ struct AzInitArgs {
     #[arg(default_value_t = 128)]
     hidden: usize,
     /// Output model path.
-    #[arg(default_value = "chineseai.nnue")]
+    #[arg(default_value = "model.safetensors")]
     output: String,
     /// Random seed.
     #[arg(default_value_t = 20260409)]
@@ -115,9 +116,9 @@ impl AzInitArgs {
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-search chineseai.nnue
-  chineseai az-search chineseai.nnue 10000 1.5 startpos
-  chineseai az-search chineseai.nnue 10000 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
+  chineseai az-search model.safetensors
+  chineseai az-search model.safetensors 10000 1.5 startpos
+  chineseai az-search model.safetensors 10000 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -159,8 +160,8 @@ struct AzSearchArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-bench chineseai.nnue 512 100 1.5 startpos
-  chineseai az-bench chineseai.nnue 512 100 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
+  chineseai az-bench model.safetensors 512 100 1.5 startpos
+  chineseai az-bench model.safetensors 512 100 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
 struct AzBenchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -236,7 +237,7 @@ struct AzBaseline100Args {
     #[arg(long, default_value = "baseline-h128-u100.azloop.toml")]
     config: String,
     /// Output model path in the generated config.
-    #[arg(long, default_value = "baseline-h128-u100.nnue")]
+    #[arg(long, default_value = "baseline-h128-u100.safetensors")]
     model: String,
     /// Absolute update number to stop at.
     #[arg(long, default_value_t = 100)]
@@ -281,7 +282,7 @@ struct PikafishLabelArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-teacher-probe pure-canonical-h128-u100.nnue hard_teacher.tsv 1200 1.5 --algorithm alphazero")]
+  chineseai az-teacher-probe pure-canonical-h128-u100.safetensors hard_teacher.tsv 1200 1.5 --algorithm alphazero")]
 struct AzTeacherProbeArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -361,9 +362,9 @@ struct AzCollectFensArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai vs-pikafish ./tools/pikafish chineseai.nnue
-  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-chineseai.nnue --simulations 192 --topk 32
-  chineseai vs-pikafish ./tools/pikafish chineseai.nnue --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
+  chineseai vs-pikafish ./tools/pikafish model.safetensors
+  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --simulations 192 --topk 32
+  chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
@@ -424,7 +425,7 @@ fn parse_search_algorithm(text: &str) -> Result<AzSearchAlgorithm, String> {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-diagnose chineseai.nnue 512 --algorithm gumbel_alphazero --topk 64 --gumbel-scale 0 \"5k3/9/9/9/9/9/4r4/4R4/4R1r2/4K4 w - - 0 1\"")]
+  chineseai az-diagnose model.safetensors 512 --algorithm gumbel_alphazero --topk 64 --gumbel-scale 0 \"5k3/9/9/9/9/9/4r4/4R4/4R1r2/4K4 w - - 0 1\"")]
 struct AzDiagnoseArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -482,15 +483,11 @@ fn build_gumbel_config(
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
-    PathBuf::from(format!("{model_path}.best"))
-}
-
-fn model_backup_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.bak", path.display()))
-}
-
-fn model_temp_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.tmp", path.display()))
+    Path::new(model_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("best.safetensors")
 }
 
 fn az_loop_progress_path(config_path: &str) -> PathBuf {
@@ -501,7 +498,8 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 struct AzLoopProgressState {
     next_update: usize,
     best_elo: f32,
@@ -520,69 +518,34 @@ impl Default for AzLoopProgressState {
     }
 }
 
+impl AzLoopProgressState {
+    fn normalize(mut self) -> Self {
+        self.next_update = self.next_update.max(1);
+        self.pikafish_depth = self.pikafish_depth.max(1);
+        if !self.best_elo.is_finite() {
+            self.best_elo = 1500.0;
+        }
+        self
+    }
+}
+
 fn load_az_loop_progress(config_path: &str) -> AzLoopProgressState {
     let path = az_loop_progress_path(config_path);
     let Ok(text) = fs::read_to_string(&path) else {
         return AzLoopProgressState::default();
     };
-    let mut state = AzLoopProgressState::default();
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "next_update" => {
-                if let Ok(v) = value.trim().parse::<usize>() {
-                    state.next_update = v.max(1);
-                }
-            }
-            "best_elo" => {
-                if let Ok(v) = value.trim().parse::<f32>() {
-                    if v.is_finite() {
-                        state.best_elo = v;
-                    } else {
-                        eprintln!(
-                            "progress : ignoring non-finite best_elo in `{}`",
-                            path.display()
-                        );
-                    }
-                }
-            }
-            "pikafish_depth" => {
-                if let Ok(v) = value.trim().parse::<u32>() {
-                    state.pikafish_depth = v.max(1);
-                }
-            }
-            "pikafish_best_wins" => {
-                if let Ok(v) = value.trim().parse::<usize>() {
-                    state.pikafish_best_wins = v;
-                }
-            }
-            _ => {}
-        }
-    }
-    state
+    toml::from_str::<AzLoopProgressState>(&text)
+        .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", path.display()))
+        .normalize()
 }
 
 fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     let path = az_loop_progress_path(config_path);
     fs::write(
-        path,
-        format!(
-            "next_update={}\nbest_elo={:.6}\npikafish_depth={}\npikafish_best_wins={}\n",
-            state.next_update, state.best_elo, state.pikafish_depth, state.pikafish_best_wins
-        ),
+        &path,
+        toml::to_string_pretty(&state.clone().normalize()).unwrap(),
     )
-    .unwrap_or_else(|err| {
-        panic!(
-            "failed to write `{}`: {err}",
-            az_loop_progress_path(config_path).display()
-        )
-    });
+    .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
 fn save_az_loop_progress_pair(
@@ -603,27 +566,7 @@ fn save_az_loop_progress_pair(
     );
 }
 
-fn load_model_with_backup(path: &Path) -> Result<AzNnue, String> {
-    match AzNnue::load(path) {
-        Ok(model) => Ok(model),
-        Err(err) => {
-            let backup = model_backup_path(path);
-            if backup.exists() {
-                AzNnue::load(&backup).map_err(|backup_err| {
-                    format!(
-                        "failed to load `{}` ({err}); backup `{}` also failed ({backup_err})",
-                        path.display(),
-                        backup.display()
-                    )
-                })
-            } else {
-                Err(format!("failed to load `{}` ({err})", path.display()))
-            }
-        }
-    }
-}
-
-fn save_model_atomic(model: &AzNnue, path: &Path) {
+fn save_model(model: &AzNnue, path: &Path) {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -634,30 +577,9 @@ fn save_model_atomic(model: &AzNnue, path: &Path) {
             );
         });
     }
-    let tmp = model_temp_path(path);
-    let backup = model_backup_path(path);
-    let _ = fs::remove_file(&tmp);
-    model.save(&tmp).unwrap_or_else(|err| {
-        panic!("failed to write temp model `{}`: {err}", tmp.display());
-    });
-    if path.exists() {
-        let _ = fs::remove_file(&backup);
-        fs::rename(path, &backup).unwrap_or_else(|err| {
-            panic!(
-                "failed to move `{}` to backup `{}`: {err}",
-                path.display(),
-                backup.display()
-            );
-        });
-    }
-    fs::rename(&tmp, path).unwrap_or_else(|err| {
-        panic!(
-            "failed to move temp model `{}` to `{}`: {err}",
-            tmp.display(),
-            path.display()
-        );
-    });
-    let _ = fs::remove_file(&backup);
+    model
+        .save(path)
+        .unwrap_or_else(|err| panic!("failed to save model `{}`: {err}", path.display()));
 }
 
 fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
@@ -679,7 +601,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "lrm{}_lds{}_ldi{}_ldf{}_sa{}_gsm{}_tb{}_te{}_tde{}_rc{}_tspu{}_mp{}_cpi{}_",
-            "tepu{}_mstc{}_ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
+            "tepu{}_mstc{}_vtd{}_ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -702,6 +624,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.train_epochs_per_update,
         config.max_sample_train_count,
         f32_slug(config.mirror_probability),
+        f32_slug(config.value_td_lambda),
         config.checkpoint_interval,
         config.arena_interval,
         f32_slug(config.arena_cpuct),
@@ -831,7 +754,7 @@ fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> Pat
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue");
+        .unwrap_or("model.safetensors");
     Path::new(checkpoint_dir).join(format!("update-{update:06}-{base}"))
 }
 
@@ -839,7 +762,7 @@ fn arena_pikafish_candidate_path(model_path: &str, checkpoint_dir: &str, update:
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue");
+        .unwrap_or("model.safetensors");
     Path::new(checkpoint_dir).join(format!("arena-pikafish-candidate-{update:04}-{base}"))
 }
 
@@ -853,7 +776,7 @@ fn save_checkpoint_model(
         panic!("failed to create checkpoint dir `{checkpoint_dir}`: {err}");
     });
     let path = checkpoint_path(model_path, checkpoint_dir, update);
-    save_model_atomic(model, &path);
+    save_model(model, &path);
     path
 }
 
@@ -939,6 +862,9 @@ struct AzSelfplayFitBenchArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.5)]
     mirror_probability: f32,
+    /// TD lambda used to mix search value with terminal game return.
+    #[arg(long, default_value_t = 0.85)]
+    value_td_lambda: f32,
     /// Gumbel root top-k considered actions.
     #[arg(long, default_value_t = 32)]
     topk: usize,
@@ -1043,6 +969,9 @@ struct AzReplayGenerateFixedArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.3)]
     mirror_probability: f32,
+    /// TD lambda used to mix search value with terminal game return.
+    #[arg(long, default_value_t = 0.85)]
+    value_td_lambda: f32,
     /// Gumbel root top-k considered actions.
     #[arg(long, default_value_t = 32)]
     topk: usize,
@@ -1136,7 +1065,7 @@ fn prune_old_checkpoints(
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("model.nnue")
+        .unwrap_or("model.safetensors")
         .to_string();
     let prefix = "update-";
     let suffix = format!("-{base}");
@@ -1225,6 +1154,7 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         root_exploration_fraction: config.root_exploration_fraction,
         gumbel: config.gumbel,
         mirror_probability: config.mirror_probability,
+        value_td_lambda: config.value_td_lambda,
     }
 }
 
@@ -2059,6 +1989,7 @@ fn main() {
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     gumbel,
                     mirror_probability: cmd.mirror_probability,
+                    value_td_lambda: cmd.value_td_lambda,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -2278,6 +2209,7 @@ fn main() {
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     gumbel,
                     mirror_probability: cmd.mirror_probability,
+                    value_td_lambda: cmd.value_td_lambda,
                 };
                 let batch_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -2458,7 +2390,7 @@ fn main() {
                     );
                 }
             }
-            save_model_atomic(&model, Path::new(&output_path));
+            save_model(&model, Path::new(&output_path));
             println!("fixed_train     : complete");
             println!("output          : {output_path}");
             println!("elapsed_sec     : {:.3}", started.elapsed().as_secs_f32());
@@ -2499,14 +2431,13 @@ fn main() {
 
             let config_arch = config.arch();
             let model_path = Path::new(&config.model_path);
-            let model = if model_path.exists() || model_backup_path(model_path).exists() {
+            let model = if model_path.exists() {
                 println!("model    : load {}", config.model_path);
-                match load_model_with_backup(model_path) {
+                match AzNnue::load(model_path) {
                     Ok(model) => {
                         if model.arch != config_arch {
                             println!(
-                                "model    : 警告：加载到的 .nnue arch={:?} 与 config arch={:?} 不一致，\
-                                 后续仍按 .nnue 自带 arch 训练（不会自动 re-init）",
+                                "model    : loaded arch={:?} differs from config arch={:?}; keep loaded arch",
                                 model.arch, config_arch
                             );
                         }
@@ -2520,11 +2451,9 @@ fn main() {
                         AzNnue::random_with_arch(config_arch, config.seed)
                     }
                 }
-            } else if config.arena_interval > 0
-                && (best_path.exists() || model_backup_path(&best_path).exists())
-            {
+            } else if config.arena_interval > 0 && best_path.exists() {
                 println!("model    : load best `{}` as current", best_path.display());
-                load_model_with_backup(&best_path).unwrap_or_else(|err| {
+                AzNnue::load(&best_path).unwrap_or_else(|err| {
                     panic!("failed to load best model `{}`: {err}", best_path.display());
                 })
             } else {
@@ -2535,16 +2464,16 @@ fn main() {
                 println!("selfplay : start from current `{}`", config.model_path);
                 model.clone()
             } else {
-                if !best_path.exists() && !model_backup_path(&best_path).exists() {
-                    save_model_atomic(&model, &best_path);
-                } else if let Err(err) = load_model_with_backup(&best_path) {
+                if !best_path.exists() {
+                    save_model(&model, &best_path);
+                } else if let Err(err) = AzNnue::load(&best_path) {
                     println!(
                         "best     : reset incompatible `{}` from current model ({err})",
                         best_path.display()
                     );
-                    save_model_atomic(&model, &best_path);
+                    save_model(&model, &best_path);
                 }
-                load_model_with_backup(&best_path).unwrap_or_else(|err| {
+                AzNnue::load(&best_path).unwrap_or_else(|err| {
                     panic!("failed to load best model `{}`: {err}", best_path.display());
                 })
             };
@@ -2599,7 +2528,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} train(value={},policy={},value_head={},policy_head={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_promotion_rate={} arena_processes={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={},value_head={},policy_head={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_promotion_rate={} arena_processes={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -2629,6 +2558,7 @@ fn main() {
                 config.gumbel.use_mixed_value,
                 config.replay_capacity,
                 config.mirror_probability,
+                config.value_td_lambda,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.train_value_head,
@@ -3362,7 +3292,7 @@ fn main() {
                             shared.model = candidate_model.clone();
                             shared.version = shared.version.wrapping_add(1);
                         }
-                        save_model_atomic(&candidate_model, &best_path);
+                        save_model(&candidate_model, &best_path);
                         println!(
                             "arena-warmup {update:04}: before_pikafish_start={} adopt=current saved_best",
                             config.arena_pikafish_start_update
@@ -3374,7 +3304,7 @@ fn main() {
                             &config.checkpoint_dir,
                             update,
                         );
-                        save_model_atomic(&candidate_model, &candidate_path);
+                        save_model(&candidate_model, &candidate_path);
                         let arena_eval_positions =
                             load_arena_eval_positions(&config.arena_pikafish_eval_fens);
                         let arena_eval_fens = arena_eval_positions.len();
@@ -3410,7 +3340,7 @@ fn main() {
                                 shared.model = candidate_model.clone();
                                 shared.version = shared.version.wrapping_add(1);
                             }
-                            save_model_atomic(&candidate_model, &best_path);
+                            save_model(&candidate_model, &best_path);
                             arena_pikafish_best_wins = wins;
                             if win_rate > config.arena_pikafish_promotion_rate {
                                 arena_pikafish_depth = arena_pikafish_depth.saturating_add(1);
@@ -3477,7 +3407,6 @@ fn main() {
                             if promoted { 1.0 } else { 0.0 },
                         );
                         let _ = fs::remove_file(&candidate_path);
-                        let _ = fs::remove_file(model_backup_path(&candidate_path));
                     } else {
                         let arena_eval_positions =
                             load_arena_eval_positions(DEFAULT_ARENA_EVAL_FENS);
@@ -3508,7 +3437,7 @@ fn main() {
                                 shared.model = candidate_model.clone();
                                 shared.version = shared.version.wrapping_add(1);
                             }
-                            save_model_atomic(&candidate_model, &best_path);
+                            save_model(&candidate_model, &best_path);
                             arena_best_elo = candidate_elo;
                         }
                         println!(
@@ -3624,7 +3553,7 @@ fn main() {
             }
             if exited_after_ctrl_c || exited_after_target_update {
                 if let Some(model) = interrupt_save_model.as_ref() {
-                    save_model_atomic(model, Path::new(&config.model_path));
+                    save_model(model, Path::new(&config.model_path));
                     save_az_loop_progress_pair(
                         &config_path,
                         interrupt_save_next_update,

@@ -2,47 +2,48 @@ use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
-use super::{AzTrainingSample, DENSE_MOVE_SPACE, POLICY_DYNAMIC_FEATURE_SIZE, SplitMix64};
+use super::{AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64};
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 19;
+const REPLAY_FILE_VERSION: u32 = 20;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
 const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
 
 fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
+    let mut buf = [0u8; 4];
+    LittleEndian::write_u32(&mut buf, v);
+    out.extend_from_slice(&buf);
 }
 
 fn replay_push_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
+    let mut buf = [0u8; 8];
+    LittleEndian::write_u64(&mut buf, v);
+    out.extend_from_slice(&buf);
 }
 
 fn replay_push_f32(out: &mut Vec<u8>, v: f32) {
-    out.extend_from_slice(&v.to_bits().to_le_bytes());
+    let mut buf = [0u8; 4];
+    LittleEndian::write_f32(&mut buf, v);
+    out.extend_from_slice(&buf);
 }
 
 fn replay_read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
+    reader.read_u32::<LittleEndian>()
 }
 
 fn replay_read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
+    reader.read_u64::<LittleEndian>()
 }
 
 fn replay_read_f32<R: Read>(reader: &mut R) -> io::Result<f32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(f32::from_bits(u32::from_le_bytes(buf)))
+    reader.read_f32::<LittleEndian>()
 }
 
 fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io::Result<()> {
@@ -54,12 +55,10 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
         || sample.policy.len() != sample.move_indices.len()
-        || sample.policy_dynamic_features.len()
-            != sample.move_indices.len() * POLICY_DYNAMIC_FEATURE_SIZE
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "replay encode: move_indices/policy/dynamic mismatch or too long",
+            "replay encode: move_indices/policy mismatch or too long",
         ));
     }
     replay_push_u32(out, sample.features.len() as u32);
@@ -72,9 +71,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     for &p in &sample.policy {
         replay_push_f32(out, p);
-    }
-    for &feature in &sample.policy_dynamic_features {
-        replay_push_f32(out, feature);
     }
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
@@ -130,17 +126,12 @@ fn decode_az_training_sample<R: Read>(
     for _ in 0..nm {
         policy.push(replay_read_f32(reader)?);
     }
-    let mut policy_dynamic_features = Vec::with_capacity(nm as usize * POLICY_DYNAMIC_FEATURE_SIZE);
-    for _ in 0..(nm as usize * POLICY_DYNAMIC_FEATURE_SIZE) {
-        policy_dynamic_features.push(replay_read_f32(reader)?);
-    }
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     let moves_left = replay_read_f32(reader)?;
     Ok(AzTrainingSample {
         features,
         move_indices,
-        policy_dynamic_features,
         policy,
         value,
         side_sign,
@@ -397,7 +388,7 @@ impl AzExperiencePool {
                 "replay bad magic",
             ));
         }
-        let ver = u32::from_le_bytes(file_blob[4..8].try_into().unwrap());
+        let ver = LittleEndian::read_u32(&file_blob[4..8]);
         if ver != REPLAY_FILE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

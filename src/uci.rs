@@ -70,7 +70,7 @@ impl Default for UciState {
             position: Position::startpos(),
             history: Vec::new(),
             rule_history: Position::startpos().initial_rule_history(),
-            eval_file: "chineseai.nnue".into(),
+            eval_file: "model.safetensors".into(),
             model: None,
             simulations: 10_000,
             threads: 1,
@@ -131,7 +131,7 @@ pub fn run_uci() {
 fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
-    println!("option name EvalFile type string default chineseai.nnue");
+    println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name Cpuct type string default 1.5");

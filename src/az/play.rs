@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::thread;
+
+use rayon::prelude::*;
 
 use crate::nnue::{
     HistoryMove, canonical_move, extract_sparse_features_az_canonical, mirror_file_move,
@@ -9,12 +10,9 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample,
-    PolicyFeaturePositionCache, SplitMix64, VALUE_SCALE_CP,
-    alphazero_search_with_history_and_rules, dense_move_index, policy_dynamic_features_cached,
+    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
+    VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
 };
-
-const TERMINAL_VALUE_DECAY_PLIES: f32 = 48.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
@@ -175,26 +173,25 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     }
 
     let shared_model = Arc::new(model.clone());
-    let mut handles = Vec::with_capacity(workers);
-    for worker in 0..workers {
-        let games = config.games / workers + usize::from(worker < config.games % workers);
-        if games == 0 {
-            continue;
-        }
-
-        let worker_model = Arc::clone(&shared_model);
-        let mut worker_config = config.clone();
-        worker_config.games = games;
-        worker_config.workers = 1;
-        worker_config.seed ^= (worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        handles.push(thread::spawn(move || {
-            generate_selfplay_chunk(&worker_model, &worker_config)
-        }));
-    }
-
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .expect("failed to build selfplay rayon pool");
+    let chunks = pool.install(|| {
+        (0..workers)
+            .into_par_iter()
+            .map(|worker| {
+                let games = config.games / workers + usize::from(worker < config.games % workers);
+                let mut worker_config = config.clone();
+                worker_config.games = games;
+                worker_config.workers = 1;
+                worker_config.seed ^= (worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                generate_selfplay_chunk(&shared_model, &worker_config)
+            })
+            .collect::<Vec<_>>()
+    });
     let mut merged = AzSelfplayData::default();
-    for handle in handles {
-        let chunk = handle.join().expect("selfplay worker panicked");
+    for chunk in chunks {
         merged.samples.extend(chunk.samples);
         merged.games.extend(chunk.games);
         merged.red_wins += chunk.red_wins;
@@ -397,7 +394,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_terminal_value_targets(&mut game_samples, result);
+        assign_td_lambda_value_targets(&mut game_samples, result, config.value_td_lambda);
         assign_moves_left_targets(&mut game_samples, config.max_plies);
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -509,24 +506,12 @@ fn make_training_sample(
         .iter()
         .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
-    let mirrored_position;
-    let policy_position = if mirror_file {
-        mirrored_position = position.mirror_files();
-        &mirrored_position
-    } else {
-        position
-    };
     if mirror_file {
         mirror_sparse_features_az_absolute_file(&mut features);
         for mv in &mut moves {
             *mv = mirror_file_move(*mv);
         }
     }
-    let policy_feature_cache = PolicyFeaturePositionCache::new_for_moves(policy_position, &moves);
-    let policy_dynamic_features = moves
-        .iter()
-        .flat_map(|&mv| policy_dynamic_features_cached(policy_position, mv, &policy_feature_cache))
-        .collect();
     let move_indices = moves
         .iter()
         .copied()
@@ -540,7 +525,6 @@ fn make_training_sample(
     AzTrainingSample {
         features,
         move_indices,
-        policy_dynamic_features,
         policy,
         value: value.clamp(-1.0, 1.0),
         side_sign,
@@ -548,15 +532,17 @@ fn make_training_sample(
     }
 }
 
-pub(super) fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], game_result: f32) {
-    let game_len = samples.len();
-    for (index, sample) in samples.iter_mut().enumerate() {
-        let terminal_value = (game_result * sample.side_sign).clamp(-1.0, 1.0);
-        let search_value = sample.value.clamp(-1.0, 1.0);
-        let remaining = game_len.saturating_sub(index + 1) as f32;
-        let terminal_weight = (-remaining / TERMINAL_VALUE_DECAY_PLIES).exp();
-        sample.value = (search_value * (1.0 - terminal_weight) + terminal_value * terminal_weight)
-            .clamp(-1.0, 1.0);
+pub(super) fn assign_td_lambda_value_targets(
+    samples: &mut [AzTrainingSample],
+    game_result: f32,
+    lambda: f32,
+) {
+    let lambda = lambda.clamp(0.0, 1.0);
+    let mut return_red = game_result.clamp(-1.0, 1.0);
+    for sample in samples.iter_mut().rev() {
+        let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
+        return_red = (search_red * (1.0 - lambda) + return_red * lambda).clamp(-1.0, 1.0);
+        sample.value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
     }
 }
 
@@ -799,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_training_sample_recomputes_policy_dynamic_features() {
+    fn mirrored_training_sample_mirrors_move_indices() {
         let position =
             Position::from_fen("3ak4/9/2n1b4/p3p3p/4R4/2P6/P3P3P/2N1C4/4A4/2BAK3c b").unwrap();
         let moves = position.legal_moves();
@@ -816,12 +802,12 @@ mod tests {
             .iter()
             .map(|candidate| mirror_file_move(candidate.mv))
             .collect::<Vec<_>>();
-        let cache = PolicyFeaturePositionCache::new_for_moves(&mirrored_position, &mirrored_moves);
         let expected = mirrored_moves
             .iter()
-            .flat_map(|&mv| policy_dynamic_features_cached(&mirrored_position, mv, &cache))
+            .copied()
+            .map(|mv| dense_move_index(canonical_move(mirrored_position.side_to_move(), mv)))
             .collect::<Vec<_>>();
 
-        assert_eq!(sample.policy_dynamic_features, expected);
+        assert_eq!(sample.move_indices, expected);
     }
 }
