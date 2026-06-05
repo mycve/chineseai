@@ -2211,9 +2211,7 @@ fn main() {
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
                 };
-                let batch_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
-                let batch_seconds = batch_started.elapsed().as_secs_f32();
                 total_games += data.games.len();
                 total_generated_samples += data.samples.len();
                 red_wins += data.red_wins;
@@ -2223,7 +2221,7 @@ fn main() {
                 pool.add_samples(data.samples);
                 batch_index += 1;
                 println!(
-                    "batch {:04}: games={} generated_samples={} kept={}/{} R/B/D={}/{}/{} avg_plies={:.1} selfplay={:.1}s elapsed={:.1}s",
+                    "batch {:04}: games={} generated_samples={} kept={}/{} R/B/D={}/{}/{} avg_plies={:.1} elapsed={:.1}s",
                     batch_index,
                     total_games,
                     total_generated_samples,
@@ -2237,7 +2235,6 @@ fn main() {
                     } else {
                         plies_total as f32 / total_games as f32
                     },
-                    batch_seconds,
                     started.elapsed().as_secs_f32()
                 );
             }
@@ -2950,7 +2947,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} value_rmse={:.4} v_mu={:.3}/{:.3} v_rms={:.3}/{:.3} v_corr={:.3} v_cal={:.3} policy_ce={:.4} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} openRawP={:.3}/{:.3} openTgtP={:.3}/{:.3} openQgap={:.3} openQabs={:.3} openVisitA={:.1} selfplay={:.1}s train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} value_rmse={:.4} v_mu={:.3}/{:.3} v_rms={:.3}/{:.3} v_corr={:.3} v_cal={:.3} policy_ce={:.4} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} openRawP={:.3}/{:.3} openTgtP={:.3}/{:.3} openQgap={:.3} openQabs={:.3} openVisitA={:.1} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -2996,7 +2993,6 @@ fn main() {
                     report.opening_q_gap,
                     report.opening_q_top1_abs,
                     report.opening_visited_actions,
-                    report.selfplay_seconds,
                     report.train_seconds,
                     report.games_per_second,
                     report.samples_per_second,
@@ -3160,12 +3156,6 @@ fn main() {
                     "train/samples_per_second",
                     update,
                     report.train_samples_per_second,
-                );
-                log_scalar(
-                    &mut tb,
-                    "timing/selfplay_seconds",
-                    update,
-                    report.selfplay_seconds,
                 );
                 log_scalar(
                     &mut tb,
