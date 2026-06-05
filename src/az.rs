@@ -5,6 +5,11 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 mod alphazero;
+#[cfg(any(
+    feature = "gpu-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+mod candle_model;
 mod mctx;
 mod play;
 mod replay;
