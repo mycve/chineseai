@@ -1,6 +1,6 @@
 use chineseai::az::{AzGumbelConfig, AzNnueArch, AzSearchAlgorithm};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{fmt::Write, fs, path::Path};
 
 pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 #[derive(Clone, Debug)]
@@ -309,8 +309,108 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
 
 impl AzLoopFileConfig {
     pub fn to_file_text(&self) -> String {
-        toml::to_string_pretty(&AzLoopTomlConfig::from(self))
-            .expect("AzLoopFileConfig should serialize to TOML")
+        fn q(value: &str) -> String {
+            format!("{value:?}")
+        }
+        fn f(value: f32) -> String {
+            if value == 0.0 {
+                return "0.0".into();
+            }
+            let precision = if value.abs() < 0.0001 { 10 } else { 8 };
+            let out = format!("{value:.precision$}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            if out == "-0" {
+                return "0.0".into();
+            }
+            if out.contains('.') {
+                out
+            } else {
+                format!("{out}.0")
+            }
+        }
+        let mut out = String::new();
+        macro_rules! line {
+            ($name:literal, $value:expr) => {
+                writeln!(out, "{} = {}", $name, $value).unwrap();
+            };
+        }
+        line!("model_path", q(&self.model_path));
+        line!("simulations", self.simulations);
+        line!(
+            "selfplay_samples_per_update",
+            self.selfplay_samples_per_update
+        );
+        line!("lr", f(self.lr));
+        line!("lr_min", f(self.lr_min));
+        line!("lr_decay_start_update", self.lr_decay_start_update);
+        line!("lr_decay_interval", self.lr_decay_interval);
+        line!("lr_decay_factor", f(self.lr_decay_factor));
+        line!("batch_size", self.batch_size);
+        line!("max_plies", self.max_plies);
+        line!("hidden_size", self.hidden_size);
+        line!("seed", self.seed);
+        line!("workers", self.workers);
+        line!("temperature_start", f(self.temperature_start));
+        line!("temperature_end", f(self.temperature_end));
+        line!("temperature_decay_plies", self.temperature_decay_plies);
+        line!("search_algorithm", q(self.search_algorithm.as_str()));
+        line!("cpuct", f(self.cpuct));
+        line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
+        line!(
+            "root_exploration_fraction",
+            f(self.root_exploration_fraction)
+        );
+        line!(
+            "gumbel_max_num_considered_actions",
+            self.gumbel.max_num_considered_actions
+        );
+        line!("gumbel_scale", f(self.gumbel.gumbel_scale));
+        line!("gumbel_value_scale", f(self.gumbel.value_scale));
+        line!("gumbel_maxvisit_init", f(self.gumbel.maxvisit_init));
+        line!("gumbel_rescale_values", self.gumbel.rescale_values);
+        line!("gumbel_use_mixed_value", self.gumbel.use_mixed_value);
+        line!("replay_capacity", self.replay_capacity);
+        line!("train_warmup_samples", self.train_warmup_samples);
+        line!("train_samples_per_update", self.train_samples_per_update);
+        line!("train_epochs_per_update", self.train_epochs_per_update);
+        line!("max_sample_train_count", self.max_sample_train_count);
+        line!("mirror_probability", f(self.mirror_probability));
+        line!("value_td_lambda", f(self.value_td_lambda));
+        line!("train_value_weight", f(self.train_value_weight));
+        line!("train_policy_weight", f(self.train_policy_weight));
+        line!("train_value_head", self.train_value_head);
+        line!("train_policy_head", self.train_policy_head);
+        line!("checkpoint_interval", self.checkpoint_interval);
+        line!("checkpoint_dir", q(&self.checkpoint_dir));
+        line!("max_checkpoints", self.max_checkpoints);
+        line!("arena_interval", self.arena_interval);
+        line!("arena_games_per_side", self.arena_games_per_side);
+        line!("arena_cpuct", f(self.arena_cpuct));
+        line!("arena_promotion_rate", f(self.arena_promotion_rate));
+        line!("arena_processes", self.arena_processes);
+        line!("arena_pikafish_exe", q(&self.arena_pikafish_exe));
+        line!(
+            "arena_pikafish_start_update",
+            self.arena_pikafish_start_update
+        );
+        line!("arena_pikafish_depth", self.arena_pikafish_depth);
+        line!("arena_pikafish_games", self.arena_pikafish_games);
+        line!(
+            "arena_pikafish_parallel_games",
+            self.arena_pikafish_parallel_games
+        );
+        line!(
+            "arena_pikafish_promotion_rate",
+            f(self.arena_pikafish_promotion_rate)
+        );
+        line!(
+            "arena_pikafish_eval_fens",
+            q(&self.arena_pikafish_eval_fens)
+        );
+        line!("tensorboard_logdir", q(&self.tensorboard_logdir));
+        out
     }
 
     fn parse(text: &str) -> Self {
@@ -363,6 +463,29 @@ impl AzLoopFileConfig {
         self.arena_pikafish_parallel_games = self.arena_pikafish_parallel_games.max(1);
         self.arena_pikafish_promotion_rate = self.arena_pikafish_promotion_rate.clamp(0.0, 1.0);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_writer_uses_short_float_literals() {
+        let text = AzLoopFileConfig::default().to_file_text();
+
+        assert!(text.contains("lr = 0.001\n"));
+        assert!(text.contains("lr_min = 0.00003\n"));
+        assert!(text.contains("temperature_start = 1.0\n"));
+        assert!(text.contains("temperature_end = 0.1\n"));
+        assert!(text.contains("value_td_lambda = 0.85\n"));
+        assert!(!text.contains("000000047"));
+        assert!(!text.contains("000000023"));
+
+        let parsed = AzLoopFileConfig::parse(&text);
+        assert_eq!(parsed.model_path, "model.safetensors");
+        assert!((parsed.lr - 0.001).abs() < 1e-9);
+        assert!((parsed.value_td_lambda - 0.85).abs() < 1e-6);
     }
 }
 
