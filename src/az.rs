@@ -10,6 +10,7 @@ mod alphazero;
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 mod candle_model;
+mod dataloader;
 mod mctx;
 mod play;
 mod replay;

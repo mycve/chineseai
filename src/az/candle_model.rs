@@ -5,13 +5,11 @@ use super::{
     AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
     PIECE_ATTENTION_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
     STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS,
-    VALUE_HEAD_SIZE, canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    policy_move_from_features, policy_move_to_features, structural_king_piece_index,
+    VALUE_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
 
-const POLICY_MASK_VALUE: f32 = -1.0e9;
 const RMS_NORM_EPS: f64 = 1.0e-6;
 
 #[derive(Debug)]
@@ -188,148 +186,74 @@ impl BatchTensors {
         batch: &[usize],
         device: &Device,
     ) -> CandleResult<Self> {
-        let batch_size = batch.len();
-        let max_features = batch
-            .iter()
-            .map(|&sample_index| samples[sample_index].features.len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let max_policy_moves = batch
-            .iter()
-            .map(|&sample_index| {
-                samples[sample_index]
-                    .move_indices
-                    .iter()
-                    .filter(|&&move_index| move_index < DENSE_MOVE_SPACE)
-                    .count()
-            })
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let mut feature_indices = vec![0u32; batch_size * max_features];
-        let mut feature_mask = vec![0.0f32; batch_size * max_features];
-        let mut structural_piece_indices = vec![0u32; batch_size * max_features];
-        let mut structural_rank_indices = vec![0u32; batch_size * max_features];
-        let mut structural_file_indices = vec![0u32; batch_size * max_features];
-        let mut structural_us_king_piece_indices = vec![0u32; batch_size * max_features];
-        let mut structural_them_king_piece_indices = vec![0u32; batch_size * max_features];
-        let mut structural_mask = vec![0.0f32; batch_size * max_features];
-        let mut policy_indices = vec![0u32; batch_size * max_policy_moves];
-        let mut policy_targets = vec![0.0f32; batch_size * max_policy_moves];
-        let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * max_policy_moves];
-        let mut values = vec![0.0f32; batch_size];
-        let mut moves_left = vec![0.0f32; batch_size];
+        Self::from_packed(PackedBatch::from_indices(samples, batch), device)
+    }
 
-        for (row, &sample_index) in batch.iter().enumerate() {
-            let sample = &samples[sample_index];
-            let (us_king_bucket, them_king_bucket) =
-                canonical_general_buckets_from_features(&sample.features);
-            let feature_base = row * max_features;
-            for (feature_offset, &feature) in sample.features.iter().enumerate() {
-                if feature < AZ_NNUE_INPUT_SIZE {
-                    let batch_feature_index = feature_base + feature_offset;
-                    feature_indices[batch_feature_index] = feature as u32;
-                    feature_mask[batch_feature_index] = 1.0;
-                    if let Some(structural) = decode_current_piece_square_feature(feature) {
-                        structural_piece_indices[batch_feature_index] =
-                            structural.piece_index as u32;
-                        structural_rank_indices[batch_feature_index] = structural.rank as u32;
-                        structural_file_indices[batch_feature_index] = structural.file as u32;
-                        structural_us_king_piece_indices[batch_feature_index] =
-                            structural_king_piece_index(0, us_king_bucket, structural.piece_index)
-                                as u32;
-                        structural_them_king_piece_indices[batch_feature_index] =
-                            structural_king_piece_index(1, them_king_bucket, structural.piece_index)
-                                as u32;
-                        structural_mask[batch_feature_index] = 1.0;
-                    }
-                }
-            }
-
-            let policy_base = row * max_policy_moves;
-            let mut policy_offset = 0;
-            for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
-                if move_index < DENSE_MOVE_SPACE {
-                    policy_indices[policy_base + policy_offset] = move_index as u32;
-                    policy_targets[policy_base + policy_offset] = target.max(0.0);
-                    policy_mask[policy_base + policy_offset] = 0.0;
-                    policy_offset += 1;
-                }
-            }
-            normalize_policy_targets(
-                &mut policy_targets[policy_base..policy_base + max_policy_moves],
-                policy_offset,
-            );
-            let value = sample.value.clamp(-1.0, 1.0);
-            values[row] = value;
-            moves_left[row] = sample.moves_left.clamp(0.0, 1.0);
-        }
+    pub(super) fn from_packed(packed: PackedBatch, device: &Device) -> CandleResult<Self> {
+        let batch_size = packed.batch_size;
+        let max_features = packed.max_features;
+        let max_policy_moves = packed.max_policy_moves;
         Ok(Self {
             batch_size,
             max_features,
-            feature_indices: Tensor::from_vec(feature_indices, (batch_size, max_features), device)?,
-            feature_mask: Tensor::from_vec(feature_mask, (batch_size, max_features, 1), device)?,
+            feature_indices: Tensor::from_vec(
+                packed.feature_indices,
+                (batch_size, max_features),
+                device,
+            )?,
+            feature_mask: Tensor::from_vec(
+                packed.feature_mask,
+                (batch_size, max_features, 1),
+                device,
+            )?,
             structural_piece_indices: Tensor::from_vec(
-                structural_piece_indices,
+                packed.structural_piece_indices,
                 (batch_size, max_features),
                 device,
             )?,
             structural_rank_indices: Tensor::from_vec(
-                structural_rank_indices,
+                packed.structural_rank_indices,
                 (batch_size, max_features),
                 device,
             )?,
             structural_file_indices: Tensor::from_vec(
-                structural_file_indices,
+                packed.structural_file_indices,
                 (batch_size, max_features),
                 device,
             )?,
             structural_us_king_piece_indices: Tensor::from_vec(
-                structural_us_king_piece_indices,
+                packed.structural_us_king_piece_indices,
                 (batch_size, max_features),
                 device,
             )?,
             structural_them_king_piece_indices: Tensor::from_vec(
-                structural_them_king_piece_indices,
+                packed.structural_them_king_piece_indices,
                 (batch_size, max_features),
                 device,
             )?,
             structural_mask: Tensor::from_vec(
-                structural_mask,
+                packed.structural_mask,
                 (batch_size, max_features, 1),
                 device,
             )?,
             policy_indices: Tensor::from_vec(
-                policy_indices,
+                packed.policy_indices,
                 (batch_size, max_policy_moves),
                 device,
             )?,
             policy_targets: Tensor::from_vec(
-                policy_targets,
+                packed.policy_targets,
                 (batch_size, max_policy_moves),
                 device,
             )?,
-            policy_mask: Tensor::from_vec(policy_mask, (batch_size, max_policy_moves), device)?,
-            values: Tensor::from_vec(values, batch_size, device)?,
-            moves_left: Tensor::from_vec(moves_left, batch_size, device)?,
+            policy_mask: Tensor::from_vec(
+                packed.policy_mask,
+                (batch_size, max_policy_moves),
+                device,
+            )?,
+            values: Tensor::from_vec(packed.values, batch_size, device)?,
+            moves_left: Tensor::from_vec(packed.moves_left, batch_size, device)?,
         })
-    }
-}
-
-fn normalize_policy_targets(targets: &mut [f32], active: usize) {
-    if active == 0 {
-        return;
-    }
-    let active_targets = &mut targets[..active];
-    let sum = active_targets.iter().copied().sum::<f32>();
-    if sum.is_finite() && sum > 1.0e-12 {
-        for target in active_targets.iter_mut() {
-            *target = (*target / sum).max(0.0);
-        }
-    } else {
-        let uniform = 1.0 / active as f32;
-        active_targets.fill(uniform);
     }
 }
 
