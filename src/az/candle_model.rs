@@ -2,7 +2,7 @@ use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradSto
 use candle_nn::ops::log_softmax;
 
 use super::{
-    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
+    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, AzTrainLossWeights, DENSE_MOVE_SPACE,
     PIECE_ATTENTION_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
     STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS,
     VALUE_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
@@ -181,14 +181,6 @@ pub(super) struct BatchTensors {
 }
 
 impl BatchTensors {
-    pub(super) fn new(
-        samples: &[AzTrainingSample],
-        batch: &[usize],
-        device: &Device,
-    ) -> CandleResult<Self> {
-        Self::from_packed(PackedBatch::from_indices(samples, batch), device)
-    }
-
     pub(super) fn from_packed(packed: PackedBatch, device: &Device) -> CandleResult<Self> {
         let batch_size = packed.batch_size;
         let max_features = packed.max_features;

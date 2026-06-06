@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -139,6 +140,80 @@ impl PackedBatch {
         packed
     }
 
+    pub(super) fn shard(&self, rows: Range<usize>) -> Self {
+        debug_assert!(rows.start <= rows.end);
+        debug_assert!(rows.end <= self.batch_size);
+        let batch_size = rows.end - rows.start;
+        Self {
+            batch_size,
+            max_features: self.max_features,
+            max_policy_moves: self.max_policy_moves,
+            feature_indices: slice_rows(
+                &self.feature_indices,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            feature_mask: slice_rows(&self.feature_mask, self.max_features, rows.start, rows.end),
+            structural_piece_indices: slice_rows(
+                &self.structural_piece_indices,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            structural_rank_indices: slice_rows(
+                &self.structural_rank_indices,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            structural_file_indices: slice_rows(
+                &self.structural_file_indices,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            structural_us_king_piece_indices: slice_rows(
+                &self.structural_us_king_piece_indices,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            structural_them_king_piece_indices: slice_rows(
+                &self.structural_them_king_piece_indices,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            structural_mask: slice_rows(
+                &self.structural_mask,
+                self.max_features,
+                rows.start,
+                rows.end,
+            ),
+            policy_indices: slice_rows(
+                &self.policy_indices,
+                self.max_policy_moves,
+                rows.start,
+                rows.end,
+            ),
+            policy_targets: slice_rows(
+                &self.policy_targets,
+                self.max_policy_moves,
+                rows.start,
+                rows.end,
+            ),
+            policy_mask: slice_rows(
+                &self.policy_mask,
+                self.max_policy_moves,
+                rows.start,
+                rows.end,
+            ),
+            values: self.values[rows.start..rows.end].to_vec(),
+            moves_left: self.moves_left[rows.start..rows.end].to_vec(),
+        }
+    }
+
     fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
         let (us_king_bucket, them_king_bucket) =
             canonical_general_buckets_from_features(&sample.features);
@@ -179,6 +254,10 @@ impl PackedBatch {
             policy_offset,
         );
     }
+}
+
+fn slice_rows<T: Copy>(values: &[T], row_width: usize, start: usize, end: usize) -> Vec<T> {
+    values[start * row_width..end * row_width].to_vec()
 }
 
 #[derive(Debug)]
@@ -345,6 +424,21 @@ mod tests {
         assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
         assert_eq!(packed.values, vec![1.0, 1.0]);
         assert_eq!(packed.moves_left, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn packed_batch_shard_keeps_row_data() {
+        let samples = (0..4).map(sample).collect::<Vec<_>>();
+        let packed = PackedBatch::from_indices(&samples, &[0, 1, 2, 3]);
+        let shard = packed.shard(1..3);
+        assert_eq!(shard.batch_size, 2);
+        assert_eq!(shard.max_features, packed.max_features);
+        assert_eq!(shard.max_policy_moves, packed.max_policy_moves);
+        assert_eq!(
+            shard.feature_indices[0],
+            packed.feature_indices[packed.max_features]
+        );
+        assert_eq!(shard.values, vec![1.0, 1.0]);
     }
 
     #[test]

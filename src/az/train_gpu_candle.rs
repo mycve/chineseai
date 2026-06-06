@@ -1,11 +1,12 @@
 use candle_core::{Device, Result as CandleResult, Tensor, backprop::GradStore};
 use candle_nn::ops::log_softmax;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
-use std::{process::Command, thread};
+use std::{process::Command, sync::Arc, thread};
 
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, MOVES_LEFT_AUX_WEIGHT,
     candle_model::{AzCandleModel, BatchTensors},
+    dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PrefetchDataLoader},
 };
 
 const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
@@ -48,8 +49,8 @@ pub(super) fn train_samples_gpu(
     {
         model.gpu_trainer = Some(Box::new(GpuTrainer::new(model, lr)?));
     }
-    let mut order = (0..samples.len()).collect::<Vec<_>>();
     let mut stats = AzTrainStats::default();
+    let samples = Arc::new(samples.to_vec());
     {
         let trainer = model
             .gpu_trainer
@@ -59,12 +60,21 @@ pub(super) fn train_samples_gpu(
         let step_chunk = (per_gpu * trainer.replicas.len().max(1)).max(1);
         trainer.set_learning_rate(lr);
         for _ in 0..epochs {
-            shuffle(&mut order, rng);
+            let config = DataLoaderConfig {
+                batch_size: step_chunk,
+                seed: rng.next_u64(),
+                num_workers: dataloader_worker_count(),
+                prefetch_batches: 2,
+                ..DataLoaderConfig::default()
+            };
+            let plan = BatchPlan::epoch(samples.len(), &config);
+            let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
             stats = AzTrainStats::default();
-            for batch in order.chunks(step_chunk) {
-                let batch_stats = trainer.train_batch(samples, batch, loss_weights)?;
+            while let Some(batch) = loader.next_packed().map_err(dataloader_error)? {
+                let batch_stats = trainer.train_batch(batch, loss_weights)?;
                 stats.add_assign(&batch_stats);
             }
+            loader.join().map_err(dataloader_error)?;
         }
     }
     if stats.samples > 0 {
@@ -128,33 +138,37 @@ impl GpuTrainer {
 
     fn train_batch(
         &mut self,
-        samples: &[AzTrainingSample],
-        batch: &[usize],
+        batch: PackedBatch,
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
-        let active_replicas = self.active_replica_count(batch.len());
+        let batch_len = batch.batch_size;
+        let active_replicas = self.active_replica_count(batch_len);
         if active_replicas <= 1 {
-            return self.train_batch_single(samples, batch, loss_weights);
+            return self.train_batch_single(batch, loss_weights);
         }
 
-        let shard_size = batch.len().div_ceil(active_replicas);
+        let shard_size = batch_len.div_ceil(active_replicas);
         let mut shard_ranges = Vec::with_capacity(active_replicas);
         for shard_index in 0..active_replicas {
             let start = shard_index * shard_size;
-            let end = ((shard_index + 1) * shard_size).min(batch.len());
+            let end = ((shard_index + 1) * shard_size).min(batch_len);
             if start < end {
                 shard_ranges.push(start..end);
             }
         }
+        let shards = shard_ranges
+            .iter()
+            .cloned()
+            .map(|range| batch.shard(range))
+            .collect::<Vec<_>>();
         let shard_outputs = thread::scope(|scope| {
             let mut handles = Vec::new();
-            for (shard_index, range) in shard_ranges.iter().cloned().enumerate() {
+            for (shard_index, shard) in shards.iter().enumerate() {
                 let replica = &self.replicas[shard_index];
                 handles.push(scope.spawn(move || {
                     replica.compute_batch_grads(
-                        samples,
-                        &batch[range],
-                        batch.len(),
+                        shard.clone(),
+                        batch_len,
                         shard_index == 0,
                         loss_weights,
                     )
@@ -197,17 +211,11 @@ impl GpuTrainer {
 
     fn train_batch_single(
         &mut self,
-        samples: &[AzTrainingSample],
-        batch: &[usize],
+        batch: PackedBatch,
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
-        let output = self.replicas[0].compute_batch_grads(
-            samples,
-            batch,
-            batch.len(),
-            true,
-            loss_weights,
-        )?;
+        let batch_len = batch.batch_size;
+        let output = self.replicas[0].compute_batch_grads(batch, batch_len, true, loss_weights)?;
         self.optimizers[0].step(
             output
                 .grads
@@ -264,13 +272,12 @@ impl GpuReplica {
 
     fn compute_batch_grads(
         &self,
-        samples: &[AzTrainingSample],
-        batch: &[usize],
+        batch: PackedBatch,
         global_batch_len: usize,
         keep_grads: bool,
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<ShardOutput> {
-        let batch_tensors = BatchTensors::new(samples, batch, &self.device)?;
+        let batch_tensors = BatchTensors::from_packed(batch, &self.device)?;
         let output = self.compute_batch_loss(
             &batch_tensors,
             global_batch_len,
@@ -434,9 +441,13 @@ fn cuda_device_supports_training(index: usize) -> bool {
         .is_ok()
 }
 
-fn shuffle(values: &mut [usize], rng: &mut super::SplitMix64) {
-    for index in (1..values.len()).rev() {
-        let swap_with = (rng.next_u64() as usize) % (index + 1);
-        values.swap(index, swap_with);
-    }
+fn dataloader_worker_count() -> usize {
+    let available = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    available.clamp(1, 4)
+}
+
+fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::Error {
+    candle_core::Error::Msg(format!("dataloader failed: {error:?}"))
 }
