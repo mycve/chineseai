@@ -303,25 +303,13 @@ impl GpuTrainer {
         profile.grad_sync_seconds += all_reduce_started.elapsed().as_secs_f64();
 
         let optimizer_started = Instant::now();
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(outputs.len());
-            for (optimizer, output) in self.optimizers.iter_mut().zip(outputs.iter()) {
-                handles.push(scope.spawn(move || {
-                    optimizer.step(
-                        output
-                            .grads
-                            .as_ref()
-                            .expect("NCCL all-reduce keeps gradients on every GPU"),
-                    )
-                }));
-            }
-            for handle in handles {
-                handle.join().map_err(|_| {
-                    candle_core::Error::Msg("NCCL optimizer worker panicked".into())
-                })??;
-            }
-            CandleResult::Ok(())
-        })?;
+        self.optimizers[0].step(
+            outputs[0]
+                .grads
+                .as_ref()
+                .expect("NCCL all-reduce keeps primary gradients on GPU"),
+        )?;
+        self.nccl_broadcast_vars()?;
         for replica in &self.replicas {
             profile_sync(&replica.device)?;
         }
@@ -338,6 +326,81 @@ impl GpuTrainer {
             .collect::<Vec<_>>();
         for var_index in 0..vars_by_rank[0].len() {
             self.nccl_all_reduce_var(outputs, &vars_by_rank, var_index)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "nccl-train")]
+    fn nccl_broadcast_vars(&self) -> CandleResult<()> {
+        let vars_by_rank = self
+            .replicas
+            .iter()
+            .map(|replica| replica.model.all_vars())
+            .collect::<Vec<_>>();
+        for var_index in 0..vars_by_rank[0].len() {
+            self.nccl_broadcast_var(&vars_by_rank, var_index)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "nccl-train")]
+    fn nccl_broadcast_var(
+        &self,
+        vars_by_rank: &[Vec<candle_core::Var>],
+        var_index: usize,
+    ) -> CandleResult<()> {
+        let nccl = self
+            .nccl
+            .as_ref()
+            .expect("NCCL reducer should be initialized");
+        let root_var = vars_by_rank[0][var_index]
+            .as_detached_tensor()
+            .contiguous()?;
+        let mut recv_slices = Vec::with_capacity(vars_by_rank.len());
+        for vars in vars_by_rank {
+            let device = vars[var_index].device().as_cuda_device()?.clone();
+            let recv = device
+                .cuda_stream()
+                .alloc_zeros::<f32>(root_var.elem_count())
+                .map_err(nccl_cuda_error)?;
+            recv_slices.push(recv);
+        }
+        let (root_storage, root_layout) = root_var.storage_and_layout();
+        if !root_layout.is_contiguous() || root_layout.start_offset() != 0 {
+            return Err(candle_core::Error::Msg(
+                "NCCL broadcast source must be contiguous with zero offset".into(),
+            ));
+        }
+
+        nccl::group_start().map_err(nccl_error)?;
+        let broadcast = (|| -> CandleResult<()> {
+            let root_send = match &*root_storage {
+                Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "NCCL broadcast source must live on CUDA".into(),
+                    ));
+                }
+            };
+            for rank in 0..vars_by_rank.len() {
+                let send = (rank == 0).then_some(root_send);
+                nccl.comms[rank]
+                    .broadcast(send, &mut recv_slices[rank], 0)
+                    .map_err(nccl_error)?;
+            }
+            Ok(())
+        })();
+        let group_end = nccl::group_end().map_err(nccl_error);
+        broadcast?;
+        group_end?;
+
+        for (rank, recv) in recv_slices.into_iter().enumerate().skip(1) {
+            let var = &vars_by_rank[rank][var_index];
+            let device = self.replicas[rank].device.as_cuda_device()?.clone();
+            let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
+            let tensor =
+                Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
+            var.set(&tensor)?;
         }
         Ok(())
     }
