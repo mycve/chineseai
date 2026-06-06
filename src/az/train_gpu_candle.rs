@@ -303,14 +303,25 @@ impl GpuTrainer {
         profile.grad_sync_seconds += all_reduce_started.elapsed().as_secs_f64();
 
         let optimizer_started = Instant::now();
-        for (optimizer, output) in self.optimizers.iter_mut().zip(outputs.iter()) {
-            optimizer.step(
-                output
-                    .grads
-                    .as_ref()
-                    .expect("NCCL all-reduce keeps gradients on every GPU"),
-            )?;
-        }
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(outputs.len());
+            for (optimizer, output) in self.optimizers.iter_mut().zip(outputs.iter()) {
+                handles.push(scope.spawn(move || {
+                    optimizer.step(
+                        output
+                            .grads
+                            .as_ref()
+                            .expect("NCCL all-reduce keeps gradients on every GPU"),
+                    )
+                }));
+            }
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    candle_core::Error::Msg("NCCL optimizer worker panicked".into())
+                })??;
+            }
+            CandleResult::Ok(())
+        })?;
         for replica in &self.replicas {
             profile_sync(&replica.device)?;
         }
