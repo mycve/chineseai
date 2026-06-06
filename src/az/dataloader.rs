@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -21,6 +20,7 @@ pub(super) struct DataLoaderConfig {
     pub drop_last: bool,
     pub num_workers: usize,
     pub prefetch_batches: usize,
+    pub shard_count: usize,
     pub seed: u64,
 }
 
@@ -32,6 +32,7 @@ impl Default for DataLoaderConfig {
             drop_last: false,
             num_workers: 1,
             prefetch_batches: 2,
+            shard_count: 1,
             seed: 0,
         }
     }
@@ -39,7 +40,13 @@ impl Default for DataLoaderConfig {
 
 #[derive(Clone, Debug)]
 pub(super) struct BatchPlan {
-    batches: Vec<Vec<usize>>,
+    steps: Vec<BatchStep>,
+}
+
+#[derive(Clone, Debug)]
+struct BatchStep {
+    shards: Vec<Vec<usize>>,
+    sample_count: usize,
 }
 
 impl BatchPlan {
@@ -50,23 +57,38 @@ impl BatchPlan {
             shuffle_indices(&mut order, config.seed);
         }
 
-        let mut batches = Vec::with_capacity(sample_count.div_ceil(batch_size));
+        let shard_count = config.shard_count.max(1);
+        let mut steps = Vec::with_capacity(sample_count.div_ceil(batch_size));
         for chunk in order.chunks(batch_size) {
             if config.drop_last && chunk.len() < batch_size {
                 break;
             }
-            batches.push(chunk.to_vec());
+            let shard_size = chunk.len().div_ceil(shard_count);
+            let shards = chunk
+                .chunks(shard_size.max(1))
+                .map(|shard| shard.to_vec())
+                .collect::<Vec<_>>();
+            steps.push(BatchStep {
+                shards,
+                sample_count: chunk.len(),
+            });
         }
-        Self { batches }
+        Self { steps }
     }
 
     pub(super) fn len(&self) -> usize {
-        self.batches.len()
+        self.steps.len()
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+        self.steps.is_empty()
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PackedStepBatch {
+    pub(super) batch_size: usize,
+    pub(super) shards: Vec<PackedBatch>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,80 +162,6 @@ impl PackedBatch {
         packed
     }
 
-    pub(super) fn shard(&self, rows: Range<usize>) -> Self {
-        debug_assert!(rows.start <= rows.end);
-        debug_assert!(rows.end <= self.batch_size);
-        let batch_size = rows.end - rows.start;
-        Self {
-            batch_size,
-            max_features: self.max_features,
-            max_policy_moves: self.max_policy_moves,
-            feature_indices: slice_rows(
-                &self.feature_indices,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            feature_mask: slice_rows(&self.feature_mask, self.max_features, rows.start, rows.end),
-            structural_piece_indices: slice_rows(
-                &self.structural_piece_indices,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            structural_rank_indices: slice_rows(
-                &self.structural_rank_indices,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            structural_file_indices: slice_rows(
-                &self.structural_file_indices,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            structural_us_king_piece_indices: slice_rows(
-                &self.structural_us_king_piece_indices,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            structural_them_king_piece_indices: slice_rows(
-                &self.structural_them_king_piece_indices,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            structural_mask: slice_rows(
-                &self.structural_mask,
-                self.max_features,
-                rows.start,
-                rows.end,
-            ),
-            policy_indices: slice_rows(
-                &self.policy_indices,
-                self.max_policy_moves,
-                rows.start,
-                rows.end,
-            ),
-            policy_targets: slice_rows(
-                &self.policy_targets,
-                self.max_policy_moves,
-                rows.start,
-                rows.end,
-            ),
-            policy_mask: slice_rows(
-                &self.policy_mask,
-                self.max_policy_moves,
-                rows.start,
-                rows.end,
-            ),
-            values: self.values[rows.start..rows.end].to_vec(),
-            moves_left: self.moves_left[rows.start..rows.end].to_vec(),
-        }
-    }
-
     fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
         let (us_king_bucket, them_king_bucket) =
             canonical_general_buckets_from_features(&sample.features);
@@ -256,10 +204,6 @@ impl PackedBatch {
     }
 }
 
-fn slice_rows<T: Copy>(values: &[T], row_width: usize, start: usize, end: usize) -> Vec<T> {
-    values[start * row_width..end * row_width].to_vec()
-}
-
 #[derive(Debug)]
 pub(super) enum DataLoaderError {
     WorkerPanic,
@@ -267,11 +211,11 @@ pub(super) enum DataLoaderError {
 }
 
 pub(super) struct PrefetchDataLoader {
-    rx: mpsc::Receiver<(usize, PackedBatch)>,
+    rx: mpsc::Receiver<(usize, PackedStepBatch)>,
     workers: Vec<thread::JoinHandle<()>>,
     next_batch_id: usize,
     total_batches: usize,
-    pending: BTreeMap<usize, PackedBatch>,
+    pending: BTreeMap<usize, PackedStepBatch>,
 }
 
 impl PrefetchDataLoader {
@@ -284,7 +228,7 @@ impl PrefetchDataLoader {
         let workers = config.num_workers.max(1);
         let channel_depth = config.prefetch_batches.max(1) * workers;
         let (tx, rx) = mpsc::sync_channel(channel_depth);
-        let plan = Arc::new(plan.batches);
+        let plan = Arc::new(plan.steps);
         let cursor = Arc::new(Mutex::new(0usize));
         let mut handles = Vec::with_capacity(workers);
 
@@ -304,7 +248,15 @@ impl PrefetchDataLoader {
                         *cursor += 1;
                         batch_id
                     };
-                    let packed = PackedBatch::from_indices(&samples, &plan[batch_id]);
+                    let step = &plan[batch_id];
+                    let packed = PackedStepBatch {
+                        batch_size: step.sample_count,
+                        shards: step
+                            .shards
+                            .iter()
+                            .map(|shard| PackedBatch::from_indices(&samples, shard))
+                            .collect(),
+                    };
                     if tx.send((batch_id, packed)).is_err() {
                         return;
                     }
@@ -322,7 +274,7 @@ impl PrefetchDataLoader {
         }
     }
 
-    pub(super) fn next_packed(&mut self) -> Result<Option<PackedBatch>, DataLoaderError> {
+    pub(super) fn next_packed(&mut self) -> Result<Option<PackedStepBatch>, DataLoaderError> {
         if self.next_batch_id >= self.total_batches {
             return Ok(None);
         }
@@ -408,8 +360,24 @@ mod tests {
         };
         let plan = BatchPlan::epoch(8, &config);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan.batches[0], vec![0, 1, 2]);
-        assert_eq!(plan.batches[1], vec![3, 4, 5]);
+        assert_eq!(plan.steps[0].shards[0], vec![0, 1, 2]);
+        assert_eq!(plan.steps[1].shards[0], vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn batch_plan_splits_steps_into_shards() {
+        let config = DataLoaderConfig {
+            batch_size: 5,
+            shuffle: false,
+            shard_count: 2,
+            ..DataLoaderConfig::default()
+        };
+        let plan = BatchPlan::epoch(7, &config);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.steps[0].sample_count, 5);
+        assert_eq!(plan.steps[0].shards, vec![vec![0, 1, 2], vec![3, 4]]);
+        assert_eq!(plan.steps[1].sample_count, 2);
+        assert_eq!(plan.steps[1].shards, vec![vec![5], vec![6]]);
     }
 
     #[test]
@@ -424,21 +392,6 @@ mod tests {
         assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
         assert_eq!(packed.values, vec![1.0, 1.0]);
         assert_eq!(packed.moves_left, vec![0.0, 0.0]);
-    }
-
-    #[test]
-    fn packed_batch_shard_keeps_row_data() {
-        let samples = (0..4).map(sample).collect::<Vec<_>>();
-        let packed = PackedBatch::from_indices(&samples, &[0, 1, 2, 3]);
-        let shard = packed.shard(1..3);
-        assert_eq!(shard.batch_size, 2);
-        assert_eq!(shard.max_features, packed.max_features);
-        assert_eq!(shard.max_policy_moves, packed.max_policy_moves);
-        assert_eq!(
-            shard.feature_indices[0],
-            packed.feature_indices[packed.max_features]
-        );
-        assert_eq!(shard.values, vec![1.0, 1.0]);
     }
 
     #[test]
@@ -457,8 +410,28 @@ mod tests {
         let mut sizes = Vec::new();
         while let Some(batch) = loader.next_packed().unwrap() {
             sizes.push(batch.batch_size);
+            assert_eq!(batch.shards.len(), 1);
         }
         loader.join().unwrap();
         assert_eq!(sizes, vec![2, 2, 2, 1]);
+    }
+
+    #[test]
+    fn prefetch_loader_packs_shards() {
+        let samples = Arc::new((0..5).map(sample).collect::<Vec<_>>());
+        let config = DataLoaderConfig {
+            batch_size: 5,
+            shuffle: false,
+            shard_count: 2,
+            ..DataLoaderConfig::default()
+        };
+        let plan = BatchPlan::epoch(samples.len(), &config);
+        let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
+        let batch = loader.next_packed().unwrap().unwrap();
+        loader.join().unwrap();
+        assert_eq!(batch.batch_size, 5);
+        assert_eq!(batch.shards.len(), 2);
+        assert_eq!(batch.shards[0].batch_size, 3);
+        assert_eq!(batch.shards[1].batch_size, 2);
     }
 }

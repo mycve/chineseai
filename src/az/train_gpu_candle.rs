@@ -6,7 +6,7 @@ use std::{process::Command, sync::Arc, thread};
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, MOVES_LEFT_AUX_WEIGHT,
     candle_model::{AzCandleModel, BatchTensors},
-    dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PrefetchDataLoader},
+    dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
 
 const ADAMW_WEIGHT_DECAY: f64 = 1e-4;
@@ -65,6 +65,7 @@ pub(super) fn train_samples_gpu(
                 seed: rng.next_u64(),
                 num_workers: dataloader_worker_count(),
                 prefetch_batches: 2,
+                shard_count: trainer.replicas.len().max(1),
                 ..DataLoaderConfig::default()
             };
             let plan = BatchPlan::epoch(samples.len(), &config);
@@ -138,40 +139,27 @@ impl GpuTrainer {
 
     fn train_batch(
         &mut self,
-        batch: PackedBatch,
+        batch: PackedStepBatch,
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<AzTrainStats> {
         let batch_len = batch.batch_size;
-        let active_replicas = self.active_replica_count(batch_len);
+        let active_replicas = self.active_replica_count(batch.shards.len());
         if active_replicas <= 1 {
-            return self.train_batch_single(batch, loss_weights);
+            let shard = batch
+                .shards
+                .into_iter()
+                .next()
+                .ok_or_else(|| candle_core::Error::Msg("empty dataloader batch".into()))?;
+            return self.train_batch_single(shard, loss_weights);
         }
 
-        let shard_size = batch_len.div_ceil(active_replicas);
-        let mut shard_ranges = Vec::with_capacity(active_replicas);
-        for shard_index in 0..active_replicas {
-            let start = shard_index * shard_size;
-            let end = ((shard_index + 1) * shard_size).min(batch_len);
-            if start < end {
-                shard_ranges.push(start..end);
-            }
-        }
-        let shards = shard_ranges
-            .iter()
-            .cloned()
-            .map(|range| batch.shard(range))
-            .collect::<Vec<_>>();
+        let shards = batch.shards;
         let shard_outputs = thread::scope(|scope| {
             let mut handles = Vec::new();
-            for (shard_index, shard) in shards.iter().enumerate() {
+            for (shard_index, shard) in shards.into_iter().enumerate() {
                 let replica = &self.replicas[shard_index];
                 handles.push(scope.spawn(move || {
-                    replica.compute_batch_grads(
-                        shard.clone(),
-                        batch_len,
-                        shard_index == 0,
-                        loss_weights,
-                    )
+                    replica.compute_batch_grads(shard, batch_len, shard_index == 0, loss_weights)
                 }));
             }
             let mut outputs = Vec::with_capacity(handles.len());
