@@ -320,22 +320,51 @@ impl GpuTrainer {
 
     #[cfg(feature = "nccl-train")]
     fn nccl_all_reduce_grads(&self, outputs: &mut [ShardOutput]) -> CandleResult<()> {
-        let vars = self.replicas[0].model.all_vars();
-        for var in vars {
-            self.nccl_all_reduce_var(outputs, &var)?;
+        let vars_by_rank = self
+            .replicas
+            .iter()
+            .map(|replica| replica.model.all_vars())
+            .collect::<Vec<_>>();
+        for var_index in 0..vars_by_rank[0].len() {
+            self.nccl_all_reduce_var(outputs, &vars_by_rank, var_index)?;
         }
         Ok(())
     }
 
     #[cfg(feature = "nccl-train")]
-    fn nccl_all_reduce_var(&self, outputs: &mut [ShardOutput], var: &Tensor) -> CandleResult<()> {
+    fn nccl_all_reduce_var(
+        &self,
+        outputs: &mut [ShardOutput],
+        vars_by_rank: &[Vec<candle_core::Var>],
+        var_index: usize,
+    ) -> CandleResult<()> {
         let nccl = self
             .nccl
             .as_ref()
             .expect("NCCL reducer should be initialized");
+        let has_grad = outputs
+            .iter()
+            .zip(vars_by_rank.iter())
+            .map(|(output, vars)| {
+                output
+                    .grads
+                    .as_ref()
+                    .is_some_and(|grads| grads.get(&vars[var_index]).is_some())
+            })
+            .collect::<Vec<_>>();
+        if has_grad.iter().all(|has_grad| !has_grad) {
+            return Ok(());
+        }
+        if has_grad.iter().any(|has_grad| !has_grad) {
+            return Err(candle_core::Error::Msg(format!(
+                "partial gradient set for NCCL var index {var_index}: {has_grad:?}"
+            )));
+        }
+
         let mut send_tensors = Vec::with_capacity(outputs.len());
         let mut recv_slices = Vec::with_capacity(outputs.len());
         for (rank, output) in outputs.iter_mut().enumerate() {
+            let var = &vars_by_rank[rank][var_index];
             let grad = output
                 .grads
                 .as_ref()
@@ -388,6 +417,7 @@ impl GpuTrainer {
         group_end?;
 
         for (rank, recv) in recv_slices.into_iter().enumerate() {
+            let var = &vars_by_rank[rank][var_index];
             let device = self.replicas[rank].device.as_cuda_device()?.clone();
             let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
             let reduced =
