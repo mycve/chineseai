@@ -303,13 +303,17 @@ impl GpuTrainer {
         profile.grad_sync_seconds += all_reduce_started.elapsed().as_secs_f64();
 
         let optimizer_started = Instant::now();
+        let adam_started = Instant::now();
         self.optimizers[0].step(
             outputs[0]
                 .grads
                 .as_ref()
                 .expect("NCCL all-reduce keeps primary gradients on GPU"),
         )?;
+        profile.optimizer_step_seconds += adam_started.elapsed().as_secs_f64();
+        let param_sync_started = Instant::now();
         self.nccl_broadcast_vars()?;
+        profile.param_sync_seconds += param_sync_started.elapsed().as_secs_f64();
         for replica in &self.replicas {
             profile_sync(&replica.device)?;
         }
@@ -604,6 +608,8 @@ impl GpuReplica {
                 backward_seconds,
                 grad_sync_seconds,
                 optimizer_seconds: 0.0,
+                optimizer_step_seconds: 0.0,
+                param_sync_seconds: 0.0,
             },
             grads: if keep_grads || keep_worker_grads {
                 Some(grads)
@@ -715,6 +721,8 @@ struct StepProfile {
     backward_seconds: f64,
     grad_sync_seconds: f64,
     optimizer_seconds: f64,
+    optimizer_step_seconds: f64,
+    param_sync_seconds: f64,
 }
 
 impl StepProfile {
@@ -724,6 +732,8 @@ impl StepProfile {
         self.backward_seconds = self.backward_seconds.max(other.backward_seconds);
         self.grad_sync_seconds = self.grad_sync_seconds.max(other.grad_sync_seconds);
         self.optimizer_seconds += other.optimizer_seconds;
+        self.optimizer_step_seconds += other.optimizer_step_seconds;
+        self.param_sync_seconds += other.param_sync_seconds;
     }
 }
 
@@ -738,6 +748,8 @@ struct TrainProfile {
     backward_seconds: f64,
     grad_sync_seconds: f64,
     optimizer_seconds: f64,
+    optimizer_step_seconds: f64,
+    param_sync_seconds: f64,
 }
 
 impl TrainProfile {
@@ -747,12 +759,14 @@ impl TrainProfile {
         self.backward_seconds += step.backward_seconds;
         self.grad_sync_seconds += step.grad_sync_seconds;
         self.optimizer_seconds += step.optimizer_seconds;
+        self.optimizer_step_seconds += step.optimizer_step_seconds;
+        self.param_sync_seconds += step.param_sync_seconds;
     }
 
     fn print(&self, samples: usize) {
         let total = self.train_step_seconds.max(f64::EPSILON);
         eprintln!(
-            "[chineseai] train-profile: steps={} samples={} train={:.3}s loader_wait={:.3}s loader_pack(worker_sum)={:.3}s tensor_h2d={:.3}s loss_fwd={:.3}s backward={:.3}s optimizer={:.3}s grad_sync={:.3}s tensor%={:.1} loss%={:.1} backward%={:.1}",
+            "[chineseai] train-profile: steps={} samples={} train={:.3}s loader_wait={:.3}s loader_pack(worker_sum)={:.3}s tensor_h2d={:.3}s loss_fwd={:.3}s backward={:.3}s optimizer={:.3}s adam_step={:.3}s param_sync={:.3}s grad_sync={:.3}s tensor%={:.1} loss%={:.1} backward%={:.1}",
             self.steps,
             samples,
             self.train_step_seconds,
@@ -762,6 +776,8 @@ impl TrainProfile {
             self.loss_seconds,
             self.backward_seconds,
             self.optimizer_seconds,
+            self.optimizer_step_seconds,
+            self.param_sync_seconds,
             self.grad_sync_seconds,
             self.tensor_seconds * 100.0 / total,
             self.loss_seconds * 100.0 / total,
