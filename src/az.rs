@@ -26,12 +26,10 @@ use crate::nnue::{
     AZ_NNUE_INPUT_SIZE, HistoryMove, V2_KING_BUCKETS, add_az_absolute_history_features,
     az_absolute_general_bucket, az_absolute_piece_king_feature,
     az_absolute_piece_non_king_features, az_absolute_side_to_move_feature,
-    az_absolute_strategic_features, canonical_move, canonical_square,
-    extract_sparse_features_az_absolute_current, extract_sparse_features_az_canonical,
+    az_absolute_strategic_features, canonical_move, extract_sparse_features_az_absolute_current,
+    extract_sparse_features_az_canonical,
 };
-use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
-};
+use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position};
 
 pub use alphazero::{
     AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
@@ -54,9 +52,6 @@ pub(super) const VALUE_HEAD_SIZE: usize = 64;
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 pub(super) const AUTO_FEATURE_SIZE: usize = 64;
 pub(super) const PIECE_ATTENTION_SIZE: usize = 32;
-pub(super) const LINE_MIXER_RANK: usize = 32;
-pub(super) const SQUARE_TOKEN_PIECES: usize = 15;
-pub(super) const LINE_COUNT: usize = BOARD_RANKS + BOARD_FILES;
 pub(super) const TRUNK_LAYERS: usize = 2;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
@@ -123,20 +118,6 @@ fn canonical_general_bucket(piece_index: usize, sq: usize) -> usize {
     rank * 3 + file
 }
 
-fn square_token_piece_index(piece: Piece, side_to_move: Color) -> usize {
-    let color_offset = if piece.color == side_to_move { 0 } else { 7 };
-    color_offset
-        + match piece.kind {
-            PieceKind::General => 0,
-            PieceKind::Advisor => 1,
-            PieceKind::Elephant => 2,
-            PieceKind::Horse => 3,
-            PieceKind::Rook => 4,
-            PieceKind::Cannon => 5,
-            PieceKind::Soldier => 6,
-        }
-}
-
 fn candle_io_error(err: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())
 }
@@ -185,12 +166,6 @@ macro_rules! az_weight_tensors {
         $visit!(piece_attention_query, [$h]);
         $visit!(piece_attention_value, [PIECE_ATTENTION_SIZE, $h]);
         $visit!(piece_attention_output, [$h, PIECE_ATTENTION_SIZE]);
-        $visit!(square_piece_token, [SQUARE_TOKEN_PIECES, $h]);
-        $visit!(square_position_token, [BOARD_SIZE, $h]);
-        $visit!(line_mixer_down, [LINE_MIXER_RANK, $h]);
-        $visit!(line_mixer_bias, [LINE_MIXER_RANK]);
-        $visit!(line_mixer_up, [$h, LINE_MIXER_RANK]);
-        $visit!(line_context_bias, [$h]);
         $visit!(trunk_residual_hidden, [TRUNK_LAYERS, $h, $h]);
         $visit!(trunk_residual_bias, [TRUNK_LAYERS, $h]);
         $visit!(auto_feature_hidden, [AUTO_FEATURE_SIZE, $h]);
@@ -250,8 +225,6 @@ impl Default for AzNnueArch {
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
     auto_features: Vec<f32>,
-    line_repr: Vec<f32>,
-    line_bottleneck: Vec<f32>,
     trunk_work: Vec<f32>,
     #[allow(dead_code)]
     history_features: Vec<usize>,
@@ -270,8 +243,6 @@ impl AzEvalScratch {
         Self {
             hidden: vec![0.0; hidden_size],
             auto_features: vec![0.0; AUTO_FEATURE_SIZE],
-            line_repr: vec![0.0; hidden_size],
-            line_bottleneck: vec![0.0; LINE_MIXER_RANK],
             trunk_work: vec![0.0; hidden_size],
             history_features: Vec::with_capacity(16),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
@@ -530,12 +501,6 @@ pub struct AzNnue {
     pub piece_attention_query: Vec<f32>,
     pub piece_attention_value: Vec<f32>,
     pub piece_attention_output: Vec<f32>,
-    pub square_piece_token: Vec<f32>,
-    pub square_position_token: Vec<f32>,
-    pub line_mixer_down: Vec<f32>,
-    pub line_mixer_bias: Vec<f32>,
-    pub line_mixer_up: Vec<f32>,
-    pub line_context_bias: Vec<f32>,
     pub trunk_residual_hidden: Vec<f32>,
     pub trunk_residual_bias: Vec<f32>,
     pub auto_feature_hidden: Vec<f32>,
@@ -573,12 +538,6 @@ impl Clone for AzNnue {
             piece_attention_query: self.piece_attention_query.clone(),
             piece_attention_value: self.piece_attention_value.clone(),
             piece_attention_output: self.piece_attention_output.clone(),
-            square_piece_token: self.square_piece_token.clone(),
-            square_position_token: self.square_position_token.clone(),
-            line_mixer_down: self.line_mixer_down.clone(),
-            line_mixer_bias: self.line_mixer_bias.clone(),
-            line_mixer_up: self.line_mixer_up.clone(),
-            line_context_bias: self.line_context_bias.clone(),
             trunk_residual_hidden: self.trunk_residual_hidden.clone(),
             trunk_residual_bias: self.trunk_residual_bias.clone(),
             auto_feature_hidden: self.auto_feature_hidden.clone(),
@@ -847,18 +806,6 @@ impl AzNnue {
         // Sparse attention starts as an exact residual no-op. Training can then
         // open the output gate without perturbing the first self-play games.
         let piece_attention_output = vec![0.0; hidden_size * PIECE_ATTENTION_SIZE];
-        let square_piece_token = (0..SQUARE_TOKEN_PIECES * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let square_position_token = (0..BOARD_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let line_mixer_down = (0..LINE_MIXER_RANK * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let line_mixer_bias = vec![0.0; LINE_MIXER_RANK];
-        let line_mixer_up = vec![0.0; hidden_size * LINE_MIXER_RANK];
-        let line_context_bias = vec![0.0; hidden_size];
         let trunk_residual_hidden = vec![0.0; TRUNK_LAYERS * hidden_size * hidden_size];
         let trunk_residual_bias = vec![0.0; TRUNK_LAYERS * hidden_size];
         let auto_feature_hidden = (0..AUTO_FEATURE_SIZE * hidden_size)
@@ -912,12 +859,6 @@ impl AzNnue {
             piece_attention_query,
             piece_attention_value,
             piece_attention_output,
-            square_piece_token,
-            square_position_token,
-            line_mixer_down,
-            line_mixer_bias,
-            line_mixer_up,
-            line_context_bias,
             trunk_residual_hidden,
             trunk_residual_bias,
             auto_feature_hidden,
@@ -977,12 +918,6 @@ impl AzNnue {
             piece_attention_query: load_candle_f32_tensor(&tensors, "piece_attention_query")?,
             piece_attention_value: load_candle_f32_tensor(&tensors, "piece_attention_value")?,
             piece_attention_output: load_candle_f32_tensor(&tensors, "piece_attention_output")?,
-            square_piece_token: load_candle_f32_tensor(&tensors, "square_piece_token")?,
-            square_position_token: load_candle_f32_tensor(&tensors, "square_position_token")?,
-            line_mixer_down: load_candle_f32_tensor(&tensors, "line_mixer_down")?,
-            line_mixer_bias: load_candle_f32_tensor(&tensors, "line_mixer_bias")?,
-            line_mixer_up: load_candle_f32_tensor(&tensors, "line_mixer_up")?,
-            line_context_bias: load_candle_f32_tensor(&tensors, "line_context_bias")?,
             trunk_residual_hidden: load_candle_f32_tensor(&tensors, "trunk_residual_hidden")?,
             trunk_residual_bias: load_candle_f32_tensor(&tensors, "trunk_residual_bias")?,
             auto_feature_hidden: load_candle_f32_tensor(&tensors, "auto_feature_hidden")?,
@@ -1038,13 +973,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_into(&features, &mut scratch.hidden);
-            self.line_aware_trunk_into(
-                position,
-                &mut scratch.hidden,
-                &mut scratch.line_repr,
-                &mut scratch.line_bottleneck,
-                &mut scratch.trunk_work,
-            );
+            self.apply_fast_trunk_into(&mut scratch.hidden, &mut scratch.trunk_work);
             self.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
             rms_norm_in_place(&mut scratch.hidden);
         }
@@ -1077,13 +1006,7 @@ impl AzNnue {
             let features = extract_sparse_features_az_canonical(position, history);
             self.add_sparse_attention_into(&features, &mut scratch.hidden);
             relu_in_place(&mut scratch.hidden);
-            self.line_aware_trunk_into(
-                position,
-                &mut scratch.hidden,
-                &mut scratch.line_repr,
-                &mut scratch.line_bottleneck,
-                &mut scratch.trunk_work,
-            );
+            self.apply_fast_trunk_into(&mut scratch.hidden, &mut scratch.trunk_work);
             self.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
             rms_norm_in_place(&mut scratch.hidden);
         }
@@ -1369,93 +1292,9 @@ impl AzNnue {
         );
     }
 
-    fn line_aware_trunk_into(
-        &self,
-        position: &Position,
-        hidden: &mut [f32],
-        line_repr: &mut Vec<f32>,
-        line_bottleneck: &mut Vec<f32>,
-        trunk_work: &mut Vec<f32>,
-    ) {
-        self.add_line_context_into(position, hidden, line_repr, line_bottleneck);
+    fn apply_fast_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
         relu_in_place(hidden);
         self.apply_residual_trunk_into(hidden, trunk_work);
-    }
-
-    fn add_line_context_into(
-        &self,
-        position: &Position,
-        hidden: &mut [f32],
-        line_repr: &mut Vec<f32>,
-        line_bottleneck: &mut Vec<f32>,
-    ) {
-        line_bottleneck.resize(LINE_MIXER_RANK, 0.0);
-        line_bottleneck.fill(0.0);
-        line_repr.resize(self.hidden_size, 0.0);
-
-        let mut lines = 0usize;
-        for rank in 0..BOARD_RANKS {
-            line_repr.fill(0.0);
-            for file in 0..BOARD_FILES {
-                let sq = rank * BOARD_FILES + file;
-                self.add_square_token_to_line(position, sq, line_repr);
-            }
-            self.add_line_bottleneck(line_repr, line_bottleneck);
-            lines += 1;
-        }
-        for file in 0..BOARD_FILES {
-            line_repr.fill(0.0);
-            for rank in 0..BOARD_RANKS {
-                let sq = rank * BOARD_FILES + file;
-                self.add_square_token_to_line(position, sq, line_repr);
-            }
-            self.add_line_bottleneck(line_repr, line_bottleneck);
-            lines += 1;
-        }
-        debug_assert_eq!(lines, LINE_COUNT);
-
-        for hidden_index in 0..self.hidden_size {
-            let row = &self.line_mixer_up
-                [hidden_index * LINE_MIXER_RANK..(hidden_index + 1) * LINE_MIXER_RANK];
-            hidden[hidden_index] +=
-                self.line_context_bias[hidden_index] + dot_product(line_bottleneck, row);
-        }
-    }
-
-    fn add_square_token_to_line(
-        &self,
-        position: &Position,
-        canonical_sq: usize,
-        line_repr: &mut [f32],
-    ) {
-        let actual_sq = canonical_square(position.side_to_move(), canonical_sq);
-        let piece_index = position
-            .piece_at(actual_sq)
-            .map(|piece| square_token_piece_index(piece, position.side_to_move()))
-            .unwrap_or(SQUARE_TOKEN_PIECES - 1);
-        add_scaled_feature_row(
-            line_repr,
-            &self.square_piece_token,
-            self.hidden_size,
-            piece_index,
-            1.0,
-        );
-        add_scaled_feature_row(
-            line_repr,
-            &self.square_position_token,
-            self.hidden_size,
-            canonical_sq,
-            1.0,
-        );
-    }
-
-    fn add_line_bottleneck(&self, line_repr: &[f32], line_bottleneck: &mut [f32]) {
-        for rank_feature in 0..LINE_MIXER_RANK {
-            let row = &self.line_mixer_down
-                [rank_feature * self.hidden_size..(rank_feature + 1) * self.hidden_size];
-            line_bottleneck[rank_feature] +=
-                (self.line_mixer_bias[rank_feature] + dot_product(line_repr, row)).max(0.0);
-        }
     }
 
     fn apply_residual_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
@@ -2984,12 +2823,6 @@ mod tests {
         assert_eq!(model.piece_attention_query, loaded.piece_attention_query);
         assert_eq!(model.piece_attention_value, loaded.piece_attention_value);
         assert_eq!(model.piece_attention_output, loaded.piece_attention_output);
-        assert_eq!(model.square_piece_token, loaded.square_piece_token);
-        assert_eq!(model.square_position_token, loaded.square_position_token);
-        assert_eq!(model.line_mixer_down, loaded.line_mixer_down);
-        assert_eq!(model.line_mixer_bias, loaded.line_mixer_bias);
-        assert_eq!(model.line_mixer_up, loaded.line_mixer_up);
-        assert_eq!(model.line_context_bias, loaded.line_context_bias);
         assert_eq!(model.trunk_residual_hidden, loaded.trunk_residual_hidden);
         assert_eq!(model.trunk_residual_bias, loaded.trunk_residual_bias);
         assert_eq!(model.auto_feature_hidden, loaded.auto_feature_hidden);

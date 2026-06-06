@@ -3,14 +3,13 @@ use candle_nn::ops::log_softmax;
 
 use super::{
     AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
-    LINE_COUNT, LINE_MIXER_RANK, PIECE_ATTENTION_SIZE, POLICY_MOVE_EMBED_SIZE,
-    POLICY_PAIR_CONTEXT_SIZE, SQUARE_TOKEN_PIECES, STRUCTURAL_FILE_SIZE,
+    PIECE_ATTENTION_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
     STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS,
     VALUE_HEAD_SIZE, canonical_general_buckets_from_features, decode_current_piece_square_feature,
     policy_move_from_features, policy_move_to_features, structural_king_piece_index,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE};
+use crate::xiangqi::BOARD_SIZE;
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
 const RMS_NORM_EPS: f64 = 1.0e-6;
@@ -28,12 +27,6 @@ pub(super) struct AzCandleModel {
     piece_attention_query: Var,
     piece_attention_value: Var,
     piece_attention_output: Var,
-    square_piece_token: Var,
-    square_position_token: Var,
-    line_mixer_down: Var,
-    line_mixer_bias: Var,
-    line_mixer_up: Var,
-    line_context_bias: Var,
     trunk_residual_hidden: Var,
     trunk_residual_bias: Var,
     auto_feature_hidden: Var,
@@ -52,7 +45,6 @@ pub(super) struct AzCandleModel {
     policy_pair_embedding: Var,
     policy_move_context_hidden: Var,
     policy_move_embedding: Var,
-    line_square_mask: Tensor,
     policy_move_from_features: Tensor,
     policy_move_to_features: Tensor,
 }
@@ -112,29 +104,7 @@ impl AzCandleModel {
         let quadratic = sparse_pre
             .sqr()?
             .broadcast_mul(&self.input_quadratic_scale.reshape((1, hidden_size))?)?;
-        let sparse_hidden = (sparse_pre + quadratic)?.relu()?;
-        let line_piece_repr = batch
-            .line_piece_counts
-            .flatten_to(1)?
-            .matmul(&self.square_piece_token)?
-            .reshape((bsz, LINE_COUNT, hidden_size))?;
-        let line_position_repr = self
-            .line_square_mask
-            .matmul(&self.square_position_token)?
-            .reshape((1, LINE_COUNT, hidden_size))?
-            .broadcast_as((bsz, LINE_COUNT, hidden_size))?;
-        let line_repr = (line_piece_repr + line_position_repr)?;
-        let line_hidden = line_repr
-            .flatten_to(1)?
-            .matmul(&self.line_mixer_down.t()?)?
-            .broadcast_add(&self.line_mixer_bias)?
-            .relu()?
-            .reshape((bsz, LINE_COUNT, LINE_MIXER_RANK))?
-            .sum(1)?;
-        let line_context = line_hidden
-            .matmul(&self.line_mixer_up.t()?)?
-            .broadcast_add(&self.line_context_bias)?;
-        let mut sparse_hidden = (sparse_hidden + line_context)?.relu()?;
+        let mut sparse_hidden = (sparse_pre + quadratic)?.relu()?;
         for layer in 0..TRUNK_LAYERS {
             let weights = self.trunk_residual_hidden.narrow(0, layer, 1)?.squeeze(0)?;
             let bias = self.trunk_residual_bias.narrow(0, layer, 1)?.squeeze(0)?;
@@ -205,7 +175,6 @@ pub(super) struct BatchTensors {
     pub(super) structural_us_king_piece_indices: Tensor,
     pub(super) structural_them_king_piece_indices: Tensor,
     pub(super) structural_mask: Tensor,
-    pub(super) line_piece_counts: Tensor,
     pub(super) policy_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
@@ -246,7 +215,6 @@ impl BatchTensors {
         let mut structural_us_king_piece_indices = vec![0u32; batch_size * max_features];
         let mut structural_them_king_piece_indices = vec![0u32; batch_size * max_features];
         let mut structural_mask = vec![0.0f32; batch_size * max_features];
-        let mut line_piece_counts = vec![0.0f32; batch_size * LINE_COUNT * SQUARE_TOKEN_PIECES];
         let mut policy_indices = vec![0u32; batch_size * max_policy_moves];
         let mut policy_targets = vec![0.0f32; batch_size * max_policy_moves];
         let mut policy_mask = vec![POLICY_MASK_VALUE; batch_size * max_policy_moves];
@@ -275,13 +243,6 @@ impl BatchTensors {
                             structural_king_piece_index(1, them_king_bucket, structural.piece_index)
                                 as u32;
                         structural_mask[batch_feature_index] = 1.0;
-                        let line_base = row * LINE_COUNT * SQUARE_TOKEN_PIECES;
-                        line_piece_counts[line_base
-                            + structural.rank * SQUARE_TOKEN_PIECES
-                            + structural.piece_index] += 1.0;
-                        line_piece_counts[line_base
-                            + (BOARD_RANKS + structural.file) * SQUARE_TOKEN_PIECES
-                            + structural.piece_index] += 1.0;
                     }
                 }
             }
@@ -339,11 +300,6 @@ impl BatchTensors {
                 (batch_size, max_features, 1),
                 device,
             )?,
-            line_piece_counts: Tensor::from_vec(
-                line_piece_counts,
-                (batch_size, LINE_COUNT, SQUARE_TOKEN_PIECES),
-                device,
-            )?,
             policy_indices: Tensor::from_vec(
                 policy_indices,
                 (batch_size, max_policy_moves),
@@ -375,26 +331,6 @@ fn normalize_policy_targets(targets: &mut [f32], active: usize) {
         let uniform = 1.0 / active as f32;
         active_targets.fill(uniform);
     }
-}
-
-fn line_square_mask() -> &'static [f32] {
-    use std::sync::OnceLock;
-    static MASK: OnceLock<Vec<f32>> = OnceLock::new();
-    MASK.get_or_init(|| {
-        let mut mask = vec![0.0f32; LINE_COUNT * BOARD_SIZE];
-        for rank in 0..BOARD_RANKS {
-            for file in 0..BOARD_FILES {
-                mask[rank * BOARD_SIZE + rank * BOARD_FILES + file] = 1.0;
-            }
-        }
-        for file in 0..BOARD_FILES {
-            for rank in 0..BOARD_RANKS {
-                let line = BOARD_RANKS + file;
-                mask[line * BOARD_SIZE + rank * BOARD_FILES + file] = 1.0;
-            }
-        }
-        mask
-    })
 }
 
 impl AzCandleModel {
@@ -441,24 +377,6 @@ impl AzCandleModel {
                 (hidden, PIECE_ATTENTION_SIZE),
                 device,
             )?,
-            square_piece_token: var_from_slice(
-                &model.square_piece_token,
-                (SQUARE_TOKEN_PIECES, hidden),
-                device,
-            )?,
-            square_position_token: var_from_slice(
-                &model.square_position_token,
-                (BOARD_SIZE, hidden),
-                device,
-            )?,
-            line_mixer_down: var_from_slice(
-                &model.line_mixer_down,
-                (LINE_MIXER_RANK, hidden),
-                device,
-            )?,
-            line_mixer_bias: var_from_slice(&model.line_mixer_bias, LINE_MIXER_RANK, device)?,
-            line_mixer_up: var_from_slice(&model.line_mixer_up, (hidden, LINE_MIXER_RANK), device)?,
-            line_context_bias: var_from_slice(&model.line_context_bias, hidden, device)?,
             trunk_residual_hidden: var_from_slice(
                 &model.trunk_residual_hidden,
                 (TRUNK_LAYERS, hidden, hidden),
@@ -525,11 +443,6 @@ impl AzCandleModel {
                 (DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE),
                 device,
             )?,
-            line_square_mask: Tensor::from_vec(
-                line_square_mask().to_vec(),
-                (LINE_COUNT, BOARD_SIZE),
-                device,
-            )?,
             policy_move_from_features: Tensor::from_vec(
                 policy_move_from_features().to_vec(),
                 (DENSE_MOVE_SPACE, BOARD_SIZE),
@@ -555,12 +468,6 @@ impl AzCandleModel {
         vars.push(self.piece_attention_query.clone());
         vars.push(self.piece_attention_value.clone());
         vars.push(self.piece_attention_output.clone());
-        vars.push(self.square_piece_token.clone());
-        vars.push(self.square_position_token.clone());
-        vars.push(self.line_mixer_down.clone());
-        vars.push(self.line_mixer_bias.clone());
-        vars.push(self.line_mixer_up.clone());
-        vars.push(self.line_context_bias.clone());
         vars.push(self.trunk_residual_hidden.clone());
         vars.push(self.trunk_residual_bias.clone());
         vars.push(self.auto_feature_hidden.clone());
@@ -636,12 +543,6 @@ impl AzCandleModel {
             grads.remove(&self.piece_attention_query);
             grads.remove(&self.piece_attention_value);
             grads.remove(&self.piece_attention_output);
-            grads.remove(&self.square_piece_token);
-            grads.remove(&self.square_position_token);
-            grads.remove(&self.line_mixer_down);
-            grads.remove(&self.line_mixer_bias);
-            grads.remove(&self.line_mixer_up);
-            grads.remove(&self.line_context_bias);
             grads.remove(&self.trunk_residual_hidden);
             grads.remove(&self.trunk_residual_bias);
             grads.remove(&self.auto_feature_hidden);
@@ -686,15 +587,6 @@ impl AzCandleModel {
             &self.piece_attention_output,
             &mut model.piece_attention_output,
         )?;
-        copy_var(&self.square_piece_token, &mut model.square_piece_token)?;
-        copy_var(
-            &self.square_position_token,
-            &mut model.square_position_token,
-        )?;
-        copy_var(&self.line_mixer_down, &mut model.line_mixer_down)?;
-        copy_var(&self.line_mixer_bias, &mut model.line_mixer_bias)?;
-        copy_var(&self.line_mixer_up, &mut model.line_mixer_up)?;
-        copy_var(&self.line_context_bias, &mut model.line_context_bias)?;
         copy_var(
             &self.trunk_residual_hidden,
             &mut model.trunk_residual_hidden,
