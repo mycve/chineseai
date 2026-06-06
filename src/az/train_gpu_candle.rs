@@ -1,7 +1,7 @@
 use candle_core::{Device, Result as CandleResult, Tensor, backprop::GradStore};
 use candle_nn::ops::log_softmax;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
-use std::{process::Command, sync::Arc, thread};
+use std::{process::Command, sync::Arc, thread, time::Instant};
 
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, MOVES_LEFT_AUX_WEIGHT,
@@ -51,6 +51,8 @@ pub(super) fn train_samples_gpu(
     }
     let mut stats = AzTrainStats::default();
     let samples = Arc::new(samples.to_vec());
+    let profile_enabled = train_profile_enabled();
+    let mut profile = TrainProfile::default();
     {
         let trainer = model
             .gpu_trainer
@@ -71,9 +73,19 @@ pub(super) fn train_samples_gpu(
             let plan = BatchPlan::epoch(samples.len(), &config);
             let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
             stats = AzTrainStats::default();
-            while let Some(batch) = loader.next_packed().map_err(dataloader_error)? {
-                let batch_stats = trainer.train_batch(batch, loss_weights)?;
+            loop {
+                let wait_started = Instant::now();
+                let Some(batch) = loader.next_packed().map_err(dataloader_error)? else {
+                    break;
+                };
+                profile.loader_wait_seconds += wait_started.elapsed().as_secs_f64();
+                profile.loader_pack_seconds += batch.pack_seconds;
+                let step_started = Instant::now();
+                let (batch_stats, step_profile) = trainer.train_batch(batch, loss_weights)?;
+                profile.train_step_seconds += step_started.elapsed().as_secs_f64();
+                profile.add_step(step_profile);
                 stats.add_assign(&batch_stats);
+                profile.steps += 1;
             }
             loader.join().map_err(dataloader_error)?;
         }
@@ -90,6 +102,9 @@ pub(super) fn train_samples_gpu(
         .expect("gpu trainer was initialized");
     trainer.copy_to_model(model)?;
     model.gpu_trainer = Some(trainer);
+    if profile_enabled {
+        profile.print(stats.samples);
+    }
     Ok(stats)
 }
 
@@ -141,7 +156,7 @@ impl GpuTrainer {
         &mut self,
         batch: PackedStepBatch,
         loss_weights: AzTrainLossWeights,
-    ) -> CandleResult<AzTrainStats> {
+    ) -> CandleResult<(AzTrainStats, StepProfile)> {
         let batch_len = batch.batch_size;
         let active_replicas = self.active_replica_count(batch.shards.len());
         if active_replicas <= 1 {
@@ -177,16 +192,22 @@ impl GpuTrainer {
             .next()
             .ok_or_else(|| candle_core::Error::Msg("empty multi-gpu shard output".into()))?;
         let mut stats = primary.stats;
+        let mut profile = primary.profile;
         let mut grads = primary
             .grads
             .expect("primary shard gradients should be kept on device");
         for output in outputs {
             stats.add_assign(&output.stats);
+            profile.add_shard(output.profile);
             self.add_cpu_grads_to_primary(&mut grads, &output.cpu_grads)?;
         }
+        profile_sync(&self.replicas[0].device)?;
+        let optimizer_started = Instant::now();
         self.optimizers[0].step(&grads)?;
+        profile_sync(&self.replicas[0].device)?;
+        profile.optimizer_seconds += optimizer_started.elapsed().as_secs_f64();
         self.broadcast_primary_to_workers()?;
-        Ok(stats)
+        Ok((stats, profile))
     }
 
     fn active_replica_count(&self, batch_len: usize) -> usize {
@@ -201,16 +222,21 @@ impl GpuTrainer {
         &mut self,
         batch: PackedBatch,
         loss_weights: AzTrainLossWeights,
-    ) -> CandleResult<AzTrainStats> {
+    ) -> CandleResult<(AzTrainStats, StepProfile)> {
         let batch_len = batch.batch_size;
         let output = self.replicas[0].compute_batch_grads(batch, batch_len, true, loss_weights)?;
+        let mut profile = output.profile;
+        profile_sync(&self.replicas[0].device)?;
+        let optimizer_started = Instant::now();
         self.optimizers[0].step(
             output
                 .grads
                 .as_ref()
                 .expect("single-gpu gradients should be kept on device"),
         )?;
-        Ok(output.stats)
+        profile_sync(&self.replicas[0].device)?;
+        profile.optimizer_seconds += optimizer_started.elapsed().as_secs_f64();
+        Ok((output.stats, profile))
     }
 
     fn add_cpu_grads_to_primary(
@@ -265,23 +291,42 @@ impl GpuReplica {
         keep_grads: bool,
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<ShardOutput> {
+        profile_sync(&self.device)?;
+        let tensor_started = Instant::now();
         let batch_tensors = BatchTensors::from_packed(batch, &self.device)?;
+        profile_sync(&self.device)?;
+        let tensor_seconds = tensor_started.elapsed().as_secs_f64();
+        let loss_started = Instant::now();
         let output = self.compute_batch_loss(
             &batch_tensors,
             global_batch_len,
             loss_weights.value,
             loss_weights.policy,
         )?;
+        profile_sync(&self.device)?;
+        let loss_seconds = loss_started.elapsed().as_secs_f64();
+        let backward_started = Instant::now();
         let mut grads = output.loss_tensor.backward()?;
+        profile_sync(&self.device)?;
+        let backward_seconds = backward_started.elapsed().as_secs_f64();
         self.model.remove_frozen_grads(&mut grads, loss_weights);
         let stats = output.stats;
+        let cpu_grad_started = Instant::now();
         let cpu_grads = if keep_grads {
             Vec::new()
         } else {
             self.model.cpu_grads(&grads)?
         };
+        let cpu_grad_seconds = cpu_grad_started.elapsed().as_secs_f64();
         Ok(ShardOutput {
             stats,
+            profile: StepProfile {
+                tensor_seconds,
+                loss_seconds,
+                backward_seconds,
+                cpu_grad_seconds,
+                optimizer_seconds: 0.0,
+            },
             grads: if keep_grads { Some(grads) } else { None },
             cpu_grads,
         })
@@ -346,8 +391,71 @@ impl GpuReplica {
 
 struct ShardOutput {
     stats: AzTrainStats,
+    profile: StepProfile,
     grads: Option<GradStore>,
     cpu_grads: Vec<Option<Vec<f32>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StepProfile {
+    tensor_seconds: f64,
+    loss_seconds: f64,
+    backward_seconds: f64,
+    cpu_grad_seconds: f64,
+    optimizer_seconds: f64,
+}
+
+impl StepProfile {
+    fn add_shard(&mut self, other: Self) {
+        self.tensor_seconds = self.tensor_seconds.max(other.tensor_seconds);
+        self.loss_seconds = self.loss_seconds.max(other.loss_seconds);
+        self.backward_seconds = self.backward_seconds.max(other.backward_seconds);
+        self.cpu_grad_seconds = self.cpu_grad_seconds.max(other.cpu_grad_seconds);
+        self.optimizer_seconds += other.optimizer_seconds;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrainProfile {
+    steps: usize,
+    loader_wait_seconds: f64,
+    loader_pack_seconds: f64,
+    train_step_seconds: f64,
+    tensor_seconds: f64,
+    loss_seconds: f64,
+    backward_seconds: f64,
+    cpu_grad_seconds: f64,
+    optimizer_seconds: f64,
+}
+
+impl TrainProfile {
+    fn add_step(&mut self, step: StepProfile) {
+        self.tensor_seconds += step.tensor_seconds;
+        self.loss_seconds += step.loss_seconds;
+        self.backward_seconds += step.backward_seconds;
+        self.cpu_grad_seconds += step.cpu_grad_seconds;
+        self.optimizer_seconds += step.optimizer_seconds;
+    }
+
+    fn print(&self, samples: usize) {
+        let total = self.train_step_seconds.max(f64::EPSILON);
+        eprintln!(
+            "[chineseai] train-profile: steps={} samples={} train={:.3}s loader_wait={:.3}s loader_pack(worker_sum)={:.3}s tensor_h2d={:.3}s loss_fwd={:.3}s backward={:.3}s optimizer={:.3}s cpu_grads={:.3}s tensor%={:.1} loss%={:.1} backward%={:.1}",
+            self.steps,
+            samples,
+            self.train_step_seconds,
+            self.loader_wait_seconds,
+            self.loader_pack_seconds,
+            self.tensor_seconds,
+            self.loss_seconds,
+            self.backward_seconds,
+            self.optimizer_seconds,
+            self.cpu_grad_seconds,
+            self.tensor_seconds * 100.0 / total,
+            self.loss_seconds * 100.0 / total,
+            self.backward_seconds * 100.0 / total,
+        );
+    }
 }
 
 struct BatchLossOutput {
@@ -434,6 +542,18 @@ fn dataloader_worker_count() -> usize {
         .map(|count| count.get())
         .unwrap_or(1);
     available.clamp(1, 4)
+}
+
+fn train_profile_enabled() -> bool {
+    std::env::var("CHINESEAI_TRAIN_PROFILE")
+        .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+}
+
+fn profile_sync(device: &Device) -> CandleResult<()> {
+    if train_profile_enabled() {
+        device.synchronize()?;
+    }
+    Ok(())
 }
 
 fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::Error {

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -89,6 +90,7 @@ impl BatchPlan {
 pub(super) struct PackedStepBatch {
     pub(super) batch_size: usize,
     pub(super) shards: Vec<PackedBatch>,
+    pub(super) pack_seconds: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +250,7 @@ impl PrefetchDataLoader {
                         *cursor += 1;
                         batch_id
                     };
+                    let started = Instant::now();
                     let step = &plan[batch_id];
                     let packed = PackedStepBatch {
                         batch_size: step.sample_count,
@@ -256,6 +259,7 @@ impl PrefetchDataLoader {
                             .iter()
                             .map(|shard| PackedBatch::from_indices(&samples, shard))
                             .collect(),
+                        pack_seconds: started.elapsed().as_secs_f64(),
                     };
                     if tx.send((batch_id, packed)).is_err() {
                         return;
