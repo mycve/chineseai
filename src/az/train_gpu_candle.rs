@@ -3,6 +3,13 @@ use candle_nn::ops::log_softmax;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{process::Command, sync::Arc, thread, time::Instant};
 
+#[cfg(feature = "nccl-train")]
+use candle_core::{
+    CudaStorage, Storage,
+    cuda_backend::cudarc::nccl::{result as nccl_result, safe as nccl},
+    op::BackpropOp,
+};
+
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, MOVES_LEFT_AUX_WEIGHT,
     candle_model::{AzCandleModel, BatchTensors},
@@ -17,6 +24,8 @@ pub(super) struct GpuTrainer {
     device_indices: Vec<usize>,
     replicas: Vec<GpuReplica>,
     optimizers: Vec<AdamW>,
+    #[cfg(feature = "nccl-train")]
+    nccl: Option<NcclAllReduce>,
 }
 
 #[derive(Debug)]
@@ -24,6 +33,26 @@ struct GpuReplica {
     device: Device,
     model: AzCandleModel,
 }
+
+#[cfg(feature = "nccl-train")]
+struct NcclAllReduce {
+    comms: Vec<nccl::Comm>,
+}
+
+#[cfg(feature = "nccl-train")]
+impl std::fmt::Debug for NcclAllReduce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NcclAllReduce")
+            .field("world_size", &self.comms.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "nccl-train")]
+unsafe impl Send for NcclAllReduce {}
+
+#[cfg(feature = "nccl-train")]
+unsafe impl Sync for NcclAllReduce {}
 
 pub(crate) fn training_cuda_device_count() -> usize {
     cuda_device_indices().len().max(1)
@@ -130,15 +159,20 @@ impl GpuTrainer {
         }
         if device_indices.len() > 1 {
             eprintln!(
-                "[chineseai] 多卡 CUDA 训练: 设备下标={:?}；同步数据并行，每个 step 聚合所有 shard 梯度。",
+                "[chineseai] multi-gpu CUDA training: devices={:?}; synchronize shards each step.",
                 device_indices
             );
         }
+        #[cfg(feature = "nccl-train")]
+        let nccl = init_nccl_all_reduce(&replicas)?;
+
         Ok(Self {
             arch: model.arch,
             device_indices,
             replicas,
             optimizers,
+            #[cfg(feature = "nccl-train")]
+            nccl,
         })
     }
 
@@ -159,6 +193,7 @@ impl GpuTrainer {
     ) -> CandleResult<(AzTrainStats, StepProfile)> {
         let batch_len = batch.batch_size;
         let active_replicas = self.active_replica_count(batch.shards.len());
+        let uses_nccl_all_reduce = self.uses_nccl_all_reduce();
         if active_replicas <= 1 {
             let shard = batch
                 .shards
@@ -174,7 +209,13 @@ impl GpuTrainer {
             for (shard_index, shard) in shards.into_iter().enumerate() {
                 let replica = &self.replicas[shard_index];
                 handles.push(scope.spawn(move || {
-                    replica.compute_batch_grads(shard, batch_len, shard_index == 0, loss_weights)
+                    replica.compute_batch_grads(
+                        shard,
+                        batch_len,
+                        uses_nccl_all_reduce,
+                        shard_index == 0,
+                        loss_weights,
+                    )
                 }));
             }
             let mut outputs = Vec::with_capacity(handles.len());
@@ -186,6 +227,11 @@ impl GpuTrainer {
             }
             CandleResult::Ok(outputs)
         })?;
+
+        #[cfg(feature = "nccl-train")]
+        if self.nccl.is_some() {
+            return self.train_batch_nccl(shard_outputs, loss_weights);
+        }
 
         let mut outputs = shard_outputs.into_iter();
         let primary = outputs
@@ -224,7 +270,8 @@ impl GpuTrainer {
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<(AzTrainStats, StepProfile)> {
         let batch_len = batch.batch_size;
-        let output = self.replicas[0].compute_batch_grads(batch, batch_len, true, loss_weights)?;
+        let output =
+            self.replicas[0].compute_batch_grads(batch, batch_len, false, true, loss_weights)?;
         let mut profile = output.profile;
         profile_sync(&self.replicas[0].device)?;
         let optimizer_started = Instant::now();
@@ -237,6 +284,132 @@ impl GpuTrainer {
         profile_sync(&self.replicas[0].device)?;
         profile.optimizer_seconds += optimizer_started.elapsed().as_secs_f64();
         Ok((output.stats, profile))
+    }
+
+    #[cfg(feature = "nccl-train")]
+    fn train_batch_nccl(
+        &mut self,
+        mut outputs: Vec<ShardOutput>,
+        _loss_weights: AzTrainLossWeights,
+    ) -> CandleResult<(AzTrainStats, StepProfile)> {
+        let mut stats = AzTrainStats::default();
+        let mut profile = StepProfile::default();
+        for output in &outputs {
+            stats.add_assign(&output.stats);
+            profile.add_shard(output.profile);
+        }
+        let all_reduce_started = Instant::now();
+        self.nccl_all_reduce_grads(&mut outputs)?;
+        profile.grad_sync_seconds += all_reduce_started.elapsed().as_secs_f64();
+
+        let optimizer_started = Instant::now();
+        for (optimizer, output) in self.optimizers.iter_mut().zip(outputs.iter()) {
+            optimizer.step(
+                output
+                    .grads
+                    .as_ref()
+                    .expect("NCCL all-reduce keeps gradients on every GPU"),
+            )?;
+        }
+        for replica in &self.replicas {
+            profile_sync(&replica.device)?;
+        }
+        profile.optimizer_seconds += optimizer_started.elapsed().as_secs_f64();
+        Ok((stats, profile))
+    }
+
+    #[cfg(feature = "nccl-train")]
+    fn nccl_all_reduce_grads(&self, outputs: &mut [ShardOutput]) -> CandleResult<()> {
+        let vars = self.replicas[0].model.all_vars();
+        for var in vars {
+            self.nccl_all_reduce_var(outputs, &var)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "nccl-train")]
+    fn nccl_all_reduce_var(&self, outputs: &mut [ShardOutput], var: &Tensor) -> CandleResult<()> {
+        let nccl = self
+            .nccl
+            .as_ref()
+            .expect("NCCL reducer should be initialized");
+        let mut send_tensors = Vec::with_capacity(outputs.len());
+        let mut recv_slices = Vec::with_capacity(outputs.len());
+        for (rank, output) in outputs.iter_mut().enumerate() {
+            let grad = output
+                .grads
+                .as_ref()
+                .and_then(|grads| grads.get(var))
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(format!("missing gradient for NCCL rank {rank}"))
+                })?
+                .contiguous()?;
+            let device = grad.device().as_cuda_device()?.clone();
+            let recv = device
+                .cuda_stream()
+                .alloc_zeros::<f32>(grad.elem_count())
+                .map_err(nccl_cuda_error)?;
+            send_tensors.push(grad);
+            recv_slices.push(recv);
+        }
+
+        let send_storages = send_tensors
+            .iter()
+            .map(|tensor| {
+                let (storage, layout) = tensor.storage_and_layout();
+                if !layout.is_contiguous() || layout.start_offset() != 0 {
+                    return Err(candle_core::Error::Msg(
+                        "NCCL gradient tensor must be contiguous with zero offset".into(),
+                    ));
+                }
+                Ok(storage)
+            })
+            .collect::<CandleResult<Vec<_>>>()?;
+
+        nccl::group_start().map_err(nccl_error)?;
+        let all_reduce = (|| -> CandleResult<()> {
+            for rank in 0..outputs.len() {
+                let send = match &*send_storages[rank] {
+                    Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+                    _ => {
+                        return Err(candle_core::Error::Msg(
+                            "NCCL gradient tensor must live on CUDA".into(),
+                        ));
+                    }
+                };
+                nccl.comms[rank]
+                    .all_reduce(send, &mut recv_slices[rank], &nccl::ReduceOp::Sum)
+                    .map_err(nccl_error)?;
+            }
+            Ok(())
+        })();
+        let group_end = nccl::group_end().map_err(nccl_error);
+        all_reduce?;
+        group_end?;
+
+        for (rank, recv) in recv_slices.into_iter().enumerate() {
+            let device = self.replicas[rank].device.as_cuda_device()?.clone();
+            let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
+            let reduced =
+                Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
+            outputs[rank]
+                .grads
+                .as_mut()
+                .expect("NCCL all-reduce keeps gradients on every GPU")
+                .insert(var, reduced);
+        }
+        Ok(())
+    }
+
+    fn uses_nccl_all_reduce(&self) -> bool {
+        #[cfg(feature = "nccl-train")]
+        {
+            self.nccl.is_some()
+        }
+        #[cfg(not(feature = "nccl-train"))]
+        {
+            false
+        }
     }
 
     fn add_cpu_grads_to_primary(
@@ -288,6 +461,7 @@ impl GpuReplica {
         &self,
         batch: PackedBatch,
         global_batch_len: usize,
+        keep_worker_grads: bool,
         keep_grads: bool,
         loss_weights: AzTrainLossWeights,
     ) -> CandleResult<ShardOutput> {
@@ -312,22 +486,26 @@ impl GpuReplica {
         self.model.remove_frozen_grads(&mut grads, loss_weights);
         let stats = output.stats;
         let cpu_grad_started = Instant::now();
-        let cpu_grads = if keep_grads {
+        let cpu_grads = if keep_grads || keep_worker_grads {
             Vec::new()
         } else {
             self.model.cpu_grads(&grads)?
         };
-        let cpu_grad_seconds = cpu_grad_started.elapsed().as_secs_f64();
+        let grad_sync_seconds = cpu_grad_started.elapsed().as_secs_f64();
         Ok(ShardOutput {
             stats,
             profile: StepProfile {
                 tensor_seconds,
                 loss_seconds,
                 backward_seconds,
-                cpu_grad_seconds,
+                grad_sync_seconds,
                 optimizer_seconds: 0.0,
             },
-            grads: if keep_grads { Some(grads) } else { None },
+            grads: if keep_grads || keep_worker_grads {
+                Some(grads)
+            } else {
+                None
+            },
             cpu_grads,
         })
     }
@@ -389,6 +567,36 @@ impl GpuReplica {
     }
 }
 
+#[cfg(feature = "nccl-train")]
+fn init_nccl_all_reduce(replicas: &[GpuReplica]) -> CandleResult<Option<NcclAllReduce>> {
+    if replicas.len() <= 1 {
+        return Ok(None);
+    }
+    let streams = replicas
+        .iter()
+        .map(|replica| {
+            replica
+                .device
+                .as_cuda_device()
+                .map(|device| device.cuda_stream())
+        })
+        .collect::<CandleResult<Vec<_>>>()?;
+    let comms = nccl::Comm::from_devices(streams).map_err(nccl_error)?;
+    Ok(Some(NcclAllReduce { comms }))
+}
+
+#[cfg(feature = "nccl-train")]
+fn nccl_error(error: nccl_result::NcclError) -> candle_core::Error {
+    candle_core::Error::Msg(format!("NCCL failed: {error:?}"))
+}
+
+#[cfg(feature = "nccl-train")]
+fn nccl_cuda_error(
+    error: candle_core::cuda_backend::cudarc::driver::DriverError,
+) -> candle_core::Error {
+    candle_core::Error::Msg(format!("CUDA allocation for NCCL failed: {error:?}"))
+}
+
 struct ShardOutput {
     stats: AzTrainStats,
     profile: StepProfile,
@@ -401,7 +609,7 @@ struct StepProfile {
     tensor_seconds: f64,
     loss_seconds: f64,
     backward_seconds: f64,
-    cpu_grad_seconds: f64,
+    grad_sync_seconds: f64,
     optimizer_seconds: f64,
 }
 
@@ -410,7 +618,7 @@ impl StepProfile {
         self.tensor_seconds = self.tensor_seconds.max(other.tensor_seconds);
         self.loss_seconds = self.loss_seconds.max(other.loss_seconds);
         self.backward_seconds = self.backward_seconds.max(other.backward_seconds);
-        self.cpu_grad_seconds = self.cpu_grad_seconds.max(other.cpu_grad_seconds);
+        self.grad_sync_seconds = self.grad_sync_seconds.max(other.grad_sync_seconds);
         self.optimizer_seconds += other.optimizer_seconds;
     }
 }
@@ -424,7 +632,7 @@ struct TrainProfile {
     tensor_seconds: f64,
     loss_seconds: f64,
     backward_seconds: f64,
-    cpu_grad_seconds: f64,
+    grad_sync_seconds: f64,
     optimizer_seconds: f64,
 }
 
@@ -433,14 +641,14 @@ impl TrainProfile {
         self.tensor_seconds += step.tensor_seconds;
         self.loss_seconds += step.loss_seconds;
         self.backward_seconds += step.backward_seconds;
-        self.cpu_grad_seconds += step.cpu_grad_seconds;
+        self.grad_sync_seconds += step.grad_sync_seconds;
         self.optimizer_seconds += step.optimizer_seconds;
     }
 
     fn print(&self, samples: usize) {
         let total = self.train_step_seconds.max(f64::EPSILON);
         eprintln!(
-            "[chineseai] train-profile: steps={} samples={} train={:.3}s loader_wait={:.3}s loader_pack(worker_sum)={:.3}s tensor_h2d={:.3}s loss_fwd={:.3}s backward={:.3}s optimizer={:.3}s cpu_grads={:.3}s tensor%={:.1} loss%={:.1} backward%={:.1}",
+            "[chineseai] train-profile: steps={} samples={} train={:.3}s loader_wait={:.3}s loader_pack(worker_sum)={:.3}s tensor_h2d={:.3}s loss_fwd={:.3}s backward={:.3}s optimizer={:.3}s grad_sync={:.3}s tensor%={:.1} loss%={:.1} backward%={:.1}",
             self.steps,
             samples,
             self.train_step_seconds,
@@ -450,7 +658,7 @@ impl TrainProfile {
             self.loss_seconds,
             self.backward_seconds,
             self.optimizer_seconds,
-            self.cpu_grad_seconds,
+            self.grad_sync_seconds,
             self.tensor_seconds * 100.0 / total,
             self.loss_seconds * 100.0 / total,
             self.backward_seconds * 100.0 / total,

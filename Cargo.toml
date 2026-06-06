@@ -18,6 +18,7 @@ toml = "0.8"
 [features]
 default = []
 gpu-train = []
+nccl-train = ["gpu-train", "candle-core/nccl"]
 profile = []
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
