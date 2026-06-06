@@ -741,9 +741,6 @@ pub struct AzTrainStats {
 pub struct AzTrainLossWeights {
     pub value: f32,
     pub policy: f32,
-    pub train_trunk: bool,
-    pub train_value_head: bool,
-    pub train_policy_head: bool,
 }
 
 impl Default for AzTrainLossWeights {
@@ -751,9 +748,6 @@ impl Default for AzTrainLossWeights {
         Self {
             value: 1.0,
             policy: 1.0,
-            train_trunk: true,
-            train_value_head: true,
-            train_policy_head: true,
         }
     }
 }
@@ -1545,9 +1539,6 @@ pub fn benchmark_policy_fit(
         AzTrainLossWeights {
             value: 0.0,
             policy: 1.0,
-            train_trunk: true,
-            train_value_head: false,
-            train_policy_head: true,
         },
     );
     AzPolicyFitBenchmark {
@@ -1605,9 +1596,6 @@ pub fn benchmark_selfplay_policy_fit(
         AzTrainLossWeights {
             value: 1.0,
             policy: 1.0,
-            train_trunk: true,
-            train_value_head: true,
-            train_policy_head: true,
         },
     );
     let games = selfplay.games.len();
@@ -2778,9 +2766,6 @@ mod tests {
         let weights = AzTrainLossWeights {
             value: 1.0,
             policy: 0.0,
-            train_trunk: true,
-            train_value_head: true,
-            train_policy_head: false,
         };
         train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights);
 
@@ -2798,7 +2783,7 @@ mod tests {
             .any(|(left, right)| (*left - *right).abs() > 1e-7);
         assert!(
             input_changed || bias_changed || quadratic_changed,
-            "value-only training should update trunk when train_trunk=true"
+            "value-only training should update trunk"
         );
     }
 

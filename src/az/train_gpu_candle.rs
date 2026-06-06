@@ -588,10 +588,9 @@ impl GpuReplica {
         profile_sync(&self.device)?;
         let loss_seconds = loss_started.elapsed().as_secs_f64();
         let backward_started = Instant::now();
-        let mut grads = output.loss_tensor.backward()?;
+        let grads = output.loss_tensor.backward()?;
         profile_sync(&self.device)?;
         let backward_seconds = backward_started.elapsed().as_secs_f64();
-        self.model.remove_frozen_grads(&mut grads, loss_weights);
         let stats = output.stats;
         let cpu_grad_started = Instant::now();
         let cpu_grads = if keep_grads || keep_worker_grads {

@@ -2,8 +2,8 @@ use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradSto
 use candle_nn::ops::log_softmax;
 
 use super::{
-    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, AzTrainLossWeights, DENSE_MOVE_SPACE,
-    PIECE_ATTENTION_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
+    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_SIZE,
+    POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
     STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS,
     VALUE_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
 };
@@ -403,78 +403,6 @@ impl AzCandleModel {
         vars.push(self.policy_move_context_hidden.clone());
         vars.push(self.policy_move_embedding.clone());
         vars
-    }
-
-    fn value_head_vars(&self) -> Vec<Var> {
-        vec![
-            self.value_head_hidden.clone(),
-            self.value_head_bias.clone(),
-            self.value_head_output.clone(),
-            self.moves_left_output.clone(),
-            self.moves_left_bias.clone(),
-        ]
-    }
-
-    fn policy_head_vars(&self) -> Vec<Var> {
-        vec![
-            self.policy_move_bias.clone(),
-            self.policy_from_hidden.clone(),
-            self.policy_to_hidden.clone(),
-            self.policy_pair_context_hidden.clone(),
-            self.policy_pair_context_bias.clone(),
-            self.policy_pair_embedding.clone(),
-            self.policy_move_context_hidden.clone(),
-            self.policy_move_embedding.clone(),
-        ]
-    }
-
-    pub(super) fn remove_frozen_grads(
-        &self,
-        grads: &mut GradStore,
-        loss_weights: AzTrainLossWeights,
-    ) {
-        self.mask_grads(
-            grads,
-            loss_weights.train_trunk,
-            loss_weights.train_value_head,
-            loss_weights.train_policy_head,
-        );
-    }
-
-    fn mask_grads(
-        &self,
-        grads: &mut GradStore,
-        train_trunk: bool,
-        train_value_head: bool,
-        train_policy_head: bool,
-    ) {
-        if !train_trunk {
-            grads.remove(&self.input_hidden);
-            grads.remove(&self.input_piece_hidden);
-            grads.remove(&self.input_rank_hidden);
-            grads.remove(&self.input_file_hidden);
-            grads.remove(&self.input_king_piece_hidden);
-            grads.remove(&self.hidden_bias);
-            grads.remove(&self.input_quadratic_scale);
-            grads.remove(&self.piece_attention_query);
-            grads.remove(&self.piece_attention_value);
-            grads.remove(&self.piece_attention_output);
-            grads.remove(&self.trunk_residual_hidden);
-            grads.remove(&self.trunk_residual_bias);
-            grads.remove(&self.auto_feature_hidden);
-            grads.remove(&self.auto_feature_bias);
-            grads.remove(&self.auto_feature_output);
-        }
-        if !train_value_head {
-            for var in self.value_head_vars() {
-                grads.remove(&var);
-            }
-        }
-        if !train_policy_head {
-            for var in self.policy_head_vars() {
-                grads.remove(&var);
-            }
-        }
     }
 
     pub(super) fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {

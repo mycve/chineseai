@@ -35,8 +35,6 @@ pub struct AzLoopFileConfig {
     pub value_td_lambda: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
-    pub train_value_head: bool,
-    pub train_policy_head: bool,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -63,21 +61,21 @@ impl Default for AzLoopFileConfig {
         };
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 512,
-            selfplay_samples_per_update: 40000,
-            lr: 0.001,
+            simulations: 256,
+            selfplay_samples_per_update: 60000,
+            lr: 0.0005,
             lr_min: 0.00003,
-            lr_decay_start_update: 400,
-            lr_decay_interval: 600,
+            lr_decay_start_update: 800,
+            lr_decay_interval: 1000,
             lr_decay_factor: 0.33333334,
-            batch_size: 4096,
+            batch_size: 1024,
             max_plies: 300,
             hidden_size: 192,
-            seed: 20260411,
-            workers: 240,
+            seed: 20260412,
+            workers: 250,
             temperature_start: 1.0,
             temperature_end: 0.1,
-            temperature_decay_plies: 40,
+            temperature_decay_plies: 80,
             search_algorithm: AzSearchAlgorithm::AlphaZero,
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
@@ -88,24 +86,22 @@ impl Default for AzLoopFileConfig {
                 maxvisit_init: 50.0,
                 ..gumbel
             },
-            replay_capacity: 200000,
-            train_warmup_samples: 60000,
-            train_samples_per_update: 60000,
-            train_epochs_per_update: 3,
-            max_sample_train_count: 4,
+            replay_capacity: 500000,
+            train_warmup_samples: 150000,
+            train_samples_per_update: 120000,
+            train_epochs_per_update: 2,
+            max_sample_train_count: 3,
             mirror_probability: 0.3,
-            value_td_lambda: 0.85,
+            value_td_lambda: 0.95,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
-            train_value_head: true,
-            train_policy_head: true,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
-            arena_interval: 0,
-            arena_games_per_side: 50,
+            arena_interval: 10,
+            arena_games_per_side: 100,
             arena_cpuct: 1.5,
-            arena_promotion_rate: 0.55,
+            arena_promotion_rate: 0.60,
             arena_processes: 100,
             arena_pikafish_exe: String::new(),
             arena_pikafish_start_update: 1,
@@ -157,8 +153,6 @@ struct AzLoopTomlConfig {
     pub value_td_lambda: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
-    pub train_value_head: bool,
-    pub train_policy_head: bool,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -221,8 +215,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             value_td_lambda: config.value_td_lambda,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
-            train_value_head: config.train_value_head,
-            train_policy_head: config.train_policy_head,
             checkpoint_interval: config.checkpoint_interval,
             checkpoint_dir: config.checkpoint_dir.clone(),
             max_checkpoints: config.max_checkpoints,
@@ -285,8 +277,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             value_td_lambda: config.value_td_lambda,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
-            train_value_head: config.train_value_head,
-            train_policy_head: config.train_policy_head,
             checkpoint_interval: config.checkpoint_interval,
             checkpoint_dir: config.checkpoint_dir,
             max_checkpoints: config.max_checkpoints,
@@ -380,8 +370,6 @@ impl AzLoopFileConfig {
         line!("value_td_lambda", f(self.value_td_lambda));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
-        line!("train_value_head", self.train_value_head);
-        line!("train_policy_head", self.train_policy_head);
         line!("checkpoint_interval", self.checkpoint_interval);
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
@@ -474,18 +462,20 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.contains("lr = 0.001\n"));
+        assert!(text.contains("lr = 0.0005\n"));
         assert!(text.contains("lr_min = 0.00003\n"));
         assert!(text.contains("temperature_start = 1.0\n"));
         assert!(text.contains("temperature_end = 0.1\n"));
-        assert!(text.contains("value_td_lambda = 0.85\n"));
+        assert!(text.contains("value_td_lambda = 0.95\n"));
+        assert!(!text.contains("train_value_head"));
+        assert!(!text.contains("train_policy_head"));
         assert!(!text.contains("000000047"));
         assert!(!text.contains("000000023"));
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.001).abs() < 1e-9);
-        assert!((parsed.value_td_lambda - 0.85).abs() < 1e-6);
+        assert!((parsed.lr - 0.0005).abs() < 1e-9);
+        assert!((parsed.value_td_lambda - 0.95).abs() < 1e-6);
     }
 }
 

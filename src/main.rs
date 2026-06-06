@@ -910,15 +910,6 @@ struct AzSelfplayFitBenchArgs {
     /// Policy loss weight used by fixed-fit diagnostics.
     #[arg(long, default_value_t = 1.0)]
     fit_policy_weight: f32,
-    /// Train shared sparse input trunk during fixed-fit diagnostics.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    fit_train_trunk: bool,
-    /// Train value head during fixed-fit diagnostics.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    fit_train_value_head: bool,
-    /// Train policy head during fixed-fit diagnostics.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    fit_train_policy_head: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1037,15 +1028,6 @@ struct AzTrainFixedReplayArgs {
     /// Policy loss weight.
     #[arg(long, default_value_t = 1.0)]
     policy_weight: f32,
-    /// Train shared sparse input trunk during fixed replay fitting.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    train_trunk: bool,
-    /// Train value head/trunk variables included in value head set.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    train_value_head: bool,
-    /// Train policy head/trunk variables included in policy head set.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    train_policy_head: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2030,9 +2012,6 @@ fn main() {
             let fit_loss_weights = AzTrainLossWeights {
                 value: cmd.fit_value_weight,
                 policy: cmd.fit_policy_weight,
-                train_trunk: cmd.fit_train_trunk,
-                train_value_head: cmd.fit_train_value_head,
-                train_policy_head: cmd.fit_train_policy_head,
             };
             let (stats, trace) = benchmark_fixed_policy_fit_with_trace(
                 &mut model,
@@ -2079,12 +2058,8 @@ fn main() {
             println!("min_delta       : {}", cmd.min_delta);
             println!("trace_interval  : {}", cmd.trace_interval);
             println!(
-                "fit_loss        : value={} policy={} train_trunk={} train_value_head={} train_policy_head={}",
-                fit_loss_weights.value,
-                fit_loss_weights.policy,
-                fit_loss_weights.train_trunk,
-                fit_loss_weights.train_value_head,
-                fit_loss_weights.train_policy_head
+                "fit_loss        : value={} policy={}",
+                fit_loss_weights.value, fit_loss_weights.policy
             );
             println!("elapsed_ms      : {:.3}", elapsed * 1000.0);
             println!(
@@ -2294,9 +2269,6 @@ fn main() {
             let loss_weights = AzTrainLossWeights {
                 value: cmd.value_weight,
                 policy: cmd.policy_weight,
-                train_trunk: cmd.train_trunk,
-                train_value_head: cmd.train_value_head,
-                train_policy_head: cmd.train_policy_head,
             };
             let mut rng = SplitMix64::new(cmd.seed ^ 0x7E57_F1ED_DA7A_5EED);
             let started = Instant::now();
@@ -2317,12 +2289,8 @@ fn main() {
             println!("cuda_devices    : {n_gpu}  (global batch {g_step})");
             println!("lr              : {lr}");
             println!(
-                "fit_loss        : value={} policy={} train_trunk={} train_value_head={} train_policy_head={}",
-                loss_weights.value,
-                loss_weights.policy,
-                loss_weights.train_trunk,
-                loss_weights.train_value_head,
-                loss_weights.train_policy_head
+                "fit_loss        : value={} policy={}",
+                loss_weights.value, loss_weights.policy
             );
             let initial_stats = benchmark_fixed_policy_fit(
                 &mut model,
@@ -2525,7 +2493,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={},value_head={},policy_head={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_promotion_rate={} arena_processes={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_promotion_rate={} arena_processes={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -2558,8 +2526,6 @@ fn main() {
                 config.value_td_lambda,
                 config.train_value_weight,
                 config.train_policy_weight,
-                config.train_value_head,
-                config.train_policy_head,
                 config.checkpoint_interval,
                 config.max_checkpoints,
                 config.arena_interval,
@@ -2715,9 +2681,6 @@ fn main() {
                         AzTrainLossWeights {
                             value: trainer_config.train_value_weight,
                             policy: trainer_config.train_policy_weight,
-                            train_trunk: true,
-                            train_value_head: trainer_config.train_value_head,
-                            train_policy_head: trainer_config.train_policy_head,
                         },
                     );
                     let train_seconds = train_started.elapsed().as_secs_f32();
