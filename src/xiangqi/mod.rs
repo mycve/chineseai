@@ -533,6 +533,7 @@ impl Position {
             for read_index in 0..moves.len() {
                 let mv = moves[read_index];
                 let from = mv.from as usize;
+                let to = mv.to as usize;
                 let requires_safety_check = in_check
                     || matches!(
                         self.board[from],
@@ -541,7 +542,8 @@ impl Position {
                             ..
                         })
                     )
-                    || ((safety_check_from_mask >> from) & 1) != 0;
+                    || ((safety_check_from_mask >> from) & 1) != 0
+                    || ((safety_check_from_mask >> to) & 1) != 0;
                 if !requires_safety_check {
                     moves[legal_len] = mv;
                     legal_len += 1;
