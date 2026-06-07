@@ -103,10 +103,9 @@ impl Position {
             return legal;
         }
 
-        let current_entry = (!history
-            .last()
-            .is_some_and(|entry| entry.hash == self.hash && entry.side_to_move == self.side_to_move)
-        )
+        let current_entry = (!history.last().is_some_and(|entry| {
+            entry.hash == self.hash && entry.side_to_move == self.side_to_move
+        }))
         .then(|| self.rule_history_entry(None));
 
         let mover = self.side_to_move;

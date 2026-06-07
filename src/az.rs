@@ -155,6 +155,28 @@ fn load_candle_f32_tensor(
         .map_err(candle_io_error)
 }
 
+fn resize_input_hidden_for_current_features(
+    mut values: Vec<f32>,
+    hidden: usize,
+) -> io::Result<Vec<f32>> {
+    let expected = AZ_NNUE_INPUT_SIZE * hidden;
+    if values.len() == expected {
+        return Ok(values);
+    }
+    if values.len() < expected && values.len().is_multiple_of(hidden) {
+        values.resize(expected, 0.0);
+        return Ok(values);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "az model tensor `input_hidden` length mismatch: got {}, expected {}",
+            values.len(),
+            expected
+        ),
+    ))
+}
+
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h]);
@@ -904,7 +926,10 @@ impl AzNnue {
         let model = Self {
             hidden_size,
             arch,
-            input_hidden: load_candle_f32_tensor(&tensors, "input_hidden")?,
+            input_hidden: resize_input_hidden_for_current_features(
+                load_candle_f32_tensor(&tensors, "input_hidden")?,
+                hidden_size,
+            )?,
             input_piece_hidden: load_candle_f32_tensor(&tensors, "input_piece_hidden")?,
             input_rank_hidden: load_candle_f32_tensor(&tensors, "input_rank_hidden")?,
             input_file_hidden: load_candle_f32_tensor(&tensors, "input_file_hidden")?,

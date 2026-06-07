@@ -589,10 +589,8 @@ fn slow_legal_moves(position: &Position) -> Vec<Move> {
 
 #[test]
 fn fast_legal_moves_match_slow_on_vs_pikafish_repetition_game() {
-    let mut position = Position::from_fen(
-        "r2akab1r/c8/2n1b2c1/p3p3p/7n1/2R6/P3P3P/C1N6/6C2/2BAKABNR w",
-    )
-    .unwrap();
+    let mut position =
+        Position::from_fen("r2akab1r/c8/2n1b2c1/p3p3p/7n1/2R6/P3P3P/C1N6/6C2/2BAKABNR w").unwrap();
     let mut history = position.initial_rule_history();
     let moves = "c4c7 h7c7 i0i2 c7c0 d0e1 c0a0 i2d2 a9b9 d2d8 a8a7 g1g7 a7g7 e0d0 g7g1 a2b2 a0a2 c2b4 b9b4 d8d6 f9e8 d6d8 b4b9 d8d6 g1f1 d6d8 b9c9 d0e0 c9c0 e1d0 c0c9 b2e2 a2a0 d0e1 c9c0 e1d0 c0c1 d0e1 c1c0 e1d0 c0c1 d0e1 i9i7 e2e6 c1c0 e1d0 c0c1 d0e1 c1c0 e1d0 c0c9 d0e1 e9f9 d8e8 c9c0 e1d0 c0c1 d0e1 d9e8 h0g2 c1c0 e1d0 c0c1 d0e1 c1c0 e1d0 i7g7 e6e5 c0c1 d0e1 c1c0 e1d0 c0c1 d0e1 f1f6 e0d0 c1c0 d0d1 c0c1 d1d0 c1c0 d0d1 f6f1 e1f2 c0c1 d1d0 c1c0 d0d1 c0c1 d1d0 h5i7 g2h4 c1c0 d0d1 c0c1 d1d0 c1c0 d0d1 c0c9 h4f5 c9c1 d1d0 c1c0 d0d1 c0c1 d1d0 c1c0 d0d1 g7g0 f5g7 i7g8 g7e6 c0c1 d1d2 c1c2 d2d1 c2c1 d1d2 c1c2 d2d1 c2c9 e6c7 g0g3 f0e1";
 
@@ -604,7 +602,8 @@ fn fast_legal_moves_match_slow_on_vs_pikafish_repetition_game() {
         fast_sorted.sort_by_key(|mv| (mv.from, mv.to));
         slow_sorted.sort_by_key(|mv| (mv.from, mv.to));
         assert_eq!(
-            fast_sorted, slow_sorted,
+            fast_sorted,
+            slow_sorted,
             "fast legal mismatch before ply {} move {} at {}",
             ply + 1,
             text,
