@@ -226,6 +226,7 @@ impl Default for AzNnueArch {
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
     auto_features: Vec<f32>,
+    #[allow(dead_code)]
     trunk_work: Vec<f32>,
     #[allow(dead_code)]
     history_features: Vec<usize>,
@@ -968,9 +969,6 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_into(&features, &mut scratch.hidden);
-            self.apply_fast_trunk_into(&mut scratch.hidden, &mut scratch.trunk_work);
-            self.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
-            rms_norm_in_place(&mut scratch.hidden);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -998,12 +996,7 @@ impl AzNnue {
                 &mut scratch.history_features,
                 &mut scratch.hidden,
             );
-            let features = extract_sparse_features_az_canonical(position, history);
-            self.add_sparse_attention_into(&features, &mut scratch.hidden);
             relu_in_place(&mut scratch.hidden);
-            self.apply_fast_trunk_into(&mut scratch.hidden, &mut scratch.trunk_work);
-            self.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
-            rms_norm_in_place(&mut scratch.hidden);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -1158,8 +1151,6 @@ impl AzNnue {
                     );
                 }
                 self.add_factorized_structure_into(features, hidden);
-                self.add_quadratic_trunk_into(hidden);
-                self.add_sparse_attention_into(features, hidden);
                 // SAFETY: runtime detection above guarantees AVX2 support.
                 unsafe {
                     relu_in_place_avx2(hidden);
@@ -1175,17 +1166,17 @@ impl AzNnue {
             }
         }
         self.add_factorized_structure_into(features, hidden);
-        self.add_quadratic_trunk_into(hidden);
-        self.add_sparse_attention_into(features, hidden);
         relu_in_place(hidden);
     }
 
+    #[allow(dead_code)]
     fn add_quadratic_trunk_into(&self, hidden: &mut [f32]) {
         for (value, &scale) in hidden.iter_mut().zip(&self.input_quadratic_scale) {
             *value += scale * *value * *value;
         }
     }
 
+    #[allow(dead_code)]
     fn add_sparse_attention_into(&self, features: &[usize], hidden: &mut [f32]) {
         if features.is_empty()
             || self
@@ -1241,6 +1232,7 @@ impl AzNnue {
         }
     }
 
+    #[allow(dead_code)]
     fn sparse_attention_token_into(&self, feature: usize, features: &[usize], token: &mut [f32]) {
         let hidden_size = self.hidden_size;
         token.copy_from_slice(
@@ -1287,11 +1279,13 @@ impl AzNnue {
         );
     }
 
+    #[allow(dead_code)]
     fn apply_fast_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
         relu_in_place(hidden);
         self.apply_residual_trunk_into(hidden, trunk_work);
     }
 
+    #[allow(dead_code)]
     fn apply_residual_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
         trunk_work.resize(self.hidden_size, 0.0);
         for layer in 0..TRUNK_LAYERS {

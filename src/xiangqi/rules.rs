@@ -103,30 +103,32 @@ impl Position {
             return legal;
         }
 
-        let base_history = if history
+        let current_entry = (!history
             .last()
             .is_some_and(|entry| entry.hash == self.hash && entry.side_to_move == self.side_to_move)
-        {
-            history.to_vec()
-        } else {
-            let mut normalized = history.to_vec();
-            normalized.push(self.rule_history_entry(None));
-            normalized
-        };
+        )
+        .then(|| self.rule_history_entry(None));
 
         let mover = self.side_to_move;
         legal
             .into_iter()
             .filter(|&mv| {
-                let mut next = self.clone();
-                next.make_move(mv);
-                if !base_history
+                let next_hash = self.hash_after_move(mv);
+                let next_side_to_move = mover.opposite();
+                if !history
                     .iter()
-                    .any(|entry| entry.hash == next.hash && entry.side_to_move == next.side_to_move)
+                    .any(|entry| entry.hash == next_hash && entry.side_to_move == next_side_to_move)
                 {
                     return true;
                 }
-                let mut next_history = base_history.clone();
+                let mut next = self.clone();
+                next.make_move(mv);
+                let mut next_history =
+                    Vec::with_capacity(history.len() + usize::from(current_entry.is_some()) + 1);
+                next_history.extend_from_slice(history);
+                if let Some(entry) = current_entry {
+                    next_history.push(entry);
+                }
                 next_history.push(self.rule_history_entry_after_move(mv));
                 !matches!(
                     next.rule_outcome_with_history(&next_history),
@@ -153,9 +155,9 @@ impl Position {
 
             self.visit_attacker_origins_to(target, color, |from| {
                 let mv = Move::new(from, target);
-                let undo = work.make_move(mv);
+                let captured = work.make_move_board_only(mv);
                 let legal = !work.in_check(color);
-                work.unmake_move(mv, undo);
+                work.unmake_move_board_only(mv, captured);
                 if legal {
                     square_mask |= 1u128 << target;
                     piece_mask |= 1u16 << chased_piece_index(target_piece);
@@ -180,9 +182,9 @@ impl Position {
         let mut chased = false;
         self.visit_attacker_origins_to(target, color, |from| {
             let mv = Move::new(from, target);
-            let undo = work.make_move(mv);
+            let captured = work.make_move_board_only(mv);
             chased = !work.in_check(color);
-            work.unmake_move(mv, undo);
+            work.unmake_move_board_only(mv, captured);
             chased
         });
         chased
@@ -208,9 +210,9 @@ impl Position {
                     return false;
                 }
                 let mv = Move::new(from, target);
-                let undo = work.make_move(mv);
+                let captured = work.make_move_board_only(mv);
                 let legal = !work.in_check(color);
-                work.unmake_move(mv, undo);
+                work.unmake_move_board_only(mv, captured);
                 if legal {
                     square_mask |= 1u128 << target;
                     piece_mask |= 1u16 << chased_piece_index(target_piece);

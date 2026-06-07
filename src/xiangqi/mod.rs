@@ -174,6 +174,17 @@ impl Position {
         self.hash
     }
 
+    pub(super) fn hash_after_move(&self, mv: Move) -> u64 {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        let moving = self.board[from].expect("move from occupied square");
+        let mut hash = self.hash ^ zobrist_piece_key(from, moving);
+        if let Some(captured) = self.board[to] {
+            hash ^= zobrist_piece_key(to, captured);
+        }
+        hash ^ zobrist_piece_key(to, moving) ^ SIDE_TO_MOVE_KEY
+    }
+
     #[inline(always)]
     pub fn halfmove_clock(&self) -> u16 {
         self.halfmove_clock
@@ -238,11 +249,11 @@ impl Position {
         let mut work = self.clone();
         self.visit_attacker_origins_to(target, self.side_to_move, |from| {
             let mv = Move::new(from, target);
-            let undo = work.make_move(mv);
+            let captured = work.make_move_board_only(mv);
             if !work.in_check(self.side_to_move) {
                 legal.push(mv);
             }
-            work.unmake_move(mv, undo);
+            work.unmake_move_board_only(mv, captured);
             false
         });
 
@@ -281,9 +292,9 @@ impl Position {
         }
 
         let mut work = self.clone();
-        let undo = work.make_move(mv);
+        let captured = work.make_move_board_only(mv);
         let legal = !work.in_check(self.side_to_move);
-        work.unmake_move(mv, undo);
+        work.unmake_move_board_only(mv, captured);
         legal
     }
 
@@ -352,6 +363,35 @@ impl Position {
         }
         self.side_to_move = undo.side_to_move;
         self.halfmove_clock = undo.halfmove_clock;
+    }
+
+    fn make_move_board_only(&mut self, mv: Move) -> Option<Piece> {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        let moving = self.board[from].expect("move from occupied square");
+        let captured = self.board[to];
+        self.board[to] = Some(moving);
+        self.board[from] = None;
+        if moving.kind == PieceKind::General {
+            self.general_squares[color_hash_index(moving.color)] = Some(to);
+        }
+        captured
+    }
+
+    fn unmake_move_board_only(&mut self, mv: Move, captured: Option<Piece>) {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        let moving = self.board[to].expect("move to occupied square");
+        self.board[from] = Some(moving);
+        self.board[to] = captured;
+        if moving.kind == PieceKind::General {
+            self.general_squares[color_hash_index(moving.color)] = Some(from);
+        }
+        if let Some(captured) = captured
+            && captured.kind == PieceKind::General
+        {
+            self.general_squares[color_hash_index(captured.color)] = Some(to);
+        }
     }
 
     pub fn in_check(&self, color: Color) -> bool {
@@ -472,28 +512,100 @@ impl Position {
     fn collect_legal_moves(&self, captures_only: bool, in_check: bool) -> Vec<Move> {
         crate::scope_profile!("xiangqi.collect_legal_moves");
         let mut moves = if in_check {
+            crate::scope_profile!("xiangqi.pseudo_legal_moves");
             self.pseudo_legal_evasions()
         } else if captures_only {
+            crate::scope_profile!("xiangqi.pseudo_legal_moves");
             self.pseudo_legal_capture_moves()
         } else {
+            crate::scope_profile!("xiangqi.pseudo_legal_moves");
             self.pseudo_legal_moves()
         };
         let mut work = self.clone();
         let needs_capture_filter = captures_only && in_check;
         let mut legal_len = 0usize;
+        let safety_check_from_mask = (!in_check)
+            .then(|| self.safety_check_from_mask_when_not_in_check(self.side_to_move))
+            .unwrap_or(u128::MAX);
 
-        for read_index in 0..moves.len() {
-            let mv = moves[read_index];
-            let undo = work.make_move(mv);
-            if !work.in_check(self.side_to_move) && (!needs_capture_filter || self.is_capture(mv)) {
-                moves[legal_len] = mv;
-                legal_len += 1;
+        {
+            crate::scope_profile!("xiangqi.legal_filter");
+            for read_index in 0..moves.len() {
+                let mv = moves[read_index];
+                let from = mv.from as usize;
+                let requires_safety_check = in_check
+                    || matches!(
+                        self.board[from],
+                        Some(Piece {
+                            kind: PieceKind::General,
+                            ..
+                        })
+                    )
+                    || ((safety_check_from_mask >> from) & 1) != 0;
+                if !requires_safety_check {
+                    moves[legal_len] = mv;
+                    legal_len += 1;
+                    continue;
+                }
+
+                let captured = work.make_move_board_only(mv);
+                if !work.in_check(self.side_to_move)
+                    && (!needs_capture_filter || self.is_capture(mv))
+                {
+                    moves[legal_len] = mv;
+                    legal_len += 1;
+                }
+                work.unmake_move_board_only(mv, captured);
             }
-            work.unmake_move(mv, undo);
         }
 
         moves.truncate(legal_len);
         moves
+    }
+
+    fn safety_check_from_mask_when_not_in_check(&self, color: Color) -> u128 {
+        let Some(king_sq) = self.find_general(color) else {
+            return u128::MAX;
+        };
+        let mut mask = 0u128;
+        let king_file = file_of(king_sq);
+        let king_rank = rank_of(king_sq);
+        for rank in 0..BOARD_RANKS {
+            mask |= 1u128 << index(king_file, rank);
+        }
+        for file in 0..BOARD_FILES {
+            mask |= 1u128 << index(file, king_rank);
+        }
+
+        self.add_horse_leg_attack_mask(king_sq, color.opposite(), &mut mask);
+        mask
+    }
+
+    fn add_horse_leg_attack_mask(&self, target: usize, by: Color, mask: &mut u128) {
+        let file = file_of(target) as i32;
+        let rank = rank_of(target) as i32;
+        for ((leg_df, leg_dr), (move_df, move_dr)) in HORSE_STEPS {
+            let from_file = file - move_df;
+            let from_rank = rank - move_dr;
+            if !inside_board(from_file, from_rank) {
+                continue;
+            }
+            let leg_file = from_file + leg_df;
+            let leg_rank = from_rank + leg_dr;
+            if !inside_board(leg_file, leg_rank) {
+                continue;
+            }
+            let from = index(from_file as usize, from_rank as usize);
+            if matches!(
+                self.board[from],
+                Some(Piece {
+                    color,
+                    kind: PieceKind::Horse
+                }) if color == by
+            ) {
+                *mask |= 1u128 << index(leg_file as usize, leg_rank as usize);
+            }
+        }
     }
 
     fn pseudo_legal_evasions(&self) -> Vec<Move> {
