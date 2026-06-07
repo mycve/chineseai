@@ -17,11 +17,7 @@ const STRATEGIC_INPUT_SIZE: usize = STRATEGIC_STATES * STRATEGIC_BUCKETS;
 const AZ_ROW_INPUT_OFFSET: usize = V3_INPUT_SIZE;
 const AZ_COL_INPUT_OFFSET: usize = AZ_ROW_INPUT_OFFSET + ROW_INPUT_SIZE;
 const AZ_STRATEGIC_INPUT_OFFSET: usize = AZ_COL_INPUT_OFFSET + COL_INPUT_SIZE;
-const AZ_RELATION_INPUT_OFFSET: usize = AZ_STRATEGIC_INPUT_OFFSET + STRATEGIC_INPUT_SIZE;
-const RELATION_STATES: usize = 4;
-const RELATION_BUCKETS: usize = 16;
-const RELATION_INPUT_SIZE: usize = RELATION_STATES * 14 * RELATION_BUCKETS;
-pub const AZ_NNUE_INPUT_SIZE: usize = AZ_RELATION_INPUT_OFFSET + RELATION_INPUT_SIZE;
+pub const AZ_NNUE_INPUT_SIZE: usize = AZ_STRATEGIC_INPUT_OFFSET + STRATEGIC_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -118,7 +114,6 @@ pub fn extract_sparse_features_az_canonical_current(position: &Position) -> Vec<
         features.push(piece_index * BOARD_SIZE + rel_sq);
     }
 
-    add_az_canonical_relation_features(position, side, &mut features);
     features.sort_unstable();
     features
 }
@@ -298,14 +293,6 @@ fn mirror_sparse_feature_az_absolute_file(feature: usize) -> usize {
         }
         return feature;
     }
-    if feature < AZ_NNUE_INPUT_SIZE {
-        let offset = feature - AZ_RELATION_INPUT_OFFSET;
-        let bucket = offset % RELATION_BUCKETS;
-        let partial = offset / RELATION_BUCKETS;
-        let piece_index = partial % 14;
-        let state = partial / 14;
-        return az_relation_feature_index(state, piece_index, mirror_relation_bucket_file(bucket));
-    }
     feature
 }
 
@@ -333,153 +320,6 @@ fn az_col_feature_index(piece_index: usize, file: usize) -> usize {
 
 fn az_strategic_feature_index(state: usize, bucket: usize) -> usize {
     AZ_STRATEGIC_INPUT_OFFSET + state * STRATEGIC_BUCKETS + bucket.min(STRATEGIC_BUCKETS - 1)
-}
-
-fn az_relation_feature_index(state: usize, piece_index: usize, bucket: usize) -> usize {
-    AZ_RELATION_INPUT_OFFSET
-        + ((state * 14 + piece_index) * RELATION_BUCKETS + bucket.min(RELATION_BUCKETS - 1))
-}
-
-fn relation_square_bucket(sq: usize) -> usize {
-    let file_bucket = (file_of(sq) * 4) / BOARD_FILES;
-    let rank_bucket = (rank_of(sq) * 4) / BOARD_RANKS;
-    rank_bucket * 4 + file_bucket
-}
-
-fn mirror_relation_bucket_file(bucket: usize) -> usize {
-    let rank_bucket = bucket / 4;
-    let file_bucket = bucket % 4;
-    rank_bucket * 4 + (3 - file_bucket)
-}
-
-#[allow(dead_code)]
-fn add_az_absolute_relation_features(position: &Position, out: &mut Vec<usize>) {
-    add_az_relation_features(
-        position,
-        |piece, sq| {
-            (
-                absolute_piece_index(piece.color, piece.kind),
-                relation_square_bucket(sq),
-            )
-        },
-        out,
-    );
-}
-
-fn add_az_canonical_relation_features(position: &Position, side: Color, out: &mut Vec<usize>) {
-    add_az_relation_features(
-        position,
-        |piece, sq| {
-            let rel_color = if piece.color == side {
-                Color::Red
-            } else {
-                Color::Black
-            };
-            (
-                absolute_piece_index(rel_color, piece.kind),
-                relation_square_bucket(orient_square(side, sq)),
-            )
-        },
-        out,
-    );
-}
-
-fn add_az_relation_features<F>(position: &Position, mut encode: F, out: &mut Vec<usize>)
-where
-    F: FnMut(Piece, usize) -> (usize, usize),
-{
-    for sq in 0..BOARD_SIZE {
-        let Some(piece) = position.piece_at(sq) else {
-            continue;
-        };
-        let (piece_index, bucket) = encode(piece, sq);
-        if position.is_square_attacked(sq, piece.color.opposite()) {
-            out.push(az_relation_feature_index(0, piece_index, bucket));
-        }
-        if position.is_piece_protected(sq, piece.color) {
-            out.push(az_relation_feature_index(1, piece_index, bucket));
-        }
-    }
-    add_king_line_screen_features(position, &mut encode, out);
-    add_cannon_screen_features(position, &mut encode, out);
-}
-
-fn add_king_line_screen_features<F>(position: &Position, encode: &mut F, out: &mut Vec<usize>)
-where
-    F: FnMut(Piece, usize) -> (usize, usize),
-{
-    for color in [Color::Red, Color::Black] {
-        let Some(king_sq) = position.general_square(color) else {
-            continue;
-        };
-        let king_file = file_of(king_sq) as i32;
-        let king_rank = rank_of(king_sq) as i32;
-        for (df, dr) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let mut screen: Option<(usize, Piece)> = None;
-            let mut file = king_file + df;
-            let mut rank = king_rank + dr;
-            while inside_local(file, rank) {
-                let sq = rank as usize * BOARD_FILES + file as usize;
-                if let Some(piece) = position.piece_at(sq) {
-                    if let Some((screen_sq, screen_piece)) = screen {
-                        if screen_piece.color == color
-                            && piece.color == color.opposite()
-                            && (piece.kind == PieceKind::Rook
-                                || piece.kind == PieceKind::Cannon
-                                || (piece.kind == PieceKind::General && df == 0))
-                        {
-                            let (piece_index, bucket) = encode(screen_piece, screen_sq);
-                            out.push(az_relation_feature_index(2, piece_index, bucket));
-                        }
-                        break;
-                    }
-                    screen = Some((sq, piece));
-                }
-                file += df;
-                rank += dr;
-            }
-        }
-    }
-}
-
-fn add_cannon_screen_features<F>(position: &Position, encode: &mut F, out: &mut Vec<usize>)
-where
-    F: FnMut(Piece, usize) -> (usize, usize),
-{
-    for sq in 0..BOARD_SIZE {
-        let Some(cannon) = position.piece_at(sq) else {
-            continue;
-        };
-        if cannon.kind != PieceKind::Cannon {
-            continue;
-        }
-        let cannon_file = file_of(sq) as i32;
-        let cannon_rank = rank_of(sq) as i32;
-        for (df, dr) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let mut screen: Option<(usize, Piece)> = None;
-            let mut file = cannon_file + df;
-            let mut rank = cannon_rank + dr;
-            while inside_local(file, rank) {
-                let target_sq = rank as usize * BOARD_FILES + file as usize;
-                if let Some(piece) = position.piece_at(target_sq) {
-                    if let Some((screen_sq, screen_piece)) = screen {
-                        if piece.color != cannon.color {
-                            let (piece_index, bucket) = encode(screen_piece, screen_sq);
-                            out.push(az_relation_feature_index(3, piece_index, bucket));
-                        }
-                        break;
-                    }
-                    screen = Some((target_sq, piece));
-                }
-                file += df;
-                rank += dr;
-            }
-        }
-    }
-}
-
-fn inside_local(file: i32, rank: i32) -> bool {
-    (0..BOARD_FILES as i32).contains(&file) && (0..BOARD_RANKS as i32).contains(&rank)
 }
 
 fn add_az_absolute_strategic_features(

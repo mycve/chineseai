@@ -155,28 +155,6 @@ fn load_candle_f32_tensor(
         .map_err(candle_io_error)
 }
 
-fn resize_input_hidden_for_current_features(
-    mut values: Vec<f32>,
-    hidden: usize,
-) -> io::Result<Vec<f32>> {
-    let expected = AZ_NNUE_INPUT_SIZE * hidden;
-    if values.len() == expected {
-        return Ok(values);
-    }
-    if values.len() < expected && values.len().is_multiple_of(hidden) {
-        values.resize(expected, 0.0);
-        return Ok(values);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "az model tensor `input_hidden` length mismatch: got {}, expected {}",
-            values.len(),
-            expected
-        ),
-    ))
-}
-
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h]);
@@ -926,10 +904,7 @@ impl AzNnue {
         let model = Self {
             hidden_size,
             arch,
-            input_hidden: resize_input_hidden_for_current_features(
-                load_candle_f32_tensor(&tensors, "input_hidden")?,
-                hidden_size,
-            )?,
+            input_hidden: load_candle_f32_tensor(&tensors, "input_hidden")?,
             input_piece_hidden: load_candle_f32_tensor(&tensors, "input_piece_hidden")?,
             input_rank_hidden: load_candle_f32_tensor(&tensors, "input_rank_hidden")?,
             input_file_hidden: load_candle_f32_tensor(&tensors, "input_file_hidden")?,
@@ -994,6 +969,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_into(&features, &mut scratch.hidden);
+            self.apply_residual_trunk_layers_into(&mut scratch.hidden, &mut scratch.trunk_work, 1);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -1022,6 +998,7 @@ impl AzNnue {
                 &mut scratch.hidden,
             );
             relu_in_place(&mut scratch.hidden);
+            self.apply_residual_trunk_layers_into(&mut scratch.hidden, &mut scratch.trunk_work, 1);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -1312,8 +1289,17 @@ impl AzNnue {
 
     #[allow(dead_code)]
     fn apply_residual_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
+        self.apply_residual_trunk_layers_into(hidden, trunk_work, TRUNK_LAYERS);
+    }
+
+    fn apply_residual_trunk_layers_into(
+        &self,
+        hidden: &mut [f32],
+        trunk_work: &mut Vec<f32>,
+        layers: usize,
+    ) {
         trunk_work.resize(self.hidden_size, 0.0);
-        for layer in 0..TRUNK_LAYERS {
+        for layer in 0..layers.min(TRUNK_LAYERS) {
             let weight_base = layer * self.hidden_size * self.hidden_size;
             let bias_base = layer * self.hidden_size;
             let weights = &self.trunk_residual_hidden
