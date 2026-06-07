@@ -971,7 +971,6 @@ impl AzNnue {
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
             self.add_sparse_attention_into(&features, &mut scratch.hidden);
             relu_in_place(&mut scratch.hidden);
-            self.apply_residual_trunk_layers_into(&mut scratch.hidden, &mut scratch.trunk_work, 1);
             rms_norm_in_place(&mut scratch.hidden);
         }
         let value = {
@@ -1003,7 +1002,6 @@ impl AzNnue {
             let features = extract_sparse_features_az_canonical(position, history);
             self.add_sparse_attention_into(&features, &mut scratch.hidden);
             relu_in_place(&mut scratch.hidden);
-            self.apply_residual_trunk_layers_into(&mut scratch.hidden, &mut scratch.trunk_work, 1);
             rms_norm_in_place(&mut scratch.hidden);
         }
         let value = {
