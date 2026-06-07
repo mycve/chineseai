@@ -52,7 +52,6 @@ pub(super) const VALUE_HEAD_SIZE: usize = 64;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 pub(super) const AUTO_FEATURE_SIZE: usize = 64;
-const ACTIVE_AUTO_FEATURE_SIZE: usize = 16;
 pub(super) const PIECE_ATTENTION_SIZE: usize = 32;
 pub(super) const TRUNK_LAYERS: usize = 2;
 const VALUE_SCALE_CP: f32 = 1000.0;
@@ -970,7 +969,6 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_into(&features, &mut scratch.hidden);
-            self.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -999,7 +997,6 @@ impl AzNnue {
                 &mut scratch.hidden,
             );
             relu_in_place(&mut scratch.hidden);
-            self.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -1310,10 +1307,9 @@ impl AzNnue {
     }
 
     fn auto_feature_adapter_into(&self, hidden: &mut [f32], auto_features: &mut Vec<f32>) {
-        let active = ACTIVE_AUTO_FEATURE_SIZE.min(AUTO_FEATURE_SIZE);
-        auto_features.resize(active, 0.0);
-        auto_features.copy_from_slice(&self.auto_feature_bias[..active]);
-        for feature in 0..active {
+        auto_features.resize(AUTO_FEATURE_SIZE, 0.0);
+        auto_features.copy_from_slice(&self.auto_feature_bias);
+        for feature in 0..AUTO_FEATURE_SIZE {
             let row = &self.auto_feature_hidden
                 [feature * self.hidden_size..(feature + 1) * self.hidden_size];
             auto_features[feature] += dot_product(hidden, row);
@@ -1321,7 +1317,7 @@ impl AzNnue {
         }
         for (hidden_index, value) in hidden.iter_mut().enumerate() {
             let row = &self.auto_feature_output
-                [hidden_index * AUTO_FEATURE_SIZE..hidden_index * AUTO_FEATURE_SIZE + active];
+                [hidden_index * AUTO_FEATURE_SIZE..(hidden_index + 1) * AUTO_FEATURE_SIZE];
             *value += dot_product(auto_features, row);
         }
         relu_in_place(hidden);
