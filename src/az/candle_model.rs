@@ -2,10 +2,11 @@ use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradSto
 use candle_nn::ops::log_softmax;
 
 use super::{
-    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_SIZE,
-    POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
-    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS,
-    VALUE_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
+    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_HEADS,
+    PIECE_ATTENTION_SIZE, PIECE_ATTENTION_TOTAL_SIZE, POLICY_MOVE_EMBED_SIZE,
+    POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
+    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS, VALUE_HEAD_SIZE,
+    dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
@@ -85,18 +86,25 @@ impl AzCandleModel {
             .broadcast_mul(&batch.feature_mask)?
             .sum(1)?
             .broadcast_add(&self.hidden_bias)?;
-        let attention_scores = feature_embeddings
-            .broadcast_mul(&self.piece_attention_query.reshape((1, 1, hidden_size))?)?
-            .sum(2)?;
+        let attention_scores = feature_embeddings.matmul(&self.piece_attention_query.t()?)?;
         let attention_mask = batch.feature_mask.squeeze(2)?.affine(1.0e9, -1.0e9)?;
-        let attention_weights = log_softmax(&(attention_scores + attention_mask)?, 1)?
-            .exp()?
-            .unsqueeze(2)?;
+        let attention_weights =
+            log_softmax(&(attention_scores + attention_mask.unsqueeze(2)?)?, 1)?
+                .exp()?
+                .unsqueeze(3)?;
         let attention_values = feature_embeddings
             .flatten_to(1)?
             .matmul(&self.piece_attention_value.t()?)?
-            .reshape((bsz, batch.max_features, PIECE_ATTENTION_SIZE))?;
-        let attention_context = attention_values.broadcast_mul(&attention_weights)?.sum(1)?;
+            .reshape((
+                bsz,
+                batch.max_features,
+                PIECE_ATTENTION_HEADS,
+                PIECE_ATTENTION_SIZE,
+            ))?;
+        let attention_context = attention_values
+            .broadcast_mul(&attention_weights)?
+            .sum(1)?
+            .reshape((bsz, PIECE_ATTENTION_TOTAL_SIZE))?;
         let attention_residual = attention_context.matmul(&self.piece_attention_output.t()?)?;
         let sparse_pre = (sparse_pre + attention_residual)?;
         let quadratic = sparse_pre
@@ -282,15 +290,19 @@ impl AzCandleModel {
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
             input_quadratic_scale: var_from_slice(&model.input_quadratic_scale, hidden, device)?,
-            piece_attention_query: var_from_slice(&model.piece_attention_query, hidden, device)?,
+            piece_attention_query: var_from_slice(
+                &model.piece_attention_query,
+                (PIECE_ATTENTION_HEADS, hidden),
+                device,
+            )?,
             piece_attention_value: var_from_slice(
                 &model.piece_attention_value,
-                (PIECE_ATTENTION_SIZE, hidden),
+                (PIECE_ATTENTION_TOTAL_SIZE, hidden),
                 device,
             )?,
             piece_attention_output: var_from_slice(
                 &model.piece_attention_output,
-                (hidden, PIECE_ATTENTION_SIZE),
+                (hidden, PIECE_ATTENTION_TOTAL_SIZE),
                 device,
             )?,
             trunk_residual_hidden: var_from_slice(

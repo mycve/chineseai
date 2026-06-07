@@ -52,7 +52,9 @@ pub(super) const VALUE_HEAD_SIZE: usize = 64;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 pub(super) const AUTO_FEATURE_SIZE: usize = 64;
+const PIECE_ATTENTION_HEADS: usize = 2;
 pub(super) const PIECE_ATTENTION_SIZE: usize = 32;
+const PIECE_ATTENTION_TOTAL_SIZE: usize = PIECE_ATTENTION_HEADS * PIECE_ATTENTION_SIZE;
 pub(super) const TRUNK_LAYERS: usize = 2;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
@@ -164,9 +166,9 @@ macro_rules! az_weight_tensors {
         $visit!(input_king_piece_hidden, [STRUCTURAL_KING_PIECE_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
         $visit!(input_quadratic_scale, [$h]);
-        $visit!(piece_attention_query, [$h]);
-        $visit!(piece_attention_value, [PIECE_ATTENTION_SIZE, $h]);
-        $visit!(piece_attention_output, [$h, PIECE_ATTENTION_SIZE]);
+        $visit!(piece_attention_query, [PIECE_ATTENTION_HEADS, $h]);
+        $visit!(piece_attention_value, [PIECE_ATTENTION_TOTAL_SIZE, $h]);
+        $visit!(piece_attention_output, [$h, PIECE_ATTENTION_TOTAL_SIZE]);
         $visit!(trunk_residual_hidden, [TRUNK_LAYERS, $h, $h]);
         $visit!(trunk_residual_bias, [TRUNK_LAYERS, $h]);
         $visit!(auto_feature_hidden, [AUTO_FEATURE_SIZE, $h]);
@@ -793,15 +795,15 @@ impl AzNnue {
         // initialized as a no-op, then training can open cheap global
         // co-occurrence channels for tactical combinations.
         let input_quadratic_scale = vec![0.0; hidden_size];
-        let piece_attention_query = (0..hidden_size)
+        let piece_attention_query = (0..PIECE_ATTENTION_HEADS * hidden_size)
             .map(|_| rng.weight((1.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
-        let piece_attention_value = (0..PIECE_ATTENTION_SIZE * hidden_size)
+        let piece_attention_value = (0..PIECE_ATTENTION_TOTAL_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
         // Sparse attention starts as an exact residual no-op. Training can then
         // open the output gate without perturbing the first self-play games.
-        let piece_attention_output = vec![0.0; hidden_size * PIECE_ATTENTION_SIZE];
+        let piece_attention_output = vec![0.0; hidden_size * PIECE_ATTENTION_TOTAL_SIZE];
         let trunk_residual_hidden = vec![0.0; TRUNK_LAYERS * hidden_size * hidden_size];
         let trunk_residual_bias = vec![0.0; TRUNK_LAYERS * hidden_size];
         let auto_feature_hidden = (0..AUTO_FEATURE_SIZE * hidden_size)
@@ -1195,45 +1197,56 @@ impl AzNnue {
         let hidden_size = self.hidden_size;
         let mut scores = Vec::with_capacity(features.len());
         let mut values = Vec::with_capacity(features.len() * PIECE_ATTENTION_SIZE);
+        let mut context = vec![0.0; PIECE_ATTENTION_TOTAL_SIZE];
         let mut token = vec![0.0; hidden_size];
-        for &feature in features {
-            if feature >= AZ_NNUE_INPUT_SIZE {
+        for head in 0..PIECE_ATTENTION_HEADS {
+            scores.clear();
+            values.clear();
+            let query_base = head * hidden_size;
+            let value_head_base = head * PIECE_ATTENTION_SIZE;
+            for &feature in features {
+                if feature >= AZ_NNUE_INPUT_SIZE {
+                    continue;
+                }
+                self.sparse_attention_token_into(feature, features, &mut token);
+                scores.push(dot_product(
+                    &token,
+                    &self.piece_attention_query[query_base..query_base + hidden_size],
+                ));
+                for attention_feature in 0..PIECE_ATTENTION_SIZE {
+                    let value_index = value_head_base + attention_feature;
+                    let row = &self.piece_attention_value
+                        [value_index * hidden_size..(value_index + 1) * hidden_size];
+                    values.push(dot_product(&token, row));
+                }
+            }
+            if scores.is_empty() {
                 continue;
             }
-            self.sparse_attention_token_into(feature, features, &mut token);
-            scores.push(dot_product(&token, &self.piece_attention_query));
-            for attention_feature in 0..PIECE_ATTENTION_SIZE {
-                let row = &self.piece_attention_value
-                    [attention_feature * hidden_size..(attention_feature + 1) * hidden_size];
-                values.push(dot_product(&token, row));
+            let max_score = scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, |left, right| left.max(right));
+            let mut weight_sum = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                weight_sum += *score;
             }
-        }
-        if scores.is_empty() {
-            return;
-        }
-        let max_score = scores
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, |left, right| left.max(right));
-        let mut weight_sum = 0.0f32;
-        for score in &mut scores {
-            *score = (*score - max_score).exp();
-            weight_sum += *score;
-        }
-        if !weight_sum.is_finite() || weight_sum <= 0.0 {
-            return;
-        }
-        let mut context = vec![0.0; PIECE_ATTENTION_SIZE];
-        for (token_index, &weight) in scores.iter().enumerate() {
-            let weight = weight / weight_sum;
-            let value_base = token_index * PIECE_ATTENTION_SIZE;
-            for attention_feature in 0..PIECE_ATTENTION_SIZE {
-                context[attention_feature] += weight * values[value_base + attention_feature];
+            if !weight_sum.is_finite() || weight_sum <= 0.0 {
+                continue;
+            }
+            for (token_index, &weight) in scores.iter().enumerate() {
+                let weight = weight / weight_sum;
+                let value_base = token_index * PIECE_ATTENTION_SIZE;
+                for attention_feature in 0..PIECE_ATTENTION_SIZE {
+                    context[value_head_base + attention_feature] +=
+                        weight * values[value_base + attention_feature];
+                }
             }
         }
         for (hidden_index, hidden_value) in hidden.iter_mut().enumerate() {
-            let row = &self.piece_attention_output
-                [hidden_index * PIECE_ATTENTION_SIZE..(hidden_index + 1) * PIECE_ATTENTION_SIZE];
+            let row = &self.piece_attention_output[hidden_index * PIECE_ATTENTION_TOTAL_SIZE
+                ..(hidden_index + 1) * PIECE_ATTENTION_TOTAL_SIZE];
             *hidden_value += dot_product(&context, row);
         }
     }
