@@ -86,7 +86,15 @@ impl AzCandleModel {
             .broadcast_mul(&batch.feature_mask)?
             .sum(1)?
             .broadcast_add(&self.hidden_bias)?;
-        let attention_scores = feature_embeddings.matmul(&self.piece_attention_query.t()?)?;
+        let attention_scores = feature_embeddings
+            .unsqueeze(2)?
+            .broadcast_mul(&self.piece_attention_query.reshape((
+                1,
+                1,
+                PIECE_ATTENTION_HEADS,
+                hidden_size,
+            ))?)?
+            .sum(3)?;
         let attention_mask = batch.feature_mask.squeeze(2)?.affine(1.0e9, -1.0e9)?;
         let attention_weights =
             log_softmax(&(attention_scores + attention_mask.unsqueeze(2)?)?, 1)?
