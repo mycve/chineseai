@@ -968,8 +968,11 @@ impl AzNnue {
         };
         {
             crate::scope_profile!("az.eval.input_embedding");
-            self.input_embedding_into(&features, &mut scratch.hidden);
+            self.input_embedding_linear_into(&features, &mut scratch.hidden);
+            self.add_sparse_attention_into(&features, &mut scratch.hidden);
+            relu_in_place(&mut scratch.hidden);
             self.apply_residual_trunk_layers_into(&mut scratch.hidden, &mut scratch.trunk_work, 1);
+            rms_norm_in_place(&mut scratch.hidden);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -997,8 +1000,11 @@ impl AzNnue {
                 &mut scratch.history_features,
                 &mut scratch.hidden,
             );
+            let features = extract_sparse_features_az_canonical(position, history);
+            self.add_sparse_attention_into(&features, &mut scratch.hidden);
             relu_in_place(&mut scratch.hidden);
             self.apply_residual_trunk_layers_into(&mut scratch.hidden, &mut scratch.trunk_work, 1);
+            rms_norm_in_place(&mut scratch.hidden);
         }
         let value = {
             crate::scope_profile!("az.eval.value_head");
@@ -1138,6 +1144,11 @@ impl AzNnue {
     }
 
     fn input_embedding_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
+        self.input_embedding_linear_into(features, hidden);
+        relu_in_place(hidden);
+    }
+
+    fn input_embedding_linear_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.hidden_bias);
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1153,10 +1164,6 @@ impl AzNnue {
                     );
                 }
                 self.add_factorized_structure_into(features, hidden);
-                // SAFETY: runtime detection above guarantees AVX2 support.
-                unsafe {
-                    relu_in_place_avx2(hidden);
-                }
                 return;
             }
         }
@@ -1168,7 +1175,6 @@ impl AzNnue {
             }
         }
         self.add_factorized_structure_into(features, hidden);
-        relu_in_place(hidden);
     }
 
     #[allow(dead_code)]
