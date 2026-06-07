@@ -51,11 +51,9 @@ pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 64;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
-pub(super) const AUTO_FEATURE_SIZE: usize = 64;
-const PIECE_ATTENTION_HEADS: usize = 2;
+const PIECE_ATTENTION_HEADS: usize = 1;
 pub(super) const PIECE_ATTENTION_SIZE: usize = 32;
 const PIECE_ATTENTION_TOTAL_SIZE: usize = PIECE_ATTENTION_HEADS * PIECE_ATTENTION_SIZE;
-pub(super) const TRUNK_LAYERS: usize = 2;
 const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(super) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
@@ -165,15 +163,9 @@ macro_rules! az_weight_tensors {
         $visit!(input_file_hidden, [STRUCTURAL_FILE_SIZE, $h]);
         $visit!(input_king_piece_hidden, [STRUCTURAL_KING_PIECE_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
-        $visit!(input_quadratic_scale, [$h]);
         $visit!(piece_attention_query, [PIECE_ATTENTION_HEADS, $h]);
         $visit!(piece_attention_value, [PIECE_ATTENTION_TOTAL_SIZE, $h]);
         $visit!(piece_attention_output, [$h, PIECE_ATTENTION_TOTAL_SIZE]);
-        $visit!(trunk_residual_hidden, [TRUNK_LAYERS, $h, $h]);
-        $visit!(trunk_residual_bias, [TRUNK_LAYERS, $h]);
-        $visit!(auto_feature_hidden, [AUTO_FEATURE_SIZE, $h]);
-        $visit!(auto_feature_bias, [AUTO_FEATURE_SIZE]);
-        $visit!(auto_feature_output, [$h, AUTO_FEATURE_SIZE]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [VALUE_HEAD_SIZE]);
@@ -193,6 +185,8 @@ macro_rules! az_weight_tensors {
             policy_move_embedding,
             [DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE]
         );
+        $visit!(policy_from_token_to_hidden, [BOARD_SIZE, $h]);
+        $visit!(policy_to_token_from_hidden, [BOARD_SIZE, $h]);
     };
 }
 
@@ -227,9 +221,6 @@ impl Default for AzNnueArch {
 }
 pub(super) struct AzEvalScratch {
     hidden: Vec<f32>,
-    auto_features: Vec<f32>,
-    #[allow(dead_code)]
-    trunk_work: Vec<f32>,
     #[allow(dead_code)]
     history_features: Vec<usize>,
     value_head: Vec<f32>,
@@ -237,6 +228,7 @@ pub(super) struct AzEvalScratch {
     policy_move_context: Vec<f32>,
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
+    square_tokens: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
 }
@@ -246,14 +238,13 @@ impl AzEvalScratch {
         let hidden_size = arch.hidden_size;
         Self {
             hidden: vec![0.0; hidden_size],
-            auto_features: vec![0.0; AUTO_FEATURE_SIZE],
-            trunk_work: vec![0.0; hidden_size],
             history_features: Vec::with_capacity(16),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             policy_pair_context: vec![0.0; POLICY_PAIR_CONTEXT_SIZE],
             policy_move_context: vec![0.0; POLICY_MOVE_EMBED_SIZE],
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
+            square_tokens: vec![0.0; BOARD_SIZE * hidden_size],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -501,15 +492,9 @@ pub struct AzNnue {
     pub input_file_hidden: Vec<f32>,
     pub input_king_piece_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
-    pub input_quadratic_scale: Vec<f32>,
     pub piece_attention_query: Vec<f32>,
     pub piece_attention_value: Vec<f32>,
     pub piece_attention_output: Vec<f32>,
-    pub trunk_residual_hidden: Vec<f32>,
-    pub trunk_residual_bias: Vec<f32>,
-    pub auto_feature_hidden: Vec<f32>,
-    pub auto_feature_bias: Vec<f32>,
-    pub auto_feature_output: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_output: Vec<f32>,
@@ -523,6 +508,8 @@ pub struct AzNnue {
     pub policy_pair_embedding: Vec<f32>,
     pub policy_move_context_hidden: Vec<f32>,
     pub policy_move_embedding: Vec<f32>,
+    pub policy_from_token_to_hidden: Vec<f32>,
+    pub policy_to_token_from_hidden: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -538,15 +525,9 @@ impl Clone for AzNnue {
             input_file_hidden: self.input_file_hidden.clone(),
             input_king_piece_hidden: self.input_king_piece_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
-            input_quadratic_scale: self.input_quadratic_scale.clone(),
             piece_attention_query: self.piece_attention_query.clone(),
             piece_attention_value: self.piece_attention_value.clone(),
             piece_attention_output: self.piece_attention_output.clone(),
-            trunk_residual_hidden: self.trunk_residual_hidden.clone(),
-            trunk_residual_bias: self.trunk_residual_bias.clone(),
-            auto_feature_hidden: self.auto_feature_hidden.clone(),
-            auto_feature_bias: self.auto_feature_bias.clone(),
-            auto_feature_output: self.auto_feature_output.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_output: self.value_head_output.clone(),
@@ -560,6 +541,8 @@ impl Clone for AzNnue {
             policy_pair_embedding: self.policy_pair_embedding.clone(),
             policy_move_context_hidden: self.policy_move_context_hidden.clone(),
             policy_move_embedding: self.policy_move_embedding.clone(),
+            policy_from_token_to_hidden: self.policy_from_token_to_hidden.clone(),
+            policy_to_token_from_hidden: self.policy_to_token_from_hidden.clone(),
             gpu_trainer: None,
         }
     }
@@ -791,10 +774,6 @@ impl AzNnue {
         let input_file_hidden = vec![0.0; STRUCTURAL_FILE_SIZE * hidden_size];
         let input_king_piece_hidden = vec![0.0; STRUCTURAL_KING_PIECE_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
-        // Learned second-order pooling over the additive sparse trunk. It is
-        // initialized as a no-op, then training can open cheap global
-        // co-occurrence channels for tactical combinations.
-        let input_quadratic_scale = vec![0.0; hidden_size];
         let piece_attention_query = (0..PIECE_ATTENTION_HEADS * hidden_size)
             .map(|_| rng.weight((1.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
@@ -804,16 +783,6 @@ impl AzNnue {
         // Sparse attention starts as an exact residual no-op. Training can then
         // open the output gate without perturbing the first self-play games.
         let piece_attention_output = vec![0.0; hidden_size * PIECE_ATTENTION_TOTAL_SIZE];
-        let trunk_residual_hidden = vec![0.0; TRUNK_LAYERS * hidden_size * hidden_size];
-        let trunk_residual_bias = vec![0.0; TRUNK_LAYERS * hidden_size];
-        let auto_feature_hidden = (0..AUTO_FEATURE_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let auto_feature_bias = vec![0.0; AUTO_FEATURE_SIZE];
-        // Residual output starts at exact zero, so fresh models are behaviorally
-        // identical to the additive sparse trunk until training discovers useful
-        // feature interactions.
-        let auto_feature_output = vec![0.0; hidden_size * AUTO_FEATURE_SIZE];
         // Start value-neutral. A random value head can evaluate startpos as a
         // large red/black advantage before any training, and MCTS amplifies
         // that noise into the first self-play dataset.
@@ -844,6 +813,8 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
         let policy_move_embedding = vec![0.0; DENSE_MOVE_SPACE * POLICY_MOVE_EMBED_SIZE];
+        let policy_from_token_to_hidden = vec![0.0; BOARD_SIZE * hidden_size];
+        let policy_to_token_from_hidden = vec![0.0; BOARD_SIZE * hidden_size];
         Self {
             hidden_size,
             arch,
@@ -853,15 +824,9 @@ impl AzNnue {
             input_file_hidden,
             input_king_piece_hidden,
             hidden_bias,
-            input_quadratic_scale,
             piece_attention_query,
             piece_attention_value,
             piece_attention_output,
-            trunk_residual_hidden,
-            trunk_residual_bias,
-            auto_feature_hidden,
-            auto_feature_bias,
-            auto_feature_output,
             value_head_hidden,
             value_head_bias,
             value_head_output,
@@ -875,6 +840,8 @@ impl AzNnue {
             policy_pair_embedding,
             policy_move_context_hidden,
             policy_move_embedding,
+            policy_from_token_to_hidden,
+            policy_to_token_from_hidden,
             gpu_trainer: None,
         }
     }
@@ -912,15 +879,9 @@ impl AzNnue {
             input_file_hidden: load_candle_f32_tensor(&tensors, "input_file_hidden")?,
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             hidden_bias,
-            input_quadratic_scale: load_candle_f32_tensor(&tensors, "input_quadratic_scale")?,
             piece_attention_query: load_candle_f32_tensor(&tensors, "piece_attention_query")?,
             piece_attention_value: load_candle_f32_tensor(&tensors, "piece_attention_value")?,
             piece_attention_output: load_candle_f32_tensor(&tensors, "piece_attention_output")?,
-            trunk_residual_hidden: load_candle_f32_tensor(&tensors, "trunk_residual_hidden")?,
-            trunk_residual_bias: load_candle_f32_tensor(&tensors, "trunk_residual_bias")?,
-            auto_feature_hidden: load_candle_f32_tensor(&tensors, "auto_feature_hidden")?,
-            auto_feature_bias: load_candle_f32_tensor(&tensors, "auto_feature_bias")?,
-            auto_feature_output: load_candle_f32_tensor(&tensors, "auto_feature_output")?,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
@@ -940,6 +901,14 @@ impl AzNnue {
                 "policy_move_context_hidden",
             )?,
             policy_move_embedding: load_candle_f32_tensor(&tensors, "policy_move_embedding")?,
+            policy_from_token_to_hidden: load_candle_f32_tensor(
+                &tensors,
+                "policy_from_token_to_hidden",
+            )?,
+            policy_to_token_from_hidden: load_candle_f32_tensor(
+                &tensors,
+                "policy_to_token_from_hidden",
+            )?,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -979,7 +948,8 @@ impl AzNnue {
             crate::scope_profile!("az.eval.value_head");
             self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
-        self.evaluate_prepared_hidden_with_scratch(position, value, moves, scratch)
+        self.square_tokens_from_features_into(&features, &mut scratch.square_tokens);
+        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch)
     }
 
     #[allow(dead_code)]
@@ -1006,12 +976,13 @@ impl AzNnue {
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
+        let features = extract_sparse_features_az_canonical(position, history);
         let value = {
             crate::scope_profile!("az.eval.value_head");
-            let features = extract_sparse_features_az_canonical(position, history);
             self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
-        self.evaluate_prepared_hidden_with_scratch(position, value, moves, scratch)
+        self.square_tokens_from_features_into(&features, &mut scratch.square_tokens);
+        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch)
     }
 
     #[allow(dead_code)]
@@ -1031,6 +1002,7 @@ impl AzNnue {
     fn evaluate_prepared_hidden_with_scratch(
         &self,
         position: &Position,
+        features: &[usize],
         value: f32,
         moves: &[Move],
         scratch: &mut AzEvalScratch,
@@ -1092,10 +1064,12 @@ impl AzNnue {
                     &scratch.policy_move_context,
                     &scratch.policy_from_scores,
                     &scratch.policy_to_scores,
+                    &scratch.square_tokens,
                     move_index,
                 );
             }
         }
+        let _ = features;
         value
     }
 
@@ -1143,11 +1117,6 @@ impl AzNnue {
         }
     }
 
-    fn input_embedding_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
-        self.input_embedding_linear_into(features, hidden);
-        relu_in_place(hidden);
-    }
-
     fn input_embedding_linear_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.hidden_bias);
@@ -1178,13 +1147,6 @@ impl AzNnue {
     }
 
     #[allow(dead_code)]
-    fn add_quadratic_trunk_into(&self, hidden: &mut [f32]) {
-        for (value, &scale) in hidden.iter_mut().zip(&self.input_quadratic_scale) {
-            *value += scale * *value * *value;
-        }
-    }
-
-    #[allow(dead_code)]
     fn add_sparse_attention_into(&self, features: &[usize], hidden: &mut [f32]) {
         if features.is_empty()
             || self
@@ -1205,7 +1167,7 @@ impl AzNnue {
             let query_base = head * hidden_size;
             let value_head_base = head * PIECE_ATTENTION_SIZE;
             for &feature in features {
-                if feature >= AZ_NNUE_INPUT_SIZE {
+                if feature >= PIECE_SQUARE_INPUT_SIZE {
                     continue;
                 }
                 self.sparse_attention_token_into(feature, features, &mut token);
@@ -1298,57 +1260,18 @@ impl AzNnue {
         );
     }
 
-    #[allow(dead_code)]
-    fn apply_fast_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
-        relu_in_place(hidden);
-        self.apply_residual_trunk_into(hidden, trunk_work);
-    }
-
-    #[allow(dead_code)]
-    fn apply_residual_trunk_into(&self, hidden: &mut [f32], trunk_work: &mut Vec<f32>) {
-        self.apply_residual_trunk_layers_into(hidden, trunk_work, TRUNK_LAYERS);
-    }
-
-    fn apply_residual_trunk_layers_into(
-        &self,
-        hidden: &mut [f32],
-        trunk_work: &mut Vec<f32>,
-        layers: usize,
-    ) {
-        trunk_work.resize(self.hidden_size, 0.0);
-        for layer in 0..layers.min(TRUNK_LAYERS) {
-            let weight_base = layer * self.hidden_size * self.hidden_size;
-            let bias_base = layer * self.hidden_size;
-            let weights = &self.trunk_residual_hidden
-                [weight_base..weight_base + self.hidden_size * self.hidden_size];
-            let bias = &self.trunk_residual_bias[bias_base..bias_base + self.hidden_size];
-            if weights.iter().all(|&value| value == 0.0) && bias.iter().all(|&value| value == 0.0) {
+    fn square_tokens_from_features_into(&self, features: &[usize], out: &mut Vec<f32>) {
+        out.resize(BOARD_SIZE * self.hidden_size, 0.0);
+        out.fill(0.0);
+        let mut token = vec![0.0; self.hidden_size];
+        for &feature in features {
+            if feature >= PIECE_SQUARE_INPUT_SIZE {
                 continue;
             }
-            for out in 0..self.hidden_size {
-                let row = &weights[out * self.hidden_size..(out + 1) * self.hidden_size];
-                trunk_work[out] = hidden[out] + bias[out] + dot_product(hidden, row);
-            }
-            hidden.copy_from_slice(trunk_work);
-            relu_in_place(hidden);
+            let sq = feature % BOARD_SIZE;
+            self.sparse_attention_token_into(feature, features, &mut token);
+            out[sq * self.hidden_size..(sq + 1) * self.hidden_size].copy_from_slice(&token);
         }
-    }
-
-    fn auto_feature_adapter_into(&self, hidden: &mut [f32], auto_features: &mut Vec<f32>) {
-        auto_features.resize(AUTO_FEATURE_SIZE, 0.0);
-        auto_features.copy_from_slice(&self.auto_feature_bias);
-        for feature in 0..AUTO_FEATURE_SIZE {
-            let row = &self.auto_feature_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            auto_features[feature] += dot_product(hidden, row);
-            auto_features[feature] = auto_features[feature].max(0.0);
-        }
-        for (hidden_index, value) in hidden.iter_mut().enumerate() {
-            let row = &self.auto_feature_output
-                [hidden_index * AUTO_FEATURE_SIZE..(hidden_index + 1) * AUTO_FEATURE_SIZE];
-            *value += dot_product(auto_features, row);
-        }
-        relu_in_place(hidden);
     }
 
     fn value_from_hidden_into(
@@ -1452,6 +1375,7 @@ impl AzNnue {
         policy_move_context: &[f32],
         from_scores: &[f32],
         to_scores: &[f32],
+        square_tokens: &[f32],
         move_index: usize,
     ) -> f32 {
         let sparse = move_map().dense_to_sparse[move_index] as usize;
@@ -1469,6 +1393,16 @@ impl AzNnue {
                 policy_move_context,
                 &self.policy_move_embedding[move_index * POLICY_MOVE_EMBED_SIZE
                     ..(move_index + 1) * POLICY_MOVE_EMBED_SIZE],
+            )
+            + dot_product(
+                &square_tokens[from * self.hidden_size..(from + 1) * self.hidden_size],
+                &self.policy_from_token_to_hidden
+                    [to * self.hidden_size..(to + 1) * self.hidden_size],
+            )
+            + dot_product(
+                &square_tokens[to * self.hidden_size..(to + 1) * self.hidden_size],
+                &self.policy_to_token_from_hidden
+                    [from * self.hidden_size..(from + 1) * self.hidden_size],
             )
     }
 }
@@ -1900,8 +1834,9 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
     let mut value_ce = 0.0f32;
     let mut value_mse = 0.0f32;
     for sample in samples {
-        model.input_embedding_into(&sample.features, &mut scratch.hidden);
-        model.auto_feature_adapter_into(&mut scratch.hidden, &mut scratch.auto_features);
+        model.input_embedding_linear_into(&sample.features, &mut scratch.hidden);
+        model.add_sparse_attention_into(&sample.features, &mut scratch.hidden);
+        relu_in_place(&mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
         let value_pred = model.value_from_hidden_into(
             &scratch.hidden,
@@ -1945,12 +1880,14 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
             &mut scratch.policy_from_scores,
             &mut scratch.policy_to_scores,
         );
+        model.square_tokens_from_features_into(&sample.features, &mut scratch.square_tokens);
         for (index, &move_index) in sample.move_indices.iter().enumerate() {
             scratch.logits[index] = model.policy_logit_from_hidden_index(
                 &scratch.policy_pair_context,
                 &scratch.policy_move_context,
                 &scratch.policy_from_scores,
                 &scratch.policy_to_scores,
+                &scratch.square_tokens,
                 move_index,
             );
         }
@@ -2427,6 +2364,37 @@ pub(super) fn policy_move_to_features() -> &'static [f32] {
     })
 }
 
+#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
+pub(super) fn policy_move_sparse_indices() -> &'static [u32] {
+    use std::sync::OnceLock;
+    static INDICES: OnceLock<Vec<u32>> = OnceLock::new();
+    INDICES.get_or_init(|| {
+        move_map()
+            .dense_to_sparse
+            .iter()
+            .map(|&sparse| sparse as u32)
+            .collect()
+    })
+}
+
+#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
+pub(super) fn policy_move_transposed_sparse_indices() -> &'static [u32] {
+    use std::sync::OnceLock;
+    static INDICES: OnceLock<Vec<u32>> = OnceLock::new();
+    INDICES.get_or_init(|| {
+        move_map()
+            .dense_to_sparse
+            .iter()
+            .map(|&sparse| {
+                let sparse = sparse as usize;
+                let from = sparse / BOARD_SIZE;
+                let to = sparse % BOARD_SIZE;
+                (to * BOARD_SIZE + from) as u32
+            })
+            .collect()
+    })
+}
+
 fn dense_move_index(mv: Move) -> usize {
     let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
     let dense = move_map().sparse_to_dense[sparse];
@@ -2782,7 +2750,6 @@ mod tests {
         model.hidden_bias.fill(0.1);
         let before_input = model.input_hidden.clone();
         let before_bias = model.hidden_bias.clone();
-        let before_quadratic = model.input_quadratic_scale.clone();
 
         let mut rng = SplitMix64::new(32);
         let weights = AzTrainLossWeights {
@@ -2799,12 +2766,8 @@ mod tests {
             .iter()
             .zip(&model.hidden_bias)
             .any(|(left, right)| (*left - *right).abs() > 1e-7);
-        let quadratic_changed = before_quadratic
-            .iter()
-            .zip(&model.input_quadratic_scale)
-            .any(|(left, right)| (*left - *right).abs() > 1e-7);
         assert!(
-            input_changed || bias_changed || quadratic_changed,
+            input_changed || bias_changed,
             "value-only training should update trunk"
         );
     }
@@ -2827,15 +2790,9 @@ mod tests {
             loaded.input_king_piece_hidden
         );
         assert_eq!(model.hidden_bias, loaded.hidden_bias);
-        assert_eq!(model.input_quadratic_scale, loaded.input_quadratic_scale);
         assert_eq!(model.piece_attention_query, loaded.piece_attention_query);
         assert_eq!(model.piece_attention_value, loaded.piece_attention_value);
         assert_eq!(model.piece_attention_output, loaded.piece_attention_output);
-        assert_eq!(model.trunk_residual_hidden, loaded.trunk_residual_hidden);
-        assert_eq!(model.trunk_residual_bias, loaded.trunk_residual_bias);
-        assert_eq!(model.auto_feature_hidden, loaded.auto_feature_hidden);
-        assert_eq!(model.auto_feature_bias, loaded.auto_feature_bias);
-        assert_eq!(model.auto_feature_output, loaded.auto_feature_output);
         assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
         assert_eq!(model.value_head_bias, loaded.value_head_bias);
         assert_eq!(model.value_head_output, loaded.value_head_output);
@@ -2858,6 +2815,14 @@ mod tests {
             loaded.policy_move_context_hidden
         );
         assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
+        assert_eq!(
+            model.policy_from_token_to_hidden,
+            loaded.policy_from_token_to_hidden
+        );
+        assert_eq!(
+            model.policy_to_token_from_hidden,
+            loaded.policy_to_token_from_hidden
+        );
     }
 
     #[test]

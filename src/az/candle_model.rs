@@ -2,11 +2,11 @@ use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradSto
 use candle_nn::ops::log_softmax;
 
 use super::{
-    AUTO_FEATURE_SIZE, AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_HEADS,
-    PIECE_ATTENTION_SIZE, PIECE_ATTENTION_TOTAL_SIZE, POLICY_MOVE_EMBED_SIZE,
-    POLICY_PAIR_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
-    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, TRUNK_LAYERS, VALUE_HEAD_SIZE,
-    dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_HEADS, PIECE_ATTENTION_SIZE,
+    PIECE_ATTENTION_TOTAL_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
+    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
+    VALUE_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features,
+    policy_move_sparse_indices, policy_move_to_features, policy_move_transposed_sparse_indices,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
@@ -22,15 +22,9 @@ pub(super) struct AzCandleModel {
     input_file_hidden: Var,
     input_king_piece_hidden: Var,
     hidden_bias: Var,
-    input_quadratic_scale: Var,
     piece_attention_query: Var,
     piece_attention_value: Var,
     piece_attention_output: Var,
-    trunk_residual_hidden: Var,
-    trunk_residual_bias: Var,
-    auto_feature_hidden: Var,
-    auto_feature_bias: Var,
-    auto_feature_output: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_output: Var,
@@ -44,8 +38,12 @@ pub(super) struct AzCandleModel {
     policy_pair_embedding: Var,
     policy_move_context_hidden: Var,
     policy_move_embedding: Var,
+    policy_from_token_to_hidden: Var,
+    policy_to_token_from_hidden: Var,
     policy_move_from_features: Tensor,
     policy_move_to_features: Tensor,
+    policy_move_sparse_indices: Tensor,
+    policy_move_transposed_sparse_indices: Tensor,
 }
 
 impl AzCandleModel {
@@ -82,6 +80,11 @@ impl AzCandleModel {
         let structural_embeddings = (structural_embeddings + structural_them_king_piece)?;
         let structural_embeddings = structural_embeddings.broadcast_mul(&batch.structural_mask)?;
         let feature_embeddings = (feature_embeddings + structural_embeddings)?;
+        let square_tokens = feature_embeddings
+            .flatten_to(1)?
+            .index_select(&batch.square_token_feature_indices.flatten_all()?, 0)?
+            .reshape((bsz, BOARD_SIZE, hidden_size))?
+            .broadcast_mul(&batch.square_token_mask)?;
         let sparse_pre = feature_embeddings
             .broadcast_mul(&batch.feature_mask)?
             .sum(1)?
@@ -95,7 +98,7 @@ impl AzCandleModel {
                 hidden_size,
             ))?)?
             .sum(3)?;
-        let attention_mask = batch.feature_mask.squeeze(2)?.affine(1.0e9, -1.0e9)?;
+        let attention_mask = batch.structural_mask.squeeze(2)?.affine(1.0e9, -1.0e9)?;
         let attention_scores = attention_scores.broadcast_add(&attention_mask.unsqueeze(2)?)?;
         let attention_weights = log_softmax(&attention_scores, 1)?.exp()?.unsqueeze(3)?;
         let attention_values = feature_embeddings
@@ -113,22 +116,7 @@ impl AzCandleModel {
             .reshape((bsz, PIECE_ATTENTION_TOTAL_SIZE))?;
         let attention_residual = attention_context.matmul(&self.piece_attention_output.t()?)?;
         let sparse_pre = (sparse_pre + attention_residual)?;
-        let quadratic = sparse_pre
-            .sqr()?
-            .broadcast_mul(&self.input_quadratic_scale.reshape((1, hidden_size))?)?;
-        let mut sparse_hidden = (sparse_pre + quadratic)?.relu()?;
-        for layer in 0..TRUNK_LAYERS {
-            let weights = self.trunk_residual_hidden.narrow(0, layer, 1)?.squeeze(0)?;
-            let bias = self.trunk_residual_bias.narrow(0, layer, 1)?.squeeze(0)?;
-            let residual = sparse_hidden.matmul(&weights.t()?)?.broadcast_add(&bias)?;
-            sparse_hidden = (sparse_hidden + residual)?.relu()?;
-        }
-        let auto_features = sparse_hidden
-            .matmul(&self.auto_feature_hidden.t()?)?
-            .broadcast_add(&self.auto_feature_bias)?
-            .relu()?;
-        let auto_residual = auto_features.matmul(&self.auto_feature_output.t()?)?;
-        let sparse_hidden = (sparse_hidden + auto_residual)?.relu()?;
+        let sparse_hidden = sparse_pre.relu()?;
         let rms = sparse_hidden
             .sqr()?
             .mean_keepdim(1)?
@@ -158,8 +146,21 @@ impl AzCandleModel {
         let policy_pair_logits = policy_pair_context.matmul(&self.policy_pair_embedding.t()?)?;
         let policy_move_context = hidden.matmul(&self.policy_move_context_hidden.t()?)?;
         let policy_move_logits = policy_move_context.matmul(&self.policy_move_embedding.t()?)?;
-        let policy_logits = ((((policy_from_logits + policy_to_logits)? + policy_pair_logits)?
+        let token_from_to_logits = square_tokens
+            .flatten_to(1)?
+            .matmul(&self.policy_from_token_to_hidden.t()?)?
+            .reshape((bsz, BOARD_SIZE * BOARD_SIZE))?
+            .index_select(&self.policy_move_sparse_indices, 1)?;
+        let token_to_from_logits = square_tokens
+            .flatten_to(1)?
+            .matmul(&self.policy_to_token_from_hidden.t()?)?
+            .reshape((bsz, BOARD_SIZE * BOARD_SIZE))?
+            .index_select(&self.policy_move_transposed_sparse_indices, 1)?;
+        let policy_logits = ((((((policy_from_logits + policy_to_logits)?
+            + policy_pair_logits)?
             + policy_move_logits)?
+            + token_from_to_logits)?
+            + token_to_from_logits)?
             .broadcast_add(&policy_bias))?;
 
         Ok(ForwardOutput {
@@ -187,6 +188,8 @@ pub(super) struct BatchTensors {
     pub(super) structural_us_king_piece_indices: Tensor,
     pub(super) structural_them_king_piece_indices: Tensor,
     pub(super) structural_mask: Tensor,
+    pub(super) square_token_feature_indices: Tensor,
+    pub(super) square_token_mask: Tensor,
     pub(super) policy_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
@@ -242,6 +245,16 @@ impl BatchTensors {
                 (batch_size, max_features, 1),
                 device,
             )?,
+            square_token_feature_indices: Tensor::from_vec(
+                packed.square_token_feature_indices,
+                (batch_size, BOARD_SIZE),
+                device,
+            )?,
+            square_token_mask: Tensor::from_vec(
+                packed.square_token_mask,
+                (batch_size, BOARD_SIZE, 1),
+                device,
+            )?,
             policy_indices: Tensor::from_vec(
                 packed.policy_indices,
                 (batch_size, max_policy_moves),
@@ -295,7 +308,6 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            input_quadratic_scale: var_from_slice(&model.input_quadratic_scale, hidden, device)?,
             piece_attention_query: var_from_slice(
                 &model.piece_attention_query,
                 (PIECE_ATTENTION_HEADS, hidden),
@@ -309,27 +321,6 @@ impl AzCandleModel {
             piece_attention_output: var_from_slice(
                 &model.piece_attention_output,
                 (hidden, PIECE_ATTENTION_TOTAL_SIZE),
-                device,
-            )?,
-            trunk_residual_hidden: var_from_slice(
-                &model.trunk_residual_hidden,
-                (TRUNK_LAYERS, hidden, hidden),
-                device,
-            )?,
-            trunk_residual_bias: var_from_slice(
-                &model.trunk_residual_bias,
-                (TRUNK_LAYERS, hidden),
-                device,
-            )?,
-            auto_feature_hidden: var_from_slice(
-                &model.auto_feature_hidden,
-                (AUTO_FEATURE_SIZE, hidden),
-                device,
-            )?,
-            auto_feature_bias: var_from_slice(&model.auto_feature_bias, AUTO_FEATURE_SIZE, device)?,
-            auto_feature_output: var_from_slice(
-                &model.auto_feature_output,
-                (hidden, AUTO_FEATURE_SIZE),
                 device,
             )?,
             value_head_hidden: var_from_slice(
@@ -377,6 +368,16 @@ impl AzCandleModel {
                 (DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE),
                 device,
             )?,
+            policy_from_token_to_hidden: var_from_slice(
+                &model.policy_from_token_to_hidden,
+                (BOARD_SIZE, hidden),
+                device,
+            )?,
+            policy_to_token_from_hidden: var_from_slice(
+                &model.policy_to_token_from_hidden,
+                (BOARD_SIZE, hidden),
+                device,
+            )?,
             policy_move_from_features: Tensor::from_vec(
                 policy_move_from_features().to_vec(),
                 (DENSE_MOVE_SPACE, BOARD_SIZE),
@@ -385,6 +386,16 @@ impl AzCandleModel {
             policy_move_to_features: Tensor::from_vec(
                 policy_move_to_features().to_vec(),
                 (DENSE_MOVE_SPACE, BOARD_SIZE),
+                device,
+            )?,
+            policy_move_sparse_indices: Tensor::from_vec(
+                policy_move_sparse_indices().to_vec(),
+                DENSE_MOVE_SPACE,
+                device,
+            )?,
+            policy_move_transposed_sparse_indices: Tensor::from_vec(
+                policy_move_transposed_sparse_indices().to_vec(),
+                DENSE_MOVE_SPACE,
                 device,
             )?,
         })
@@ -398,15 +409,9 @@ impl AzCandleModel {
         vars.push(self.input_file_hidden.clone());
         vars.push(self.input_king_piece_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.input_quadratic_scale.clone());
         vars.push(self.piece_attention_query.clone());
         vars.push(self.piece_attention_value.clone());
         vars.push(self.piece_attention_output.clone());
-        vars.push(self.trunk_residual_hidden.clone());
-        vars.push(self.trunk_residual_bias.clone());
-        vars.push(self.auto_feature_hidden.clone());
-        vars.push(self.auto_feature_bias.clone());
-        vars.push(self.auto_feature_output.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_output.clone());
@@ -420,6 +425,8 @@ impl AzCandleModel {
         vars.push(self.policy_pair_embedding.clone());
         vars.push(self.policy_move_context_hidden.clone());
         vars.push(self.policy_move_embedding.clone());
+        vars.push(self.policy_from_token_to_hidden.clone());
+        vars.push(self.policy_to_token_from_hidden.clone());
         vars
     }
 
@@ -434,10 +441,6 @@ impl AzCandleModel {
         )?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(
-            &self.input_quadratic_scale,
-            &mut model.input_quadratic_scale,
-        )?;
-        copy_var(
             &self.piece_attention_query,
             &mut model.piece_attention_query,
         )?;
@@ -449,14 +452,6 @@ impl AzCandleModel {
             &self.piece_attention_output,
             &mut model.piece_attention_output,
         )?;
-        copy_var(
-            &self.trunk_residual_hidden,
-            &mut model.trunk_residual_hidden,
-        )?;
-        copy_var(&self.trunk_residual_bias, &mut model.trunk_residual_bias)?;
-        copy_var(&self.auto_feature_hidden, &mut model.auto_feature_hidden)?;
-        copy_var(&self.auto_feature_bias, &mut model.auto_feature_bias)?;
-        copy_var(&self.auto_feature_output, &mut model.auto_feature_output)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
@@ -484,6 +479,14 @@ impl AzCandleModel {
         copy_var(
             &self.policy_move_embedding,
             &mut model.policy_move_embedding,
+        )?;
+        copy_var(
+            &self.policy_from_token_to_hidden,
+            &mut model.policy_from_token_to_hidden,
+        )?;
+        copy_var(
+            &self.policy_to_token_from_hidden,
+            &mut model.policy_to_token_from_hidden,
         )?;
         model.refresh_policy_derived_caches();
         Ok(())

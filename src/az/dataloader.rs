@@ -6,6 +6,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::xiangqi::{BOARD_FILES, BOARD_SIZE};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, canonical_general_buckets_from_features,
@@ -106,6 +107,8 @@ pub(super) struct PackedBatch {
     pub structural_us_king_piece_indices: Vec<u32>,
     pub structural_them_king_piece_indices: Vec<u32>,
     pub structural_mask: Vec<f32>,
+    pub square_token_feature_indices: Vec<u32>,
+    pub square_token_mask: Vec<f32>,
     pub policy_indices: Vec<u32>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
@@ -147,6 +150,8 @@ impl PackedBatch {
             structural_us_king_piece_indices: vec![0u32; batch_size * max_features],
             structural_them_king_piece_indices: vec![0u32; batch_size * max_features],
             structural_mask: vec![0.0f32; batch_size * max_features],
+            square_token_feature_indices: vec![0u32; batch_size * BOARD_SIZE],
+            square_token_mask: vec![0.0f32; batch_size * BOARD_SIZE],
             policy_indices: vec![0u32; batch_size * max_policy_moves],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
@@ -184,6 +189,10 @@ impl PackedBatch {
                 self.structural_them_king_piece_indices[batch_feature_index] =
                     structural_king_piece_index(1, them_king_bucket, structural.piece_index) as u32;
                 self.structural_mask[batch_feature_index] = 1.0;
+                let sq = structural.rank * BOARD_FILES + structural.file;
+                self.square_token_feature_indices[row * BOARD_SIZE + sq] =
+                    batch_feature_index as u32;
+                self.square_token_mask[row * BOARD_SIZE + sq] = 1.0;
             }
         }
     }
