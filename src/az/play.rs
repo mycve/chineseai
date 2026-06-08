@@ -297,6 +297,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
+            let use_root_noise = ply < config.root_exploration_plies;
             let search = alphazero_search_with_history_and_rules(
                 &position,
                 &history,
@@ -308,8 +309,16 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
                     cpuct: config.cpuct,
                     max_depth: 0,
-                    root_dirichlet_alpha: config.root_dirichlet_alpha,
-                    root_exploration_fraction: config.root_exploration_fraction,
+                    root_dirichlet_alpha: if use_root_noise {
+                        config.root_dirichlet_alpha
+                    } else {
+                        0.0
+                    },
+                    root_exploration_fraction: if use_root_noise {
+                        config.root_exploration_fraction
+                    } else {
+                        0.0
+                    },
                     algorithm: config.search_algorithm,
                     gumbel: config.gumbel,
                     value_scale: 1.0,

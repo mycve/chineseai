@@ -562,6 +562,7 @@ pub struct AzLoopConfig {
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub root_exploration_plies: usize,
     pub gumbel: AzGumbelConfig,
     pub mirror_probability: f32,
     pub value_td_lambda: f32,

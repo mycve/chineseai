@@ -25,6 +25,7 @@ pub struct AzLoopFileConfig {
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub root_exploration_plies: usize,
     pub gumbel: AzGumbelConfig,
     pub replay_capacity: usize,
     pub train_warmup_samples: usize,
@@ -80,6 +81,7 @@ impl Default for AzLoopFileConfig {
             cpuct: 1.5,
             root_dirichlet_alpha: 0.3,
             root_exploration_fraction: 0.25,
+            root_exploration_plies: 80,
             gumbel: AzGumbelConfig {
                 gumbel_scale: 1.0,
                 value_scale: 0.1,
@@ -138,6 +140,7 @@ struct AzLoopTomlConfig {
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub root_exploration_plies: usize,
     gumbel_max_num_considered_actions: usize,
     gumbel_scale: f32,
     gumbel_value_scale: f32,
@@ -200,6 +203,7 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             cpuct: config.cpuct,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
+            root_exploration_plies: config.root_exploration_plies,
             gumbel_max_num_considered_actions: config.gumbel.max_num_considered_actions,
             gumbel_scale: config.gumbel.gumbel_scale,
             gumbel_value_scale: config.gumbel.value_scale,
@@ -260,6 +264,7 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             cpuct: config.cpuct,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
+            root_exploration_plies: config.root_exploration_plies,
             gumbel: AzGumbelConfig {
                 max_num_considered_actions: config.gumbel_max_num_considered_actions,
                 gumbel_scale: config.gumbel_scale,
@@ -348,6 +353,7 @@ impl AzLoopFileConfig {
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
         );
+        line!("root_exploration_plies", self.root_exploration_plies);
         line!(
             "gumbel_max_num_considered_actions",
             self.gumbel.max_num_considered_actions
@@ -428,6 +434,7 @@ impl AzLoopFileConfig {
         self.cpuct = self.cpuct.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.root_exploration_plies = self.root_exploration_plies.min(self.max_plies);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);

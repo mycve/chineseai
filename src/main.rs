@@ -1134,6 +1134,7 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         cpuct: config.cpuct,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
+        root_exploration_plies: config.root_exploration_plies,
         gumbel: config.gumbel,
         mirror_probability: config.mirror_probability,
         value_td_lambda: config.value_td_lambda,
@@ -1976,6 +1977,7 @@ fn main() {
                     cpuct: cmd.cpuct,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
+                    root_exploration_plies: cmd.temperature_decay_plies,
                     gumbel,
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
@@ -2189,6 +2191,7 @@ fn main() {
                     cpuct: cmd.cpuct,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
+                    root_exploration_plies: cmd.temperature_decay_plies,
                     gumbel,
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
@@ -2500,7 +2503,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} root_noise(alpha={},fraction={},plies={}) gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -2522,6 +2525,9 @@ fn main() {
                 config.temperature_end,
                 config.temperature_decay_plies,
                 config.cpuct,
+                config.root_dirichlet_alpha,
+                config.root_exploration_fraction,
+                config.root_exploration_plies,
                 config.gumbel.max_num_considered_actions,
                 config.gumbel.gumbel_scale,
                 config.gumbel.value_scale,
