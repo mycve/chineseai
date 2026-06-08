@@ -42,6 +42,7 @@ pub struct AzLoopFileConfig {
     pub arena_games_per_side: usize,
     pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
+    pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
     pub arena_pikafish_exe: String,
     pub arena_pikafish_start_update: usize,
@@ -101,7 +102,8 @@ impl Default for AzLoopFileConfig {
             arena_interval: 10,
             arena_games_per_side: 100,
             arena_cpuct: 1.5,
-            arena_promotion_rate: 0.60,
+            arena_promotion_rate: 0.50,
+            arena_promotion_confidence_z: 1.28,
             arena_processes: 100,
             arena_pikafish_exe: String::new(),
             arena_pikafish_start_update: 1,
@@ -160,6 +162,7 @@ struct AzLoopTomlConfig {
     pub arena_games_per_side: usize,
     pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
+    pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
     pub arena_pikafish_exe: String,
     pub arena_pikafish_start_update: usize,
@@ -222,6 +225,7 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             arena_games_per_side: config.arena_games_per_side,
             arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
+            arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
             arena_pikafish_exe: config.arena_pikafish_exe.clone(),
             arena_pikafish_start_update: config.arena_pikafish_start_update,
@@ -284,6 +288,7 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             arena_games_per_side: config.arena_games_per_side,
             arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
+            arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
             arena_pikafish_exe: config.arena_pikafish_exe,
             arena_pikafish_start_update: config.arena_pikafish_start_update,
@@ -306,11 +311,7 @@ impl AzLoopFileConfig {
             if value == 0.0 {
                 return "0.0".into();
             }
-            let precision = if value.abs() < 0.0001 { 10 } else { 8 };
-            let out = format!("{value:.precision$}")
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string();
+            let out = value.to_string();
             if out == "-0" {
                 return "0.0".into();
             }
@@ -377,6 +378,10 @@ impl AzLoopFileConfig {
         line!("arena_games_per_side", self.arena_games_per_side);
         line!("arena_cpuct", f(self.arena_cpuct));
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
+        line!(
+            "arena_promotion_confidence_z",
+            f(self.arena_promotion_confidence_z)
+        );
         line!("arena_processes", self.arena_processes);
         line!("arena_pikafish_exe", q(&self.arena_pikafish_exe));
         line!(
@@ -445,6 +450,7 @@ impl AzLoopFileConfig {
         self.arena_games_per_side = self.arena_games_per_side.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
+        self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_pikafish_start_update = self.arena_pikafish_start_update.max(1);
         self.arena_pikafish_depth = self.arena_pikafish_depth.max(1);
         self.arena_pikafish_games = self.arena_pikafish_games.max(1);

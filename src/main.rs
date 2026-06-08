@@ -2493,7 +2493,7 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_promotion_rate={} arena_processes={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_games_per_side={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
                 config_path,
                 config.search_algorithm.as_str(),
                 config.simulations,
@@ -2532,6 +2532,7 @@ fn main() {
                 config.arena_games_per_side,
                 config.arena_cpuct,
                 config.arena_promotion_rate,
+                config.arena_promotion_confidence_z,
                 config.arena_processes,
                 config.arena_pikafish_exe,
                 config.arena_pikafish_start_update,
@@ -3362,7 +3363,7 @@ fn main() {
                         let _ = fs::remove_file(&candidate_path);
                     } else {
                         let arena_eval_positions =
-                            load_arena_eval_positions(DEFAULT_ARENA_EVAL_FENS);
+                            load_arena_eval_positions(&config.arena_pikafish_eval_fens);
                         let arena_eval_fens = arena_eval_positions.len();
                         let candidate = Arc::new(candidate_model.clone());
                         let baseline = Arc::new(arena_reference_model.clone());
@@ -3380,7 +3381,13 @@ fn main() {
                         let ref_elo = arena_best_elo;
                         let candidate_elo = arena.anchored_elo(ref_elo);
                         let elo_diff = arena.elo_diff_vs_even();
-                        let promoted = arena.score_rate() >= config.arena_promotion_rate;
+                        let arena_se = arena.score_rate_standard_error();
+                        let arena_lcb =
+                            arena.score_rate_lower_bound(config.arena_promotion_confidence_z);
+                        let promoted = arena.promotes_with_lower_bound(
+                            config.arena_promotion_rate,
+                            config.arena_promotion_confidence_z,
+                        );
                         if promoted {
                             arena_reference_model = candidate_model.clone();
                             {
@@ -3394,7 +3401,7 @@ fn main() {
                             arena_best_elo = candidate_elo;
                         }
                         println!(
-                            "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} promote_at={:.3} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
+                            "arena {update:04}: total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} se={:.3} lcb={:.3} promote_at={:.3} z={:.2} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
                             arena.total_games(),
                             arena_eval_fens,
                             arena.wins,
@@ -3406,7 +3413,10 @@ fn main() {
                             arena.losses_as_black,
                             arena.score(),
                             arena.score_rate(),
+                            arena_se,
+                            arena_lcb,
                             config.arena_promotion_rate,
+                            config.arena_promotion_confidence_z,
                             ref_elo,
                             candidate_elo,
                             elo_diff,
@@ -3421,6 +3431,8 @@ fn main() {
                         log_scalar(&mut tb, "arena/draws", update, arena.draws as f32);
                         log_scalar(&mut tb, "arena/score", update, arena.score());
                         log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
+                        log_scalar(&mut tb, "arena/score_rate_se", update, arena_se);
+                        log_scalar(&mut tb, "arena/score_rate_lcb", update, arena_lcb);
                         log_scalar(&mut tb, "arena/ref_elo", update, ref_elo);
                         log_scalar(&mut tb, "arena/elo", update, candidate_elo);
                         log_scalar(&mut tb, "arena/elo_diff", update, elo_diff);
