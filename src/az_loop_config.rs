@@ -39,7 +39,6 @@ pub struct AzLoopFileConfig {
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
     pub arena_interval: usize,
-    pub arena_games_per_side: usize,
     pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
@@ -100,7 +99,6 @@ impl Default for AzLoopFileConfig {
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
             arena_interval: 10,
-            arena_games_per_side: 100,
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
@@ -159,7 +157,6 @@ struct AzLoopTomlConfig {
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
     pub arena_interval: usize,
-    pub arena_games_per_side: usize,
     pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
@@ -222,7 +219,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             checkpoint_dir: config.checkpoint_dir.clone(),
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
-            arena_games_per_side: config.arena_games_per_side,
             arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
@@ -285,7 +281,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             checkpoint_dir: config.checkpoint_dir,
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
-            arena_games_per_side: config.arena_games_per_side,
             arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
@@ -375,7 +370,6 @@ impl AzLoopFileConfig {
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
         line!("arena_interval", self.arena_interval);
-        line!("arena_games_per_side", self.arena_games_per_side);
         line!("arena_cpuct", f(self.arena_cpuct));
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
         line!(
@@ -447,7 +441,6 @@ impl AzLoopFileConfig {
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
-        self.arena_games_per_side = self.arena_games_per_side.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);

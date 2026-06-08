@@ -646,6 +646,7 @@ pub struct AzArenaConfig {
     pub max_plies: usize,
     pub games_as_red: usize,
     pub games_as_black: usize,
+    pub start_index: usize,
     pub seed: u64,
     pub cpuct: f32,
 }
@@ -659,7 +660,7 @@ pub fn play_arena_games_from_positions(
     let mut report = AzArenaReport::default();
     let mut game_seed = config.seed;
     for game_index in 0..config.games_as_red {
-        let position = arena_start_position(positions, config.seed, game_index);
+        let position = arena_start_position(positions, config.start_index + game_index);
         let outcome = play_arena_game(
             &position,
             candidate,
@@ -683,7 +684,7 @@ pub fn play_arena_games_from_positions(
         game_seed = game_seed.wrapping_add(1);
     }
     for game_index in 0..config.games_as_black {
-        let position = arena_start_position(positions, config.seed, game_index);
+        let position = arena_start_position(positions, config.start_index + game_index);
         let outcome = play_arena_game(
             &position,
             baseline,
@@ -709,13 +710,11 @@ pub fn play_arena_games_from_positions(
     report
 }
 
-fn arena_start_position(positions: &[Position], seed: u64, game_index: usize) -> Position {
+fn arena_start_position(positions: &[Position], game_index: usize) -> Position {
     if positions.is_empty() {
         Position::startpos()
     } else {
-        let mut rng =
-            SplitMix64::new(seed ^ (game_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
-        let index = (rng.next_u64() as usize) % positions.len();
+        let index = game_index % positions.len();
         positions[index].clone()
     }
 }
