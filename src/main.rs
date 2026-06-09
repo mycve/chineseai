@@ -117,20 +117,41 @@ impl AzInitArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-search model.safetensors
-  chineseai az-search model.safetensors 10000 1.5 startpos
-  chineseai az-search model.safetensors 10000 1.5 startpos")]
+  chineseai az-search model.safetensors 50000 0.65 --cpuct-at-root 2.53 startpos
+  chineseai az-search model.safetensors 10000 0.65 --cpuct-at-root 2.53 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
     /// Number of MCTS simulations.
     #[arg(default_value_t = 10_000)]
     simulations: usize,
-    /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.5)]
+    /// Non-root PUCT init.
+    #[arg(default_value_t = 0.65)]
     cpuct: f32,
+    /// Root PUCT init.
+    #[arg(long, default_value_t = 2.53)]
+    cpuct_at_root: f32,
+    /// Dynamic PUCT base.
+    #[arg(long, default_value_t = 19652.0)]
+    cpuct_base: f32,
+    /// Dynamic PUCT growth factor.
+    #[arg(long, default_value_t = 2.0)]
+    cpuct_factor: f32,
+    /// Root dynamic PUCT base.
+    #[arg(long, default_value_t = 19652.0)]
+    cpuct_base_at_root: f32,
+    /// Root dynamic PUCT growth factor.
+    #[arg(long, default_value_t = 2.0)]
+    cpuct_factor_at_root: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
+    /// Draw value in Q = W - L + draw_score * D.
+    #[arg(long, default_value_t = 0.0)]
+    draw_score: f32,
+    /// Enable moves-left utility.
+    #[arg(long, default_value_t = true)]
+    moves_left_utility: bool,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -1432,6 +1453,7 @@ fn main() {
             let model_path = cmd.model;
             let simulations = cmd.simulations.max(1);
             let cpuct = cmd.cpuct.max(0.0);
+            let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -1440,13 +1462,38 @@ fn main() {
             let result = alphazero_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, cmd.max_depth),
+                AzSearchLimits {
+                    simulations,
+                    seed: 0,
+                    cpuct,
+                    cpuct_at_root,
+                    cpuct_base: cmd.cpuct_base.max(1.0),
+                    cpuct_factor: cmd.cpuct_factor.max(0.0),
+                    cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
+                    cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
+                    max_depth: cmd.max_depth,
+                    root_dirichlet_alpha: 0.0,
+                    root_exploration_fraction: 0.0,
+                    fpu_value: 0.23,
+                    fpu_value_at_root: 1.0,
+                    draw_score: cmd.draw_score.clamp(-1.0, 1.0),
+                    moves_left_max_effect: if cmd.moves_left_utility { 0.3 } else { 0.0 },
+                    moves_left_slope: if cmd.moves_left_utility { 0.007 } else { 0.0 },
+                    moves_left_threshold: 0.8,
+                    moves_left_constant_factor: 0.0,
+                    moves_left_scaled_factor: if cmd.moves_left_utility { 0.15 } else { 0.0 },
+                    moves_left_quadratic_factor: if cmd.moves_left_utility { 0.85 } else { 0.0 },
+                    value_scale: 1.0,
+                },
             );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
             println!("search   : alphazero");
             println!("cpuct    : {cpuct}");
+            println!("cpuct_at_root: {cpuct_at_root}");
+            println!("draw_score: {}", cmd.draw_score);
+            println!("moves_left_utility: {}", cmd.moves_left_utility);
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
