@@ -615,7 +615,7 @@ fn rescore_early_optimistic_samples(
     config: &AzLoopConfig,
     seed: u64,
 ) {
-    if samples.is_empty() || game_result_red > 0.0 {
+    if samples.is_empty() {
         return;
     }
     let simulations = config
@@ -630,6 +630,9 @@ fn rescore_early_optimistic_samples(
             break;
         }
         if sample.value <= EARLY_OPTIMISM_RESCORER_Q {
+            continue;
+        }
+        if game_result_red * sample.side_sign > 0.0 {
             continue;
         }
         let search = alphazero_search_with_history_and_rules(
