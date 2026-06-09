@@ -11,7 +11,6 @@ mod alphazero;
 ))]
 mod candle_model;
 mod dataloader;
-mod mctx;
 mod play;
 mod replay;
 mod train;
@@ -33,10 +32,9 @@ use crate::nnue::{
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position};
 
 pub use alphazero::{
-    AzCandidate, AzSearchAlgorithm, AzSearchLimits, AzSearchResult, alphazero_search,
+    AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search,
     alphazero_search_with_history_and_rules,
 };
-pub use mctx::AzGumbelConfig;
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions,
@@ -557,14 +555,16 @@ pub struct AzLoopConfig {
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
-    pub temperature_end: f32,
+    pub temperature_endgame: f32,
+    pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub search_algorithm: AzSearchAlgorithm,
+    pub temperature_cutoff_plies: usize,
+    pub temperature_value_cutoff: f32,
+    pub temperature_visit_offset: f32,
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
-    pub gumbel: AzGumbelConfig,
     pub mirror_probability: f32,
     pub value_td_lambda: f32,
 }

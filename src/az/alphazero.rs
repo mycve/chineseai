@@ -1,50 +1,21 @@
 use crate::nnue::HistoryMove;
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
-use super::mctx::{self, ActionStats, AzGumbelConfig};
 use super::{AzEvalScratch, AzNnue, SplitMix64, VALUE_SCALE_CP};
 
 const DEFAULT_CPUCT: f32 = 1.5;
 const ALPHAZERO_FPU_REDUCTION: f32 = 0.0;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AzSearchAlgorithm {
-    #[default]
-    AlphaZero,
-    GumbelAlphaZero,
-}
-
-impl AzSearchAlgorithm {
-    pub fn parse(text: &str) -> Option<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "alphazero" | "alpha_zero" | "puct" => Some(Self::AlphaZero),
-            "gumbel" | "gumbel_alphazero" | "gumbel-alpha-zero" | "gumbel_alpha_zero" => {
-                Some(Self::GumbelAlphaZero)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::AlphaZero => "alphazero",
-            Self::GumbelAlphaZero => "gumbel_alphazero",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
     pub seed: u64,
     pub cpuct: f32,
-    /// Maximum search depth in plies below root. 0 keeps the MCTX default:
+    /// Maximum search depth in plies below root. 0 keeps the default:
     /// max_depth = num_simulations.
     pub max_depth: usize,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
-    pub algorithm: AzSearchAlgorithm,
-    pub gumbel: AzGumbelConfig,
     pub value_scale: f32,
 }
 
@@ -57,8 +28,6 @@ impl Default for AzSearchLimits {
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            algorithm: AzSearchAlgorithm::AlphaZero,
-            gumbel: AzGumbelConfig::default(),
             value_scale: 1.0,
         }
     }
@@ -184,17 +153,12 @@ struct AzTree<'a> {
     root_dirichlet_alpha: f32,
     root_exploration_fraction: f32,
     root_noise_seed: u64,
-    algorithm: AzSearchAlgorithm,
-    gumbel: AzGumbelConfig,
     value_scale: f32,
     max_depth: usize,
-    num_simulations: usize,
     search_depth_sum: usize,
     search_depth_count: usize,
     search_depth_max: usize,
     search_depth_cutoffs: usize,
-    root_gumbels: Vec<f32>,
-    root_considered_visits: Vec<u32>,
     eval_scratch: AzEvalScratch,
 }
 
@@ -212,7 +176,6 @@ struct AzNode {
 #[derive(Clone)]
 struct AzChild {
     mv: Move,
-    logit: f32,
     raw_prior: f32,
     prior: f32,
     visits: u32,
@@ -263,28 +226,16 @@ impl<'a> AzTree<'a> {
             root_dirichlet_alpha: limits.root_dirichlet_alpha.max(0.0),
             root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
             root_noise_seed: limits.seed,
-            algorithm: limits.algorithm,
-            gumbel: AzGumbelConfig {
-                max_num_considered_actions: limits.gumbel.max_num_considered_actions.max(1),
-                gumbel_scale: limits.gumbel.gumbel_scale.max(0.0),
-                value_scale: limits.gumbel.value_scale.max(0.0),
-                maxvisit_init: limits.gumbel.maxvisit_init.max(0.0),
-                rescale_values: limits.gumbel.rescale_values,
-                use_mixed_value: limits.gumbel.use_mixed_value,
-            },
             value_scale: limits.value_scale.clamp(0.0, 1.0),
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
             } else {
                 limits.max_depth
             },
-            num_simulations: limits.simulations,
             search_depth_sum: 0,
             search_depth_count: 0,
             search_depth_max: 0,
             search_depth_cutoffs: 0,
-            root_gumbels: Vec::new(),
-            root_considered_visits: Vec::new(),
             eval_scratch: AzEvalScratch::new(model.arch),
         }
     }
@@ -334,7 +285,6 @@ impl<'a> AzTree<'a> {
         );
         let raw_priors = priors.clone();
         if node_index == self.root
-            && self.algorithm == AzSearchAlgorithm::AlphaZero
             && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
         {
@@ -349,10 +299,8 @@ impl<'a> AzTree<'a> {
             .into_iter()
             .zip(priors.drain(..))
             .zip(raw_priors)
-            .enumerate()
-            .map(|(index, ((mv, prior), raw_prior))| AzChild {
+            .map(|((mv, prior), raw_prior)| AzChild {
                 mv,
-                logit: self.eval_scratch.logits[index],
                 raw_prior,
                 prior,
                 visits: 0,
@@ -360,20 +308,6 @@ impl<'a> AzTree<'a> {
                 child: None,
             })
             .collect();
-        if node_index == self.root && self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
-            self.root_gumbels = mctx::sample_gumbels(
-                self.nodes[node_index].children.len(),
-                self.gumbel.gumbel_scale,
-                self.root_noise_seed,
-            );
-            let considered = self
-                .gumbel
-                .max_num_considered_actions
-                .min(self.nodes[node_index].children.len())
-                .max(1);
-            self.root_considered_visits =
-                mctx::get_sequence_of_considered_visits(considered, self.num_simulations);
-        }
         self.nodes[node_index].value = value;
         self.nodes[node_index].expanded = true;
         value
@@ -492,13 +426,6 @@ impl<'a> AzTree<'a> {
     }
 
     fn select_child(&self, node_index: usize) -> usize {
-        if self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
-            if node_index == self.root {
-                return self.select_gumbel_root_child(node_index);
-            }
-            return self.select_gumbel_interior_child(node_index);
-        }
-
         let node = &self.nodes[node_index];
         let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
         let fpu_value = alphazero_fpu_value(node);
@@ -520,9 +447,6 @@ impl<'a> AzTree<'a> {
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
-        if self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
-            return self.best_gumbel_root_child(node_index);
-        }
         self.nodes[node_index]
             .children
             .iter()
@@ -538,42 +462,7 @@ impl<'a> AzTree<'a> {
             .map(|(index, _)| index)
     }
 
-    fn select_gumbel_root_child(&self, node_index: usize) -> usize {
-        mctx::gumbel_muzero_root_action_selection(
-            &self.action_stats(node_index),
-            &self.root_gumbels,
-            &self.root_considered_visits,
-            self.gumbel,
-            self.nodes[node_index].value,
-        )
-    }
-
-    fn select_gumbel_interior_child(&self, node_index: usize) -> usize {
-        mctx::gumbel_muzero_interior_action_selection(
-            &self.action_stats(node_index),
-            self.gumbel,
-            self.nodes[node_index].value,
-        )
-    }
-
-    fn best_gumbel_root_child(&self, node_index: usize) -> Option<usize> {
-        mctx::gumbel_muzero_root_best_action(
-            &self.action_stats(node_index),
-            &self.root_gumbels,
-            self.gumbel,
-            self.nodes[node_index].value,
-        )
-    }
-
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
-        if self.algorithm == AzSearchAlgorithm::GumbelAlphaZero {
-            return mctx::gumbel_muzero_root_policy(
-                &self.action_stats(node_index),
-                self.gumbel,
-                self.nodes[node_index].value,
-            );
-        }
-
         let total_visits = self.nodes[node_index]
             .children
             .iter()
@@ -605,17 +494,6 @@ impl<'a> AzTree<'a> {
             .collect()
     }
 
-    fn action_stats(&self, node_index: usize) -> Vec<ActionStats> {
-        self.nodes[node_index]
-            .children
-            .iter()
-            .map(|child| ActionStats {
-                logit: child.logit,
-                visit_count: child.visits,
-                qvalue: child.q(),
-            })
-            .collect()
-    }
 }
 
 fn alphazero_fpu_value(node: &AzNode) -> f32 {
@@ -823,8 +701,6 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                algorithm: AzSearchAlgorithm::AlphaZero,
-                gumbel: AzGumbelConfig::default(),
                 value_scale: 1.0,
             },
         );
@@ -859,8 +735,6 @@ mod tests {
                 max_depth: 1,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                algorithm: AzSearchAlgorithm::AlphaZero,
-                gumbel: AzGumbelConfig::default(),
                 value_scale: 1.0,
             },
         );
@@ -886,8 +760,6 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                algorithm: AzSearchAlgorithm::AlphaZero,
-                gumbel: AzGumbelConfig::default(),
                 value_scale: 1.0,
             },
         );
@@ -901,8 +773,6 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.3,
                 root_exploration_fraction: 0.25,
-                algorithm: AzSearchAlgorithm::AlphaZero,
-                gumbel: AzGumbelConfig::default(),
                 value_scale: 1.0,
             },
         );
@@ -1051,42 +921,6 @@ mod tests {
         let child_node = tree.nodes[tree.root].children[child_index].child.unwrap();
         tree.expand(child_node);
         assert_ne!(tree.nodes[child_node].children.len(), root_moves.len());
-    }
-
-    #[test]
-    fn gumbel_search_uses_improved_policy_targets() {
-        let model = AzNnue::random(4, 7);
-        let result = alphazero_search(
-            &Position::startpos(),
-            &model,
-            AzSearchLimits {
-                simulations: 64,
-                seed: 23,
-                cpuct: 1.5,
-                max_depth: 0,
-                root_dirichlet_alpha: 0.3,
-                root_exploration_fraction: 0.25,
-                algorithm: AzSearchAlgorithm::GumbelAlphaZero,
-                gumbel: AzGumbelConfig::default(),
-                value_scale: 1.0,
-            },
-        );
-
-        let total_policy = result
-            .candidates
-            .iter()
-            .map(|candidate| candidate.policy)
-            .sum::<f32>();
-
-        assert_eq!(result.simulations, 64);
-        assert!(result.best_move.is_some());
-        assert!(
-            result
-                .candidates
-                .iter()
-                .any(|candidate| candidate.visits > 0)
-        );
-        assert!((total_policy - 1.0).abs() < 1e-3);
     }
 
     #[test]

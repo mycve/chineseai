@@ -1,7 +1,4 @@
-use crate::az::{
-    AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
-    alphazero_search_with_history_and_rules,
-};
+use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Position, RuleHistoryEntry, RuleOutcome};
 use std::fs;
@@ -57,8 +54,6 @@ struct UciState {
     simulations: usize,
     threads: usize,
     cpuct: f32,
-    search_algorithm: AzSearchAlgorithm,
-    gumbel: AzGumbelConfig,
     policy_debug: bool,
     policy_debug_limit: usize,
     seed: u64,
@@ -75,11 +70,6 @@ impl Default for UciState {
             simulations: 10_000,
             threads: 1,
             cpuct: 1.5,
-            search_algorithm: AzSearchAlgorithm::AlphaZero,
-            gumbel: AzGumbelConfig {
-                gumbel_scale: 0.0,
-                ..AzGumbelConfig::default()
-            },
             policy_debug: false,
             policy_debug_limit: 16,
             seed: 20260409,
@@ -135,15 +125,6 @@ fn print_uci_id() {
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name Cpuct type string default 1.5");
-    println!(
-        "option name SearchAlgorithm type combo default alphazero var alphazero var gumbel_alphazero"
-    );
-    println!("option name GumbelMaxActions type spin default 16 min 1 max 512");
-    println!("option name GumbelScale type string default 0.0");
-    println!("option name GumbelValueScale type string default 0.1");
-    println!("option name GumbelMaxVisitInit type string default 50.0");
-    println!("option name GumbelRescaleValues type check default true");
-    println!("option name GumbelUseMixedValue type check default true");
     println!("option name PolicyDebug type check default false");
     println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
@@ -192,41 +173,6 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         }
         "cpuct" => {
             state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
-        }
-        "searchalgorithm" => {
-            if let Some(algorithm) = AzSearchAlgorithm::parse(&value) {
-                state.search_algorithm = algorithm;
-            }
-        }
-        "gumbelmaxactions" => {
-            state.gumbel.max_num_considered_actions = value
-                .parse::<usize>()
-                .unwrap_or(state.gumbel.max_num_considered_actions)
-                .clamp(1, 512);
-        }
-        "gumbelscale" => {
-            state.gumbel.gumbel_scale = value
-                .parse::<f32>()
-                .unwrap_or(state.gumbel.gumbel_scale)
-                .max(0.0);
-        }
-        "gumbelvaluescale" => {
-            state.gumbel.value_scale = value
-                .parse::<f32>()
-                .unwrap_or(state.gumbel.value_scale)
-                .max(0.0);
-        }
-        "gumbelmaxvisitinit" => {
-            state.gumbel.maxvisit_init = value
-                .parse::<f32>()
-                .unwrap_or(state.gumbel.maxvisit_init)
-                .max(0.0);
-        }
-        "gumbelrescalevalues" => {
-            state.gumbel.rescale_values = parse_uci_bool(&value, state.gumbel.rescale_values);
-        }
-        "gumbelusemixedvalue" => {
-            state.gumbel.use_mixed_value = parse_uci_bool(&value, state.gumbel.use_mixed_value);
         }
         "policydebug" => {
             state.policy_debug = parse_uci_bool(&value, state.policy_debug);
@@ -430,8 +376,6 @@ fn handle_go(state: &mut UciState, logger: &mut UciLogger) {
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            algorithm: state.search_algorithm,
-            gumbel: state.gumbel,
             value_scale: 1.0,
         },
     );

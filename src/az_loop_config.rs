@@ -1,4 +1,4 @@
-use chineseai::az::{AzGumbelConfig, AzNnueArch, AzSearchAlgorithm};
+use chineseai::az::AzNnueArch;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
 
@@ -19,14 +19,16 @@ pub struct AzLoopFileConfig {
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
-    pub temperature_end: f32,
+    pub temperature_endgame: f32,
+    pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub search_algorithm: AzSearchAlgorithm,
+    pub temperature_cutoff_plies: usize,
+    pub temperature_value_cutoff: f32,
+    pub temperature_visit_offset: f32,
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
-    pub gumbel: AzGumbelConfig,
     pub replay_capacity: usize,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
@@ -56,13 +58,9 @@ pub struct AzLoopFileConfig {
 
 impl Default for AzLoopFileConfig {
     fn default() -> Self {
-        let gumbel = AzGumbelConfig {
-            max_num_considered_actions: 32,
-            ..AzGumbelConfig::default()
-        };
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 256,
+            simulations: 800,
             selfplay_samples_per_update: 60000,
             lr: 0.0005,
             lr_min: 0.00003,
@@ -74,20 +72,17 @@ impl Default for AzLoopFileConfig {
             hidden_size: 192,
             seed: 20260412,
             workers: 250,
-            temperature_start: 1.0,
-            temperature_end: 0.1,
-            temperature_decay_plies: 80,
-            search_algorithm: AzSearchAlgorithm::AlphaZero,
+            temperature_start: 0.9,
+            temperature_endgame: 0.6,
+            temperature_decay_delay_plies: 20,
+            temperature_decay_plies: 60,
+            temperature_cutoff_plies: 40,
+            temperature_value_cutoff: 0.15,
+            temperature_visit_offset: -0.8,
             cpuct: 1.5,
-            root_dirichlet_alpha: 0.3,
-            root_exploration_fraction: 0.25,
-            root_exploration_plies: 80,
-            gumbel: AzGumbelConfig {
-                gumbel_scale: 1.0,
-                value_scale: 0.1,
-                maxvisit_init: 50.0,
-                ..gumbel
-            },
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.1,
+            root_exploration_plies: 60,
             replay_capacity: 500000,
             train_warmup_samples: 150000,
             train_samples_per_update: 120000,
@@ -134,19 +129,16 @@ struct AzLoopTomlConfig {
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
-    pub temperature_end: f32,
+    pub temperature_endgame: f32,
+    pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub search_algorithm: String,
+    pub temperature_cutoff_plies: usize,
+    pub temperature_value_cutoff: f32,
+    pub temperature_visit_offset: f32,
     pub cpuct: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
-    gumbel_max_num_considered_actions: usize,
-    gumbel_scale: f32,
-    gumbel_value_scale: f32,
-    gumbel_maxvisit_init: f32,
-    gumbel_rescale_values: bool,
-    gumbel_use_mixed_value: bool,
     pub replay_capacity: usize,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
@@ -197,19 +189,16 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             seed: config.seed,
             workers: config.workers,
             temperature_start: config.temperature_start,
-            temperature_end: config.temperature_end,
+            temperature_endgame: config.temperature_endgame,
+            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
             temperature_decay_plies: config.temperature_decay_plies,
-            search_algorithm: config.search_algorithm.as_str().into(),
+            temperature_cutoff_plies: config.temperature_cutoff_plies,
+            temperature_value_cutoff: config.temperature_value_cutoff,
+            temperature_visit_offset: config.temperature_visit_offset,
             cpuct: config.cpuct,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
             root_exploration_plies: config.root_exploration_plies,
-            gumbel_max_num_considered_actions: config.gumbel.max_num_considered_actions,
-            gumbel_scale: config.gumbel.gumbel_scale,
-            gumbel_value_scale: config.gumbel.value_scale,
-            gumbel_maxvisit_init: config.gumbel.maxvisit_init,
-            gumbel_rescale_values: config.gumbel.rescale_values,
-            gumbel_use_mixed_value: config.gumbel.use_mixed_value,
             replay_capacity: config.replay_capacity,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
@@ -256,23 +245,16 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             seed: config.seed,
             workers: config.workers,
             temperature_start: config.temperature_start,
-            temperature_end: config.temperature_end,
+            temperature_endgame: config.temperature_endgame,
+            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
             temperature_decay_plies: config.temperature_decay_plies,
-            search_algorithm: AzSearchAlgorithm::parse(&config.search_algorithm).unwrap_or_else(
-                || panic!("invalid search_algorithm `{}`", config.search_algorithm),
-            ),
+            temperature_cutoff_plies: config.temperature_cutoff_plies,
+            temperature_value_cutoff: config.temperature_value_cutoff,
+            temperature_visit_offset: config.temperature_visit_offset,
             cpuct: config.cpuct,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
             root_exploration_plies: config.root_exploration_plies,
-            gumbel: AzGumbelConfig {
-                max_num_considered_actions: config.gumbel_max_num_considered_actions,
-                gumbel_scale: config.gumbel_scale,
-                value_scale: config.gumbel_value_scale,
-                maxvisit_init: config.gumbel_maxvisit_init,
-                rescale_values: config.gumbel_rescale_values,
-                use_mixed_value: config.gumbel_use_mixed_value,
-            },
             replay_capacity: config.replay_capacity,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
@@ -344,9 +326,15 @@ impl AzLoopFileConfig {
         line!("seed", self.seed);
         line!("workers", self.workers);
         line!("temperature_start", f(self.temperature_start));
-        line!("temperature_end", f(self.temperature_end));
+        line!("temperature_endgame", f(self.temperature_endgame));
+        line!(
+            "temperature_decay_delay_plies",
+            self.temperature_decay_delay_plies
+        );
         line!("temperature_decay_plies", self.temperature_decay_plies);
-        line!("search_algorithm", q(self.search_algorithm.as_str()));
+        line!("temperature_cutoff_plies", self.temperature_cutoff_plies);
+        line!("temperature_value_cutoff", f(self.temperature_value_cutoff));
+        line!("temperature_visit_offset", f(self.temperature_visit_offset));
         line!("cpuct", f(self.cpuct));
         line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
         line!(
@@ -354,15 +342,6 @@ impl AzLoopFileConfig {
             f(self.root_exploration_fraction)
         );
         line!("root_exploration_plies", self.root_exploration_plies);
-        line!(
-            "gumbel_max_num_considered_actions",
-            self.gumbel.max_num_considered_actions
-        );
-        line!("gumbel_scale", f(self.gumbel.gumbel_scale));
-        line!("gumbel_value_scale", f(self.gumbel.value_scale));
-        line!("gumbel_maxvisit_init", f(self.gumbel.maxvisit_init));
-        line!("gumbel_rescale_values", self.gumbel.rescale_values);
-        line!("gumbel_use_mixed_value", self.gumbel.use_mixed_value);
         line!("replay_capacity", self.replay_capacity);
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
@@ -430,7 +409,12 @@ impl AzLoopFileConfig {
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
-        self.temperature_end = self.temperature_end.max(0.0);
+        self.temperature_endgame = self.temperature_endgame.max(0.0);
+        self.temperature_decay_delay_plies =
+            self.temperature_decay_delay_plies.min(self.max_plies);
+        self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
+        self.temperature_cutoff_plies = self.temperature_cutoff_plies.min(self.max_plies);
+        self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
         self.cpuct = self.cpuct.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
@@ -438,10 +422,6 @@ impl AzLoopFileConfig {
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
-        self.gumbel.max_num_considered_actions = self.gumbel.max_num_considered_actions.max(1);
-        self.gumbel.gumbel_scale = self.gumbel.gumbel_scale.max(0.0);
-        self.gumbel.value_scale = self.gumbel.value_scale.max(0.0);
-        self.gumbel.maxvisit_init = self.gumbel.maxvisit_init.max(0.0);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
@@ -470,11 +450,15 @@ mod tests {
 
         assert!(text.contains("lr = 0.0005\n"));
         assert!(text.contains("lr_min = 0.00003\n"));
-        assert!(text.contains("temperature_start = 1.0\n"));
-        assert!(text.contains("temperature_end = 0.1\n"));
+        assert!(text.contains("temperature_start = 0.9\n"));
+        assert!(text.contains("temperature_endgame = 0.6\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 20\n"));
+        assert!(text.contains("temperature_cutoff_plies = 40\n"));
+        assert!(text.contains("temperature_value_cutoff = 0.15\n"));
+        assert!(text.contains("temperature_visit_offset = -0.8\n"));
         assert!(text.contains("value_td_lambda = 0.95\n"));
-        assert!(!text.contains("train_value_head"));
-        assert!(!text.contains("train_policy_head"));
+        assert!(!text.contains("gumbel"));
+        assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("000000047"));
         assert!(!text.contains("000000023"));
 

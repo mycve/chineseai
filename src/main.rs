@@ -8,8 +8,8 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzGumbelConfig, AzLoopConfig, AzLoopReport,
-        AzNnue, AzSearchAlgorithm, AzSearchLimits, AzSelfplayData, AzTrainLossWeights,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
+        AzSearchLimits, AzSelfplayData, AzTrainLossWeights,
         AzTrainingSample, SplitMix64, alphazero_search, alphazero_search_with_history_and_rules,
         benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
         benchmark_training, generate_selfplay_data, global_training_step_sample_count,
@@ -118,7 +118,7 @@ impl AzInitArgs {
 Examples:
   chineseai az-search model.safetensors
   chineseai az-search model.safetensors 10000 1.5 startpos
-  chineseai az-search model.safetensors 10000 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
+  chineseai az-search model.safetensors 10000 1.5 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -131,27 +131,6 @@ struct AzSearchArgs {
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 16)]
-    topk: usize,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 1.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -161,7 +140,7 @@ struct AzSearchArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-bench model.safetensors 512 100 1.5 startpos
-  chineseai az-bench model.safetensors 512 100 1.5 --algorithm gumbel_alphazero --topk 32 startpos")]
+  chineseai az-bench model.safetensors 512 100 1.5 startpos")]
 struct AzBenchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -174,27 +153,6 @@ struct AzBenchArgs {
     /// PUCT constant for AlphaZero search.
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 16)]
-    topk: usize,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 1.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -282,7 +240,7 @@ struct PikafishLabelArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-teacher-probe pure-canonical-h128-u100.safetensors hard_teacher.tsv 1200 1.5 --algorithm alphazero")]
+  chineseai az-teacher-probe pure-canonical-h128-u100.safetensors hard_teacher.tsv 1200 1.5")]
 struct AzTeacherProbeArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -294,27 +252,6 @@ struct AzTeacherProbeArgs {
     /// PUCT constant for AlphaZero search.
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 16)]
-    topk: usize,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 1.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -363,7 +300,7 @@ struct AzCollectFensArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai vs-pikafish ./tools/pikafish model.safetensors
-  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --simulations 192 --topk 32
+  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --simulations 192
   chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5 --eval-fens eval_fens.txt")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
@@ -373,12 +310,6 @@ struct VsPikafishArgs {
     /// ChineseAI MCTS simulations per move.
     #[arg(short = 's', long)]
     simulations: Option<usize>,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 32)]
-    topk: usize,
-    /// ChineseAI search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
     /// ChineseAI PUCT constant.
     #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
@@ -388,21 +319,6 @@ struct VsPikafishArgs {
     /// Random seed.
     #[arg(long, default_value_t = 20260411)]
     seed: u64,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 1.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
     /// Pikafish search depth.
     #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_DEPTH)]
     pikafish_depth: u32,
@@ -417,15 +333,10 @@ struct VsPikafishArgs {
     eval_fens_path: String,
 }
 
-fn parse_search_algorithm(text: &str) -> Result<AzSearchAlgorithm, String> {
-    AzSearchAlgorithm::parse(text)
-        .ok_or_else(|| "expected `alphazero` or `gumbel_alphazero`".to_string())
-}
-
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-diagnose model.safetensors 512 --algorithm gumbel_alphazero --topk 64 --gumbel-scale 0 \"5k3/9/9/9/9/9/4r4/4R4/4R1r2/4K4 w - - 0 1\"")]
+  chineseai az-diagnose model.safetensors 512 \"5k3/9/9/9/9/9/4r4/4R4/4R1r2/4K4 w - - 0 1\"")]
 struct AzDiagnoseArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -435,51 +346,12 @@ struct AzDiagnoseArgs {
     /// PUCT constant for AlphaZero search.
     #[arg(default_value_t = 0.0)]
     cpuct: f32,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 64)]
-    topk: usize,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 0.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
     /// Print child reply diagnostics for this many top static moves.
     #[arg(long, default_value_t = 3)]
     replies: usize,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
-}
-
-fn build_gumbel_config(
-    topk: usize,
-    gumbel_scale: f32,
-    gumbel_value_scale: f32,
-    gumbel_maxvisit_init: f32,
-    gumbel_rescale_values: bool,
-    gumbel_use_mixed_value: bool,
-) -> AzGumbelConfig {
-    AzGumbelConfig {
-        max_num_considered_actions: topk.max(1),
-        gumbel_scale: gumbel_scale.max(0.0),
-        value_scale: gumbel_value_scale.max(0.0),
-        maxvisit_init: gumbel_maxvisit_init.max(0.0),
-        rescale_values: gumbel_rescale_values,
-        use_mixed_value: gumbel_use_mixed_value,
-    }
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
@@ -600,8 +472,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "lrm{}_lds{}_ldi{}_ldf{}_sa{}_gsm{}_tb{}_te{}_tde{}_rc{}_tspu{}_mp{}_cpi{}_",
-            "tepu{}_mstc{}_vtd{}_ai{}_acp{}_rda{}_ref{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
+            "lrm{}_lds{}_ldi{}_ldf{}_cp{}_tb{}_teg{}_tdd{}_tde{}_tco{}_tvc{}_tvo{}_rc{}_tspu{}_mp{}_cpi{}_",
+            "tepu{}_mstc{}_vtd{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -614,11 +486,14 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.lr_decay_start_update,
         config.lr_decay_interval,
         f32_slug(config.lr_decay_factor),
-        config.search_algorithm.as_str(),
         f32_slug(config.cpuct),
         f32_slug(config.temperature_start),
-        f32_slug(config.temperature_end),
+        f32_slug(config.temperature_endgame),
+        config.temperature_decay_delay_plies,
         config.temperature_decay_plies,
+        config.temperature_cutoff_plies,
+        f32_slug(config.temperature_value_cutoff),
+        f32_slug(config.temperature_visit_offset),
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
@@ -630,10 +505,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
-        config.gumbel.max_num_considered_actions,
-        f32_slug(config.gumbel.gumbel_scale),
-        f32_slug(config.gumbel.value_scale),
-        f32_slug(config.gumbel.maxvisit_init),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -646,12 +517,11 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }
     format!(
-        "sim{}_bs{}_lr{}_h{}_sa{}_sd{}_cfg{:016x}",
+        "sim{}_bs{}_lr{}_h{}_sd{}_cfg{:016x}",
         config.simulations,
         config.batch_size,
         f32_slug(config.lr),
         config.hidden_size,
-        config.search_algorithm.as_str(),
         config.seed,
         hash
     )
@@ -682,7 +552,7 @@ fn tensorboard_effective_logdir(config: &AzLoopFileConfig) -> PathBuf {
 fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     let mut config = AzLoopFileConfig::default();
     config.model_path = cmd.model.clone();
-    config.simulations = 256;
+    config.simulations = 800;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
     config.train_warmup_samples = config.train_samples_per_update;
@@ -818,7 +688,7 @@ struct AzSelfplayFitBenchArgs {
     #[arg(default_value_t = 2000)]
     games: usize,
     /// MCTS simulations per self-play move.
-    #[arg(default_value_t = 600)]
+    #[arg(default_value_t = 800)]
     simulations: usize,
     /// Self-play worker threads.
     #[arg(default_value_t = 44)]
@@ -838,9 +708,6 @@ struct AzSelfplayFitBenchArgs {
     /// Maximum plies per self-play game.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
     /// PUCT constant for AlphaZero search.
     #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
@@ -851,38 +718,32 @@ struct AzSelfplayFitBenchArgs {
     #[arg(long, default_value_t = 0.0)]
     root_exploration_fraction: f32,
     /// Opening temperature.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.9)]
     temperature_start: f32,
-    /// Final temperature after decay.
-    #[arg(long, default_value_t = 0.05)]
-    temperature_end: f32,
-    /// Plies over which temperature decays.
+    /// Endgame temperature after cutoff.
+    #[arg(long, default_value_t = 0.6)]
+    temperature_endgame: f32,
+    /// Plies before temperature starts decaying.
     #[arg(long, default_value_t = 20)]
+    temperature_decay_delay_plies: usize,
+    /// Plies over which temperature decays.
+    #[arg(long, default_value_t = 60)]
     temperature_decay_plies: usize,
+    /// Ply from which endgame temperature is used.
+    #[arg(long, default_value_t = 40)]
+    temperature_cutoff_plies: usize,
+    /// Exclude temperature-sampled moves worse than best Q by this much.
+    #[arg(long, default_value_t = 0.15)]
+    temperature_value_cutoff: f32,
+    /// Visit offset applied before temperature sampling.
+    #[arg(long, default_value_t = -0.8)]
+    temperature_visit_offset: f32,
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.5)]
     mirror_probability: f32,
     /// TD lambda used to mix search value with terminal game return.
     #[arg(long, default_value_t = 0.85)]
     value_td_lambda: f32,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 32)]
-    topk: usize,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 0.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
     replay_out: Option<String>,
@@ -925,7 +786,7 @@ struct AzReplayGenerateFixedArgs {
     #[arg(long, default_value_t = 300)]
     batch_games: usize,
     /// MCTS simulations per self-play move.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 800)]
     simulations: usize,
     /// Self-play worker threads.
     #[arg(long, default_value_t = 30)]
@@ -936,9 +797,6 @@ struct AzReplayGenerateFixedArgs {
     /// Maximum plies per self-play game.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
-    /// Search algorithm: alphazero or gumbel_alphazero.
-    #[arg(long, value_parser = parse_search_algorithm)]
-    algorithm: Option<AzSearchAlgorithm>,
     /// PUCT constant for AlphaZero search.
     #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
@@ -949,38 +807,32 @@ struct AzReplayGenerateFixedArgs {
     #[arg(long, default_value_t = 0.0)]
     root_exploration_fraction: f32,
     /// Opening temperature.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.9)]
     temperature_start: f32,
-    /// Final temperature after decay.
-    #[arg(long, default_value_t = 0.1)]
-    temperature_end: f32,
+    /// Endgame temperature after cutoff.
+    #[arg(long, default_value_t = 0.6)]
+    temperature_endgame: f32,
+    /// Plies before temperature starts decaying.
+    #[arg(long, default_value_t = 20)]
+    temperature_decay_delay_plies: usize,
     /// Plies over which temperature decays.
-    #[arg(long, default_value_t = 40)]
+    #[arg(long, default_value_t = 60)]
     temperature_decay_plies: usize,
+    /// Ply from which endgame temperature is used.
+    #[arg(long, default_value_t = 40)]
+    temperature_cutoff_plies: usize,
+    /// Exclude temperature-sampled moves worse than best Q by this much.
+    #[arg(long, default_value_t = 0.15)]
+    temperature_value_cutoff: f32,
+    /// Visit offset applied before temperature sampling.
+    #[arg(long, default_value_t = -0.8)]
+    temperature_visit_offset: f32,
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.3)]
     mirror_probability: f32,
     /// TD lambda used to mix search value with terminal game return.
     #[arg(long, default_value_t = 0.85)]
     value_td_lambda: f32,
-    /// Gumbel root top-k considered actions.
-    #[arg(long, default_value_t = 32)]
-    topk: usize,
-    /// Gumbel noise scale.
-    #[arg(long, default_value_t = 1.0)]
-    gumbel_scale: f32,
-    /// Gumbel completed-q value scale.
-    #[arg(long, default_value_t = 0.1)]
-    gumbel_value_scale: f32,
-    /// Gumbel max-visit initialization.
-    #[arg(long, default_value_t = 50.0)]
-    gumbel_maxvisit_init: f32,
-    /// Rescale completed values in Gumbel search.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_rescale_values: bool,
-    /// Mix root value into unvisited Gumbel action values.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    gumbel_use_mixed_value: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1128,14 +980,16 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         seed,
         workers,
         temperature_start: config.temperature_start,
-        temperature_end: config.temperature_end,
+        temperature_endgame: config.temperature_endgame,
+        temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
-        search_algorithm: config.search_algorithm,
+        temperature_cutoff_plies: config.temperature_cutoff_plies,
+        temperature_value_cutoff: config.temperature_value_cutoff,
+        temperature_visit_offset: config.temperature_visit_offset,
         cpuct: config.cpuct,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
         root_exploration_plies: config.root_exploration_plies,
-        gumbel: config.gumbel,
         mirror_probability: config.mirror_probability,
         value_td_lambda: config.value_td_lambda,
     }
@@ -1478,15 +1332,6 @@ fn main() {
             let model_path = cmd.model;
             let simulations = cmd.simulations.max(1);
             let cpuct = cmd.cpuct.max(0.0);
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-            let gumbel = build_gumbel_config(
-                cmd.topk,
-                cmd.gumbel_scale,
-                cmd.gumbel_value_scale,
-                cmd.gumbel_maxvisit_init,
-                cmd.gumbel_rescale_values,
-                cmd.gumbel_use_mixed_value,
-            );
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -1502,24 +1347,13 @@ fn main() {
                     max_depth: cmd.max_depth,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
-                    algorithm,
-                    gumbel,
                     value_scale: 1.0,
                 },
             );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
-            println!("search   : {}", algorithm.as_str());
-            println!(
-                "gumbel   : topk={} scale={} value_scale={} maxvisit_init={} rescale={} mixed={}",
-                gumbel.max_num_considered_actions,
-                gumbel.gumbel_scale,
-                gumbel.value_scale,
-                gumbel.maxvisit_init,
-                gumbel.rescale_values,
-                gumbel.use_mixed_value
-            );
+            println!("search   : alphazero");
             println!("cpuct    : {cpuct}");
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
@@ -1571,15 +1405,6 @@ fn main() {
             let model_path = cmd.model;
             let simulations = cmd.simulations.max(1);
             let cpuct = cmd.cpuct.max(0.0);
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::GumbelAlphaZero);
-            let gumbel = build_gumbel_config(
-                cmd.topk,
-                cmd.gumbel_scale,
-                cmd.gumbel_value_scale,
-                cmd.gumbel_maxvisit_init,
-                cmd.gumbel_rescale_values,
-                cmd.gumbel_use_mixed_value,
-            );
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -1601,8 +1426,6 @@ fn main() {
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
-                    algorithm,
-                    gumbel,
                     value_scale: 1.0,
                 },
             );
@@ -1616,12 +1439,8 @@ fn main() {
                 root_static * 1000.0
             );
             println!(
-                "search       : {} sims={} cpuct={} gumbel_topk={} gumbel_scale={}",
-                algorithm.as_str(),
-                search.simulations,
-                cpuct,
-                gumbel.max_num_considered_actions,
-                gumbel.gumbel_scale
+                "search       : alphazero sims={} cpuct={}",
+                search.simulations, cpuct
             );
             println!("search_value : cp={}", search.value_cp);
             println!(
@@ -1750,15 +1569,6 @@ fn main() {
             let simulations = cmd.simulations.max(1);
             let repeat = cmd.repeat.max(1);
             let cpuct = cmd.cpuct.max(0.0);
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-            let gumbel = build_gumbel_config(
-                cmd.topk,
-                cmd.gumbel_scale,
-                cmd.gumbel_value_scale,
-                cmd.gumbel_maxvisit_init,
-                cmd.gumbel_rescale_values,
-                cmd.gumbel_use_mixed_value,
-            );
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -1775,8 +1585,6 @@ fn main() {
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
-                    algorithm,
-                    gumbel,
                     value_scale: 1.0,
                 },
             );
@@ -1795,8 +1603,6 @@ fn main() {
                         max_depth: 0,
                         root_dirichlet_alpha: 0.0,
                         root_exploration_fraction: 0.0,
-                        algorithm,
-                        gumbel,
                         value_scale: 1.0,
                     },
                 );
@@ -1810,16 +1616,7 @@ fn main() {
             println!("fen          : {}", position.to_fen());
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
-            println!("search       : {}", algorithm.as_str());
-            println!(
-                "gumbel       : topk={} scale={} value_scale={} maxvisit_init={} rescale={} mixed={}",
-                gumbel.max_num_considered_actions,
-                gumbel.gumbel_scale,
-                gumbel.value_scale,
-                gumbel.maxvisit_init,
-                gumbel.rescale_values,
-                gumbel.use_mixed_value
-            );
+            println!("search       : alphazero");
             println!("cpuct        : {cpuct}");
             println!("total_sims   : {total_sims}");
             println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
@@ -1928,15 +1725,6 @@ fn main() {
             let batch_size = cmd.batch_size_per_gpu.max(1);
             let lr = cmd.lr.max(0.0);
             let seed = cmd.seed;
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-            let gumbel = build_gumbel_config(
-                cmd.topk,
-                cmd.gumbel_scale,
-                cmd.gumbel_value_scale,
-                cmd.gumbel_maxvisit_init,
-                cmd.gumbel_rescale_values,
-                cmd.gumbel_use_mixed_value,
-            );
             let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
@@ -1971,14 +1759,16 @@ fn main() {
                     seed,
                     workers,
                     temperature_start: cmd.temperature_start,
-                    temperature_end: cmd.temperature_end,
+                    temperature_endgame: cmd.temperature_endgame,
+                    temperature_decay_delay_plies: cmd.temperature_decay_delay_plies,
                     temperature_decay_plies: cmd.temperature_decay_plies,
-                    search_algorithm: algorithm,
+                    temperature_cutoff_plies: cmd.temperature_cutoff_plies,
+                    temperature_value_cutoff: cmd.temperature_value_cutoff,
+                    temperature_visit_offset: cmd.temperature_visit_offset,
                     cpuct: cmd.cpuct,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     root_exploration_plies: cmd.temperature_decay_plies,
-                    gumbel,
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
                 };
@@ -2051,7 +1841,7 @@ fn main() {
             println!("selfplay_sec    : {:.3}", selfplay_seconds);
             println!("simulations     : {simulations}");
             println!("workers         : {workers}");
-            println!("search          : {}", algorithm.as_str());
+            println!("search          : alphazero");
             println!("epochs          : {epochs}");
             println!("epochs_done     : {}", stats.epochs_completed);
             println!("batch(per_gpu)  : {batch_size}");
@@ -2156,15 +1946,6 @@ fn main() {
             let simulations = cmd.simulations.max(1);
             let workers = cmd.workers.max(1);
             let seed = cmd.seed;
-            let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-            let gumbel = build_gumbel_config(
-                cmd.topk,
-                cmd.gumbel_scale,
-                cmd.gumbel_value_scale,
-                cmd.gumbel_maxvisit_init,
-                cmd.gumbel_rescale_values,
-                cmd.gumbel_use_mixed_value,
-            );
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
@@ -2185,14 +1966,16 @@ fn main() {
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
                     temperature_start: cmd.temperature_start,
-                    temperature_end: cmd.temperature_end,
+                    temperature_endgame: cmd.temperature_endgame,
+                    temperature_decay_delay_plies: cmd.temperature_decay_delay_plies,
                     temperature_decay_plies: cmd.temperature_decay_plies,
-                    search_algorithm: algorithm,
+                    temperature_cutoff_plies: cmd.temperature_cutoff_plies,
+                    temperature_value_cutoff: cmd.temperature_value_cutoff,
+                    temperature_visit_offset: cmd.temperature_visit_offset,
                     cpuct: cmd.cpuct,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     root_exploration_plies: cmd.temperature_decay_plies,
-                    gumbel,
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
                 };
@@ -2242,7 +2025,7 @@ fn main() {
             );
             println!("simulations     : {simulations}");
             println!("workers         : {workers}");
-            println!("search          : {}", algorithm.as_str());
+            println!("search          : alphazero");
             println!("elapsed_sec     : {:.3}", started.elapsed().as_secs_f32());
         }
         Some(CliCommand::AzTrainFixedReplay(cmd)) => {
@@ -2503,9 +2286,8 @@ fn main() {
             let mut tb = SummaryWriter::new(&tb_dir);
 
             println!(
-                "loop     : config={} mode=batch search={} sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp={}->{}/{}ply cpuct={} root_noise(alpha={},fraction={},plies={}) gumbel(max_actions={},scale={},value_scale={},maxvisit_init={},rescale={},mixed={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} root_noise(alpha={},fraction={},plies={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
                 config_path,
-                config.search_algorithm.as_str(),
                 config.simulations,
                 config.selfplay_samples_per_update,
                 config.lr,
@@ -2522,18 +2304,16 @@ fn main() {
                 config.max_plies,
                 config.workers,
                 config.temperature_start,
-                config.temperature_end,
+                config.temperature_endgame,
+                config.temperature_decay_delay_plies,
                 config.temperature_decay_plies,
+                config.temperature_cutoff_plies,
+                config.temperature_value_cutoff,
+                config.temperature_visit_offset,
                 config.cpuct,
                 config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
                 config.root_exploration_plies,
-                config.gumbel.max_num_considered_actions,
-                config.gumbel.gumbel_scale,
-                config.gumbel.value_scale,
-                config.gumbel.maxvisit_init,
-                config.gumbel.rescale_values,
-                config.gumbel.use_mixed_value,
                 config.replay_capacity,
                 config.mirror_probability,
                 config.value_td_lambda,
@@ -3288,9 +3068,7 @@ fn main() {
                                 seed: config.seed
                                     ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                                 parallel_games: config.arena_pikafish_parallel_games,
-                                search_algorithm: config.search_algorithm,
                                 cpuct: config.arena_cpuct,
-                                gumbel: config.gumbel,
                             },
                         )
                         .unwrap_or_else(|err| panic!("arena pikafish failed: {err}"));
@@ -3585,18 +3363,8 @@ fn main() {
             let pikafish_exe = cmd.pikafish_exe;
             let model_path = cmd.model;
             let simulations = cmd.simulations.unwrap_or(192).max(1);
-            let topk = cmd.topk.max(1);
-            let search_algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::GumbelAlphaZero);
             let cpuct = cmd.cpuct.max(0.0);
             let max_plies = cmd.max_plies.max(1);
-            let gumbel = build_gumbel_config(
-                topk,
-                cmd.gumbel_scale,
-                cmd.gumbel_value_scale,
-                cmd.gumbel_maxvisit_init,
-                cmd.gumbel_rescale_values,
-                cmd.gumbel_use_mixed_value,
-            );
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
@@ -3613,9 +3381,7 @@ fn main() {
                     simulations,
                     seed: cmd.seed,
                     parallel_games,
-                    search_algorithm,
                     cpuct,
-                    gumbel,
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
@@ -3634,10 +3400,8 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search={} topk={} games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}",
+                "vs-pikafish: model={} search=alphazero games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}",
                 model_path,
-                search_algorithm.as_str(),
-                topk,
                 summary.total_games,
                 start_positions.len(),
                 parallel_games.min(games),
@@ -4219,15 +3983,6 @@ fn run_az_teacher_probe(cmd: AzTeacherProbeArgs) {
     });
     let simulations = cmd.simulations.max(1);
     let cpuct = cmd.cpuct.max(0.0);
-    let algorithm = cmd.algorithm.unwrap_or(AzSearchAlgorithm::AlphaZero);
-    let gumbel = build_gumbel_config(
-        cmd.topk,
-        cmd.gumbel_scale,
-        cmd.gumbel_value_scale,
-        cmd.gumbel_maxvisit_init,
-        cmd.gumbel_rescale_values,
-        cmd.gumbel_use_mixed_value,
-    );
 
     println!(
         "fen\tteacher_best\tteacher_cp\tmodel_best\tmodel_value_cp\tvalue_error_cp\tteacher_prior\tteacher_policy\tteacher_visits\tteacher_q\trank_prior\trank_policy\trank_visits\trank_q\tfound\tsuite\tsplit\tcase_id\tmultipv"
@@ -4258,8 +4013,6 @@ fn run_az_teacher_probe(cmd: AzTeacherProbeArgs) {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                algorithm,
-                gumbel,
                 value_scale: 1.0,
             },
         );

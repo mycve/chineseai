@@ -10,16 +10,12 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzTrainingSample,
-    SplitMix64, VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
+    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
+    VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
     scalar_value_to_wdl_target, wdl_q,
 };
 
-const EARLY_OPTIMISM_RESCORER_PLIES: usize = 40;
-const EARLY_OPTIMISM_RESCORER_Q: f32 = 0.20;
-const EARLY_OPTIMISM_RESCORER_MARGIN: f32 = 0.15;
-const EARLY_OPTIMISM_RESCORER_MAX_PER_GAME: usize = 4;
-const EARLY_OPTIMISM_RESCORER_SIM_MULTIPLIER: usize = 4;
+const DEBLUNDER_Q_GAP: f32 = 0.15;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
@@ -288,7 +284,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut history = Vec::new();
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
-        let mut sample_contexts = Vec::new();
+        let mut first_blunder_ply = None;
         let mut result = None;
         let mut plies = 0usize;
 
@@ -327,8 +323,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     } else {
                         0.0
                     },
-                    algorithm: config.search_algorithm,
-                    gumbel: config.gumbel,
                     value_scale: 1.0,
                 },
             );
@@ -344,7 +338,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             shape_count += 1;
             entropy_all_sum += entropy;
             entropy_all_count += 1;
-            if ply < config.temperature_decay_plies {
+            if ply < config.temperature_cutoff_plies {
                 entropy_opening_sum += entropy;
                 entropy_opening_count += 1;
                 opening_raw_prior_top1_sum += shape.raw_prior_top1;
@@ -363,20 +357,27 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let mv_opt = if temperature <= 1e-6 {
                 search
                     .best_move
-                    .or_else(|| choose_selfplay_move(&search.candidates, temperature, &mut rng))
+                    .or_else(|| {
+                        choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
+                    })
             } else {
-                choose_selfplay_move(&search.candidates, temperature, &mut rng)
+                choose_selfplay_move(
+                    &search.candidates,
+                    temperature,
+                    config.temperature_value_cutoff,
+                    config.temperature_visit_offset,
+                    &mut rng,
+                )
             };
             let Some(mv) = mv_opt else {
                 result = Some(0.0);
                 break;
             };
-            sample_contexts.push(RescoreContext {
-                position: position.clone(),
-                history: history.clone(),
-                rule_history: rule_history.clone(),
-                legal: search.candidates.iter().map(|candidate| candidate.mv).collect(),
-            });
+            if first_blunder_ply.is_none()
+                && sampled_move_is_deblunder_candidate(&search.candidates, mv)
+            {
+                first_blunder_ply = Some(game_samples.len());
+            }
             game_samples.push(make_training_sample(
                 &position,
                 &history,
@@ -436,15 +437,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_td_lambda_value_targets(&mut game_samples, result, config.value_td_lambda);
-        rescore_early_optimistic_samples(
-            &mut game_samples,
-            &sample_contexts,
-            result,
-            model,
-            config,
-            rng.next_u64() ^ ((game_index as u64) << 48),
-        );
+        assign_deblundered_value_targets(&mut game_samples, result, first_blunder_ply, config);
         assign_moves_left_targets(&mut game_samples, config.max_plies);
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -599,66 +592,39 @@ pub(super) fn assign_td_lambda_value_targets(
     }
 }
 
-#[derive(Clone)]
-struct RescoreContext {
-    position: Position,
-    history: Vec<HistoryMove>,
-    rule_history: Vec<crate::xiangqi::RuleHistoryEntry>,
-    legal: Vec<Move>,
+fn sampled_move_is_deblunder_candidate(candidates: &[AzCandidate], mv: Move) -> bool {
+    let Some(best) = candidates
+        .iter()
+        .max_by(|left, right| left.q.total_cmp(&right.q))
+    else {
+        return false;
+    };
+    let Some(played) = candidates.iter().find(|candidate| candidate.mv == mv) else {
+        return false;
+    };
+    best.mv != played.mv && best.q - played.q >= DEBLUNDER_Q_GAP
 }
 
-fn rescore_early_optimistic_samples(
+fn assign_deblundered_value_targets(
     samples: &mut [AzTrainingSample],
-    contexts: &[RescoreContext],
     game_result_red: f32,
-    model: &AzNnue,
+    first_blunder_ply: Option<usize>,
     config: &AzLoopConfig,
-    seed: u64,
 ) {
-    if samples.is_empty() {
+    let Some(blunder_ply) = first_blunder_ply else {
+        assign_td_lambda_value_targets(samples, game_result_red, config.value_td_lambda);
+        return;
+    };
+    if blunder_ply >= samples.len() {
+        assign_td_lambda_value_targets(samples, game_result_red, config.value_td_lambda);
         return;
     }
-    let simulations = config
-        .simulations
-        .saturating_mul(EARLY_OPTIMISM_RESCORER_SIM_MULTIPLIER)
-        .max(config.simulations + 1);
-    let mut rescored = 0usize;
-    for (index, (sample, context)) in samples.iter_mut().zip(contexts).enumerate() {
-        if index >= EARLY_OPTIMISM_RESCORER_PLIES
-            || rescored >= EARLY_OPTIMISM_RESCORER_MAX_PER_GAME
-        {
-            break;
-        }
-        if sample.value <= EARLY_OPTIMISM_RESCORER_Q {
-            continue;
-        }
-        if game_result_red * sample.side_sign > 0.0 {
-            continue;
-        }
-        let search = alphazero_search_with_history_and_rules(
-            &context.position,
-            &context.history,
-            Some(context.rule_history.clone()),
-            Some(context.legal.clone()),
-            model,
-            AzSearchLimits {
-                simulations,
-                seed: seed ^ index as u64,
-                cpuct: config.cpuct,
-                max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                algorithm: AzSearchAlgorithm::AlphaZero,
-                gumbel: Default::default(),
-                value_scale: 1.0,
-            },
-        );
-        let rescored_value = (search.value_cp as f32 / VALUE_SCALE_CP).clamp(-1.0, 1.0);
-        if rescored_value < sample.value - EARLY_OPTIMISM_RESCORER_MARGIN {
-            sample.value_wdl = scalar_value_to_wdl_target(rescored_value);
-            sample.value = wdl_q(sample.value_wdl);
-            rescored += 1;
-        }
+    let boundary_red =
+        (samples[blunder_ply].value * samples[blunder_ply].side_sign).clamp(-1.0, 1.0);
+    let (prefix, suffix) = samples.split_at_mut(blunder_ply + 1);
+    assign_td_lambda_value_targets(prefix, boundary_red, config.value_td_lambda);
+    if !suffix.is_empty() {
+        assign_td_lambda_value_targets(suffix, game_result_red, config.value_td_lambda);
     }
 }
 
@@ -672,16 +638,28 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], max_pl
 }
 
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
-    if config.temperature_decay_plies == 0 || ply >= config.temperature_decay_plies {
-        return config.temperature_end;
+    if config.temperature_cutoff_plies > 0 && ply >= config.temperature_cutoff_plies {
+        return config.temperature_endgame;
     }
-    let progress = ply as f32 / config.temperature_decay_plies as f32;
-    config.temperature_start + (config.temperature_end - config.temperature_start) * progress
+    if ply < config.temperature_decay_delay_plies {
+        return config.temperature_start;
+    }
+    if config.temperature_decay_plies == 0 {
+        return config.temperature_endgame;
+    }
+    let decay_ply = ply.saturating_sub(config.temperature_decay_delay_plies);
+    if decay_ply >= config.temperature_decay_plies {
+        return config.temperature_endgame;
+    }
+    let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
+    config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
 }
 
 fn choose_selfplay_move(
     candidates: &[AzCandidate],
     temperature: f32,
+    value_cutoff: f32,
+    visit_offset: f32,
     rng: &mut SplitMix64,
 ) -> Option<Move> {
     if temperature <= 1e-6 {
@@ -695,10 +673,20 @@ fn choose_selfplay_move(
             .map(|candidate| candidate.mv);
     }
 
+    let best_q = candidates
+        .iter()
+        .map(|candidate| candidate.q)
+        .fold(f32::NEG_INFINITY, f32::max);
     let inv_temperature = 1.0 / temperature.max(1e-3);
     let weights = candidates
         .iter()
-        .map(|candidate| candidate.policy.max(1e-9).powf(inv_temperature))
+        .map(|candidate| {
+            if value_cutoff > 0.0 && best_q.is_finite() && best_q - candidate.q > value_cutoff {
+                0.0
+            } else {
+                (candidate.visits as f32 - visit_offset).max(1e-9).powf(inv_temperature)
+            }
+        })
         .collect::<Vec<_>>();
     let total = candidates
         .iter()
@@ -855,8 +843,6 @@ fn play_arena_game(
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                algorithm: Default::default(),
-                gumbel: Default::default(),
                 value_scale: 1.0,
             },
         );

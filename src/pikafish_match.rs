@@ -6,10 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{
-    AzGumbelConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits,
-    alphazero_search_with_history_and_rules,
-};
+use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
@@ -47,9 +44,7 @@ pub struct VsPikafishConfig {
     pub simulations: usize,
     pub seed: u64,
     pub parallel_games: usize,
-    pub search_algorithm: AzSearchAlgorithm,
     pub cpuct: f32,
-    pub gumbel: AzGumbelConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,9 +73,7 @@ struct GameConfig {
     max_plies: usize,
     simulations: usize,
     seed: u64,
-    search_algorithm: AzSearchAlgorithm,
     cpuct: f32,
-    gumbel: AzGumbelConfig,
 }
 
 struct ExternalUci {
@@ -307,8 +300,6 @@ fn play_one_game(
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
-                    algorithm: config.search_algorithm,
-                    gumbel: config.gumbel,
                     value_scale: 1.0,
                 },
             );
@@ -419,9 +410,7 @@ pub fn run_vs_pikafish(
                             simulations: config.simulations,
                             seed: config.seed
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                            search_algorithm: config.search_algorithm,
                             cpuct: config.cpuct,
-                            gumbel: config.gumbel,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));
