@@ -54,6 +54,20 @@ struct UciState {
     simulations: usize,
     threads: usize,
     cpuct: f32,
+    cpuct_at_root: f32,
+    cpuct_base: f32,
+    cpuct_factor: f32,
+    cpuct_base_at_root: f32,
+    cpuct_factor_at_root: f32,
+    fpu_value: f32,
+    fpu_value_at_root: f32,
+    draw_score: f32,
+    moves_left_max_effect: f32,
+    moves_left_slope: f32,
+    moves_left_threshold: f32,
+    moves_left_constant_factor: f32,
+    moves_left_scaled_factor: f32,
+    moves_left_quadratic_factor: f32,
     policy_debug: bool,
     policy_debug_limit: usize,
     seed: u64,
@@ -69,7 +83,21 @@ impl Default for UciState {
             model: None,
             simulations: 10_000,
             threads: 1,
-            cpuct: 1.5,
+            cpuct: 0.65,
+            cpuct_at_root: 2.53,
+            cpuct_base: 19652.0,
+            cpuct_factor: 2.0,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 2.0,
+            fpu_value: 0.23,
+            fpu_value_at_root: 1.0,
+            draw_score: 0.0,
+            moves_left_max_effect: 0.3,
+            moves_left_slope: 0.007,
+            moves_left_threshold: 0.8,
+            moves_left_constant_factor: 0.0,
+            moves_left_scaled_factor: 0.15,
+            moves_left_quadratic_factor: 0.85,
             policy_debug: false,
             policy_debug_limit: 16,
             seed: 20260409,
@@ -107,7 +135,7 @@ pub fn run_uci() {
             }
             Some("setoption") => handle_setoption(line, &mut state),
             Some("position") => handle_position(line, &mut state, &mut logger),
-            Some("go") => handle_go(&mut state, &mut logger),
+            Some("go") => handle_go(line, &mut state, &mut logger),
             Some("stop") => {}
             Some("quit") => {
                 ulog!(logger, "=== UCI session ended ===");
@@ -124,7 +152,21 @@ fn print_uci_id() {
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name Cpuct type string default 1.5");
+    println!("option name Cpuct type string default 0.65");
+    println!("option name CpuctAtRoot type string default 2.53");
+    println!("option name CpuctBase type string default 19652.0");
+    println!("option name CpuctFactor type string default 2.0");
+    println!("option name CpuctBaseAtRoot type string default 19652.0");
+    println!("option name CpuctFactorAtRoot type string default 2.0");
+    println!("option name FpuValue type string default 0.23");
+    println!("option name FpuValueAtRoot type string default 1.0");
+    println!("option name DrawScore type string default 0.0");
+    println!("option name MovesLeftMaxEffect type string default 0.3");
+    println!("option name MovesLeftSlope type string default 0.007");
+    println!("option name MovesLeftThreshold type string default 0.8");
+    println!("option name MovesLeftConstantFactor type string default 0.0");
+    println!("option name MovesLeftScaledFactor type string default 0.15");
+    println!("option name MovesLeftQuadraticFactor type string default 0.85");
     println!("option name PolicyDebug type check default false");
     println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
@@ -173,6 +215,75 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         }
         "cpuct" => {
             state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
+        }
+        "cpuctatroot" => {
+            state.cpuct_at_root = value.parse::<f32>().unwrap_or(state.cpuct_at_root).max(0.0);
+        }
+        "cpuctbase" => {
+            state.cpuct_base = value.parse::<f32>().unwrap_or(state.cpuct_base).max(1.0);
+        }
+        "cpuctfactor" => {
+            state.cpuct_factor = value.parse::<f32>().unwrap_or(state.cpuct_factor).max(0.0);
+        }
+        "cpuctbaseatroot" => {
+            state.cpuct_base_at_root = value
+                .parse::<f32>()
+                .unwrap_or(state.cpuct_base_at_root)
+                .max(1.0);
+        }
+        "cpuctfactoratroot" => {
+            state.cpuct_factor_at_root = value
+                .parse::<f32>()
+                .unwrap_or(state.cpuct_factor_at_root)
+                .max(0.0);
+        }
+        "fpuvalue" => {
+            state.fpu_value = value.parse::<f32>().unwrap_or(state.fpu_value).max(0.0);
+        }
+        "fpuvalueatroot" => {
+            state.fpu_value_at_root = value
+                .parse::<f32>()
+                .unwrap_or(state.fpu_value_at_root)
+                .clamp(-1.0, 1.0);
+        }
+        "drawscore" => {
+            state.draw_score = value
+                .parse::<f32>()
+                .unwrap_or(state.draw_score)
+                .clamp(-1.0, 1.0);
+        }
+        "movesleftmaxeffect" => {
+            state.moves_left_max_effect = value
+                .parse::<f32>()
+                .unwrap_or(state.moves_left_max_effect)
+                .max(0.0);
+        }
+        "movesleftslope" => {
+            state.moves_left_slope = value
+                .parse::<f32>()
+                .unwrap_or(state.moves_left_slope)
+                .max(0.0);
+        }
+        "movesleftthreshold" => {
+            state.moves_left_threshold = value
+                .parse::<f32>()
+                .unwrap_or(state.moves_left_threshold)
+                .clamp(0.0, 1.0);
+        }
+        "movesleftconstantfactor" => {
+            state.moves_left_constant_factor = value
+                .parse::<f32>()
+                .unwrap_or(state.moves_left_constant_factor);
+        }
+        "movesleftscaledfactor" => {
+            state.moves_left_scaled_factor = value
+                .parse::<f32>()
+                .unwrap_or(state.moves_left_scaled_factor);
+        }
+        "movesleftquadraticfactor" => {
+            state.moves_left_quadratic_factor = value
+                .parse::<f32>()
+                .unwrap_or(state.moves_left_quadratic_factor);
         }
         "policydebug" => {
             state.policy_debug = parse_uci_bool(&value, state.policy_debug);
@@ -303,7 +414,7 @@ fn position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry])
     )
 }
 
-fn handle_go(state: &mut UciState, logger: &mut UciLogger) {
+fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
     ensure_model(state);
     let simulations = state.simulations.max(1);
     let model = state.model.as_ref().expect("model was loaded");
@@ -373,23 +484,23 @@ fn handle_go(state: &mut UciState, logger: &mut UciLogger) {
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,
-            cpuct_at_root: state.cpuct,
-            cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
+            cpuct_at_root: state.cpuct_at_root,
+            cpuct_base: state.cpuct_base,
+            cpuct_factor: state.cpuct_factor,
+            cpuct_base_at_root: state.cpuct_base_at_root,
+            cpuct_factor_at_root: state.cpuct_factor_at_root,
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            fpu_value: 0.23,
-            fpu_value_at_root: 1.0,
-            draw_score: 0.0,
-            moves_left_max_effect: 0.0,
-            moves_left_slope: 0.0,
-            moves_left_threshold: 0.8,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.0,
-            moves_left_quadratic_factor: 0.0,
+            fpu_value: state.fpu_value,
+            fpu_value_at_root: state.fpu_value_at_root,
+            draw_score: state.draw_score,
+            moves_left_max_effect: state.moves_left_max_effect,
+            moves_left_slope: state.moves_left_slope,
+            moves_left_threshold: state.moves_left_threshold,
+            moves_left_constant_factor: state.moves_left_constant_factor,
+            moves_left_scaled_factor: state.moves_left_scaled_factor,
+            moves_left_quadratic_factor: state.moves_left_quadratic_factor,
             value_scale: 1.0,
         },
     );
