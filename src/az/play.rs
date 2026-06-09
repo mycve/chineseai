@@ -29,6 +29,8 @@ pub struct AzTerminalStats {
     pub rule_draw_mutual_long_chase: usize,
     pub rule_win_red: usize,
     pub rule_win_black: usize,
+    pub resign_red: usize,
+    pub resign_black: usize,
     pub max_plies: usize,
 }
 
@@ -44,6 +46,8 @@ impl AzTerminalStats {
         self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
         self.rule_win_red += other.rule_win_red;
         self.rule_win_black += other.rule_win_black;
+        self.resign_red += other.resign_red;
+        self.resign_black += other.resign_black;
         self.max_plies += other.max_plies;
     }
 }
@@ -280,13 +284,19 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
-        let mut position = Position::startpos();
+        let mut position = if config.opening_positions.is_empty() {
+            Position::startpos()
+        } else {
+            let index = (rng.next_u64() as usize) % config.opening_positions.len();
+            config.opening_positions[index].clone()
+        };
         let mut history = Vec::new();
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
         let mut first_blunder_ply = None;
         let mut result = None;
         let mut plies = 0usize;
+        let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
@@ -312,6 +322,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     simulations: config.simulations,
                     seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
                     cpuct: config.cpuct,
+                    cpuct_at_root: config.cpuct_at_root,
                     max_depth: 0,
                     root_dirichlet_alpha: if use_root_noise {
                         config.root_dirichlet_alpha
@@ -323,6 +334,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     } else {
                         0.0
                     },
+                    fpu_value: config.fpu_value,
+                    fpu_value_at_root: config.fpu_value_at_root,
                     value_scale: 1.0,
                 },
             );
@@ -352,6 +365,24 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             } else {
                 entropy_mid_sum += entropy;
                 entropy_mid_count += 1;
+            }
+            if allow_resign && should_resign(search.value_cp as f32 / VALUE_SCALE_CP, config) {
+                game_samples.push(make_training_sample(
+                    &position,
+                    &history,
+                    &search.candidates,
+                    search.value_cp as f32 / VALUE_SCALE_CP,
+                    config.policy_softmax_temp,
+                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                ));
+                result = Some(if position.side_to_move() == Color::Red {
+                    terminal.resign_red += 1;
+                    -1.0
+                } else {
+                    terminal.resign_black += 1;
+                    1.0
+                });
+                break;
             }
             let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
@@ -383,6 +414,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &history,
                 &search.candidates,
                 search.value_cp as f32 / VALUE_SCALE_CP,
+                config.policy_softmax_temp,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
             append_history(&mut history, &position, mv);
@@ -535,15 +567,12 @@ fn make_training_sample(
     history: &[HistoryMove],
     candidates: &[AzCandidate],
     value: f32,
+    policy_softmax_temp: f32,
     mirror_file: bool,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
-    let total_policy = candidates
-        .iter()
-        .map(|candidate| candidate.policy.max(0.0))
-        .sum::<f32>()
-        .max(1.0);
+    let policy_softmax_temp = policy_softmax_temp.max(1e-3);
     let mut features = extract_sparse_features_az_canonical(position, history);
     let mut moves = candidates
         .iter()
@@ -560,10 +589,14 @@ fn make_training_sample(
         .copied()
         .map(|mv| dense_move_index(canonical_move(side, mv)))
         .collect();
-    let policy = candidates
+    let mut policy = candidates
         .iter()
-        .map(|candidate| candidate.policy.max(0.0) / total_policy)
-        .collect();
+        .map(|candidate| candidate.policy.max(1e-12).powf(1.0 / policy_softmax_temp))
+        .collect::<Vec<_>>();
+    let total_policy = policy.iter().sum::<f32>().max(1e-12);
+    for value in &mut policy {
+        *value /= total_policy;
+    }
 
     AzTrainingSample {
         features,
@@ -626,6 +659,14 @@ fn assign_deblundered_value_targets(
     if !suffix.is_empty() {
         assign_td_lambda_value_targets(suffix, game_result_red, config.value_td_lambda);
     }
+}
+
+fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
+    if config.resign_percentage <= 0.0 {
+        return false;
+    }
+    let threshold = -(1.0 - config.resign_percentage.clamp(0.0, 100.0) / 100.0);
+    root_q <= threshold
 }
 
 pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], max_plies: usize) {
@@ -840,9 +881,12 @@ fn play_arena_game(
                 simulations,
                 seed: seed ^ ((ply as u64) << 32),
                 cpuct,
+                cpuct_at_root: cpuct,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
             },
         );
@@ -910,7 +954,7 @@ mod tests {
             .enumerate()
             .map(|(index, &mv)| candidate(mv, 1.0 / (index + 2) as f32))
             .collect::<Vec<_>>();
-        let sample = make_training_sample(&position, &[], &candidates, 0.0, true);
+        let sample = make_training_sample(&position, &[], &candidates, 0.0, 1.45, true);
 
         let mirrored_position = position.mirror_files();
         let mirrored_moves = candidates

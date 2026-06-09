@@ -562,9 +562,16 @@ pub struct AzLoopConfig {
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
     pub cpuct: f32,
+    pub cpuct_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
+    pub fpu_value: f32,
+    pub fpu_value_at_root: f32,
+    pub policy_softmax_temp: f32,
+    pub opening_positions: Vec<Position>,
+    pub resign_percentage: f32,
+    pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub value_td_lambda: f32,
 }
@@ -625,6 +632,8 @@ pub struct AzLoopReport {
     pub terminal_rule_draw_mutual_long_chase: usize,
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
+    pub terminal_resign_red: usize,
+    pub terminal_resign_black: usize,
     pub terminal_max_plies: usize,
 }
 

@@ -4,18 +4,20 @@ use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 use super::{AzEvalScratch, AzNnue, SplitMix64, VALUE_SCALE_CP};
 
 const DEFAULT_CPUCT: f32 = 1.5;
-const ALPHAZERO_FPU_REDUCTION: f32 = 0.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
     pub seed: u64,
     pub cpuct: f32,
+    pub cpuct_at_root: f32,
     /// Maximum search depth in plies below root. 0 keeps the default:
     /// max_depth = num_simulations.
     pub max_depth: usize,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub fpu_value: f32,
+    pub fpu_value_at_root: f32,
     pub value_scale: f32,
 }
 
@@ -25,9 +27,12 @@ impl Default for AzSearchLimits {
             simulations: 10_000,
             seed: 0,
             cpuct: DEFAULT_CPUCT,
+            cpuct_at_root: DEFAULT_CPUCT,
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
+            fpu_value: 0.23,
+            fpu_value_at_root: 1.0,
             value_scale: 1.0,
         }
     }
@@ -150,9 +155,12 @@ struct AzTree<'a> {
     root_moves: Option<Vec<Move>>,
     root: usize,
     cpuct: f32,
+    cpuct_at_root: f32,
     root_dirichlet_alpha: f32,
     root_exploration_fraction: f32,
     root_noise_seed: u64,
+    fpu_value: f32,
+    fpu_value_at_root: f32,
     value_scale: f32,
     max_depth: usize,
     search_depth_sum: usize,
@@ -223,9 +231,18 @@ impl<'a> AzTree<'a> {
             } else {
                 DEFAULT_CPUCT
             },
+            cpuct_at_root: if limits.cpuct_at_root > 0.0 {
+                limits.cpuct_at_root
+            } else if limits.cpuct > 0.0 {
+                limits.cpuct
+            } else {
+                DEFAULT_CPUCT
+            },
             root_dirichlet_alpha: limits.root_dirichlet_alpha.max(0.0),
             root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
             root_noise_seed: limits.seed,
+            fpu_value: limits.fpu_value.max(0.0),
+            fpu_value_at_root: limits.fpu_value_at_root.clamp(-1.0, 1.0),
             value_scale: limits.value_scale.clamp(0.0, 1.0),
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
@@ -428,15 +445,24 @@ impl<'a> AzTree<'a> {
     fn select_child(&self, node_index: usize) -> usize {
         let node = &self.nodes[node_index];
         let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
-        let fpu_value = alphazero_fpu_value(node);
+        let is_root = node_index == self.root;
+        let fpu_value = if is_root {
+            self.fpu_value_at_root
+        } else {
+            alphazero_fpu_value_reduction(node, self.fpu_value)
+        };
+        let cpuct = if is_root {
+            self.cpuct_at_root
+        } else {
+            self.cpuct
+        };
         self.nodes[node_index]
             .children
             .iter()
             .enumerate()
             .max_by(|(left_index, left_child), (right_index, right_child)| {
-                let left_score = puct_score(left_child, fpu_value, parent_visits_sqrt, self.cpuct);
-                let right_score =
-                    puct_score(right_child, fpu_value, parent_visits_sqrt, self.cpuct);
+                let left_score = puct_score(left_child, fpu_value, parent_visits_sqrt, cpuct);
+                let right_score = puct_score(right_child, fpu_value, parent_visits_sqrt, cpuct);
                 left_score
                     .total_cmp(&right_score)
                     .then_with(|| right_child.prior.total_cmp(&left_child.prior))
@@ -496,13 +522,13 @@ impl<'a> AzTree<'a> {
 
 }
 
-fn alphazero_fpu_value(node: &AzNode) -> f32 {
+fn alphazero_fpu_value_reduction(node: &AzNode, reduction: f32) -> f32 {
     let parent_q = if node.visits > 0 {
         node.value_sum / node.visits as f32
     } else {
         node.value
     };
-    if ALPHAZERO_FPU_REDUCTION <= 0.0 {
+    if reduction <= 0.0 {
         return parent_q;
     }
 
@@ -513,7 +539,7 @@ fn alphazero_fpu_value(node: &AzNode) -> f32 {
         .map(|child| child.prior.max(0.0))
         .sum::<f32>()
         .clamp(0.0, 1.0);
-    parent_q - ALPHAZERO_FPU_REDUCTION * visited_prior.sqrt()
+    (parent_q - reduction * visited_prior.sqrt()).clamp(-1.0, 1.0)
 }
 
 fn puct_score(child: &AzChild, fpu_value: f32, parent_visits_sqrt: f32, cpuct: f32) -> f32 {
@@ -698,9 +724,12 @@ mod tests {
                 simulations: 128,
                 seed: 11,
                 cpuct: 1.5,
+                cpuct_at_root: 1.5,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
             },
         );
@@ -732,9 +761,12 @@ mod tests {
                 simulations: 32,
                 seed: 13,
                 cpuct: 1.5,
+                cpuct_at_root: 1.5,
                 max_depth: 1,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
             },
         );
@@ -757,9 +789,12 @@ mod tests {
                 simulations: 1,
                 seed: 19,
                 cpuct: 1.5,
+                cpuct_at_root: 1.5,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
             },
         );
@@ -770,9 +805,12 @@ mod tests {
                 simulations: 1,
                 seed: 19,
                 cpuct: 1.5,
+                cpuct_at_root: 1.5,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.3,
                 root_exploration_fraction: 0.25,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
             },
         );

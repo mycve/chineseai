@@ -472,7 +472,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "lrm{}_lds{}_ldi{}_ldf{}_cp{}_tb{}_teg{}_tdd{}_tde{}_tco{}_tvc{}_tvo{}_rc{}_tspu{}_mp{}_cpi{}_",
+            "lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tco{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_tspu{}_mp{}_cpi{}_",
             "tepu{}_mstc{}_vtd{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
@@ -487,6 +487,10 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.lr_decay_interval,
         f32_slug(config.lr_decay_factor),
         f32_slug(config.cpuct),
+        f32_slug(config.cpuct_at_root),
+        f32_slug(config.fpu_value),
+        f32_slug(config.fpu_value_at_root),
+        f32_slug(config.policy_softmax_temp),
         f32_slug(config.temperature_start),
         f32_slug(config.temperature_endgame),
         config.temperature_decay_delay_plies,
@@ -494,6 +498,13 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.temperature_cutoff_plies,
         f32_slug(config.temperature_value_cutoff),
         f32_slug(config.temperature_visit_offset),
+        if config.opening_fens_path.trim().is_empty() {
+            "none".to_string()
+        } else {
+            format!("{:016x}", fnv1a64(config.opening_fens_path.as_bytes()))
+        },
+        f32_slug(config.resign_percentage),
+        f32_slug(config.resign_playthrough),
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
@@ -525,6 +536,15 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.seed,
         hash
     )
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 fn learning_rate_for_update(config: &AzLoopFileConfig, update: usize) -> f32 {
@@ -972,7 +992,12 @@ impl PendingTrainingData {
     }
 }
 
-fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) -> AzLoopConfig {
+fn build_az_loop_config(
+    config: &AzLoopFileConfig,
+    seed: u64,
+    workers: usize,
+    opening_positions: &[Position],
+) -> AzLoopConfig {
     AzLoopConfig {
         games: 1,
         max_plies: config.max_plies,
@@ -987,12 +1012,43 @@ fn build_az_loop_config(config: &AzLoopFileConfig, seed: u64, workers: usize) ->
         temperature_value_cutoff: config.temperature_value_cutoff,
         temperature_visit_offset: config.temperature_visit_offset,
         cpuct: config.cpuct,
+        cpuct_at_root: config.cpuct_at_root,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
         root_exploration_plies: config.root_exploration_plies,
+        fpu_value: config.fpu_value,
+        fpu_value_at_root: config.fpu_value_at_root,
+        policy_softmax_temp: config.policy_softmax_temp,
+        opening_positions: opening_positions.to_vec(),
+        resign_percentage: config.resign_percentage,
+        resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         value_td_lambda: config.value_td_lambda,
     }
+}
+
+fn load_opening_positions(path: &str) -> Vec<Position> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read opening_fens_path `{path}`: {err}"));
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            Some(Position::from_fen(line).unwrap_or_else(|err| {
+                panic!(
+                    "invalid opening FEN at `{path}` line {}: {err}",
+                    index + 1
+                )
+            }))
+        })
+        .collect()
 }
 
 fn build_async_training_report(
@@ -1093,6 +1149,8 @@ fn build_async_training_report(
         terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
+        terminal_resign_red: pending.selfplay.terminal.resign_red,
+        terminal_resign_black: pending.selfplay.terminal.resign_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
     }
 }
@@ -1344,9 +1402,12 @@ fn main() {
                     simulations,
                     seed: 0,
                     cpuct,
+                    cpuct_at_root: cpuct,
                     max_depth: cmd.max_depth,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
+                    fpu_value: 0.23,
+                    fpu_value_at_root: 1.0,
                     value_scale: 1.0,
                 },
             );
@@ -1423,9 +1484,12 @@ fn main() {
                     simulations,
                     seed: 0,
                     cpuct,
+                    cpuct_at_root: cpuct,
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
+                    fpu_value: 0.23,
+                    fpu_value_at_root: 1.0,
                     value_scale: 1.0,
                 },
             );
@@ -1582,9 +1646,12 @@ fn main() {
                     simulations,
                     seed: 0,
                     cpuct,
+                    cpuct_at_root: cpuct,
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
+                    fpu_value: 0.23,
+                    fpu_value_at_root: 1.0,
                     value_scale: 1.0,
                 },
             );
@@ -1600,9 +1667,12 @@ fn main() {
                         simulations,
                         seed: iteration as u64,
                         cpuct,
+                        cpuct_at_root: cpuct,
                         max_depth: 0,
                         root_dirichlet_alpha: 0.0,
                         root_exploration_fraction: 0.0,
+                        fpu_value: 0.23,
+                        fpu_value_at_root: 1.0,
                         value_scale: 1.0,
                     },
                 );
@@ -1766,9 +1836,16 @@ fn main() {
                     temperature_value_cutoff: cmd.temperature_value_cutoff,
                     temperature_visit_offset: cmd.temperature_visit_offset,
                     cpuct: cmd.cpuct,
+                    cpuct_at_root: 2.53,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     root_exploration_plies: cmd.temperature_decay_plies,
+                    fpu_value: 0.23,
+                    fpu_value_at_root: 1.0,
+                    policy_softmax_temp: 1.45,
+                    opening_positions: Vec::new(),
+                    resign_percentage: 0.0,
+                    resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
                 };
@@ -1973,9 +2050,16 @@ fn main() {
                     temperature_value_cutoff: cmd.temperature_value_cutoff,
                     temperature_visit_offset: cmd.temperature_visit_offset,
                     cpuct: cmd.cpuct,
+                    cpuct_at_root: 2.53,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     root_exploration_plies: cmd.temperature_decay_plies,
+                    fpu_value: 0.23,
+                    fpu_value_at_root: 1.0,
+                    policy_softmax_temp: 1.45,
+                    opening_positions: Vec::new(),
+                    resign_percentage: 0.0,
+                    resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     value_td_lambda: cmd.value_td_lambda,
                 };
@@ -2284,9 +2368,10 @@ fn main() {
                 );
             });
             let mut tb = SummaryWriter::new(&tb_dir);
+            let opening_positions = load_opening_positions(&config.opening_fens_path);
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} root_noise(alpha={},fraction={},plies={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={},plies={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_samples_per_update,
@@ -2311,9 +2396,21 @@ fn main() {
                 config.temperature_value_cutoff,
                 config.temperature_visit_offset,
                 config.cpuct,
+                config.cpuct_at_root,
+                config.fpu_value,
+                config.fpu_value_at_root,
+                config.policy_softmax_temp,
                 config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
                 config.root_exploration_plies,
+                if config.opening_fens_path.trim().is_empty() {
+                    "(none)"
+                } else {
+                    config.opening_fens_path.as_str()
+                },
+                opening_positions.len(),
+                config.resign_percentage,
+                config.resign_playthrough,
                 config.replay_capacity,
                 config.mirror_probability,
                 config.value_td_lambda,
@@ -2351,6 +2448,7 @@ fn main() {
             for worker_id in 0..config.workers.max(1) {
                 let selfplay_stop = stop_requested.clone();
                 let selfplay_config = config.clone();
+                let selfplay_opening_positions = opening_positions.clone();
                 let selfplay_tx = selfplay_tx.clone();
                 let shared_model = Arc::clone(&shared_model);
                 let selfplay_pause = Arc::clone(&selfplay_pause);
@@ -2388,7 +2486,12 @@ fn main() {
                         let batch_seed = selfplay_config.seed
                             ^ ((worker_id as u64).wrapping_add(1) << 32)
                             ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        let loop_config = build_az_loop_config(&selfplay_config, batch_seed, 1);
+                        let loop_config = build_az_loop_config(
+                            &selfplay_config,
+                            batch_seed,
+                            1,
+                            &selfplay_opening_positions,
+                        );
                         let started = Instant::now();
                         let data = generate_selfplay_data(&local_model, &loop_config);
                         let batch = SelfplayBatch {
@@ -2598,6 +2701,8 @@ fn main() {
                                         terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
+                                        terminal_resign_red: 0,
+                                        terminal_resign_black: 0,
                                         terminal_max_plies: 0,
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
@@ -2663,6 +2768,8 @@ fn main() {
                                         terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
+                                        terminal_resign_red: 0,
+                                        terminal_resign_black: 0,
                                         terminal_max_plies: 0,
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
@@ -3005,6 +3112,18 @@ fn main() {
                     "terminal/rule_win_black",
                     update,
                     report.terminal_rule_win_black as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/resign_red",
+                    update,
+                    report.terminal_resign_red as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/resign_black",
+                    update,
+                    report.terminal_resign_black as f32,
                 );
                 log_scalar(
                     &mut tb,
@@ -4010,9 +4129,12 @@ fn run_az_teacher_probe(cmd: AzTeacherProbeArgs) {
                 simulations,
                 seed: 0,
                 cpuct,
+                cpuct_at_root: cpuct,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
             },
         );

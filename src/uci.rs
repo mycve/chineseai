@@ -373,9 +373,12 @@ fn handle_go(state: &mut UciState, logger: &mut UciLogger) {
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,
+            cpuct_at_root: state.cpuct,
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
+            fpu_value: 0.23,
+            fpu_value_at_root: 1.0,
             value_scale: 1.0,
         },
     );

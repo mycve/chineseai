@@ -26,9 +26,16 @@ pub struct AzLoopFileConfig {
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
     pub cpuct: f32,
+    pub cpuct_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
+    pub fpu_value: f32,
+    pub fpu_value_at_root: f32,
+    pub policy_softmax_temp: f32,
+    pub opening_fens_path: String,
+    pub resign_percentage: f32,
+    pub resign_playthrough: f32,
     pub replay_capacity: usize,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
@@ -79,10 +86,17 @@ impl Default for AzLoopFileConfig {
             temperature_cutoff_plies: 40,
             temperature_value_cutoff: 0.15,
             temperature_visit_offset: -0.8,
-            cpuct: 1.5,
+            cpuct: 0.65,
+            cpuct_at_root: 2.53,
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.1,
             root_exploration_plies: 60,
+            fpu_value: 0.23,
+            fpu_value_at_root: 1.0,
+            policy_softmax_temp: 1.45,
+            opening_fens_path: String::new(),
+            resign_percentage: 1.0,
+            resign_playthrough: 20.0,
             replay_capacity: 500000,
             train_warmup_samples: 150000,
             train_samples_per_update: 120000,
@@ -136,9 +150,16 @@ struct AzLoopTomlConfig {
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
     pub cpuct: f32,
+    pub cpuct_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
+    pub fpu_value: f32,
+    pub fpu_value_at_root: f32,
+    pub policy_softmax_temp: f32,
+    pub opening_fens_path: String,
+    pub resign_percentage: f32,
+    pub resign_playthrough: f32,
     pub replay_capacity: usize,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
@@ -196,9 +217,16 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
             cpuct: config.cpuct,
+            cpuct_at_root: config.cpuct_at_root,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
             root_exploration_plies: config.root_exploration_plies,
+            fpu_value: config.fpu_value,
+            fpu_value_at_root: config.fpu_value_at_root,
+            policy_softmax_temp: config.policy_softmax_temp,
+            opening_fens_path: config.opening_fens_path.clone(),
+            resign_percentage: config.resign_percentage,
+            resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
@@ -252,9 +280,16 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
             cpuct: config.cpuct,
+            cpuct_at_root: config.cpuct_at_root,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
             root_exploration_plies: config.root_exploration_plies,
+            fpu_value: config.fpu_value,
+            fpu_value_at_root: config.fpu_value_at_root,
+            policy_softmax_temp: config.policy_softmax_temp,
+            opening_fens_path: config.opening_fens_path,
+            resign_percentage: config.resign_percentage,
+            resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
@@ -336,12 +371,19 @@ impl AzLoopFileConfig {
         line!("temperature_value_cutoff", f(self.temperature_value_cutoff));
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
         line!("cpuct", f(self.cpuct));
+        line!("cpuct_at_root", f(self.cpuct_at_root));
         line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
         line!(
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
         );
         line!("root_exploration_plies", self.root_exploration_plies);
+        line!("fpu_value", f(self.fpu_value));
+        line!("fpu_value_at_root", f(self.fpu_value_at_root));
+        line!("policy_softmax_temp", f(self.policy_softmax_temp));
+        line!("opening_fens_path", q(&self.opening_fens_path));
+        line!("resign_percentage", f(self.resign_percentage));
+        line!("resign_playthrough", f(self.resign_playthrough));
         line!("replay_capacity", self.replay_capacity);
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
@@ -416,9 +458,15 @@ impl AzLoopFileConfig {
         self.temperature_cutoff_plies = self.temperature_cutoff_plies.min(self.max_plies);
         self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
         self.cpuct = self.cpuct.max(0.0);
+        self.cpuct_at_root = self.cpuct_at_root.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
         self.root_exploration_plies = self.root_exploration_plies.min(self.max_plies);
+        self.fpu_value = self.fpu_value.max(0.0);
+        self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
+        self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
+        self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
+        self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
@@ -456,6 +504,14 @@ mod tests {
         assert!(text.contains("temperature_cutoff_plies = 40\n"));
         assert!(text.contains("temperature_value_cutoff = 0.15\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
+        assert!(text.contains("cpuct = 0.65\n"));
+        assert!(text.contains("cpuct_at_root = 2.53\n"));
+        assert!(text.contains("fpu_value = 0.23\n"));
+        assert!(text.contains("fpu_value_at_root = 1.0\n"));
+        assert!(text.contains("policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("opening_fens_path = \"\"\n"));
+        assert!(text.contains("resign_percentage = 1.0\n"));
+        assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("value_td_lambda = 0.95\n"));
         assert!(!text.contains("gumbel"));
         assert!(!text.contains("search_algorithm"));
