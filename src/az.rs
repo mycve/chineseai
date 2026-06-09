@@ -33,7 +33,7 @@ use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, P
 
 pub use alphazero::{
     AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search,
-    alphazero_search_with_history_and_rules,
+    alphazero_search_with_history_and_rules, lc0_cp_from_q,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -53,7 +53,6 @@ pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 const PIECE_ATTENTION_HEADS: usize = 1;
 pub(super) const PIECE_ATTENTION_SIZE: usize = 32;
 const PIECE_ATTENTION_TOTAL_SIZE: usize = PIECE_ATTENTION_HEADS * PIECE_ATTENTION_SIZE;
-const VALUE_SCALE_CP: f32 = 1000.0;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(super) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub(super) const STRUCTURAL_PIECE_SIZE: usize = 14;
@@ -563,11 +562,22 @@ pub struct AzLoopConfig {
     pub temperature_visit_offset: f32,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
+    pub cpuct_base: f32,
+    pub cpuct_factor: f32,
+    pub cpuct_base_at_root: f32,
+    pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub root_exploration_plies: usize,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
+    pub draw_score: f32,
+    pub moves_left_max_effect: f32,
+    pub moves_left_slope: f32,
+    pub moves_left_threshold: f32,
+    pub moves_left_constant_factor: f32,
+    pub moves_left_scaled_factor: f32,
+    pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
     pub opening_positions: Vec<Position>,
     pub resign_percentage: f32,
@@ -718,6 +728,13 @@ pub struct AzTrainingSample {
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
     pub side_sign: f32,
+    pub moves_left: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AzEvalOutput {
+    pub value_wdl: [f32; WDL_HEAD_SIZE],
+    pub value: f32,
     pub moves_left: f32,
 }
 
@@ -944,6 +961,17 @@ impl AzNnue {
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
+        self.evaluate_with_scratch_output(position, history, moves, scratch)
+            .value
+    }
+
+    pub(super) fn evaluate_with_scratch_output(
+        &self,
+        position: &Position,
+        history: &[HistoryMove],
+        moves: &[Move],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_with_scratch");
         let features = {
             crate::scope_profile!("az.eval.extract_features");
@@ -956,12 +984,19 @@ impl AzNnue {
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
-        let value = {
+        let value_wdl = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
+            self.value_wdl_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
+        let value = wdl_q(value_wdl);
+        let moves_left = self.moves_left_from_value_head(&scratch.value_head);
         self.square_tokens_from_features_into(&features, &mut scratch.square_tokens);
-        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch)
+        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
+        AzEvalOutput {
+            value_wdl,
+            value,
+            moves_left,
+        }
     }
 
     #[allow(dead_code)]
@@ -1318,6 +1353,12 @@ impl AzNnue {
             *logit = dot_product(value_head, row);
         }
         softmax_fixed3(logits)
+    }
+
+    fn moves_left_from_value_head(&self, value_head: &[f32]) -> f32 {
+        let logit =
+            dot_product(value_head, &self.moves_left_output) + self.moves_left_bias[0];
+        sigmoid(logit)
     }
 
     fn policy_square_scores_for_squares_into(
@@ -2008,6 +2049,16 @@ pub(super) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_H
 pub(super) fn wdl_q(wdl: [f32; WDL_HEAD_SIZE]) -> f32 {
     let wdl = normalize_wdl_target(wdl);
     wdl[0] - wdl[2]
+}
+
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        let z = (-value).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = value.exp();
+        z / (1.0 + z)
+    }
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {

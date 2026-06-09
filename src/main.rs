@@ -12,7 +12,7 @@ use chineseai::{
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights,
         AzTrainingSample, SplitMix64, alphazero_search, alphazero_search_with_history_and_rules,
         benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
-        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
+        benchmark_training, generate_selfplay_data, global_training_step_sample_count, lc0_cp_from_q,
         play_arena_games_from_positions, train_samples_weighted,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -1013,11 +1013,22 @@ fn build_az_loop_config(
         temperature_visit_offset: config.temperature_visit_offset,
         cpuct: config.cpuct,
         cpuct_at_root: config.cpuct_at_root,
+        cpuct_base: config.cpuct_base,
+        cpuct_factor: config.cpuct_factor,
+        cpuct_base_at_root: config.cpuct_base_at_root,
+        cpuct_factor_at_root: config.cpuct_factor_at_root,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
         root_exploration_plies: config.root_exploration_plies,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
+        draw_score: config.draw_score,
+        moves_left_max_effect: config.moves_left_max_effect,
+        moves_left_slope: config.moves_left_slope,
+        moves_left_threshold: config.moves_left_threshold,
+        moves_left_constant_factor: config.moves_left_constant_factor,
+        moves_left_scaled_factor: config.moves_left_scaled_factor,
+        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
@@ -1358,6 +1369,37 @@ fn load_arena_eval_positions(path: &str) -> Vec<Position> {
     positions
 }
 
+fn fixed_az_search_limits(
+    simulations: usize,
+    seed: u64,
+    cpuct: f32,
+    max_depth: usize,
+) -> AzSearchLimits {
+    AzSearchLimits {
+        simulations,
+        seed,
+        cpuct,
+        cpuct_at_root: cpuct,
+        cpuct_base: 19652.0,
+        cpuct_factor: 2.0,
+        cpuct_base_at_root: 19652.0,
+        cpuct_factor_at_root: 2.0,
+        max_depth,
+        root_dirichlet_alpha: 0.0,
+        root_exploration_fraction: 0.0,
+        fpu_value: 0.23,
+        fpu_value_at_root: 1.0,
+        draw_score: 0.0,
+        moves_left_max_effect: 0.0,
+        moves_left_slope: 0.0,
+        moves_left_threshold: 0.8,
+        moves_left_constant_factor: 0.0,
+        moves_left_scaled_factor: 0.0,
+        moves_left_quadratic_factor: 0.0,
+        value_scale: 1.0,
+    }
+}
+
 fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
@@ -1398,18 +1440,7 @@ fn main() {
             let result = alphazero_search(
                 &position,
                 &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    cpuct_at_root: cpuct,
-                    max_depth: cmd.max_depth,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: 0.23,
-                    fpu_value_at_root: 1.0,
-                    value_scale: 1.0,
-                },
+                fixed_az_search_limits(simulations, 0, cpuct, cmd.max_depth),
             );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
@@ -1480,27 +1511,16 @@ fn main() {
                 Some(rule_history.clone()),
                 Some(legal.clone()),
                 &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    cpuct_at_root: cpuct,
-                    max_depth: 0,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: 0.23,
-                    fpu_value_at_root: 1.0,
-                    value_scale: 1.0,
-                },
+                fixed_az_search_limits(simulations, 0, cpuct, 0),
             );
             println!("fen          : {}", position.to_fen());
             println!("model        : {model_path}");
             println!("side         : {:?}", position.side_to_move());
             println!("legal_moves  : {}", legal.len());
             println!(
-                "root_static  : {:.4} cp={:.0}",
+                "root_static  : {:.4} cp={}",
                 root_static,
-                root_static * 1000.0
+                lc0_cp_from_q(root_static)
             );
             println!(
                 "search       : alphazero sims={} cpuct={}",
@@ -1561,10 +1581,10 @@ fn main() {
             println!("move capture child_static_cp child_legal visits q prior policy");
             for (mv, captured, child_value, child_legal, visits, q, prior, policy) in &rows {
                 println!(
-                    "{} {} {:.0} {} {} {:.4} {:.6} {:.6}",
+                    "{} {} {} {} {} {:.4} {:.6} {:.6}",
                     mv,
                     piece_label(*captured),
-                    child_value * 1000.0,
+                    lc0_cp_from_q(*child_value),
                     child_legal,
                     visits,
                     q,
@@ -1619,10 +1639,10 @@ fn main() {
                 reply_rows.sort_by(|left, right| right.2.total_cmp(&left.2));
                 for (reply, reply_captured, reply_value, reply_fen) in reply_rows {
                     println!(
-                        "  reply {} capture={} child_static_cp={:.0} fen={}",
+                        "  reply {} capture={} child_static_cp={} fen={}",
                         reply,
                         piece_label(reply_captured),
-                        reply_value * 1000.0,
+                        lc0_cp_from_q(reply_value),
                         reply_fen
                     );
                 }
@@ -1642,18 +1662,7 @@ fn main() {
             let _ = alphazero_search(
                 &position,
                 &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    cpuct_at_root: cpuct,
-                    max_depth: 0,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: 0.23,
-                    fpu_value_at_root: 1.0,
-                    value_scale: 1.0,
-                },
+                fixed_az_search_limits(simulations, 0, cpuct, 0),
             );
 
             let started = std::time::Instant::now();
@@ -1663,18 +1672,7 @@ fn main() {
                 let result = alphazero_search(
                     &position,
                     &model,
-                    AzSearchLimits {
-                        simulations,
-                        seed: iteration as u64,
-                        cpuct,
-                        cpuct_at_root: cpuct,
-                        max_depth: 0,
-                        root_dirichlet_alpha: 0.0,
-                        root_exploration_fraction: 0.0,
-                        fpu_value: 0.23,
-                        fpu_value_at_root: 1.0,
-                        value_scale: 1.0,
-                    },
+                    fixed_az_search_limits(simulations, iteration as u64, cpuct, 0),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -1837,11 +1835,22 @@ fn main() {
                     temperature_visit_offset: cmd.temperature_visit_offset,
                     cpuct: cmd.cpuct,
                     cpuct_at_root: 2.53,
+                    cpuct_base: 19652.0,
+                    cpuct_factor: 2.0,
+                    cpuct_base_at_root: 19652.0,
+                    cpuct_factor_at_root: 2.0,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     root_exploration_plies: cmd.temperature_decay_plies,
                     fpu_value: 0.23,
                     fpu_value_at_root: 1.0,
+                    draw_score: 0.0,
+                    moves_left_max_effect: 0.3,
+                    moves_left_slope: 0.007,
+                    moves_left_threshold: 0.8,
+                    moves_left_constant_factor: 0.0,
+                    moves_left_scaled_factor: 0.15,
+                    moves_left_quadratic_factor: 0.85,
                     policy_softmax_temp: 1.45,
                     opening_positions: Vec::new(),
                     resign_percentage: 0.0,
@@ -2051,11 +2060,22 @@ fn main() {
                     temperature_visit_offset: cmd.temperature_visit_offset,
                     cpuct: cmd.cpuct,
                     cpuct_at_root: 2.53,
+                    cpuct_base: 19652.0,
+                    cpuct_factor: 2.0,
+                    cpuct_base_at_root: 19652.0,
+                    cpuct_factor_at_root: 2.0,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
                     root_exploration_plies: cmd.temperature_decay_plies,
                     fpu_value: 0.23,
                     fpu_value_at_root: 1.0,
+                    draw_score: 0.0,
+                    moves_left_max_effect: 0.3,
+                    moves_left_slope: 0.007,
+                    moves_left_threshold: 0.8,
+                    moves_left_constant_factor: 0.0,
+                    moves_left_scaled_factor: 0.15,
+                    moves_left_quadratic_factor: 0.85,
                     policy_softmax_temp: 1.45,
                     opening_positions: Vec::new(),
                     resign_percentage: 0.0,
@@ -4125,18 +4145,7 @@ fn run_az_teacher_probe(cmd: AzTeacherProbeArgs) {
         let result = alphazero_search(
             &position,
             &model,
-            AzSearchLimits {
-                simulations,
-                seed: 0,
-                cpuct,
-                cpuct_at_root: cpuct,
-                max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
-                value_scale: 1.0,
-            },
+            fixed_az_search_limits(simulations, 0, cpuct, 0),
         );
         let model_best = result
             .best_move

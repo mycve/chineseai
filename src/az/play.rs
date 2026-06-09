@@ -11,8 +11,7 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 use super::alphazero::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
-    VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
-    scalar_value_to_wdl_target, wdl_q,
+    alphazero_search_with_history_and_rules, dense_move_index, scalar_value_to_wdl_target, wdl_q,
 };
 
 const DEBLUNDER_Q_GAP: f32 = 0.15;
@@ -323,6 +322,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
                     cpuct: config.cpuct,
                     cpuct_at_root: config.cpuct_at_root,
+                    cpuct_base: config.cpuct_base,
+                    cpuct_factor: config.cpuct_factor,
+                    cpuct_base_at_root: config.cpuct_base_at_root,
+                    cpuct_factor_at_root: config.cpuct_factor_at_root,
                     max_depth: 0,
                     root_dirichlet_alpha: if use_root_noise {
                         config.root_dirichlet_alpha
@@ -336,6 +339,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     },
                     fpu_value: config.fpu_value,
                     fpu_value_at_root: config.fpu_value_at_root,
+                    draw_score: config.draw_score,
+                    moves_left_max_effect: config.moves_left_max_effect,
+                    moves_left_slope: config.moves_left_slope,
+                    moves_left_threshold: config.moves_left_threshold,
+                    moves_left_constant_factor: config.moves_left_constant_factor,
+                    moves_left_scaled_factor: config.moves_left_scaled_factor,
+                    moves_left_quadratic_factor: config.moves_left_quadratic_factor,
                     value_scale: 1.0,
                 },
             );
@@ -366,12 +376,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 entropy_mid_sum += entropy;
                 entropy_mid_count += 1;
             }
-            if allow_resign && should_resign(search.value_cp as f32 / VALUE_SCALE_CP, config) {
+            if allow_resign && should_resign(search.value_q, config) {
                 game_samples.push(make_training_sample(
                     &position,
                     &history,
                     &search.candidates,
-                    search.value_cp as f32 / VALUE_SCALE_CP,
+                    search.value_q,
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                 ));
@@ -413,7 +423,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &position,
                 &history,
                 &search.candidates,
-                search.value_cp as f32 / VALUE_SCALE_CP,
+                search.value_q,
                 config.policy_softmax_temp,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             ));
@@ -882,11 +892,22 @@ fn play_arena_game(
                 seed: seed ^ ((ply as u64) << 32),
                 cpuct,
                 cpuct_at_root: cpuct,
+                cpuct_base: 19652.0,
+                cpuct_factor: 2.0,
+                cpuct_base_at_root: 19652.0,
+                cpuct_factor_at_root: 2.0,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.23,
                 fpu_value_at_root: 1.0,
+                draw_score: 0.0,
+                moves_left_max_effect: 0.0,
+                moves_left_slope: 0.0,
+                moves_left_threshold: 0.8,
+                moves_left_constant_factor: 0.0,
+                moves_left_scaled_factor: 0.0,
+                moves_left_quadratic_factor: 0.0,
                 value_scale: 1.0,
             },
         );
