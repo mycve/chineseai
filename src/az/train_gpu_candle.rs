@@ -630,6 +630,10 @@ impl GpuReplica {
         let value = forward.values.squeeze(1)?;
         let value_error = (&value - &batch_tensors.values)?;
         let value_sse = value_error.sqr()?.sum_all()?;
+        let value_log_probs = log_softmax(&forward.value_logits, 1)?;
+        let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
+        let value_ce = value_ce_per_sample.sum(1)?;
+        let value_ce = value_ce.sum_all()?;
         let moves_left_pred = forward
             .moves_left_logits
             .tanh()?
@@ -646,7 +650,7 @@ impl GpuReplica {
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce_per_sample = policy_ce_per_sample.sum(1)?;
         let policy_ce = policy_ce_per_sample.sum_all()?;
-        let weighted_value_loss = (&value_sse * value_weight.max(0.0) as f64)?;
+        let weighted_value_loss = (&value_ce * value_weight.max(0.0) as f64)?;
         let weighted_policy_ce = (&policy_ce * policy_weight.max(0.0) as f64)?;
         let weighted_moves_left_loss = (&moves_left_sse * MOVES_LEFT_AUX_WEIGHT as f64)?;
         let loss_tensor = (((weighted_value_loss + weighted_policy_ce)?
@@ -654,12 +658,13 @@ impl GpuReplica {
             / global_batch_len as f64)?;
 
         let value_sse = value_sse.to_scalar::<f32>()?;
+        let value_ce = value_ce.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
         let stats = AzTrainStats {
-            loss: value_sse
+            loss: value_ce
                 + policy_ce
                 + moves_left_sse.to_scalar::<f32>()? * MOVES_LEFT_AUX_WEIGHT,
-            value_loss: value_sse,
+            value_loss: value_ce,
             policy_ce,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
             value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,

@@ -10,7 +10,8 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, canonical_general_buckets_from_features,
-    decode_current_piece_square_feature, structural_king_piece_index,
+    decode_current_piece_square_feature, normalize_wdl_target, structural_king_piece_index,
+    WDL_HEAD_SIZE,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -112,6 +113,7 @@ pub(super) struct PackedBatch {
     pub policy_indices: Vec<u32>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
+    pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
 }
@@ -155,6 +157,7 @@ impl PackedBatch {
             policy_indices: vec![0u32; batch_size * max_policy_moves],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
+            value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
         };
@@ -163,6 +166,9 @@ impl PackedBatch {
             let sample = &samples[sample_index];
             packed.pack_features(row, sample);
             packed.pack_policy(row, sample);
+            let wdl = normalize_wdl_target(sample.value_wdl);
+            packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE]
+                .copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.moves_left[row] = sample.moves_left.clamp(0.0, 1.0);
         }
@@ -357,6 +363,7 @@ mod tests {
             features: vec![index % AZ_NNUE_INPUT_SIZE],
             move_indices: vec![0, 1],
             policy: vec![1.0 + index as f32, 1.0],
+            value_wdl: [1.0, 0.0, 0.0],
             value: 2.0,
             side_sign: 1.0,
             moves_left: -1.0,
@@ -403,6 +410,7 @@ mod tests {
         assert_eq!(packed.policy_targets[1], 0.5);
         assert!((packed.policy_targets[2] - 2.0 / 3.0).abs() < 1.0e-6);
         assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
+        assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
         assert_eq!(packed.values, vec![1.0, 1.0]);
         assert_eq!(packed.moves_left, vec![0.0, 0.0]);
     }

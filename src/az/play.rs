@@ -10,9 +10,16 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
-    VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
+    AzCandidate, AzLoopConfig, AzNnue, AzSearchAlgorithm, AzSearchLimits, AzTrainingSample,
+    SplitMix64, VALUE_SCALE_CP, alphazero_search_with_history_and_rules, dense_move_index,
+    scalar_value_to_wdl_target, wdl_q,
 };
+
+const EARLY_OPTIMISM_RESCORER_PLIES: usize = 40;
+const EARLY_OPTIMISM_RESCORER_Q: f32 = 0.20;
+const EARLY_OPTIMISM_RESCORER_MARGIN: f32 = 0.15;
+const EARLY_OPTIMISM_RESCORER_MAX_PER_GAME: usize = 4;
+const EARLY_OPTIMISM_RESCORER_SIM_MULTIPLIER: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
@@ -281,6 +288,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut history = Vec::new();
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
+        let mut sample_contexts = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
 
@@ -363,6 +371,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 result = Some(0.0);
                 break;
             };
+            sample_contexts.push(RescoreContext {
+                position: position.clone(),
+                history: history.clone(),
+                rule_history: rule_history.clone(),
+                legal: search.candidates.iter().map(|candidate| candidate.mv).collect(),
+            });
             game_samples.push(make_training_sample(
                 &position,
                 &history,
@@ -423,6 +437,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         plies_total += plies;
 
         assign_td_lambda_value_targets(&mut game_samples, result, config.value_td_lambda);
+        rescore_early_optimistic_samples(
+            &mut game_samples,
+            &sample_contexts,
+            result,
+            model,
+            config,
+            rng.next_u64() ^ ((game_index as u64) << 48),
+        );
         assign_moves_left_targets(&mut game_samples, config.max_plies);
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -554,6 +576,7 @@ fn make_training_sample(
         features,
         move_indices,
         policy,
+        value_wdl: scalar_value_to_wdl_target(value),
         value: value.clamp(-1.0, 1.0),
         side_sign,
         moves_left: 0.0,
@@ -570,7 +593,69 @@ pub(super) fn assign_td_lambda_value_targets(
     for sample in samples.iter_mut().rev() {
         let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
         return_red = (search_red * (1.0 - lambda) + return_red * lambda).clamp(-1.0, 1.0);
-        sample.value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
+        let side_value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
+        sample.value_wdl = scalar_value_to_wdl_target(side_value);
+        sample.value = wdl_q(sample.value_wdl);
+    }
+}
+
+#[derive(Clone)]
+struct RescoreContext {
+    position: Position,
+    history: Vec<HistoryMove>,
+    rule_history: Vec<crate::xiangqi::RuleHistoryEntry>,
+    legal: Vec<Move>,
+}
+
+fn rescore_early_optimistic_samples(
+    samples: &mut [AzTrainingSample],
+    contexts: &[RescoreContext],
+    game_result_red: f32,
+    model: &AzNnue,
+    config: &AzLoopConfig,
+    seed: u64,
+) {
+    if samples.is_empty() || game_result_red > 0.0 {
+        return;
+    }
+    let simulations = config
+        .simulations
+        .saturating_mul(EARLY_OPTIMISM_RESCORER_SIM_MULTIPLIER)
+        .max(config.simulations + 1);
+    let mut rescored = 0usize;
+    for (index, (sample, context)) in samples.iter_mut().zip(contexts).enumerate() {
+        if index >= EARLY_OPTIMISM_RESCORER_PLIES
+            || rescored >= EARLY_OPTIMISM_RESCORER_MAX_PER_GAME
+        {
+            break;
+        }
+        if sample.value <= EARLY_OPTIMISM_RESCORER_Q {
+            continue;
+        }
+        let search = alphazero_search_with_history_and_rules(
+            &context.position,
+            &context.history,
+            Some(context.rule_history.clone()),
+            Some(context.legal.clone()),
+            model,
+            AzSearchLimits {
+                simulations,
+                seed: seed ^ index as u64,
+                cpuct: config.cpuct,
+                max_depth: 0,
+                root_dirichlet_alpha: 0.0,
+                root_exploration_fraction: 0.0,
+                algorithm: AzSearchAlgorithm::AlphaZero,
+                gumbel: Default::default(),
+                value_scale: 1.0,
+            },
+        );
+        let rescored_value = (search.value_cp as f32 / VALUE_SCALE_CP).clamp(-1.0, 1.0);
+        if rescored_value < sample.value - EARLY_OPTIMISM_RESCORER_MARGIN {
+            sample.value_wdl = scalar_value_to_wdl_target(rescored_value);
+            sample.value = wdl_q(sample.value_wdl);
+            rescored += 1;
+        }
     }
 }
 

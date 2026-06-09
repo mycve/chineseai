@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
-use super::{AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64};
+use super::{AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE, normalize_wdl_target};
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 20;
+const REPLAY_FILE_VERSION: u32 = 21;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -72,6 +72,9 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     for &p in &sample.policy {
         replay_push_f32(out, p);
     }
+    for &value in &normalize_wdl_target(sample.value_wdl) {
+        replay_push_f32(out, value);
+    }
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
     replay_push_f32(out, sample.moves_left);
@@ -126,6 +129,11 @@ fn decode_az_training_sample<R: Read>(
     for _ in 0..nm {
         policy.push(replay_read_f32(reader)?);
     }
+    let mut value_wdl = [0.0f32; WDL_HEAD_SIZE];
+    for value in &mut value_wdl {
+        *value = replay_read_f32(reader)?;
+    }
+    value_wdl = normalize_wdl_target(value_wdl);
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     let moves_left = replay_read_f32(reader)?;
@@ -133,6 +141,7 @@ fn decode_az_training_sample<R: Read>(
         features,
         move_indices,
         policy,
+        value_wdl,
         value,
         side_sign,
         moves_left,

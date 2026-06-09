@@ -4,6 +4,7 @@ pikafish.exe
 pikafish.nnue
 /Cargo.lock
 *.nnue
+*.safetensors
 chineseai*
 *.toml.progress
 *.replay.lz4

@@ -5,7 +5,7 @@ use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_HEADS, PIECE_ATTENTION_SIZE,
     PIECE_ATTENTION_TOTAL_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    VALUE_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features,
+    VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features,
     policy_move_sparse_indices, policy_move_to_features, policy_move_transposed_sparse_indices,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
@@ -128,12 +128,15 @@ impl AzCandleModel {
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
-        let value_head_output =
-            value_head.matmul(&self.value_head_output.reshape((VALUE_HEAD_SIZE, 1))?)?;
+        let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
         let moves_left_logits = value_head
             .matmul(&self.moves_left_output.reshape((VALUE_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
-        let values = value_head_output.tanh()?;
+        let value_log_probs = log_softmax(&value_logits, 1)?;
+        let value_probs = value_log_probs.exp()?;
+        let win = value_probs.narrow(1, 0, 1)?;
+        let loss = value_probs.narrow(1, 2, 1)?;
+        let values = (&win - &loss)?;
         let policy_bias = self.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
         let policy_from_scores = hidden.matmul(&self.policy_from_hidden.t()?)?;
         let policy_to_scores = hidden.matmul(&self.policy_to_hidden.t()?)?;
@@ -165,6 +168,7 @@ impl AzCandleModel {
 
         Ok(ForwardOutput {
             values,
+            value_logits,
             policy_logits,
             moves_left_logits,
         })
@@ -173,6 +177,7 @@ impl AzCandleModel {
 
 pub(super) struct ForwardOutput {
     pub(super) values: Tensor,
+    pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
     pub(super) moves_left_logits: Tensor,
 }
@@ -193,6 +198,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
+    pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) moves_left: Tensor,
 }
@@ -270,6 +276,7 @@ impl BatchTensors {
                 (batch_size, max_policy_moves),
                 device,
             )?,
+            value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             moves_left: Tensor::from_vec(packed.moves_left, batch_size, device)?,
         })
@@ -329,7 +336,11 @@ impl AzCandleModel {
                 device,
             )?,
             value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
-            value_head_output: var_from_slice(&model.value_head_output, VALUE_HEAD_SIZE, device)?,
+            value_head_output: var_from_slice(
+                &model.value_head_output,
+                (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
             moves_left_output: var_from_slice(&model.moves_left_output, VALUE_HEAD_SIZE, device)?,
             moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,

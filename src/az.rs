@@ -49,6 +49,7 @@ const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 64;
+pub(super) const WDL_HEAD_SIZE: usize = 3;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 const PIECE_ATTENTION_HEADS: usize = 1;
@@ -168,7 +169,7 @@ macro_rules! az_weight_tensors {
         $visit!(piece_attention_output, [$h, PIECE_ATTENTION_TOTAL_SIZE]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
-        $visit!(value_head_output, [VALUE_HEAD_SIZE]);
+        $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
         $visit!(moves_left_output, [VALUE_HEAD_SIZE]);
         $visit!(moves_left_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
@@ -705,6 +706,7 @@ pub struct AzTrainingSample {
     pub features: Vec<usize>,
     pub move_indices: Vec<usize>,
     pub policy: Vec<f32>,
+    pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
     pub side_sign: f32,
     pub moves_left: f32,
@@ -793,7 +795,7 @@ impl AzNnue {
         let value_head_bias = vec![0.0; VALUE_HEAD_SIZE];
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
-        let value_head_output = vec![0.0; VALUE_HEAD_SIZE];
+        let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
         let moves_left_output = vec![0.0; VALUE_HEAD_SIZE];
         let moves_left_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
@@ -1281,6 +1283,16 @@ impl AzNnue {
         features: &[usize],
         value_head: &mut Vec<f32>,
     ) -> f32 {
+        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head);
+        probs[0] - probs[2]
+    }
+
+    fn value_wdl_from_hidden_into(
+        &self,
+        hidden: &[f32],
+        features: &[usize],
+        value_head: &mut Vec<f32>,
+    ) -> [f32; WDL_HEAD_SIZE] {
         value_head.resize(VALUE_HEAD_SIZE, 0.0);
         value_head.copy_from_slice(&self.value_head_bias);
         for (feature, value) in value_head.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
@@ -1290,7 +1302,13 @@ impl AzNnue {
             *value = (*value).max(0.0);
         }
         let _ = features;
-        dot_product(value_head, &self.value_head_output).tanh()
+        let mut logits = [0.0f32; WDL_HEAD_SIZE];
+        for (out, logit) in logits.iter_mut().enumerate() {
+            let row = &self.value_head_output
+                [out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
+            *logit = dot_product(value_head, row);
+        }
+        softmax_fixed3(logits)
     }
 
     fn policy_square_scores_for_squares_into(
@@ -1447,6 +1465,7 @@ pub fn benchmark_training(
             features,
             move_indices,
             policy,
+            value_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign: 1.0,
             moves_left: 0.0,
@@ -1817,6 +1836,7 @@ fn generate_policy_fit_samples(
             features: extract_sparse_features_az_canonical(&position, &history),
             move_indices,
             policy,
+            value_wdl: scalar_value_to_wdl_target(value),
             value: value.clamp(-1.0, 1.0),
             side_sign: if side == Color::Red { 1.0 } else { -1.0 },
             moves_left: 0.0,
@@ -1839,15 +1859,21 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
         model.add_sparse_attention_into(&sample.features, &mut scratch.hidden);
         relu_in_place(&mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
-        let value_pred = model.value_from_hidden_into(
+        let value_wdl = model.value_wdl_from_hidden_into(
             &scratch.hidden,
             &sample.features,
             &mut scratch.value_head,
         );
+        let value_pred = value_wdl[0] - value_wdl[2];
         let value_target = sample.value.clamp(-1.0, 1.0);
         let error = value_pred - value_target;
         value_mse += error * error;
-        value_ce += error * error;
+        let value_target_wdl = normalize_wdl_target(sample.value_wdl);
+        for (&target, &pred) in value_target_wdl.iter().zip(&value_wdl) {
+            if target > 0.0 {
+                value_ce -= target * pred.max(1.0e-8).ln();
+            }
+        }
         model.policy_pair_context_into(&scratch.hidden, &mut scratch.policy_pair_context);
         model.policy_move_context_into(&scratch.hidden, &mut scratch.policy_move_context);
         scratch.logits.resize(sample.move_indices.len(), 0.0);
@@ -1927,6 +1953,52 @@ fn log_softmax_values(logits: &[f32]) -> Vec<f32> {
 fn softmax_values(logits: &[f32]) -> Vec<f32> {
     let log_probs = log_softmax_values(logits);
     log_probs.iter().map(|&value| value.exp()).collect()
+}
+
+fn softmax_fixed3(logits: [f32; 3]) -> [f32; 3] {
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut out = [
+        (logits[0] - max_logit).exp(),
+        (logits[1] - max_logit).exp(),
+        (logits[2] - max_logit).exp(),
+    ];
+    let sum = (out[0] + out[1] + out[2]).max(f32::MIN_POSITIVE);
+    out[0] /= sum;
+    out[1] /= sum;
+    out[2] /= sum;
+    out
+}
+
+pub(super) fn scalar_value_to_wdl_target(value: f32) -> [f32; 3] {
+    let value = value.clamp(-1.0, 1.0);
+    if value >= 0.0 {
+        [value, 1.0 - value, 0.0]
+    } else {
+        [0.0, 1.0 + value, -value]
+    }
+}
+
+pub(super) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_HEAD_SIZE] {
+    for value in &mut wdl {
+        *value = value.max(0.0);
+    }
+    let sum = wdl.iter().sum::<f32>();
+    if sum.is_finite() && sum > 1.0e-6 {
+        for value in &mut wdl {
+            *value /= sum;
+        }
+        wdl
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+pub(super) fn wdl_q(wdl: [f32; WDL_HEAD_SIZE]) -> f32 {
+    let wdl = normalize_wdl_target(wdl);
+    wdl[0] - wdl[2]
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {
@@ -2414,6 +2486,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
         features: vec![1, 2, 3],
         move_indices: vec![0, 1],
         policy: vec![0.6, 0.4],
+        value_wdl: scalar_value_to_wdl_target(0.1),
         value: 0.1,
         side_sign: 1.0,
         moves_left: 0.0,
@@ -2522,6 +2595,7 @@ mod tests {
                 features: Vec::new(),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-0.5),
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2530,6 +2604,7 @@ mod tests {
                 features: Vec::new(),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.5),
                 value: 0.5,
                 side_sign: -1.0,
                 moves_left: 0.0,
@@ -2549,6 +2624,7 @@ mod tests {
                 features: Vec::new(),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-0.5),
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2557,6 +2633,7 @@ mod tests {
                 features: Vec::new(),
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.5),
                 value: 0.5,
                 side_sign: -1.0,
                 moves_left: 0.0,
@@ -2612,6 +2689,7 @@ mod tests {
                 features: vec![0],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2620,6 +2698,7 @@ mod tests {
                 features: vec![1],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2628,6 +2707,7 @@ mod tests {
                 features: vec![2],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.75),
                 value: 0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2636,6 +2716,7 @@ mod tests {
                 features: vec![3],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-0.75),
                 value: -0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2658,6 +2739,7 @@ mod tests {
                 features: vec![0, 4, 8],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2666,6 +2748,7 @@ mod tests {
                 features: vec![1, 5, 9],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2674,6 +2757,7 @@ mod tests {
                 features: vec![2, 6, 10],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.5),
                 value: 0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2682,6 +2766,7 @@ mod tests {
                 features: vec![3, 7, 11],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-0.5),
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2718,6 +2803,7 @@ mod tests {
                 features: vec![0, 4, 8],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2726,6 +2812,7 @@ mod tests {
                 features: vec![1, 5, 9],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2734,6 +2821,7 @@ mod tests {
                 features: vec![2, 6, 10],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.75),
                 value: 0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
@@ -2742,6 +2830,7 @@ mod tests {
                 features: vec![3, 7, 11],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-0.75),
                 value: -0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
