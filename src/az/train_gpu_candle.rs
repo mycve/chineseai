@@ -661,9 +661,7 @@ impl GpuReplica {
         let value_ce = value_ce.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
         let stats = AzTrainStats {
-            loss: value_ce
-                + policy_ce
-                + moves_left_sse.to_scalar::<f32>()? * MOVES_LEFT_AUX_WEIGHT,
+            loss: value_ce + policy_ce + moves_left_sse.to_scalar::<f32>()? * MOVES_LEFT_AUX_WEIGHT,
             value_loss: value_ce,
             policy_ce,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,

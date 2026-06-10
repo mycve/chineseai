@@ -396,11 +396,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
             let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
-                search
-                    .best_move
-                    .or_else(|| {
-                        choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
-                    })
+                search.best_move.or_else(|| {
+                    choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
+                })
             } else {
                 choose_selfplay_move(
                     &search.candidates,
@@ -735,7 +733,9 @@ fn choose_selfplay_move(
             if value_cutoff > 0.0 && best_q.is_finite() && best_q - candidate.q > value_cutoff {
                 0.0
             } else {
-                (candidate.visits as f32 - visit_offset).max(1e-9).powf(inv_temperature)
+                (candidate.visits as f32 - visit_offset)
+                    .max(1e-9)
+                    .powf(inv_temperature)
             }
         })
         .collect::<Vec<_>>();

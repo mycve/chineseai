@@ -64,13 +64,7 @@ pub struct AzLoopFileConfig {
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
-    pub arena_pikafish_exe: String,
-    pub arena_pikafish_start_update: usize,
-    pub arena_pikafish_depth: u32,
-    pub arena_pikafish_games: usize,
-    pub arena_pikafish_parallel_games: usize,
-    pub arena_pikafish_promotion_rate: f32,
-    pub arena_pikafish_eval_fens: String,
+    pub arena_eval_fens: String,
     pub tensorboard_logdir: String,
 }
 
@@ -136,13 +130,7 @@ impl Default for AzLoopFileConfig {
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_processes: 100,
-            arena_pikafish_exe: String::new(),
-            arena_pikafish_start_update: 1,
-            arena_pikafish_depth: 1,
-            arena_pikafish_games: 200,
-            arena_pikafish_parallel_games: 100,
-            arena_pikafish_promotion_rate: 0.60,
-            arena_pikafish_eval_fens: "eval_fens.txt".into(),
+            arena_eval_fens: "eval_fens.txt".into(),
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -210,12 +198,20 @@ struct AzLoopTomlConfig {
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
+    pub arena_eval_fens: String,
+    #[serde(skip_serializing)]
     pub arena_pikafish_exe: String,
+    #[serde(skip_serializing)]
     pub arena_pikafish_start_update: usize,
+    #[serde(skip_serializing)]
     pub arena_pikafish_depth: u32,
+    #[serde(skip_serializing)]
     pub arena_pikafish_games: usize,
+    #[serde(skip_serializing)]
     pub arena_pikafish_parallel_games: usize,
+    #[serde(skip_serializing)]
     pub arena_pikafish_promotion_rate: f32,
+    #[serde(skip_serializing)]
     pub arena_pikafish_eval_fens: String,
     pub tensorboard_logdir: String,
 }
@@ -288,13 +284,14 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
-            arena_pikafish_exe: config.arena_pikafish_exe.clone(),
-            arena_pikafish_start_update: config.arena_pikafish_start_update,
-            arena_pikafish_depth: config.arena_pikafish_depth,
-            arena_pikafish_games: config.arena_pikafish_games,
-            arena_pikafish_parallel_games: config.arena_pikafish_parallel_games,
-            arena_pikafish_promotion_rate: config.arena_pikafish_promotion_rate,
-            arena_pikafish_eval_fens: config.arena_pikafish_eval_fens.clone(),
+            arena_eval_fens: config.arena_eval_fens.clone(),
+            arena_pikafish_exe: String::new(),
+            arena_pikafish_start_update: 1,
+            arena_pikafish_depth: 1,
+            arena_pikafish_games: 1,
+            arena_pikafish_parallel_games: 1,
+            arena_pikafish_promotion_rate: 0.0,
+            arena_pikafish_eval_fens: String::new(),
             tensorboard_logdir: config.tensorboard_logdir.clone(),
         }
     }
@@ -362,13 +359,11 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
-            arena_pikafish_exe: config.arena_pikafish_exe,
-            arena_pikafish_start_update: config.arena_pikafish_start_update,
-            arena_pikafish_depth: config.arena_pikafish_depth,
-            arena_pikafish_games: config.arena_pikafish_games,
-            arena_pikafish_parallel_games: config.arena_pikafish_parallel_games,
-            arena_pikafish_promotion_rate: config.arena_pikafish_promotion_rate,
-            arena_pikafish_eval_fens: config.arena_pikafish_eval_fens,
+            arena_eval_fens: if config.arena_eval_fens.trim().is_empty() {
+                config.arena_pikafish_eval_fens
+            } else {
+                config.arena_eval_fens
+            },
             tensorboard_logdir: config.tensorboard_logdir,
         }
     }
@@ -476,25 +471,7 @@ impl AzLoopFileConfig {
             f(self.arena_promotion_confidence_z)
         );
         line!("arena_processes", self.arena_processes);
-        line!("arena_pikafish_exe", q(&self.arena_pikafish_exe));
-        line!(
-            "arena_pikafish_start_update",
-            self.arena_pikafish_start_update
-        );
-        line!("arena_pikafish_depth", self.arena_pikafish_depth);
-        line!("arena_pikafish_games", self.arena_pikafish_games);
-        line!(
-            "arena_pikafish_parallel_games",
-            self.arena_pikafish_parallel_games
-        );
-        line!(
-            "arena_pikafish_promotion_rate",
-            f(self.arena_pikafish_promotion_rate)
-        );
-        line!(
-            "arena_pikafish_eval_fens",
-            q(&self.arena_pikafish_eval_fens)
-        );
+        line!("arena_eval_fens", q(&self.arena_eval_fens));
         line!("tensorboard_logdir", q(&self.tensorboard_logdir));
         out
     }
@@ -524,8 +501,7 @@ impl AzLoopFileConfig {
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_endgame = self.temperature_endgame.max(0.0);
-        self.temperature_decay_delay_plies =
-            self.temperature_decay_delay_plies.min(self.max_plies);
+        self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
         self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
         self.temperature_cutoff_plies = self.temperature_cutoff_plies.min(self.max_plies);
         self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
@@ -559,11 +535,6 @@ impl AzLoopFileConfig {
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
-        self.arena_pikafish_start_update = self.arena_pikafish_start_update.max(1);
-        self.arena_pikafish_depth = self.arena_pikafish_depth.max(1);
-        self.arena_pikafish_games = self.arena_pikafish_games.max(1);
-        self.arena_pikafish_parallel_games = self.arena_pikafish_parallel_games.max(1);
-        self.arena_pikafish_promotion_rate = self.arena_pikafish_promotion_rate.clamp(0.0, 1.0);
         self
     }
 }
@@ -606,6 +577,7 @@ mod tests {
         assert!(text.contains("value_td_lambda = 0.95\n"));
         assert!(!text.contains("gumbel"));
         assert!(!text.contains("search_algorithm"));
+        assert!(!text.contains("arena_pikafish"));
         assert!(!text.contains("000000047"));
         assert!(!text.contains("000000023"));
 
@@ -613,6 +585,19 @@ mod tests {
         assert_eq!(parsed.model_path, "model.safetensors");
         assert!((parsed.lr - 0.0005).abs() < 1e-9);
         assert!((parsed.value_td_lambda - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn old_pikafish_eval_fens_config_field_maps_to_internal_arena_fens() {
+        let mut text = AzLoopFileConfig::default().to_file_text();
+        text = text.replace(
+            "arena_eval_fens = \"eval_fens.txt\"",
+            "arena_eval_fens = \"\"\narena_pikafish_eval_fens = \"old_eval.txt\"",
+        );
+
+        let parsed = AzLoopFileConfig::parse(&text);
+
+        assert_eq!(parsed.arena_eval_fens, "old_eval.txt");
     }
 }
 

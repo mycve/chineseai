@@ -9,9 +9,8 @@ use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE};
 
 use super::{
-    AzTrainingSample, DENSE_MOVE_SPACE, canonical_general_buckets_from_features,
+    AzTrainingSample, DENSE_MOVE_SPACE, WDL_HEAD_SIZE, canonical_general_buckets_from_features,
     decode_current_piece_square_feature, normalize_wdl_target, structural_king_piece_index,
-    WDL_HEAD_SIZE,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -167,8 +166,7 @@ impl PackedBatch {
             packed.pack_features(row, sample);
             packed.pack_policy(row, sample);
             let wdl = normalize_wdl_target(sample.value_wdl);
-            packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE]
-                .copy_from_slice(&wdl);
+            packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.moves_left[row] = sample.moves_left.clamp(0.0, 1.0);
         }

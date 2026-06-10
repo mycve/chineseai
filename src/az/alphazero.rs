@@ -1,4 +1,4 @@
-﻿use crate::nnue::HistoryMove;
+use crate::nnue::HistoryMove;
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 use super::{AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
@@ -126,7 +126,10 @@ pub fn alphazero_search_with_history_and_rules(
 
     let root_node = &tree.nodes[root];
     let searched_value = if root_node.visits > 0 {
-        wdl_q_with_draw(average_wdl(root_node.value_wdl_sum, root_node.visits), tree.draw_score)
+        wdl_q_with_draw(
+            average_wdl(root_node.value_wdl_sum, root_node.visits),
+            tree.draw_score,
+        )
     } else {
         wdl_q_with_draw(root_node.value_wdl, tree.draw_score)
     };
@@ -609,8 +612,10 @@ impl<'a> AzTree<'a> {
             .iter()
             .enumerate()
             .max_by(|(left_index, left_child), (right_index, right_child)| {
-                let left_score = self.child_score(node, left_child, fpu_value, parent_visits_sqrt, cpuct);
-                let right_score = self.child_score(node, right_child, fpu_value, parent_visits_sqrt, cpuct);
+                let left_score =
+                    self.child_score(node, left_child, fpu_value, parent_visits_sqrt, cpuct);
+                let right_score =
+                    self.child_score(node, right_child, fpu_value, parent_visits_sqrt, cpuct);
                 left_score
                     .total_cmp(&right_score)
                     .then_with(|| left_child.prior.total_cmp(&right_child.prior))
@@ -629,7 +634,11 @@ impl<'a> AzTree<'a> {
                 left_child
                     .visits
                     .cmp(&right_child.visits)
-                    .then_with(|| left_child.q(self.draw_score).total_cmp(&right_child.q(self.draw_score)))
+                    .then_with(|| {
+                        left_child
+                            .q(self.draw_score)
+                            .total_cmp(&right_child.q(self.draw_score))
+                    })
                     .then_with(|| left_child.prior.total_cmp(&right_child.prior))
                     .then_with(|| right_index.cmp(left_index))
             })
@@ -735,7 +744,6 @@ impl<'a> AzTree<'a> {
             .map(|child| child.prior / total_prior)
             .collect()
     }
-
 }
 
 fn alphazero_fpu_value_reduction(node: &AzNode, reduction: f32, draw_score: f32) -> f32 {

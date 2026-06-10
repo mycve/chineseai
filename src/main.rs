@@ -9,10 +9,10 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSearchLimits, AzSelfplayData, AzTrainLossWeights,
-        AzTrainingSample, SplitMix64, alphazero_search, alphazero_search_with_history_and_rules,
-        benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
-        benchmark_training, generate_selfplay_data, global_training_step_sample_count, lc0_cp_from_q,
+        AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
+        alphazero_search, alphazero_search_with_history_and_rules, benchmark_fixed_policy_fit,
+        benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit, benchmark_training,
+        generate_selfplay_data, global_training_step_sample_count, lc0_cp_from_q,
         play_arena_games_from_positions, train_samples_weighted,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -396,7 +396,9 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
 struct AzLoopProgressState {
     next_update: usize,
     best_elo: f32,
+    #[serde(skip_serializing)]
     pikafish_depth: u32,
+    #[serde(skip_serializing)]
     pikafish_best_wins: usize,
 }
 
@@ -414,7 +416,6 @@ impl Default for AzLoopProgressState {
 impl AzLoopProgressState {
     fn normalize(mut self) -> Self {
         self.next_update = self.next_update.max(1);
-        self.pikafish_depth = self.pikafish_depth.max(1);
         if !self.best_elo.is_finite() {
             self.best_elo = 1500.0;
         }
@@ -441,20 +442,13 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
-fn save_az_loop_progress_pair(
-    config_path: &str,
-    next_update: usize,
-    best_elo: f32,
-    pikafish_depth: u32,
-    pikafish_best_wins: usize,
-) {
+fn save_az_loop_progress_pair(config_path: &str, next_update: usize, best_elo: f32) {
     save_az_loop_progress(
         config_path,
         &AzLoopProgressState {
             next_update,
             best_elo,
-            pikafish_depth,
-            pikafish_best_wins,
+            ..Default::default()
         },
     );
 }
@@ -667,14 +661,6 @@ fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> Pat
         .and_then(|name| name.to_str())
         .unwrap_or("model.safetensors");
     Path::new(checkpoint_dir).join(format!("update-{update:06}-{base}"))
-}
-
-fn arena_pikafish_candidate_path(model_path: &str, checkpoint_dir: &str, update: usize) -> PathBuf {
-    let base = Path::new(model_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("model.safetensors");
-    Path::new(checkpoint_dir).join(format!("arena-pikafish-candidate-{update:04}-{base}"))
 }
 
 fn save_checkpoint_model(
@@ -1074,10 +1060,7 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
                 return None;
             }
             Some(Position::from_fen(line).unwrap_or_else(|err| {
-                panic!(
-                    "invalid opening FEN at `{path}` line {}: {err}",
-                    index + 1
-                )
+                panic!("invalid opening FEN at `{path}` line {}: {err}", index + 1)
             }))
         })
         .collect()
@@ -2313,10 +2296,6 @@ fn main() {
             let progress_boot = load_az_loop_progress(&config_path);
             let start_update = progress_boot.next_update.max(1);
             let mut arena_best_elo = progress_boot.best_elo;
-            let mut arena_pikafish_depth = progress_boot
-                .pikafish_depth
-                .max(config.arena_pikafish_depth.max(1));
-            let mut arena_pikafish_best_wins = progress_boot.pikafish_best_wins;
             if let Some(target_update) = target_update
                 && start_update > target_update
             {
@@ -2328,12 +2307,10 @@ fn main() {
             }
             if start_update > 1 {
                 println!(
-                    "resume   : update starts at {} (from `{}`) arena_ref_elo={:.1} pikafish_depth={} pikafish_best_wins={}",
+                    "resume   : update starts at {} (from `{}`) arena_ref_elo={:.1}",
                     start_update,
                     az_loop_progress_path(&config_path).display(),
-                    arena_best_elo,
-                    arena_pikafish_depth,
-                    arena_pikafish_best_wins
+                    arena_best_elo
                 );
             }
             let best_path = best_model_path(&config.model_path);
@@ -2438,7 +2415,7 @@ fn main() {
             let opening_positions = load_opening_positions(&config.opening_fens_path);
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={},plies={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} arena_pikafish(exe={},start_update={},depth={},games={},parallel={},promotion_rate={},eval_fens={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={},plies={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_samples_per_update,
@@ -2490,14 +2467,7 @@ fn main() {
                 config.arena_promotion_rate,
                 config.arena_promotion_confidence_z,
                 config.arena_processes,
-                config.arena_pikafish_eval_fens,
-                config.arena_pikafish_exe,
-                config.arena_pikafish_start_update,
-                config.arena_pikafish_depth,
-                config.arena_pikafish_games,
-                config.arena_pikafish_parallel_games,
-                config.arena_pikafish_promotion_rate,
-                config.arena_pikafish_eval_fens,
+                config.arena_eval_fens,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
@@ -3213,134 +3183,9 @@ fn main() {
                         pause_state.arena_paused = true;
                     }
                     println!("pause    : selfplay paused for arena");
-                    let pikafish_arena_enabled = !config.arena_pikafish_exe.trim().is_empty();
-                    let use_pikafish_arena =
-                        pikafish_arena_enabled && update >= config.arena_pikafish_start_update;
-                    if pikafish_arena_enabled && !use_pikafish_arena {
-                        arena_reference_model = candidate_model.clone();
-                        {
-                            let mut shared = shared_model
-                                .write()
-                                .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                            shared.model = candidate_model.clone();
-                            shared.version = shared.version.wrapping_add(1);
-                        }
-                        save_model(&candidate_model, &best_path);
-                        println!(
-                            "arena-warmup {update:04}: before_pikafish_start={} adopt=current saved_best",
-                            config.arena_pikafish_start_update
-                        );
-                        log_scalar(&mut tb, "arena_warmup/adopted_latest", update, 1.0);
-                    } else if use_pikafish_arena {
-                        let candidate_path = arena_pikafish_candidate_path(
-                            &config.model_path,
-                            &config.checkpoint_dir,
-                            update,
-                        );
-                        save_model(&candidate_model, &candidate_path);
+                    {
                         let arena_eval_positions =
-                            load_arena_eval_positions(&config.arena_pikafish_eval_fens);
-                        let arena_eval_fens = arena_eval_positions.len();
-                        let eval_pikafish_depth = arena_pikafish_depth.max(1);
-                        let summary = run_vs_pikafish(
-                            Path::new(&config.arena_pikafish_exe),
-                            &candidate_path,
-                            &arena_eval_positions,
-                            VsPikafishConfig {
-                                pikafish_depth: eval_pikafish_depth,
-                                total_games: config.arena_pikafish_games,
-                                max_plies: config.max_plies,
-                                simulations: config.simulations,
-                                seed: config.seed
-                                    ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                                parallel_games: config.arena_pikafish_parallel_games,
-                                cpuct: config.arena_cpuct,
-                            },
-                        )
-                        .unwrap_or_else(|err| panic!("arena pikafish failed: {err}"));
-                        let wins = summary.chinese_wins;
-                        let win_rate = wins as f32 / summary.total_games.max(1) as f32;
-                        let promoted = wins >= arena_pikafish_best_wins;
-                        let old_best_wins = arena_pikafish_best_wins;
-                        if promoted {
-                            arena_reference_model = candidate_model.clone();
-                            {
-                                let mut shared = shared_model
-                                    .write()
-                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                                shared.model = candidate_model.clone();
-                                shared.version = shared.version.wrapping_add(1);
-                            }
-                            save_model(&candidate_model, &best_path);
-                            arena_pikafish_best_wins = wins;
-                            if win_rate > config.arena_pikafish_promotion_rate {
-                                arena_pikafish_depth = arena_pikafish_depth.saturating_add(1);
-                                arena_pikafish_best_wins = 0;
-                            }
-                        }
-                        println!(
-                            "arena-pikafish {update:04}: model={} total={} fens={} W/L/D={}/{}/{} as_red={} as_black={} win_rate={:.3} min_wins={} depth={} promote_at_wins>=previous promote_depth_at>{:.3}{} next_depth={} next_min_wins={}",
-                            candidate_path.display(),
-                            summary.total_games,
-                            arena_eval_fens,
-                            summary.chinese_wins,
-                            summary.chinese_losses,
-                            summary.draws,
-                            summary.chinese_wins_as_red,
-                            summary.chinese_wins_as_black,
-                            win_rate,
-                            old_best_wins,
-                            eval_pikafish_depth,
-                            config.arena_pikafish_promotion_rate,
-                            if promoted {
-                                " promoted=current saved_best"
-                            } else {
-                                ""
-                            },
-                            arena_pikafish_depth,
-                            arena_pikafish_best_wins
-                        );
-                        log_scalar(
-                            &mut tb,
-                            "arena_pikafish/wins",
-                            update,
-                            summary.chinese_wins as f32,
-                        );
-                        log_scalar(
-                            &mut tb,
-                            "arena_pikafish/losses",
-                            update,
-                            summary.chinese_losses as f32,
-                        );
-                        log_scalar(
-                            &mut tb,
-                            "arena_pikafish/draws",
-                            update,
-                            summary.draws as f32,
-                        );
-                        log_scalar(&mut tb, "arena_pikafish/win_rate", update, win_rate);
-                        log_scalar(
-                            &mut tb,
-                            "arena_pikafish/depth",
-                            update,
-                            arena_pikafish_depth as f32,
-                        );
-                        log_scalar(
-                            &mut tb,
-                            "arena_pikafish/best_wins",
-                            update,
-                            arena_pikafish_best_wins as f32,
-                        );
-                        log_scalar(
-                            &mut tb,
-                            "arena_pikafish/promoted",
-                            update,
-                            if promoted { 1.0 } else { 0.0 },
-                        );
-                        let _ = fs::remove_file(&candidate_path);
-                    } else {
-                        let arena_eval_positions =
-                            load_arena_eval_positions(&config.arena_pikafish_eval_fens);
+                            load_arena_eval_positions(&config.arena_eval_fens);
                         let arena_eval_fens = arena_eval_positions.len();
                         let arena_mode = if arena_eval_fens == 0 {
                             "startpos_fallback"
@@ -3505,8 +3350,6 @@ fn main() {
                         &config_path,
                         interrupt_save_next_update,
                         arena_best_elo,
-                        arena_pikafish_depth,
-                        arena_pikafish_best_wins,
                     );
                     println!(
                         "model    : {} save `{}` next_update={}",

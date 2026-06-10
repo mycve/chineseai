@@ -1348,16 +1348,14 @@ impl AzNnue {
         let _ = features;
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
-            let row = &self.value_head_output
-                [out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
+            let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
             *logit = dot_product(value_head, row);
         }
         softmax_fixed3(logits)
     }
 
     fn moves_left_from_value_head(&self, value_head: &[f32]) -> f32 {
-        let logit =
-            dot_product(value_head, &self.moves_left_output) + self.moves_left_bias[0];
+        let logit = dot_product(value_head, &self.moves_left_output) + self.moves_left_bias[0];
         sigmoid(logit)
     }
 
@@ -2006,10 +2004,7 @@ fn softmax_values(logits: &[f32]) -> Vec<f32> {
 }
 
 fn softmax_fixed3(logits: [f32; 3]) -> [f32; 3] {
-    let max_logit = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut out = [
         (logits[0] - max_logit).exp(),
         (logits[1] - max_logit).exp(),
