@@ -178,7 +178,7 @@ pub fn alphazero_search(
 
 pub fn lc0_cp_from_q(q: f32) -> i32 {
     let q = q.clamp(-0.999, 0.999);
-    (90.0 * (1.5637541897 * q).tan()).round() as i32
+    (220.0 * (1.5637541897 * q).tan()).round() as i32
 }
 
 struct AzTree<'a> {
