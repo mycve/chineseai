@@ -2346,8 +2346,11 @@ fn main() {
                 println!("model    : init {}", config.model_path);
                 AzNnue::random_with_arch(config_arch, config.seed)
             };
-            let selfplay_model = if config.arena_interval == 0 {
-                println!("selfplay : start from current `{}`", config.model_path);
+            let selfplay_model = {
+                println!("selfplay : start from latest `{}`", config.model_path);
+                model.clone()
+            };
+            let initial_arena_reference_model = if config.arena_interval == 0 {
                 model.clone()
             } else {
                 if !best_path.exists() {
@@ -2478,7 +2481,7 @@ fn main() {
                 version: 0,
                 model: selfplay_model.clone(),
             }));
-            let mut arena_reference_model = selfplay_model.clone();
+            let mut arena_reference_model = initial_arena_reference_model;
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
             let mut selfplay_handles = Vec::with_capacity(config.workers.max(1));
@@ -3168,13 +3171,14 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                if config.arena_interval == 0 {
+                {
                     let mut shared = shared_model
                         .write()
                         .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
                     shared.model = candidate_model.clone();
                     shared.version = shared.version.wrapping_add(1);
-                } else if update.is_multiple_of(config.arena_interval) {
+                }
+                if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
                         let (pause_lock, _) = &*selfplay_pause;
                         let mut pause_state = pause_lock
@@ -3216,13 +3220,6 @@ fn main() {
                         );
                         if promoted {
                             arena_reference_model = candidate_model.clone();
-                            {
-                                let mut shared = shared_model
-                                    .write()
-                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                                shared.model = candidate_model.clone();
-                                shared.version = shared.version.wrapping_add(1);
-                            }
                             save_model(&candidate_model, &best_path);
                             arena_best_elo = candidate_elo;
                         }
