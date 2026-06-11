@@ -1124,6 +1124,7 @@ fn build_async_training_report(
         pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
     let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
+    let sampled_moves = pending.selfplay.sampled_moves.max(1) as f32;
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1183,6 +1184,12 @@ fn build_async_training_report(
         opening_q_top1_abs: pending.selfplay.opening_q_top1_abs_sum / opening_shape_count,
         opening_visited_actions: pending.selfplay.opening_visited_actions_sum as f32
             / opening_shape_count,
+        sampled_best_rate: pending.selfplay.sampled_best_moves as f32 / sampled_moves,
+        deblunder_rate: pending.selfplay.deblundered_moves as f32 / sampled_moves,
+        avg_best_played_q_gap: pending.selfplay.best_played_q_gap_sum / sampled_moves,
+        avg_best_played_visit_ratio: pending.selfplay.best_played_visit_ratio_sum / sampled_moves,
+        avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
+        avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
         selfplay_seconds: pending.selfplay_seconds,
         train_seconds,
         total_seconds,
@@ -2766,6 +2773,12 @@ fn main() {
                                         opening_q_gap: 0.0,
                                         opening_q_top1_abs: 0.0,
                                         opening_visited_actions: 0.0,
+                                        sampled_best_rate: 0.0,
+                                        deblunder_rate: 0.0,
+                                        avg_best_played_q_gap: 0.0,
+                                        avg_best_played_visit_ratio: 0.0,
+                                        avg_best_q: 0.0,
+                                        avg_played_q: 0.0,
                                         selfplay_seconds: 0.0,
                                         train_seconds: 0.0,
                                         total_seconds: 0.0,
@@ -2833,6 +2846,12 @@ fn main() {
                                         opening_q_gap: 0.0,
                                         opening_q_top1_abs: 0.0,
                                         opening_visited_actions: 0.0,
+                                        sampled_best_rate: 0.0,
+                                        deblunder_rate: 0.0,
+                                        avg_best_played_q_gap: 0.0,
+                                        avg_best_played_visit_ratio: 0.0,
+                                        avg_best_q: 0.0,
+                                        avg_played_q: 0.0,
                                         selfplay_seconds: 0.0,
                                         train_seconds: 0.0,
                                         total_seconds: 0.0,
@@ -2895,7 +2914,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} value_rmse={:.4} v_mu={:.3}/{:.3} v_rms={:.3}/{:.3} v_corr={:.3} v_cal={:.3} policy_ce={:.4} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} openRawP={:.3}/{:.3} openTgtP={:.3}/{:.3} openQgap={:.3} openQabs={:.3} openVisitA={:.1} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} value_rmse={:.4} v_mu={:.3}/{:.3} v_rms={:.3}/{:.3} v_corr={:.3} v_cal={:.3} policy_ce={:.4} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} openRawP={:.3}/{:.3} openTgtP={:.3}/{:.3} openQgap={:.3} openQabs={:.3} openVisitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -2941,6 +2960,12 @@ fn main() {
                     report.opening_q_gap,
                     report.opening_q_top1_abs,
                     report.opening_visited_actions,
+                    report.sampled_best_rate,
+                    report.deblunder_rate,
+                    report.avg_best_played_q_gap,
+                    report.avg_best_played_visit_ratio,
+                    report.avg_best_q,
+                    report.avg_played_q,
                     report.train_seconds,
                     report.games_per_second,
                     report.samples_per_second,
@@ -3087,6 +3112,32 @@ fn main() {
                     update,
                     report.opening_visited_actions,
                 );
+                log_scalar(
+                    &mut tb,
+                    "stats/sampled_best_rate",
+                    update,
+                    report.sampled_best_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "stats/deblunder_rate",
+                    update,
+                    report.deblunder_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "stats/avg_best_played_q_gap",
+                    update,
+                    report.avg_best_played_q_gap,
+                );
+                log_scalar(
+                    &mut tb,
+                    "stats/avg_best_played_visit_ratio",
+                    update,
+                    report.avg_best_played_visit_ratio,
+                );
+                log_scalar(&mut tb, "stats/avg_best_q", update, report.avg_best_q);
+                log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
                 log_scalar(
                     &mut tb,
                     "selfplay/games_per_second",

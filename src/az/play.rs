@@ -164,6 +164,13 @@ pub struct AzSelfplayData {
     pub opening_q_top1_abs_sum: f32,
     pub opening_visited_actions_sum: usize,
     pub opening_shape_count: usize,
+    pub sampled_moves: usize,
+    pub sampled_best_moves: usize,
+    pub deblundered_moves: usize,
+    pub best_played_q_gap_sum: f32,
+    pub best_played_visit_ratio_sum: f32,
+    pub best_q_sum: f32,
+    pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
 }
 
@@ -197,6 +204,13 @@ impl AzSelfplayData {
         self.opening_q_top1_abs_sum += other.opening_q_top1_abs_sum;
         self.opening_visited_actions_sum += other.opening_visited_actions_sum;
         self.opening_shape_count += other.opening_shape_count;
+        self.sampled_moves += other.sampled_moves;
+        self.sampled_best_moves += other.sampled_best_moves;
+        self.deblundered_moves += other.deblundered_moves;
+        self.best_played_q_gap_sum += other.best_played_q_gap_sum;
+        self.best_played_visit_ratio_sum += other.best_played_visit_ratio_sum;
+        self.best_q_sum += other.best_q_sum;
+        self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
     }
 }
@@ -255,6 +269,13 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.opening_q_top1_abs_sum += chunk.opening_q_top1_abs_sum;
         merged.opening_visited_actions_sum += chunk.opening_visited_actions_sum;
         merged.opening_shape_count += chunk.opening_shape_count;
+        merged.sampled_moves += chunk.sampled_moves;
+        merged.sampled_best_moves += chunk.sampled_best_moves;
+        merged.deblundered_moves += chunk.deblundered_moves;
+        merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
+        merged.best_played_visit_ratio_sum += chunk.best_played_visit_ratio_sum;
+        merged.best_q_sum += chunk.best_q_sum;
+        merged.played_q_sum += chunk.played_q_sum;
         merged.terminal.add_assign(&chunk.terminal);
     }
     merged
@@ -290,6 +311,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut opening_q_top1_abs_sum = 0.0f32;
     let mut opening_visited_actions_sum = 0usize;
     let mut opening_shape_count = 0usize;
+    let mut sampled_moves = 0usize;
+    let mut sampled_best_moves = 0usize;
+    let mut deblundered_moves = 0usize;
+    let mut best_played_q_gap_sum = 0.0f32;
+    let mut best_played_visit_ratio_sum = 0.0f32;
+    let mut best_q_sum = 0.0f32;
+    let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
@@ -439,6 +467,18 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 ply,
                 config.deblunder_q_gap,
             );
+            sampled_moves += 1;
+            sampled_best_moves +=
+                usize::from(move_meta.sample.best_index == move_meta.sample.played_index);
+            deblundered_moves += usize::from(move_meta.sample.deblundered);
+            best_played_q_gap_sum += (move_meta.sample.best_q - move_meta.sample.played_q).max(0.0);
+            best_played_visit_ratio_sum += if move_meta.sample.best_visits == 0 {
+                0.0
+            } else {
+                move_meta.sample.played_visits as f32 / move_meta.sample.best_visits as f32
+            };
+            best_q_sum += move_meta.sample.best_q;
+            played_q_sum += move_meta.sample.played_q;
             let side_sign = if position.side_to_move() == Color::Red {
                 1.0
             } else {
@@ -546,6 +586,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         opening_q_top1_abs_sum,
         opening_visited_actions_sum,
         opening_shape_count,
+        sampled_moves,
+        sampled_best_moves,
+        deblundered_moves,
+        best_played_q_gap_sum,
+        best_played_visit_ratio_sum,
+        best_q_sum,
+        played_q_sum,
         terminal,
     }
 }
