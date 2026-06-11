@@ -92,8 +92,8 @@ impl Default for UciState {
             fpu_value: 0.23,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
-            moves_left_max_effect: 0.3,
-            moves_left_slope: 0.007,
+            moves_left_max_effect: 0.1,
+            moves_left_slope: 0.0007,
             moves_left_threshold: 0.8,
             moves_left_constant_factor: 0.0,
             moves_left_scaled_factor: 0.15,
@@ -161,8 +161,8 @@ fn print_uci_id() {
     println!("option name FpuValue type string default 0.23");
     println!("option name FpuValueAtRoot type string default 1.0");
     println!("option name DrawScore type string default 0.0");
-    println!("option name MovesLeftMaxEffect type string default 0.3");
-    println!("option name MovesLeftSlope type string default 0.007");
+    println!("option name MovesLeftMaxEffect type string default 0.1");
+    println!("option name MovesLeftSlope type string default 0.0007");
     println!("option name MovesLeftThreshold type string default 0.8");
     println!("option name MovesLeftConstantFactor type string default 0.0");
     println!("option name MovesLeftScaledFactor type string default 0.15");

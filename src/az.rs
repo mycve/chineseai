@@ -553,6 +553,7 @@ pub struct AzLoopConfig {
     pub simulations: usize,
     pub seed: u64,
     pub workers: usize,
+    pub generation_update: u32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
@@ -583,6 +584,7 @@ pub struct AzLoopConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
+    pub deblunder_q_gap: f32,
     pub value_td_lambda: f32,
 }
 
@@ -729,6 +731,22 @@ pub struct AzTrainingSample {
     pub value: f32,
     pub side_sign: f32,
     pub moves_left: f32,
+    pub meta: AzSampleMeta,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzSampleMeta {
+    pub generation_update: u32,
+    pub game_id: u64,
+    pub ply: u16,
+    pub root_q: f32,
+    pub best_q: f32,
+    pub played_q: f32,
+    pub best_visits: u32,
+    pub played_visits: u32,
+    pub best_index: u16,
+    pub played_index: u16,
+    pub deblundered: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1356,7 +1374,7 @@ impl AzNnue {
 
     fn moves_left_from_value_head(&self, value_head: &[f32]) -> f32 {
         let logit = dot_product(value_head, &self.moves_left_output) + self.moves_left_bias[0];
-        sigmoid(logit)
+        softplus(logit)
     }
 
     fn policy_square_scores_for_squares_into(
@@ -1517,6 +1535,7 @@ pub fn benchmark_training(
             value,
             side_sign: 1.0,
             moves_left: 0.0,
+            meta: AzSampleMeta::default(),
         });
         if index + 1 == sample_count {
             break;
@@ -1888,6 +1907,7 @@ fn generate_policy_fit_samples(
             value: value.clamp(-1.0, 1.0),
             side_sign: if side == Color::Red { 1.0 } else { -1.0 },
             moves_left: 0.0,
+            meta: AzSampleMeta::default(),
         });
     }
     samples
@@ -2046,13 +2066,13 @@ pub(super) fn wdl_q(wdl: [f32; WDL_HEAD_SIZE]) -> f32 {
     wdl[0] - wdl[2]
 }
 
-fn sigmoid(value: f32) -> f32 {
-    if value >= 0.0 {
-        let z = (-value).exp();
-        1.0 / (1.0 + z)
+fn softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else if value < -20.0 {
+        value.exp()
     } else {
-        let z = value.exp();
-        z / (1.0 + z)
+        value.exp().ln_1p()
     }
 }
 
@@ -2545,6 +2565,19 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
         value: 0.1,
         side_sign: 1.0,
         moves_left: 0.0,
+        meta: AzSampleMeta {
+            generation_update: 7,
+            game_id: 42,
+            ply: 9,
+            root_q: 0.11,
+            best_q: 0.33,
+            played_q: 0.02,
+            best_visits: 88,
+            played_visits: 13,
+            best_index: 1,
+            played_index: 0,
+            deblundered: true,
+        },
     };
     let mut pool = AzExperiencePool::new(100);
     pool.add_games(vec![vec![sample.clone()], vec![sample.clone(), sample]]);
@@ -2654,6 +2687,7 @@ mod tests {
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: Vec::new(),
@@ -2663,6 +2697,7 @@ mod tests {
                 value: 0.5,
                 side_sign: -1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
         ];
 
@@ -2683,6 +2718,7 @@ mod tests {
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: Vec::new(),
@@ -2692,6 +2728,7 @@ mod tests {
                 value: 0.5,
                 side_sign: -1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
         ];
 
@@ -2980,5 +3017,12 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.sample_count(), pool.sample_count());
         assert_eq!(loaded.capacity(), pool.capacity());
+        let loaded_samples = loaded.all_samples();
+        assert_eq!(loaded_samples[0].meta.generation_update, 7);
+        assert_eq!(loaded_samples[0].meta.game_id, 42);
+        assert_eq!(loaded_samples[0].meta.ply, 9);
+        assert!((loaded_samples[0].meta.best_q - 0.33).abs() < 1e-6);
+        assert_eq!(loaded_samples[0].meta.played_visits, 13);
+        assert!(loaded_samples[0].meta.deblundered);
     }
 }

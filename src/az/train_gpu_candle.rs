@@ -634,12 +634,8 @@ impl GpuReplica {
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce = value_ce_per_sample.sum(1)?;
         let value_ce = value_ce.sum_all()?;
-        let moves_left_pred = forward
-            .moves_left_logits
-            .tanh()?
-            .affine(0.5, 0.5)?
-            .squeeze(1)?;
-        let moves_left_error = (&moves_left_pred - &batch_tensors.moves_left)?;
+        let moves_left_pred = forward.moves_left_logits.softplus()?.squeeze(1)?;
+        let moves_left_error = (&moves_left_pred.log1p()? - &batch_tensors.moves_left.log1p()?)?;
         let moves_left_sse = moves_left_error.sqr()?.sum_all()?;
 
         let legal_policy_logits = forward

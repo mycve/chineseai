@@ -10,11 +10,21 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSearchLimits, AzTrainingSample, SplitMix64,
+    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
     alphazero_search_with_history_and_rules, dense_move_index, scalar_value_to_wdl_target, wdl_q,
 };
 
-const DEBLUNDER_Q_GAP: f32 = 0.15;
+#[derive(Clone, Copy, Debug)]
+struct DeblunderEvent {
+    sample_index: usize,
+    boundary_red: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoveSearchMeta {
+    sample: AzSampleMeta,
+    deblunder_boundary_q: Option<f32>,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
@@ -292,7 +302,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut history = Vec::new();
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
-        let mut first_blunder_ply = None;
+        let mut deblunder_events = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
@@ -377,6 +387,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 entropy_mid_count += 1;
             }
             if allow_resign && should_resign(search.value_q, config) {
+                let meta = root_search_meta(
+                    &search.candidates,
+                    search.value_q,
+                    config.generation_update,
+                    config.seed ^ game_index as u64,
+                    ply,
+                );
                 game_samples.push(make_training_sample(
                     &position,
                     &history,
@@ -384,6 +401,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     search.value_q,
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                    meta,
                 ));
                 result = Some(if position.side_to_move() == Color::Red {
                     terminal.resign_red += 1;
@@ -412,10 +430,25 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 result = Some(0.0);
                 break;
             };
-            if first_blunder_ply.is_none()
-                && sampled_move_is_deblunder_candidate(&search.candidates, mv)
-            {
-                first_blunder_ply = Some(game_samples.len());
+            let move_meta = move_search_meta(
+                &search.candidates,
+                mv,
+                search.value_q,
+                config.generation_update,
+                config.seed ^ game_index as u64,
+                ply,
+                config.deblunder_q_gap,
+            );
+            let side_sign = if position.side_to_move() == Color::Red {
+                1.0
+            } else {
+                -1.0
+            };
+            if let Some(best_q) = move_meta.deblunder_boundary_q {
+                deblunder_events.push(DeblunderEvent {
+                    sample_index: game_samples.len(),
+                    boundary_red: (best_q * side_sign).clamp(-1.0, 1.0),
+                });
             }
             game_samples.push(make_training_sample(
                 &position,
@@ -424,6 +457,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 search.value_q,
                 config.policy_softmax_temp,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                move_meta.sample,
             ));
             append_history(&mut history, &position, mv);
             rule_history.push(position.rule_history_entry_after_move(mv));
@@ -477,7 +511,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_deblundered_value_targets(&mut game_samples, result, first_blunder_ply, config);
+        assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
         assign_moves_left_targets(&mut game_samples, config.max_plies);
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -577,6 +611,7 @@ fn make_training_sample(
     value: f32,
     policy_softmax_temp: f32,
     mirror_file: bool,
+    meta: AzSampleMeta,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
@@ -614,6 +649,7 @@ fn make_training_sample(
         value: value.clamp(-1.0, 1.0),
         side_sign,
         moves_left: 0.0,
+        meta,
     }
 }
 
@@ -633,39 +669,99 @@ pub(super) fn assign_td_lambda_value_targets(
     }
 }
 
-fn sampled_move_is_deblunder_candidate(candidates: &[AzCandidate], mv: Move) -> bool {
-    let Some(best) = candidates
+fn root_search_meta(
+    candidates: &[AzCandidate],
+    root_q: f32,
+    generation_update: u32,
+    game_id: u64,
+    ply: usize,
+) -> AzSampleMeta {
+    let mut meta = AzSampleMeta {
+        generation_update,
+        game_id,
+        ply: ply.min(u16::MAX as usize) as u16,
+        root_q,
+        best_index: u16::MAX,
+        played_index: u16::MAX,
+        ..AzSampleMeta::default()
+    };
+    if let Some((best_index, best)) = candidates
         .iter()
-        .max_by(|left, right| left.q.total_cmp(&right.q))
-    else {
-        return false;
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.q.total_cmp(&right.q))
+    {
+        meta.best_q = best.q;
+        meta.best_visits = best.visits;
+        meta.best_index = best_index.min(u16::MAX as usize) as u16;
+    }
+    meta
+}
+
+fn move_search_meta(
+    candidates: &[AzCandidate],
+    mv: Move,
+    root_q: f32,
+    generation_update: u32,
+    game_id: u64,
+    ply: usize,
+    q_gap: f32,
+) -> MoveSearchMeta {
+    let mut meta = root_search_meta(candidates, root_q, generation_update, game_id, ply);
+    if let Some((played_index, played)) = candidates
+        .iter()
+        .enumerate()
+        .find(|(_, candidate)| candidate.mv == mv)
+    {
+        meta.played_q = played.q;
+        meta.played_visits = played.visits;
+        meta.played_index = played_index.min(u16::MAX as usize) as u16;
+    }
+    let deblunder_boundary_q = if q_gap > 0.0
+        && meta.best_index != meta.played_index
+        && meta.played_index != u16::MAX
+        && meta.best_q - meta.played_q >= q_gap
+    {
+        meta.deblundered = true;
+        Some(meta.best_q)
+    } else {
+        None
     };
-    let Some(played) = candidates.iter().find(|candidate| candidate.mv == mv) else {
-        return false;
-    };
-    best.mv != played.mv && best.q - played.q >= DEBLUNDER_Q_GAP
+    MoveSearchMeta {
+        sample: meta,
+        deblunder_boundary_q,
+    }
 }
 
 fn assign_deblundered_value_targets(
     samples: &mut [AzTrainingSample],
     game_result_red: f32,
-    first_blunder_ply: Option<usize>,
+    deblunder_events: &[DeblunderEvent],
     config: &AzLoopConfig,
 ) {
-    let Some(blunder_ply) = first_blunder_ply else {
-        assign_td_lambda_value_targets(samples, game_result_red, config.value_td_lambda);
-        return;
-    };
-    if blunder_ply >= samples.len() {
+    if deblunder_events.is_empty() {
         assign_td_lambda_value_targets(samples, game_result_red, config.value_td_lambda);
         return;
     }
-    let boundary_red =
-        (samples[blunder_ply].value * samples[blunder_ply].side_sign).clamp(-1.0, 1.0);
-    let (prefix, suffix) = samples.split_at_mut(blunder_ply + 1);
-    assign_td_lambda_value_targets(prefix, boundary_red, config.value_td_lambda);
-    if !suffix.is_empty() {
-        assign_td_lambda_value_targets(suffix, game_result_red, config.value_td_lambda);
+
+    let mut start = 0usize;
+    for event in deblunder_events {
+        if event.sample_index < start || event.sample_index >= samples.len() {
+            continue;
+        }
+        let end = event.sample_index + 1;
+        assign_td_lambda_value_targets(
+            &mut samples[start..end],
+            event.boundary_red,
+            config.value_td_lambda,
+        );
+        start = end;
+    }
+    if start < samples.len() {
+        assign_td_lambda_value_targets(
+            &mut samples[start..],
+            game_result_red,
+            config.value_td_lambda,
+        );
     }
 }
 
@@ -677,12 +773,11 @@ fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
     root_q <= threshold
 }
 
-pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], max_plies: usize) {
-    let denom = (max_plies.max(1) as f32).ln_1p().max(f32::MIN_POSITIVE);
+pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_plies: usize) {
     let game_len = samples.len();
     for (index, sample) in samples.iter_mut().enumerate() {
         let remaining = game_len.saturating_sub(index).max(1) as f32;
-        sample.moves_left = (remaining.ln_1p() / denom).clamp(0.0, 1.0);
+        sample.moves_left = remaining;
     }
 }
 
@@ -950,6 +1045,62 @@ mod tests {
         }
     }
 
+    fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
+        AzTrainingSample {
+            features: Vec::new(),
+            move_indices: Vec::new(),
+            policy: Vec::new(),
+            value_wdl: scalar_value_to_wdl_target(value),
+            value,
+            side_sign,
+            moves_left: 0.0,
+            meta: AzSampleMeta::default(),
+        }
+    }
+
+    fn test_config(value_td_lambda: f32) -> AzLoopConfig {
+        AzLoopConfig {
+            games: 1,
+            max_plies: 100,
+            simulations: 1,
+            seed: 1,
+            workers: 1,
+            generation_update: 0,
+            temperature_start: 1.0,
+            temperature_endgame: 0.0,
+            temperature_decay_delay_plies: 0,
+            temperature_decay_plies: 0,
+            temperature_cutoff_plies: 0,
+            temperature_value_cutoff: 0.0,
+            temperature_visit_offset: 0.0,
+            cpuct: 1.0,
+            cpuct_at_root: 1.0,
+            cpuct_base: 1.0,
+            cpuct_factor: 0.0,
+            cpuct_base_at_root: 1.0,
+            cpuct_factor_at_root: 0.0,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            root_exploration_plies: 0,
+            fpu_value: 0.0,
+            fpu_value_at_root: 0.0,
+            draw_score: 0.0,
+            moves_left_max_effect: 0.0,
+            moves_left_slope: 0.0,
+            moves_left_threshold: 0.0,
+            moves_left_constant_factor: 0.0,
+            moves_left_scaled_factor: 0.0,
+            moves_left_quadratic_factor: 0.0,
+            policy_softmax_temp: 1.0,
+            opening_positions: Vec::new(),
+            resign_percentage: 0.0,
+            resign_playthrough: 0.0,
+            mirror_probability: 0.0,
+            deblunder_q_gap: 0.25,
+            value_td_lambda,
+        }
+    }
+
     #[test]
     fn arena_promotion_uses_score_lower_bound() {
         let report = AzArenaReport {
@@ -975,7 +1126,15 @@ mod tests {
             .enumerate()
             .map(|(index, &mv)| candidate(mv, 1.0 / (index + 2) as f32))
             .collect::<Vec<_>>();
-        let sample = make_training_sample(&position, &[], &candidates, 0.0, 1.45, true);
+        let sample = make_training_sample(
+            &position,
+            &[],
+            &candidates,
+            0.0,
+            1.45,
+            true,
+            AzSampleMeta::default(),
+        );
 
         let mirrored_position = position.mirror_files();
         let mirrored_moves = candidates
@@ -989,5 +1148,76 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sample.move_indices, expected);
+    }
+
+    #[test]
+    fn deblunder_value_targets_split_on_each_repair_event() {
+        let mut samples = vec![
+            sample(0.1, 1.0),
+            sample(0.2, -1.0),
+            sample(-0.3, 1.0),
+            sample(-0.4, -1.0),
+        ];
+        let events = vec![
+            DeblunderEvent {
+                sample_index: 1,
+                boundary_red: 0.6,
+            },
+            DeblunderEvent {
+                sample_index: 2,
+                boundary_red: -0.5,
+            },
+        ];
+
+        assign_deblundered_value_targets(&mut samples, 1.0, &events, &test_config(1.0));
+
+        assert!((samples[0].value - 0.6).abs() < 1e-6);
+        assert!((samples[1].value + 0.6).abs() < 1e-6);
+        assert!((samples[2].value + 0.5).abs() < 1e-6);
+        assert!((samples[3].value + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn moves_left_targets_use_raw_remaining_plies() {
+        let mut samples = vec![sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
+
+        assign_moves_left_targets(&mut samples, 300);
+
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.moves_left)
+                .collect::<Vec<_>>(),
+            vec![3.0, 2.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn sampled_move_deblunder_boundary_uses_best_q() {
+        let moves = [
+            Move { from: 0, to: 1 },
+            Move { from: 1, to: 2 },
+            Move { from: 2, to: 3 },
+        ];
+        let mut candidates = vec![
+            candidate(moves[0], 0.5),
+            candidate(moves[1], 0.3),
+            candidate(moves[2], 0.2),
+        ];
+        candidates[0].q = 0.7;
+        candidates[1].q = 0.35;
+        candidates[2].q = 0.65;
+
+        let meta = move_search_meta(&candidates, moves[1], 0.2, 3, 99, 7, 0.25);
+        assert_eq!(meta.deblunder_boundary_q, Some(0.7));
+        assert!(meta.sample.deblundered);
+        assert_eq!(meta.sample.generation_update, 3);
+        assert_eq!(meta.sample.game_id, 99);
+        assert_eq!(meta.sample.ply, 7);
+        assert_eq!(meta.sample.best_index, 0);
+        assert_eq!(meta.sample.played_index, 1);
+        let quiet_meta = move_search_meta(&candidates, moves[2], 0.2, 3, 99, 7, 0.25);
+        assert_eq!(quiet_meta.deblunder_boundary_q, None);
+        assert!(!quiet_meta.sample.deblundered);
     }
 }

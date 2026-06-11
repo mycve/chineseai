@@ -487,8 +487,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tco{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_tspu{}_mp{}_cpi{}_",
-            "tepu{}_mstc{}_vtd{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tco{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
+            "tspu{}_tepu{}_mstc{}_dbg{}_mp{}_vtd{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -524,6 +524,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.train_samples_per_update,
         config.train_epochs_per_update,
         config.max_sample_train_count,
+        f32_slug(config.deblunder_q_gap),
         f32_slug(config.mirror_probability),
         f32_slug(config.value_td_lambda),
         config.checkpoint_interval,
@@ -663,6 +664,14 @@ fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> Pat
     Path::new(checkpoint_dir).join(format!("update-{update:06}-{base}"))
 }
 
+fn best_checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> PathBuf {
+    let base = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model.safetensors");
+    Path::new(checkpoint_dir).join(format!("best-update-{update:06}-{base}"))
+}
+
 fn save_checkpoint_model(
     model: &AzNnue,
     model_path: &str,
@@ -673,6 +682,20 @@ fn save_checkpoint_model(
         panic!("failed to create checkpoint dir `{checkpoint_dir}`: {err}");
     });
     let path = checkpoint_path(model_path, checkpoint_dir, update);
+    save_model(model, &path);
+    path
+}
+
+fn save_best_checkpoint_model(
+    model: &AzNnue,
+    model_path: &str,
+    checkpoint_dir: &str,
+    update: usize,
+) -> PathBuf {
+    fs::create_dir_all(checkpoint_dir).unwrap_or_else(|err| {
+        panic!("failed to create checkpoint dir `{checkpoint_dir}`: {err}");
+    });
+    let path = best_checkpoint_path(model_path, checkpoint_dir, update);
     save_model(model, &path);
     path
 }
@@ -744,6 +767,9 @@ struct AzSelfplayFitBenchArgs {
     /// Root Dirichlet exploration fraction.
     #[arg(long, default_value_t = 0.0)]
     root_exploration_fraction: f32,
+    /// Plies during which root Dirichlet noise is enabled.
+    #[arg(long, default_value_t = 60)]
+    root_exploration_plies: usize,
     /// Opening temperature.
     #[arg(long, default_value_t = 0.9)]
     temperature_start: f32,
@@ -768,8 +794,11 @@ struct AzSelfplayFitBenchArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.5)]
     mirror_probability: f32,
-    /// TD lambda used to mix search value with terminal game return.
-    #[arg(long, default_value_t = 0.85)]
+    /// Q gap that marks a sampled move as a value-repair blunder.
+    #[arg(long, default_value_t = 0.25)]
+    deblunder_q_gap: f32,
+    /// TD lambda used inside value-repair segments. 1.0 keeps LC0/AZ-style terminal targets.
+    #[arg(long, default_value_t = 1.0)]
     value_td_lambda: f32,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
@@ -833,6 +862,9 @@ struct AzReplayGenerateFixedArgs {
     /// Root Dirichlet exploration fraction.
     #[arg(long, default_value_t = 0.0)]
     root_exploration_fraction: f32,
+    /// Plies during which root Dirichlet noise is enabled.
+    #[arg(long, default_value_t = 60)]
+    root_exploration_plies: usize,
     /// Opening temperature.
     #[arg(long, default_value_t = 0.9)]
     temperature_start: f32,
@@ -857,8 +889,11 @@ struct AzReplayGenerateFixedArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.3)]
     mirror_probability: f32,
-    /// TD lambda used to mix search value with terminal game return.
-    #[arg(long, default_value_t = 0.85)]
+    /// Q gap that marks a sampled move as a value-repair blunder.
+    #[arg(long, default_value_t = 0.25)]
+    deblunder_q_gap: f32,
+    /// TD lambda used inside value-repair segments. 1.0 keeps LC0/AZ-style terminal targets.
+    #[arg(long, default_value_t = 1.0)]
     value_td_lambda: f32,
 }
 
@@ -1003,6 +1038,7 @@ fn build_az_loop_config(
     config: &AzLoopFileConfig,
     seed: u64,
     workers: usize,
+    generation_update: u32,
     opening_positions: &[Position],
 ) -> AzLoopConfig {
     AzLoopConfig {
@@ -1011,6 +1047,7 @@ fn build_az_loop_config(
         simulations: config.simulations,
         seed,
         workers,
+        generation_update,
         temperature_start: config.temperature_start,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
@@ -1041,6 +1078,7 @@ fn build_az_loop_config(
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
+        deblunder_q_gap: config.deblunder_q_gap,
         value_td_lambda: config.value_td_lambda,
     }
 }
@@ -1460,8 +1498,8 @@ fn main() {
                     fpu_value: 0.23,
                     fpu_value_at_root: 1.0,
                     draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                    moves_left_max_effect: if cmd.moves_left_utility { 0.3 } else { 0.0 },
-                    moves_left_slope: if cmd.moves_left_utility { 0.007 } else { 0.0 },
+                    moves_left_max_effect: if cmd.moves_left_utility { 0.1 } else { 0.0 },
+                    moves_left_slope: if cmd.moves_left_utility { 0.0007 } else { 0.0 },
                     moves_left_threshold: 0.8,
                     moves_left_constant_factor: 0.0,
                     moves_left_scaled_factor: if cmd.moves_left_utility { 0.15 } else { 0.0 },
@@ -1856,6 +1894,7 @@ fn main() {
                     simulations,
                     seed,
                     workers,
+                    generation_update: 0,
                     temperature_start: cmd.temperature_start,
                     temperature_endgame: cmd.temperature_endgame,
                     temperature_decay_delay_plies: cmd.temperature_decay_delay_plies,
@@ -1871,12 +1910,12 @@ fn main() {
                     cpuct_factor_at_root: 2.0,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
-                    root_exploration_plies: cmd.temperature_decay_plies,
+                    root_exploration_plies: cmd.root_exploration_plies,
                     fpu_value: 0.23,
                     fpu_value_at_root: 1.0,
                     draw_score: 0.0,
-                    moves_left_max_effect: 0.3,
-                    moves_left_slope: 0.007,
+                    moves_left_max_effect: 0.1,
+                    moves_left_slope: 0.0007,
                     moves_left_threshold: 0.8,
                     moves_left_constant_factor: 0.0,
                     moves_left_scaled_factor: 0.15,
@@ -1886,6 +1925,7 @@ fn main() {
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
+                    deblunder_q_gap: cmd.deblunder_q_gap,
                     value_td_lambda: cmd.value_td_lambda,
                 };
                 let selfplay_started = Instant::now();
@@ -2081,6 +2121,7 @@ fn main() {
                     simulations,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
+                    generation_update: 0,
                     temperature_start: cmd.temperature_start,
                     temperature_endgame: cmd.temperature_endgame,
                     temperature_decay_delay_plies: cmd.temperature_decay_delay_plies,
@@ -2096,12 +2137,12 @@ fn main() {
                     cpuct_factor_at_root: 2.0,
                     root_dirichlet_alpha: cmd.root_dirichlet_alpha,
                     root_exploration_fraction: cmd.root_exploration_fraction,
-                    root_exploration_plies: cmd.temperature_decay_plies,
+                    root_exploration_plies: cmd.root_exploration_plies,
                     fpu_value: 0.23,
                     fpu_value_at_root: 1.0,
                     draw_score: 0.0,
-                    moves_left_max_effect: 0.3,
-                    moves_left_slope: 0.007,
+                    moves_left_max_effect: 0.1,
+                    moves_left_slope: 0.0007,
                     moves_left_threshold: 0.8,
                     moves_left_constant_factor: 0.0,
                     moves_left_scaled_factor: 0.15,
@@ -2111,6 +2152,7 @@ fn main() {
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
+                    deblunder_q_gap: cmd.deblunder_q_gap,
                     value_td_lambda: cmd.value_td_lambda,
                 };
                 let data = generate_selfplay_data(&model, &config);
@@ -2418,7 +2460,7 @@ fn main() {
             let opening_positions = load_opening_positions(&config.opening_fens_path);
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={},plies={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,cutoff={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={},plies={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_eval_fens={} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_samples_per_update,
@@ -2460,6 +2502,7 @@ fn main() {
                 config.resign_playthrough,
                 config.replay_capacity,
                 config.mirror_probability,
+                config.deblunder_q_gap,
                 config.value_td_lambda,
                 config.train_value_weight,
                 config.train_policy_weight,
@@ -2530,6 +2573,7 @@ fn main() {
                             &selfplay_config,
                             batch_seed,
                             1,
+                            local_version.min(u32::MAX as u64) as u32,
                             &selfplay_opening_positions,
                         );
                         let started = Instant::now();
@@ -3220,8 +3264,15 @@ fn main() {
                         );
                         if promoted {
                             arena_reference_model = candidate_model.clone();
+                            let best_checkpoint = save_best_checkpoint_model(
+                                &candidate_model,
+                                &config.model_path,
+                                &config.checkpoint_dir,
+                                update,
+                            );
                             save_model(&candidate_model, &best_path);
                             arena_best_elo = candidate_elo;
+                            println!("best     : saved {}", best_checkpoint.display());
                         }
                         println!(
                             "arena {update:04}: mode={} total={} fens={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} se={:.3} lcb={:.3} promote_at={:.3} z={:.2} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",

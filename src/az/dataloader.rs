@@ -168,7 +168,7 @@ impl PackedBatch {
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
-            packed.moves_left[row] = sample.moves_left.clamp(0.0, 1.0);
+            packed.moves_left[row] = sample.moves_left.max(0.0);
         }
         packed
     }
@@ -354,6 +354,8 @@ fn splitmix_next(state: &mut u64) -> u64 {
 mod tests {
     use std::sync::Arc;
 
+    use crate::az::AzSampleMeta;
+
     use super::*;
 
     fn sample(index: usize) -> AzTrainingSample {
@@ -365,6 +367,7 @@ mod tests {
             value: 2.0,
             side_sign: 1.0,
             moves_left: -1.0,
+            meta: AzSampleMeta::default(),
         }
     }
 

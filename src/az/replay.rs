@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
-use super::{AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE, normalize_wdl_target};
+use super::{
+    AzSampleMeta, AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE,
+    normalize_wdl_target,
+};
 
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 21;
+const REPLAY_FILE_VERSION: u32 = 22;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -78,6 +81,17 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
     replay_push_f32(out, sample.moves_left);
+    replay_push_u32(out, sample.meta.generation_update);
+    replay_push_u64(out, sample.meta.game_id);
+    replay_push_u32(out, sample.meta.ply as u32);
+    replay_push_f32(out, sample.meta.root_q);
+    replay_push_f32(out, sample.meta.best_q);
+    replay_push_f32(out, sample.meta.played_q);
+    replay_push_u32(out, sample.meta.best_visits);
+    replay_push_u32(out, sample.meta.played_visits);
+    replay_push_u32(out, sample.meta.best_index as u32);
+    replay_push_u32(out, sample.meta.played_index as u32);
+    replay_push_u32(out, u32::from(sample.meta.deblundered));
     Ok(())
 }
 
@@ -137,6 +151,19 @@ fn decode_az_training_sample<R: Read>(
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     let moves_left = replay_read_f32(reader)?;
+    let meta = AzSampleMeta {
+        generation_update: replay_read_u32(reader)?,
+        game_id: replay_read_u64(reader)?,
+        ply: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
+        root_q: replay_read_f32(reader)?,
+        best_q: replay_read_f32(reader)?,
+        played_q: replay_read_f32(reader)?,
+        best_visits: replay_read_u32(reader)?,
+        played_visits: replay_read_u32(reader)?,
+        best_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
+        played_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
+        deblundered: replay_read_u32(reader)? != 0,
+    };
     Ok(AzTrainingSample {
         features,
         move_indices,
@@ -145,6 +172,7 @@ fn decode_az_training_sample<R: Read>(
         value,
         side_sign,
         moves_left,
+        meta,
     })
 }
 
