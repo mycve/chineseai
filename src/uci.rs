@@ -1,48 +1,7 @@
 use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Position, RuleHistoryEntry, RuleOutcome};
-use std::fs;
-use std::io::{self, BufRead, BufWriter, Write};
-
-struct UciLogger {
-    file: Option<BufWriter<fs::File>>,
-    elapsed: std::time::Instant,
-}
-
-impl UciLogger {
-    fn new() -> Self {
-        let path = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("chineseai-uci.log")));
-
-        let file = path.and_then(|p| {
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
-                .map(BufWriter::new)
-        });
-
-        Self {
-            file,
-            elapsed: std::time::Instant::now(),
-        }
-    }
-
-    fn log(&mut self, msg: &str) {
-        let Some(f) = self.file.as_mut() else { return };
-        let ms = self.elapsed.elapsed().as_millis();
-        let _ = writeln!(f, "[{ms:>8}ms] {msg}");
-        let _ = f.flush();
-    }
-}
-
-macro_rules! ulog {
-    ($logger:expr, $($arg:tt)*) => {
-        $logger.log(&format!($($arg)*))
-    };
-}
+use std::io::{self, BufRead, Write};
 
 #[derive(Clone, Debug)]
 struct UciState {
@@ -68,8 +27,6 @@ struct UciState {
     moves_left_constant_factor: f32,
     moves_left_scaled_factor: f32,
     moves_left_quadratic_factor: f32,
-    policy_debug: bool,
-    policy_debug_limit: usize,
     seed: u64,
 }
 
@@ -98,8 +55,6 @@ impl Default for UciState {
             moves_left_constant_factor: 0.0,
             moves_left_scaled_factor: 0.15,
             moves_left_quadratic_factor: 0.85,
-            policy_debug: false,
-            policy_debug_limit: 16,
             seed: 20260409,
         }
     }
@@ -108,8 +63,6 @@ impl Default for UciState {
 pub fn run_uci() {
     let stdin = io::stdin();
     let mut state = UciState::default();
-    let mut logger = UciLogger::new();
-    ulog!(logger, "=== UCI session started ===");
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
             break;
@@ -118,7 +71,6 @@ pub fn run_uci() {
         if line.is_empty() {
             continue;
         }
-        ulog!(logger, ">> {line}");
         match line.split_whitespace().next() {
             Some("uci") => print_uci_id(),
             Some("isready") => {
@@ -131,16 +83,12 @@ pub fn run_uci() {
                 state.history.clear();
                 state.rule_history = state.position.initial_rule_history();
                 state.seed = 20260409;
-                ulog!(logger, "[ucinewgame] reset to startpos");
             }
             Some("setoption") => handle_setoption(line, &mut state),
-            Some("position") => handle_position(line, &mut state, &mut logger),
-            Some("go") => handle_go(line, &mut state, &mut logger),
+            Some("position") => handle_position(line, &mut state),
+            Some("go") => handle_go(line, &mut state),
             Some("stop") => {}
-            Some("quit") => {
-                ulog!(logger, "=== UCI session ended ===");
-                break;
-            }
+            Some("quit") => break,
             _ => {}
         }
     }
@@ -167,8 +115,6 @@ fn print_uci_id() {
     println!("option name MovesLeftConstantFactor type string default 0.0");
     println!("option name MovesLeftScaledFactor type string default 0.15");
     println!("option name MovesLeftQuadraticFactor type string default 0.85");
-    println!("option name PolicyDebug type check default false");
-    println!("option name PolicyDebugLimit type spin default 16 min 1 max 256");
     println!("uciok");
     flush();
 }
@@ -285,28 +231,11 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .parse::<f32>()
                 .unwrap_or(state.moves_left_quadratic_factor);
         }
-        "policydebug" => {
-            state.policy_debug = parse_uci_bool(&value, state.policy_debug);
-        }
-        "policydebuglimit" => {
-            state.policy_debug_limit = value
-                .parse::<usize>()
-                .unwrap_or(state.policy_debug_limit)
-                .clamp(1, 256);
-        }
         _ => {}
     }
 }
 
-fn parse_uci_bool(value: &str, fallback: bool) -> bool {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "on" | "yes" => true,
-        "false" | "0" | "off" | "no" => false,
-        _ => fallback,
-    }
-}
-
-fn handle_position(line: &str, state: &mut UciState, logger: &mut UciLogger) {
+fn handle_position(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     if tokens.get(1) == Some(&"startpos") {
         state.position = Position::startpos();
@@ -314,23 +243,13 @@ fn handle_position(line: &str, state: &mut UciState, logger: &mut UciLogger) {
         state.rule_history = state.position.initial_rule_history();
         if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
             let move_list = &tokens[moves_index + 1..];
-            ulog!(logger, "[position] startpos moves={}", move_list.join(" "));
             apply_uci_moves(
                 &mut state.position,
                 &mut state.history,
                 &mut state.rule_history,
                 move_list,
-                logger,
             );
-        } else {
-            ulog!(logger, "[position] startpos (no moves)");
         }
-        ulog!(
-            logger,
-            "[position] result fen={} halfmove_clock={}",
-            state.position.to_fen(),
-            state.position.halfmove_clock()
-        );
         return;
     }
 
@@ -344,26 +263,13 @@ fn handle_position(line: &str, state: &mut UciState, logger: &mut UciLogger) {
             state.rule_history = state.position.initial_rule_history();
             if let Some(moves_index) = moves_index {
                 let move_list = &tokens[moves_index + 1..];
-                ulog!(logger, "[position] fen={fen} moves={}", move_list.join(" "));
                 apply_uci_moves(
                     &mut state.position,
                     &mut state.history,
                     &mut state.rule_history,
                     move_list,
-                    logger,
                 );
-            } else {
-                ulog!(logger, "[position] fen={fen} (no moves)");
             }
-            ulog!(
-                logger,
-                "[position] result fen={} halfmove_clock={}",
-                state.position.to_fen(),
-                state.position.halfmove_clock()
-            );
-        } else {
-            eprintln!("info string invalid fen: {fen}");
-            ulog!(logger, "[position] ERROR invalid fen={fen}");
         }
     }
 }
@@ -373,17 +279,9 @@ fn apply_uci_moves(
     history: &mut Vec<HistoryMove>,
     rule_history: &mut Vec<RuleHistoryEntry>,
     moves: &[&str],
-    logger: &mut UciLogger,
 ) {
-    for (i, text) in moves.iter().enumerate() {
+    for text in moves {
         let Some(mv) = position.parse_uci_move(text) else {
-            eprintln!("info string illegal move ignored: {text}");
-            ulog!(
-                logger,
-                "[apply_move] #{i} {text} ILLEGAL fen={} halfmove_clock={}",
-                position.to_fen(),
-                position.halfmove_clock()
-            );
             break;
         };
         if let Some(piece) = position.piece_at(mv.from as usize) {
@@ -399,11 +297,6 @@ fn apply_uci_moves(
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
-        ulog!(
-            logger,
-            "[apply_move] #{i} {text} ok fen={}",
-            position.to_fen()
-        );
     }
 }
 
@@ -414,60 +307,21 @@ fn position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry])
     )
 }
 
-fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
+fn handle_go(_line: &str, state: &mut UciState) {
     ensure_model(state);
     let simulations = state.simulations.max(1);
     let model = state.model.as_ref().expect("model was loaded");
-    let fen = state.position.to_fen();
 
     if position_is_rule_draw(&state.position, &state.rule_history) {
-        ulog!(logger, "[go] rule draw fen={fen} (no search)");
         println!("info depth 0 nodes 0 time 0 score cp 0 pv draw");
         println!("bestmove draw");
         flush();
         return;
     }
 
-    let raw_legal = state.position.legal_moves();
     let legal = state.position.legal_moves_with_rules(&state.rule_history);
 
-    ulog!(
-        logger,
-        "[go] fen={fen} halfmove_clock={} rule_history_len={} raw_legal={} filtered_legal={}",
-        state.position.halfmove_clock(),
-        state.rule_history.len(),
-        raw_legal.len(),
-        legal.len()
-    );
-
     if legal.is_empty() {
-        ulog!(logger, "[no_legal_moves] fen={fen}");
-        ulog!(
-            logger,
-            "[no_legal_moves] raw_legal_moves({})={}",
-            raw_legal.len(),
-            raw_legal
-                .iter()
-                .map(|mv| mv.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        ulog!(
-            logger,
-            "[no_legal_moves] rule_history ({} entries):",
-            state.rule_history.len()
-        );
-        for (i, entry) in state.rule_history.iter().enumerate() {
-            ulog!(
-                logger,
-                "[no_legal_moves]   [{i:>3}] hash={:#018x} side={:?} mover={:?} check={} chase_mask={:#034x}",
-                entry.hash,
-                entry.side_to_move,
-                entry.mover,
-                entry.gives_check,
-                entry.chased_mask
-            );
-        }
         println!("info depth 1 nodes 0 time 0 score cp -32000");
         flush();
         return;
@@ -505,9 +359,6 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
         },
     );
     state.seed = state.seed.wrapping_add(1);
-    if state.policy_debug {
-        print_policy_debug(&result, state.policy_debug_limit);
-    }
     match result.best_move {
         Some(mv) => {
             let best_text = mv.to_string();
@@ -533,37 +384,6 @@ fn handle_go(_line: &str, state: &mut UciState, logger: &mut UciLogger) {
         }
     }
     flush();
-}
-
-fn print_policy_debug(result: &crate::az::AzSearchResult, limit: usize) {
-    let visited_actions = result
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.visits > 0)
-        .count();
-    println!("info string policy_debug visited_actions {visited_actions}");
-    println!("info string policy_debug columns move visits q raw_policy searched_policy");
-    for candidate in result.candidates.iter().take(limit) {
-        println!(
-            "info string policy_debug {} {} {:.4} {:.6} {:.6}",
-            candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-        );
-    }
-    println!("info string policy_debug_by_visits columns move visits q raw_policy searched_policy");
-    let mut by_visits = result.candidates.clone();
-    by_visits.sort_by(|left, right| {
-        right
-            .visits
-            .cmp(&left.visits)
-            .then_with(|| right.policy.total_cmp(&left.policy))
-            .then_with(|| right.q.total_cmp(&left.q))
-    });
-    for candidate in by_visits.iter().take(limit) {
-        println!(
-            "info string policy_debug_by_visits {} {} {:.4} {:.6} {:.6}",
-            candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-        );
-    }
 }
 
 fn flush() {
