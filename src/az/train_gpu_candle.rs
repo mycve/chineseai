@@ -650,8 +650,8 @@ impl GpuReplica {
         let weighted_value_loss = (&value_ce * value_weight.max(0.0) as f64)?;
         let weighted_policy_ce = (&policy_ce * policy_weight.max(0.0) as f64)?;
         let weighted_moves_left_loss = (&moves_left_sse * MOVES_LEFT_AUX_WEIGHT as f64)?;
-        let loss_tensor = ((weighted_value_loss + weighted_policy_ce + weighted_moves_left_loss)
-            / global_batch_len as f64)?;
+        let loss_sum = (weighted_value_loss + weighted_policy_ce + weighted_moves_left_loss)?;
+        let loss_tensor = (loss_sum / global_batch_len as f64)?;
 
         let value_sse = value_sse.to_scalar::<f32>()?;
         let value_ce = value_ce.to_scalar::<f32>()?;
