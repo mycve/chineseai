@@ -348,7 +348,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let use_root_noise = ply < config.root_exploration_plies;
             let search = alphazero_search_with_history_and_rules(
                 &position,
                 &history,
@@ -365,16 +364,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     cpuct_base_at_root: config.cpuct_base_at_root,
                     cpuct_factor_at_root: config.cpuct_factor_at_root,
                     max_depth: 0,
-                    root_dirichlet_alpha: if use_root_noise {
-                        config.root_dirichlet_alpha
-                    } else {
-                        0.0
-                    },
-                    root_exploration_fraction: if use_root_noise {
-                        config.root_exploration_fraction
-                    } else {
-                        0.0
-                    },
+                    root_dirichlet_alpha: config.root_dirichlet_alpha,
+                    root_exploration_fraction: config.root_exploration_fraction,
                     fpu_value: config.fpu_value,
                     fpu_value_at_root: config.fpu_value_at_root,
                     draw_score: config.draw_score,
@@ -1134,7 +1125,6 @@ mod tests {
             cpuct_factor_at_root: 0.0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            root_exploration_plies: 0,
             fpu_value: 0.0,
             fpu_value_at_root: 0.0,
             draw_score: 0.0,

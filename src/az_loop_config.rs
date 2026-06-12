@@ -33,7 +33,6 @@ pub struct AzLoopFileConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
-    pub root_exploration_plies: usize,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
@@ -65,7 +64,10 @@ pub struct AzLoopFileConfig {
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
-    pub arena_eval_fens: String,
+    pub arena_opening_book: String,
+    pub arena_opening_positions: usize,
+    pub arena_opening_plies_min: usize,
+    pub arena_opening_plies_max: usize,
     pub tensorboard_logdir: String,
 }
 
@@ -100,7 +102,6 @@ impl Default for AzLoopFileConfig {
             cpuct_factor_at_root: 2.0,
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.1,
-            root_exploration_plies: 60,
             fpu_value: 0.23,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
@@ -132,7 +133,10 @@ impl Default for AzLoopFileConfig {
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_processes: 100,
-            arena_eval_fens: "eval_fens.txt".into(),
+            arena_opening_book: "opening.obk".into(),
+            arena_opening_positions: 300,
+            arena_opening_plies_min: 4,
+            arena_opening_plies_max: 10,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -169,7 +173,6 @@ struct AzLoopTomlConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
-    pub root_exploration_plies: usize,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
@@ -201,7 +204,10 @@ struct AzLoopTomlConfig {
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
-    pub arena_eval_fens: String,
+    pub arena_opening_book: String,
+    pub arena_opening_positions: usize,
+    pub arena_opening_plies_min: usize,
+    pub arena_opening_plies_max: usize,
     #[serde(skip_serializing)]
     pub arena_pikafish_exe: String,
     #[serde(skip_serializing)]
@@ -214,8 +220,6 @@ struct AzLoopTomlConfig {
     pub arena_pikafish_parallel_games: usize,
     #[serde(skip_serializing)]
     pub arena_pikafish_promotion_rate: f32,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_eval_fens: String,
     pub tensorboard_logdir: String,
 }
 
@@ -256,7 +260,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             cpuct_factor_at_root: config.cpuct_factor_at_root,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
-            root_exploration_plies: config.root_exploration_plies,
             fpu_value: config.fpu_value,
             fpu_value_at_root: config.fpu_value_at_root,
             draw_score: config.draw_score,
@@ -288,14 +291,16 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
-            arena_eval_fens: config.arena_eval_fens.clone(),
+            arena_opening_book: config.arena_opening_book.clone(),
+            arena_opening_positions: config.arena_opening_positions,
+            arena_opening_plies_min: config.arena_opening_plies_min,
+            arena_opening_plies_max: config.arena_opening_plies_max,
             arena_pikafish_exe: String::new(),
             arena_pikafish_start_update: 1,
             arena_pikafish_depth: 1,
             arena_pikafish_games: 1,
             arena_pikafish_parallel_games: 1,
             arena_pikafish_promotion_rate: 0.0,
-            arena_pikafish_eval_fens: String::new(),
             tensorboard_logdir: config.tensorboard_logdir.clone(),
         }
     }
@@ -332,7 +337,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             cpuct_factor_at_root: config.cpuct_factor_at_root,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
-            root_exploration_plies: config.root_exploration_plies,
             fpu_value: config.fpu_value,
             fpu_value_at_root: config.fpu_value_at_root,
             draw_score: config.draw_score,
@@ -364,11 +368,10 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
-            arena_eval_fens: if config.arena_eval_fens.trim().is_empty() {
-                config.arena_pikafish_eval_fens
-            } else {
-                config.arena_eval_fens
-            },
+            arena_opening_book: config.arena_opening_book,
+            arena_opening_positions: config.arena_opening_positions,
+            arena_opening_plies_min: config.arena_opening_plies_min,
+            arena_opening_plies_max: config.arena_opening_plies_max,
             tensorboard_logdir: config.tensorboard_logdir,
         }
     }
@@ -436,7 +439,6 @@ impl AzLoopFileConfig {
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
         );
-        line!("root_exploration_plies", self.root_exploration_plies);
         line!("fpu_value", f(self.fpu_value));
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
@@ -477,7 +479,10 @@ impl AzLoopFileConfig {
             f(self.arena_promotion_confidence_z)
         );
         line!("arena_processes", self.arena_processes);
-        line!("arena_eval_fens", q(&self.arena_eval_fens));
+        line!("arena_opening_book", q(&self.arena_opening_book));
+        line!("arena_opening_positions", self.arena_opening_positions);
+        line!("arena_opening_plies_min", self.arena_opening_plies_min);
+        line!("arena_opening_plies_max", self.arena_opening_plies_max);
         line!("tensorboard_logdir", q(&self.tensorboard_logdir));
         out
     }
@@ -519,7 +524,6 @@ impl AzLoopFileConfig {
         self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
-        self.root_exploration_plies = self.root_exploration_plies.min(self.max_plies);
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
@@ -542,6 +546,13 @@ impl AzLoopFileConfig {
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
+        self.arena_opening_positions = self.arena_opening_positions.max(1);
+        if self.arena_opening_plies_min > self.arena_opening_plies_max {
+            std::mem::swap(
+                &mut self.arena_opening_plies_min,
+                &mut self.arena_opening_plies_max,
+            );
+        }
         self
     }
 }
@@ -583,9 +594,15 @@ mod tests {
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("deblunder_q_gap = 0.25\n"));
         assert!(text.contains("value_td_lambda = 1.0\n"));
+        assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
+        assert!(text.contains("arena_opening_positions = 300\n"));
+        assert!(text.contains("arena_opening_plies_min = 4\n"));
+        assert!(text.contains("arena_opening_plies_max = 10\n"));
+        assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("gumbel"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));
+        assert!(!text.contains("arena_eval_fens"));
         assert!(!text.contains("000000047"));
         assert!(!text.contains("000000023"));
 
@@ -594,19 +611,6 @@ mod tests {
         assert!((parsed.lr - 0.0005).abs() < 1e-9);
         assert!((parsed.deblunder_q_gap - 0.25).abs() < 1e-6);
         assert!((parsed.value_td_lambda - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn old_pikafish_eval_fens_config_field_maps_to_internal_arena_fens() {
-        let mut text = AzLoopFileConfig::default().to_file_text();
-        text = text.replace(
-            "arena_eval_fens = \"eval_fens.txt\"",
-            "arena_eval_fens = \"\"\narena_pikafish_eval_fens = \"old_eval.txt\"",
-        );
-
-        let parsed = AzLoopFileConfig::parse(&text);
-
-        assert_eq!(parsed.arena_eval_fens, "old_eval.txt");
     }
 }
 

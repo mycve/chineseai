@@ -569,7 +569,6 @@ pub struct AzLoopConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
-    pub root_exploration_plies: usize,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
