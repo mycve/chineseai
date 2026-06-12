@@ -634,8 +634,9 @@ impl GpuReplica {
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce = value_ce_per_sample.sum(1)?;
         let value_ce = value_ce.sum_all()?;
-        let moves_left_pred = forward.moves_left_logits.softplus()?.squeeze(1)?;
-        let moves_left_error = (&moves_left_pred.log1p()? - &batch_tensors.moves_left.log1p()?)?;
+        let moves_left_pred = tensor_softplus(&forward.moves_left_logits)?.squeeze(1)?;
+        let moves_left_error =
+            (&tensor_log1p(&moves_left_pred)? - &tensor_log1p(&batch_tensors.moves_left)?)?;
         let moves_left_sse = moves_left_error.sqr()?.sum_all()?;
 
         let legal_policy_logits = forward
@@ -649,8 +650,7 @@ impl GpuReplica {
         let weighted_value_loss = (&value_ce * value_weight.max(0.0) as f64)?;
         let weighted_policy_ce = (&policy_ce * policy_weight.max(0.0) as f64)?;
         let weighted_moves_left_loss = (&moves_left_sse * MOVES_LEFT_AUX_WEIGHT as f64)?;
-        let loss_tensor = (((weighted_value_loss + weighted_policy_ce)?
-            + weighted_moves_left_loss)?
+        let loss_tensor = ((weighted_value_loss + weighted_policy_ce + weighted_moves_left_loss)
             / global_batch_len as f64)?;
 
         let value_sse = value_sse.to_scalar::<f32>()?;
@@ -673,6 +673,16 @@ impl GpuReplica {
         };
         Ok(BatchLossOutput { loss_tensor, stats })
     }
+}
+
+fn tensor_softplus(input: &Tensor) -> CandleResult<Tensor> {
+    let relu = input.relu()?;
+    let exp_neg_abs = input.abs()?.neg()?.exp()?;
+    Ok((relu + tensor_log1p(&exp_neg_abs)?)?)
+}
+
+fn tensor_log1p(input: &Tensor) -> CandleResult<Tensor> {
+    input.affine(1.0, 1.0)?.log()
 }
 
 #[cfg(feature = "nccl-train")]
