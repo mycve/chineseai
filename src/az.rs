@@ -558,7 +558,6 @@ pub struct AzLoopConfig {
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub temperature_cutoff_plies: usize,
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
     pub cpuct: f32,
@@ -584,7 +583,6 @@ pub struct AzLoopConfig {
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
-    pub value_td_lambda: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -2591,7 +2589,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::assign_td_lambda_value_targets;
     use super::*;
     use std::fs;
 
@@ -2679,68 +2676,6 @@ mod tests {
                 position.to_fen()
             );
         }
-    }
-
-    #[test]
-    fn td_lambda_value_targets_mix_search_and_terminal_returns() {
-        let mut samples = vec![
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(-0.5),
-                value: -0.5,
-                side_sign: 1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(0.5),
-                value: 0.5,
-                side_sign: -1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-        ];
-
-        assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
-
-        assert!((samples[0].value + 0.125).abs() < 1e-6);
-        assert!((samples[1].value + 0.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn td_lambda_one_is_pure_mc_terminal_return() {
-        let mut samples = vec![
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(-0.5),
-                value: -0.5,
-                side_sign: 1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(0.5),
-                value: 0.5,
-                side_sign: -1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-        ];
-
-        assign_td_lambda_value_targets(&mut samples, 1.0, 1.0);
-
-        assert!((samples[0].value - 1.0).abs() < 1e-6);
-        assert!((samples[1].value + 1.0).abs() < 1e-6);
     }
 
     #[test]

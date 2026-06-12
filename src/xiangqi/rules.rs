@@ -93,7 +93,7 @@ impl Position {
             (None, None) => {}
         }
 
-        (repeated_indices.len() >= 5).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        (repeated_indices.len() >= 3).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -129,9 +129,9 @@ impl Position {
                     next_history.push(entry);
                 }
                 next_history.push(self.rule_history_entry_after_move(mv));
-                !matches!(
+                !rule_outcome_forbidden_for_mover(
                     next.rule_outcome_with_history(&next_history),
-                    Some(RuleOutcome::Win(winner)) if winner == mover.opposite()
+                    mover,
                 )
             })
             .collect()
@@ -234,6 +234,18 @@ impl Position {
             PieceKind::Soldier => soldier_crossed_river(piece.color, super::geom::rank_of(sq)),
             PieceKind::Horse | PieceKind::Rook | PieceKind::Cannon => true,
         }
+    }
+}
+
+fn rule_outcome_forbidden_for_mover(outcome: Option<RuleOutcome>, mover: Color) -> bool {
+    match outcome {
+        Some(RuleOutcome::Win(winner)) => winner == mover.opposite(),
+        Some(RuleOutcome::Draw(
+            RuleDrawReason::Repetition
+            | RuleDrawReason::MutualLongCheck
+            | RuleDrawReason::MutualLongChase,
+        )) => true,
+        Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120)) | None => false,
     }
 }
 

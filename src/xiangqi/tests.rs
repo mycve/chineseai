@@ -507,11 +507,11 @@ fn cannon_repetition_chasing_advisor_is_not_long_chase_loss() {
 
     let mv = position.parse_uci_move("e4e3").unwrap();
     assert!(position.legal_moves().contains(&mv));
-    assert!(position.legal_moves_with_rules(&history).contains(&mv));
+    assert!(!position.legal_moves_with_rules(&history).contains(&mv));
 }
 
 #[test]
-fn four_repetition_cycles_without_forcing_do_not_draw() {
+fn three_repetition_cycles_without_forcing_draw() {
     let history = vec![
         test_rule_entry(21, Color::Red, None, false, 0),
         test_rule_entry(22, Color::Black, Some(Color::Red), false, 0),
@@ -527,7 +527,10 @@ fn four_repetition_cycles_without_forcing_do_not_draw() {
         test_rule_entry(23, Color::Red, Some(Color::Black), false, 0),
         test_rule_entry(21, Color::Red, Some(Color::Black), false, 0),
     ];
-    assert_eq!(Position::rule_outcome(&history), None);
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+    );
 }
 
 #[test]

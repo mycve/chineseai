@@ -390,7 +390,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             shape_count += 1;
             entropy_all_sum += entropy;
             entropy_all_count += 1;
-            if ply < config.temperature_cutoff_plies {
+            if ply < temperature_opening_plies(config) {
                 entropy_opening_sum += entropy;
                 entropy_opening_count += 1;
                 opening_raw_prior_top1_sum += shape.raw_prior_top1;
@@ -548,7 +548,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
+        assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events);
         assign_moves_left_targets(&mut game_samples, config.max_plies);
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -697,17 +697,10 @@ fn make_training_sample(
     }
 }
 
-pub(super) fn assign_td_lambda_value_targets(
-    samples: &mut [AzTrainingSample],
-    game_result: f32,
-    lambda: f32,
-) {
-    let lambda = lambda.clamp(0.0, 1.0);
-    let mut return_red = game_result.clamp(-1.0, 1.0);
-    for sample in samples.iter_mut().rev() {
-        let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
-        return_red = (search_red * (1.0 - lambda) + return_red * lambda).clamp(-1.0, 1.0);
-        let side_value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
+pub(super) fn assign_mc_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
+    let result_red = game_result_red.clamp(-1.0, 1.0);
+    for sample in samples.iter_mut() {
+        let side_value = (result_red * sample.side_sign).clamp(-1.0, 1.0);
         sample.value_wdl = scalar_value_to_wdl_target(side_value);
         sample.value = wdl_q(sample.value_wdl);
     }
@@ -780,10 +773,9 @@ fn assign_deblundered_value_targets(
     samples: &mut [AzTrainingSample],
     game_result_red: f32,
     deblunder_events: &[DeblunderEvent],
-    config: &AzLoopConfig,
 ) {
     if deblunder_events.is_empty() {
-        assign_td_lambda_value_targets(samples, game_result_red, config.value_td_lambda);
+        assign_mc_value_targets(samples, game_result_red);
         return;
     }
 
@@ -793,19 +785,11 @@ fn assign_deblundered_value_targets(
             continue;
         }
         let end = event.sample_index + 1;
-        assign_td_lambda_value_targets(
-            &mut samples[start..end],
-            event.boundary_red,
-            config.value_td_lambda,
-        );
+        assign_mc_value_targets(&mut samples[start..end], event.boundary_red);
         start = end;
     }
     if start < samples.len() {
-        assign_td_lambda_value_targets(
-            &mut samples[start..],
-            game_result_red,
-            config.value_td_lambda,
-        );
+        assign_mc_value_targets(&mut samples[start..], game_result_red);
     }
 }
 
@@ -826,9 +810,6 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
 }
 
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
-    if config.temperature_cutoff_plies > 0 && ply >= config.temperature_cutoff_plies {
-        return config.temperature_endgame;
-    }
     if ply < config.temperature_decay_delay_plies {
         return config.temperature_start;
     }
@@ -841,6 +822,12 @@ fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
     }
     let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
     config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
+}
+
+fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
+    config
+        .temperature_decay_delay_plies
+        .saturating_add(config.temperature_decay_plies)
 }
 
 fn choose_selfplay_move(
@@ -861,23 +848,7 @@ fn choose_selfplay_move(
             .map(|candidate| candidate.mv);
     }
 
-    let best_q = candidates
-        .iter()
-        .map(|candidate| candidate.q)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let inv_temperature = 1.0 / temperature.max(1e-3);
-    let weights = candidates
-        .iter()
-        .map(|candidate| {
-            if value_cutoff > 0.0 && best_q.is_finite() && best_q - candidate.q > value_cutoff {
-                0.0
-            } else {
-                (candidate.visits as f32 - visit_offset)
-                    .max(1e-9)
-                    .powf(inv_temperature)
-            }
-        })
-        .collect::<Vec<_>>();
+    let weights = temperature_move_weights(candidates, temperature, value_cutoff, visit_offset);
     let total = candidates
         .iter()
         .zip(&weights)
@@ -895,6 +866,95 @@ fn choose_selfplay_move(
         ticket -= weight;
     }
     candidates.first().map(|candidate| candidate.mv)
+}
+
+fn temperature_move_weights(
+    candidates: &[AzCandidate],
+    temperature: f32,
+    value_cutoff: f32,
+    visit_offset: f32,
+) -> Vec<f32> {
+    let best_q = candidates
+        .iter()
+        .map(|candidate| candidate.q)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let inv_temperature = 1.0 / temperature.max(1e-3);
+    let mut weights = candidates
+        .iter()
+        .map(|candidate| {
+            (candidate.visits as f32 - visit_offset)
+                .max(1e-9)
+                .powf(inv_temperature)
+        })
+        .collect::<Vec<_>>();
+
+    if value_cutoff <= 0.0 || value_cutoff >= 1.0 || !best_q.is_finite() {
+        return weights;
+    }
+
+    const MIN_CUTOFF_CANDIDATES: usize = 8;
+    const MIN_CUTOFF_WEIGHT_MASS: f32 = 0.98;
+
+    let total_weight = weights.iter().sum::<f32>();
+    if total_weight <= 0.0 {
+        return weights;
+    }
+
+    let mut keep = candidates
+        .iter()
+        .map(|candidate| {
+            let best_win = (best_q + 1.0) * 0.5;
+            let win = (candidate.q + 1.0) * 0.5;
+            best_win - win <= value_cutoff
+        })
+        .collect::<Vec<_>>();
+    if keep.iter().filter(|&&kept| kept).count() < MIN_CUTOFF_CANDIDATES {
+        let mut ranked = candidates
+            .iter()
+            .enumerate()
+            .collect::<Vec<(usize, &AzCandidate)>>();
+        ranked.sort_by(|(_, left), (_, right)| {
+            right
+                .visits
+                .cmp(&left.visits)
+                .then_with(|| right.q.total_cmp(&left.q))
+        });
+        for (index, _) in ranked.into_iter().take(MIN_CUTOFF_CANDIDATES) {
+            keep[index] = true;
+        }
+    }
+
+    let kept_weight = weights
+        .iter()
+        .zip(&keep)
+        .filter_map(|(weight, kept)| kept.then_some(*weight))
+        .sum::<f32>();
+    if kept_weight / total_weight < MIN_CUTOFF_WEIGHT_MASS {
+        let mut ranked = weights
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<(usize, f32)>>();
+        ranked.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+        let mut mass = kept_weight;
+        for (index, weight) in ranked {
+            if keep[index] {
+                continue;
+            }
+            keep[index] = true;
+            mass += weight;
+            if mass / total_weight >= MIN_CUTOFF_WEIGHT_MASS {
+                break;
+            }
+        }
+    }
+
+    for (weight, kept) in weights.iter_mut().zip(keep) {
+        if !kept {
+            *weight = 0.0;
+        }
+    }
+    weights
 }
 
 fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
@@ -1089,6 +1149,17 @@ mod tests {
         }
     }
 
+    fn candidate_q(mv: Move, visits: u32, q: f32) -> AzCandidate {
+        AzCandidate {
+            mv,
+            visits,
+            q,
+            raw_prior: 0.0,
+            prior: 0.0,
+            policy: 0.0,
+        }
+    }
+
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
         AzTrainingSample {
             features: Vec::new(),
@@ -1099,48 +1170,6 @@ mod tests {
             side_sign,
             moves_left: 0.0,
             meta: AzSampleMeta::default(),
-        }
-    }
-
-    fn test_config(value_td_lambda: f32) -> AzLoopConfig {
-        AzLoopConfig {
-            games: 1,
-            max_plies: 100,
-            simulations: 1,
-            seed: 1,
-            workers: 1,
-            generation_update: 0,
-            temperature_start: 1.0,
-            temperature_endgame: 0.0,
-            temperature_decay_delay_plies: 0,
-            temperature_decay_plies: 0,
-            temperature_cutoff_plies: 0,
-            temperature_value_cutoff: 0.0,
-            temperature_visit_offset: 0.0,
-            cpuct: 1.0,
-            cpuct_at_root: 1.0,
-            cpuct_base: 1.0,
-            cpuct_factor: 0.0,
-            cpuct_base_at_root: 1.0,
-            cpuct_factor_at_root: 0.0,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            fpu_value: 0.0,
-            fpu_value_at_root: 0.0,
-            draw_score: 0.0,
-            moves_left_max_effect: 0.0,
-            moves_left_slope: 0.0,
-            moves_left_threshold: 0.0,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.0,
-            moves_left_quadratic_factor: 0.0,
-            policy_softmax_temp: 1.0,
-            opening_positions: Vec::new(),
-            resign_percentage: 0.0,
-            resign_playthrough: 0.0,
-            mirror_probability: 0.0,
-            deblunder_q_gap: 0.25,
-            value_td_lambda,
         }
     }
 
@@ -1212,7 +1241,7 @@ mod tests {
             },
         ];
 
-        assign_deblundered_value_targets(&mut samples, 1.0, &events, &test_config(1.0));
+        assign_deblundered_value_targets(&mut samples, 1.0, &events);
 
         assert!((samples[0].value - 0.6).abs() < 1e-6);
         assert!((samples[1].value + 0.6).abs() < 1e-6);
@@ -1262,5 +1291,41 @@ mod tests {
         let quiet_meta = move_search_meta(&candidates, moves[2], 0.2, 3, 99, 7, 0.25);
         assert_eq!(quiet_meta.deblunder_boundary_q, None);
         assert!(!quiet_meta.sample.deblundered);
+    }
+
+    #[test]
+    fn temperature_value_cutoff_uses_win_probability_gap() {
+        let mut candidates = vec![
+            candidate_q(Move::new(0, 1), 100, 0.80),
+            candidate_q(Move::new(0, 2), 1, 0.60),
+        ];
+        for index in 2..10 {
+            candidates.push(candidate_q(Move::new(index, index + 1), 10, 0.40));
+        }
+
+        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
+
+        assert!(weights[1] > 0.0);
+    }
+
+    #[test]
+    fn temperature_value_cutoff_keeps_exploration_floor() {
+        let candidates = (0..12)
+            .map(|index| {
+                candidate_q(
+                    Move::new(index, index + 1),
+                    if index == 0 { 100 } else { 10 },
+                    0.90 - index as f32 * 0.10,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
+        let kept = weights.iter().filter(|&&weight| weight > 0.0).count();
+        let total_without_cutoff = 100.0 + 11.0 * 10.0;
+        let kept_weight = weights.iter().sum::<f32>();
+
+        assert!(kept >= 8);
+        assert!(kept_weight / total_without_cutoff >= 0.98);
     }
 }
