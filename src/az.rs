@@ -628,7 +628,7 @@ pub struct AzLoopReport {
     pub sampled_best_rate: f32,
     pub deblunder_rate: f32,
     pub avg_best_played_q_gap: f32,
-    pub avg_best_played_visit_ratio: f32,
+    pub avg_played_top_visit_ratio: f32,
     pub avg_best_q: f32,
     pub avg_played_q: f32,
     pub selfplay_seconds: f32,

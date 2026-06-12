@@ -1187,7 +1187,7 @@ fn build_async_training_report(
         sampled_best_rate: pending.selfplay.sampled_best_moves as f32 / sampled_moves,
         deblunder_rate: pending.selfplay.deblundered_moves as f32 / sampled_moves,
         avg_best_played_q_gap: pending.selfplay.best_played_q_gap_sum / sampled_moves,
-        avg_best_played_visit_ratio: pending.selfplay.best_played_visit_ratio_sum / sampled_moves,
+        avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
         avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
         selfplay_seconds: pending.selfplay_seconds,
@@ -2776,7 +2776,7 @@ fn main() {
                                         sampled_best_rate: 0.0,
                                         deblunder_rate: 0.0,
                                         avg_best_played_q_gap: 0.0,
-                                        avg_best_played_visit_ratio: 0.0,
+                                        avg_played_top_visit_ratio: 0.0,
                                         avg_best_q: 0.0,
                                         avg_played_q: 0.0,
                                         selfplay_seconds: 0.0,
@@ -2849,7 +2849,7 @@ fn main() {
                                         sampled_best_rate: 0.0,
                                         deblunder_rate: 0.0,
                                         avg_best_played_q_gap: 0.0,
-                                        avg_best_played_visit_ratio: 0.0,
+                                        avg_played_top_visit_ratio: 0.0,
                                         avg_best_q: 0.0,
                                         avg_played_q: 0.0,
                                         selfplay_seconds: 0.0,
@@ -2963,7 +2963,7 @@ fn main() {
                     report.sampled_best_rate,
                     report.deblunder_rate,
                     report.avg_best_played_q_gap,
-                    report.avg_best_played_visit_ratio,
+                    report.avg_played_top_visit_ratio,
                     report.avg_best_q,
                     report.avg_played_q,
                     report.train_seconds,
@@ -3132,9 +3132,9 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/avg_best_played_visit_ratio",
+                    "stats/avg_played_top_visit_ratio",
                     update,
-                    report.avg_best_played_visit_ratio,
+                    report.avg_played_top_visit_ratio,
                 );
                 log_scalar(&mut tb, "stats/avg_best_q", update, report.avg_best_q);
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);

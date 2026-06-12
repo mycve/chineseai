@@ -168,7 +168,7 @@ pub struct AzSelfplayData {
     pub sampled_best_moves: usize,
     pub deblundered_moves: usize,
     pub best_played_q_gap_sum: f32,
-    pub best_played_visit_ratio_sum: f32,
+    pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
@@ -208,7 +208,7 @@ impl AzSelfplayData {
         self.sampled_best_moves += other.sampled_best_moves;
         self.deblundered_moves += other.deblundered_moves;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
-        self.best_played_visit_ratio_sum += other.best_played_visit_ratio_sum;
+        self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
@@ -273,7 +273,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.sampled_best_moves += chunk.sampled_best_moves;
         merged.deblundered_moves += chunk.deblundered_moves;
         merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
-        merged.best_played_visit_ratio_sum += chunk.best_played_visit_ratio_sum;
+        merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
         merged.best_q_sum += chunk.best_q_sum;
         merged.played_q_sum += chunk.played_q_sum;
         merged.terminal.add_assign(&chunk.terminal);
@@ -315,7 +315,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut sampled_best_moves = 0usize;
     let mut deblundered_moves = 0usize;
     let mut best_played_q_gap_sum = 0.0f32;
-    let mut best_played_visit_ratio_sum = 0.0f32;
+    let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
@@ -472,10 +472,16 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 usize::from(move_meta.sample.best_index == move_meta.sample.played_index);
             deblundered_moves += usize::from(move_meta.sample.deblundered);
             best_played_q_gap_sum += (move_meta.sample.best_q - move_meta.sample.played_q).max(0.0);
-            best_played_visit_ratio_sum += if move_meta.sample.best_visits == 0 {
+            let top_visits = search
+                .candidates
+                .iter()
+                .map(|candidate| candidate.visits)
+                .max()
+                .unwrap_or(0);
+            played_top_visit_ratio_sum += if top_visits == 0 {
                 0.0
             } else {
-                move_meta.sample.played_visits as f32 / move_meta.sample.best_visits as f32
+                move_meta.sample.played_visits as f32 / top_visits as f32
             };
             best_q_sum += move_meta.sample.best_q;
             played_q_sum += move_meta.sample.played_q;
@@ -590,7 +596,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         sampled_best_moves,
         deblundered_moves,
         best_played_q_gap_sum,
-        best_played_visit_ratio_sum,
+        played_top_visit_ratio_sum,
         best_q_sum,
         played_q_sum,
         terminal,
