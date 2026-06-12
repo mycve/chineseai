@@ -108,7 +108,7 @@ pub fn alphazero_search_with_history_and_rules(
         return AzSearchResult {
             best_move: None,
             value_q: tree.nodes[root].value,
-            value_cp: lc0_cp_from_q(tree.nodes[root].value),
+            value_cp: cp_from_q(tree.nodes[root].value),
             simulations: 0,
             search_depth_avg: 0.0,
             search_depth_max: 0,
@@ -161,7 +161,7 @@ pub fn alphazero_search_with_history_and_rules(
     AzSearchResult {
         best_move,
         value_q: searched_value,
-        value_cp: lc0_cp_from_q(searched_value),
+        value_cp: cp_from_q(searched_value),
         simulations: used,
         search_depth_avg: tree.search_depth_avg(),
         search_depth_max: tree.search_depth_max,
@@ -179,9 +179,8 @@ pub fn alphazero_search(
     alphazero_search_with_history_and_rules(position, &[], None, None, model, limits)
 }
 
-pub fn lc0_cp_from_q(q: f32) -> i32 {
-    let q = q.clamp(-0.999, 0.999);
-    (220.0 * (1.5637541897 * q).tan()).round() as i32
+pub fn cp_from_q(q: f32) -> i32 {
+    (q.clamp(-1.0, 1.0) * 1000.0).round() as i32
 }
 
 struct AzTree<'a> {

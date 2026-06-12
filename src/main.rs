@@ -370,7 +370,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mstc{}_dbg{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mstc{}_dbg{}_mp{}_vtd{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -407,6 +407,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.max_sample_train_count,
         f32_slug(config.deblunder_q_gap),
         f32_slug(config.mirror_probability),
+        f32_slug(config.value_td_lambda),
         config.checkpoint_interval,
         config.arena_interval,
         f32_slug(config.arena_cpuct),
@@ -671,6 +672,9 @@ struct AzSelfplayFitBenchArgs {
     /// Q gap that marks a sampled move as a value-repair blunder.
     #[arg(long, default_value_t = 0.25)]
     deblunder_q_gap: f32,
+    /// TD lambda used inside value-repair segments. 1.0 keeps pure terminal targets.
+    #[arg(long, default_value_t = 0.95)]
+    value_td_lambda: f32,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
     replay_out: Option<String>,
@@ -757,6 +761,9 @@ struct AzReplayGenerateFixedArgs {
     /// Q gap that marks a sampled move as a value-repair blunder.
     #[arg(long, default_value_t = 0.25)]
     deblunder_q_gap: f32,
+    /// TD lambda used inside value-repair segments. 1.0 keeps pure terminal targets.
+    #[arg(long, default_value_t = 0.95)]
+    value_td_lambda: f32,
 }
 
 #[derive(Args, Debug)]
@@ -939,6 +946,7 @@ fn build_az_loop_config(
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         deblunder_q_gap: config.deblunder_q_gap,
+        value_td_lambda: config.value_td_lambda,
     }
 }
 
@@ -1634,6 +1642,7 @@ fn main() {
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     deblunder_q_gap: cmd.deblunder_q_gap,
+                    value_td_lambda: cmd.value_td_lambda,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -1858,6 +1867,7 @@ fn main() {
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     deblunder_q_gap: cmd.deblunder_q_gap,
+                    value_td_lambda: cmd.value_td_lambda,
                 };
                 let data = generate_selfplay_data(&model, &config);
                 total_games += data.games.len();
@@ -2164,7 +2174,7 @@ fn main() {
             let opening_positions = load_opening_positions(&config.opening_fens_path);
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_samples_per_update,
@@ -2205,6 +2215,7 @@ fn main() {
                 config.replay_capacity,
                 config.mirror_probability,
                 config.deblunder_q_gap,
+                config.value_td_lambda,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
