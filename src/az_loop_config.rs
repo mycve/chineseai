@@ -76,8 +76,8 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 800,
             selfplay_samples_per_update: 60000,
-            lr: 0.0005,
-            lr_min: 0.00003,
+            lr: 0.001,
+            lr_min: 0.0001,
             lr_decay_start_update: 800,
             lr_decay_interval: 1000,
             lr_decay_factor: 0.33333334,
@@ -114,7 +114,7 @@ impl Default for AzLoopFileConfig {
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 500000,
-            train_warmup_samples: 150000,
+            train_warmup_samples: 300000,
             train_samples_per_update: 120000,
             train_epochs_per_update: 2,
             max_sample_train_count: 3,
@@ -130,10 +130,10 @@ impl Default for AzLoopFileConfig {
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
-            arena_processes: 100,
+            arena_processes: 250,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 300,
-            arena_opening_plies_min: 4,
+            arena_opening_plies_min: 6,
             arena_opening_plies_max: 10,
             tensorboard_logdir: "runs/chineseai".into(),
         }
@@ -558,8 +558,8 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.contains("lr = 0.0005\n"));
-        assert!(text.contains("lr_min = 0.00003\n"));
+        assert!(text.contains("lr = 0.001\n"));
+        assert!(text.contains("lr_min = 0.0001\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("temperature_endgame = 0.5\n"));
         assert!(text.contains("temperature_decay_delay_plies = 20\n"));
@@ -590,7 +590,7 @@ mod tests {
         assert!(text.contains("value_td_lambda = 0.95\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
-        assert!(text.contains("arena_opening_plies_min = 4\n"));
+        assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("gumbel"));
