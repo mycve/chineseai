@@ -87,10 +87,10 @@ impl Default for AzLoopFileConfig {
             seed: 20260412,
             workers: 250,
             temperature_start: 0.9,
-            temperature_endgame: 0.6,
+            temperature_endgame: 0.5,
             temperature_decay_delay_plies: 20,
             temperature_decay_plies: 60,
-            temperature_value_cutoff: 1.0,
+            temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
             cpuct: 0.65,
             cpuct_at_root: 2.53,
@@ -561,11 +561,11 @@ mod tests {
         assert!(text.contains("lr = 0.0005\n"));
         assert!(text.contains("lr_min = 0.00003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
-        assert!(text.contains("temperature_endgame = 0.6\n"));
+        assert!(text.contains("temperature_endgame = 0.5\n"));
         assert!(text.contains("temperature_decay_delay_plies = 20\n"));
         assert!(text.contains("temperature_decay_plies = 60\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("temperature_value_cutoff = 1.0\n"));
+        assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
         assert!(text.contains("cpuct = 0.65\n"));
         assert!(text.contains("cpuct_at_root = 2.53\n"));
