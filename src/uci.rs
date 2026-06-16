@@ -284,6 +284,9 @@ fn apply_uci_moves(
         let Some(mv) = position.parse_uci_move(text) else {
             break;
         };
+        if !position.legal_moves_with_rules(rule_history).contains(&mv) {
+            break;
+        }
         if let Some(piece) = position.piece_at(mv.from as usize) {
             history.push(HistoryMove {
                 piece,
