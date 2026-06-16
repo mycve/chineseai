@@ -10,10 +10,9 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
-        alphazero_search, benchmark_fixed_policy_fit,
-        benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit, benchmark_training,
-        generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples_weighted,
+        alphazero_search, benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace,
+        benchmark_policy_fit, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples_weighted,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -23,8 +22,7 @@ use chineseai::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -105,8 +103,8 @@ impl AzInitArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-search model.safetensors
-  chineseai az-search model.safetensors 50000 0.65 --cpuct-at-root 2.53 startpos
-  chineseai az-search model.safetensors 10000 0.65 --cpuct-at-root 2.53 startpos")]
+  chineseai az-search model.safetensors 50000 1.5 --cpuct-at-root 3.0 startpos
+  chineseai az-search model.safetensors 10000 1.5 --cpuct-at-root 3.0 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -114,10 +112,10 @@ struct AzSearchArgs {
     #[arg(default_value_t = 10_000)]
     simulations: usize,
     /// Non-root PUCT init.
-    #[arg(default_value_t = 0.65)]
+    #[arg(default_value_t = 1.5)]
     cpuct: f32,
     /// Root PUCT init.
-    #[arg(long, default_value_t = 2.53)]
+    #[arg(long, default_value_t = 3.0)]
     cpuct_at_root: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
@@ -240,6 +238,9 @@ struct VsPikafishArgs {
     /// ChineseAI PUCT constant.
     #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
+    /// ChineseAI root PUCT constant.
+    #[arg(long, default_value_t = 3.0)]
+    cpuct_at_root: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
@@ -1259,7 +1260,10 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
     merged
 }
 
-fn build_arena_start_positions(config: &AzLoopFileConfig, update: usize) -> (Vec<Position>, String) {
+fn build_arena_start_positions(
+    config: &AzLoopFileConfig,
+    update: usize,
+) -> (Vec<Position>, String) {
     if !config.arena_opening_book.trim().is_empty() {
         let book = ObkBook::load(&config.arena_opening_book).unwrap_or_else(|err| {
             panic!(
@@ -3190,6 +3194,7 @@ fn main() {
             let model_path = cmd.model;
             let simulations = cmd.simulations.unwrap_or(192).max(1);
             let cpuct = cmd.cpuct.max(0.0);
+            let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let max_plies = cmd.max_plies.max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
@@ -3207,6 +3212,7 @@ fn main() {
                     seed: cmd.seed,
                     parallel_games,
                     cpuct,
+                    cpuct_at_root,
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
@@ -3225,7 +3231,7 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}",
+                "vs-pikafish: model={} search=alphazero games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),
@@ -3244,7 +3250,8 @@ fn main() {
                 pikafish_depth,
                 max_plies,
                 simulations,
-                cpuct
+                cpuct,
+                cpuct_at_root
             );
         }
     };
@@ -3260,5 +3267,3 @@ fn parse_position(text: &str) -> Position {
         })
     }
 }
-
-

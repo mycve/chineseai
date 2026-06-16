@@ -40,8 +40,8 @@ impl Default for UciState {
             model: None,
             simulations: 10_000,
             threads: 1,
-            cpuct: 0.65,
-            cpuct_at_root: 2.53,
+            cpuct: 1.5,
+            cpuct_at_root: 3.0,
             cpuct_base: 19652.0,
             cpuct_factor: 2.0,
             cpuct_base_at_root: 19652.0,
@@ -100,8 +100,8 @@ fn print_uci_id() {
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name Cpuct type string default 0.65");
-    println!("option name CpuctAtRoot type string default 2.53");
+    println!("option name Cpuct type string default 1.5");
+    println!("option name CpuctAtRoot type string default 3.0");
     println!("option name CpuctBase type string default 19652.0");
     println!("option name CpuctFactor type string default 2.0");
     println!("option name CpuctBaseAtRoot type string default 19652.0");
