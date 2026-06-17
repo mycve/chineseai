@@ -103,9 +103,9 @@ impl Default for AzLoopFileConfig {
             fpu_value: 0.23,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
-            moves_left_max_effect: 0.1,
-            moves_left_slope: 0.0007,
-            moves_left_threshold: 0.8,
+            moves_left_max_effect: 0.25,
+            moves_left_slope: 0.002,
+            moves_left_threshold: 0.6,
             moves_left_constant_factor: 0.0,
             moves_left_scaled_factor: 0.15,
             moves_left_quadratic_factor: 0.85,
@@ -576,9 +576,9 @@ mod tests {
         assert!(text.contains("fpu_value = 0.23\n"));
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("moves_left_max_effect = 0.1\n"));
-        assert!(text.contains("moves_left_slope = 0.0007\n"));
-        assert!(text.contains("moves_left_threshold = 0.8\n"));
+        assert!(text.contains("moves_left_max_effect = 0.25\n"));
+        assert!(text.contains("moves_left_slope = 0.002\n"));
+        assert!(text.contains("moves_left_threshold = 0.6\n"));
         assert!(text.contains("moves_left_constant_factor = 0.0\n"));
         assert!(text.contains("moves_left_scaled_factor = 0.15\n"));
         assert!(text.contains("moves_left_quadratic_factor = 0.85\n"));

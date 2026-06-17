@@ -312,7 +312,7 @@ fn play_one_game(
                     draw_score: 0.0,
                     moves_left_max_effect: 0.0,
                     moves_left_slope: 0.0,
-                    moves_left_threshold: 0.8,
+                    moves_left_threshold: 0.6,
                     moves_left_constant_factor: 0.0,
                     moves_left_scaled_factor: 0.0,
                     moves_left_quadratic_factor: 0.0,
