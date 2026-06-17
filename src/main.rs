@@ -1418,8 +1418,13 @@ fn main() {
             println!("by_policy:");
             for candidate in &result.candidates {
                 println!(
-                    "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
+                    "candidate: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    candidate.mv,
+                    candidate.visits,
+                    candidate.q,
+                    candidate.moves_left,
+                    candidate.prior,
+                    candidate.policy
                 );
             }
             println!("by_visits:");
@@ -1433,8 +1438,13 @@ fn main() {
             });
             for candidate in &by_visits {
                 println!(
-                    "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
+                    "visited: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    candidate.mv,
+                    candidate.visits,
+                    candidate.q,
+                    candidate.moves_left,
+                    candidate.prior,
+                    candidate.policy
                 );
             }
         }
