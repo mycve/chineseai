@@ -227,6 +227,10 @@ pub(super) struct AzEvalScratch {
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
     square_tokens: Vec<f32>,
+    attention_scores: Vec<f32>,
+    attention_values: Vec<f32>,
+    attention_context: Vec<f32>,
+    attention_token: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
 }
@@ -243,6 +247,10 @@ impl AzEvalScratch {
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
             square_tokens: vec![0.0; BOARD_SIZE * hidden_size],
+            attention_scores: Vec::with_capacity(64),
+            attention_values: Vec::with_capacity(64 * PIECE_ATTENTION_SIZE),
+            attention_context: vec![0.0; PIECE_ATTENTION_TOTAL_SIZE],
+            attention_token: vec![0.0; hidden_size],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -508,6 +516,7 @@ pub struct AzNnue {
     pub policy_move_embedding: Vec<f32>,
     pub policy_from_token_to_hidden: Vec<f32>,
     pub policy_to_token_from_hidden: Vec<f32>,
+    piece_attention_enabled: bool,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -541,6 +550,7 @@ impl Clone for AzNnue {
             policy_move_embedding: self.policy_move_embedding.clone(),
             policy_from_token_to_hidden: self.policy_from_token_to_hidden.clone(),
             policy_to_token_from_hidden: self.policy_to_token_from_hidden.clone(),
+            piece_attention_enabled: self.piece_attention_enabled,
             gpu_trainer: None,
         }
     }
@@ -807,7 +817,12 @@ impl AzTrainStats {
 
 impl AzNnue {
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-    pub(super) fn refresh_policy_derived_caches(&mut self) {}
+    pub(super) fn refresh_policy_derived_caches(&mut self) {
+        self.piece_attention_enabled = self
+            .piece_attention_output
+            .iter()
+            .any(|&value| value != 0.0);
+    }
 
     pub fn random_with_arch(arch: AzNnueArch, seed: u64) -> Self {
         if let Err(err) = arch.validate() {
@@ -893,8 +908,10 @@ impl AzNnue {
             policy_move_embedding,
             policy_from_token_to_hidden,
             policy_to_token_from_hidden,
+            piece_attention_enabled: false,
             gpu_trainer: None,
         }
+        .with_refreshed_derived_flags()
     }
 
     pub fn random(hidden_size: usize, seed: u64) -> Self {
@@ -960,10 +977,20 @@ impl AzNnue {
                 &tensors,
                 "policy_to_token_from_hidden",
             )?,
+            piece_attention_enabled: false,
             gpu_trainer: None,
         };
+        let model = model.with_refreshed_derived_flags();
         model.validate()?;
         Ok(model)
+    }
+
+    fn with_refreshed_derived_flags(mut self) -> Self {
+        self.piece_attention_enabled = self
+            .piece_attention_output
+            .iter()
+            .any(|&value| value != 0.0);
+        self
     }
 
     pub fn evaluate_value(
@@ -1002,7 +1029,14 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
-            self.add_sparse_attention_into(&features, &mut scratch.hidden);
+            self.add_sparse_attention_into(
+                &features,
+                &mut scratch.hidden,
+                &mut scratch.attention_scores,
+                &mut scratch.attention_values,
+                &mut scratch.attention_context,
+                &mut scratch.attention_token,
+            );
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
@@ -1012,7 +1046,11 @@ impl AzNnue {
         };
         let value = wdl_q(value_wdl);
         let moves_left = self.moves_left_from_value_head(&scratch.value_head);
-        self.square_tokens_from_features_into(&features, &mut scratch.square_tokens);
+        self.square_tokens_from_features_into(
+            &features,
+            &mut scratch.square_tokens,
+            &mut scratch.attention_token,
+        );
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
         AzEvalOutput {
             value_wdl,
@@ -1041,7 +1079,14 @@ impl AzNnue {
                 &mut scratch.hidden,
             );
             let features = extract_sparse_features_az_canonical(position, history);
-            self.add_sparse_attention_into(&features, &mut scratch.hidden);
+            self.add_sparse_attention_into(
+                &features,
+                &mut scratch.hidden,
+                &mut scratch.attention_scores,
+                &mut scratch.attention_values,
+                &mut scratch.attention_context,
+                &mut scratch.attention_token,
+            );
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
@@ -1050,7 +1095,11 @@ impl AzNnue {
             crate::scope_profile!("az.eval.value_head");
             self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
-        self.square_tokens_from_features_into(&features, &mut scratch.square_tokens);
+        self.square_tokens_from_features_into(
+            &features,
+            &mut scratch.square_tokens,
+            &mut scratch.attention_token,
+        );
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch)
     }
 
@@ -1143,11 +1192,45 @@ impl AzNnue {
     }
 
     fn add_factorized_structure_into(&self, features: &[usize], hidden: &mut [f32]) {
-        let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
+        let mut us_king_bucket = 4;
+        let mut them_king_bucket = 4;
+        let mut structural_features = [StructuralPieceSquare {
+            piece_index: 0,
+            rank: 0,
+            file: 0,
+        }; BOARD_SIZE];
+        let mut structural_count = 0usize;
         for &feature in features {
             let Some(structural) = decode_current_piece_square_feature(feature) else {
                 continue;
             };
+            let sq = feature % BOARD_SIZE;
+            match structural.piece_index {
+                0 => us_king_bucket = canonical_general_bucket(structural.piece_index, sq),
+                7 => them_king_bucket = canonical_general_bucket(structural.piece_index, sq),
+                _ => {}
+            }
+            structural_features[structural_count] = structural;
+            structural_count += 1;
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if self.hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: runtime detection above guarantees AVX2 support.
+                unsafe {
+                    self.add_factorized_structure_avx2(
+                        &structural_features[..structural_count],
+                        us_king_bucket,
+                        them_king_bucket,
+                        hidden,
+                    );
+                }
+                return;
+            }
+        }
+
+        for &structural in &structural_features[..structural_count] {
             add_scaled_feature_row(
                 hidden,
                 &self.input_piece_hidden,
@@ -1186,6 +1269,52 @@ impl AzNnue {
         }
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe fn add_factorized_structure_avx2(
+        &self,
+        structural_features: &[StructuralPieceSquare],
+        us_king_bucket: usize,
+        them_king_bucket: usize,
+        hidden: &mut [f32],
+    ) {
+        for &structural in structural_features {
+            unsafe {
+                add_feature_row_avx2(
+                    hidden,
+                    feature_row(
+                        &self.input_piece_hidden,
+                        self.hidden_size,
+                        structural.piece_index,
+                    ),
+                );
+                add_feature_row_avx2(
+                    hidden,
+                    feature_row(&self.input_rank_hidden, self.hidden_size, structural.rank),
+                );
+                add_feature_row_avx2(
+                    hidden,
+                    feature_row(&self.input_file_hidden, self.hidden_size, structural.file),
+                );
+                add_feature_row_avx2(
+                    hidden,
+                    feature_row(
+                        &self.input_king_piece_hidden,
+                        self.hidden_size,
+                        structural_king_piece_index(0, us_king_bucket, structural.piece_index),
+                    ),
+                );
+                add_feature_row_avx2(
+                    hidden,
+                    feature_row(
+                        &self.input_king_piece_hidden,
+                        self.hidden_size,
+                        structural_king_piece_index(1, them_king_bucket, structural.piece_index),
+                    ),
+                );
+            }
+        }
+    }
+
     fn input_embedding_linear_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
         hidden.copy_from_slice(&self.hidden_bias);
@@ -1216,20 +1345,33 @@ impl AzNnue {
     }
 
     #[allow(dead_code)]
-    fn add_sparse_attention_into(&self, features: &[usize], hidden: &mut [f32]) {
-        if features.is_empty()
-            || self
-                .piece_attention_output
-                .iter()
-                .all(|&value| value == 0.0)
-        {
+    fn add_sparse_attention_into(
+        &self,
+        features: &[usize],
+        hidden: &mut [f32],
+        scores: &mut Vec<f32>,
+        values: &mut Vec<f32>,
+        context: &mut Vec<f32>,
+        token: &mut Vec<f32>,
+    ) {
+        if features.is_empty() || !self.piece_attention_enabled {
             return;
         }
         let hidden_size = self.hidden_size;
-        let mut scores = Vec::with_capacity(features.len());
-        let mut values = Vec::with_capacity(features.len() * PIECE_ATTENTION_SIZE);
-        let mut context = vec![0.0; PIECE_ATTENTION_TOTAL_SIZE];
-        let mut token = vec![0.0; hidden_size];
+        context.resize(PIECE_ATTENTION_TOTAL_SIZE, 0.0);
+        context.fill(0.0);
+        token.resize(hidden_size, 0.0);
+        let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
+        let use_avx2 = {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2")
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                false
+            }
+        };
         for head in 0..PIECE_ATTENTION_HEADS {
             scores.clear();
             values.clear();
@@ -1239,16 +1381,22 @@ impl AzNnue {
                 if feature >= PIECE_SQUARE_INPUT_SIZE {
                     continue;
                 }
-                self.sparse_attention_token_into(feature, features, &mut token);
+                self.sparse_attention_token_into(
+                    feature,
+                    us_king_bucket,
+                    them_king_bucket,
+                    token.as_mut_slice(),
+                    use_avx2,
+                );
                 scores.push(dot_product(
-                    &token,
+                    token,
                     &self.piece_attention_query[query_base..query_base + hidden_size],
                 ));
                 for attention_feature in 0..PIECE_ATTENTION_SIZE {
                     let value_index = value_head_base + attention_feature;
                     let row = &self.piece_attention_value
                         [value_index * hidden_size..(value_index + 1) * hidden_size];
-                    values.push(dot_product(&token, row));
+                    values.push(dot_product(token, row));
                 }
             }
             if scores.is_empty() {
@@ -1259,7 +1407,7 @@ impl AzNnue {
                 .copied()
                 .fold(f32::NEG_INFINITY, |left, right| left.max(right));
             let mut weight_sum = 0.0f32;
-            for score in &mut scores {
+            for score in scores.iter_mut() {
                 *score = (*score - max_score).exp();
                 weight_sum += *score;
             }
@@ -1278,12 +1426,19 @@ impl AzNnue {
         for (hidden_index, hidden_value) in hidden.iter_mut().enumerate() {
             let row = &self.piece_attention_output[hidden_index * PIECE_ATTENTION_TOTAL_SIZE
                 ..(hidden_index + 1) * PIECE_ATTENTION_TOTAL_SIZE];
-            *hidden_value += dot_product(&context, row);
+            *hidden_value += dot_product(context, row);
         }
     }
 
     #[allow(dead_code)]
-    fn sparse_attention_token_into(&self, feature: usize, features: &[usize], token: &mut [f32]) {
+    fn sparse_attention_token_into(
+        &self,
+        feature: usize,
+        us_king_bucket: usize,
+        them_king_bucket: usize,
+        token: &mut [f32],
+        use_avx2: bool,
+    ) {
         let hidden_size = self.hidden_size;
         token.copy_from_slice(
             &self.input_hidden[feature * hidden_size..(feature + 1) * hidden_size],
@@ -1291,7 +1446,21 @@ impl AzNnue {
         let Some(structural) = decode_current_piece_square_feature(feature) else {
             return;
         };
-        let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if use_avx2 {
+                // SAFETY: caller only sets use_avx2 after runtime AVX2 detection.
+                unsafe {
+                    self.add_sparse_attention_token_structure_avx2(
+                        token,
+                        structural,
+                        us_king_bucket,
+                        them_king_bucket,
+                    );
+                }
+                return;
+            }
+        }
         add_scaled_feature_row(
             token,
             &self.input_piece_hidden,
@@ -1329,20 +1498,87 @@ impl AzNnue {
         );
     }
 
-    fn square_tokens_from_features_into(&self, features: &[usize], out: &mut Vec<f32>) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe fn add_sparse_attention_token_structure_avx2(
+        &self,
+        token: &mut [f32],
+        structural: StructuralPieceSquare,
+        us_king_bucket: usize,
+        them_king_bucket: usize,
+    ) {
+        unsafe {
+            add_feature_row_avx2(
+                token,
+                feature_row(
+                    &self.input_piece_hidden,
+                    self.hidden_size,
+                    structural.piece_index,
+                ),
+            );
+            add_feature_row_avx2(
+                token,
+                feature_row(&self.input_rank_hidden, self.hidden_size, structural.rank),
+            );
+            add_feature_row_avx2(
+                token,
+                feature_row(&self.input_file_hidden, self.hidden_size, structural.file),
+            );
+            add_feature_row_avx2(
+                token,
+                feature_row(
+                    &self.input_king_piece_hidden,
+                    self.hidden_size,
+                    structural_king_piece_index(0, us_king_bucket, structural.piece_index),
+                ),
+            );
+            add_feature_row_avx2(
+                token,
+                feature_row(
+                    &self.input_king_piece_hidden,
+                    self.hidden_size,
+                    structural_king_piece_index(1, them_king_bucket, structural.piece_index),
+                ),
+            );
+        }
+    }
+
+    fn square_tokens_from_features_into(
+        &self,
+        features: &[usize],
+        out: &mut Vec<f32>,
+        token: &mut Vec<f32>,
+    ) {
         out.resize(BOARD_SIZE * self.hidden_size, 0.0);
         out.fill(0.0);
-        let mut token = vec![0.0; self.hidden_size];
+        token.resize(self.hidden_size, 0.0);
+        let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
+        let use_avx2 = {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                self.hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2")
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                false
+            }
+        };
         for &feature in features {
             if feature >= PIECE_SQUARE_INPUT_SIZE {
                 continue;
             }
             let sq = feature % BOARD_SIZE;
-            self.sparse_attention_token_into(feature, features, &mut token);
-            out[sq * self.hidden_size..(sq + 1) * self.hidden_size].copy_from_slice(&token);
+            self.sparse_attention_token_into(
+                feature,
+                us_king_bucket,
+                them_king_bucket,
+                token.as_mut_slice(),
+                use_avx2,
+            );
+            out[sq * self.hidden_size..(sq + 1) * self.hidden_size].copy_from_slice(token);
         }
     }
 
+    #[allow(dead_code)]
     fn value_from_hidden_into(
         &self,
         hidden: &[f32],
@@ -1928,7 +2164,14 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
     let mut value_mse = 0.0f32;
     for sample in samples {
         model.input_embedding_linear_into(&sample.features, &mut scratch.hidden);
-        model.add_sparse_attention_into(&sample.features, &mut scratch.hidden);
+        model.add_sparse_attention_into(
+            &sample.features,
+            &mut scratch.hidden,
+            &mut scratch.attention_scores,
+            &mut scratch.attention_values,
+            &mut scratch.attention_context,
+            &mut scratch.attention_token,
+        );
         relu_in_place(&mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
         let value_wdl = model.value_wdl_from_hidden_into(
@@ -1979,7 +2222,11 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
             &mut scratch.policy_from_scores,
             &mut scratch.policy_to_scores,
         );
-        model.square_tokens_from_features_into(&sample.features, &mut scratch.square_tokens);
+        model.square_tokens_from_features_into(
+            &sample.features,
+            &mut scratch.square_tokens,
+            &mut scratch.attention_token,
+        );
         for (index, &move_index) in sample.move_indices.iter().enumerate() {
             scratch.logits[index] = model.policy_logit_from_hidden_index(
                 &scratch.policy_pair_context,
@@ -2132,6 +2379,10 @@ fn add_scaled_feature_row(
     }
 }
 
+fn feature_row(input_hidden: &[f32], hidden_size: usize, feature: usize) -> &[f32] {
+    &input_hidden[feature * hidden_size..(feature + 1) * hidden_size]
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
@@ -2180,6 +2431,42 @@ unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
         sum += left[index] * right[index];
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
+    use std::arch::x86_64::*;
+    let chunks = hidden.len() / 8;
+    for chunk in 0..chunks {
+        let index = chunk * 8;
+        unsafe {
+            let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
+            let right = _mm256_loadu_ps(row.as_ptr().add(index));
+            _mm256_storeu_ps(hidden.as_mut_ptr().add(index), _mm256_add_ps(left, right));
+        }
+    }
+    for index in (chunks * 8)..hidden.len() {
+        hidden[index] += row[index];
+    }
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
+    use std::arch::x86::*;
+    let chunks = hidden.len() / 8;
+    for chunk in 0..chunks {
+        let index = chunk * 8;
+        unsafe {
+            let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
+            let right = _mm256_loadu_ps(row.as_ptr().add(index));
+            _mm256_storeu_ps(hidden.as_mut_ptr().add(index), _mm256_add_ps(left, right));
+        }
+    }
+    for index in (chunks * 8)..hidden.len() {
+        hidden[index] += row[index];
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
