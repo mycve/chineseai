@@ -127,12 +127,9 @@ pub fn alphazero_search_with_history_and_rules(
 
     let root_node = &tree.nodes[root];
     let searched_value = if root_node.visits > 0 {
-        wdl_q_with_draw(
-            average_wdl(root_node.value_wdl_sum, root_node.visits),
-            tree.draw_score,
-        )
+        root_node.value_sum / root_node.visits as f32
     } else {
-        wdl_q_with_draw(root_node.value_wdl, tree.draw_score)
+        root_node.value
     };
     let policy = tree.root_policy(root);
     let mut candidates = root_node
@@ -248,20 +245,8 @@ impl AzChild {
         if self.visits == 0 {
             0.0
         } else {
-            wdl_q_with_draw(self.value_wdl(), draw_score)
-        }
-    }
-
-    fn value_wdl(&self) -> [f32; 3] {
-        if self.visits == 0 {
-            [0.0, 1.0, 0.0]
-        } else {
-            let inv = 1.0 / self.visits as f32;
-            [
-                self.value_wdl_sum[0] * inv,
-                self.value_wdl_sum[1] * inv,
-                self.value_wdl_sum[2] * inv,
-            ]
+            let _ = draw_score;
+            self.value_sum / self.visits as f32
         }
     }
 
@@ -405,7 +390,7 @@ impl<'a> AzTree<'a> {
             &mut self.eval_scratch,
         );
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
-        eval.value = wdl_q_with_draw(eval.value_wdl, 0.0);
+        eval.value *= self.value_scale;
         let priors = softmax_into(
             &self.eval_scratch.logits[..moves.len()],
             &mut self.eval_scratch.priors,
@@ -560,7 +545,7 @@ impl<'a> AzTree<'a> {
             &mut self.eval_scratch,
         );
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
-        eval.value = wdl_q_with_draw(eval.value_wdl, 0.0);
+        eval.value *= self.value_scale;
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
         self.nodes[node_index].moves_left = eval.moves_left;
@@ -749,9 +734,10 @@ impl<'a> AzTree<'a> {
 
 fn alphazero_fpu_value_reduction(node: &AzNode, reduction: f32, draw_score: f32) -> f32 {
     let parent_q = if node.visits > 0 {
-        wdl_q_with_draw(average_wdl(node.value_wdl_sum, node.visits), draw_score)
+        let _ = draw_score;
+        node.value_sum / node.visits as f32
     } else {
-        wdl_q_with_draw(node.value_wdl, draw_score)
+        node.value
     };
     if reduction <= 0.0 {
         return parent_q;
@@ -773,20 +759,8 @@ fn add_wdl(sum: &mut [f32; 3], wdl: [f32; 3]) {
     sum[2] += wdl[2];
 }
 
-fn average_wdl(sum: [f32; 3], visits: u32) -> [f32; 3] {
-    if visits == 0 {
-        return [0.0, 1.0, 0.0];
-    }
-    let inv = 1.0 / visits as f32;
-    [sum[0] * inv, sum[1] * inv, sum[2] * inv]
-}
-
 fn flip_wdl(wdl: [f32; 3]) -> [f32; 3] {
     [wdl[2], wdl[1], wdl[0]]
-}
-
-fn wdl_q_with_draw(wdl: [f32; 3], draw_score: f32) -> f32 {
-    wdl[0] - wdl[2] + draw_score * wdl[1]
 }
 
 fn scalar_terminal_wdl(value: f32) -> [f32; 3] {
@@ -1145,7 +1119,7 @@ mod tests {
         let position = Position::startpos();
         let mut model = AzNnue::random(4, 7);
         model.value_head_bias[0] = 2.0;
-        model.value_head_output[0] = 1.0;
+        model.value_q_output[0] = 1.0;
 
         let full = alphazero_search(
             &position,

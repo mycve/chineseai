@@ -408,7 +408,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.max_sample_train_count,
         f32_slug(config.deblunder_q_gap),
         f32_slug(config.mirror_probability),
-        f32_slug(config.value_td_lambda),
+        f32_slug(config.value_q_ratio),
         config.checkpoint_interval,
         config.arena_interval,
         f32_slug(config.arena_cpuct),
@@ -673,9 +673,9 @@ struct AzSelfplayFitBenchArgs {
     /// Q gap that marks a sampled move as a value-repair blunder.
     #[arg(long, default_value_t = 0.25)]
     deblunder_q_gap: f32,
-    /// TD lambda used inside value-repair segments. 1.0 keeps pure terminal targets.
-    #[arg(long, default_value_t = 0.95)]
-    value_td_lambda: f32,
+    /// Lc0-style value target mix: q_ratio * search_q + (1-q_ratio) * result.
+    #[arg(long, default_value_t = 0.25)]
+    value_q_ratio: f32,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
     replay_out: Option<String>,
@@ -762,9 +762,9 @@ struct AzReplayGenerateFixedArgs {
     /// Q gap that marks a sampled move as a value-repair blunder.
     #[arg(long, default_value_t = 0.25)]
     deblunder_q_gap: f32,
-    /// TD lambda used inside value-repair segments. 1.0 keeps pure terminal targets.
-    #[arg(long, default_value_t = 0.95)]
-    value_td_lambda: f32,
+    /// Lc0-style value target mix: q_ratio * search_q + (1-q_ratio) * result.
+    #[arg(long, default_value_t = 0.25)]
+    value_q_ratio: f32,
 }
 
 #[derive(Args, Debug)]
@@ -947,7 +947,7 @@ fn build_az_loop_config(
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         deblunder_q_gap: config.deblunder_q_gap,
-        value_td_lambda: config.value_td_lambda,
+        value_q_ratio: config.value_q_ratio,
     }
 }
 
@@ -1656,7 +1656,7 @@ fn main() {
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     deblunder_q_gap: cmd.deblunder_q_gap,
-                    value_td_lambda: cmd.value_td_lambda,
+                    value_q_ratio: cmd.value_q_ratio,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -1881,7 +1881,7 @@ fn main() {
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     deblunder_q_gap: cmd.deblunder_q_gap,
-                    value_td_lambda: cmd.value_td_lambda,
+                    value_q_ratio: cmd.value_q_ratio,
                 };
                 let data = generate_selfplay_data(&model, &config);
                 total_games += data.games.len();
@@ -2188,7 +2188,7 @@ fn main() {
             let opening_positions = load_opening_positions(&config.opening_fens_path);
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} value_td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} value_q_ratio={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_samples_per_update,
@@ -2229,7 +2229,7 @@ fn main() {
                 config.replay_capacity,
                 config.mirror_probability,
                 config.deblunder_q_gap,
-                config.value_td_lambda,
+                config.value_q_ratio,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
@@ -2640,7 +2640,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} value_mse={:.4} value_rmse={:.4} v_mu={:.3}/{:.3} v_rms={:.3}/{:.3} v_corr={:.3} v_cal={:.3} policy_ce={:.4} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} openRawP={:.3}/{:.3} openTgtP={:.3}/{:.3} openQgap={:.3} openQabs={:.3} openVisitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -2657,7 +2657,7 @@ fn main() {
                     report.red_wins as f32 / report.games.max(1) as f32,
                     report.avg_plies,
                     report.loss,
-                    report.value_mse,
+                    report.value_loss,
                     value_rmse,
                     report.value_pred_mean,
                     report.value_target_mean,
@@ -2665,7 +2665,6 @@ fn main() {
                     report.value_target_rms,
                     report.value_corr,
                     report.value_calibration,
-                    report.policy_ce,
                     report.policy_kl,
                     policy_target_entropy,
                     report.learning_rate,
@@ -2679,13 +2678,6 @@ fn main() {
                     report.root_q_gap,
                     report.root_q_top1_abs,
                     report.visited_actions,
-                    report.opening_raw_prior_top1,
-                    report.opening_raw_prior_top2,
-                    report.opening_policy_top1,
-                    report.opening_policy_top2,
-                    report.opening_q_gap,
-                    report.opening_q_top1_abs,
-                    report.opening_visited_actions,
                     report.sampled_best_rate,
                     report.deblunder_rate,
                     report.avg_best_played_q_gap,

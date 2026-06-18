@@ -27,7 +27,13 @@ pub(super) struct AzCandleModel {
     piece_attention_output: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
+    value_head_hidden2: Var,
+    value_head_bias2: Var,
     value_head_output: Var,
+    value_q_output: Var,
+    value_q_bias: Var,
+    moves_left_hidden: Var,
+    moves_left_bias_hidden: Var,
     moves_left_output: Var,
     moves_left_bias: Var,
     policy_move_bias: Var,
@@ -128,15 +134,22 @@ impl AzCandleModel {
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
+        let value_head = value_head
+            .matmul(&self.value_head_hidden2.t()?)?
+            .broadcast_add(&self.value_head_bias2)?
+            .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
-        let moves_left_logits = value_head
+        let q_values = value_head
+            .matmul(&self.value_q_output.reshape((VALUE_HEAD_SIZE, 1))?)?
+            .broadcast_add(&self.value_q_bias)?
+            .tanh()?;
+        let moves_left_head = hidden
+            .matmul(&self.moves_left_hidden.t()?)?
+            .broadcast_add(&self.moves_left_bias_hidden)?
+            .relu()?;
+        let moves_left_logits = moves_left_head
             .matmul(&self.moves_left_output.reshape((VALUE_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
-        let value_log_probs = log_softmax(&value_logits, 1)?;
-        let value_probs = value_log_probs.exp()?;
-        let win = value_probs.narrow(1, 0, 1)?;
-        let loss = value_probs.narrow(1, 2, 1)?;
-        let values = (&win - &loss)?;
         let policy_bias = self.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
         let policy_from_scores = hidden.matmul(&self.policy_from_hidden.t()?)?;
         let policy_to_scores = hidden.matmul(&self.policy_to_hidden.t()?)?;
@@ -167,7 +180,7 @@ impl AzCandleModel {
             .broadcast_add(&policy_bias))?;
 
         Ok(ForwardOutput {
-            values,
+            q_values,
             value_logits,
             policy_logits,
             moves_left_logits,
@@ -176,7 +189,7 @@ impl AzCandleModel {
 }
 
 pub(super) struct ForwardOutput {
-    pub(super) values: Tensor,
+    pub(super) q_values: Tensor,
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
     pub(super) moves_left_logits: Tensor,
@@ -336,9 +349,27 @@ impl AzCandleModel {
                 device,
             )?,
             value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
+            value_head_hidden2: var_from_slice(
+                &model.value_head_hidden2,
+                (VALUE_HEAD_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            value_head_bias2: var_from_slice(&model.value_head_bias2, VALUE_HEAD_SIZE, device)?,
             value_head_output: var_from_slice(
                 &model.value_head_output,
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            value_q_output: var_from_slice(&model.value_q_output, VALUE_HEAD_SIZE, device)?,
+            value_q_bias: var_from_slice(&model.value_q_bias, 1, device)?,
+            moves_left_hidden: var_from_slice(
+                &model.moves_left_hidden,
+                (VALUE_HEAD_SIZE, hidden),
+                device,
+            )?,
+            moves_left_bias_hidden: var_from_slice(
+                &model.moves_left_bias_hidden,
+                VALUE_HEAD_SIZE,
                 device,
             )?,
             moves_left_output: var_from_slice(&model.moves_left_output, VALUE_HEAD_SIZE, device)?,
@@ -425,7 +456,13 @@ impl AzCandleModel {
         vars.push(self.piece_attention_output.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
+        vars.push(self.value_head_hidden2.clone());
+        vars.push(self.value_head_bias2.clone());
         vars.push(self.value_head_output.clone());
+        vars.push(self.value_q_output.clone());
+        vars.push(self.value_q_bias.clone());
+        vars.push(self.moves_left_hidden.clone());
+        vars.push(self.moves_left_bias_hidden.clone());
         vars.push(self.moves_left_output.clone());
         vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
@@ -465,7 +502,16 @@ impl AzCandleModel {
         )?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
+        copy_var(&self.value_head_hidden2, &mut model.value_head_hidden2)?;
+        copy_var(&self.value_head_bias2, &mut model.value_head_bias2)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
+        copy_var(&self.value_q_output, &mut model.value_q_output)?;
+        copy_var(&self.value_q_bias, &mut model.value_q_bias)?;
+        copy_var(&self.moves_left_hidden, &mut model.moves_left_hidden)?;
+        copy_var(
+            &self.moves_left_bias_hidden,
+            &mut model.moves_left_bias_hidden,
+        )?;
         copy_var(&self.moves_left_output, &mut model.moves_left_output)?;
         copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;

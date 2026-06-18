@@ -46,7 +46,7 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
-pub(super) const VALUE_HEAD_SIZE: usize = 64;
+pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
@@ -166,7 +166,13 @@ macro_rules! az_weight_tensors {
         $visit!(piece_attention_output, [$h, PIECE_ATTENTION_TOTAL_SIZE]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
+        $visit!(value_head_hidden2, [VALUE_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(value_head_bias2, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(value_q_output, [VALUE_HEAD_SIZE]);
+        $visit!(value_q_bias, [1]);
+        $visit!(moves_left_hidden, [VALUE_HEAD_SIZE, $h]);
+        $visit!(moves_left_bias_hidden, [VALUE_HEAD_SIZE]);
         $visit!(moves_left_output, [VALUE_HEAD_SIZE]);
         $visit!(moves_left_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
@@ -222,6 +228,7 @@ pub(super) struct AzEvalScratch {
     #[allow(dead_code)]
     history_features: Vec<usize>,
     value_head: Vec<f32>,
+    value_head2: Vec<f32>,
     policy_pair_context: Vec<f32>,
     policy_move_context: Vec<f32>,
     policy_from_scores: Vec<f32>,
@@ -242,6 +249,7 @@ impl AzEvalScratch {
             hidden: vec![0.0; hidden_size],
             history_features: Vec::with_capacity(16),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
+            value_head2: vec![0.0; VALUE_HEAD_SIZE],
             policy_pair_context: vec![0.0; POLICY_PAIR_CONTEXT_SIZE],
             policy_move_context: vec![0.0; POLICY_MOVE_EMBED_SIZE],
             policy_from_scores: vec![0.0; BOARD_SIZE],
@@ -503,7 +511,13 @@ pub struct AzNnue {
     pub piece_attention_output: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
+    pub value_head_hidden2: Vec<f32>,
+    pub value_head_bias2: Vec<f32>,
     pub value_head_output: Vec<f32>,
+    pub value_q_output: Vec<f32>,
+    pub value_q_bias: Vec<f32>,
+    pub moves_left_hidden: Vec<f32>,
+    pub moves_left_bias_hidden: Vec<f32>,
     pub moves_left_output: Vec<f32>,
     pub moves_left_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
@@ -537,7 +551,13 @@ impl Clone for AzNnue {
             piece_attention_output: self.piece_attention_output.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
+            value_head_hidden2: self.value_head_hidden2.clone(),
+            value_head_bias2: self.value_head_bias2.clone(),
             value_head_output: self.value_head_output.clone(),
+            value_q_output: self.value_q_output.clone(),
+            value_q_bias: self.value_q_bias.clone(),
+            moves_left_hidden: self.moves_left_hidden.clone(),
+            moves_left_bias_hidden: self.moves_left_bias_hidden.clone(),
             moves_left_output: self.moves_left_output.clone(),
             moves_left_bias: self.moves_left_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
@@ -593,7 +613,7 @@ pub struct AzLoopConfig {
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
-    pub value_td_lambda: f32,
+    pub value_q_ratio: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -856,9 +876,19 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let value_head_bias = vec![0.0; VALUE_HEAD_SIZE];
+        let value_head_hidden2 = (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
+            .map(|_| rng.weight((2.0 / VALUE_HEAD_SIZE as f32).sqrt() * 0.5))
+            .collect();
+        let value_head_bias2 = vec![0.0; VALUE_HEAD_SIZE];
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
+        let value_q_output = vec![0.0; VALUE_HEAD_SIZE];
+        let value_q_bias = vec![0.0; 1];
+        let moves_left_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
+            .collect();
+        let moves_left_bias_hidden = vec![0.0; VALUE_HEAD_SIZE];
         let moves_left_output = vec![0.0; VALUE_HEAD_SIZE];
         let moves_left_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
@@ -895,7 +925,13 @@ impl AzNnue {
             piece_attention_output,
             value_head_hidden,
             value_head_bias,
+            value_head_hidden2,
+            value_head_bias2,
             value_head_output,
+            value_q_output,
+            value_q_bias,
+            moves_left_hidden,
+            moves_left_bias_hidden,
             moves_left_output,
             moves_left_bias,
             policy_move_bias,
@@ -952,7 +988,13 @@ impl AzNnue {
             piece_attention_output: load_candle_f32_tensor(&tensors, "piece_attention_output")?,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
+            value_head_hidden2: load_candle_f32_tensor(&tensors, "value_head_hidden2")?,
+            value_head_bias2: load_candle_f32_tensor(&tensors, "value_head_bias2")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
+            value_q_output: load_candle_f32_tensor(&tensors, "value_q_output")?,
+            value_q_bias: load_candle_f32_tensor(&tensors, "value_q_bias")?,
+            moves_left_hidden: load_candle_f32_tensor(&tensors, "moves_left_hidden")?,
+            moves_left_bias_hidden: load_candle_f32_tensor(&tensors, "moves_left_bias_hidden")?,
             moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
             moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
@@ -1040,12 +1082,16 @@ impl AzNnue {
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
-        let value_wdl = {
+        let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
+            self.value_wdl_from_hidden_into(
+                &scratch.hidden,
+                &features,
+                &mut scratch.value_head,
+                &mut scratch.value_head2,
+            )
         };
-        let value = wdl_q(value_wdl);
-        let moves_left = self.moves_left_from_value_head(&scratch.value_head);
+        let moves_left = self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head);
         self.square_tokens_from_features_into(
             &features,
             &mut scratch.square_tokens,
@@ -1585,8 +1631,9 @@ impl AzNnue {
         features: &[usize],
         value_head: &mut Vec<f32>,
     ) -> f32 {
-        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head);
-        probs[0] - probs[2]
+        let mut value_head2 = Vec::new();
+        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head, &mut value_head2);
+        probs.1
     }
 
     fn value_wdl_from_hidden_into(
@@ -1594,7 +1641,8 @@ impl AzNnue {
         hidden: &[f32],
         features: &[usize],
         value_head: &mut Vec<f32>,
-    ) -> [f32; WDL_HEAD_SIZE] {
+        value_head2: &mut Vec<f32>,
+    ) -> ([f32; WDL_HEAD_SIZE], f32) {
         value_head.resize(VALUE_HEAD_SIZE, 0.0);
         value_head.copy_from_slice(&self.value_head_bias);
         for (feature, value) in value_head.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
@@ -1603,17 +1651,34 @@ impl AzNnue {
             *value += dot_product(hidden, hidden_row);
             *value = (*value).max(0.0);
         }
+        value_head2.resize(VALUE_HEAD_SIZE, 0.0);
+        value_head2.copy_from_slice(&self.value_head_bias2);
+        for (feature, value) in value_head2.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
+            let row = &self.value_head_hidden2
+                [feature * VALUE_HEAD_SIZE..(feature + 1) * VALUE_HEAD_SIZE];
+            *value += dot_product(value_head, row);
+            *value = (*value).max(0.0);
+        }
         let _ = features;
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
             let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-            *logit = dot_product(value_head, row);
+            *logit = dot_product(value_head2, row);
         }
-        softmax_fixed3(logits)
+        let q_logit = dot_product(value_head2, &self.value_q_output) + self.value_q_bias[0];
+        (softmax_fixed3(logits), q_logit.tanh())
     }
 
-    fn moves_left_from_value_head(&self, value_head: &[f32]) -> f32 {
-        let logit = dot_product(value_head, &self.moves_left_output) + self.moves_left_bias[0];
+    fn moves_left_from_hidden_into(&self, hidden: &[f32], moves_left_head: &mut Vec<f32>) -> f32 {
+        moves_left_head.resize(VALUE_HEAD_SIZE, 0.0);
+        moves_left_head.copy_from_slice(&self.moves_left_bias_hidden);
+        for (feature, value) in moves_left_head.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
+            let hidden_row = &self.moves_left_hidden
+                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            *value += dot_product(hidden, hidden_row);
+            *value = (*value).max(0.0);
+        }
+        let logit = dot_product(moves_left_head, &self.moves_left_output) + self.moves_left_bias[0];
         softplus(logit)
     }
 
@@ -2174,12 +2239,12 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
         );
         relu_in_place(&mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
-        let value_wdl = model.value_wdl_from_hidden_into(
+        let (value_wdl, value_pred) = model.value_wdl_from_hidden_into(
             &scratch.hidden,
             &sample.features,
             &mut scratch.value_head,
+            &mut scratch.value_head2,
         );
-        let value_pred = value_wdl[0] - value_wdl[2];
         let value_target = sample.value.clamp(-1.0, 1.0);
         let error = value_pred - value_target;
         value_mse += error * error;
@@ -2310,11 +2375,6 @@ pub(super) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_H
     } else {
         [0.0, 1.0, 0.0]
     }
-}
-
-pub(super) fn wdl_q(wdl: [f32; WDL_HEAD_SIZE]) -> f32 {
-    let wdl = normalize_wdl_target(wdl);
-    wdl[0] - wdl[2]
 }
 
 fn softplus(value: f32) -> f32 {
@@ -2877,7 +2937,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::assign_td_lambda_value_targets;
+    use super::play::assign_q_ratio_value_targets;
     use super::*;
     use std::fs;
 
@@ -2895,6 +2955,7 @@ mod tests {
     fn random_initial_value_head_is_neutral() {
         let model = AzNnue::random_with_arch(AzNnueArch::with_hidden_size(512), 20260409);
         assert!(model.value_head_output.iter().all(|&weight| weight == 0.0));
+        assert!(model.value_q_output.iter().all(|&weight| weight == 0.0));
 
         let position = Position::startpos();
         let moves = position.legal_moves();
@@ -2968,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn td_lambda_value_targets_mix_search_and_terminal_returns() {
+    fn q_ratio_value_targets_mix_search_and_result() {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
@@ -2992,14 +3053,14 @@ mod tests {
             },
         ];
 
-        assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
+        assign_q_ratio_value_targets(&mut samples, 1.0, 0.25);
 
-        assert!((samples[0].value + 0.125).abs() < 1e-6);
-        assert!((samples[1].value + 0.25).abs() < 1e-6);
+        assert!((samples[0].value - 0.625).abs() < 1e-6);
+        assert!((samples[1].value + 0.625).abs() < 1e-6);
     }
 
     #[test]
-    fn td_lambda_one_is_pure_mc_terminal_return() {
+    fn q_ratio_one_is_pure_search_q() {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
@@ -3023,10 +3084,10 @@ mod tests {
             },
         ];
 
-        assign_td_lambda_value_targets(&mut samples, 1.0, 1.0);
+        assign_q_ratio_value_targets(&mut samples, 1.0, 1.0);
 
-        assert!((samples[0].value - 1.0).abs() < 1e-6);
-        assert!((samples[1].value + 1.0).abs() < 1e-6);
+        assert!((samples[0].value + 0.5).abs() < 1e-6);
+        assert!((samples[1].value - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -3268,7 +3329,13 @@ mod tests {
         assert_eq!(model.piece_attention_output, loaded.piece_attention_output);
         assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
         assert_eq!(model.value_head_bias, loaded.value_head_bias);
+        assert_eq!(model.value_head_hidden2, loaded.value_head_hidden2);
+        assert_eq!(model.value_head_bias2, loaded.value_head_bias2);
         assert_eq!(model.value_head_output, loaded.value_head_output);
+        assert_eq!(model.value_q_output, loaded.value_q_output);
+        assert_eq!(model.value_q_bias, loaded.value_q_bias);
+        assert_eq!(model.moves_left_hidden, loaded.moves_left_hidden);
+        assert_eq!(model.moves_left_bias_hidden, loaded.moves_left_bias_hidden);
         assert_eq!(model.moves_left_output, loaded.moves_left_output);
         assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
