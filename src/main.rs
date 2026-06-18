@@ -226,7 +226,8 @@ struct AzBaseline100Args {
 Examples:
   chineseai vs-pikafish ./tools/pikafish model.safetensors
   chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --simulations 192
-  chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5")]
+  chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5
+  chineseai vs-pikafish ./tools/pikafish model.safetensors --opening-book opening.obk --opening-plies-min 6 --opening-plies-max 10")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
@@ -256,6 +257,18 @@ struct VsPikafishArgs {
     /// Simultaneous games/processes.
     #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_PARALLEL_GAMES)]
     parallel_games: usize,
+    /// OBK opening book used to generate random start positions. Empty uses startpos.
+    #[arg(long, default_value = "opening.obk")]
+    opening_book: String,
+    /// Number of random opening positions to generate from the OBK book.
+    #[arg(long, default_value_t = 300)]
+    opening_positions: usize,
+    /// Minimum book plies before handing the position to both engines.
+    #[arg(long, default_value_t = 6)]
+    opening_plies_min: usize,
+    /// Maximum book plies before handing the position to both engines.
+    #[arg(long, default_value_t = 10)]
+    opening_plies_max: usize,
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
@@ -3201,7 +3214,40 @@ fn main() {
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
-            let start_positions = Vec::new();
+            let (opening_plies_min, opening_plies_max) =
+                if cmd.opening_plies_min <= cmd.opening_plies_max {
+                    (cmd.opening_plies_min, cmd.opening_plies_max)
+                } else {
+                    (cmd.opening_plies_max, cmd.opening_plies_min)
+                };
+            let (start_positions, opening_mode) = if cmd.opening_book.trim().is_empty() {
+                (Vec::new(), "startpos_fallback".to_string())
+            } else {
+                let book = ObkBook::load(&cmd.opening_book).unwrap_or_else(|err| {
+                    panic!("failed to load vs-pikafish opening book `{}`: {err}", cmd.opening_book)
+                });
+                let mut rng = SplitMix64::new(cmd.seed ^ 0xA24B_AED4_963E_E407);
+                let count = cmd.opening_positions.max(1);
+                let mut positions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    positions.push(book.random_prefix_position(
+                        opening_plies_min,
+                        opening_plies_max,
+                        &mut rng,
+                    ));
+                }
+                (
+                    positions,
+                    format!(
+                        "obk_openings(book={},keys={},moves={},plies={}-{})",
+                        cmd.opening_book,
+                        book.key_count(),
+                        book.move_count(),
+                        opening_plies_min,
+                        opening_plies_max
+                    ),
+                )
+            };
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
                 Path::new(&model_path),
@@ -3233,10 +3279,11 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
+                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),
+                opening_mode,
                 parallel_games.min(games),
                 summary.chinese_wins,
                 summary.chinese_losses,
