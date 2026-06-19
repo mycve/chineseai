@@ -714,6 +714,23 @@ pub(super) fn assign_q_ratio_value_targets(
     }
 }
 
+pub(super) fn assign_td_lambda_value_targets(
+    samples: &mut [AzTrainingSample],
+    game_result_red: f32,
+    td_lambda: f32,
+) {
+    let td_lambda = td_lambda.clamp(0.0, 1.0);
+    let mut return_red = game_result_red.clamp(-1.0, 1.0);
+    for sample in samples.iter_mut().rev() {
+        let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
+        return_red = (search_red * (1.0 - td_lambda) + return_red * td_lambda).clamp(-1.0, 1.0);
+        let side_value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
+        let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
+        sample.value_wdl = scalar_value_to_wdl_target(side_result);
+        sample.value = side_value;
+    }
+}
+
 fn root_search_meta(
     candidates: &[AzCandidate],
     root_q: f32,
@@ -784,7 +801,7 @@ fn assign_deblundered_value_targets(
     config: &AzLoopConfig,
 ) {
     if deblunder_events.is_empty() {
-        assign_q_ratio_value_targets(samples, game_result_red, config.value_q_ratio);
+        assign_value_targets(samples, game_result_red, config);
         return;
     }
 
@@ -794,15 +811,23 @@ fn assign_deblundered_value_targets(
             continue;
         }
         let end = event.sample_index + 1;
-        assign_q_ratio_value_targets(
-            &mut samples[start..end],
-            event.boundary_red,
-            config.value_q_ratio,
-        );
+        assign_value_targets(&mut samples[start..end], event.boundary_red, config);
         start = end;
     }
     if start < samples.len() {
-        assign_q_ratio_value_targets(&mut samples[start..], game_result_red, config.value_q_ratio);
+        assign_value_targets(&mut samples[start..], game_result_red, config);
+    }
+}
+
+fn assign_value_targets(
+    samples: &mut [AzTrainingSample],
+    game_result_red: f32,
+    config: &AzLoopConfig,
+) {
+    if config.td_lambda > 0.0 {
+        assign_td_lambda_value_targets(samples, game_result_red, config.td_lambda);
+    } else {
+        assign_q_ratio_value_targets(samples, game_result_red, config.value_q_ratio);
     }
 }
 
@@ -1225,6 +1250,7 @@ mod tests {
             resign_playthrough: 0.0,
             mirror_probability: 0.0,
             deblunder_q_gap: 0.25,
+            td_lambda: 0.0,
             value_q_ratio,
         }
     }

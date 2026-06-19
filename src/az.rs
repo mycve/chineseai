@@ -613,6 +613,7 @@ pub struct AzLoopConfig {
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
+    pub td_lambda: f32,
     pub value_q_ratio: f32,
 }
 
@@ -2937,7 +2938,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::assign_q_ratio_value_targets;
+    use super::play::{assign_q_ratio_value_targets, assign_td_lambda_value_targets};
     use super::*;
     use std::fs;
 
@@ -3088,6 +3089,37 @@ mod tests {
 
         assert!((samples[0].value + 0.5).abs() < 1e-6);
         assert!((samples[1].value - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn td_lambda_value_targets_backfill_from_terminal_result() {
+        let mut samples = vec![
+            AzTrainingSample {
+                features: Vec::new(),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.0),
+                value: 0.0,
+                side_sign: 1.0,
+                moves_left: 0.0,
+                meta: AzSampleMeta::default(),
+            },
+            AzTrainingSample {
+                features: Vec::new(),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.0),
+                value: 0.0,
+                side_sign: -1.0,
+                moves_left: 0.0,
+                meta: AzSampleMeta::default(),
+            },
+        ];
+
+        assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
+
+        assert!((samples[0].value - 0.25).abs() < 1e-6);
+        assert!((samples[1].value + 0.5).abs() < 1e-6);
     }
 
     #[test]
