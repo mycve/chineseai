@@ -324,9 +324,16 @@ fn load_az_loop_progress(config_path: &str) -> AzLoopProgressState {
     let Ok(text) = fs::read_to_string(&path) else {
         return AzLoopProgressState::default();
     };
-    toml::from_str::<AzLoopProgressState>(&text)
+    let state = toml::from_str::<AzLoopProgressState>(&text)
         .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", path.display()))
-        .normalize()
+        .normalize();
+    fs::remove_file(&path).unwrap_or_else(|err| {
+        panic!(
+            "loaded progress but failed to remove consumed `{}`: {err}",
+            path.display()
+        )
+    });
+    state
 }
 
 fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
@@ -2120,6 +2127,13 @@ fn main() {
                                 model.arch, config_arch
                             );
                         }
+                        fs::remove_file(model_path).unwrap_or_else(|err| {
+                            panic!(
+                                "loaded model but failed to remove consumed `{}`: {err}",
+                                model_path.display()
+                            )
+                        });
+                        println!("resume   : consumed `{}` into memory", model_path.display());
                         model
                     }
                     Err(err) => {
