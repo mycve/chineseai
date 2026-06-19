@@ -494,6 +494,11 @@ fn horse_repeatedly_chasing_rook_is_forbidden() {
 
     let mv = position.parse_uci_move("c7b5").unwrap();
     assert!(position.legal_moves().contains(&mv));
+    let mut next = position.clone();
+    let mut next_history = history.clone();
+    next_history.push(position.rule_history_entry_after_move(mv));
+    next.make_move(mv);
+    assert_eq!(next.rule_outcome_with_history(&next_history), Some(RuleOutcome::Win(Color::Red)));
     assert!(!position.legal_moves_with_rules(&history).contains(&mv));
 }
 
@@ -549,7 +554,7 @@ fn cannon_repetition_chasing_advisor_is_not_long_chase_loss() {
 
     let mv = position.parse_uci_move("e4e3").unwrap();
     assert!(position.legal_moves().contains(&mv));
-    assert!(!position.legal_moves_with_rules(&history).contains(&mv));
+    assert!(position.legal_moves_with_rules(&history).contains(&mv));
 }
 
 #[test]

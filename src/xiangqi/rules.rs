@@ -162,6 +162,9 @@ impl Position {
             }
 
             self.visit_attacker_origins_to(target, color, |from| {
+                if !self.is_effective_chase(target_piece, target, from) {
+                    return false;
+                }
                 let mv = Move::new(from, target);
                 let captured = work.make_move_board_only(mv);
                 let legal = !work.in_check(color);
@@ -196,6 +199,9 @@ impl Position {
                 if from != origin {
                     return false;
                 }
+                if !self.is_effective_chase(target_piece, target, from) {
+                    return true;
+                }
                 let mv = Move::new(from, target);
                 let captured = work.make_move_board_only(mv);
                 let legal = !work.in_check(color);
@@ -214,27 +220,34 @@ impl Position {
         if piece.color == attacker {
             return false;
         }
-        if self.is_piece_protected(sq, piece.color) {
-            return false;
-        }
         match piece.kind {
             PieceKind::General | PieceKind::Advisor | PieceKind::Elephant => false,
             PieceKind::Soldier => soldier_crossed_river(piece.color, super::geom::rank_of(sq)),
             PieceKind::Horse | PieceKind::Rook | PieceKind::Cannon => true,
         }
     }
+
+    fn is_effective_chase(&self, target: super::Piece, target_sq: usize, from: usize) -> bool {
+        if !self.is_piece_protected(target_sq, target.color) {
+            return true;
+        }
+        matches!(
+            (self.board[from].map(|piece| piece.kind), target.kind),
+            (Some(PieceKind::Horse), PieceKind::Rook)
+        )
+    }
 }
 
 fn rule_outcome_forbidden_for_mover(outcome: Option<RuleOutcome>, mover: Color) -> bool {
-    match outcome {
-        Some(RuleOutcome::Win(winner)) => winner == mover.opposite(),
+    matches!(
+        outcome,
+        Some(RuleOutcome::Win(winner)) if winner == mover.opposite()
+    ) || matches!(
+        outcome,
         Some(RuleOutcome::Draw(
-            RuleDrawReason::Repetition
-            | RuleDrawReason::MutualLongCheck
-            | RuleDrawReason::MutualLongChase,
-        )) => true,
-        Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120)) | None => false,
-    }
+            RuleDrawReason::MutualLongCheck | RuleDrawReason::MutualLongChase
+        ))
+    )
 }
 
 fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option<RuleViolation> {
