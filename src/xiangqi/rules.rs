@@ -65,15 +65,28 @@ impl Position {
             return None;
         }
 
-        if repeated_indices.len() < 3 {
-            return None;
-        }
-
         let cycle_start = repeated_indices[0] + 1;
         let red_violation =
             repeated_rule_violation(&history[cycle_start..=current_index], Color::Red);
         let black_violation =
             repeated_rule_violation(&history[cycle_start..=current_index], Color::Black);
+
+        // One matching position only establishes the first complete cycle.
+        // Stop long check as soon as the next cycle closes; ordinary
+        // repetition and long chase keep their existing limit.
+        if repeated_indices.len() < 2 {
+            return None;
+        }
+        if repeated_indices.len() == 2 {
+            return match (red_violation, black_violation) {
+                (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
+                    Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck))
+                }
+                (Some(RuleViolation::LongCheck), _) => Some(RuleOutcome::Win(Color::Black)),
+                (_, Some(RuleViolation::LongCheck)) => Some(RuleOutcome::Win(Color::Red)),
+                _ => None,
+            };
+        }
 
         match (red_violation, black_violation) {
             (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
@@ -89,7 +102,7 @@ impl Position {
             (None, None) => {}
         }
 
-        (repeated_indices.len() >= 3).then_some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {

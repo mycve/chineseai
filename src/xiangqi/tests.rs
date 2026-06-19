@@ -498,6 +498,27 @@ fn horse_repeatedly_chasing_rook_is_forbidden() {
 }
 
 #[test]
+fn rook_repeated_long_check_is_forbidden() {
+    let mut position = Position::from_fen(
+        "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1",
+    )
+    .unwrap();
+    let mut history = position.initial_rule_history();
+    let moves = "g3g4 b7e7 b0c2 b9c7 a0b0 a9b9 h0g2 c6c5 i0i1 h9i7 i1f1 h7g7 g2h4 g6g5 f1f4 g5g4 f4g4 g7g8 b2b6 i6i5 g4d4 f9e8 b6c6 e7g7 d4b4 g8g0 f0e1 g0i0 e0f0 g7f7 b4b9 c7b9 b0b9 g9e7 b9b4 i9g9 h2g2 g9g3 c0e2 i7h5 f0e0 g3h3 e1f2 h3h0 e0e1 h0h1 e1e0 h1h0 e0e1 h0h1 e1e0 h1h0 e0e1 h0h1";
+    let mut first_forbidden = None;
+    for text in moves.split_whitespace() {
+        let mv = position.parse_uci_move(text).unwrap();
+        if !position.legal_moves_with_rules(&history).contains(&mv) {
+            first_forbidden = Some(text);
+            break;
+        }
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+    }
+    assert_eq!(first_forbidden, Some("h1h0"));
+}
+
+#[test]
 fn cannon_repetition_chasing_advisor_is_not_long_chase_loss() {
     let mut position =
         Position::from_fen("r2akab1r/9/1cn1b1nc1/p1p1p3p/6p2/2P3P2/P3P3P/C1N3C2/9/R1BAKABNR b")
