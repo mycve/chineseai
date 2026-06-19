@@ -30,13 +30,9 @@ impl Position {
     pub fn rule_history_entry_after_move(&self, mv: Move) -> RuleHistoryEntry {
         let mut next = self.clone();
         let mover = self.side_to_move;
-        let moved_piece_was_chased = self.square_is_chased_by(mv.from as usize, mover.opposite());
         next.make_move(mv);
-        let (chased_mask, chased_piece_mask) = if moved_piece_was_chased {
-            (0, 0)
-        } else {
-            next.chased_masks_by_origin(mover, mv.to as usize)
-        };
+        let (chased_mask, chased_piece_mask) =
+            next.chased_masks_by_origin(mover, mv.to as usize);
         RuleHistoryEntry {
             hash: next.hash,
             side_to_move: next.side_to_move,
@@ -166,27 +162,6 @@ impl Position {
             });
         }
         (square_mask, piece_mask)
-    }
-
-    fn square_is_chased_by(&self, target: usize, color: Color) -> bool {
-        let Some(target_piece) = self.board[target] else {
-            return false;
-        };
-        if !self.is_chase_target_piece(target_piece, color, target) {
-            return false;
-        }
-
-        let mut work = self.clone();
-        work.side_to_move = color;
-        let mut chased = false;
-        self.visit_attacker_origins_to(target, color, |from| {
-            let mv = Move::new(from, target);
-            let captured = work.make_move_board_only(mv);
-            chased = !work.in_check(color);
-            work.unmake_move_board_only(mv, captured);
-            chased
-        });
-        chased
     }
 
     fn chased_masks_by_origin(&self, color: Color, origin: usize) -> (u128, u16) {

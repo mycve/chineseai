@@ -477,6 +477,27 @@ fn one_cycle_repetition_does_not_end_by_force_rule() {
 }
 
 #[test]
+fn horse_repeatedly_chasing_rook_is_forbidden() {
+    let mut position = Position::from_fen(
+        "2bak4/4a4/2ncb2c1/p3p2CP/9/1N1RP4/P5r2/4C4/9/2BAKA3 b - - 0 1",
+    )
+    .unwrap();
+    let mut history = position.initial_rule_history();
+    let moves = ["c7b5", "d4d5", "b5c7", "d5d4"];
+    for _ in 0..3 {
+        for text in moves {
+            let mv = position.parse_uci_move(text).unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+    }
+
+    let mv = position.parse_uci_move("c7b5").unwrap();
+    assert!(position.legal_moves().contains(&mv));
+    assert!(!position.legal_moves_with_rules(&history).contains(&mv));
+}
+
+#[test]
 fn cannon_repetition_chasing_advisor_is_not_long_chase_loss() {
     let mut position =
         Position::from_fen("r2akab1r/9/1cn1b1nc1/p1p1p3p/6p2/2P3P2/P3P3P/C1N3C2/9/R1BAKABNR b")
