@@ -78,6 +78,8 @@ pub struct AzSearchResult {
     pub best_move: Option<Move>,
     pub value_q: f32,
     pub value_cp: i32,
+    /// Root win/draw/loss probabilities from the side-to-move perspective.
+    pub value_wdl: [f32; 3],
     pub simulations: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
@@ -110,6 +112,7 @@ pub fn alphazero_search_with_history_and_rules(
             best_move: None,
             value_q: tree.nodes[root].value,
             value_cp: cp_from_q(tree.nodes[root].value),
+            value_wdl: tree.nodes[root].value_wdl,
             simulations: 0,
             search_depth_avg: 0.0,
             search_depth_max: 0,
@@ -130,6 +133,13 @@ pub fn alphazero_search_with_history_and_rules(
         root_node.value_sum / root_node.visits as f32
     } else {
         root_node.value
+    };
+    let searched_wdl = if root_node.visits > 0 {
+        root_node
+            .value_wdl_sum
+            .map(|value| value / root_node.visits as f32)
+    } else {
+        root_node.value_wdl
     };
     let policy = tree.root_policy(root);
     let mut candidates = root_node
@@ -161,6 +171,7 @@ pub fn alphazero_search_with_history_and_rules(
         best_move,
         value_q: searched_value,
         value_cp: cp_from_q(searched_value),
+        value_wdl: searched_wdl,
         simulations: used,
         search_depth_avg: tree.search_depth_avg(),
         search_depth_max: tree.search_depth_max,

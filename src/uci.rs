@@ -365,11 +365,20 @@ fn handle_go(_line: &str, state: &mut UciState) {
     match result.best_move {
         Some(mv) => {
             let best_text = mv.to_string();
+            let elapsed_ms = started.elapsed().as_millis();
+            let nps = (result.simulations as u128 * 1000 / elapsed_ms.max(1)) as usize;
+            let wdl = uci_wdl(result.value_wdl);
             println!(
-                "info depth 1 nodes {} time {} score cp {} pv {}",
+                "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
+                result.search_depth_avg.round() as usize,
+                result.search_depth_max,
                 result.simulations,
-                started.elapsed().as_millis(),
+                nps,
+                elapsed_ms,
                 result.value_cp,
+                wdl[0],
+                wdl[1],
+                wdl[2],
                 best_text
             );
             println!("bestmove {best_text}");
@@ -387,6 +396,14 @@ fn handle_go(_line: &str, state: &mut UciState) {
         }
     }
     flush();
+}
+
+fn uci_wdl(probabilities: [f32; 3]) -> [u16; 3] {
+    let mut wdl = probabilities.map(|value| (value.clamp(0.0, 1.0) * 1000.0).round() as u16);
+    let sum = wdl.iter().copied().map(i32::from).sum::<i32>();
+    let draw = (i32::from(wdl[1]) + 1000 - sum).clamp(0, 1000) as u16;
+    wdl[1] = draw;
+    wdl
 }
 
 fn flush() {
