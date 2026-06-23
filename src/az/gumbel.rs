@@ -24,9 +24,9 @@ pub struct GumbelSearchConfig {
 impl Default for GumbelSearchConfig {
     fn default() -> Self {
         Self {
-            max_num_considered_actions: 16,
+            max_num_considered_actions: 24,
             gumbel_scale: 1.0,
-            value_scale: 0.02,
+            value_scale: 0.1,
             maxvisit_init: 50.0,
         }
     }

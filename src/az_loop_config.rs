@@ -52,9 +52,9 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            gumbel_actions: 16,
+            gumbel_actions: 24,
             gumbel_scale: 1.0,
-            gumbel_value_scale: 0.02,
+            gumbel_value_scale: 0.1,
             gumbel_maxvisit_init: 50.0,
             simulations: 800,
             selfplay_samples_per_update: 60000,
@@ -406,9 +406,9 @@ mod tests {
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
-        assert!(text.contains("gumbel_actions = 16\n"));
+        assert!(text.contains("gumbel_actions = 24\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
-        assert!(text.contains("gumbel_value_scale = 0.02\n"));
+        assert!(text.contains("gumbel_value_scale = 0.1\n"));
         assert!(text.contains("gumbel_maxvisit_init = 50.0\n"));
         assert!(!text.contains("search"));
         assert!(!text.contains("temperature"));

@@ -118,13 +118,13 @@ struct AzSearchArgs {
     #[arg(long)]
     root_move: Option<String>,
     /// Maximum root actions considered by Gumbel Sequential Halving.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 24)]
     gumbel_actions: usize,
     /// Gumbel noise scale; use 0 for deterministic evaluation.
     #[arg(long, default_value_t = 0.0)]
     gumbel_scale: f32,
     /// Scale applied to normalized completed Q-values.
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = 0.1)]
     gumbel_value_scale: f32,
     /// Visit offset used when scaling completed Q-values.
     #[arg(long, default_value_t = 50.0)]
@@ -224,11 +224,11 @@ struct VsPikafishArgs {
     /// ChineseAI MCTS simulations per move.
     #[arg(short = 's', long)]
     simulations: Option<usize>,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 24)]
     gumbel_actions: usize,
     #[arg(long, default_value_t = 0.0)]
     gumbel_scale: f32,
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = 0.1)]
     gumbel_value_scale: f32,
     #[arg(long, default_value_t = 50.0)]
     gumbel_maxvisit_init: f32,
@@ -1520,9 +1520,9 @@ fn main() {
             } else {
                 let config = AzLoopConfig {
                     games,
-                    gumbel_actions: 16,
+                    gumbel_actions: 24,
                     gumbel_scale: 1.0,
-                    gumbel_value_scale: 0.02,
+                    gumbel_value_scale: 0.1,
                     gumbel_maxvisit_init: 50.0,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
@@ -1724,9 +1724,9 @@ fn main() {
             while pool.sample_count() < target_samples {
                 let config = AzLoopConfig {
                     games: batch_games,
-                    gumbel_actions: 16,
+                    gumbel_actions: 24,
                     gumbel_scale: 1.0,
-                    gumbel_value_scale: 0.02,
+                    gumbel_value_scale: 0.1,
                     gumbel_maxvisit_init: 50.0,
                     max_plies: cmd.max_plies.max(1),
                     simulations,

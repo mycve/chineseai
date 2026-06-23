@@ -31,9 +31,9 @@ impl Default for UciState {
             model: None,
             simulations: 10_000,
             threads: 1,
-            gumbel_actions: 16,
+            gumbel_actions: 24,
             gumbel_scale: 0.0,
-            gumbel_value_scale: 0.02,
+            gumbel_value_scale: 0.1,
             gumbel_maxvisit_init: 50.0,
             seed: 20260409,
         }
@@ -80,9 +80,9 @@ fn print_uci_id() {
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name GumbelActions type spin default 16 min 1 max 128");
+    println!("option name GumbelActions type spin default 24 min 1 max 128");
     println!("option name GumbelScale type string default 0.0");
-    println!("option name GumbelValueScale type string default 0.02");
+    println!("option name GumbelValueScale type string default 0.1");
     println!("option name GumbelMaxVisitInit type string default 50.0");
     println!("uciok");
     flush();
