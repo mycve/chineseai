@@ -86,6 +86,7 @@ pub struct AzCandidate {
     pub mv: Move,
     pub visits: u32,
     pub q: f32,
+    pub value_wdl: [f32; 3],
     pub moves_left: f32,
     pub raw_prior: f32,
     pub prior: f32,
@@ -211,6 +212,7 @@ fn search_with_history_and_rules(
             mv: child.mv,
             visits: child.visits,
             q: child.q(tree.draw_score),
+            value_wdl: child.mean_wdl(),
             moves_left: child.moves_left(),
             raw_prior: child.raw_prior,
             prior: child.prior,
@@ -330,6 +332,15 @@ impl AzChild {
             0.0
         } else {
             self.moves_left_sum / self.visits as f32
+        }
+    }
+
+    fn mean_wdl(&self) -> [f32; 3] {
+        if self.visits == 0 {
+            [0.0, 1.0, 0.0]
+        } else {
+            self.value_wdl_sum
+                .map(|value| value / self.visits as f32)
         }
     }
 }

@@ -1,6 +1,6 @@
 use crate::az::{
     AzNnue, AzSearchLimits, GumbelSearchConfig, alphazero_search_with_history_and_rules,
-    gumbel_search_with_history_and_rules,
+    cp_from_q, gumbel_search_with_history_and_rules,
 };
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Position, RuleHistoryEntry, RuleOutcome};
@@ -358,7 +358,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
 
     if position_is_rule_draw(&state.position, &state.rule_history) {
         println!("info depth 0 nodes 0 time 0 score cp 0 pv draw");
-        println!("bestmove draw");
+        println!("bestmove 0000");
         flush();
         return;
     }
@@ -367,6 +367,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
 
     if legal.is_empty() {
         println!("info depth 1 nodes 0 time 0 score cp -32000");
+        println!("bestmove 0000");
         flush();
         return;
     }
@@ -426,7 +427,12 @@ fn handle_go(_line: &str, state: &mut UciState) {
             let best_text = mv.to_string();
             let elapsed_ms = started.elapsed().as_millis();
             let nps = (result.simulations as u128 * 1000 / elapsed_ms.max(1)) as usize;
-            let wdl = uci_wdl(result.value_wdl);
+            let selected = result.candidates.iter().find(|candidate| candidate.mv == mv);
+            let selected_q = selected.map(|candidate| candidate.q).unwrap_or(result.value_q);
+            let selected_wdl = selected
+                .map(|candidate| candidate.value_wdl)
+                .unwrap_or(result.value_wdl);
+            let wdl = uci_wdl(selected_wdl);
             println!(
                 "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
                 result.search_depth_avg.round() as usize,
@@ -434,7 +440,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
                 result.simulations,
                 nps,
                 elapsed_ms,
-                result.value_cp,
+                cp_from_q(selected_q),
                 wdl[0],
                 wdl[1],
                 wdl[2],
@@ -449,9 +455,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
                 started.elapsed().as_millis(),
                 result.value_cp
             );
-            if position_is_rule_draw(&state.position, &state.rule_history) {
-                println!("bestmove draw");
-            }
+            println!("bestmove 0000");
         }
     }
     flush();
