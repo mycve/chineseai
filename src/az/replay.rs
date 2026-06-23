@@ -13,7 +13,7 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 22;
+const REPLAY_FILE_VERSION: u32 = 23;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -91,7 +91,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_u32(out, sample.meta.played_visits);
     replay_push_u32(out, sample.meta.best_index as u32);
     replay_push_u32(out, sample.meta.played_index as u32);
-    replay_push_u32(out, u32::from(sample.meta.deblundered));
     Ok(())
 }
 
@@ -162,7 +161,6 @@ fn decode_az_training_sample<R: Read>(
         played_visits: replay_read_u32(reader)?,
         best_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
         played_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
-        deblundered: replay_read_u32(reader)? != 0,
     };
     Ok(AzTrainingSample {
         features,

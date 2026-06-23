@@ -8,23 +8,16 @@ use crate::nnue::{
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
-use super::alphazero::append_history;
+use super::gumbel::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample,
-    GumbelSearchConfig, SplitMix64, alphazero_search_with_history_and_rules, dense_move_index,
-    gumbel_search_with_history_and_rules, scalar_value_to_wdl_target,
+    GumbelSearchConfig, SplitMix64, dense_move_index, gumbel_search_with_history_and_rules,
+    scalar_value_to_wdl_target,
 };
-
-#[derive(Clone, Copy, Debug)]
-struct DeblunderEvent {
-    sample_index: usize,
-    boundary_red: f32,
-}
 
 #[derive(Clone, Copy, Debug)]
 struct MoveSearchMeta {
     sample: AzSampleMeta,
-    deblunder_boundary_q: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -166,12 +159,6 @@ pub struct AzSelfplayData {
     pub opening_visited_actions_sum: usize,
     pub opening_shape_count: usize,
     pub sampled_moves: usize,
-    pub sampled_best_moves: usize,
-    pub deblundered_moves: usize,
-    pub best_played_q_gap_sum: f32,
-    pub played_top_visit_ratio_sum: f32,
-    pub best_q_sum: f32,
-    pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
 }
 
@@ -206,12 +193,6 @@ impl AzSelfplayData {
         self.opening_visited_actions_sum += other.opening_visited_actions_sum;
         self.opening_shape_count += other.opening_shape_count;
         self.sampled_moves += other.sampled_moves;
-        self.sampled_best_moves += other.sampled_best_moves;
-        self.deblundered_moves += other.deblundered_moves;
-        self.best_played_q_gap_sum += other.best_played_q_gap_sum;
-        self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
-        self.best_q_sum += other.best_q_sum;
-        self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
     }
 }
@@ -271,12 +252,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.opening_visited_actions_sum += chunk.opening_visited_actions_sum;
         merged.opening_shape_count += chunk.opening_shape_count;
         merged.sampled_moves += chunk.sampled_moves;
-        merged.sampled_best_moves += chunk.sampled_best_moves;
-        merged.deblundered_moves += chunk.deblundered_moves;
-        merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
-        merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
-        merged.best_q_sum += chunk.best_q_sum;
-        merged.played_q_sum += chunk.played_q_sum;
         merged.terminal.add_assign(&chunk.terminal);
     }
     merged
@@ -313,12 +288,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut opening_visited_actions_sum = 0usize;
     let mut opening_shape_count = 0usize;
     let mut sampled_moves = 0usize;
-    let mut sampled_best_moves = 0usize;
-    let mut deblundered_moves = 0usize;
-    let mut best_played_q_gap_sum = 0.0f32;
-    let mut played_top_visit_ratio_sum = 0.0f32;
-    let mut best_q_sum = 0.0f32;
-    let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
 
     for game_index in 0..config.games {
@@ -331,7 +300,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut history = Vec::new();
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
-        let mut deblunder_events = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
@@ -353,59 +321,24 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let limits = AzSearchLimits {
                 simulations: config.simulations,
                 seed: search_seed,
-                cpuct: config.cpuct,
-                cpuct_at_root: config.cpuct_at_root,
-                cpuct_base: config.cpuct_base,
-                cpuct_factor: config.cpuct_factor,
-                cpuct_base_at_root: config.cpuct_base_at_root,
-                cpuct_factor_at_root: config.cpuct_factor_at_root,
                 max_depth: 0,
-                root_dirichlet_alpha: if config.search == "gumbel" {
-                    0.0
-                } else {
-                    config.root_dirichlet_alpha
-                },
-                root_exploration_fraction: if config.search == "gumbel" {
-                    0.0
-                } else {
-                    config.root_exploration_fraction
-                },
-                fpu_value: config.fpu_value,
-                fpu_value_at_root: config.fpu_value_at_root,
-                draw_score: config.draw_score,
-                moves_left_max_effect: config.moves_left_max_effect,
-                moves_left_slope: config.moves_left_slope,
-                moves_left_threshold: config.moves_left_threshold,
-                moves_left_constant_factor: config.moves_left_constant_factor,
-                moves_left_scaled_factor: config.moves_left_scaled_factor,
-                moves_left_quadratic_factor: config.moves_left_quadratic_factor,
                 value_scale: 1.0,
+                ..AzSearchLimits::default()
             };
-            let search = if config.search == "gumbel" {
-                gumbel_search_with_history_and_rules(
-                    &position,
-                    &history,
-                    Some(rule_history.clone()),
-                    Some(legal),
-                    model,
-                    limits,
-                    GumbelSearchConfig {
-                        max_num_considered_actions: config.gumbel_actions,
-                        gumbel_scale: config.gumbel_scale,
-                        value_scale: config.gumbel_value_scale,
-                        maxvisit_init: config.gumbel_maxvisit_init,
-                    },
-                )
-            } else {
-                alphazero_search_with_history_and_rules(
-                    &position,
-                    &history,
-                    Some(rule_history.clone()),
-                    Some(legal),
-                    model,
-                    limits,
-                )
-            };
+            let search = gumbel_search_with_history_and_rules(
+                &position,
+                &history,
+                Some(rule_history.clone()),
+                Some(legal),
+                model,
+                limits,
+                GumbelSearchConfig {
+                    max_num_considered_actions: config.gumbel_actions,
+                    gumbel_scale: config.gumbel_scale,
+                    value_scale: config.gumbel_value_scale,
+                    maxvisit_init: config.gumbel_maxvisit_init,
+                },
+            );
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
             raw_prior_top1_sum += shape.raw_prior_top1;
@@ -418,7 +351,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             shape_count += 1;
             entropy_all_sum += entropy;
             entropy_all_count += 1;
-            if ply < temperature_opening_plies(config) {
+            if false {
                 entropy_opening_sum += entropy;
                 entropy_opening_count += 1;
                 opening_raw_prior_top1_sum += shape.raw_prior_top1;
@@ -446,11 +379,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &history,
                     &search.candidates,
                     search.value_q,
-                    if config.search == "gumbel" {
-                        1.0
-                    } else {
-                        config.policy_softmax_temp
-                    },
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                 ));
@@ -463,36 +391,17 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 break;
             }
-            let temperature = temperature_for_ply(config, ply);
-            let mv_opt = if config.search == "gumbel" {
-                search.best_move
-            } else if temperature <= 1e-6 {
-                search.best_move.or_else(|| {
-                    choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
-                })
-            } else {
-                choose_selfplay_move(
-                    &search.candidates,
-                    temperature,
-                    config.temperature_value_cutoff,
-                    config.temperature_visit_offset,
-                    &mut rng,
-                )
-            };
+            let mv_opt = search.best_move;
             let Some(mv) = mv_opt else {
                 result = Some(0.0);
                 break;
             };
-            let bootstrap_value = if config.search == "gumbel" {
-                search
-                    .candidates
-                    .iter()
-                    .find(|candidate| candidate.mv == mv)
-                    .map(|candidate| candidate.q)
-                    .unwrap_or(search.value_q)
-            } else {
-                search.value_q
-            };
+            let bootstrap_value = search
+                .candidates
+                .iter()
+                .find(|candidate| candidate.mv == mv)
+                .map(|candidate| candidate.q)
+                .unwrap_or(search.value_q);
             let move_meta = move_search_meta(
                 &search.candidates,
                 mv,
@@ -500,51 +409,19 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 config.generation_update,
                 config.seed ^ game_index as u64,
                 ply,
-                if config.search == "gumbel" {
-                    0.0
-                } else {
-                    config.deblunder_q_gap
-                },
             );
             sampled_moves += 1;
-            sampled_best_moves +=
-                usize::from(move_meta.sample.best_index == move_meta.sample.played_index);
-            deblundered_moves += usize::from(move_meta.sample.deblundered);
-            best_played_q_gap_sum += (move_meta.sample.best_q - move_meta.sample.played_q).max(0.0);
-            let top_visits = search
-                .candidates
-                .iter()
-                .map(|candidate| candidate.visits)
-                .max()
-                .unwrap_or(0);
-            played_top_visit_ratio_sum += if top_visits == 0 {
-                0.0
-            } else {
-                move_meta.sample.played_visits as f32 / top_visits as f32
-            };
-            best_q_sum += move_meta.sample.best_q;
-            played_q_sum += move_meta.sample.played_q;
             let side_sign = if position.side_to_move() == Color::Red {
                 1.0
             } else {
                 -1.0
             };
-            if let Some(best_q) = move_meta.deblunder_boundary_q {
-                deblunder_events.push(DeblunderEvent {
-                    sample_index: game_samples.len(),
-                    boundary_red: (best_q * side_sign).clamp(-1.0, 1.0),
-                });
-            }
+            let _ = side_sign;
             game_samples.push(make_training_sample(
                 &position,
                 &history,
                 &search.candidates,
                 bootstrap_value,
-                if config.search == "gumbel" {
-                    1.0
-                } else {
-                    config.policy_softmax_temp
-                },
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                 move_meta.sample,
             ));
@@ -600,7 +477,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
+        assign_value_targets(&mut game_samples, result, config);
         assign_moves_left_targets(&mut game_samples, config.max_plies);
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -636,12 +513,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         opening_visited_actions_sum,
         opening_shape_count,
         sampled_moves,
-        sampled_best_moves,
-        deblundered_moves,
-        best_played_q_gap_sum,
-        played_top_visit_ratio_sum,
-        best_q_sum,
-        played_q_sum,
         terminal,
     }
 }
@@ -705,13 +576,11 @@ fn make_training_sample(
     history: &[HistoryMove],
     candidates: &[AzCandidate],
     value: f32,
-    policy_softmax_temp: f32,
     mirror_file: bool,
     meta: AzSampleMeta,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
-    let policy_softmax_temp = policy_softmax_temp.max(1e-3);
     let mut features = extract_sparse_features_az_canonical(position, history);
     let mut moves = candidates
         .iter()
@@ -730,7 +599,7 @@ fn make_training_sample(
         .collect();
     let mut policy = candidates
         .iter()
-        .map(|candidate| candidate.policy.max(1e-12).powf(1.0 / policy_softmax_temp))
+        .map(|candidate| candidate.policy.max(1e-12))
         .collect::<Vec<_>>();
     let total_policy = policy.iter().sum::<f32>().max(1e-12);
     for value in &mut policy {
@@ -813,7 +682,6 @@ fn move_search_meta(
     generation_update: u32,
     game_id: u64,
     ply: usize,
-    q_gap: f32,
 ) -> MoveSearchMeta {
     let mut meta = root_search_meta(candidates, root_q, generation_update, game_id, ply);
     if let Some((played_index, played)) = candidates
@@ -825,45 +693,7 @@ fn move_search_meta(
         meta.played_visits = played.visits;
         meta.played_index = played_index.min(u16::MAX as usize) as u16;
     }
-    let deblunder_boundary_q = if q_gap > 0.0
-        && meta.best_index != meta.played_index
-        && meta.played_index != u16::MAX
-        && meta.best_q - meta.played_q >= q_gap
-    {
-        meta.deblundered = true;
-        Some(meta.best_q)
-    } else {
-        None
-    };
-    MoveSearchMeta {
-        sample: meta,
-        deblunder_boundary_q,
-    }
-}
-
-fn assign_deblundered_value_targets(
-    samples: &mut [AzTrainingSample],
-    game_result_red: f32,
-    deblunder_events: &[DeblunderEvent],
-    config: &AzLoopConfig,
-) {
-    if deblunder_events.is_empty() {
-        assign_value_targets(samples, game_result_red, config);
-        return;
-    }
-
-    let mut start = 0usize;
-    for event in deblunder_events {
-        if event.sample_index < start || event.sample_index >= samples.len() {
-            continue;
-        }
-        let end = event.sample_index + 1;
-        assign_value_targets(&mut samples[start..end], event.boundary_red, config);
-        start = end;
-    }
-    if start < samples.len() {
-        assign_value_targets(&mut samples[start..], game_result_red, config);
-    }
+    MoveSearchMeta { sample: meta }
 }
 
 fn assign_value_targets(
@@ -888,154 +718,6 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
         let remaining = game_len.saturating_sub(index).max(1) as f32;
         sample.moves_left = remaining;
     }
-}
-
-fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
-    if ply < config.temperature_decay_delay_plies {
-        return config.temperature_start;
-    }
-    if config.temperature_decay_plies == 0 {
-        return config.temperature_endgame;
-    }
-    let decay_ply = ply.saturating_sub(config.temperature_decay_delay_plies);
-    if decay_ply >= config.temperature_decay_plies {
-        return config.temperature_endgame;
-    }
-    let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
-    config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
-}
-
-fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
-    config
-        .temperature_decay_delay_plies
-        .saturating_add(config.temperature_decay_plies)
-}
-
-fn choose_selfplay_move(
-    candidates: &[AzCandidate],
-    temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
-    rng: &mut SplitMix64,
-) -> Option<Move> {
-    if temperature <= 1e-6 {
-        return candidates
-            .iter()
-            .max_by(|left, right| {
-                left.policy
-                    .total_cmp(&right.policy)
-                    .then_with(|| left.visits.cmp(&right.visits))
-            })
-            .map(|candidate| candidate.mv);
-    }
-
-    let weights = temperature_move_weights(candidates, temperature, value_cutoff, visit_offset);
-    let total = candidates
-        .iter()
-        .zip(&weights)
-        .map(|(_, weight)| *weight)
-        .sum::<f32>();
-    if total <= 0.0 {
-        return candidates.first().map(|candidate| candidate.mv);
-    }
-
-    let mut ticket = rng.unit_f32() * total;
-    for (candidate, weight) in candidates.iter().zip(weights) {
-        if ticket < weight {
-            return Some(candidate.mv);
-        }
-        ticket -= weight;
-    }
-    candidates.first().map(|candidate| candidate.mv)
-}
-
-fn temperature_move_weights(
-    candidates: &[AzCandidate],
-    temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
-) -> Vec<f32> {
-    let best_q = candidates
-        .iter()
-        .map(|candidate| candidate.q)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let inv_temperature = 1.0 / temperature.max(1e-3);
-    let mut weights = candidates
-        .iter()
-        .map(|candidate| {
-            (candidate.visits as f32 - visit_offset)
-                .max(1e-9)
-                .powf(inv_temperature)
-        })
-        .collect::<Vec<_>>();
-
-    if value_cutoff <= 0.0 || value_cutoff >= 1.0 || !best_q.is_finite() {
-        return weights;
-    }
-
-    const MIN_CUTOFF_CANDIDATES: usize = 8;
-    const MIN_CUTOFF_WEIGHT_MASS: f32 = 0.98;
-
-    let total_weight = weights.iter().sum::<f32>();
-    if total_weight <= 0.0 {
-        return weights;
-    }
-
-    let mut keep = candidates
-        .iter()
-        .map(|candidate| {
-            let best_win = (best_q + 1.0) * 0.5;
-            let win = (candidate.q + 1.0) * 0.5;
-            best_win - win <= value_cutoff
-        })
-        .collect::<Vec<_>>();
-    if keep.iter().filter(|&&kept| kept).count() < MIN_CUTOFF_CANDIDATES {
-        let mut ranked = candidates
-            .iter()
-            .enumerate()
-            .collect::<Vec<(usize, &AzCandidate)>>();
-        ranked.sort_by(|(_, left), (_, right)| {
-            right
-                .visits
-                .cmp(&left.visits)
-                .then_with(|| right.q.total_cmp(&left.q))
-        });
-        for (index, _) in ranked.into_iter().take(MIN_CUTOFF_CANDIDATES) {
-            keep[index] = true;
-        }
-    }
-
-    let kept_weight = weights
-        .iter()
-        .zip(&keep)
-        .filter_map(|(weight, kept)| kept.then_some(*weight))
-        .sum::<f32>();
-    if kept_weight / total_weight < MIN_CUTOFF_WEIGHT_MASS {
-        let mut ranked = weights
-            .iter()
-            .copied()
-            .enumerate()
-            .collect::<Vec<(usize, f32)>>();
-        ranked.sort_by(|(_, left), (_, right)| right.total_cmp(left));
-        let mut mass = kept_weight;
-        for (index, weight) in ranked {
-            if keep[index] {
-                continue;
-            }
-            keep[index] = true;
-            mass += weight;
-            if mass / total_weight >= MIN_CUTOFF_WEIGHT_MASS {
-                break;
-            }
-        }
-    }
-
-    for (weight, kept) in weights.iter_mut().zip(keep) {
-        if !kept {
-            *weight = 0.0;
-        }
-    }
-    weights
 }
 
 fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
@@ -1064,7 +746,6 @@ pub struct AzArenaConfig {
     pub games_as_black: usize,
     pub start_index: usize,
     pub seed: u64,
-    pub cpuct: f32,
 }
 
 pub fn play_arena_games_from_positions(
@@ -1084,7 +765,6 @@ pub fn play_arena_games_from_positions(
             config.simulations,
             config.max_plies,
             game_seed,
-            config.cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1108,7 +788,6 @@ pub fn play_arena_games_from_positions(
             config.simulations,
             config.max_plies,
             game_seed,
-            config.cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1142,7 +821,6 @@ fn play_arena_game(
     simulations: usize,
     max_plies: usize,
     seed: u64,
-    cpuct: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut history = Vec::new();
@@ -1161,7 +839,7 @@ fn play_arena_game(
         } else {
             black_model
         };
-        let result = alphazero_search_with_history_and_rules(
+        let result = gumbel_search_with_history_and_rules(
             &position,
             &history,
             Some(rule_history.clone()),
@@ -1170,25 +848,12 @@ fn play_arena_game(
             AzSearchLimits {
                 simulations,
                 seed: seed ^ ((ply as u64) << 32),
-                cpuct,
-                cpuct_at_root: cpuct,
-                cpuct_base: 19652.0,
-                cpuct_factor: 2.0,
-                cpuct_base_at_root: 19652.0,
-                cpuct_factor_at_root: 2.0,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
-                draw_score: 0.0,
-                moves_left_max_effect: 0.0,
-                moves_left_slope: 0.0,
-                moves_left_threshold: 0.6,
-                moves_left_constant_factor: 0.0,
-                moves_left_scaled_factor: 0.0,
-                moves_left_quadratic_factor: 0.0,
                 value_scale: 1.0,
+            },
+            GumbelSearchConfig {
+                gumbel_scale: 0.0,
+                ..GumbelSearchConfig::default()
             },
         );
         let Some(mv) = result.best_move else {
@@ -1232,19 +897,6 @@ mod tests {
         }
     }
 
-    fn candidate_q(mv: Move, visits: u32, q: f32) -> AzCandidate {
-        AzCandidate {
-            mv,
-            visits,
-            q,
-            value_wdl: [0.0, 1.0, 0.0],
-            moves_left: 0.0,
-            raw_prior: 0.0,
-            prior: 0.0,
-            policy: 0.0,
-        }
-    }
-
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
         AzTrainingSample {
             features: Vec::new(),
@@ -1255,52 +907,6 @@ mod tests {
             side_sign,
             moves_left: 0.0,
             meta: AzSampleMeta::default(),
-        }
-    }
-
-    fn test_config() -> AzLoopConfig {
-        AzLoopConfig {
-            games: 1,
-            search: "alphazero".into(),
-            gumbel_actions: 16,
-            gumbel_scale: 1.0,
-            gumbel_value_scale: 0.02,
-            gumbel_maxvisit_init: 50.0,
-            max_plies: 100,
-            simulations: 1,
-            seed: 1,
-            workers: 1,
-            generation_update: 0,
-            temperature_start: 1.0,
-            temperature_endgame: 0.0,
-            temperature_decay_delay_plies: 0,
-            temperature_decay_plies: 0,
-            temperature_value_cutoff: 0.0,
-            temperature_visit_offset: 0.0,
-            cpuct: 1.0,
-            cpuct_at_root: 1.0,
-            cpuct_base: 1.0,
-            cpuct_factor: 0.0,
-            cpuct_base_at_root: 1.0,
-            cpuct_factor_at_root: 0.0,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            fpu_value: 0.0,
-            fpu_value_at_root: 0.0,
-            draw_score: 0.0,
-            moves_left_max_effect: 0.0,
-            moves_left_slope: 0.0,
-            moves_left_threshold: 0.0,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.0,
-            moves_left_quadratic_factor: 0.0,
-            policy_softmax_temp: 1.0,
-            opening_positions: Vec::new(),
-            resign_percentage: 0.0,
-            resign_playthrough: 0.0,
-            mirror_probability: 0.0,
-            deblunder_q_gap: 0.25,
-            td_lambda: 1.0,
         }
     }
 
@@ -1334,7 +940,6 @@ mod tests {
             &[],
             &candidates,
             0.0,
-            1.45,
             true,
             AzSampleMeta::default(),
         );
@@ -1354,33 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn deblunder_value_targets_split_on_each_repair_event() {
-        let mut samples = vec![
-            sample(0.1, 1.0),
-            sample(0.2, -1.0),
-            sample(-0.3, 1.0),
-            sample(-0.4, -1.0),
-        ];
-        let events = vec![
-            DeblunderEvent {
-                sample_index: 1,
-                boundary_red: 0.6,
-            },
-            DeblunderEvent {
-                sample_index: 2,
-                boundary_red: -0.5,
-            },
-        ];
-
-        assign_deblundered_value_targets(&mut samples, 1.0, &events, &test_config());
-
-        assert!((samples[0].value - 0.6).abs() < 1e-6);
-        assert!((samples[1].value + 0.6).abs() < 1e-6);
-        assert!((samples[2].value + 0.5).abs() < 1e-6);
-        assert!((samples[3].value + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
     fn moves_left_targets_use_raw_remaining_plies() {
         let mut samples = vec![sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
 
@@ -1393,70 +971,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3.0, 2.0, 1.0]
         );
-    }
-
-    #[test]
-    fn sampled_move_deblunder_boundary_uses_best_q() {
-        let moves = [
-            Move { from: 0, to: 1 },
-            Move { from: 1, to: 2 },
-            Move { from: 2, to: 3 },
-        ];
-        let mut candidates = vec![
-            candidate(moves[0], 0.5),
-            candidate(moves[1], 0.3),
-            candidate(moves[2], 0.2),
-        ];
-        candidates[0].q = 0.7;
-        candidates[1].q = 0.35;
-        candidates[2].q = 0.65;
-
-        let meta = move_search_meta(&candidates, moves[1], 0.2, 3, 99, 7, 0.25);
-        assert_eq!(meta.deblunder_boundary_q, Some(0.7));
-        assert!(meta.sample.deblundered);
-        assert_eq!(meta.sample.generation_update, 3);
-        assert_eq!(meta.sample.game_id, 99);
-        assert_eq!(meta.sample.ply, 7);
-        assert_eq!(meta.sample.best_index, 0);
-        assert_eq!(meta.sample.played_index, 1);
-        let quiet_meta = move_search_meta(&candidates, moves[2], 0.2, 3, 99, 7, 0.25);
-        assert_eq!(quiet_meta.deblunder_boundary_q, None);
-        assert!(!quiet_meta.sample.deblundered);
-    }
-
-    #[test]
-    fn temperature_value_cutoff_uses_win_probability_gap() {
-        let mut candidates = vec![
-            candidate_q(Move::new(0, 1), 100, 0.80),
-            candidate_q(Move::new(0, 2), 1, 0.60),
-        ];
-        for index in 2..10 {
-            candidates.push(candidate_q(Move::new(index, index + 1), 10, 0.40));
-        }
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-
-        assert!(weights[1] > 0.0);
-    }
-
-    #[test]
-    fn temperature_value_cutoff_keeps_exploration_floor() {
-        let candidates = (0..12)
-            .map(|index| {
-                candidate_q(
-                    Move::new(index, index + 1),
-                    if index == 0 { 100 } else { 10 },
-                    0.90 - index as f32 * 0.10,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-        let kept = weights.iter().filter(|&&weight| weight > 0.0).count();
-        let total_without_cutoff = 100.0 + 11.0 * 10.0;
-        let kept_weight = weights.iter().sum::<f32>();
-
-        assert!(kept >= 8);
-        assert!(kept_weight / total_without_cutoff >= 0.98);
     }
 }

@@ -6,7 +6,6 @@ pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 #[derive(Clone, Debug)]
 pub struct AzLoopFileConfig {
     pub model_path: String,
-    pub search: String,
     pub gumbel_actions: usize,
     pub gumbel_scale: f32,
     pub gumbel_value_scale: f32,
@@ -23,30 +22,6 @@ pub struct AzLoopFileConfig {
     pub hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -56,7 +31,6 @@ pub struct AzLoopFileConfig {
     pub train_epochs_per_update: usize,
     pub max_sample_train_count: u32,
     pub mirror_probability: f32,
-    pub deblunder_q_gap: f32,
     pub td_lambda: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
@@ -64,7 +38,6 @@ pub struct AzLoopFileConfig {
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
     pub arena_interval: usize,
-    pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
@@ -79,7 +52,6 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            search: "alphazero".into(),
             gumbel_actions: 16,
             gumbel_scale: 1.0,
             gumbel_value_scale: 0.02,
@@ -96,30 +68,6 @@ impl Default for AzLoopFileConfig {
             hidden_size: 192,
             seed: 20260412,
             workers: 250,
-            temperature_start: 0.9,
-            temperature_endgame: 0.5,
-            temperature_decay_delay_plies: 20,
-            temperature_decay_plies: 60,
-            temperature_value_cutoff: 0.12,
-            temperature_visit_offset: -0.8,
-            cpuct: 0.65,
-            cpuct_at_root: 2.53,
-            cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
-            root_dirichlet_alpha: 0.12,
-            root_exploration_fraction: 0.1,
-            fpu_value: 0.23,
-            fpu_value_at_root: 1.0,
-            draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.002,
-            moves_left_threshold: 0.6,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.15,
-            moves_left_quadratic_factor: 0.85,
-            policy_softmax_temp: 1.45,
             opening_fens_path: String::new(),
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
@@ -129,7 +77,6 @@ impl Default for AzLoopFileConfig {
             train_epochs_per_update: 2,
             max_sample_train_count: 3,
             mirror_probability: 0.3,
-            deblunder_q_gap: 0.25,
             td_lambda: 0.95,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
@@ -137,7 +84,6 @@ impl Default for AzLoopFileConfig {
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
             arena_interval: 10,
-            arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_processes: 250,
@@ -154,7 +100,6 @@ impl Default for AzLoopFileConfig {
 #[serde(default, deny_unknown_fields)]
 struct AzLoopTomlConfig {
     pub model_path: String,
-    pub search: String,
     pub gumbel_actions: usize,
     pub gumbel_scale: f32,
     pub gumbel_value_scale: f32,
@@ -171,30 +116,6 @@ struct AzLoopTomlConfig {
     pub hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -204,7 +125,6 @@ struct AzLoopTomlConfig {
     pub train_epochs_per_update: usize,
     pub max_sample_train_count: u32,
     pub mirror_probability: f32,
-    pub deblunder_q_gap: f32,
     pub td_lambda: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
@@ -212,7 +132,6 @@ struct AzLoopTomlConfig {
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
     pub arena_interval: usize,
-    pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
@@ -245,7 +164,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
     fn from(config: &AzLoopFileConfig) -> Self {
         Self {
             model_path: config.model_path.clone(),
-            search: config.search.clone(),
             gumbel_actions: config.gumbel_actions,
             gumbel_scale: config.gumbel_scale,
             gumbel_value_scale: config.gumbel_value_scale,
@@ -262,30 +180,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             hidden_size: config.hidden_size,
             seed: config.seed,
             workers: config.workers,
-            temperature_start: config.temperature_start,
-            temperature_endgame: config.temperature_endgame,
-            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-            temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
-            root_exploration_fraction: config.root_exploration_fraction,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
-            draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            policy_softmax_temp: config.policy_softmax_temp,
             opening_fens_path: config.opening_fens_path.clone(),
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -295,7 +189,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             train_epochs_per_update: config.train_epochs_per_update,
             max_sample_train_count: config.max_sample_train_count,
             mirror_probability: config.mirror_probability,
-            deblunder_q_gap: config.deblunder_q_gap,
             td_lambda: config.td_lambda,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
@@ -303,7 +196,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             checkpoint_dir: config.checkpoint_dir.clone(),
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
-            arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
@@ -326,7 +218,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
     fn from(config: AzLoopTomlConfig) -> Self {
         Self {
             model_path: config.model_path,
-            search: config.search,
             gumbel_actions: config.gumbel_actions,
             gumbel_scale: config.gumbel_scale,
             gumbel_value_scale: config.gumbel_value_scale,
@@ -343,30 +234,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             hidden_size: config.hidden_size,
             seed: config.seed,
             workers: config.workers,
-            temperature_start: config.temperature_start,
-            temperature_endgame: config.temperature_endgame,
-            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-            temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
-            root_exploration_fraction: config.root_exploration_fraction,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
-            draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            policy_softmax_temp: config.policy_softmax_temp,
             opening_fens_path: config.opening_fens_path,
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -376,7 +243,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             train_epochs_per_update: config.train_epochs_per_update,
             max_sample_train_count: config.max_sample_train_count,
             mirror_probability: config.mirror_probability,
-            deblunder_q_gap: config.deblunder_q_gap,
             td_lambda: config.td_lambda,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
@@ -384,7 +250,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             checkpoint_dir: config.checkpoint_dir,
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
-            arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
@@ -423,7 +288,6 @@ impl AzLoopFileConfig {
             };
         }
         line!("model_path", q(&self.model_path));
-        line!("search", q(&self.search));
         line!("gumbel_actions", self.gumbel_actions);
         line!("gumbel_scale", f(self.gumbel_scale));
         line!("gumbel_value_scale", f(self.gumbel_value_scale));
@@ -443,42 +307,6 @@ impl AzLoopFileConfig {
         line!("hidden_size", self.hidden_size);
         line!("seed", self.seed);
         line!("workers", self.workers);
-        line!("temperature_start", f(self.temperature_start));
-        line!("temperature_endgame", f(self.temperature_endgame));
-        line!(
-            "temperature_decay_delay_plies",
-            self.temperature_decay_delay_plies
-        );
-        line!("temperature_decay_plies", self.temperature_decay_plies);
-        line!("temperature_value_cutoff", f(self.temperature_value_cutoff));
-        line!("temperature_visit_offset", f(self.temperature_visit_offset));
-        line!("cpuct", f(self.cpuct));
-        line!("cpuct_at_root", f(self.cpuct_at_root));
-        line!("cpuct_base", f(self.cpuct_base));
-        line!("cpuct_factor", f(self.cpuct_factor));
-        line!("cpuct_base_at_root", f(self.cpuct_base_at_root));
-        line!("cpuct_factor_at_root", f(self.cpuct_factor_at_root));
-        line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
-        line!(
-            "root_exploration_fraction",
-            f(self.root_exploration_fraction)
-        );
-        line!("fpu_value", f(self.fpu_value));
-        line!("fpu_value_at_root", f(self.fpu_value_at_root));
-        line!("draw_score", f(self.draw_score));
-        line!("moves_left_max_effect", f(self.moves_left_max_effect));
-        line!("moves_left_slope", f(self.moves_left_slope));
-        line!("moves_left_threshold", f(self.moves_left_threshold));
-        line!(
-            "moves_left_constant_factor",
-            f(self.moves_left_constant_factor)
-        );
-        line!("moves_left_scaled_factor", f(self.moves_left_scaled_factor));
-        line!(
-            "moves_left_quadratic_factor",
-            f(self.moves_left_quadratic_factor)
-        );
-        line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -488,7 +316,6 @@ impl AzLoopFileConfig {
         line!("train_epochs_per_update", self.train_epochs_per_update);
         line!("max_sample_train_count", self.max_sample_train_count);
         line!("mirror_probability", f(self.mirror_probability));
-        line!("deblunder_q_gap", f(self.deblunder_q_gap));
         line!("td_lambda", f(self.td_lambda));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
@@ -496,7 +323,6 @@ impl AzLoopFileConfig {
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
         line!("arena_interval", self.arena_interval);
-        line!("arena_cpuct", f(self.arena_cpuct));
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
         line!(
             "arena_promotion_confidence_z",
@@ -524,11 +350,6 @@ impl AzLoopFileConfig {
     }
 
     fn normalize(mut self) -> Self {
-        self.search = self.search.trim().to_ascii_lowercase();
-        assert!(
-            matches!(self.search.as_str(), "alphazero" | "gumbel"),
-            "search must be `alphazero` or `gumbel`"
-        );
         self.gumbel_actions = self.gumbel_actions.max(1);
         self.gumbel_scale = self.gumbel_scale.max(0.0);
         self.gumbel_value_scale = self.gumbel_value_scale.max(0.0);
@@ -543,34 +364,12 @@ impl AzLoopFileConfig {
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
-        self.temperature_start = self.temperature_start.max(0.0);
-        self.temperature_endgame = self.temperature_endgame.max(0.0);
-        self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
-        self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
-        self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
-        self.cpuct = self.cpuct.max(0.0);
-        self.cpuct_at_root = self.cpuct_at_root.max(0.0);
-        self.cpuct_base = self.cpuct_base.max(1.0);
-        self.cpuct_factor = self.cpuct_factor.max(0.0);
-        self.cpuct_base_at_root = self.cpuct_base_at_root.max(1.0);
-        self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
-        self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
-        self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
-        self.fpu_value = self.fpu_value.max(0.0);
-        self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
-        self.draw_score = self.draw_score.clamp(-1.0, 1.0);
-        self.moves_left_max_effect = self.moves_left_max_effect.max(0.0);
-        self.moves_left_slope = self.moves_left_slope.max(0.0);
-        self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
-        self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
-        self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
-        self.deblunder_q_gap = self.deblunder_q_gap.max(0.0);
         self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
@@ -599,44 +398,24 @@ mod tests {
 
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0001\n"));
-        assert!(text.contains("temperature_start = 0.9\n"));
-        assert!(text.contains("temperature_endgame = 0.5\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 20\n"));
-        assert!(text.contains("temperature_decay_plies = 60\n"));
-        assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("temperature_value_cutoff = 0.12\n"));
-        assert!(text.contains("temperature_visit_offset = -0.8\n"));
-        assert!(text.contains("cpuct = 0.65\n"));
-        assert!(text.contains("cpuct_at_root = 2.53\n"));
-        assert!(text.contains("cpuct_base = 19652.0\n"));
-        assert!(text.contains("cpuct_factor = 2.0\n"));
-        assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
-        assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
-        assert!(text.contains("fpu_value = 0.23\n"));
-        assert!(text.contains("fpu_value_at_root = 1.0\n"));
-        assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("moves_left_max_effect = 0.25\n"));
-        assert!(text.contains("moves_left_slope = 0.002\n"));
-        assert!(text.contains("moves_left_threshold = 0.6\n"));
-        assert!(text.contains("moves_left_constant_factor = 0.0\n"));
-        assert!(text.contains("moves_left_scaled_factor = 0.15\n"));
-        assert!(text.contains("moves_left_quadratic_factor = 0.85\n"));
-        assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("deblunder_q_gap = 0.25\n"));
         assert!(text.contains("td_lambda = 0.95\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
-        assert!(!text.contains("root_exploration_plies"));
-        assert!(text.contains("search = \"alphazero\"\n"));
         assert!(text.contains("gumbel_actions = 16\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
         assert!(text.contains("gumbel_value_scale = 0.02\n"));
         assert!(text.contains("gumbel_maxvisit_init = 50.0\n"));
+        assert!(!text.contains("search"));
+        assert!(!text.contains("temperature"));
+        assert!(!text.contains("cpuct"));
+        assert!(!text.contains("fpu"));
+        assert!(!text.contains("dirichlet"));
+        assert!(!text.contains("deblunder"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));
         assert!(!text.contains("arena_eval_fens"));
@@ -646,7 +425,6 @@ mod tests {
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
         assert!((parsed.lr - 0.001).abs() < 1e-9);
-        assert!((parsed.deblunder_q_gap - 0.25).abs() < 1e-6);
         assert!((parsed.td_lambda - 0.95).abs() < 1e-6);
     }
 }

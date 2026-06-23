@@ -4,13 +4,13 @@ use std::path::Path;
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
-mod alphazero;
 #[cfg(any(
     feature = "gpu-train",
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 mod candle_model;
 mod dataloader;
+mod gumbel;
 mod play;
 mod replay;
 mod train;
@@ -31,9 +31,9 @@ use crate::nnue::{
 };
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position};
 
-pub use alphazero::{
-    AzCandidate, AzSearchLimits, AzSearchResult, GumbelSearchConfig, alphazero_search,
-    alphazero_search_with_history_and_rules, cp_from_q, gumbel_search_with_history_and_rules,
+pub use gumbel::{
+    AzCandidate, AzSearchLimits, AzSearchResult, GumbelSearchConfig, cp_from_q,
+    gumbel_search_with_history_and_rules,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -579,7 +579,6 @@ impl Clone for AzNnue {
 #[derive(Clone, Debug)]
 pub struct AzLoopConfig {
     pub games: usize,
-    pub search: String,
     pub gumbel_actions: usize,
     pub gumbel_scale: f32,
     pub gumbel_value_scale: f32,
@@ -589,35 +588,10 @@ pub struct AzLoopConfig {
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
     pub opening_positions: Vec<Position>,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
-    pub deblunder_q_gap: f32,
     pub td_lambda: f32,
 }
 
@@ -658,12 +632,6 @@ pub struct AzLoopReport {
     pub opening_q_gap: f32,
     pub opening_q_top1_abs: f32,
     pub opening_visited_actions: f32,
-    pub sampled_best_rate: f32,
-    pub deblunder_rate: f32,
-    pub avg_best_played_q_gap: f32,
-    pub avg_played_top_visit_ratio: f32,
-    pub avg_best_q: f32,
-    pub avg_played_q: f32,
     pub selfplay_seconds: f32,
     pub train_seconds: f32,
     pub total_seconds: f32,
@@ -785,7 +753,6 @@ pub struct AzSampleMeta {
     pub played_visits: u32,
     pub best_index: u16,
     pub played_index: u16,
-    pub deblundered: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2182,7 +2149,7 @@ fn generate_policy_fit_samples(
                 break;
             }
             let mv = legal[(rng.next_u64() as usize) % legal.len()];
-            alphazero::append_history(&mut history, &position, mv);
+            gumbel::append_history(&mut history, &position, mv);
             position.make_move(mv);
             if !position.has_general(Color::Red) || !position.has_general(Color::Black) {
                 break;
@@ -2932,7 +2899,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             played_visits: 13,
             best_index: 1,
             played_index: 0,
-            deblundered: true,
         },
     };
     let mut pool = AzExperiencePool::new(100);
@@ -3355,6 +3321,5 @@ mod tests {
         assert_eq!(loaded_samples[0].meta.ply, 9);
         assert!((loaded_samples[0].meta.best_q - 0.33).abs() < 1e-6);
         assert_eq!(loaded_samples[0].meta.played_visits, 13);
-        assert!(loaded_samples[0].meta.deblundered);
     }
 }
