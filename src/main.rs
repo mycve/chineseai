@@ -906,10 +906,12 @@ fn build_async_training_report(
         .map(|started| started.elapsed().as_secs_f32())
         .unwrap_or(train_seconds);
     let train_stat_samples = stats.samples.max(1) as f32;
-    let root_visit_entropy =
-        pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
-    let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
+    let target_entropy = pending.selfplay.target_entropy_sum / shape_count;
+    let prior_top1 = pending.selfplay.prior_top1_sum / shape_count;
+    let target_top1 = pending.selfplay.target_top1_sum / shape_count;
+    let legal_actions = pending.selfplay.legal_actions_sum as f32 / shape_count;
+    let visited_actions = pending.selfplay.visited_actions_sum as f32 / shape_count;
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -948,27 +950,24 @@ fn build_async_training_report(
         value_corr: value_corr.clamp(-1.0, 1.0),
         value_calibration,
         policy_ce: stats.policy_ce,
-        policy_kl: stats.policy_ce - root_visit_entropy,
-        root_visit_entropy,
-        entropy_opening: pending.selfplay.entropy_opening_sum
-            / pending.selfplay.entropy_opening_count.max(1) as f32,
-        entropy_mid: pending.selfplay.entropy_mid_sum
-            / pending.selfplay.entropy_mid_count.max(1) as f32,
-        raw_prior_top1: pending.selfplay.raw_prior_top1_sum / shape_count,
-        raw_prior_top2: pending.selfplay.raw_prior_top2_sum / shape_count,
-        policy_top1: pending.selfplay.policy_top1_sum / shape_count,
-        policy_top2: pending.selfplay.policy_top2_sum / shape_count,
-        root_q_gap: pending.selfplay.q_gap_sum / shape_count,
-        root_q_top1_abs: pending.selfplay.q_top1_abs_sum / shape_count,
-        visited_actions: pending.selfplay.visited_actions_sum as f32 / shape_count,
-        opening_raw_prior_top1: pending.selfplay.opening_raw_prior_top1_sum / opening_shape_count,
-        opening_raw_prior_top2: pending.selfplay.opening_raw_prior_top2_sum / opening_shape_count,
-        opening_policy_top1: pending.selfplay.opening_policy_top1_sum / opening_shape_count,
-        opening_policy_top2: pending.selfplay.opening_policy_top2_sum / opening_shape_count,
-        opening_q_gap: pending.selfplay.opening_q_gap_sum / opening_shape_count,
-        opening_q_top1_abs: pending.selfplay.opening_q_top1_abs_sum / opening_shape_count,
-        opening_visited_actions: pending.selfplay.opening_visited_actions_sum as f32
-            / opening_shape_count,
+        policy_kl: stats.policy_ce - target_entropy,
+        prior_entropy: pending.selfplay.prior_entropy_sum / shape_count,
+        target_entropy,
+        prior_top1,
+        prior_top2: pending.selfplay.prior_top2_sum / shape_count,
+        target_top1,
+        target_top2: pending.selfplay.target_top2_sum / shape_count,
+        target_effective_actions: target_entropy.exp(),
+        policy_sharpen_top1: target_top1 - prior_top1,
+        legal_actions,
+        visited_actions,
+        visited_ratio: if legal_actions <= 0.0 {
+            0.0
+        } else {
+            visited_actions / legal_actions
+        },
+        q_gap: pending.selfplay.q_gap_sum / shape_count,
+        q_top1_abs: pending.selfplay.q_top1_abs_sum / shape_count,
         selfplay_seconds: pending.selfplay_seconds,
         train_seconds,
         total_seconds,
@@ -1301,16 +1300,23 @@ fn main() {
                     .filter(|candidate| candidate.visits > 0)
                     .count()
             );
-            println!("by_improved_policy:");
+            println!("by_gumbel_policy:");
             for candidate in &result.candidates {
+                let selected = if Some(candidate.mv) == result.best_move {
+                    "*"
+                } else {
+                    " "
+                };
                 println!(
-                    "candidate: {} visits={} q={:.3} ml={:.1} prior={:.5} improved_policy={:.5}",
+                    "candidate:{} {} visits={} q={:.3} ml={:.1} prior={:.5} improved_policy={:.5} gscore={:.3}",
+                    selected,
                     candidate.mv,
                     candidate.visits,
                     candidate.q,
                     candidate.moves_left,
                     candidate.prior,
-                    candidate.policy
+                    candidate.policy,
+                    candidate.gumbel_score
                 );
             }
             println!("by_visits:");
@@ -1323,14 +1329,21 @@ fn main() {
                     .then_with(|| right.q.total_cmp(&left.q))
             });
             for candidate in &by_visits {
+                let selected = if Some(candidate.mv) == result.best_move {
+                    "*"
+                } else {
+                    " "
+                };
                 println!(
-                    "visited: {} visits={} q={:.3} ml={:.1} prior={:.5} improved_policy={:.5}",
+                    "visited:{} {} visits={} q={:.3} ml={:.1} prior={:.5} improved_policy={:.5} gscore={:.3}",
+                    selected,
                     candidate.mv,
                     candidate.visits,
                     candidate.q,
                     candidate.moves_left,
                     candidate.prior,
-                    candidate.policy
+                    candidate.policy,
+                    candidate.gumbel_score
                 );
             }
         }
@@ -2343,23 +2356,19 @@ fn main() {
                                         value_calibration: 0.0,
                                         policy_ce: 0.0,
                                         policy_kl: 0.0,
-                                        root_visit_entropy: 0.0,
-                                        entropy_opening: 0.0,
-                                        entropy_mid: 0.0,
-                                        raw_prior_top1: 0.0,
-                                        raw_prior_top2: 0.0,
-                                        policy_top1: 0.0,
-                                        policy_top2: 0.0,
-                                        root_q_gap: 0.0,
-                                        root_q_top1_abs: 0.0,
+                                        prior_entropy: 0.0,
+                                        target_entropy: 0.0,
+                                        prior_top1: 0.0,
+                                        prior_top2: 0.0,
+                                        target_top1: 0.0,
+                                        target_top2: 0.0,
+                                        target_effective_actions: 0.0,
+                                        policy_sharpen_top1: 0.0,
+                                        legal_actions: 0.0,
                                         visited_actions: 0.0,
-                                        opening_raw_prior_top1: 0.0,
-                                        opening_raw_prior_top2: 0.0,
-                                        opening_policy_top1: 0.0,
-                                        opening_policy_top2: 0.0,
-                                        opening_q_gap: 0.0,
-                                        opening_q_top1_abs: 0.0,
-                                        opening_visited_actions: 0.0,
+                                        visited_ratio: 0.0,
+                                        q_gap: 0.0,
+                                        q_top1_abs: 0.0,
                                         selfplay_seconds: 0.0,
                                         train_seconds: 0.0,
                                         total_seconds: 0.0,
@@ -2410,23 +2419,19 @@ fn main() {
                                         value_calibration: 0.0,
                                         policy_ce: 0.0,
                                         policy_kl: 0.0,
-                                        root_visit_entropy: 0.0,
-                                        entropy_opening: 0.0,
-                                        entropy_mid: 0.0,
-                                        raw_prior_top1: 0.0,
-                                        raw_prior_top2: 0.0,
-                                        policy_top1: 0.0,
-                                        policy_top2: 0.0,
-                                        root_q_gap: 0.0,
-                                        root_q_top1_abs: 0.0,
+                                        prior_entropy: 0.0,
+                                        target_entropy: 0.0,
+                                        prior_top1: 0.0,
+                                        prior_top2: 0.0,
+                                        target_top1: 0.0,
+                                        target_top2: 0.0,
+                                        target_effective_actions: 0.0,
+                                        policy_sharpen_top1: 0.0,
+                                        legal_actions: 0.0,
                                         visited_actions: 0.0,
-                                        opening_raw_prior_top1: 0.0,
-                                        opening_raw_prior_top2: 0.0,
-                                        opening_policy_top1: 0.0,
-                                        opening_policy_top2: 0.0,
-                                        opening_q_gap: 0.0,
-                                        opening_q_top1_abs: 0.0,
-                                        opening_visited_actions: 0.0,
+                                        visited_ratio: 0.0,
+                                        q_gap: 0.0,
+                                        q_top1_abs: 0.0,
                                         selfplay_seconds: 0.0,
                                         train_seconds: 0.0,
                                         total_seconds: 0.0,
@@ -2487,9 +2492,8 @@ fn main() {
                     None
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
-                let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} priorH={:.3} tgtH={:.3} effA={:.2} priorP={:.3}/{:.3} tgtP={:.3}/{:.3} sharp={:.3} act={:.1}/{:.1} visit={:.3} qgap={:.3} qabs={:.3} lr={:.6} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -2515,18 +2519,20 @@ fn main() {
                     report.value_corr,
                     report.value_calibration,
                     report.policy_kl,
-                    policy_target_entropy,
-                    report.learning_rate,
-                    report.root_visit_entropy,
-                    report.entropy_opening,
-                    report.entropy_mid,
-                    report.raw_prior_top1,
-                    report.raw_prior_top2,
-                    report.policy_top1,
-                    report.policy_top2,
-                    report.root_q_gap,
-                    report.root_q_top1_abs,
+                    report.prior_entropy,
+                    report.target_entropy,
+                    report.target_effective_actions,
+                    report.prior_top1,
+                    report.prior_top2,
+                    report.target_top1,
+                    report.target_top2,
+                    report.policy_sharpen_top1,
                     report.visited_actions,
+                    report.legal_actions,
+                    report.visited_ratio,
+                    report.q_gap,
+                    report.q_top1_abs,
+                    report.learning_rate,
                     report.train_seconds,
                     report.games_per_second,
                     report.samples_per_second,
@@ -2580,7 +2586,7 @@ fn main() {
                     &mut tb,
                     "train/policy_target_entropy",
                     update,
-                    policy_target_entropy,
+                    report.target_entropy,
                 );
                 log_scalar(&mut tb, "train/lr", update, report.learning_rate);
                 log_scalar(
@@ -2598,81 +2604,52 @@ fn main() {
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
                 log_scalar(
                     &mut tb,
-                    "stats/root_visit_entropy",
+                    "gumbel/prior_entropy",
                     update,
-                    report.root_visit_entropy,
+                    report.prior_entropy,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/entropy_opening",
+                    "gumbel/target_entropy",
                     update,
-                    report.entropy_opening,
-                );
-                log_scalar(&mut tb, "stats/entropy_mid", update, report.entropy_mid);
-                log_scalar(
-                    &mut tb,
-                    "stats/raw_prior_top1",
-                    update,
-                    report.raw_prior_top1,
+                    report.target_entropy,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/raw_prior_top2",
+                    "gumbel/target_effective_actions",
                     update,
-                    report.raw_prior_top2,
+                    report.target_effective_actions,
                 );
-                log_scalar(&mut tb, "stats/policy_top1", update, report.policy_top1);
-                log_scalar(&mut tb, "stats/policy_top2", update, report.policy_top2);
-                log_scalar(&mut tb, "stats/root_q_gap", update, report.root_q_gap);
+                log_scalar(&mut tb, "gumbel/prior_top1", update, report.prior_top1);
+                log_scalar(&mut tb, "gumbel/prior_top2", update, report.prior_top2);
+                log_scalar(&mut tb, "gumbel/target_top1", update, report.target_top1);
+                log_scalar(&mut tb, "gumbel/target_top2", update, report.target_top2);
                 log_scalar(
                     &mut tb,
-                    "stats/root_q_top1_abs",
+                    "gumbel/policy_sharpen_top1",
                     update,
-                    report.root_q_top1_abs,
+                    report.policy_sharpen_top1,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/visited_actions",
+                    "gumbel/legal_actions",
+                    update,
+                    report.legal_actions,
+                );
+                log_scalar(
+                    &mut tb,
+                    "gumbel/visited_actions",
                     update,
                     report.visited_actions,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/opening_raw_prior_top1",
+                    "gumbel/visited_ratio",
                     update,
-                    report.opening_raw_prior_top1,
+                    report.visited_ratio,
                 );
-                log_scalar(
-                    &mut tb,
-                    "stats/opening_raw_prior_top2",
-                    update,
-                    report.opening_raw_prior_top2,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/opening_policy_top1",
-                    update,
-                    report.opening_policy_top1,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/opening_policy_top2",
-                    update,
-                    report.opening_policy_top2,
-                );
-                log_scalar(&mut tb, "stats/opening_q_gap", update, report.opening_q_gap);
-                log_scalar(
-                    &mut tb,
-                    "stats/opening_q_top1_abs",
-                    update,
-                    report.opening_q_top1_abs,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/opening_visited_actions",
-                    update,
-                    report.opening_visited_actions,
-                );
+                log_scalar(&mut tb, "gumbel/q_gap", update, report.q_gap);
+                log_scalar(&mut tb, "gumbel/q_top1_abs", update, report.q_top1_abs);
                 log_scalar(
                     &mut tb,
                     "selfplay/games_per_second",

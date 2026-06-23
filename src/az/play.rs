@@ -136,28 +136,17 @@ pub struct AzSelfplayData {
     pub black_wins: usize,
     pub draws: usize,
     pub plies_total: usize,
-    pub entropy_all_sum: f32,
-    pub entropy_all_count: usize,
-    pub entropy_opening_sum: f32,
-    pub entropy_opening_count: usize,
-    pub entropy_mid_sum: f32,
-    pub entropy_mid_count: usize,
-    pub raw_prior_top1_sum: f32,
-    pub raw_prior_top2_sum: f32,
-    pub policy_top1_sum: f32,
-    pub policy_top2_sum: f32,
+    pub prior_entropy_sum: f32,
+    pub target_entropy_sum: f32,
+    pub prior_top1_sum: f32,
+    pub prior_top2_sum: f32,
+    pub target_top1_sum: f32,
+    pub target_top2_sum: f32,
     pub q_gap_sum: f32,
     pub q_top1_abs_sum: f32,
+    pub legal_actions_sum: usize,
     pub visited_actions_sum: usize,
     pub shape_count: usize,
-    pub opening_raw_prior_top1_sum: f32,
-    pub opening_raw_prior_top2_sum: f32,
-    pub opening_policy_top1_sum: f32,
-    pub opening_policy_top2_sum: f32,
-    pub opening_q_gap_sum: f32,
-    pub opening_q_top1_abs_sum: f32,
-    pub opening_visited_actions_sum: usize,
-    pub opening_shape_count: usize,
     pub sampled_moves: usize,
     pub terminal: AzTerminalStats,
 }
@@ -170,28 +159,17 @@ impl AzSelfplayData {
         self.black_wins += other.black_wins;
         self.draws += other.draws;
         self.plies_total += other.plies_total;
-        self.entropy_all_sum += other.entropy_all_sum;
-        self.entropy_all_count += other.entropy_all_count;
-        self.entropy_opening_sum += other.entropy_opening_sum;
-        self.entropy_opening_count += other.entropy_opening_count;
-        self.entropy_mid_sum += other.entropy_mid_sum;
-        self.entropy_mid_count += other.entropy_mid_count;
-        self.raw_prior_top1_sum += other.raw_prior_top1_sum;
-        self.raw_prior_top2_sum += other.raw_prior_top2_sum;
-        self.policy_top1_sum += other.policy_top1_sum;
-        self.policy_top2_sum += other.policy_top2_sum;
+        self.prior_entropy_sum += other.prior_entropy_sum;
+        self.target_entropy_sum += other.target_entropy_sum;
+        self.prior_top1_sum += other.prior_top1_sum;
+        self.prior_top2_sum += other.prior_top2_sum;
+        self.target_top1_sum += other.target_top1_sum;
+        self.target_top2_sum += other.target_top2_sum;
         self.q_gap_sum += other.q_gap_sum;
         self.q_top1_abs_sum += other.q_top1_abs_sum;
+        self.legal_actions_sum += other.legal_actions_sum;
         self.visited_actions_sum += other.visited_actions_sum;
         self.shape_count += other.shape_count;
-        self.opening_raw_prior_top1_sum += other.opening_raw_prior_top1_sum;
-        self.opening_raw_prior_top2_sum += other.opening_raw_prior_top2_sum;
-        self.opening_policy_top1_sum += other.opening_policy_top1_sum;
-        self.opening_policy_top2_sum += other.opening_policy_top2_sum;
-        self.opening_q_gap_sum += other.opening_q_gap_sum;
-        self.opening_q_top1_abs_sum += other.opening_q_top1_abs_sum;
-        self.opening_visited_actions_sum += other.opening_visited_actions_sum;
-        self.opening_shape_count += other.opening_shape_count;
         self.sampled_moves += other.sampled_moves;
         self.terminal.add_assign(&other.terminal);
     }
@@ -229,28 +207,17 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.black_wins += chunk.black_wins;
         merged.draws += chunk.draws;
         merged.plies_total += chunk.plies_total;
-        merged.entropy_all_sum += chunk.entropy_all_sum;
-        merged.entropy_all_count += chunk.entropy_all_count;
-        merged.entropy_opening_sum += chunk.entropy_opening_sum;
-        merged.entropy_opening_count += chunk.entropy_opening_count;
-        merged.entropy_mid_sum += chunk.entropy_mid_sum;
-        merged.entropy_mid_count += chunk.entropy_mid_count;
-        merged.raw_prior_top1_sum += chunk.raw_prior_top1_sum;
-        merged.raw_prior_top2_sum += chunk.raw_prior_top2_sum;
-        merged.policy_top1_sum += chunk.policy_top1_sum;
-        merged.policy_top2_sum += chunk.policy_top2_sum;
+        merged.prior_entropy_sum += chunk.prior_entropy_sum;
+        merged.target_entropy_sum += chunk.target_entropy_sum;
+        merged.prior_top1_sum += chunk.prior_top1_sum;
+        merged.prior_top2_sum += chunk.prior_top2_sum;
+        merged.target_top1_sum += chunk.target_top1_sum;
+        merged.target_top2_sum += chunk.target_top2_sum;
         merged.q_gap_sum += chunk.q_gap_sum;
         merged.q_top1_abs_sum += chunk.q_top1_abs_sum;
+        merged.legal_actions_sum += chunk.legal_actions_sum;
         merged.visited_actions_sum += chunk.visited_actions_sum;
         merged.shape_count += chunk.shape_count;
-        merged.opening_raw_prior_top1_sum += chunk.opening_raw_prior_top1_sum;
-        merged.opening_raw_prior_top2_sum += chunk.opening_raw_prior_top2_sum;
-        merged.opening_policy_top1_sum += chunk.opening_policy_top1_sum;
-        merged.opening_policy_top2_sum += chunk.opening_policy_top2_sum;
-        merged.opening_q_gap_sum += chunk.opening_q_gap_sum;
-        merged.opening_q_top1_abs_sum += chunk.opening_q_top1_abs_sum;
-        merged.opening_visited_actions_sum += chunk.opening_visited_actions_sum;
-        merged.opening_shape_count += chunk.opening_shape_count;
         merged.sampled_moves += chunk.sampled_moves;
         merged.terminal.add_assign(&chunk.terminal);
     }
@@ -265,28 +232,17 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut draws = 0usize;
     let mut plies_total = 0usize;
     let mut games = Vec::with_capacity(config.games);
-    let mut entropy_all_sum = 0.0f32;
-    let mut entropy_all_count = 0usize;
-    let mut entropy_opening_sum = 0.0f32;
-    let mut entropy_opening_count = 0usize;
-    let mut entropy_mid_sum = 0.0f32;
-    let mut entropy_mid_count = 0usize;
-    let mut raw_prior_top1_sum = 0.0f32;
-    let mut raw_prior_top2_sum = 0.0f32;
-    let mut policy_top1_sum = 0.0f32;
-    let mut policy_top2_sum = 0.0f32;
+    let mut prior_entropy_sum = 0.0f32;
+    let mut target_entropy_sum = 0.0f32;
+    let mut prior_top1_sum = 0.0f32;
+    let mut prior_top2_sum = 0.0f32;
+    let mut target_top1_sum = 0.0f32;
+    let mut target_top2_sum = 0.0f32;
     let mut q_gap_sum = 0.0f32;
     let mut q_top1_abs_sum = 0.0f32;
+    let mut legal_actions_sum = 0usize;
     let mut visited_actions_sum = 0usize;
     let mut shape_count = 0usize;
-    let mut opening_raw_prior_top1_sum = 0.0f32;
-    let mut opening_raw_prior_top2_sum = 0.0f32;
-    let mut opening_policy_top1_sum = 0.0f32;
-    let mut opening_policy_top2_sum = 0.0f32;
-    let mut opening_q_gap_sum = 0.0f32;
-    let mut opening_q_top1_abs_sum = 0.0f32;
-    let mut opening_visited_actions_sum = 0usize;
-    let mut opening_shape_count = 0usize;
     let mut sampled_moves = 0usize;
     let mut terminal = AzTerminalStats::default();
 
@@ -339,33 +295,18 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     maxvisit_init: config.gumbel_maxvisit_init,
                 },
             );
-            let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
-            raw_prior_top1_sum += shape.raw_prior_top1;
-            raw_prior_top2_sum += shape.raw_prior_top2;
-            policy_top1_sum += shape.policy_top1;
-            policy_top2_sum += shape.policy_top2;
+            prior_entropy_sum += shape.prior_entropy;
+            target_entropy_sum += shape.target_entropy;
+            prior_top1_sum += shape.prior_top1;
+            prior_top2_sum += shape.prior_top2;
+            target_top1_sum += shape.target_top1;
+            target_top2_sum += shape.target_top2;
             q_gap_sum += shape.q_gap;
             q_top1_abs_sum += shape.q_top1_abs;
+            legal_actions_sum += shape.legal_actions;
             visited_actions_sum += shape.visited_actions;
             shape_count += 1;
-            entropy_all_sum += entropy;
-            entropy_all_count += 1;
-            if false {
-                entropy_opening_sum += entropy;
-                entropy_opening_count += 1;
-                opening_raw_prior_top1_sum += shape.raw_prior_top1;
-                opening_raw_prior_top2_sum += shape.raw_prior_top2;
-                opening_policy_top1_sum += shape.policy_top1;
-                opening_policy_top2_sum += shape.policy_top2;
-                opening_q_gap_sum += shape.q_gap;
-                opening_q_top1_abs_sum += shape.q_top1_abs;
-                opening_visited_actions_sum += shape.visited_actions;
-                opening_shape_count += 1;
-            } else {
-                entropy_mid_sum += entropy;
-                entropy_mid_count += 1;
-            }
             if allow_resign && should_resign(search.value_q, config) {
                 let meta = root_search_meta(
                     &search.candidates,
@@ -490,28 +431,17 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         black_wins,
         draws,
         plies_total,
-        entropy_all_sum,
-        entropy_all_count,
-        entropy_opening_sum,
-        entropy_opening_count,
-        entropy_mid_sum,
-        entropy_mid_count,
-        raw_prior_top1_sum,
-        raw_prior_top2_sum,
-        policy_top1_sum,
-        policy_top2_sum,
+        prior_entropy_sum,
+        target_entropy_sum,
+        prior_top1_sum,
+        prior_top2_sum,
+        target_top1_sum,
+        target_top2_sum,
         q_gap_sum,
         q_top1_abs_sum,
+        legal_actions_sum,
         visited_actions_sum,
         shape_count,
-        opening_raw_prior_top1_sum,
-        opening_raw_prior_top2_sum,
-        opening_policy_top1_sum,
-        opening_policy_top2_sum,
-        opening_q_gap_sum,
-        opening_q_top1_abs_sum,
-        opening_visited_actions_sum,
-        opening_shape_count,
         sampled_moves,
         terminal,
     }
@@ -519,23 +449,36 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PolicyShapeStats {
-    raw_prior_top1: f32,
-    raw_prior_top2: f32,
-    policy_top1: f32,
-    policy_top2: f32,
+    prior_entropy: f32,
+    target_entropy: f32,
+    prior_top1: f32,
+    prior_top2: f32,
+    target_top1: f32,
+    target_top2: f32,
     q_gap: f32,
     q_top1_abs: f32,
+    legal_actions: usize,
     visited_actions: usize,
 }
 
 fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
-    let mut raw_top = [0.0f32; 2];
-    let mut policy_top = [0.0f32; 2];
+    let mut prior_top = [0.0f32; 2];
+    let mut target_top = [0.0f32; 2];
     let mut q_top = [f32::NEG_INFINITY; 2];
+    let mut prior_entropy = 0.0f32;
+    let mut target_entropy = 0.0f32;
     let mut visited_actions = 0usize;
     for candidate in candidates {
-        insert_top2(candidate.raw_prior.max(0.0), &mut raw_top);
-        insert_top2(candidate.policy.max(0.0), &mut policy_top);
+        let prior = candidate.raw_prior.max(0.0);
+        let target = candidate.policy.max(0.0);
+        insert_top2(prior, &mut prior_top);
+        insert_top2(target, &mut target_top);
+        if prior > 0.0 {
+            prior_entropy -= prior * prior.ln();
+        }
+        if target > 0.0 {
+            target_entropy -= target * target.ln();
+        }
         if candidate.visits > 0 {
             insert_top2(candidate.q, &mut q_top);
             visited_actions += 1;
@@ -552,12 +495,15 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
         0.0
     };
     PolicyShapeStats {
-        raw_prior_top1: raw_top[0],
-        raw_prior_top2: raw_top[0] + raw_top[1],
-        policy_top1: policy_top[0],
-        policy_top2: policy_top[0] + policy_top[1],
+        prior_entropy,
+        target_entropy,
+        prior_top1: prior_top[0],
+        prior_top2: prior_top[0] + prior_top[1],
+        target_top1: target_top[0],
+        target_top2: target_top[0] + target_top[1],
         q_gap,
         q_top1_abs,
+        legal_actions: candidates.len(),
         visited_actions,
     }
 }
@@ -720,24 +666,6 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
     }
 }
 
-fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
-    const EPS: f32 = 1e-10;
-    let total = candidates
-        .iter()
-        .map(|candidate| candidate.policy.max(0.0))
-        .sum::<f32>();
-    if total <= 0.0 {
-        return 0.0;
-    }
-    candidates
-        .iter()
-        .map(|candidate| {
-            let p = (candidate.policy.max(0.0) / total).max(0.0);
-            if p <= 0.0 { 0.0 } else { -p * (p + EPS).ln() }
-        })
-        .sum()
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct AzArenaConfig {
     pub simulations: usize,
@@ -894,6 +822,7 @@ mod tests {
             raw_prior: policy,
             prior: policy,
             policy,
+            gumbel_score: 0.0,
         }
     }
 

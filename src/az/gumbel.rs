@@ -53,6 +53,7 @@ pub struct AzCandidate {
     pub raw_prior: f32,
     pub prior: f32,
     pub policy: f32,
+    pub gumbel_score: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -126,12 +127,14 @@ pub fn gumbel_search_with_history_and_rules(
     } else {
         root_node.value_wdl
     };
-    let policy = tree.root_policy(root);
+    let completed_q = tree.gumbel_completed_q(root);
+    let policy = tree.root_policy_with_completed(root, &completed_q);
     let mut candidates = root_node
         .children
         .iter()
         .zip(policy)
-        .map(|(child, policy)| AzCandidate {
+        .enumerate()
+        .map(|(index, (child, policy))| AzCandidate {
             mv: child.mv,
             visits: child.visits,
             q: child.q(),
@@ -140,6 +143,7 @@ pub fn gumbel_search_with_history_and_rules(
             raw_prior: child.raw_prior,
             prior: child.prior,
             policy,
+            gumbel_score: tree.gumbel_score(index, &completed_q),
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -690,12 +694,11 @@ impl<'a> AzTree<'a> {
             .map(|(index, _)| index)
     }
 
-    fn root_policy(&self, node_index: usize) -> Vec<f32> {
-        let completed = self.gumbel_completed_q(node_index);
+    fn root_policy_with_completed(&self, node_index: usize, completed: &[f32]) -> Vec<f32> {
         let logits = self.nodes[node_index]
             .children
             .iter()
-            .zip(completed)
+            .zip(completed.iter().copied())
             .map(|(child, q)| child.prior.max(1e-12).ln() + q)
             .collect::<Vec<_>>();
         let mut policy = Vec::new();
