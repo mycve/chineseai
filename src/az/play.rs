@@ -10,8 +10,9 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_history_and_rules, dense_move_index, scalar_value_to_wdl_target,
+    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample,
+    GumbelSearchConfig, SplitMix64, alphazero_search_with_history_and_rules, dense_move_index,
+    gumbel_search_with_history_and_rules, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -348,36 +349,63 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search = alphazero_search_with_history_and_rules(
-                &position,
-                &history,
-                Some(rule_history.clone()),
-                Some(legal),
-                model,
-                AzSearchLimits {
-                    simulations: config.simulations,
-                    seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                    cpuct: config.cpuct,
-                    cpuct_at_root: config.cpuct_at_root,
-                    cpuct_base: config.cpuct_base,
-                    cpuct_factor: config.cpuct_factor,
-                    cpuct_base_at_root: config.cpuct_base_at_root,
-                    cpuct_factor_at_root: config.cpuct_factor_at_root,
-                    max_depth: 0,
-                    root_dirichlet_alpha: config.root_dirichlet_alpha,
-                    root_exploration_fraction: config.root_exploration_fraction,
-                    fpu_value: config.fpu_value,
-                    fpu_value_at_root: config.fpu_value_at_root,
-                    draw_score: config.draw_score,
-                    moves_left_max_effect: config.moves_left_max_effect,
-                    moves_left_slope: config.moves_left_slope,
-                    moves_left_threshold: config.moves_left_threshold,
-                    moves_left_constant_factor: config.moves_left_constant_factor,
-                    moves_left_scaled_factor: config.moves_left_scaled_factor,
-                    moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-                    value_scale: 1.0,
+            let search_seed = rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64;
+            let limits = AzSearchLimits {
+                simulations: config.simulations,
+                seed: search_seed,
+                cpuct: config.cpuct,
+                cpuct_at_root: config.cpuct_at_root,
+                cpuct_base: config.cpuct_base,
+                cpuct_factor: config.cpuct_factor,
+                cpuct_base_at_root: config.cpuct_base_at_root,
+                cpuct_factor_at_root: config.cpuct_factor_at_root,
+                max_depth: 0,
+                root_dirichlet_alpha: if config.search == "gumbel" {
+                    0.0
+                } else {
+                    config.root_dirichlet_alpha
                 },
-            );
+                root_exploration_fraction: if config.search == "gumbel" {
+                    0.0
+                } else {
+                    config.root_exploration_fraction
+                },
+                fpu_value: config.fpu_value,
+                fpu_value_at_root: config.fpu_value_at_root,
+                draw_score: config.draw_score,
+                moves_left_max_effect: config.moves_left_max_effect,
+                moves_left_slope: config.moves_left_slope,
+                moves_left_threshold: config.moves_left_threshold,
+                moves_left_constant_factor: config.moves_left_constant_factor,
+                moves_left_scaled_factor: config.moves_left_scaled_factor,
+                moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+                value_scale: 1.0,
+            };
+            let search = if config.search == "gumbel" {
+                gumbel_search_with_history_and_rules(
+                    &position,
+                    &history,
+                    Some(rule_history.clone()),
+                    Some(legal),
+                    model,
+                    limits,
+                    GumbelSearchConfig {
+                        max_num_considered_actions: config.gumbel_actions,
+                        gumbel_scale: config.gumbel_scale,
+                        value_scale: config.gumbel_value_scale,
+                        maxvisit_init: config.gumbel_maxvisit_init,
+                    },
+                )
+            } else {
+                alphazero_search_with_history_and_rules(
+                    &position,
+                    &history,
+                    Some(rule_history.clone()),
+                    Some(legal),
+                    model,
+                    limits,
+                )
+            };
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
             raw_prior_top1_sum += shape.raw_prior_top1;
@@ -1216,6 +1244,11 @@ mod tests {
     fn test_config(value_q_ratio: f32) -> AzLoopConfig {
         AzLoopConfig {
             games: 1,
+            search: "alphazero".into(),
+            gumbel_actions: 16,
+            gumbel_scale: 1.0,
+            gumbel_value_scale: 0.02,
+            gumbel_maxvisit_init: 50.0,
             max_plies: 100,
             simulations: 1,
             seed: 1,

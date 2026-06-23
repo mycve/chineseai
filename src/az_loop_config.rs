@@ -6,6 +6,11 @@ pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 #[derive(Clone, Debug)]
 pub struct AzLoopFileConfig {
     pub model_path: String,
+    pub search: String,
+    pub gumbel_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_value_scale: f32,
+    pub gumbel_maxvisit_init: f32,
     pub simulations: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
@@ -75,6 +80,11 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
+            search: "alphazero".into(),
+            gumbel_actions: 16,
+            gumbel_scale: 1.0,
+            gumbel_value_scale: 0.02,
+            gumbel_maxvisit_init: 50.0,
             simulations: 800,
             selfplay_samples_per_update: 60000,
             lr: 0.001,
@@ -146,6 +156,11 @@ impl Default for AzLoopFileConfig {
 #[serde(default, deny_unknown_fields)]
 struct AzLoopTomlConfig {
     pub model_path: String,
+    pub search: String,
+    pub gumbel_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_value_scale: f32,
+    pub gumbel_maxvisit_init: f32,
     pub simulations: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
@@ -233,6 +248,11 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
     fn from(config: &AzLoopFileConfig) -> Self {
         Self {
             model_path: config.model_path.clone(),
+            search: config.search.clone(),
+            gumbel_actions: config.gumbel_actions,
+            gumbel_scale: config.gumbel_scale,
+            gumbel_value_scale: config.gumbel_value_scale,
+            gumbel_maxvisit_init: config.gumbel_maxvisit_init,
             simulations: config.simulations,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
@@ -310,6 +330,11 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
     fn from(config: AzLoopTomlConfig) -> Self {
         Self {
             model_path: config.model_path,
+            search: config.search,
+            gumbel_actions: config.gumbel_actions,
+            gumbel_scale: config.gumbel_scale,
+            gumbel_value_scale: config.gumbel_value_scale,
+            gumbel_maxvisit_init: config.gumbel_maxvisit_init,
             simulations: config.simulations,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
@@ -403,6 +428,11 @@ impl AzLoopFileConfig {
             };
         }
         line!("model_path", q(&self.model_path));
+        line!("search", q(&self.search));
+        line!("gumbel_actions", self.gumbel_actions);
+        line!("gumbel_scale", f(self.gumbel_scale));
+        line!("gumbel_value_scale", f(self.gumbel_value_scale));
+        line!("gumbel_maxvisit_init", f(self.gumbel_maxvisit_init));
         line!("simulations", self.simulations);
         line!(
             "selfplay_samples_per_update",
@@ -500,6 +530,15 @@ impl AzLoopFileConfig {
     }
 
     fn normalize(mut self) -> Self {
+        self.search = self.search.trim().to_ascii_lowercase();
+        assert!(
+            matches!(self.search.as_str(), "alphazero" | "gumbel"),
+            "search must be `alphazero` or `gumbel`"
+        );
+        self.gumbel_actions = self.gumbel_actions.max(1);
+        self.gumbel_scale = self.gumbel_scale.max(0.0);
+        self.gumbel_value_scale = self.gumbel_value_scale.max(0.0);
+        self.gumbel_maxvisit_init = self.gumbel_maxvisit_init.max(0.0);
         self.simulations = self.simulations.max(1);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
@@ -601,7 +640,11 @@ mod tests {
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
         assert!(!text.contains("root_exploration_plies"));
-        assert!(!text.contains("gumbel"));
+        assert!(text.contains("search = \"alphazero\"\n"));
+        assert!(text.contains("gumbel_actions = 16\n"));
+        assert!(text.contains("gumbel_scale = 1.0\n"));
+        assert!(text.contains("gumbel_value_scale = 0.02\n"));
+        assert!(text.contains("gumbel_maxvisit_init = 50.0\n"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));
         assert!(!text.contains("arena_eval_fens"));

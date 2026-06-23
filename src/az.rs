@@ -32,8 +32,8 @@ use crate::nnue::{
 use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position};
 
 pub use alphazero::{
-    AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search,
-    alphazero_search_with_history_and_rules, cp_from_q,
+    AzCandidate, AzSearchLimits, AzSearchResult, GumbelSearchConfig, alphazero_search,
+    alphazero_search_with_history_and_rules, cp_from_q, gumbel_search_with_history_and_rules,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -579,6 +579,11 @@ impl Clone for AzNnue {
 #[derive(Clone, Debug)]
 pub struct AzLoopConfig {
     pub games: usize,
+    pub search: String,
+    pub gumbel_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_value_scale: f32,
+    pub gumbel_maxvisit_init: f32,
     pub max_plies: usize,
     pub simulations: usize,
     pub seed: u64,

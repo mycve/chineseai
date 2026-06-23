@@ -9,10 +9,12 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
-        alphazero_search, benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace,
-        benchmark_policy_fit, benchmark_training, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, train_samples_weighted,
+        AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, GumbelSearchConfig,
+        SplitMix64, alphazero_search, alphazero_search_with_history_and_rules,
+        benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
+        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
+        gumbel_search_with_history_and_rules, play_arena_games_from_positions,
+        train_samples_weighted,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -138,9 +140,33 @@ struct AzSearchArgs {
     /// Enable moves-left utility.
     #[arg(long, default_value_t = true)]
     moves_left_utility: bool,
+    /// Restrict root search to one legal UCI move (diagnostics).
+    #[arg(long)]
+    root_move: Option<String>,
+    /// Search algorithm.
+    #[arg(long, value_enum, default_value_t = SearchAlgorithm::Alphazero)]
+    search: SearchAlgorithm,
+    /// Maximum root actions considered by Gumbel Sequential Halving.
+    #[arg(long, default_value_t = 16)]
+    gumbel_actions: usize,
+    /// Gumbel noise scale; use 0 for deterministic evaluation.
+    #[arg(long, default_value_t = 1.0)]
+    gumbel_scale: f32,
+    /// Scale applied to normalized completed Q-values.
+    #[arg(long, default_value_t = 0.02)]
+    gumbel_value_scale: f32,
+    /// Visit offset used when scaling completed Q-values.
+    #[arg(long, default_value_t = 50.0)]
+    gumbel_maxvisit_init: f32,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SearchAlgorithm {
+    Alphazero,
+    Gumbel,
 }
 
 #[derive(Args, Debug)]
@@ -940,6 +966,11 @@ fn build_az_loop_config(
 ) -> AzLoopConfig {
     AzLoopConfig {
         games: 1,
+        search: config.search.clone(),
+        gumbel_actions: config.gumbel_actions,
+        gumbel_scale: config.gumbel_scale,
+        gumbel_value_scale: config.gumbel_value_scale,
+        gumbel_maxvisit_init: config.gumbel_maxvisit_init,
         max_plies: config.max_plies,
         simulations: config.simulations,
         seed,
@@ -1385,37 +1416,62 @@ fn main() {
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
-            let result = alphazero_search(
-                &position,
-                &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    cpuct_at_root,
-                    cpuct_base: cmd.cpuct_base.max(1.0),
-                    cpuct_factor: cmd.cpuct_factor.max(0.0),
-                    cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
-                    cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
-                    max_depth: cmd.max_depth,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: 0.23,
-                    fpu_value_at_root: 1.0,
-                    draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                    moves_left_max_effect: if cmd.moves_left_utility { 0.25 } else { 0.0 },
-                    moves_left_slope: if cmd.moves_left_utility { 0.002 } else { 0.0 },
-                    moves_left_threshold: 0.6,
-                    moves_left_constant_factor: 0.0,
-                    moves_left_scaled_factor: if cmd.moves_left_utility { 0.15 } else { 0.0 },
-                    moves_left_quadratic_factor: if cmd.moves_left_utility { 0.85 } else { 0.0 },
-                    value_scale: 1.0,
-                },
-            );
+            let root_moves = cmd.root_move.as_deref().map(|text| {
+                vec![position.parse_uci_move(text).unwrap_or_else(|| {
+                    panic!("illegal root move `{text}` for {}", position.to_fen())
+                })]
+            });
+            let limits = AzSearchLimits {
+                simulations,
+                seed: 0,
+                cpuct,
+                cpuct_at_root,
+                cpuct_base: cmd.cpuct_base.max(1.0),
+                cpuct_factor: cmd.cpuct_factor.max(0.0),
+                cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
+                cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
+                max_depth: cmd.max_depth,
+                root_dirichlet_alpha: 0.0,
+                root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
+                draw_score: cmd.draw_score.clamp(-1.0, 1.0),
+                moves_left_max_effect: if cmd.moves_left_utility { 0.25 } else { 0.0 },
+                moves_left_slope: if cmd.moves_left_utility { 0.002 } else { 0.0 },
+                moves_left_threshold: 0.6,
+                moves_left_constant_factor: 0.0,
+                moves_left_scaled_factor: if cmd.moves_left_utility { 0.15 } else { 0.0 },
+                moves_left_quadratic_factor: if cmd.moves_left_utility { 0.85 } else { 0.0 },
+                value_scale: 1.0,
+            };
+            let result = match cmd.search {
+                SearchAlgorithm::Alphazero => alphazero_search_with_history_and_rules(
+                    &position,
+                    &[],
+                    None,
+                    root_moves,
+                    &model,
+                    limits,
+                ),
+                SearchAlgorithm::Gumbel => gumbel_search_with_history_and_rules(
+                    &position,
+                    &[],
+                    None,
+                    root_moves,
+                    &model,
+                    limits,
+                    GumbelSearchConfig {
+                        max_num_considered_actions: cmd.gumbel_actions.max(1),
+                        gumbel_scale: cmd.gumbel_scale.max(0.0),
+                        value_scale: cmd.gumbel_value_scale.max(0.0),
+                        maxvisit_init: cmd.gumbel_maxvisit_init.max(0.0),
+                    },
+                ),
+            };
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
-            println!("search   : alphazero");
+            println!("search   : {:?}", cmd.search);
             println!("cpuct    : {cpuct}");
             println!("cpuct_at_root: {cpuct_at_root}");
             println!("draw_score: {}", cmd.draw_score);
@@ -1650,6 +1706,11 @@ fn main() {
             } else {
                 let config = AzLoopConfig {
                     games,
+                    search: "alphazero".into(),
+                    gumbel_actions: 16,
+                    gumbel_scale: 1.0,
+                    gumbel_value_scale: 0.02,
+                    gumbel_maxvisit_init: 50.0,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
                     seed,
@@ -1876,6 +1937,11 @@ fn main() {
             while pool.sample_count() < target_samples {
                 let config = AzLoopConfig {
                     games: batch_games,
+                    search: "alphazero".into(),
+                    gumbel_actions: 16,
+                    gumbel_scale: 1.0,
+                    gumbel_value_scale: 0.02,
+                    gumbel_maxvisit_init: 50.0,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
@@ -2223,6 +2289,15 @@ fn main() {
             });
             let mut tb = SummaryWriter::new(&tb_dir);
             let opening_positions = load_opening_positions(&config.opening_fens_path);
+
+            println!(
+                "search   : {} gumbel_actions={} gumbel_scale={} gumbel_value_scale={} gumbel_maxvisit_init={}",
+                config.search,
+                config.gumbel_actions,
+                config.gumbel_scale,
+                config.gumbel_value_scale,
+                config.gumbel_maxvisit_init
+            );
 
             println!(
                 "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} value_q_ratio={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
