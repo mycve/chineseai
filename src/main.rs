@@ -150,7 +150,7 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 16)]
     gumbel_actions: usize,
     /// Gumbel noise scale; use 0 for deterministic evaluation.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.0)]
     gumbel_scale: f32,
     /// Scale applied to normalized completed Q-values.
     #[arg(long, default_value_t = 0.02)]

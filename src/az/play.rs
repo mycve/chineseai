@@ -446,7 +446,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &history,
                     &search.candidates,
                     search.value_q,
-                    config.policy_softmax_temp,
+                    if config.search == "gumbel" {
+                        1.0
+                    } else {
+                        config.policy_softmax_temp
+                    },
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                 ));
@@ -460,7 +464,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
             let temperature = temperature_for_ply(config, ply);
-            let mv_opt = if temperature <= 1e-6 {
+            let mv_opt = if config.search == "gumbel" {
+                search.best_move
+            } else if temperature <= 1e-6 {
                 search.best_move.or_else(|| {
                     choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
                 })
@@ -520,7 +526,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &history,
                 &search.candidates,
                 search.value_q,
-                config.policy_softmax_temp,
+                if config.search == "gumbel" {
+                    1.0
+                } else {
+                    config.policy_softmax_temp
+                },
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                 move_meta.sample,
             ));
