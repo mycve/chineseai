@@ -6,7 +6,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
+use crate::az::{
+    AzNnue, AzSearchLimits, GumbelSearchConfig, alphazero_search_with_history_and_rules,
+    gumbel_search_with_history_and_rules,
+};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
@@ -46,6 +49,11 @@ pub struct VsPikafishConfig {
     pub parallel_games: usize,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
+    pub use_gumbel: bool,
+    pub gumbel_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_value_scale: f32,
+    pub gumbel_maxvisit_init: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +84,11 @@ struct GameConfig {
     seed: u64,
     cpuct: f32,
     cpuct_at_root: f32,
+    use_gumbel: bool,
+    gumbel_actions: usize,
+    gumbel_scale: f32,
+    gumbel_value_scale: f32,
+    gumbel_maxvisit_init: f32,
 }
 
 struct ExternalUci {
@@ -289,13 +302,7 @@ fn play_one_game(
             || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let search = alphazero_search_with_history_and_rules(
-                &position,
-                &history,
-                Some(rule_history.clone()),
-                Some(legal.clone()),
-                model,
-                AzSearchLimits {
+            let limits = AzSearchLimits {
                     simulations: config.simulations,
                     seed,
                     cpuct: config.cpuct,
@@ -317,8 +324,32 @@ fn play_one_game(
                     moves_left_scaled_factor: 0.0,
                     moves_left_quadratic_factor: 0.0,
                     value_scale: 1.0,
-                },
-            );
+                };
+            let search = if config.use_gumbel {
+                gumbel_search_with_history_and_rules(
+                    &position,
+                    &history,
+                    Some(rule_history.clone()),
+                    Some(legal.clone()),
+                    model,
+                    limits,
+                    GumbelSearchConfig {
+                        max_num_considered_actions: config.gumbel_actions,
+                        gumbel_scale: config.gumbel_scale,
+                        value_scale: config.gumbel_value_scale,
+                        maxvisit_init: config.gumbel_maxvisit_init,
+                    },
+                )
+            } else {
+                alphazero_search_with_history_and_rules(
+                    &position,
+                    &history,
+                    Some(rule_history.clone()),
+                    Some(legal.clone()),
+                    model,
+                    limits,
+                )
+            };
             seed = seed.wrapping_add(1);
             let Some(mv) = search.best_move else {
                 return Ok((
@@ -428,6 +459,11 @@ pub fn run_vs_pikafish(
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                             cpuct: config.cpuct,
                             cpuct_at_root: config.cpuct_at_root,
+                            use_gumbel: config.use_gumbel,
+                            gumbel_actions: config.gumbel_actions,
+                            gumbel_scale: config.gumbel_scale,
+                            gumbel_value_scale: config.gumbel_value_scale,
+                            gumbel_maxvisit_init: config.gumbel_maxvisit_init,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));

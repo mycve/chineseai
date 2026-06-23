@@ -1,4 +1,7 @@
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
+use crate::az::{
+    AzNnue, AzSearchLimits, GumbelSearchConfig, alphazero_search_with_history_and_rules,
+    gumbel_search_with_history_and_rules,
+};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Position, RuleHistoryEntry, RuleOutcome};
 use std::io::{self, BufRead, Write};
@@ -14,6 +17,11 @@ struct UciState {
     threads: usize,
     cpuct: f32,
     cpuct_at_root: f32,
+    search_gumbel: bool,
+    gumbel_actions: usize,
+    gumbel_scale: f32,
+    gumbel_value_scale: f32,
+    gumbel_maxvisit_init: f32,
     cpuct_base: f32,
     cpuct_factor: f32,
     cpuct_base_at_root: f32,
@@ -42,6 +50,11 @@ impl Default for UciState {
             threads: 1,
             cpuct: 1.5,
             cpuct_at_root: 3.0,
+            search_gumbel: false,
+            gumbel_actions: 16,
+            gumbel_scale: 0.0,
+            gumbel_value_scale: 0.02,
+            gumbel_maxvisit_init: 50.0,
             cpuct_base: 19652.0,
             cpuct_factor: 2.0,
             cpuct_base_at_root: 19652.0,
@@ -102,6 +115,13 @@ fn print_uci_id() {
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name Cpuct type string default 1.5");
     println!("option name CpuctAtRoot type string default 3.0");
+    println!(
+        "option name SearchAlgorithm type combo default alphazero var alphazero var gumbel"
+    );
+    println!("option name GumbelActions type spin default 16 min 1 max 128");
+    println!("option name GumbelScale type string default 0.0");
+    println!("option name GumbelValueScale type string default 0.02");
+    println!("option name GumbelMaxVisitInit type string default 50.0");
     println!("option name CpuctBase type string default 19652.0");
     println!("option name CpuctFactor type string default 2.0");
     println!("option name CpuctBaseAtRoot type string default 19652.0");
@@ -164,6 +184,27 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         }
         "cpuctatroot" => {
             state.cpuct_at_root = value.parse::<f32>().unwrap_or(state.cpuct_at_root).max(0.0);
+        }
+        "searchalgorithm" => {
+            state.search_gumbel = value.trim().eq_ignore_ascii_case("gumbel");
+        }
+        "gumbelactions" => {
+            state.gumbel_actions = value.parse::<usize>().unwrap_or(state.gumbel_actions).max(1);
+        }
+        "gumbelscale" => {
+            state.gumbel_scale = value.parse::<f32>().unwrap_or(state.gumbel_scale).max(0.0);
+        }
+        "gumbelvaluescale" => {
+            state.gumbel_value_scale = value
+                .parse::<f32>()
+                .unwrap_or(state.gumbel_value_scale)
+                .max(0.0);
+        }
+        "gumbelmaxvisitinit" => {
+            state.gumbel_maxvisit_init = value
+                .parse::<f32>()
+                .unwrap_or(state.gumbel_maxvisit_init)
+                .max(0.0);
         }
         "cpuctbase" => {
             state.cpuct_base = value.parse::<f32>().unwrap_or(state.cpuct_base).max(1.0);
@@ -331,13 +372,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
     }
 
     let started = std::time::Instant::now();
-    let result = alphazero_search_with_history_and_rules(
-        &state.position,
-        &state.history,
-        Some(state.rule_history.clone()),
-        Some(legal),
-        model,
-        AzSearchLimits {
+    let limits = AzSearchLimits {
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,
@@ -359,8 +394,32 @@ fn handle_go(_line: &str, state: &mut UciState) {
             moves_left_scaled_factor: state.moves_left_scaled_factor,
             moves_left_quadratic_factor: state.moves_left_quadratic_factor,
             value_scale: 1.0,
-        },
-    );
+        };
+    let result = if state.search_gumbel {
+        gumbel_search_with_history_and_rules(
+            &state.position,
+            &state.history,
+            Some(state.rule_history.clone()),
+            Some(legal),
+            model,
+            limits,
+            GumbelSearchConfig {
+                max_num_considered_actions: state.gumbel_actions,
+                gumbel_scale: state.gumbel_scale,
+                value_scale: state.gumbel_value_scale,
+                maxvisit_init: state.gumbel_maxvisit_init,
+            },
+        )
+    } else {
+        alphazero_search_with_history_and_rules(
+            &state.position,
+            &state.history,
+            Some(state.rule_history.clone()),
+            Some(legal),
+            model,
+            limits,
+        )
+    };
     state.seed = state.seed.wrapping_add(1);
     match result.best_move {
         Some(mv) => {

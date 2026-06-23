@@ -268,6 +268,17 @@ struct VsPikafishArgs {
     /// ChineseAI root PUCT constant.
     #[arg(long, default_value_t = 3.0)]
     cpuct_at_root: f32,
+    /// ChineseAI search algorithm.
+    #[arg(long, value_enum, default_value_t = SearchAlgorithm::Alphazero)]
+    search: SearchAlgorithm,
+    #[arg(long, default_value_t = 16)]
+    gumbel_actions: usize,
+    #[arg(long, default_value_t = 0.0)]
+    gumbel_scale: f32,
+    #[arg(long, default_value_t = 0.02)]
+    gumbel_value_scale: f32,
+    #[arg(long, default_value_t = 50.0)]
+    gumbel_maxvisit_init: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
@@ -3364,6 +3375,11 @@ fn main() {
                     parallel_games,
                     cpuct,
                     cpuct_at_root,
+                    use_gumbel: matches!(cmd.search, SearchAlgorithm::Gumbel),
+                    gumbel_actions: cmd.gumbel_actions.max(1),
+                    gumbel_scale: cmd.gumbel_scale.max(0.0),
+                    gumbel_value_scale: cmd.gumbel_value_scale.max(0.0),
+                    gumbel_maxvisit_init: cmd.gumbel_maxvisit_init.max(0.0),
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
@@ -3382,8 +3398,9 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
+                "vs-pikafish: model={} search={:?} games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
                 model_path,
+                cmd.search,
                 summary.total_games,
                 start_positions.len(),
                 opening_mode,
