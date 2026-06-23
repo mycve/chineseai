@@ -483,14 +483,28 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 result = Some(0.0);
                 break;
             };
+            let bootstrap_value = if config.search == "gumbel" {
+                search
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.mv == mv)
+                    .map(|candidate| candidate.q)
+                    .unwrap_or(search.value_q)
+            } else {
+                search.value_q
+            };
             let move_meta = move_search_meta(
                 &search.candidates,
                 mv,
-                search.value_q,
+                bootstrap_value,
                 config.generation_update,
                 config.seed ^ game_index as u64,
                 ply,
-                config.deblunder_q_gap,
+                if config.search == "gumbel" {
+                    0.0
+                } else {
+                    config.deblunder_q_gap
+                },
             );
             sampled_moves += 1;
             sampled_best_moves +=
@@ -525,7 +539,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 &position,
                 &history,
                 &search.candidates,
-                search.value_q,
+                bootstrap_value,
                 if config.search == "gumbel" {
                     1.0
                 } else {
@@ -740,11 +754,23 @@ pub(super) fn assign_td_lambda_value_targets(
     game_result_red: f32,
     td_lambda: f32,
 ) {
+    if samples.is_empty() {
+        return;
+    }
     let td_lambda = td_lambda.clamp(0.0, 1.0);
-    let mut return_red = game_result_red.clamp(-1.0, 1.0);
-    for sample in samples.iter_mut().rev() {
-        let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
-        return_red = (search_red * (1.0 - td_lambda) + return_red * td_lambda).clamp(-1.0, 1.0);
+    let result_red = game_result_red.clamp(-1.0, 1.0);
+    let search_values_red = samples
+        .iter()
+        .map(|sample| (sample.value * sample.side_sign).clamp(-1.0, 1.0))
+        .collect::<Vec<_>>();
+    let mut return_red = result_red;
+    for index in (0..samples.len()).rev() {
+        if index + 1 < samples.len() {
+            return_red = (search_values_red[index + 1] * (1.0 - td_lambda)
+                + return_red * td_lambda)
+                .clamp(-1.0, 1.0);
+        }
+        let sample = &mut samples[index];
         let side_value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
         let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
         sample.value_wdl = scalar_value_to_wdl_target(side_result);

@@ -3060,8 +3060,8 @@ mod tests {
 
         assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
 
-        assert!((samples[0].value - 0.25).abs() < 1e-6);
-        assert!((samples[1].value + 0.5).abs() < 1e-6);
+        assert!((samples[0].value - 0.5).abs() < 1e-6);
+        assert!((samples[1].value + 1.0).abs() < 1e-6);
     }
 
     #[test]
