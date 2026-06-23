@@ -105,8 +105,8 @@ impl AzInitArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-search model.safetensors
-  chineseai az-search model.safetensors 50000 1.5 --cpuct-at-root 3.0 startpos
-  chineseai az-search model.safetensors 10000 1.5 --cpuct-at-root 3.0 startpos")]
+  chineseai az-search model.safetensors 50000 --cpuct 1.5 --cpuct-at-root 3.0 startpos
+  chineseai az-search model.safetensors 1200 --search gumbel startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -114,7 +114,7 @@ struct AzSearchArgs {
     #[arg(default_value_t = 10_000)]
     simulations: usize,
     /// Non-root PUCT init.
-    #[arg(default_value_t = 1.5)]
+    #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
     /// Root PUCT init.
     #[arg(long, default_value_t = 3.0)]
@@ -1483,10 +1483,23 @@ fn main() {
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
             println!("search   : {:?}", cmd.search);
-            println!("cpuct    : {cpuct}");
-            println!("cpuct_at_root: {cpuct_at_root}");
-            println!("draw_score: {}", cmd.draw_score);
-            println!("moves_left_utility: {}", cmd.moves_left_utility);
+            match cmd.search {
+                SearchAlgorithm::Alphazero => {
+                    println!("draw_score: {}", cmd.draw_score);
+                    println!("cpuct    : {cpuct}");
+                    println!("cpuct_at_root: {cpuct_at_root}");
+                    println!("moves_left_utility: {}", cmd.moves_left_utility);
+                }
+                SearchAlgorithm::Gumbel => {
+                    println!("gumbel_actions: {}", cmd.gumbel_actions.max(1));
+                    println!("gumbel_scale: {}", cmd.gumbel_scale.max(0.0));
+                    println!("gumbel_value_scale: {}", cmd.gumbel_value_scale.max(0.0));
+                    println!(
+                        "gumbel_maxvisit_init: {}",
+                        cmd.gumbel_maxvisit_init.max(0.0)
+                    );
+                }
+            }
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
@@ -1510,15 +1523,27 @@ fn main() {
                     .filter(|candidate| candidate.visits > 0)
                     .count()
             );
-            println!("by_policy:");
+            println!(
+                "{}:",
+                if matches!(cmd.search, SearchAlgorithm::Gumbel) {
+                    "by_improved_policy"
+                } else {
+                    "by_visit_policy"
+                }
+            );
             for candidate in &result.candidates {
                 println!(
-                    "candidate: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    "candidate: {} visits={} q={:.3} ml={:.1} prior={:.5} {}={:.5}",
                     candidate.mv,
                     candidate.visits,
                     candidate.q,
                     candidate.moves_left,
                     candidate.prior,
+                    if matches!(cmd.search, SearchAlgorithm::Gumbel) {
+                        "improved_policy"
+                    } else {
+                        "visit_policy"
+                    },
                     candidate.policy
                 );
             }
@@ -1533,12 +1558,17 @@ fn main() {
             });
             for candidate in &by_visits {
                 println!(
-                    "visited: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    "visited: {} visits={} q={:.3} ml={:.1} prior={:.5} {}={:.5}",
                     candidate.mv,
                     candidate.visits,
                     candidate.q,
                     candidate.moves_left,
                     candidate.prior,
+                    if matches!(cmd.search, SearchAlgorithm::Gumbel) {
+                        "improved_policy"
+                    } else {
+                        "visit_policy"
+                    },
                     candidate.policy
                 );
             }
