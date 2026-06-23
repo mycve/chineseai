@@ -735,23 +735,6 @@ fn make_training_sample(
     }
 }
 
-pub(super) fn assign_q_ratio_value_targets(
-    samples: &mut [AzTrainingSample],
-    game_result_red: f32,
-    q_ratio: f32,
-) {
-    let q_ratio = q_ratio.clamp(0.0, 1.0);
-    let result_red = game_result_red.clamp(-1.0, 1.0);
-    for sample in samples.iter_mut() {
-        let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
-        let target_red = (search_red * q_ratio + result_red * (1.0 - q_ratio)).clamp(-1.0, 1.0);
-        let side_value = (target_red * sample.side_sign).clamp(-1.0, 1.0);
-        let side_result = (result_red * sample.side_sign).clamp(-1.0, 1.0);
-        sample.value_wdl = scalar_value_to_wdl_target(side_result);
-        sample.value = side_value;
-    }
-}
-
 pub(super) fn assign_td_lambda_value_targets(
     samples: &mut [AzTrainingSample],
     game_result_red: f32,
@@ -862,11 +845,7 @@ fn assign_value_targets(
     game_result_red: f32,
     config: &AzLoopConfig,
 ) {
-    if config.td_lambda > 0.0 {
-        assign_td_lambda_value_targets(samples, game_result_red, config.td_lambda);
-    } else {
-        assign_q_ratio_value_targets(samples, game_result_red, config.value_q_ratio);
-    }
+    assign_td_lambda_value_targets(samples, game_result_red, config.td_lambda);
 }
 
 fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
@@ -1251,7 +1230,7 @@ mod tests {
         }
     }
 
-    fn test_config(value_q_ratio: f32) -> AzLoopConfig {
+    fn test_config() -> AzLoopConfig {
         AzLoopConfig {
             games: 1,
             search: "alphazero".into(),
@@ -1293,8 +1272,7 @@ mod tests {
             resign_playthrough: 0.0,
             mirror_probability: 0.0,
             deblunder_q_gap: 0.25,
-            td_lambda: 0.0,
-            value_q_ratio,
+            td_lambda: 1.0,
         }
     }
 
@@ -1366,7 +1344,7 @@ mod tests {
             },
         ];
 
-        assign_deblundered_value_targets(&mut samples, 1.0, &events, &test_config(0.0));
+        assign_deblundered_value_targets(&mut samples, 1.0, &events, &test_config());
 
         assert!((samples[0].value - 0.6).abs() < 1e-6);
         assert!((samples[1].value + 0.6).abs() < 1e-6);

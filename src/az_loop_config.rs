@@ -58,7 +58,6 @@ pub struct AzLoopFileConfig {
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
     pub td_lambda: f32,
-    pub value_q_ratio: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -132,7 +131,6 @@ impl Default for AzLoopFileConfig {
             mirror_probability: 0.3,
             deblunder_q_gap: 0.25,
             td_lambda: 0.95,
-            value_q_ratio: 0.25,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -208,7 +206,6 @@ struct AzLoopTomlConfig {
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
     pub td_lambda: f32,
-    pub value_q_ratio: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -300,7 +297,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             mirror_probability: config.mirror_probability,
             deblunder_q_gap: config.deblunder_q_gap,
             td_lambda: config.td_lambda,
-            value_q_ratio: config.value_q_ratio,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -382,7 +378,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             mirror_probability: config.mirror_probability,
             deblunder_q_gap: config.deblunder_q_gap,
             td_lambda: config.td_lambda,
-            value_q_ratio: config.value_q_ratio,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -495,7 +490,6 @@ impl AzLoopFileConfig {
         line!("mirror_probability", f(self.mirror_probability));
         line!("deblunder_q_gap", f(self.deblunder_q_gap));
         line!("td_lambda", f(self.td_lambda));
-        line!("value_q_ratio", f(self.value_q_ratio));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
@@ -578,7 +572,6 @@ impl AzLoopFileConfig {
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.deblunder_q_gap = self.deblunder_q_gap.max(0.0);
         self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
-        self.value_q_ratio = self.value_q_ratio.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
@@ -634,7 +627,6 @@ mod tests {
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("deblunder_q_gap = 0.25\n"));
         assert!(text.contains("td_lambda = 0.95\n"));
-        assert!(text.contains("value_q_ratio = 0.25\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
@@ -656,7 +648,6 @@ mod tests {
         assert!((parsed.lr - 0.001).abs() < 1e-9);
         assert!((parsed.deblunder_q_gap - 0.25).abs() < 1e-6);
         assert!((parsed.td_lambda - 0.95).abs() < 1e-6);
-        assert!((parsed.value_q_ratio - 0.25).abs() < 1e-6);
     }
 }
 
