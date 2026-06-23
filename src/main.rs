@@ -409,7 +409,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.train_samples_per_update,
         config.train_epochs_per_update,
         config.max_sample_train_count,
-        f32_slug(config.td_lambda),
+        f32_slug(config.search_value_weight),
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
@@ -642,9 +642,9 @@ struct AzSelfplayFitBenchArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.5)]
     mirror_probability: f32,
-    /// TD(lambda) value target: 0 is search Q, 1 is terminal result.
-    #[arg(long, default_value_t = 0.95)]
-    td_lambda: f32,
+    /// Search Q mixture weight in value target; 0 is pure terminal result.
+    #[arg(long, default_value_t = 0.25)]
+    search_value_weight: f32,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
     replay_out: Option<String>,
@@ -701,9 +701,9 @@ struct AzReplayGenerateFixedArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.3)]
     mirror_probability: f32,
-    /// TD(lambda) value target: 0 is search Q, 1 is terminal result.
-    #[arg(long, default_value_t = 0.95)]
-    td_lambda: f32,
+    /// Search Q mixture weight in value target; 0 is pure terminal result.
+    #[arg(long, default_value_t = 0.25)]
+    search_value_weight: f32,
 }
 
 #[derive(Args, Debug)]
@@ -865,7 +865,7 @@ fn build_az_loop_config(
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
-        td_lambda: config.td_lambda,
+        search_value_weight: config.search_value_weight,
     }
 }
 
@@ -1546,7 +1546,7 @@ fn main() {
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
-                    td_lambda: cmd.td_lambda,
+                    search_value_weight: cmd.search_value_weight,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -1750,7 +1750,7 @@ fn main() {
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
-                    td_lambda: cmd.td_lambda,
+                    search_value_weight: cmd.search_value_weight,
                 };
                 let data = generate_selfplay_data(&model, &config);
                 total_games += data.games.len();
@@ -2073,7 +2073,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=gumbel sims={} gumbel(actions={},scale={},value_scale={},maxvisit_init={}) selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=gumbel sims={} gumbel(actions={},scale={},value_scale={},maxvisit_init={}) selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} search_value_weight={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.gumbel_actions,
@@ -2104,7 +2104,7 @@ fn main() {
                 config.resign_playthrough,
                 config.replay_capacity,
                 config.mirror_probability,
-                config.td_lambda,
+                config.search_value_weight,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,

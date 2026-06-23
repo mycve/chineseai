@@ -564,35 +564,6 @@ fn make_training_sample(
     }
 }
 
-pub(super) fn assign_td_lambda_value_targets(
-    samples: &mut [AzTrainingSample],
-    game_result_red: f32,
-    td_lambda: f32,
-) {
-    if samples.is_empty() {
-        return;
-    }
-    let td_lambda = td_lambda.clamp(0.0, 1.0);
-    let result_red = game_result_red.clamp(-1.0, 1.0);
-    let search_values_red = samples
-        .iter()
-        .map(|sample| (sample.value * sample.side_sign).clamp(-1.0, 1.0))
-        .collect::<Vec<_>>();
-    let mut return_red = result_red;
-    for index in (0..samples.len()).rev() {
-        if index + 1 < samples.len() {
-            return_red = (search_values_red[index + 1] * (1.0 - td_lambda)
-                + return_red * td_lambda)
-                .clamp(-1.0, 1.0);
-        }
-        let sample = &mut samples[index];
-        let side_value = (return_red * sample.side_sign).clamp(-1.0, 1.0);
-        let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
-        sample.value_wdl = scalar_value_to_wdl_target(side_result);
-        sample.value = side_value;
-    }
-}
-
 fn root_search_meta(
     candidates: &[AzCandidate],
     root_q: f32,
@@ -647,7 +618,16 @@ fn assign_value_targets(
     game_result_red: f32,
     config: &AzLoopConfig,
 ) {
-    assign_td_lambda_value_targets(samples, game_result_red, config.td_lambda);
+    let search_weight = config.search_value_weight.clamp(0.0, 1.0);
+    let result_red = game_result_red.clamp(-1.0, 1.0);
+    for sample in samples {
+        let search_red = (sample.value * sample.side_sign).clamp(-1.0, 1.0);
+        let mixed_red =
+            ((1.0 - search_weight) * result_red + search_weight * search_red).clamp(-1.0, 1.0);
+        let side_result = (result_red * sample.side_sign).clamp(-1.0, 1.0);
+        sample.value_wdl = scalar_value_to_wdl_target(side_result);
+        sample.value = (mixed_red * sample.side_sign).clamp(-1.0, 1.0);
+    }
 }
 
 fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {

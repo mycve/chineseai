@@ -592,7 +592,7 @@ pub struct AzLoopConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
-    pub td_lambda: f32,
+    pub search_value_weight: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -2904,7 +2904,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::assign_td_lambda_value_targets;
     use super::*;
     use std::fs;
 
@@ -2993,37 +2992,6 @@ mod tests {
                 position.to_fen()
             );
         }
-    }
-
-    #[test]
-    fn td_lambda_value_targets_backfill_from_terminal_result() {
-        let mut samples = vec![
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(0.0),
-                value: 0.0,
-                side_sign: 1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(0.0),
-                value: 0.0,
-                side_sign: -1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-        ];
-
-        assign_td_lambda_value_targets(&mut samples, 1.0, 0.5);
-
-        assert!((samples[0].value - 0.5).abs() < 1e-6);
-        assert!((samples[1].value + 1.0).abs() < 1e-6);
     }
 
     #[test]
