@@ -169,8 +169,6 @@ macro_rules! az_weight_tensors {
         $visit!(value_head_hidden2, [VALUE_HEAD_SIZE, VALUE_HEAD_SIZE]);
         $visit!(value_head_bias2, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
-        $visit!(value_q_output, [VALUE_HEAD_SIZE]);
-        $visit!(value_q_bias, [1]);
         $visit!(moves_left_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(moves_left_bias_hidden, [VALUE_HEAD_SIZE]);
         $visit!(moves_left_output, [VALUE_HEAD_SIZE]);
@@ -514,8 +512,6 @@ pub struct AzNnue {
     pub value_head_hidden2: Vec<f32>,
     pub value_head_bias2: Vec<f32>,
     pub value_head_output: Vec<f32>,
-    pub value_q_output: Vec<f32>,
-    pub value_q_bias: Vec<f32>,
     pub moves_left_hidden: Vec<f32>,
     pub moves_left_bias_hidden: Vec<f32>,
     pub moves_left_output: Vec<f32>,
@@ -554,8 +550,6 @@ impl Clone for AzNnue {
             value_head_hidden2: self.value_head_hidden2.clone(),
             value_head_bias2: self.value_head_bias2.clone(),
             value_head_output: self.value_head_output.clone(),
-            value_q_output: self.value_q_output.clone(),
-            value_q_bias: self.value_q_bias.clone(),
             moves_left_hidden: self.moves_left_hidden.clone(),
             moves_left_bias_hidden: self.moves_left_bias_hidden.clone(),
             moves_left_output: self.moves_left_output.clone(),
@@ -884,8 +878,6 @@ impl AzNnue {
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
-        let value_q_output = vec![0.0; VALUE_HEAD_SIZE];
-        let value_q_bias = vec![0.0; 1];
         let moves_left_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
@@ -929,8 +921,6 @@ impl AzNnue {
             value_head_hidden2,
             value_head_bias2,
             value_head_output,
-            value_q_output,
-            value_q_bias,
             moves_left_hidden,
             moves_left_bias_hidden,
             moves_left_output,
@@ -992,8 +982,6 @@ impl AzNnue {
             value_head_hidden2: load_candle_f32_tensor(&tensors, "value_head_hidden2")?,
             value_head_bias2: load_candle_f32_tensor(&tensors, "value_head_bias2")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
-            value_q_output: load_candle_f32_tensor(&tensors, "value_q_output")?,
-            value_q_bias: load_candle_f32_tensor(&tensors, "value_q_bias")?,
             moves_left_hidden: load_candle_f32_tensor(&tensors, "moves_left_hidden")?,
             moves_left_bias_hidden: load_candle_f32_tensor(&tensors, "moves_left_bias_hidden")?,
             moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
@@ -1666,8 +1654,9 @@ impl AzNnue {
             let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
             *logit = dot_product(value_head2, row);
         }
-        let q_logit = dot_product(value_head2, &self.value_q_output) + self.value_q_bias[0];
-        (softmax_fixed3(logits), q_logit.tanh())
+        let wdl = softmax_fixed3(logits);
+        let q = wdl[0] - wdl[2];
+        (wdl, q)
     }
 
     fn moves_left_from_hidden_into(&self, hidden: &[f32], moves_left_head: &mut Vec<f32>) -> f32 {
@@ -2956,7 +2945,6 @@ mod tests {
     fn random_initial_value_head_is_neutral() {
         let model = AzNnue::random_with_arch(AzNnueArch::with_hidden_size(512), 20260409);
         assert!(model.value_head_output.iter().all(|&weight| weight == 0.0));
-        assert!(model.value_q_output.iter().all(|&weight| weight == 0.0));
 
         let position = Position::startpos();
         let moves = position.legal_moves();
@@ -3169,6 +3157,7 @@ mod tests {
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![1],
@@ -3178,6 +3167,7 @@ mod tests {
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![2],
@@ -3187,6 +3177,7 @@ mod tests {
                 value: 0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![3],
@@ -3196,6 +3187,7 @@ mod tests {
                 value: -0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
         ];
 
@@ -3219,6 +3211,7 @@ mod tests {
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![1, 5, 9],
@@ -3228,6 +3221,7 @@ mod tests {
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![2, 6, 10],
@@ -3237,6 +3231,7 @@ mod tests {
                 value: 0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![3, 7, 11],
@@ -3246,6 +3241,7 @@ mod tests {
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
         ];
         let mut single = AzNnue::random(16, 23);
@@ -3283,6 +3279,7 @@ mod tests {
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![1, 5, 9],
@@ -3292,6 +3289,7 @@ mod tests {
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![2, 6, 10],
@@ -3301,6 +3299,7 @@ mod tests {
                 value: 0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
                 features: vec![3, 7, 11],
@@ -3310,6 +3309,7 @@ mod tests {
                 value: -0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                meta: AzSampleMeta::default(),
             },
         ];
         let mut model = AzNnue::random(8, 31);
@@ -3364,8 +3364,6 @@ mod tests {
         assert_eq!(model.value_head_hidden2, loaded.value_head_hidden2);
         assert_eq!(model.value_head_bias2, loaded.value_head_bias2);
         assert_eq!(model.value_head_output, loaded.value_head_output);
-        assert_eq!(model.value_q_output, loaded.value_q_output);
-        assert_eq!(model.value_q_bias, loaded.value_q_bias);
         assert_eq!(model.moves_left_hidden, loaded.moves_left_hidden);
         assert_eq!(model.moves_left_bias_hidden, loaded.moves_left_bias_hidden);
         assert_eq!(model.moves_left_output, loaded.moves_left_output);

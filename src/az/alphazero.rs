@@ -1130,7 +1130,7 @@ mod tests {
         let position = Position::startpos();
         let mut model = AzNnue::random(4, 7);
         model.value_head_bias[0] = 2.0;
-        model.value_q_output[0] = 1.0;
+        model.value_head_output[0] = 1.0;
 
         let full = alphazero_search(
             &position,

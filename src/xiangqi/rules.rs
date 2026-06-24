@@ -31,8 +31,7 @@ impl Position {
         let mut next = self.clone();
         let mover = self.side_to_move;
         next.make_move(mv);
-        let (chased_mask, chased_piece_mask) =
-            next.chased_masks_by_origin(mover, mv.to as usize);
+        let (chased_mask, chased_piece_mask) = next.chased_masks_by_origin(mover, mv.to as usize);
         RuleHistoryEntry {
             hash: next.hash,
             side_to_move: next.side_to_move,
