@@ -592,7 +592,7 @@ pub struct AzLoopConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
-    pub search_value_weight: f32,
+    pub td_lambda: f32,
     pub selfplay_sampling_plies: usize,
     pub selfplay_sampling_temperature: f32,
 }

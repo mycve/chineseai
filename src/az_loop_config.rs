@@ -33,7 +33,7 @@ pub struct AzLoopFileConfig {
     pub train_epochs_per_update: usize,
     pub max_sample_train_count: u32,
     pub mirror_probability: f32,
-    pub search_value_weight: f32,
+    pub td_lambda: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -81,7 +81,7 @@ impl Default for AzLoopFileConfig {
             train_epochs_per_update: 2,
             max_sample_train_count: 3,
             mirror_probability: 0.3,
-            search_value_weight: 0.25,
+            td_lambda: 1.0,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -131,7 +131,7 @@ struct AzLoopTomlConfig {
     pub train_epochs_per_update: usize,
     pub max_sample_train_count: u32,
     pub mirror_probability: f32,
-    pub search_value_weight: f32,
+    pub td_lambda: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -197,7 +197,7 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             train_epochs_per_update: config.train_epochs_per_update,
             max_sample_train_count: config.max_sample_train_count,
             mirror_probability: config.mirror_probability,
-            search_value_weight: config.search_value_weight,
+            td_lambda: config.td_lambda,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -253,7 +253,7 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             train_epochs_per_update: config.train_epochs_per_update,
             max_sample_train_count: config.max_sample_train_count,
             mirror_probability: config.mirror_probability,
-            search_value_weight: config.search_value_weight,
+            td_lambda: config.td_lambda,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -331,7 +331,7 @@ impl AzLoopFileConfig {
         line!("train_epochs_per_update", self.train_epochs_per_update);
         line!("max_sample_train_count", self.max_sample_train_count);
         line!("mirror_probability", f(self.mirror_probability));
-        line!("search_value_weight", f(self.search_value_weight));
+        line!("td_lambda", f(self.td_lambda));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
@@ -387,7 +387,7 @@ impl AzLoopFileConfig {
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
-        self.search_value_weight = self.search_value_weight.clamp(0.0, 1.0);
+        self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
@@ -418,7 +418,7 @@ mod tests {
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("search_value_weight = 0.25\n"));
+        assert!(text.contains("td_lambda = 1.0\n"));
         assert!(text.contains("selfplay_sampling_plies = 30\n"));
         assert!(text.contains("selfplay_sampling_temperature = 1.0\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
@@ -448,7 +448,7 @@ mod tests {
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
         assert!((parsed.lr - 0.001).abs() < 1e-9);
-        assert!((parsed.search_value_weight - 0.25).abs() < 1e-6);
+        assert!((parsed.td_lambda - 1.0).abs() < 1e-6);
     }
 }
 
