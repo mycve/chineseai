@@ -1115,6 +1115,9 @@ struct ArenaThreadConfig {
     eval_positions: Arc<Vec<Position>>,
     simulations: usize,
     max_plies: usize,
+    gumbel_actions: usize,
+    gumbel_value_scale: f32,
+    gumbel_maxvisit_init: f32,
     thread_count: usize,
     seed: u64,
 }
@@ -1140,6 +1143,9 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let eval_positions = Arc::clone(&config.eval_positions);
         let simulations = config.simulations;
         let max_plies = config.max_plies;
+        let gumbel_actions = config.gumbel_actions;
+        let gumbel_value_scale = config.gumbel_value_scale;
+        let gumbel_maxvisit_init = config.gumbel_maxvisit_init;
         let seed = config.seed ^ index as u64;
         let thread_start_index = start_index;
         start_index += red_games;
@@ -1151,6 +1157,9 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                 AzArenaConfig {
                     simulations,
                     max_plies,
+                    gumbel_actions,
+                    gumbel_value_scale,
+                    gumbel_maxvisit_init,
                     games_as_red: red_games,
                     games_as_black: black_games,
                     start_index: thread_start_index,
@@ -2816,6 +2825,9 @@ fn main() {
                             eval_positions: Arc::new(arena_start_positions),
                             simulations: config.simulations,
                             max_plies: config.max_plies,
+                            gumbel_actions: config.gumbel_actions,
+                            gumbel_value_scale: config.gumbel_value_scale,
+                            gumbel_maxvisit_init: config.gumbel_maxvisit_init,
                             thread_count: config.arena_processes,
                             seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                         });

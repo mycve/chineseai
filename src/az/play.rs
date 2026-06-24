@@ -692,6 +692,9 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
 pub struct AzArenaConfig {
     pub simulations: usize,
     pub max_plies: usize,
+    pub gumbel_actions: usize,
+    pub gumbel_value_scale: f32,
+    pub gumbel_maxvisit_init: f32,
     pub games_as_red: usize,
     pub games_as_black: usize,
     pub start_index: usize,
@@ -714,6 +717,12 @@ pub fn play_arena_games_from_positions(
             baseline,
             config.simulations,
             config.max_plies,
+            GumbelSearchConfig {
+                max_num_considered_actions: config.gumbel_actions,
+                gumbel_scale: 0.0,
+                value_scale: config.gumbel_value_scale,
+                maxvisit_init: config.gumbel_maxvisit_init,
+            },
             game_seed,
         );
         match outcome.total_cmp(&0.0) {
@@ -737,6 +746,12 @@ pub fn play_arena_games_from_positions(
             candidate,
             config.simulations,
             config.max_plies,
+            GumbelSearchConfig {
+                max_num_considered_actions: config.gumbel_actions,
+                gumbel_scale: 0.0,
+                value_scale: config.gumbel_value_scale,
+                maxvisit_init: config.gumbel_maxvisit_init,
+            },
             game_seed,
         );
         match outcome.total_cmp(&0.0) {
@@ -770,6 +785,7 @@ fn play_arena_game(
     black_model: &AzNnue,
     simulations: usize,
     max_plies: usize,
+    gumbel: GumbelSearchConfig,
     seed: u64,
 ) -> f32 {
     let mut position = initial_position.clone();
@@ -801,10 +817,7 @@ fn play_arena_game(
                 max_depth: 0,
                 value_scale: 1.0,
             },
-            GumbelSearchConfig {
-                gumbel_scale: 0.0,
-                ..GumbelSearchConfig::default()
-            },
+            gumbel,
         );
         let Some(mv) = result.best_move else {
             return 0.0;
