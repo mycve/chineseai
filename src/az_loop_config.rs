@@ -26,6 +26,8 @@ pub struct AzLoopFileConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
+    pub selfplay_sampling_plies: usize,
+    pub selfplay_sampling_temperature: f32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
@@ -72,6 +74,8 @@ impl Default for AzLoopFileConfig {
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 500000,
+            selfplay_sampling_plies: 30,
+            selfplay_sampling_temperature: 1.0,
             train_warmup_samples: 300000,
             train_samples_per_update: 120000,
             train_epochs_per_update: 2,
@@ -120,6 +124,8 @@ struct AzLoopTomlConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
+    pub selfplay_sampling_plies: usize,
+    pub selfplay_sampling_temperature: f32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
@@ -184,6 +190,8 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
+            selfplay_sampling_plies: config.selfplay_sampling_plies,
+            selfplay_sampling_temperature: config.selfplay_sampling_temperature,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
@@ -238,6 +246,8 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
+            selfplay_sampling_plies: config.selfplay_sampling_plies,
+            selfplay_sampling_temperature: config.selfplay_sampling_temperature,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
@@ -311,6 +321,11 @@ impl AzLoopFileConfig {
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
         line!("replay_capacity", self.replay_capacity);
+        line!("selfplay_sampling_plies", self.selfplay_sampling_plies);
+        line!(
+            "selfplay_sampling_temperature",
+            f(self.selfplay_sampling_temperature)
+        );
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("train_epochs_per_update", self.train_epochs_per_update);
@@ -366,6 +381,8 @@ impl AzLoopFileConfig {
         self.workers = self.workers.max(1);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
+        self.selfplay_sampling_plies = self.selfplay_sampling_plies.min(self.max_plies);
+        self.selfplay_sampling_temperature = self.selfplay_sampling_temperature.max(1e-3);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
@@ -402,6 +419,8 @@ mod tests {
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("search_value_weight = 0.25\n"));
+        assert!(text.contains("selfplay_sampling_plies = 30\n"));
+        assert!(text.contains("selfplay_sampling_temperature = 1.0\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
@@ -411,7 +430,11 @@ mod tests {
         assert!(text.contains("gumbel_value_scale = 0.1\n"));
         assert!(text.contains("gumbel_maxvisit_init = 50.0\n"));
         assert!(!text.contains("search ="));
-        assert!(!text.contains("temperature"));
+        assert!(!text.contains("temperature_start"));
+        assert!(!text.contains("temperature_endgame"));
+        assert!(!text.contains("temperature_decay"));
+        assert!(!text.contains("temperature_value_cutoff"));
+        assert!(!text.contains("temperature_visit_offset"));
         assert!(!text.contains("cpuct"));
         assert!(!text.contains("fpu"));
         assert!(!text.contains("dirichlet"));

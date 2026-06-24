@@ -332,7 +332,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 break;
             }
-            let mv_opt = search.best_move;
+            let mv_opt =
+                choose_selfplay_move(&search.candidates, search.best_move, ply, config, &mut rng);
             let Some(mv) = mv_opt else {
                 result = Some(0.0);
                 break;
@@ -628,6 +629,47 @@ fn assign_value_targets(
         sample.value_wdl = scalar_value_to_wdl_target(side_result);
         sample.value = (mixed_red * sample.side_sign).clamp(-1.0, 1.0);
     }
+}
+
+fn choose_selfplay_move(
+    candidates: &[AzCandidate],
+    best_move: Option<Move>,
+    ply: usize,
+    config: &AzLoopConfig,
+    rng: &mut SplitMix64,
+) -> Option<Move> {
+    if ply >= config.selfplay_sampling_plies {
+        return best_move;
+    }
+    let temperature = config.selfplay_sampling_temperature.max(1e-3);
+    let mut total = 0.0f32;
+    let weights = candidates
+        .iter()
+        .map(|candidate| {
+            if candidate.visits == 0 {
+                0.0
+            } else {
+                (candidate.visits as f32).powf(1.0 / temperature)
+            }
+        })
+        .inspect(|weight| total += *weight)
+        .collect::<Vec<_>>();
+    if total <= 0.0 {
+        return best_move;
+    }
+    let mut threshold = rng.unit_f32() * total;
+    for (candidate, weight) in candidates.iter().zip(weights) {
+        threshold -= weight;
+        if threshold <= 0.0 {
+            return Some(candidate.mv);
+        }
+    }
+    candidates
+        .iter()
+        .rev()
+        .find(|candidate| candidate.visits > 0)
+        .map(|candidate| candidate.mv)
+        .or(best_move)
 }
 
 fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {

@@ -381,7 +381,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "ga{}_gs{}_gvs{}_gmv{}_lrm{}_lds{}_ldi{}_ldf{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mstc{}_tdl{}_mp{}_cpi{}_ai{}_sd{}"
+            "tspu{}_tepu{}_mstc{}_svw{}_ssp{}_sst{}_mp{}_cpi{}_ai{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -410,6 +410,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.train_epochs_per_update,
         config.max_sample_train_count,
         f32_slug(config.search_value_weight),
+        config.selfplay_sampling_plies,
+        f32_slug(config.selfplay_sampling_temperature),
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
@@ -866,6 +868,8 @@ fn build_az_loop_config(
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         search_value_weight: config.search_value_weight,
+        selfplay_sampling_plies: config.selfplay_sampling_plies,
+        selfplay_sampling_temperature: config.selfplay_sampling_temperature,
     }
 }
 
@@ -1547,6 +1551,8 @@ fn main() {
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     search_value_weight: cmd.search_value_weight,
+                    selfplay_sampling_plies: 30,
+                    selfplay_sampling_temperature: 1.0,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -1751,6 +1757,8 @@ fn main() {
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
                     search_value_weight: cmd.search_value_weight,
+                    selfplay_sampling_plies: 30,
+                    selfplay_sampling_temperature: 1.0,
                 };
                 let data = generate_selfplay_data(&model, &config);
                 total_games += data.games.len();
@@ -2073,7 +2081,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=gumbel sims={} gumbel(actions={},scale={},value_scale={},maxvisit_init={}) selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} search_value_weight={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=gumbel sims={} gumbel(actions={},scale={},value_scale={},maxvisit_init={}) selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} search_value_weight={} selfplay_sampling(plies={},temp={}) train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.gumbel_actions,
@@ -2105,6 +2113,8 @@ fn main() {
                 config.replay_capacity,
                 config.mirror_probability,
                 config.search_value_weight,
+                config.selfplay_sampling_plies,
+                config.selfplay_sampling_temperature,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
