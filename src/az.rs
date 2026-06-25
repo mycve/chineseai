@@ -610,10 +610,20 @@ pub struct AzLoopConfig {
     pub td_lambda: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct AzLoopReport {
     pub games: usize,
     pub samples: usize,
+    pub native_games: usize,
+    pub native_samples: usize,
+    pub external_games: usize,
+    pub external_samples: usize,
+    pub total_games_generated: usize,
+    pub total_samples_generated: usize,
+    pub total_native_games: usize,
+    pub total_native_samples: usize,
+    pub total_external_games: usize,
+    pub total_external_samples: usize,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,

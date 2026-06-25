@@ -891,6 +891,44 @@ fn prune_old_checkpoints(
 struct SelfplayBatch {
     data: AzSelfplayData,
     selfplay_seconds: f32,
+    source: SelfplaySource,
+}
+
+#[derive(Clone, Copy)]
+enum SelfplaySource {
+    Native,
+    External,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SelfplaySourceCounts {
+    native_games: usize,
+    native_samples: usize,
+    external_games: usize,
+    external_samples: usize,
+}
+
+impl SelfplaySourceCounts {
+    fn add_batch(&mut self, batch: &SelfplayBatch) {
+        match batch.source {
+            SelfplaySource::Native => {
+                self.native_games += batch.data.games.len();
+                self.native_samples += batch.data.samples.len();
+            }
+            SelfplaySource::External => {
+                self.external_games += batch.data.games.len();
+                self.external_samples += batch.data.samples.len();
+            }
+        }
+    }
+
+    fn games(self) -> usize {
+        self.native_games + self.external_games
+    }
+
+    fn samples(self) -> usize {
+        self.native_samples + self.external_samples
+    }
 }
 
 struct TrainerEvent {
@@ -920,6 +958,7 @@ struct PendingTrainingData {
     selfplay_seconds: f32,
     started: Option<Instant>,
     selfplay: AzSelfplayData,
+    source_counts: SelfplaySourceCounts,
 }
 
 impl PendingTrainingData {
@@ -928,6 +967,7 @@ impl PendingTrainingData {
             self.started = Some(Instant::now());
         }
         self.selfplay_seconds += batch.selfplay_seconds;
+        self.source_counts.add_batch(&batch);
         self.selfplay.add_assign(&batch.data);
     }
 }
@@ -1002,6 +1042,7 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
 
 fn build_async_training_report(
     pending: PendingTrainingData,
+    total_source_counts: SelfplaySourceCounts,
     stats: chineseai::az::AzTrainStats,
     learning_rate: f32,
     train_data_len: usize,
@@ -1036,6 +1077,16 @@ fn build_async_training_report(
     AzLoopReport {
         games: selfplay_games,
         samples: selfplay_samples,
+        native_games: pending.source_counts.native_games,
+        native_samples: pending.source_counts.native_samples,
+        external_games: pending.source_counts.external_games,
+        external_samples: pending.source_counts.external_samples,
+        total_games_generated: total_source_counts.games(),
+        total_samples_generated: total_source_counts.samples(),
+        total_native_games: total_source_counts.native_games,
+        total_native_samples: total_source_counts.native_samples,
+        total_external_games: total_source_counts.external_games,
+        total_external_samples: total_source_counts.external_samples,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -2362,6 +2413,7 @@ fn main() {
                         let batch = SelfplayBatch {
                             data,
                             selfplay_seconds: started.elapsed().as_secs_f32(),
+                            source: SelfplaySource::Native,
                         };
                         if selfplay_tx.send(batch).is_err() {
                             break;
@@ -2431,6 +2483,7 @@ fn main() {
                                 let batch = SelfplayBatch {
                                     data,
                                     selfplay_seconds: started.elapsed().as_secs_f32(),
+                                    source: SelfplaySource::External,
                                 };
                                 if selfplay_tx.send(batch).is_err() {
                                     break;
@@ -2459,6 +2512,7 @@ fn main() {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
                 let mut pending = PendingTrainingData::default();
+                let mut total_source_counts = SelfplaySourceCounts::default();
                 let mut train_index = 0usize;
                 let min_train_samples =
                     global_training_step_sample_count(trainer_config.batch_size);
@@ -2466,11 +2520,13 @@ fn main() {
                     if let Some(pool) = trainer_pool.as_mut() {
                         pool.add_samples(batch.data.samples.clone());
                     }
+                    total_source_counts.add_batch(&batch);
                     pending.push(batch);
                     while let Ok(batch) = selfplay_rx.try_recv() {
                         if let Some(pool) = trainer_pool.as_mut() {
                             pool.add_samples(batch.data.samples.clone());
                         }
+                        total_source_counts.add_batch(&batch);
                         pending.push(batch);
                     }
                     if trainer_stop.load(Ordering::SeqCst) {
@@ -2527,6 +2583,7 @@ fn main() {
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
                         std::mem::take(&mut pending),
+                        total_source_counts,
                         stats,
                         current_lr,
                         train_data.len(),
@@ -2548,6 +2605,7 @@ fn main() {
                         if let Some(pool) = trainer_pool.as_mut() {
                             pool.add_samples(batch.data.samples.clone());
                         }
+                        total_source_counts.add_batch(&batch);
                         pending.push(batch);
                     }
                 }
@@ -2654,6 +2712,7 @@ fn main() {
                                         terminal_resign_red: 0,
                                         terminal_resign_black: 0,
                                         terminal_max_plies: 0,
+                                        ..AzLoopReport::default()
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
                                 );
@@ -2727,6 +2786,7 @@ fn main() {
                                         terminal_resign_red: 0,
                                         terminal_resign_black: 0,
                                         terminal_max_plies: 0,
+                                        ..AzLoopReport::default()
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
                                 );
@@ -2767,9 +2827,16 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} native={}/{} external={}/{} total_samples={} total_native={} total_external={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
+                    report.native_games,
+                    report.native_samples,
+                    report.external_games,
+                    report.external_samples,
+                    report.total_samples_generated,
+                    report.total_native_samples,
+                    report.total_external_samples,
                     report.train_samples,
                     report.pool_samples,
                     report.pool_capacity,
@@ -2825,7 +2892,6 @@ fn main() {
                 );
                 log_scalar(&mut tb, "train/loss", update, report.loss);
                 log_scalar(&mut tb, "train/value_loss", update, report.value_loss);
-                log_scalar(&mut tb, "train/value_mse", update, report.value_mse);
                 log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
                 log_scalar(
                     &mut tb,
@@ -2839,18 +2905,6 @@ fn main() {
                     update,
                     report.value_target_mean,
                 );
-                log_scalar(
-                    &mut tb,
-                    "train/value_pred_rms",
-                    update,
-                    report.value_pred_rms,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/value_target_rms",
-                    update,
-                    report.value_target_rms,
-                );
                 log_scalar(&mut tb, "train/value_corr", update, report.value_corr);
                 log_scalar(
                     &mut tb,
@@ -2860,12 +2914,6 @@ fn main() {
                 );
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
                 log_scalar(&mut tb, "train/policy_kl", update, report.policy_kl);
-                log_scalar(
-                    &mut tb,
-                    "train/policy_target_entropy",
-                    update,
-                    policy_target_entropy,
-                );
                 log_scalar(&mut tb, "train/lr", update, report.learning_rate);
                 log_scalar(
                     &mut tb,
@@ -2879,6 +2927,66 @@ fn main() {
                 );
                 log_scalar(&mut tb, "selfplay/games", update, report.games as f32);
                 log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
+                log_scalar(
+                    &mut tb,
+                    "selfplay/native_games",
+                    update,
+                    report.native_games as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/native_samples",
+                    update,
+                    report.native_samples as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/external_games",
+                    update,
+                    report.external_games as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/external_samples",
+                    update,
+                    report.external_samples as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/total_games_generated",
+                    update,
+                    report.total_games_generated as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/total_samples_generated",
+                    update,
+                    report.total_samples_generated as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/total_native_samples",
+                    update,
+                    report.total_native_samples as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/total_native_games",
+                    update,
+                    report.total_native_games as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/total_external_samples",
+                    update,
+                    report.total_external_samples as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/total_external_games",
+                    update,
+                    report.total_external_games as f32,
+                );
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
                 log_scalar(
                     &mut tb,
@@ -3013,7 +3121,6 @@ fn main() {
                     update,
                     report.total_seconds,
                 );
-                log_scalar(&mut tb, "outcome/red_wins", update, report.red_wins as f32);
                 log_scalar(
                     &mut tb,
                     "outcome/red_win_rate",
@@ -3022,17 +3129,10 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "outcome/black_wins",
-                    update,
-                    report.black_wins as f32,
-                );
-                log_scalar(
-                    &mut tb,
                     "outcome/black_win_rate",
                     update,
                     report.black_wins as f32 / report.games.max(1) as f32,
                 );
-                log_scalar(&mut tb, "outcome/draws", update, report.draws as f32);
                 log_scalar(
                     &mut tb,
                     "terminal/checkmate_no_legal_moves",
@@ -3192,22 +3292,12 @@ fn main() {
                                 ""
                             }
                         );
-                        log_scalar(&mut tb, "arena/wins", update, arena.wins as f32);
-                        log_scalar(&mut tb, "arena/losses", update, arena.losses as f32);
-                        log_scalar(&mut tb, "arena/draws", update, arena.draws as f32);
-                        log_scalar(&mut tb, "arena/score", update, arena.score());
                         log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
                         log_scalar(&mut tb, "arena/score_rate_se", update, arena_se);
                         log_scalar(&mut tb, "arena/score_rate_lcb", update, arena_lcb);
                         log_scalar(&mut tb, "arena/ref_elo", update, ref_elo);
                         log_scalar(&mut tb, "arena/elo", update, candidate_elo);
                         log_scalar(&mut tb, "arena/elo_diff", update, elo_diff);
-                        log_scalar(
-                            &mut tb,
-                            "arena/win_rate",
-                            update,
-                            arena.wins as f32 / arena.total_games().max(1) as f32,
-                        );
                         log_scalar(
                             &mut tb,
                             "arena/wins_as_red",
