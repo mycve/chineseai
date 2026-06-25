@@ -11,8 +11,9 @@ use chineseai::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
         alphazero_search, benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace,
-        benchmark_policy_fit, benchmark_training, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, train_samples_weighted,
+        benchmark_policy_fit, benchmark_training, generate_external_selfplay_data,
+        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
+        train_samples_weighted,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -391,7 +392,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mstc{}_dbg{}_tdl{}_mp{}_vtd{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mstc{}_dbg{}_tdl{}_mp{}_ext{}_ed{}_ew{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -429,7 +430,13 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.deblunder_q_gap),
         f32_slug(config.td_lambda),
         f32_slug(config.mirror_probability),
-        f32_slug(config.value_q_ratio),
+        if config.external_selfplay_exe.trim().is_empty() {
+            "none".to_string()
+        } else {
+            format!("{:016x}", fnv1a64(config.external_selfplay_exe.as_bytes()))
+        },
+        config.external_selfplay_depth,
+        config.external_selfplay_workers,
         config.checkpoint_interval,
         config.arena_interval,
         f32_slug(config.arena_cpuct),
@@ -692,14 +699,11 @@ struct AzSelfplayFitBenchArgs {
     #[arg(long, default_value_t = 0.5)]
     mirror_probability: f32,
     /// Q gap that marks a sampled move as a value-repair blunder.
-    #[arg(long, default_value_t = 0.25)]
+    #[arg(long, default_value_t = 0.15)]
     deblunder_q_gap: f32,
-    /// TD(lambda) value target. Set 0 to use value-q-ratio search/result mix.
+    /// TD(lambda) value target. 1.0 is pure final result; 0.0 is pure root search Q.
     #[arg(long, default_value_t = 0.95)]
     td_lambda: f32,
-    /// Lc0-style value target mix: q_ratio * search_q + (1-q_ratio) * result.
-    #[arg(long, default_value_t = 0.25)]
-    value_q_ratio: f32,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
     replay_out: Option<String>,
@@ -784,14 +788,11 @@ struct AzReplayGenerateFixedArgs {
     #[arg(long, default_value_t = 0.3)]
     mirror_probability: f32,
     /// Q gap that marks a sampled move as a value-repair blunder.
-    #[arg(long, default_value_t = 0.25)]
+    #[arg(long, default_value_t = 0.15)]
     deblunder_q_gap: f32,
-    /// TD(lambda) value target. Set 0 to use value-q-ratio search/result mix.
+    /// TD(lambda) value target. 1.0 is pure final result; 0.0 is pure root search Q.
     #[arg(long, default_value_t = 0.95)]
     td_lambda: f32,
-    /// Lc0-style value target mix: q_ratio * search_q + (1-q_ratio) * result.
-    #[arg(long, default_value_t = 0.25)]
-    value_q_ratio: f32,
 }
 
 #[derive(Args, Debug)]
@@ -975,7 +976,6 @@ fn build_az_loop_config(
         mirror_probability: config.mirror_probability,
         deblunder_q_gap: config.deblunder_q_gap,
         td_lambda: config.td_lambda,
-        value_q_ratio: config.value_q_ratio,
     }
 }
 
@@ -1685,7 +1685,6 @@ fn main() {
                     mirror_probability: cmd.mirror_probability,
                     deblunder_q_gap: cmd.deblunder_q_gap,
                     td_lambda: cmd.td_lambda,
-                    value_q_ratio: cmd.value_q_ratio,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -1911,7 +1910,6 @@ fn main() {
                     mirror_probability: cmd.mirror_probability,
                     deblunder_q_gap: cmd.deblunder_q_gap,
                     td_lambda: cmd.td_lambda,
-                    value_q_ratio: cmd.value_q_ratio,
                 };
                 let data = generate_selfplay_data(&model, &config);
                 total_games += data.games.len();
@@ -2225,7 +2223,7 @@ fn main() {
             let opening_positions = load_opening_positions(&config.opening_fens_path);
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} value_q_ratio={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} external_selfplay(exe={},depth={},workers={}) train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.selfplay_samples_per_update,
@@ -2267,7 +2265,13 @@ fn main() {
                 config.mirror_probability,
                 config.deblunder_q_gap,
                 config.td_lambda,
-                config.value_q_ratio,
+                if config.external_selfplay_exe.trim().is_empty() {
+                    "(none)"
+                } else {
+                    config.external_selfplay_exe.as_str()
+                },
+                config.external_selfplay_depth,
+                config.external_selfplay_workers,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
@@ -2288,8 +2292,14 @@ fn main() {
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
-            let (selfplay_tx, selfplay_rx) =
-                mpsc::sync_channel::<SelfplayBatch>(config.workers.max(1) * 2);
+            let external_workers = if config.external_selfplay_exe.trim().is_empty() {
+                0
+            } else {
+                config.external_selfplay_workers
+            };
+            let (selfplay_tx, selfplay_rx) = mpsc::sync_channel::<SelfplayBatch>(
+                (config.workers.max(1) + external_workers).max(1) * 2,
+            );
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: 0,
@@ -2298,7 +2308,7 @@ fn main() {
             let mut arena_reference_model = initial_arena_reference_model;
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
-            let mut selfplay_handles = Vec::with_capacity(config.workers.max(1));
+            let mut selfplay_handles = Vec::with_capacity(config.workers.max(1) + external_workers);
             for worker_id in 0..config.workers.max(1) {
                 let selfplay_stop = stop_requested.clone();
                 let selfplay_config = config.clone();
@@ -2355,6 +2365,85 @@ fn main() {
                         };
                         if selfplay_tx.send(batch).is_err() {
                             break;
+                        }
+                        batch_index += 1;
+                    }
+                }));
+            }
+            for worker_id in 0..external_workers {
+                let selfplay_stop = stop_requested.clone();
+                let selfplay_config = config.clone();
+                let selfplay_opening_positions = opening_positions.clone();
+                let selfplay_tx = selfplay_tx.clone();
+                let shared_model = Arc::clone(&shared_model);
+                let selfplay_pause = Arc::clone(&selfplay_pause);
+                let external_exe = PathBuf::from(config.external_selfplay_exe.clone());
+                selfplay_handles.push(thread::spawn(move || {
+                    let mut batch_index = 0usize;
+                    let mut local_version = u64::MAX;
+                    let mut local_model = AzNnue::random_with_arch(
+                        selfplay_config.arch(),
+                        selfplay_config.seed ^ 0xE17E_4A1B_9ACD_55D5 ^ worker_id as u64,
+                    );
+                    while !selfplay_stop.load(Ordering::SeqCst) {
+                        {
+                            let (pause_lock, pause_cvar) = &*selfplay_pause;
+                            let mut pause_state = pause_lock
+                                .lock()
+                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                            while pause_state.is_paused() && !selfplay_stop.load(Ordering::SeqCst) {
+                                pause_state = pause_cvar
+                                    .wait(pause_state)
+                                    .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                            }
+                        }
+                        if selfplay_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        {
+                            let shared = shared_model
+                                .read()
+                                .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                            if shared.version != local_version {
+                                local_model = shared.model.clone();
+                                local_version = shared.version;
+                            }
+                        }
+                        let batch_seed = selfplay_config.seed
+                            ^ 0xA6A6_31C9_F021_7B88
+                            ^ ((worker_id as u64).wrapping_add(1) << 32)
+                            ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let loop_config = build_az_loop_config(
+                            &selfplay_config,
+                            batch_seed,
+                            1,
+                            local_version.min(u32::MAX as u64) as u32,
+                            &selfplay_opening_positions,
+                        );
+                        let started = Instant::now();
+                        match generate_external_selfplay_data(
+                            &local_model,
+                            &external_exe,
+                            selfplay_config.external_selfplay_depth,
+                            &loop_config,
+                        ) {
+                            Ok(data) => {
+                                let batch = SelfplayBatch {
+                                    data,
+                                    selfplay_seconds: started.elapsed().as_secs_f32(),
+                                };
+                                if selfplay_tx.send(batch).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "external-selfplay: worker={} exe={} failed: {err}",
+                                    worker_id,
+                                    external_exe.display()
+                                );
+                                break;
+                            }
                         }
                         batch_index += 1;
                     }

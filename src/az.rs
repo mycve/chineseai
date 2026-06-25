@@ -36,8 +36,8 @@ pub use alphazero::{
     alphazero_search_with_history_and_rules, cp_from_q,
 };
 pub use play::{
-    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
-    play_arena_games_from_positions,
+    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_external_selfplay_data,
+    generate_selfplay_data, play_arena_games_from_positions,
 };
 pub use replay::AzExperiencePool;
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
@@ -608,7 +608,6 @@ pub struct AzLoopConfig {
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
     pub td_lambda: f32,
-    pub value_q_ratio: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -2927,7 +2926,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[cfg(test)]
 mod tests {
-    use super::play::{assign_q_ratio_value_targets, assign_td_lambda_value_targets};
+    use super::play::assign_td_lambda_value_targets;
     use super::*;
     use std::fs;
 
@@ -3018,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn q_ratio_value_targets_mix_search_and_result() {
+    fn td_lambda_zero_is_pure_search_q() {
         let mut samples = vec![
             AzTrainingSample {
                 features: Vec::new(),
@@ -3042,41 +3041,41 @@ mod tests {
             },
         ];
 
-        assign_q_ratio_value_targets(&mut samples, 1.0, 0.25);
-
-        assert!((samples[0].value - 0.625).abs() < 1e-6);
-        assert!((samples[1].value + 0.625).abs() < 1e-6);
-    }
-
-    #[test]
-    fn q_ratio_one_is_pure_search_q() {
-        let mut samples = vec![
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(-0.5),
-                value: -0.5,
-                side_sign: 1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-            AzTrainingSample {
-                features: Vec::new(),
-                move_indices: Vec::new(),
-                policy: Vec::new(),
-                value_wdl: scalar_value_to_wdl_target(0.5),
-                value: 0.5,
-                side_sign: -1.0,
-                moves_left: 0.0,
-                meta: AzSampleMeta::default(),
-            },
-        ];
-
-        assign_q_ratio_value_targets(&mut samples, 1.0, 1.0);
+        assign_td_lambda_value_targets(&mut samples, 1.0, 0.0);
 
         assert!((samples[0].value + 0.5).abs() < 1e-6);
         assert!((samples[1].value - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn td_lambda_one_is_pure_terminal_result() {
+        let mut samples = vec![
+            AzTrainingSample {
+                features: Vec::new(),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(-0.5),
+                value: -0.5,
+                side_sign: 1.0,
+                moves_left: 0.0,
+                meta: AzSampleMeta::default(),
+            },
+            AzTrainingSample {
+                features: Vec::new(),
+                move_indices: Vec::new(),
+                policy: Vec::new(),
+                value_wdl: scalar_value_to_wdl_target(0.5),
+                value: 0.5,
+                side_sign: -1.0,
+                moves_left: 0.0,
+                meta: AzSampleMeta::default(),
+            },
+        ];
+
+        assign_td_lambda_value_targets(&mut samples, 1.0, 1.0);
+
+        assert!((samples[0].value - 1.0).abs() < 1e-6);
+        assert!((samples[1].value + 1.0).abs() < 1e-6);
     }
 
     #[test]
