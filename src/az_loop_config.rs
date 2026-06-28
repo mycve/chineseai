@@ -127,7 +127,7 @@ impl Default for AzLoopFileConfig {
             resign_playthrough: 20.0,
             replay_capacity: 5000000,
             replay_recent_sample_fraction: 0.4,
-            replay_recent_window_updates: 3,
+            replay_recent_window_updates: 5000,
             train_warmup_samples: 240000,
             train_samples_per_update: 120000,
             train_epochs_per_update: 1,
@@ -672,6 +672,7 @@ mod tests {
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("selfplay_samples_per_update = 240000\n"));
+        assert!(text.contains("replay_recent_window_updates = 5000\n"));
         assert!(text.contains("deblunder_q_gap = 0.15\n"));
         assert!(text.contains("td_lambda = 0.95\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));

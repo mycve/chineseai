@@ -573,7 +573,7 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     config.train_warmup_samples = config.train_samples_per_update;
     config.replay_capacity = 80000;
     config.replay_recent_sample_fraction = 0.4;
-    config.replay_recent_window_updates = 3;
+    config.replay_recent_window_updates = 5000;
     config.train_epochs_per_update = 1;
     config.hidden_size = cmd.hidden.max(1);
     config.workers = cmd.workers.max(1);
