@@ -1126,8 +1126,7 @@ fn build_async_training_report(
         total_samples_generated,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
-        low_simulation_rate: pending.selfplay.search_simulations.low_searches as f32
-            / search_count,
+        low_simulation_rate: pending.selfplay.search_simulations.low_searches as f32 / search_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -1226,7 +1225,9 @@ fn train_batch_source_stats(
     let mut policy_weight_sum = 0.0f32;
     let mut value_weight_sum = 0.0f32;
     for sample in samples {
-        fast += usize::from(sample.search_simulations > 0 && sample.search_simulations < full_simulations);
+        fast += usize::from(
+            sample.search_simulations > 0 && sample.search_simulations < full_simulations,
+        );
         policy_weight_sum += sample.policy_weight.max(0.0);
         value_weight_sum += sample.value_weight.max(0.0);
     }
@@ -2360,7 +2361,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},updates={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},updates={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.low_simulations,
@@ -2424,6 +2425,15 @@ fn main() {
                 config.arena_opening_positions,
                 config.arena_opening_plies_min,
                 config.arena_opening_plies_max,
+                if config.pikafish_label_eval_sqlite.trim().is_empty() {
+                    "(none)"
+                } else {
+                    config.pikafish_label_eval_sqlite.as_str()
+                },
+                config.pikafish_label_eval_interval,
+                config.pikafish_label_eval_limit,
+                config.pikafish_label_eval_simulations,
+                config.pikafish_label_eval_cpuct,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
@@ -2437,6 +2447,7 @@ fn main() {
             let mut arena_reference_model = initial_arena_reference_model;
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
+            let selfplay_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
             let mut selfplay_handles = Vec::with_capacity(config.workers.max(1));
             for worker_id in 0..config.workers.max(1) {
                 let selfplay_stop = stop_requested.clone();
@@ -2445,6 +2456,7 @@ fn main() {
                 let selfplay_tx = selfplay_tx.clone();
                 let shared_model = Arc::clone(&shared_model);
                 let selfplay_pause = Arc::clone(&selfplay_pause);
+                let selfplay_generation = Arc::clone(&selfplay_generation);
                 selfplay_handles.push(thread::spawn(move || {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
@@ -2479,11 +2491,15 @@ fn main() {
                         let batch_seed = selfplay_config.seed
                             ^ ((worker_id as u64).wrapping_add(1) << 32)
                             ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let generation_update = selfplay_generation
+                            .fetch_add(1, Ordering::SeqCst)
+                            .min(u32::MAX as u64)
+                            as u32;
                         let loop_config = build_az_loop_config(
                             &selfplay_config,
                             batch_seed,
                             1,
-                            local_version.min(u32::MAX as u64) as u32,
+                            generation_update,
                             &selfplay_opening_positions,
                         );
                         let started = Instant::now();
@@ -2958,7 +2974,8 @@ fn main() {
                     &mut tb,
                     "train/train_to_selfplay_ratio",
                     update,
-                    (config.train_samples_per_update as f32 * config.train_epochs_per_update as f32)
+                    (config.train_samples_per_update as f32
+                        * config.train_epochs_per_update as f32)
                         / config.selfplay_samples_per_update.max(1) as f32,
                 );
                 log_scalar(
@@ -3385,6 +3402,126 @@ fn main() {
                     }
                     println!("resume   : selfplay resumed after arena");
                 }
+                if config.pikafish_label_eval_interval > 0
+                    && update.is_multiple_of(config.pikafish_label_eval_interval)
+                    && !config.pikafish_label_eval_sqlite.trim().is_empty()
+                {
+                    let sqlite_path = Path::new(&config.pikafish_label_eval_sqlite);
+                    if sqlite_path.exists() {
+                        {
+                            let (pause_lock, _) = &*selfplay_pause;
+                            let mut pause_state = pause_lock
+                                .lock()
+                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                            pause_state.arena_paused = true;
+                        }
+                        println!("pause    : selfplay paused for pikafish label eval");
+                        let started = Instant::now();
+                        let eval_result = (|| -> io::Result<LabelEvalStats> {
+                            let conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
+                            let rows =
+                                load_pikafish_label_rows(&conn, config.pikafish_label_eval_limit)
+                                    .map_err(sqlite_io_error)?;
+                            evaluate_pikafish_labels_parallel(
+                                Arc::new(candidate_model.clone()),
+                                rows,
+                                config.pikafish_label_eval_simulations,
+                                config.seed ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
+                                config.pikafish_label_eval_cpuct,
+                                config.max_plies,
+                                config.arena_processes,
+                            )
+                        })();
+                        {
+                            let (pause_lock, pause_cvar) = &*selfplay_pause;
+                            let mut pause_state = pause_lock
+                                .lock()
+                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
+                            pause_state.arena_paused = false;
+                            pause_cvar.notify_all();
+                        }
+                        match eval_result {
+                            Ok(stats) => {
+                                println!(
+                                    "pikafish-label {update:04}: sqlite={} positions={} legal={} sims={} threads={} top1={:.3}% top2={:.3}% top4={:.3}% top8={:.3}% prior_top1={:.3}% value_corr={:.4} value_mae={:.4} elapsed={:.1}s",
+                                    config.pikafish_label_eval_sqlite,
+                                    stats.count,
+                                    stats.legal_bestmove,
+                                    config.pikafish_label_eval_simulations,
+                                    config.arena_processes,
+                                    100.0 * stats.top1_rate(),
+                                    100.0 * stats.top2_rate(),
+                                    100.0 * stats.top4_rate(),
+                                    100.0 * stats.top8_rate(),
+                                    100.0 * stats.prior_top1_rate(),
+                                    stats.value_corr(),
+                                    stats.value_mae_tanh_cp(),
+                                    started.elapsed().as_secs_f32()
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/positions",
+                                    update,
+                                    stats.count as f32,
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/top1",
+                                    update,
+                                    stats.top1_rate(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/top2",
+                                    update,
+                                    stats.top2_rate(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/top4",
+                                    update,
+                                    stats.top4_rate(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/top8",
+                                    update,
+                                    stats.top8_rate(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/prior_top1",
+                                    update,
+                                    stats.prior_top1_rate(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/value_corr",
+                                    update,
+                                    stats.value_corr() as f32,
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/value_mae_tanh_cp",
+                                    update,
+                                    stats.value_mae_tanh_cp(),
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "pikafish-label {update:04}: failed sqlite={}: {err}",
+                                    config.pikafish_label_eval_sqlite
+                                );
+                            }
+                        }
+                        println!("resume   : selfplay resumed after pikafish label eval");
+                    } else {
+                        println!(
+                            "pikafish-label {update:04}: skipped missing sqlite={}",
+                            config.pikafish_label_eval_sqlite
+                        );
+                    }
+                }
                 update = update.saturating_add(1);
                 if let Some(target_update) = target_update
                     && update > target_update
@@ -3594,6 +3731,50 @@ struct LabelEvalStats {
 }
 
 impl LabelEvalStats {
+    fn merge(&mut self, other: LabelEvalStats) {
+        self.count += other.count;
+        self.legal_bestmove += other.legal_bestmove;
+        self.top1_hits += other.top1_hits;
+        self.top2_hits += other.top2_hits;
+        self.top4_hits += other.top4_hits;
+        self.top8_hits += other.top8_hits;
+        self.prior_top1_hits += other.prior_top1_hits;
+        self.value_q_sum += other.value_q_sum;
+        self.cp_tanh_sum += other.cp_tanh_sum;
+        self.value_q_sq_sum += other.value_q_sq_sum;
+        self.cp_tanh_sq_sum += other.cp_tanh_sq_sum;
+        self.value_cp_cross_sum += other.value_cp_cross_sum;
+        self.abs_value_error_sum += other.abs_value_error_sum;
+    }
+
+    fn denom(&self) -> f32 {
+        self.count.max(1) as f32
+    }
+
+    fn top1_rate(&self) -> f32 {
+        self.top1_hits as f32 / self.denom()
+    }
+
+    fn top2_rate(&self) -> f32 {
+        self.top2_hits as f32 / self.denom()
+    }
+
+    fn top4_rate(&self) -> f32 {
+        self.top4_hits as f32 / self.denom()
+    }
+
+    fn top8_rate(&self) -> f32 {
+        self.top8_hits as f32 / self.denom()
+    }
+
+    fn prior_top1_rate(&self) -> f32 {
+        self.prior_top1_hits as f32 / self.denom()
+    }
+
+    fn value_mae_tanh_cp(&self) -> f32 {
+        (self.abs_value_error_sum / self.denom() as f64) as f32
+    }
+
     fn push_value_pair(&mut self, value_q: f32, score_cp: Option<i32>) {
         let Some(score_cp) = score_cp else {
             return;
@@ -3644,8 +3825,50 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         ));
     }
 
-    let mut stats = LabelEvalStats::default();
     let started = Instant::now();
+    let stats = evaluate_pikafish_labels(
+        &model,
+        &rows,
+        cmd.simulations.max(1),
+        cmd.seed,
+        cmd.cpuct.max(0.0),
+        cmd.max_depth,
+        |done, total| {
+            if done % 100 == 0 || done == total {
+                println!("pikafish-label-eval: searched {done}/{total}");
+            }
+        },
+    )?;
+
+    println!(
+        "pikafish-label-eval: model={} sqlite={} positions={} legal_labels={} sims={} top1={:.3}% top2={:.3}% top4={:.3}% top8={:.3}% prior_top1={:.3}% value_corr={:.4} value_mae_tanh_cp={:.4} elapsed={:.1}s",
+        cmd.model,
+        cmd.sqlite,
+        stats.count,
+        stats.legal_bestmove,
+        cmd.simulations.max(1),
+        100.0 * stats.top1_rate(),
+        100.0 * stats.top2_rate(),
+        100.0 * stats.top4_rate(),
+        100.0 * stats.top8_rate(),
+        100.0 * stats.prior_top1_rate(),
+        stats.value_corr(),
+        stats.value_mae_tanh_cp(),
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
+fn evaluate_pikafish_labels(
+    model: &AzNnue,
+    rows: &[PikafishLabelRow],
+    simulations: usize,
+    seed: u64,
+    cpuct: f32,
+    max_depth: usize,
+    mut progress: impl FnMut(usize, usize),
+) -> io::Result<LabelEvalStats> {
+    let mut stats = LabelEvalStats::default();
     for (offset, row) in rows.iter().enumerate() {
         let position = Position::from_fen(&row.fen).map_err(|err| {
             io::Error::new(
@@ -3659,13 +3882,8 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         stats.legal_bestmove += 1;
         let result = alphazero_search(
             &position,
-            &model,
-            fixed_az_search_limits(
-                cmd.simulations.max(1),
-                cmd.seed ^ row.id as u64,
-                cmd.cpuct.max(0.0),
-                cmd.max_depth,
-            ),
+            model,
+            fixed_az_search_limits(simulations.max(1), seed ^ row.id as u64, cpuct, max_depth),
         );
         stats.count += 1;
         if result.best_move == Some(label_move) {
@@ -3678,13 +3896,25 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
                 .cmp(&left.visits)
                 .then_with(|| right.policy.total_cmp(&left.policy))
         });
-        if by_visits.iter().take(2).any(|candidate| candidate.mv == label_move) {
+        if by_visits
+            .iter()
+            .take(2)
+            .any(|candidate| candidate.mv == label_move)
+        {
             stats.top2_hits += 1;
         }
-        if by_visits.iter().take(4).any(|candidate| candidate.mv == label_move) {
+        if by_visits
+            .iter()
+            .take(4)
+            .any(|candidate| candidate.mv == label_move)
+        {
             stats.top4_hits += 1;
         }
-        if by_visits.iter().take(8).any(|candidate| candidate.mv == label_move) {
+        if by_visits
+            .iter()
+            .take(8)
+            .any(|candidate| candidate.mv == label_move)
+        {
             stats.top8_hits += 1;
         }
         if result
@@ -3696,41 +3926,64 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
             stats.prior_top1_hits += 1;
         }
         stats.push_value_pair(result.value_q, row.best_score_cp);
-        if (offset + 1) % 100 == 0 || offset + 1 == rows.len() {
-            println!(
-                "pikafish-label-eval: searched {}/{}",
-                offset + 1,
-                rows.len()
-            );
-        }
+        progress(offset + 1, rows.len());
+    }
+    Ok(stats)
+}
+
+fn evaluate_pikafish_labels_parallel(
+    model: Arc<AzNnue>,
+    rows: Vec<PikafishLabelRow>,
+    simulations: usize,
+    seed: u64,
+    cpuct: f32,
+    max_depth: usize,
+    thread_count: usize,
+) -> io::Result<LabelEvalStats> {
+    if rows.is_empty() {
+        return Ok(LabelEvalStats::default());
+    }
+    let thread_count = thread_count.max(1).min(rows.len());
+    let rows = Arc::new(rows);
+    let mut handles = Vec::with_capacity(thread_count);
+    for thread_id in 0..thread_count {
+        let model = Arc::clone(&model);
+        let rows = Arc::clone(&rows);
+        handles.push(thread::spawn(move || {
+            let shard: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % thread_count == thread_id)
+                .map(|(_, row)| row.clone())
+                .collect();
+            evaluate_pikafish_labels(
+                &model,
+                &shard,
+                simulations,
+                seed ^ (thread_id as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
+                cpuct,
+                max_depth,
+                |_, _| {},
+            )
+        }));
     }
 
-    let denom = stats.count.max(1) as f64;
-    println!(
-        "pikafish-label-eval: model={} sqlite={} positions={} legal_labels={} sims={} top1={:.3}% top2={:.3}% top4={:.3}% top8={:.3}% prior_top1={:.3}% value_corr={:.4} value_mae_tanh_cp={:.4} elapsed={:.1}s",
-        cmd.model,
-        cmd.sqlite,
-        stats.count,
-        stats.legal_bestmove,
-        cmd.simulations.max(1),
-        100.0 * stats.top1_hits as f64 / denom,
-        100.0 * stats.top2_hits as f64 / denom,
-        100.0 * stats.top4_hits as f64 / denom,
-        100.0 * stats.top8_hits as f64 / denom,
-        100.0 * stats.prior_top1_hits as f64 / denom,
-        stats.value_corr(),
-        stats.abs_value_error_sum / denom,
-        started.elapsed().as_secs_f32()
-    );
-    Ok(())
+    let mut merged = LabelEvalStats::default();
+    for handle in handles {
+        let stats = handle
+            .join()
+            .map_err(|_| io::Error::other("pikafish label eval thread panicked"))??;
+        merged.merge(stats);
+    }
+    Ok(merged)
 }
 
 fn load_pikafish_label_rows(
     conn: &Connection,
     limit: usize,
 ) -> rusqlite::Result<Vec<PikafishLabelRow>> {
-    let mut query = "SELECT id, fen, bestmove, best_score_cp FROM pikafish_labels ORDER BY id"
-        .to_string();
+    let mut query =
+        "SELECT id, fen, bestmove, best_score_cp FROM pikafish_labels ORDER BY id".to_string();
     if limit > 0 {
         query.push_str(" LIMIT ?1");
         let mut stmt = conn.prepare(&query)?;
@@ -3921,7 +4174,10 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
             cmd.min_plies.max(cmd.max_plies),
             cmd.seed,
         );
-        if let Some(parent) = fens_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = fens_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
         fs::write(fens_path, format!("{}\n", fens.join("\n")))?;

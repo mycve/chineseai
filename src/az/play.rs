@@ -228,7 +228,8 @@ impl AzSelfplayData {
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
-        self.search_simulations.add_assign(&other.search_simulations);
+        self.search_simulations
+            .add_assign(&other.search_simulations);
     }
 }
 
@@ -294,7 +295,9 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.best_q_sum += chunk.best_q_sum;
         merged.played_q_sum += chunk.played_q_sum;
         merged.terminal.add_assign(&chunk.terminal);
-        merged.search_simulations.add_assign(&chunk.search_simulations);
+        merged
+            .search_simulations
+            .add_assign(&chunk.search_simulations);
     }
     merged
 }

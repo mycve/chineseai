@@ -71,6 +71,11 @@ pub struct AzLoopFileConfig {
     pub arena_opening_positions: usize,
     pub arena_opening_plies_min: usize,
     pub arena_opening_plies_max: usize,
+    pub pikafish_label_eval_sqlite: String,
+    pub pikafish_label_eval_interval: usize,
+    pub pikafish_label_eval_limit: usize,
+    pub pikafish_label_eval_simulations: usize,
+    pub pikafish_label_eval_cpuct: f32,
     pub tensorboard_logdir: String,
 }
 
@@ -82,7 +87,7 @@ impl Default for AzLoopFileConfig {
             low_simulations: 256,
             low_simulation_probability: 0.35,
             low_simulation_policy_weight: 0.35,
-            selfplay_samples_per_update: 120000,
+            selfplay_samples_per_update: 240000,
             lr: 0.001,
             lr_min: 0.0001,
             lr_decay_start_update: 800,
@@ -120,7 +125,7 @@ impl Default for AzLoopFileConfig {
             opening_fens_path: String::new(),
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
-            replay_capacity: 2000000,
+            replay_capacity: 5000000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_window_updates: 3,
             train_warmup_samples: 240000,
@@ -134,7 +139,7 @@ impl Default for AzLoopFileConfig {
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
-            arena_interval: 10,
+            arena_interval: 20,
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
@@ -143,6 +148,11 @@ impl Default for AzLoopFileConfig {
             arena_opening_positions: 300,
             arena_opening_plies_min: 6,
             arena_opening_plies_max: 10,
+            pikafish_label_eval_sqlite: "eval/pikafish-random-5000-d8.sqlite".into(),
+            pikafish_label_eval_interval: 20,
+            pikafish_label_eval_limit: 1000,
+            pikafish_label_eval_simulations: 256,
+            pikafish_label_eval_cpuct: 1.5,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -217,6 +227,11 @@ struct AzLoopTomlConfig {
     pub arena_opening_positions: usize,
     pub arena_opening_plies_min: usize,
     pub arena_opening_plies_max: usize,
+    pub pikafish_label_eval_sqlite: String,
+    pub pikafish_label_eval_interval: usize,
+    pub pikafish_label_eval_limit: usize,
+    pub pikafish_label_eval_simulations: usize,
+    pub pikafish_label_eval_cpuct: f32,
     #[serde(skip_serializing)]
     pub arena_pikafish_exe: String,
     #[serde(skip_serializing)]
@@ -307,6 +322,11 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             arena_opening_positions: config.arena_opening_positions,
             arena_opening_plies_min: config.arena_opening_plies_min,
             arena_opening_plies_max: config.arena_opening_plies_max,
+            pikafish_label_eval_sqlite: config.pikafish_label_eval_sqlite.clone(),
+            pikafish_label_eval_interval: config.pikafish_label_eval_interval,
+            pikafish_label_eval_limit: config.pikafish_label_eval_limit,
+            pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
+            pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
             arena_pikafish_exe: String::new(),
             arena_pikafish_start_update: 1,
             arena_pikafish_depth: 1,
@@ -387,6 +407,11 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             arena_opening_positions: config.arena_opening_positions,
             arena_opening_plies_min: config.arena_opening_plies_min,
             arena_opening_plies_max: config.arena_opening_plies_max,
+            pikafish_label_eval_sqlite: config.pikafish_label_eval_sqlite,
+            pikafish_label_eval_interval: config.pikafish_label_eval_interval,
+            pikafish_label_eval_limit: config.pikafish_label_eval_limit,
+            pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
+            pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
             tensorboard_logdir: config.tensorboard_logdir,
         }
     }
@@ -513,6 +538,23 @@ impl AzLoopFileConfig {
         line!("arena_opening_positions", self.arena_opening_positions);
         line!("arena_opening_plies_min", self.arena_opening_plies_min);
         line!("arena_opening_plies_max", self.arena_opening_plies_max);
+        line!(
+            "pikafish_label_eval_sqlite",
+            q(&self.pikafish_label_eval_sqlite)
+        );
+        line!(
+            "pikafish_label_eval_interval",
+            self.pikafish_label_eval_interval
+        );
+        line!("pikafish_label_eval_limit", self.pikafish_label_eval_limit);
+        line!(
+            "pikafish_label_eval_simulations",
+            self.pikafish_label_eval_simulations
+        );
+        line!(
+            "pikafish_label_eval_cpuct",
+            f(self.pikafish_label_eval_cpuct)
+        );
         line!("tensorboard_logdir", q(&self.tensorboard_logdir));
         out
     }
@@ -581,6 +623,8 @@ impl AzLoopFileConfig {
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_opening_positions = self.arena_opening_positions.max(1);
+        self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
+        self.pikafish_label_eval_cpuct = self.pikafish_label_eval_cpuct.max(0.0);
         if self.arena_opening_plies_min > self.arena_opening_plies_max {
             std::mem::swap(
                 &mut self.arena_opening_plies_min,
@@ -627,12 +671,21 @@ mod tests {
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
+        assert!(text.contains("selfplay_samples_per_update = 240000\n"));
         assert!(text.contains("deblunder_q_gap = 0.15\n"));
         assert!(text.contains("td_lambda = 0.95\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
+        assert!(text.contains("arena_interval = 20\n"));
+        assert!(
+            text.contains("pikafish_label_eval_sqlite = \"eval/pikafish-random-5000-d8.sqlite\"\n")
+        );
+        assert!(text.contains("pikafish_label_eval_interval = 20\n"));
+        assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
+        assert!(text.contains("pikafish_label_eval_simulations = 256\n"));
+        assert!(text.contains("pikafish_label_eval_cpuct = 1.5\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("gumbel"));
         assert!(!text.contains("search_algorithm"));
@@ -646,6 +699,8 @@ mod tests {
         assert!((parsed.lr - 0.001).abs() < 1e-9);
         assert!((parsed.deblunder_q_gap - 0.15).abs() < 1e-6);
         assert!((parsed.td_lambda - 0.95).abs() < 1e-6);
+        assert_eq!(parsed.arena_interval, 20);
+        assert_eq!(parsed.pikafish_label_eval_interval, 20);
     }
 }
 

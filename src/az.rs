@@ -2925,30 +2925,30 @@ fn dense_move_index(mv: Move) -> usize {
 fn replay_pool_test_fixture() -> AzExperiencePool {
     fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
         AzTrainingSample {
-        features: vec![1, 2, 3],
-        move_indices: vec![0, 1],
-        policy: vec![0.6, 0.4],
-        value_wdl: scalar_value_to_wdl_target(0.1),
-        value: 0.1,
-        side_sign: 1.0,
-        moves_left: 0.0,
-        policy_weight: 1.0,
-        value_weight: 1.0,
-        search_simulations: 0,
-        meta: AzSampleMeta {
-            generation_update: update,
-            game_id,
-            ply,
-            root_q: 0.11,
-            best_q: 0.33,
-            played_q: 0.02,
-            best_visits: 88,
-            played_visits: 13,
-            best_index: 1,
-            played_index: 0,
-            deblundered: true,
-        },
-    }
+            features: vec![1, 2, 3],
+            move_indices: vec![0, 1],
+            policy: vec![0.6, 0.4],
+            value_wdl: scalar_value_to_wdl_target(0.1),
+            value: 0.1,
+            side_sign: 1.0,
+            moves_left: 0.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
+            meta: AzSampleMeta {
+                generation_update: update,
+                game_id,
+                ply,
+                root_q: 0.11,
+                best_q: 0.33,
+                played_q: 0.02,
+                best_visits: 88,
+                played_visits: 13,
+                best_index: 1,
+                played_index: 0,
+                deblundered: true,
+            },
+        }
     }
     let mut pool = AzExperiencePool::new(100);
     pool.add_games(vec![
