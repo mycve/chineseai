@@ -674,7 +674,7 @@ pub struct AzLoopReport {
     pub replay_newest_update: u32,
     pub replay_avg_update: f32,
     pub replay_window_updates: u32,
-    pub replay_newest_update_fraction: f32,
+    pub replay_recent_window_fraction: f32,
     pub train_fast_sample_rate: f32,
     pub train_policy_weight_mean: f32,
     pub train_value_weight_mean: f32,
@@ -3531,13 +3531,13 @@ mod tests {
             vec![sample(3, 3, 0), sample(3, 3, 1)],
         ]);
 
-        let stats = pool.window_stats();
+        let stats = pool.window_stats(1);
         assert_eq!(pool.sample_count(), 4);
         assert_eq!(stats.chunks, 2);
         assert_eq!(stats.oldest_generation_update, 2);
         assert_eq!(stats.newest_generation_update, 3);
         assert_eq!(stats.window_updates, 2);
-        assert!((stats.newest_update_sample_fraction - 0.5).abs() < 1e-6);
+        assert!((stats.recent_window_sample_fraction - 0.5).abs() < 1e-6);
         assert_eq!(pool.all_sample_groups().len(), 2);
     }
 

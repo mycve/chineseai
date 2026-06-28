@@ -139,7 +139,6 @@ pub struct AzReplayWindowStats {
     pub newest_generation_update: u32,
     pub avg_generation_update: f32,
     pub window_updates: u32,
-    pub newest_update_sample_fraction: f32,
     pub recent_window_sample_fraction: f32,
 }
 
@@ -404,7 +403,7 @@ impl AzExperiencePool {
             .collect()
     }
 
-    pub fn window_stats(&self) -> AzReplayWindowStats {
+    pub fn window_stats(&self, recent_window_updates: u32) -> AzReplayWindowStats {
         if self.sample_count == 0 {
             return AzReplayWindowStats::default();
         }
@@ -424,8 +423,7 @@ impl AzExperiencePool {
             weighted_sum += chunk.generation_update as u64 * chunk.len() as u64;
             *by_update.entry(chunk.generation_update).or_default() += chunk.len();
         }
-        let newest_samples = by_update.get(&newest).copied().unwrap_or(0);
-        let recent_oldest = newest.saturating_sub(2);
+        let recent_oldest = newest.saturating_sub(recent_window_updates.max(1).saturating_sub(1));
         let recent_samples = by_update
             .iter()
             .filter_map(|(&update, &count)| (update >= recent_oldest).then_some(count))
@@ -437,7 +435,6 @@ impl AzExperiencePool {
             newest_generation_update: newest,
             avg_generation_update: weighted_sum as f32 / self.sample_count as f32,
             window_updates: newest.saturating_sub(oldest).saturating_add(1),
-            newest_update_sample_fraction: newest_samples as f32 / self.sample_count as f32,
             recent_window_sample_fraction: recent_samples as f32 / self.sample_count as f32,
         }
     }

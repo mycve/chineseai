@@ -1191,7 +1191,7 @@ fn build_async_training_report(
         replay_newest_update: replay_window.newest_generation_update,
         replay_avg_update: replay_window.avg_generation_update,
         replay_window_updates: replay_window.window_updates,
-        replay_newest_update_fraction: replay_window.newest_update_sample_fraction,
+        replay_recent_window_fraction: replay_window.recent_window_sample_fraction,
         train_fast_sample_rate: train_source.fast_sample_rate,
         train_policy_weight_mean: train_source.policy_weight_mean,
         train_value_weight_mean: train_source.value_weight_mean,
@@ -2613,7 +2613,7 @@ fn main() {
                         train_seconds,
                         pool.sample_count(),
                         pool.capacity(),
-                        pool.window_stats(),
+                        pool.window_stats(trainer_config.replay_recent_window_updates),
                         train_source_stats,
                     );
                     if trainer_tx
@@ -2853,7 +2853,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} new_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2869,7 +2869,7 @@ fn main() {
                     report.replay_oldest_update,
                     report.replay_newest_update,
                     report.replay_window_updates,
-                    report.replay_newest_update_fraction,
+                    report.replay_recent_window_fraction,
                     report.train_recent_sample_rate,
                     report.train_fast_sample_rate,
                     report.train_policy_weight_mean,
@@ -3046,9 +3046,9 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "replay/newest_update_fraction",
+                    "replay/recent_window_fraction",
                     update,
-                    report.replay_newest_update_fraction,
+                    report.replay_recent_window_fraction,
                 );
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
                 log_scalar(
