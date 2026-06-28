@@ -206,6 +206,8 @@ pub(super) struct BatchTensors {
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) moves_left: Tensor,
+    pub(super) policy_weights: Tensor,
+    pub(super) value_weights: Tensor,
 }
 
 impl BatchTensors {
@@ -284,6 +286,8 @@ impl BatchTensors {
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             moves_left: Tensor::from_vec(packed.moves_left, batch_size, device)?,
+            policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
+            value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
         })
     }
 }

@@ -11,21 +11,23 @@ use chineseai::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
         alphazero_search, benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace,
-        benchmark_policy_fit, benchmark_training, generate_external_selfplay_data,
-        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples_weighted,
+        benchmark_policy_fit, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples_weighted,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
-    xiangqi::Position,
+    xiangqi::{Move, Position, RuleOutcome},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs, io,
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -79,6 +81,10 @@ enum CliCommand {
     AzBaseline100(AzBaseline100Args),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
+    /// Generate random positions and label them with Pikafish best moves.
+    PikafishLabelRandom(PikafishLabelRandomArgs),
+    /// Evaluate a model against Pikafish labels stored in SQLite.
+    PikafishLabelEval(PikafishLabelEvalArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -272,6 +278,69 @@ struct VsPikafishArgs {
     opening_plies_max: usize,
 }
 
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --count 5000 --depth 8
+  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --fens eval/random.fens --output eval/pikafish-labels.csv --sqlite eval/pikafish-labels.sqlite")]
+struct PikafishLabelRandomArgs {
+    /// Pikafish UCI executable path.
+    pikafish_exe: String,
+    /// Output FEN list. Existing file is reused unless --regenerate is set.
+    #[arg(long, default_value = "eval/random.fens")]
+    fens: String,
+    /// Output CSV labels.
+    #[arg(long, default_value = "eval/pikafish-labels.csv")]
+    output: String,
+    /// Output SQLite labels.
+    #[arg(long, default_value = "eval/pikafish-labels.sqlite")]
+    sqlite: String,
+    /// Number of unique random positions.
+    #[arg(long, default_value_t = 5000)]
+    count: usize,
+    /// Random seed for FEN generation.
+    #[arg(long, default_value_t = 20260628)]
+    seed: u64,
+    /// Minimum random plies from startpos.
+    #[arg(long, default_value_t = 12)]
+    min_plies: usize,
+    /// Maximum random plies from startpos.
+    #[arg(long, default_value_t = 80)]
+    max_plies: usize,
+    /// Pikafish search depth.
+    #[arg(long, default_value_t = 8)]
+    depth: u32,
+    /// Regenerate the FEN file even when it already exists.
+    #[arg(long)]
+    regenerate: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai pikafish-label-eval model.safetensors eval/pikafish-labels.sqlite --simulations 64")]
+struct PikafishLabelEvalArgs {
+    /// ChineseAI AZ-NNUE model path.
+    model: String,
+    /// SQLite labels produced by pikafish-label-random.
+    sqlite: String,
+    /// ChineseAI MCTS simulations per position.
+    #[arg(short = 's', long, default_value_t = 64)]
+    simulations: usize,
+    /// ChineseAI PUCT constant.
+    #[arg(long, default_value_t = 1.5)]
+    cpuct: f32,
+    /// Maximum search depth in plies below root; 0 keeps the MCTS default.
+    #[arg(long, default_value_t = 0)]
+    max_depth: usize,
+    /// Random seed.
+    #[arg(long, default_value_t = 20260628)]
+    seed: u64,
+    /// Limit number of positions; 0 means all.
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+}
+
 fn best_model_path(model_path: &str) -> PathBuf {
     Path::new(model_path)
         .parent()
@@ -391,8 +460,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mstc{}_dbg{}_tdl{}_mp{}_ext{}_ed{}_ew{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "ls{}_lsp{}_lspw{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
+            "tspu{}_tepu{}_dbg{}_tdl{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -401,6 +470,11 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.hidden_size,
         config.max_plies,
         config.workers,
+        config.low_simulations,
+        f32_slug(config.low_simulation_probability),
+        f32_slug(config.low_simulation_policy_weight),
+        f32_slug(config.replay_recent_sample_fraction),
+        config.replay_recent_window_updates,
         f32_slug(config.lr_min),
         config.lr_decay_start_update,
         config.lr_decay_interval,
@@ -426,17 +500,9 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
-        config.max_sample_train_count,
         f32_slug(config.deblunder_q_gap),
         f32_slug(config.td_lambda),
         f32_slug(config.mirror_probability),
-        if config.external_selfplay_exe.trim().is_empty() {
-            "none".to_string()
-        } else {
-            format!("{:016x}", fnv1a64(config.external_selfplay_exe.as_bytes()))
-        },
-        config.external_selfplay_depth,
-        config.external_selfplay_workers,
         config.checkpoint_interval,
         config.arena_interval,
         f32_slug(config.arena_cpuct),
@@ -498,13 +564,17 @@ fn tensorboard_effective_logdir(config: &AzLoopFileConfig) -> PathBuf {
 fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     let mut config = AzLoopFileConfig::default();
     config.model_path = cmd.model.clone();
-    config.simulations = 800;
+    config.simulations = 512;
+    config.low_simulations = 256;
+    config.low_simulation_probability = 0.35;
+    config.low_simulation_policy_weight = 0.35;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
     config.train_warmup_samples = config.train_samples_per_update;
     config.replay_capacity = 80000;
-    config.train_epochs_per_update = 2;
-    config.max_sample_train_count = 3;
+    config.replay_recent_sample_fraction = 0.4;
+    config.replay_recent_window_updates = 3;
+    config.train_epochs_per_update = 1;
     config.hidden_size = cmd.hidden.max(1);
     config.workers = cmd.workers.max(1);
     config.checkpoint_dir = format!(
@@ -891,44 +961,6 @@ fn prune_old_checkpoints(
 struct SelfplayBatch {
     data: AzSelfplayData,
     selfplay_seconds: f32,
-    source: SelfplaySource,
-}
-
-#[derive(Clone, Copy)]
-enum SelfplaySource {
-    Native,
-    External,
-}
-
-#[derive(Clone, Copy, Default)]
-struct SelfplaySourceCounts {
-    native_games: usize,
-    native_samples: usize,
-    external_games: usize,
-    external_samples: usize,
-}
-
-impl SelfplaySourceCounts {
-    fn add_batch(&mut self, batch: &SelfplayBatch) {
-        match batch.source {
-            SelfplaySource::Native => {
-                self.native_games += batch.data.games.len();
-                self.native_samples += batch.data.samples.len();
-            }
-            SelfplaySource::External => {
-                self.external_games += batch.data.games.len();
-                self.external_samples += batch.data.samples.len();
-            }
-        }
-    }
-
-    fn games(self) -> usize {
-        self.native_games + self.external_games
-    }
-
-    fn samples(self) -> usize {
-        self.native_samples + self.external_samples
-    }
 }
 
 struct TrainerEvent {
@@ -958,7 +990,14 @@ struct PendingTrainingData {
     selfplay_seconds: f32,
     started: Option<Instant>,
     selfplay: AzSelfplayData,
-    source_counts: SelfplaySourceCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrainBatchSourceStats {
+    fast_sample_rate: f32,
+    policy_weight_mean: f32,
+    value_weight_mean: f32,
+    recent_sample_rate: f32,
 }
 
 impl PendingTrainingData {
@@ -967,7 +1006,6 @@ impl PendingTrainingData {
             self.started = Some(Instant::now());
         }
         self.selfplay_seconds += batch.selfplay_seconds;
-        self.source_counts.add_batch(&batch);
         self.selfplay.add_assign(&batch.data);
     }
 }
@@ -983,6 +1021,9 @@ fn build_az_loop_config(
         games: 1,
         max_plies: config.max_plies,
         simulations: config.simulations,
+        low_simulations: config.low_simulations,
+        low_simulation_probability: config.low_simulation_probability,
+        low_simulation_policy_weight: config.low_simulation_policy_weight,
         seed,
         workers,
         generation_update,
@@ -1042,13 +1083,16 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
 
 fn build_async_training_report(
     pending: PendingTrainingData,
-    total_source_counts: SelfplaySourceCounts,
+    total_games_generated: usize,
+    total_samples_generated: usize,
     stats: chineseai::az::AzTrainStats,
     learning_rate: f32,
     train_data_len: usize,
     train_seconds: f32,
     pool_samples: usize,
     pool_capacity: usize,
+    replay_window: chineseai::az::AzReplayWindowStats,
+    train_source: TrainBatchSourceStats,
 ) -> AzLoopReport {
     let selfplay_games = pending.selfplay.games.len();
     let selfplay_samples = pending.selfplay.samples.len();
@@ -1062,6 +1106,7 @@ fn build_async_training_report(
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
     let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
     let sampled_moves = pending.selfplay.sampled_moves.max(1) as f32;
+    let search_count = pending.selfplay.search_simulations.searches.max(1) as f32;
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1077,16 +1122,12 @@ fn build_async_training_report(
     AzLoopReport {
         games: selfplay_games,
         samples: selfplay_samples,
-        native_games: pending.source_counts.native_games,
-        native_samples: pending.source_counts.native_samples,
-        external_games: pending.source_counts.external_games,
-        external_samples: pending.source_counts.external_samples,
-        total_games_generated: total_source_counts.games(),
-        total_samples_generated: total_source_counts.samples(),
-        total_native_games: total_source_counts.native_games,
-        total_native_samples: total_source_counts.native_samples,
-        total_external_games: total_source_counts.external_games,
-        total_external_samples: total_source_counts.external_samples,
+        total_games_generated,
+        total_samples_generated,
+        avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
+            / search_count,
+        low_simulation_rate: pending.selfplay.search_simulations.low_searches as f32
+            / search_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -1146,6 +1187,16 @@ fn build_async_training_report(
         train_samples: train_data_len,
         pool_samples,
         pool_capacity,
+        replay_chunks: replay_window.chunks,
+        replay_oldest_update: replay_window.oldest_generation_update,
+        replay_newest_update: replay_window.newest_generation_update,
+        replay_avg_update: replay_window.avg_generation_update,
+        replay_window_updates: replay_window.window_updates,
+        replay_newest_update_fraction: replay_window.newest_update_sample_fraction,
+        train_fast_sample_rate: train_source.fast_sample_rate,
+        train_policy_weight_mean: train_source.policy_weight_mean,
+        train_value_weight_mean: train_source.value_weight_mean,
+        train_recent_sample_rate: train_source.recent_sample_rate,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
@@ -1159,6 +1210,32 @@ fn build_async_training_report(
         terminal_resign_red: pending.selfplay.terminal.resign_red,
         terminal_resign_black: pending.selfplay.terminal.resign_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
+    }
+}
+
+fn train_batch_source_stats(
+    samples: &[AzTrainingSample],
+    full_simulations: usize,
+    recent_samples: usize,
+) -> TrainBatchSourceStats {
+    if samples.is_empty() {
+        return TrainBatchSourceStats::default();
+    }
+    let full_simulations = full_simulations.max(1) as u32;
+    let mut fast = 0usize;
+    let mut policy_weight_sum = 0.0f32;
+    let mut value_weight_sum = 0.0f32;
+    for sample in samples {
+        fast += usize::from(sample.search_simulations > 0 && sample.search_simulations < full_simulations);
+        policy_weight_sum += sample.policy_weight.max(0.0);
+        value_weight_sum += sample.value_weight.max(0.0);
+    }
+    let denom = samples.len() as f32;
+    TrainBatchSourceStats {
+        fast_sample_rate: fast as f32 / denom,
+        policy_weight_mean: policy_weight_sum / denom,
+        value_weight_mean: value_weight_sum / denom,
+        recent_sample_rate: recent_samples.min(samples.len()) as f32 / denom,
     }
 }
 
@@ -1703,6 +1780,9 @@ fn main() {
                     games,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
+                    low_simulations: simulations,
+                    low_simulation_probability: 0.0,
+                    low_simulation_policy_weight: 1.0,
                     seed,
                     workers,
                     generation_update: 0,
@@ -1928,6 +2008,9 @@ fn main() {
                     games: batch_games,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
+                    low_simulations: simulations,
+                    low_simulation_probability: 0.0,
+                    low_simulation_policy_weight: 1.0,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
                     generation_update: 0,
@@ -2272,12 +2355,21 @@ fn main() {
             });
             let mut tb = SummaryWriter::new(&tb_dir);
             let opening_positions = load_opening_positions(&config.opening_fens_path);
+            let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
+                * config.train_epochs_per_update as f32)
+                / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} selfplay_samples_per_update={} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_sample_train_count={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} external_selfplay(exe={},depth={},workers={}) train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},updates={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} td_lambda={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
+                config.low_simulations,
+                config.low_simulation_probability,
+                config.low_simulation_policy_weight,
+                config.replay_recent_sample_fraction,
+                config.replay_recent_window_updates,
                 config.selfplay_samples_per_update,
+                effective_train_to_selfplay_ratio,
                 config.lr,
                 config.lr_min,
                 config.lr_decay_start_update,
@@ -2288,7 +2380,6 @@ fn main() {
                 config.train_warmup_samples,
                 config.train_samples_per_update,
                 config.train_epochs_per_update,
-                config.max_sample_train_count,
                 config.max_plies,
                 config.workers,
                 config.temperature_start,
@@ -2316,13 +2407,6 @@ fn main() {
                 config.mirror_probability,
                 config.deblunder_q_gap,
                 config.td_lambda,
-                if config.external_selfplay_exe.trim().is_empty() {
-                    "(none)"
-                } else {
-                    config.external_selfplay_exe.as_str()
-                },
-                config.external_selfplay_depth,
-                config.external_selfplay_workers,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
@@ -2343,14 +2427,8 @@ fn main() {
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
-            let external_workers = if config.external_selfplay_exe.trim().is_empty() {
-                0
-            } else {
-                config.external_selfplay_workers
-            };
-            let (selfplay_tx, selfplay_rx) = mpsc::sync_channel::<SelfplayBatch>(
-                (config.workers.max(1) + external_workers).max(1) * 2,
-            );
+            let (selfplay_tx, selfplay_rx) =
+                mpsc::sync_channel::<SelfplayBatch>(config.workers.max(1) * 2);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: 0,
@@ -2359,7 +2437,7 @@ fn main() {
             let mut arena_reference_model = initial_arena_reference_model;
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
-            let mut selfplay_handles = Vec::with_capacity(config.workers.max(1) + external_workers);
+            let mut selfplay_handles = Vec::with_capacity(config.workers.max(1));
             for worker_id in 0..config.workers.max(1) {
                 let selfplay_stop = stop_requested.clone();
                 let selfplay_config = config.clone();
@@ -2413,90 +2491,9 @@ fn main() {
                         let batch = SelfplayBatch {
                             data,
                             selfplay_seconds: started.elapsed().as_secs_f32(),
-                            source: SelfplaySource::Native,
                         };
                         if selfplay_tx.send(batch).is_err() {
                             break;
-                        }
-                        batch_index += 1;
-                    }
-                }));
-            }
-            for worker_id in 0..external_workers {
-                let selfplay_stop = stop_requested.clone();
-                let selfplay_config = config.clone();
-                let selfplay_opening_positions = opening_positions.clone();
-                let selfplay_tx = selfplay_tx.clone();
-                let shared_model = Arc::clone(&shared_model);
-                let selfplay_pause = Arc::clone(&selfplay_pause);
-                let external_exe = PathBuf::from(config.external_selfplay_exe.clone());
-                selfplay_handles.push(thread::spawn(move || {
-                    let mut batch_index = 0usize;
-                    let mut local_version = u64::MAX;
-                    let mut local_model = AzNnue::random_with_arch(
-                        selfplay_config.arch(),
-                        selfplay_config.seed ^ 0xE17E_4A1B_9ACD_55D5 ^ worker_id as u64,
-                    );
-                    while !selfplay_stop.load(Ordering::SeqCst) {
-                        {
-                            let (pause_lock, pause_cvar) = &*selfplay_pause;
-                            let mut pause_state = pause_lock
-                                .lock()
-                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                            while pause_state.is_paused() && !selfplay_stop.load(Ordering::SeqCst) {
-                                pause_state = pause_cvar
-                                    .wait(pause_state)
-                                    .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                            }
-                        }
-                        if selfplay_stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        {
-                            let shared = shared_model
-                                .read()
-                                .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                            if shared.version != local_version {
-                                local_model = shared.model.clone();
-                                local_version = shared.version;
-                            }
-                        }
-                        let batch_seed = selfplay_config.seed
-                            ^ 0xA6A6_31C9_F021_7B88
-                            ^ ((worker_id as u64).wrapping_add(1) << 32)
-                            ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        let loop_config = build_az_loop_config(
-                            &selfplay_config,
-                            batch_seed,
-                            1,
-                            local_version.min(u32::MAX as u64) as u32,
-                            &selfplay_opening_positions,
-                        );
-                        let started = Instant::now();
-                        match generate_external_selfplay_data(
-                            &local_model,
-                            &external_exe,
-                            selfplay_config.external_selfplay_depth,
-                            &loop_config,
-                        ) {
-                            Ok(data) => {
-                                let batch = SelfplayBatch {
-                                    data,
-                                    selfplay_seconds: started.elapsed().as_secs_f32(),
-                                    source: SelfplaySource::External,
-                                };
-                                if selfplay_tx.send(batch).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "external-selfplay: worker={} exe={} failed: {err}",
-                                    worker_id,
-                                    external_exe.display()
-                                );
-                                break;
-                            }
                         }
                         batch_index += 1;
                     }
@@ -2512,21 +2509,24 @@ fn main() {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
                 let mut pending = PendingTrainingData::default();
-                let mut total_source_counts = SelfplaySourceCounts::default();
+                let mut total_games_generated = 0usize;
+                let mut total_samples_generated = 0usize;
                 let mut train_index = 0usize;
                 let min_train_samples =
                     global_training_step_sample_count(trainer_config.batch_size);
                 'training: while let Ok(batch) = selfplay_rx.recv() {
                     if let Some(pool) = trainer_pool.as_mut() {
-                        pool.add_samples(batch.data.samples.clone());
+                        pool.add_games(batch.data.games.clone());
                     }
-                    total_source_counts.add_batch(&batch);
+                    total_games_generated += batch.data.games.len();
+                    total_samples_generated += batch.data.samples.len();
                     pending.push(batch);
                     while let Ok(batch) = selfplay_rx.try_recv() {
                         if let Some(pool) = trainer_pool.as_mut() {
-                            pool.add_samples(batch.data.samples.clone());
+                            pool.add_games(batch.data.games.clone());
                         }
-                        total_source_counts.add_batch(&batch);
+                        total_games_generated += batch.data.games.len();
+                        total_samples_generated += batch.data.samples.len();
                         pending.push(batch);
                     }
                     if trainer_stop.load(Ordering::SeqCst) {
@@ -2556,15 +2556,21 @@ fn main() {
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
                     );
-                    let train_data = pool.sample_uniform_marked_capped_by(
+                    let sampled_batch = pool.sample_mixed_recent(
                         trainer_config.train_samples_per_update,
-                        trainer_config.train_epochs_per_update as u32,
-                        trainer_config.max_sample_train_count,
+                        trainer_config.replay_recent_sample_fraction,
+                        trainer_config.replay_recent_window_updates,
                         &mut rng,
                     );
+                    let train_data = sampled_batch.samples;
                     if train_data.is_empty() {
                         continue;
                     }
+                    let train_source_stats = train_batch_source_stats(
+                        &train_data,
+                        trainer_config.simulations,
+                        sampled_batch.recent_samples,
+                    );
                     let train_update = trainer_start_update.saturating_add(train_index);
                     let current_lr = learning_rate_for_update(&trainer_config, train_update);
                     let train_started = Instant::now();
@@ -2583,13 +2589,16 @@ fn main() {
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
                         std::mem::take(&mut pending),
-                        total_source_counts,
+                        total_games_generated,
+                        total_samples_generated,
                         stats,
                         current_lr,
                         train_data.len(),
                         train_seconds,
                         pool.sample_count(),
                         pool.capacity(),
+                        pool.window_stats(),
+                        train_source_stats,
                     );
                     if trainer_tx
                         .send(TrainerEvent {
@@ -2603,9 +2612,10 @@ fn main() {
                     train_index += 1;
                     while let Ok(batch) = selfplay_rx.try_recv() {
                         if let Some(pool) = trainer_pool.as_mut() {
-                            pool.add_samples(batch.data.samples.clone());
+                            pool.add_games(batch.data.games.clone());
                         }
-                        total_source_counts.add_batch(&batch);
+                        total_games_generated += batch.data.games.len();
+                        total_samples_generated += batch.data.samples.len();
                         pending.push(batch);
                     }
                 }
@@ -2827,16 +2837,10 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} native={}/{} external={}/{} total_samples={} total_native={} total_external={} train_samples={} pool={}/{} fill={:.0}% R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} new_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
-                    report.native_games,
-                    report.native_samples,
-                    report.external_games,
-                    report.external_samples,
                     report.total_samples_generated,
-                    report.total_native_samples,
-                    report.total_external_samples,
                     report.train_samples,
                     report.pool_samples,
                     report.pool_capacity,
@@ -2845,11 +2849,22 @@ fn main() {
                     } else {
                         100.0 * report.pool_samples as f32 / report.pool_capacity as f32
                     },
+                    report.replay_chunks,
+                    report.replay_oldest_update,
+                    report.replay_newest_update,
+                    report.replay_window_updates,
+                    report.replay_newest_update_fraction,
+                    report.train_recent_sample_rate,
+                    report.train_fast_sample_rate,
+                    report.train_policy_weight_mean,
+                    report.train_value_weight_mean,
                     report.red_wins,
                     report.black_wins,
                     report.draws,
                     report.red_wins as f32 / report.games.max(1) as f32,
                     report.avg_plies,
+                    report.avg_search_simulations,
+                    report.low_simulation_rate,
                     report.loss,
                     report.value_loss,
                     value_rmse,
@@ -2929,27 +2944,46 @@ fn main() {
                 log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
                 log_scalar(
                     &mut tb,
-                    "selfplay/native_games",
+                    "selfplay/avg_search_simulations",
                     update,
-                    report.native_games as f32,
+                    report.avg_search_simulations,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/native_samples",
+                    "selfplay/low_simulation_rate",
                     update,
-                    report.native_samples as f32,
+                    report.low_simulation_rate,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/external_games",
+                    "train/train_to_selfplay_ratio",
                     update,
-                    report.external_games as f32,
+                    (config.train_samples_per_update as f32 * config.train_epochs_per_update as f32)
+                        / config.selfplay_samples_per_update.max(1) as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/external_samples",
+                    "train/fast_sample_rate",
                     update,
-                    report.external_samples as f32,
+                    report.train_fast_sample_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/recent_sample_rate",
+                    update,
+                    report.train_recent_sample_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/policy_weight_mean",
+                    update,
+                    report.train_policy_weight_mean,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/value_weight_mean",
+                    update,
+                    report.train_value_weight_mean,
                 );
                 log_scalar(
                     &mut tb,
@@ -2965,27 +2999,39 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/total_native_samples",
+                    "replay/chunks",
                     update,
-                    report.total_native_samples as f32,
+                    report.replay_chunks as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/total_native_games",
+                    "replay/oldest_update",
                     update,
-                    report.total_native_games as f32,
+                    report.replay_oldest_update as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/total_external_samples",
+                    "replay/newest_update",
                     update,
-                    report.total_external_samples as f32,
+                    report.replay_newest_update as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/total_external_games",
+                    "replay/avg_update",
                     update,
-                    report.total_external_games as f32,
+                    report.replay_avg_update,
+                );
+                log_scalar(
+                    &mut tb,
+                    "replay/window_updates",
+                    update,
+                    report.replay_window_updates as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "replay/newest_update_fraction",
+                    update,
+                    report.replay_newest_update_fraction,
                 );
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
                 log_scalar(
@@ -3510,8 +3556,597 @@ fn main() {
                 cpuct_at_root
             );
         }
+        Some(CliCommand::PikafishLabelRandom(cmd)) => {
+            run_pikafish_label_random(cmd)
+                .unwrap_or_else(|err| panic!("pikafish-label-random failed: {err}"));
+        }
+        Some(CliCommand::PikafishLabelEval(cmd)) => {
+            run_pikafish_label_eval(cmd)
+                .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
+        }
     };
     chineseai::profile::print_report();
+}
+
+#[derive(Clone, Debug)]
+struct PikafishLabelRow {
+    id: i64,
+    fen: String,
+    bestmove: String,
+    best_score_cp: Option<i32>,
+}
+
+#[derive(Default)]
+struct LabelEvalStats {
+    count: usize,
+    legal_bestmove: usize,
+    top1_hits: usize,
+    top2_hits: usize,
+    top4_hits: usize,
+    top8_hits: usize,
+    prior_top1_hits: usize,
+    value_q_sum: f64,
+    cp_tanh_sum: f64,
+    value_q_sq_sum: f64,
+    cp_tanh_sq_sum: f64,
+    value_cp_cross_sum: f64,
+    abs_value_error_sum: f64,
+}
+
+impl LabelEvalStats {
+    fn push_value_pair(&mut self, value_q: f32, score_cp: Option<i32>) {
+        let Some(score_cp) = score_cp else {
+            return;
+        };
+        let target = ((score_cp as f64) / 600.0).tanh();
+        let value = value_q as f64;
+        self.value_q_sum += value;
+        self.cp_tanh_sum += target;
+        self.value_q_sq_sum += value * value;
+        self.cp_tanh_sq_sum += target * target;
+        self.value_cp_cross_sum += value * target;
+        self.abs_value_error_sum += (value - target).abs();
+    }
+
+    fn value_count(&self) -> usize {
+        self.count
+    }
+
+    fn value_corr(&self) -> f64 {
+        let n = self.value_count() as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+        let cov = self.value_cp_cross_sum - self.value_q_sum * self.cp_tanh_sum / n;
+        let left = self.value_q_sq_sum - self.value_q_sum * self.value_q_sum / n;
+        let right = self.cp_tanh_sq_sum - self.cp_tanh_sum * self.cp_tanh_sum / n;
+        if left <= 0.0 || right <= 0.0 {
+            0.0
+        } else {
+            cov / (left * right).sqrt()
+        }
+    }
+}
+
+fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
+    let model = AzNnue::load(&cmd.model).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to load model `{}`: {err}", cmd.model),
+        )
+    })?;
+    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
+    let rows = load_pikafish_label_rows(&conn, cmd.limit).map_err(sqlite_io_error)?;
+    if rows.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no labels in {}", cmd.sqlite),
+        ));
+    }
+
+    let mut stats = LabelEvalStats::default();
+    let started = Instant::now();
+    for (offset, row) in rows.iter().enumerate() {
+        let position = Position::from_fen(&row.fen).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid FEN id={}: {err}", row.id),
+            )
+        })?;
+        let Some(label_move) = position.parse_uci_move(&row.bestmove) else {
+            continue;
+        };
+        stats.legal_bestmove += 1;
+        let result = alphazero_search(
+            &position,
+            &model,
+            fixed_az_search_limits(
+                cmd.simulations.max(1),
+                cmd.seed ^ row.id as u64,
+                cmd.cpuct.max(0.0),
+                cmd.max_depth,
+            ),
+        );
+        stats.count += 1;
+        if result.best_move == Some(label_move) {
+            stats.top1_hits += 1;
+        }
+        let mut by_visits = result.candidates.clone();
+        by_visits.sort_by(|left, right| {
+            right
+                .visits
+                .cmp(&left.visits)
+                .then_with(|| right.policy.total_cmp(&left.policy))
+        });
+        if by_visits.iter().take(2).any(|candidate| candidate.mv == label_move) {
+            stats.top2_hits += 1;
+        }
+        if by_visits.iter().take(4).any(|candidate| candidate.mv == label_move) {
+            stats.top4_hits += 1;
+        }
+        if by_visits.iter().take(8).any(|candidate| candidate.mv == label_move) {
+            stats.top8_hits += 1;
+        }
+        if result
+            .candidates
+            .iter()
+            .max_by(|left, right| left.policy.total_cmp(&right.policy))
+            .is_some_and(|candidate| candidate.mv == label_move)
+        {
+            stats.prior_top1_hits += 1;
+        }
+        stats.push_value_pair(result.value_q, row.best_score_cp);
+        if (offset + 1) % 100 == 0 || offset + 1 == rows.len() {
+            println!(
+                "pikafish-label-eval: searched {}/{}",
+                offset + 1,
+                rows.len()
+            );
+        }
+    }
+
+    let denom = stats.count.max(1) as f64;
+    println!(
+        "pikafish-label-eval: model={} sqlite={} positions={} legal_labels={} sims={} top1={:.3}% top2={:.3}% top4={:.3}% top8={:.3}% prior_top1={:.3}% value_corr={:.4} value_mae_tanh_cp={:.4} elapsed={:.1}s",
+        cmd.model,
+        cmd.sqlite,
+        stats.count,
+        stats.legal_bestmove,
+        cmd.simulations.max(1),
+        100.0 * stats.top1_hits as f64 / denom,
+        100.0 * stats.top2_hits as f64 / denom,
+        100.0 * stats.top4_hits as f64 / denom,
+        100.0 * stats.top8_hits as f64 / denom,
+        100.0 * stats.prior_top1_hits as f64 / denom,
+        stats.value_corr(),
+        stats.abs_value_error_sum / denom,
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
+fn load_pikafish_label_rows(
+    conn: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<PikafishLabelRow>> {
+    let mut query = "SELECT id, fen, bestmove, best_score_cp FROM pikafish_labels ORDER BY id"
+        .to_string();
+    if limit > 0 {
+        query.push_str(" LIMIT ?1");
+        let mut stmt = conn.prepare(&query)?;
+        stmt.query_map(params![limit as i64], |row| {
+            Ok(PikafishLabelRow {
+                id: row.get(0)?,
+                fen: row.get(1)?,
+                bestmove: row.get(2)?,
+                best_score_cp: row.get(3)?,
+            })
+        })?
+        .collect()
+    } else {
+        let mut stmt = conn.prepare(&query)?;
+        stmt.query_map([], |row| {
+            Ok(PikafishLabelRow {
+                id: row.get(0)?,
+                fen: row.get(1)?,
+                bestmove: row.get(2)?,
+                best_score_cp: row.get(3)?,
+            })
+        })?
+        .collect()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PikafishPv {
+    multipv: usize,
+    score_cp: Option<i32>,
+    mate: Option<i32>,
+    moves: Vec<String>,
+}
+
+struct PikafishLabelUci {
+    child: Child,
+    stdin: BufWriter<std::process::ChildStdin>,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl PikafishLabelUci {
+    fn spawn(exe: &Path) -> io::Result<Self> {
+        let mut child = Command::new(exe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = BufWriter::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("pikafish: missing stdin"))?,
+        );
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("pikafish: missing stdout"))?,
+        );
+        let mut out = Self {
+            child,
+            stdin,
+            stdout,
+        };
+        out.handshake()?;
+        Ok(out)
+    }
+
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        writeln!(self.stdin, "{line}")?;
+        self.stdin.flush()
+    }
+
+    fn read_line_into(&mut self, buf: &mut String) -> io::Result<usize> {
+        buf.clear();
+        self.stdout.read_line(buf)
+    }
+
+    fn handshake(&mut self) -> io::Result<()> {
+        self.write_line("uci")?;
+        self.wait_for("uciok")?;
+        self.write_line("isready")?;
+        self.wait_for("readyok")
+    }
+
+    fn wait_for(&mut self, token: &str) -> io::Result<()> {
+        let mut buf = String::new();
+        loop {
+            if self.read_line_into(&mut buf)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("pikafish: EOF before {token}"),
+                ));
+            }
+            if buf.trim() == token {
+                return Ok(());
+            }
+        }
+    }
+
+    fn query(&mut self, fen: &str, depth: u32) -> io::Result<(String, Vec<PikafishPv>)> {
+        self.write_line(&format!("position fen {fen}"))?;
+        self.write_line(&format!("go depth {}", depth.max(1)))?;
+        let mut buf = String::new();
+        let mut pvs = Vec::<PikafishPv>::new();
+        loop {
+            if self.read_line_into(&mut buf)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pikafish: EOF before bestmove",
+                ));
+            }
+            let line = buf.trim();
+            if let Some(rest) = line.strip_prefix("bestmove ") {
+                let bestmove = rest.split_whitespace().next().unwrap_or("").to_string();
+                pvs.sort_by_key(|pv| pv.multipv);
+                return Ok((bestmove, pvs));
+            }
+            if let Some(pv) = parse_pikafish_info_pv(line) {
+                if let Some(slot) = pvs.iter_mut().find(|old| old.multipv == pv.multipv) {
+                    *slot = pv;
+                } else {
+                    pvs.push(pv);
+                }
+            }
+        }
+    }
+
+    fn quit(&mut self) {
+        let _ = self.write_line("quit");
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for PikafishLabelUci {
+    fn drop(&mut self) {
+        self.quit();
+    }
+}
+
+fn parse_pikafish_info_pv(line: &str) -> Option<PikafishPv> {
+    if !line.starts_with("info ") || !line.contains(" pv ") {
+        return None;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let mut multipv = 1usize;
+    let mut score_cp = None;
+    let mut mate = None;
+    let mut moves = Vec::new();
+    let mut i = 0usize;
+    while i < parts.len() {
+        match parts[i] {
+            "multipv" if i + 1 < parts.len() => {
+                multipv = parts[i + 1].parse().ok()?;
+                i += 2;
+            }
+            "score" if i + 2 < parts.len() => {
+                match parts[i + 1] {
+                    "cp" => score_cp = parts[i + 2].parse().ok(),
+                    "mate" => mate = parts[i + 2].parse().ok(),
+                    _ => {}
+                }
+                i += 3;
+            }
+            "pv" => {
+                moves.extend(parts[i + 1..].iter().map(|item| (*item).to_string()));
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    (!moves.is_empty()).then_some(PikafishPv {
+        multipv,
+        score_cp,
+        mate,
+        moves,
+    })
+}
+
+fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
+    let fens_path = Path::new(&cmd.fens);
+    let output_path = Path::new(&cmd.output);
+    let sqlite_path = Path::new(&cmd.sqlite);
+    if cmd.regenerate || !fens_path.exists() {
+        let fens = generate_random_eval_fens(
+            cmd.count.max(1),
+            cmd.min_plies.min(cmd.max_plies),
+            cmd.min_plies.max(cmd.max_plies),
+            cmd.seed,
+        );
+        if let Some(parent) = fens_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(fens_path, format!("{}\n", fens.join("\n")))?;
+        println!(
+            "pikafish-label-random: generated {} fens -> {}",
+            fens.len(),
+            fens_path.display()
+        );
+    }
+
+    let fens_text = fs::read_to_string(fens_path)?;
+    let fens: Vec<String> = fens_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if fens.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no FENs in {}", fens_path.display()),
+        ));
+    }
+
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = sqlite_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pikafish_labels (
+            id INTEGER PRIMARY KEY,
+            fen TEXT NOT NULL UNIQUE,
+            side_to_move TEXT NOT NULL,
+            depth INTEGER NOT NULL,
+            bestmove TEXT NOT NULL,
+            best_score_cp INTEGER,
+            best_mate INTEGER,
+            best_pv TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
+    )
+    .map_err(sqlite_io_error)?;
+    migrate_pikafish_label_schema(&conn).map_err(sqlite_io_error)?;
+    let tx = conn.transaction().map_err(sqlite_io_error)?;
+    let mut writer = BufWriter::new(fs::File::create(output_path)?);
+    writeln!(
+        writer,
+        "index,fen,side_to_move,depth,bestmove,best_score_cp,best_mate,best_pv"
+    )?;
+
+    let mut engine = PikafishLabelUci::spawn(Path::new(&cmd.pikafish_exe))?;
+    for (index, fen) in fens.iter().enumerate() {
+        let position = Position::from_fen(fen).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid FEN at {}: {err}", index + 1),
+            )
+        })?;
+        let (bestmove, pvs) = engine.query(fen, cmd.depth.max(1))?;
+        let best = pvs.iter().find(|pv| pv.multipv == 1);
+        let best_pv = best.map(|pv| pv.moves.join(" ")).unwrap_or_default();
+        let side_to_move = match position.side_to_move() {
+            chineseai::xiangqi::Color::Red => "w",
+            chineseai::xiangqi::Color::Black => "b",
+        };
+        write!(
+            writer,
+            "{},{},{},{},{},{},{},{}",
+            index,
+            csv_escape(fen),
+            side_to_move,
+            cmd.depth.max(1),
+            csv_escape(&bestmove),
+            best.and_then(|pv| pv.score_cp)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            best.and_then(|pv| pv.mate)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            csv_escape(&best_pv)
+        )?;
+        writeln!(writer)?;
+        tx.execute(
+            "INSERT INTO pikafish_labels (
+                id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
+            ON CONFLICT(fen) DO UPDATE SET
+                side_to_move=excluded.side_to_move,
+                depth=excluded.depth,
+                bestmove=excluded.bestmove,
+                best_score_cp=excluded.best_score_cp,
+                best_mate=excluded.best_mate,
+                best_pv=excluded.best_pv,
+                updated_at=CURRENT_TIMESTAMP",
+            params![
+                index as i64,
+                fen,
+                side_to_move,
+                cmd.depth.max(1) as i64,
+                bestmove,
+                best.and_then(|pv| pv.score_cp).map(i64::from),
+                best.and_then(|pv| pv.mate).map(i64::from),
+                best_pv,
+            ],
+        )
+        .map_err(sqlite_io_error)?;
+        if (index + 1) % 100 == 0 || index + 1 == fens.len() {
+            println!(
+                "pikafish-label-random: labeled {}/{} -> {} {}",
+                index + 1,
+                fens.len(),
+                output_path.display(),
+                sqlite_path.display()
+            );
+        }
+    }
+    writer.flush()?;
+    tx.commit().map_err(sqlite_io_error)?;
+    Ok(())
+}
+
+fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
+fn migrate_pikafish_label_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pikafish_labels)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "multipv") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE pikafish_labels RENAME TO pikafish_labels_old;
+        CREATE TABLE pikafish_labels (
+            id INTEGER PRIMARY KEY,
+            fen TEXT NOT NULL UNIQUE,
+            side_to_move TEXT NOT NULL,
+            depth INTEGER NOT NULL,
+            bestmove TEXT NOT NULL,
+            best_score_cp INTEGER,
+            best_mate INTEGER,
+            best_pv TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT OR REPLACE INTO pikafish_labels (
+            id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
+        )
+        SELECT id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
+        FROM pikafish_labels_old;
+        DROP TABLE pikafish_labels_old;
+        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
+    )
+}
+
+fn generate_random_eval_fens(
+    count: usize,
+    min_plies: usize,
+    max_plies: usize,
+    seed: u64,
+) -> Vec<String> {
+    let mut rng = SplitMix64::new(seed);
+    let mut seen = HashSet::with_capacity(count * 2);
+    let mut out = Vec::with_capacity(count);
+    let mut attempts = 0usize;
+    let max_attempts = count.saturating_mul(200).max(10_000);
+    while out.len() < count && attempts < max_attempts {
+        attempts += 1;
+        let span = max_plies.saturating_sub(min_plies);
+        let target_plies = min_plies + (rng.next_u64() as usize % (span + 1));
+        if let Some(fen) = random_position_fen(target_plies, &mut rng)
+            && seen.insert(fen.clone())
+        {
+            out.push(fen);
+        }
+    }
+    if out.len() < count {
+        panic!(
+            "only generated {} unique random FENs after {} attempts",
+            out.len(),
+            attempts
+        );
+    }
+    out
+}
+
+fn random_position_fen(target_plies: usize, rng: &mut SplitMix64) -> Option<String> {
+    let mut position = Position::startpos();
+    let mut rule_history = position.initial_rule_history();
+    for _ in 0..target_plies {
+        if position.rule_outcome_with_history(&rule_history).is_some() {
+            return None;
+        }
+        let legal = position.legal_moves_with_rules(&rule_history);
+        if legal.is_empty() {
+            return None;
+        }
+        let mv: Move = legal[(rng.next_u64() as usize) % legal.len()];
+        rule_history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+    }
+    match position.rule_outcome_with_history(&rule_history) {
+        Some(RuleOutcome::Draw(_) | RuleOutcome::Win(_)) => None,
+        None if position.legal_moves_with_rules(&rule_history).is_empty() => None,
+        None => Some(position.to_fen()),
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn parse_position(text: &str) -> Position {

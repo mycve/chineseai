@@ -115,6 +115,8 @@ pub(super) struct PackedBatch {
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
+    pub policy_weights: Vec<f32>,
+    pub value_weights: Vec<f32>,
 }
 
 impl PackedBatch {
@@ -159,6 +161,8 @@ impl PackedBatch {
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
+            policy_weights: vec![1.0f32; batch_size],
+            value_weights: vec![1.0f32; batch_size],
         };
 
         for (row, &sample_index) in batch.iter().enumerate() {
@@ -169,6 +173,8 @@ impl PackedBatch {
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.moves_left[row] = sample.moves_left.max(0.0);
+            packed.policy_weights[row] = sample.policy_weight.max(0.0);
+            packed.value_weights[row] = sample.value_weight.max(0.0);
         }
         packed
     }
@@ -367,6 +373,9 @@ mod tests {
             value: 2.0,
             side_sign: 1.0,
             moves_left: -1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
     }

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 22;
+const REPLAY_FILE_VERSION: u32 = 25;
 /// 解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
@@ -81,6 +82,9 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
     replay_push_f32(out, sample.moves_left);
+    replay_push_f32(out, sample.policy_weight);
+    replay_push_f32(out, sample.value_weight);
+    replay_push_u32(out, sample.search_simulations);
     replay_push_u32(out, sample.meta.generation_update);
     replay_push_u64(out, sample.meta.game_id);
     replay_push_u32(out, sample.meta.ply as u32);
@@ -98,13 +102,56 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
 #[derive(Clone, Debug)]
 struct ReplayEntry {
     sample: AzTrainingSample,
-    train_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayChunk {
+    generation_update: u32,
+    entries: Vec<ReplayEntry>,
+}
+
+impl ReplayChunk {
+    fn new(samples: Vec<AzTrainingSample>) -> Self {
+        let generation_update = samples
+            .first()
+            .map(|sample| sample.meta.generation_update)
+            .unwrap_or(0);
+        let entries = samples
+            .into_iter()
+            .map(|sample| ReplayEntry { sample })
+            .collect();
+        Self {
+            generation_update,
+            entries,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzReplayWindowStats {
+    pub chunks: usize,
+    pub samples: usize,
+    pub oldest_generation_update: u32,
+    pub newest_generation_update: u32,
+    pub avg_generation_update: f32,
+    pub window_updates: u32,
+    pub newest_update_sample_fraction: f32,
+    pub recent_window_sample_fraction: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AzReplaySampleBatch {
+    pub samples: Vec<AzTrainingSample>,
+    pub recent_samples: usize,
+    pub full_window_samples: usize,
 }
 
 fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()> {
-    encode_az_training_sample(out, &entry.sample)?;
-    replay_push_u32(out, entry.train_count);
-    Ok(())
+    encode_az_training_sample(out, &entry.sample)
 }
 
 fn decode_az_training_sample<R: Read>(
@@ -151,6 +198,9 @@ fn decode_az_training_sample<R: Read>(
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     let moves_left = replay_read_f32(reader)?;
+    let policy_weight = replay_read_f32(reader)?;
+    let value_weight = replay_read_f32(reader)?;
+    let search_simulations = replay_read_u32(reader)?;
     let meta = AzSampleMeta {
         generation_update: replay_read_u32(reader)?,
         game_id: replay_read_u64(reader)?,
@@ -172,34 +222,31 @@ fn decode_az_training_sample<R: Read>(
         value,
         side_sign,
         moves_left,
+        policy_weight,
+        value_weight,
+        search_simulations,
         meta,
     })
 }
 
 fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
     let sample = decode_az_training_sample(reader, version)?;
-    let train_count = replay_read_u32(reader)?;
-    Ok(ReplayEntry {
-        sample,
-        train_count,
-    })
+    Ok(ReplayEntry { sample })
 }
 
 #[derive(Clone, Debug)]
 pub struct AzExperiencePool {
     capacity: usize,
-    samples: Vec<ReplayEntry>,
-    next: usize,
-    train_count_sum: u64,
+    chunks: VecDeque<ReplayChunk>,
+    sample_count: usize,
 }
 
 impl AzExperiencePool {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            samples: Vec::with_capacity(capacity),
-            next: 0,
-            train_count_sum: 0,
+            chunks: VecDeque::new(),
+            sample_count: 0,
         }
     }
 
@@ -208,135 +255,203 @@ impl AzExperiencePool {
     }
 
     pub fn sample_count(&self) -> usize {
-        self.samples.len()
-    }
-
-    pub fn average_train_count(&self) -> f32 {
-        if self.samples.is_empty() {
-            0.0
-        } else {
-            self.train_count_sum as f32 / self.samples.len() as f32
-        }
+        self.sample_count
     }
 
     pub fn add_samples<I>(&mut self, samples: I)
     where
         I: IntoIterator<Item = AzTrainingSample>,
     {
+        self.add_chunk(samples.into_iter().collect());
+    }
+
+    fn add_chunk(&mut self, samples: Vec<AzTrainingSample>) {
         if self.capacity == 0 {
             return;
         }
-        for sample in samples {
-            let entry = ReplayEntry {
-                sample,
-                train_count: 0,
+        if samples.is_empty() {
+            return;
+        }
+        let mut chunk = ReplayChunk::new(samples);
+        if chunk.len() > self.capacity {
+            let start = chunk.len() - self.capacity;
+            chunk.entries.drain(0..start);
+        }
+        self.sample_count += chunk.len();
+        self.chunks.push_back(chunk);
+        self.prune_to_capacity();
+    }
+
+    fn prune_to_capacity(&mut self) {
+        while self.sample_count > self.capacity {
+            let Some(chunk) = self.chunks.pop_front() else {
+                self.sample_count = 0;
+                return;
             };
-            if self.samples.len() < self.capacity {
-                self.samples.push(entry);
-            } else {
-                let old = std::mem::replace(&mut self.samples[self.next], entry);
-                self.train_count_sum = self.train_count_sum.saturating_sub(old.train_count as u64);
-                self.next = (self.next + 1) % self.capacity;
-            }
+            self.sample_count = self.sample_count.saturating_sub(chunk.len());
         }
     }
 
     pub fn add_games(&mut self, games: Vec<Vec<AzTrainingSample>>) {
-        self.add_samples(games.into_iter().flatten());
+        for game in games {
+            self.add_chunk(game);
+        }
     }
 
-    pub fn sample_uniform_marked(
-        &mut self,
-        count: usize,
-        rng: &mut SplitMix64,
-    ) -> Vec<AzTrainingSample> {
-        self.sample_uniform_marked_capped(count, 0, rng)
-    }
-
-    pub fn sample_uniform_marked_capped(
-        &mut self,
-        count: usize,
-        max_train_count: u32,
-        rng: &mut SplitMix64,
-    ) -> Vec<AzTrainingSample> {
-        self.sample_uniform_marked_capped_by(count, 1, max_train_count, rng)
-    }
-
-    pub fn sample_uniform_marked_capped_by(
-        &mut self,
-        count: usize,
-        train_count_increment: u32,
-        max_train_count: u32,
-        rng: &mut SplitMix64,
-    ) -> Vec<AzTrainingSample> {
-        if self.samples.is_empty() || count == 0 {
+    pub fn sample_uniform(&self, count: usize, rng: &mut SplitMix64) -> Vec<AzTrainingSample> {
+        if self.sample_count == 0 || count == 0 {
             return Vec::new();
         }
-        let train_count_increment = train_count_increment.max(1);
         let mut out = Vec::with_capacity(count);
-        while out.len() < count && !self.samples.is_empty() {
-            let index = (rng.next_u64() as usize) % self.samples.len();
-            let entry = &mut self.samples[index];
-            entry.train_count = entry.train_count.saturating_add(train_count_increment);
-            self.train_count_sum = self
-                .train_count_sum
-                .saturating_add(train_count_increment as u64);
-            out.push(entry.sample.clone());
-            if max_train_count > 0 && entry.train_count >= max_train_count {
-                self.remove_entry(index);
+        for _ in 0..count {
+            let mut index = (rng.next_u64() as usize) % self.sample_count;
+            for chunk in &self.chunks {
+                if index < chunk.len() {
+                    out.push(chunk.entries[index].sample.clone());
+                    break;
+                }
+                index -= chunk.len();
             }
         }
         out
     }
 
-    fn remove_entry(&mut self, index: usize) {
-        if index >= self.samples.len() {
-            return;
+    pub fn sample_mixed_recent(
+        &self,
+        count: usize,
+        recent_fraction: f32,
+        recent_window_updates: u32,
+        rng: &mut SplitMix64,
+    ) -> AzReplaySampleBatch {
+        if self.sample_count == 0 || count == 0 {
+            return AzReplaySampleBatch::default();
         }
-        let removed = self.samples.swap_remove(index);
-        self.train_count_sum = self
-            .train_count_sum
-            .saturating_sub(removed.train_count as u64);
-        if self.samples.is_empty() {
-            self.next = 0;
-        } else if self.next >= self.samples.len() {
-            self.next %= self.samples.len();
+        let recent_indices = self.recent_flat_indices(recent_window_updates.max(1));
+        if recent_indices.is_empty() {
+            return AzReplaySampleBatch {
+                samples: self.sample_uniform(count, rng),
+                recent_samples: 0,
+                full_window_samples: count,
+            };
+        }
+        let recent_target = ((count as f32) * recent_fraction.clamp(0.0, 1.0)).round() as usize;
+        let recent_target = recent_target.min(count);
+        let mut samples = Vec::with_capacity(count);
+        for _ in 0..recent_target {
+            let flat = recent_indices[(rng.next_u64() as usize) % recent_indices.len()];
+            samples.push(self.sample_by_flat_index(flat));
+        }
+        let full_count = count - recent_target;
+        samples.extend(self.sample_uniform(full_count, rng));
+        AzReplaySampleBatch {
+            samples,
+            recent_samples: recent_target,
+            full_window_samples: full_count,
         }
     }
 
-    pub fn sample_uniform(&self, count: usize, rng: &mut SplitMix64) -> Vec<AzTrainingSample> {
-        if self.samples.is_empty() || count == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            let index = (rng.next_u64() as usize) % self.samples.len();
-            out.push(self.samples[index].sample.clone());
+    fn recent_flat_indices(&self, recent_window_updates: u32) -> Vec<usize> {
+        let newest = self
+            .chunks
+            .back()
+            .map(|chunk| chunk.generation_update)
+            .unwrap_or(0);
+        let oldest_recent = newest.saturating_sub(recent_window_updates.saturating_sub(1));
+        let mut out = Vec::new();
+        let mut flat = 0usize;
+        for chunk in &self.chunks {
+            if chunk.generation_update >= oldest_recent {
+                out.extend(flat..flat + chunk.len());
+            }
+            flat += chunk.len();
         }
         out
     }
 
+    fn sample_by_flat_index(&self, mut index: usize) -> AzTrainingSample {
+        for chunk in &self.chunks {
+            if index < chunk.len() {
+                return chunk.entries[index].sample.clone();
+            }
+            index -= chunk.len();
+        }
+        self.chunks
+            .back()
+            .and_then(|chunk| chunk.entries.last())
+            .expect("non-empty replay pool")
+            .sample
+            .clone()
+    }
+
     pub fn all_samples(&self) -> Vec<AzTrainingSample> {
-        self.samples
+        self.chunks
             .iter()
+            .flat_map(|chunk| chunk.entries.iter())
             .map(|entry| entry.sample.clone())
             .collect()
     }
 
     pub fn all_sample_groups(&self) -> Vec<Vec<AzTrainingSample>> {
-        self.samples
+        self.chunks
             .iter()
-            .map(|entry| vec![entry.sample.clone()])
+            .map(|chunk| {
+                chunk
+                    .entries
+                    .iter()
+                    .map(|entry| entry.sample.clone())
+                    .collect()
+            })
             .collect()
+    }
+
+    pub fn window_stats(&self) -> AzReplayWindowStats {
+        if self.sample_count == 0 {
+            return AzReplayWindowStats::default();
+        }
+        let oldest = self
+            .chunks
+            .front()
+            .map(|chunk| chunk.generation_update)
+            .unwrap_or(0);
+        let newest = self
+            .chunks
+            .back()
+            .map(|chunk| chunk.generation_update)
+            .unwrap_or(0);
+        let mut weighted_sum = 0u64;
+        let mut by_update = BTreeMap::<u32, usize>::new();
+        for chunk in &self.chunks {
+            weighted_sum += chunk.generation_update as u64 * chunk.len() as u64;
+            *by_update.entry(chunk.generation_update).or_default() += chunk.len();
+        }
+        let newest_samples = by_update.get(&newest).copied().unwrap_or(0);
+        let recent_oldest = newest.saturating_sub(2);
+        let recent_samples = by_update
+            .iter()
+            .filter_map(|(&update, &count)| (update >= recent_oldest).then_some(count))
+            .sum::<usize>();
+        AzReplayWindowStats {
+            chunks: self.chunks.len(),
+            samples: self.sample_count,
+            oldest_generation_update: oldest,
+            newest_generation_update: newest,
+            avg_generation_update: weighted_sum as f32 / self.sample_count as f32,
+            window_updates: newest.saturating_sub(oldest).saturating_add(1),
+            newest_update_sample_fraction: newest_samples as f32 / self.sample_count as f32,
+            recent_window_sample_fraction: recent_samples as f32 / self.sample_count as f32,
+        }
     }
 
     fn encode_replay_payload(&self) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         replay_push_u64(&mut out, self.capacity as u64);
-        replay_push_u64(&mut out, self.next as u64);
-        replay_push_u64(&mut out, self.samples.len() as u64);
-        for entry in &self.samples {
-            encode_replay_entry(&mut out, entry)?;
+        replay_push_u64(&mut out, self.chunks.len() as u64);
+        for chunk in &self.chunks {
+            replay_push_u32(&mut out, chunk.generation_update);
+            replay_push_u64(&mut out, chunk.entries.len() as u64);
+            for entry in &chunk.entries {
+                encode_replay_entry(&mut out, entry)?;
+            }
         }
         Ok(out)
     }
@@ -344,45 +459,46 @@ impl AzExperiencePool {
     fn decode_replay_payload(data: &[u8], capacity: usize, version: u32) -> io::Result<Self> {
         let mut reader = Cursor::new(data);
         let _stored_capacity = replay_read_u64(&mut reader)? as usize;
-        let stored_next = replay_read_u64(&mut reader)? as usize;
-        let n_samples = replay_read_u64(&mut reader)? as usize;
-        if n_samples > 100_000_000 {
+        let n_chunks = replay_read_u64(&mut reader)? as usize;
+        if n_chunks > 10_000_000 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "replay decode: absurd sample count",
+                "replay decode: absurd chunk count",
             ));
         }
 
-        let mut entries: Vec<ReplayEntry> = Vec::with_capacity(n_samples.min(capacity));
-        let mut train_count_sum = 0u64;
-        for _ in 0..n_samples {
-            let entry = decode_replay_entry(&mut reader, version)?;
-            if capacity == 0 {
-                continue;
+        let mut pool = Self::new(capacity);
+        for _ in 0..n_chunks {
+            let generation_update = replay_read_u32(&mut reader)?;
+            let n_entries = replay_read_u64(&mut reader)? as usize;
+            if n_entries > 10_000_000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "replay decode: absurd chunk size",
+                ));
             }
-            if entries.len() == capacity {
-                let removed = entries.remove(0);
-                train_count_sum = train_count_sum.saturating_sub(removed.train_count as u64);
+            let mut entries = Vec::with_capacity(n_entries.min(capacity));
+            for _ in 0..n_entries {
+                let entry = decode_replay_entry(&mut reader, version)?;
+                if capacity > 0 {
+                    entries.push(entry);
+                }
             }
-            train_count_sum = train_count_sum.saturating_add(entry.train_count as u64);
-            entries.push(entry);
+            if capacity > 0 && !entries.is_empty() {
+                pool.sample_count += entries.len();
+                pool.chunks.push_back(ReplayChunk {
+                    generation_update,
+                    entries,
+                });
+                pool.prune_to_capacity();
+            }
         }
 
-        let next = if entries.len() < capacity || capacity == 0 {
-            entries.len()
-        } else {
-            stored_next % capacity
-        };
-        Ok(Self {
-            capacity,
-            samples: entries,
-            next,
-            train_count_sum,
-        })
+        Ok(pool)
     }
 
     pub fn save_snapshot_lz4(&self, path: &Path) -> io::Result<()> {
-        if self.capacity == 0 || self.samples.is_empty() {
+        if self.capacity == 0 || self.sample_count == 0 {
             let _ = fs::remove_file(path);
             return Ok(());
         }

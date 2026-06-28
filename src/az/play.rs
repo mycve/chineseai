@@ -1,6 +1,3 @@
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -44,6 +41,21 @@ pub struct AzTerminalStats {
     pub resign_red: usize,
     pub resign_black: usize,
     pub max_plies: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzSearchSimulationStats {
+    pub searches: usize,
+    pub low_searches: usize,
+    pub simulations_sum: usize,
+}
+
+impl AzSearchSimulationStats {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.searches += other.searches;
+        self.low_searches += other.low_searches;
+        self.simulations_sum += other.simulations_sum;
+    }
 }
 
 impl AzTerminalStats {
@@ -175,6 +187,7 @@ pub struct AzSelfplayData {
     pub best_q_sum: f32,
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
+    pub search_simulations: AzSearchSimulationStats,
 }
 
 impl AzSelfplayData {
@@ -215,6 +228,7 @@ impl AzSelfplayData {
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
+        self.search_simulations.add_assign(&other.search_simulations);
     }
 }
 
@@ -280,6 +294,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.best_q_sum += chunk.best_q_sum;
         merged.played_q_sum += chunk.played_q_sum;
         merged.terminal.add_assign(&chunk.terminal);
+        merged.search_simulations.add_assign(&chunk.search_simulations);
     }
     merged
 }
@@ -322,6 +337,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut best_q_sum = 0.0f32;
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
+    let mut search_simulations = AzSearchSimulationStats::default();
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -351,6 +367,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
+            let search_simulation_count = search_simulations_for_ply(config, &mut rng);
+            search_simulations.searches += 1;
+            search_simulations.simulations_sum += search_simulation_count;
+            search_simulations.low_searches +=
+                usize::from(search_simulation_count < config.simulations);
             let search = alphazero_search_with_history_and_rules(
                 &position,
                 &history,
@@ -358,7 +379,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 Some(legal),
                 model,
                 AzSearchLimits {
-                    simulations: config.simulations,
+                    simulations: search_simulation_count,
                     seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
                     cpuct: config.cpuct,
                     cpuct_at_root: config.cpuct_at_root,
@@ -424,6 +445,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
+                    search_simulation_count,
+                    policy_weight_for_search(config, search_simulation_count),
                 ));
                 result = Some(if position.side_to_move() == Color::Red {
                     terminal.resign_red += 1;
@@ -498,6 +521,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 config.policy_softmax_temp,
                 rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                 move_meta.sample,
+                search_simulation_count,
+                policy_weight_for_search(config, search_simulation_count),
             ));
             append_history(&mut history, &position, mv);
             rule_history.push(position.rule_history_entry_after_move(mv));
@@ -594,6 +619,28 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         best_q_sum,
         played_q_sum,
         terminal,
+        search_simulations,
+    }
+}
+
+fn search_simulations_for_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> usize {
+    let high = config.simulations.max(1);
+    let low = config.low_simulations.max(1).min(high);
+    if low >= high {
+        return high;
+    }
+    if rng.unit_f32() < config.low_simulation_probability.clamp(0.0, 1.0) {
+        low
+    } else {
+        high
+    }
+}
+
+fn policy_weight_for_search(config: &AzLoopConfig, search_simulations: usize) -> f32 {
+    if search_simulations < config.simulations.max(1) {
+        config.low_simulation_policy_weight.max(0.0)
+    } else {
+        1.0
     }
 }
 
@@ -659,6 +706,8 @@ fn make_training_sample(
     policy_softmax_temp: f32,
     mirror_file: bool,
     meta: AzSampleMeta,
+    search_simulations: usize,
+    policy_weight: f32,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
@@ -696,6 +745,9 @@ fn make_training_sample(
         value: value.clamp(-1.0, 1.0),
         side_sign,
         moves_left: 0.0,
+        policy_weight: policy_weight.max(0.0),
+        value_weight: 1.0,
+        search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
     }
 }
@@ -811,387 +863,6 @@ fn assign_value_targets(
     config: &AzLoopConfig,
 ) {
     assign_td_lambda_value_targets(samples, game_result_red, config.td_lambda);
-}
-
-struct ExternalUci {
-    child: Child,
-    stdin: BufWriter<std::process::ChildStdin>,
-    stdout: BufReader<std::process::ChildStdout>,
-}
-
-impl ExternalUci {
-    fn spawn(exe: &Path) -> io::Result<Self> {
-        let mut child = Command::new(exe)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = BufWriter::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("external uci: missing stdin"))?,
-        );
-        let stdout = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| io::Error::other("external uci: missing stdout"))?,
-        );
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-        })
-    }
-
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
-        writeln!(self.stdin, "{line}")?;
-        self.stdin.flush()
-    }
-
-    fn read_line_into(&mut self, buf: &mut String) -> io::Result<usize> {
-        buf.clear();
-        self.stdout.read_line(buf)
-    }
-
-    fn handshake(&mut self) -> io::Result<()> {
-        self.write_line("uci")?;
-        let mut buf = String::new();
-        loop {
-            if self.read_line_into(&mut buf)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "external uci: EOF before uciok",
-                ));
-            }
-            if buf.trim() == "uciok" {
-                break;
-            }
-        }
-        self.write_line("isready")?;
-        loop {
-            if self.read_line_into(&mut buf)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "external uci: EOF before readyok",
-                ));
-            }
-            if buf.trim() == "readyok" {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn query_move(
-        &mut self,
-        initial_fen: Option<&str>,
-        moves_uci: &[String],
-        depth: u32,
-    ) -> io::Result<String> {
-        let mut pos_cmd = if let Some(fen) = initial_fen {
-            format!("position fen {fen}")
-        } else {
-            "position startpos".to_string()
-        };
-        if !moves_uci.is_empty() {
-            pos_cmd.push_str(" moves ");
-            pos_cmd.push_str(&moves_uci.join(" "));
-        }
-        self.write_line(&pos_cmd)?;
-        self.write_line(&format!("go depth {}", depth.max(1)))?;
-        let mut buf = String::new();
-        loop {
-            if self.read_line_into(&mut buf)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "external uci: EOF before bestmove",
-                ));
-            }
-            let line = buf.trim();
-            if let Some(rest) = line.strip_prefix("bestmove ") {
-                return Ok(rest.split_whitespace().next().unwrap_or("").to_string());
-            }
-        }
-    }
-}
-
-fn generate_external_selfplay_chunk(
-    model: &AzNnue,
-    external: &mut ExternalUci,
-    engine_depth: u32,
-    config: &AzLoopConfig,
-) -> AzSelfplayData {
-    let mut rng = SplitMix64::new(config.seed);
-    let mut out = AzSelfplayData::default();
-
-    for game_index in 0..config.games {
-        let mut position = if config.opening_positions.is_empty() {
-            Position::startpos()
-        } else {
-            let index = (rng.next_u64() as usize) % config.opening_positions.len();
-            config.opening_positions[index].clone()
-        };
-        let initial_fen =
-            (position.to_fen() != crate::xiangqi::STARTPOS_FEN).then(|| position.to_fen());
-        let model_plays_red = rng.unit_f32() < 0.5;
-        let mut history = Vec::new();
-        let mut rule_history = position.initial_rule_history();
-        let mut moves_uci = Vec::new();
-        let mut game_samples = Vec::new();
-        let mut deblunder_events = Vec::new();
-        let mut result = None;
-        let mut plies = 0usize;
-
-        for ply in 0..config.max_plies {
-            plies = ply + 1;
-            let legal = position.legal_moves_with_rules(&rule_history);
-            if legal.is_empty() {
-                result = Some(if position.side_to_move() == Color::Red {
-                    -1.0
-                } else {
-                    1.0
-                });
-                out.terminal.no_legal_moves += 1;
-                break;
-            }
-
-            let side = position.side_to_move();
-            let model_to_move = (model_plays_red && side == Color::Red)
-                || (!model_plays_red && side == Color::Black);
-            let mv = if model_to_move {
-                let search = alphazero_search_with_history_and_rules(
-                    &position,
-                    &history,
-                    Some(rule_history.clone()),
-                    Some(legal),
-                    model,
-                    AzSearchLimits {
-                        simulations: config.simulations,
-                        seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                        cpuct: config.cpuct,
-                        cpuct_at_root: config.cpuct_at_root,
-                        cpuct_base: config.cpuct_base,
-                        cpuct_factor: config.cpuct_factor,
-                        cpuct_base_at_root: config.cpuct_base_at_root,
-                        cpuct_factor_at_root: config.cpuct_factor_at_root,
-                        max_depth: 0,
-                        root_dirichlet_alpha: config.root_dirichlet_alpha,
-                        root_exploration_fraction: config.root_exploration_fraction,
-                        fpu_value: config.fpu_value,
-                        fpu_value_at_root: config.fpu_value_at_root,
-                        draw_score: config.draw_score,
-                        moves_left_max_effect: config.moves_left_max_effect,
-                        moves_left_slope: config.moves_left_slope,
-                        moves_left_threshold: config.moves_left_threshold,
-                        moves_left_constant_factor: config.moves_left_constant_factor,
-                        moves_left_scaled_factor: config.moves_left_scaled_factor,
-                        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-                        value_scale: 1.0,
-                    },
-                );
-                let entropy = policy_entropy(&search.candidates);
-                let shape = policy_shape_stats(&search.candidates);
-                out.raw_prior_top1_sum += shape.raw_prior_top1;
-                out.raw_prior_top2_sum += shape.raw_prior_top2;
-                out.policy_top1_sum += shape.policy_top1;
-                out.policy_top2_sum += shape.policy_top2;
-                out.q_gap_sum += shape.q_gap;
-                out.q_top1_abs_sum += shape.q_top1_abs;
-                out.visited_actions_sum += shape.visited_actions;
-                out.shape_count += 1;
-                out.entropy_all_sum += entropy;
-                out.entropy_all_count += 1;
-                if ply < temperature_opening_plies(config) {
-                    out.entropy_opening_sum += entropy;
-                    out.entropy_opening_count += 1;
-                    out.opening_raw_prior_top1_sum += shape.raw_prior_top1;
-                    out.opening_raw_prior_top2_sum += shape.raw_prior_top2;
-                    out.opening_policy_top1_sum += shape.policy_top1;
-                    out.opening_policy_top2_sum += shape.policy_top2;
-                    out.opening_q_gap_sum += shape.q_gap;
-                    out.opening_q_top1_abs_sum += shape.q_top1_abs;
-                    out.opening_visited_actions_sum += shape.visited_actions;
-                    out.opening_shape_count += 1;
-                } else {
-                    out.entropy_mid_sum += entropy;
-                    out.entropy_mid_count += 1;
-                }
-
-                let temperature = temperature_for_ply(config, ply);
-                let mv = if temperature <= 1e-6 {
-                    search.best_move.or_else(|| {
-                        choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
-                    })
-                } else {
-                    choose_selfplay_move(
-                        &search.candidates,
-                        temperature,
-                        config.temperature_value_cutoff,
-                        config.temperature_visit_offset,
-                        &mut rng,
-                    )
-                };
-                let Some(mv) = mv else {
-                    result = Some(0.0);
-                    break;
-                };
-                let move_meta = move_search_meta(
-                    &search.candidates,
-                    mv,
-                    search.value_q,
-                    config.generation_update,
-                    config.seed ^ game_index as u64,
-                    ply,
-                    config.deblunder_q_gap,
-                );
-                out.sampled_moves += 1;
-                out.sampled_best_moves +=
-                    usize::from(move_meta.sample.best_index == move_meta.sample.played_index);
-                out.deblundered_moves += usize::from(move_meta.sample.deblundered);
-                out.best_played_q_gap_sum +=
-                    (move_meta.sample.best_q - move_meta.sample.played_q).max(0.0);
-                let top_visits = search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.visits)
-                    .max()
-                    .unwrap_or(0);
-                out.played_top_visit_ratio_sum += if top_visits == 0 {
-                    0.0
-                } else {
-                    move_meta.sample.played_visits as f32 / top_visits as f32
-                };
-                out.best_q_sum += move_meta.sample.best_q;
-                out.played_q_sum += move_meta.sample.played_q;
-                let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
-                if let Some(best_q) = move_meta.deblunder_boundary_q {
-                    deblunder_events.push(DeblunderEvent {
-                        sample_index: game_samples.len(),
-                        boundary_red: (best_q * side_sign).clamp(-1.0, 1.0),
-                    });
-                }
-                game_samples.push(make_training_sample(
-                    &position,
-                    &history,
-                    &search.candidates,
-                    search.value_q,
-                    config.policy_softmax_temp,
-                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-                    move_meta.sample,
-                ));
-                mv
-            } else {
-                let token =
-                    match external.query_move(initial_fen.as_deref(), &moves_uci, engine_depth) {
-                        Ok(token) => token,
-                        Err(_) => {
-                            result = Some(if side == Color::Red { -1.0 } else { 1.0 });
-                            break;
-                        }
-                    };
-                if token.is_empty() || token == "(none)" || token == "0000" {
-                    result = Some(if side == Color::Red { -1.0 } else { 1.0 });
-                    break;
-                }
-                let Some(parsed) = position.parse_uci_move(&token) else {
-                    result = Some(if side == Color::Red { -1.0 } else { 1.0 });
-                    break;
-                };
-                if !position
-                    .legal_moves_with_rules(&rule_history)
-                    .contains(&parsed)
-                {
-                    result = Some(if side == Color::Red { -1.0 } else { 1.0 });
-                    break;
-                }
-                parsed
-            };
-
-            append_history(&mut history, &position, mv);
-            rule_history.push(position.rule_history_entry_after_move(mv));
-            position.make_move(mv);
-            moves_uci.push(mv.to_string());
-
-            if !position.has_general(Color::Red) {
-                result = Some(-1.0);
-                out.terminal.red_general_missing += 1;
-                break;
-            }
-            if !position.has_general(Color::Black) {
-                result = Some(1.0);
-                out.terminal.black_general_missing += 1;
-                break;
-            }
-            if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
-                result = Some(match rule_outcome {
-                    RuleOutcome::Draw(_) => 0.0,
-                    RuleOutcome::Win(Color::Red) => 1.0,
-                    RuleOutcome::Win(Color::Black) => -1.0,
-                });
-                record_rule_terminal(&mut out.terminal, rule_outcome);
-                break;
-            }
-        }
-        if result.is_none() {
-            out.terminal.max_plies += 1;
-        }
-
-        let result: f32 = result.unwrap_or(0.0);
-        match result.total_cmp(&0.0) {
-            std::cmp::Ordering::Greater => out.red_wins += 1,
-            std::cmp::Ordering::Less => out.black_wins += 1,
-            std::cmp::Ordering::Equal => out.draws += 1,
-        }
-        out.plies_total += plies;
-        assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
-        assign_moves_left_targets(&mut game_samples, config.max_plies);
-        out.samples.extend(game_samples.clone());
-        out.games.push(game_samples);
-    }
-
-    out
-}
-
-fn record_rule_terminal(terminal: &mut AzTerminalStats, rule_outcome: RuleOutcome) {
-    match rule_outcome {
-        RuleOutcome::Draw(reason) => {
-            terminal.rule_draw += 1;
-            match reason {
-                RuleDrawReason::Halfmove120 => terminal.rule_draw_halfmove120 += 1,
-                RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
-                RuleDrawReason::MutualLongCheck => terminal.rule_draw_mutual_long_check += 1,
-                RuleDrawReason::MutualLongChase => terminal.rule_draw_mutual_long_chase += 1,
-            }
-        }
-        RuleOutcome::Win(Color::Red) => terminal.rule_win_red += 1,
-        RuleOutcome::Win(Color::Black) => terminal.rule_win_black += 1,
-    }
-}
-
-impl Drop for ExternalUci {
-    fn drop(&mut self) {
-        let _ = self.write_line("quit");
-        let _ = self.child.wait();
-    }
-}
-
-pub fn generate_external_selfplay_data(
-    model: &AzNnue,
-    engine_exe: &Path,
-    engine_depth: u32,
-    config: &AzLoopConfig,
-) -> io::Result<AzSelfplayData> {
-    let mut external = ExternalUci::spawn(engine_exe)?;
-    external.handshake()?;
-    let _ = external.write_line("ucinewgame");
-    Ok(generate_external_selfplay_chunk(
-        model,
-        &mut external,
-        engine_depth,
-        config,
-    ))
 }
 
 fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
@@ -1572,6 +1243,9 @@ mod tests {
             value,
             side_sign,
             moves_left: 0.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
     }
@@ -1581,6 +1255,9 @@ mod tests {
             games: 1,
             max_plies: 100,
             simulations: 1,
+            low_simulations: 1,
+            low_simulation_probability: 0.0,
+            low_simulation_policy_weight: 1.0,
             seed: 1,
             workers: 1,
             generation_update: 0,
@@ -1650,6 +1327,8 @@ mod tests {
             1.45,
             true,
             AzSampleMeta::default(),
+            1,
+            1.0,
         );
 
         let mirrored_position = position.mirror_files();

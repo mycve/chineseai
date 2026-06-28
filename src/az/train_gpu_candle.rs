@@ -634,12 +634,13 @@ impl GpuReplica {
         let value_error = (&value - &batch_tensors.values)?;
         let value_sse = value_error.sqr()?.sum_all()?;
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
-        let value_ce = value_ce_per_sample.sum(1)?;
-        let value_ce = value_ce.sum_all()?;
+        let value_ce_per_sample = value_ce_per_sample.sum(1)?;
+        let value_ce = value_ce_per_sample.sum_all()?;
         let moves_left_pred = tensor_softplus(&forward.moves_left_logits)?.squeeze(1)?;
         let moves_left_error =
             (&tensor_log1p(&moves_left_pred)? - &tensor_log1p(&batch_tensors.moves_left)?)?;
-        let moves_left_sse = moves_left_error.sqr()?.sum_all()?;
+        let moves_left_sse_per_sample = moves_left_error.sqr()?;
+        let moves_left_sse = moves_left_sse_per_sample.sum_all()?;
 
         let legal_policy_logits = forward
             .policy_logits
@@ -649,9 +650,18 @@ impl GpuReplica {
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce_per_sample = policy_ce_per_sample.sum(1)?;
         let policy_ce = policy_ce_per_sample.sum_all()?;
-        let weighted_value_loss = (&value_ce * value_weight.max(0.0) as f64)?;
-        let weighted_policy_ce = (&policy_ce * policy_weight.max(0.0) as f64)?;
-        let weighted_moves_left_loss = (&moves_left_sse * MOVES_LEFT_AUX_WEIGHT as f64)?;
+        let weighted_value_loss = value_ce_per_sample
+            .broadcast_mul(&batch_tensors.value_weights)?
+            .sum_all()?
+            .affine(value_weight.max(0.0) as f64, 0.0)?;
+        let weighted_policy_ce = policy_ce_per_sample
+            .broadcast_mul(&batch_tensors.policy_weights)?
+            .sum_all()?
+            .affine(policy_weight.max(0.0) as f64, 0.0)?;
+        let weighted_moves_left_loss = moves_left_sse_per_sample
+            .broadcast_mul(&batch_tensors.value_weights)?
+            .sum_all()?
+            .affine(MOVES_LEFT_AUX_WEIGHT as f64, 0.0)?;
         let loss_sum = (weighted_value_loss + weighted_policy_ce + weighted_moves_left_loss)?;
         let loss_tensor = (loss_sum / global_batch_len as f64)?;
 

@@ -7,6 +7,9 @@ pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 pub struct AzLoopFileConfig {
     pub model_path: String,
     pub simulations: usize,
+    pub low_simulations: usize,
+    pub low_simulation_probability: f32,
+    pub low_simulation_policy_weight: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -46,16 +49,14 @@ pub struct AzLoopFileConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
+    pub replay_recent_sample_fraction: f32,
+    pub replay_recent_window_updates: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
-    pub max_sample_train_count: u32,
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
     pub td_lambda: f32,
-    pub external_selfplay_exe: String,
-    pub external_selfplay_depth: u32,
-    pub external_selfplay_workers: usize,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -77,8 +78,11 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 800,
-            selfplay_samples_per_update: 60000,
+            simulations: 512,
+            low_simulations: 256,
+            low_simulation_probability: 0.35,
+            low_simulation_policy_weight: 0.35,
+            selfplay_samples_per_update: 120000,
             lr: 0.001,
             lr_min: 0.0001,
             lr_decay_start_update: 800,
@@ -116,17 +120,15 @@ impl Default for AzLoopFileConfig {
             opening_fens_path: String::new(),
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
-            replay_capacity: 500000,
-            train_warmup_samples: 300000,
+            replay_capacity: 2000000,
+            replay_recent_sample_fraction: 0.4,
+            replay_recent_window_updates: 3,
+            train_warmup_samples: 240000,
             train_samples_per_update: 120000,
-            train_epochs_per_update: 2,
-            max_sample_train_count: 3,
+            train_epochs_per_update: 1,
             mirror_probability: 0.3,
             deblunder_q_gap: 0.15,
             td_lambda: 0.95,
-            external_selfplay_exe: String::new(),
-            external_selfplay_depth: 10,
-            external_selfplay_workers: 0,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -151,6 +153,9 @@ impl Default for AzLoopFileConfig {
 struct AzLoopTomlConfig {
     pub model_path: String,
     pub simulations: usize,
+    pub low_simulations: usize,
+    pub low_simulation_probability: f32,
+    pub low_simulation_policy_weight: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -190,16 +195,14 @@ struct AzLoopTomlConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
+    pub replay_recent_sample_fraction: f32,
+    pub replay_recent_window_updates: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
-    pub max_sample_train_count: u32,
     pub mirror_probability: f32,
     pub deblunder_q_gap: f32,
     pub td_lambda: f32,
-    pub external_selfplay_exe: String,
-    pub external_selfplay_depth: u32,
-    pub external_selfplay_workers: usize,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -240,6 +243,9 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
         Self {
             model_path: config.model_path.clone(),
             simulations: config.simulations,
+            low_simulations: config.low_simulations,
+            low_simulation_probability: config.low_simulation_probability,
+            low_simulation_policy_weight: config.low_simulation_policy_weight,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -279,16 +285,14 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
+            replay_recent_sample_fraction: config.replay_recent_sample_fraction,
+            replay_recent_window_updates: config.replay_recent_window_updates,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
-            max_sample_train_count: config.max_sample_train_count,
             mirror_probability: config.mirror_probability,
             deblunder_q_gap: config.deblunder_q_gap,
             td_lambda: config.td_lambda,
-            external_selfplay_exe: config.external_selfplay_exe.clone(),
-            external_selfplay_depth: config.external_selfplay_depth,
-            external_selfplay_workers: config.external_selfplay_workers,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -319,6 +323,9 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
         Self {
             model_path: config.model_path,
             simulations: config.simulations,
+            low_simulations: config.low_simulations,
+            low_simulation_probability: config.low_simulation_probability,
+            low_simulation_policy_weight: config.low_simulation_policy_weight,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -358,16 +365,14 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
+            replay_recent_sample_fraction: config.replay_recent_sample_fraction,
+            replay_recent_window_updates: config.replay_recent_window_updates,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
-            max_sample_train_count: config.max_sample_train_count,
             mirror_probability: config.mirror_probability,
             deblunder_q_gap: config.deblunder_q_gap,
             td_lambda: config.td_lambda,
-            external_selfplay_exe: config.external_selfplay_exe,
-            external_selfplay_depth: config.external_selfplay_depth,
-            external_selfplay_workers: config.external_selfplay_workers,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -414,6 +419,15 @@ impl AzLoopFileConfig {
         }
         line!("model_path", q(&self.model_path));
         line!("simulations", self.simulations);
+        line!("low_simulations", self.low_simulations);
+        line!(
+            "low_simulation_probability",
+            f(self.low_simulation_probability)
+        );
+        line!(
+            "low_simulation_policy_weight",
+            f(self.low_simulation_policy_weight)
+        );
         line!(
             "selfplay_samples_per_update",
             self.selfplay_samples_per_update
@@ -468,16 +482,20 @@ impl AzLoopFileConfig {
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
         line!("replay_capacity", self.replay_capacity);
+        line!(
+            "replay_recent_sample_fraction",
+            f(self.replay_recent_sample_fraction)
+        );
+        line!(
+            "replay_recent_window_updates",
+            self.replay_recent_window_updates
+        );
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("train_epochs_per_update", self.train_epochs_per_update);
-        line!("max_sample_train_count", self.max_sample_train_count);
         line!("mirror_probability", f(self.mirror_probability));
         line!("deblunder_q_gap", f(self.deblunder_q_gap));
         line!("td_lambda", f(self.td_lambda));
-        line!("external_selfplay_exe", q(&self.external_selfplay_exe));
-        line!("external_selfplay_depth", self.external_selfplay_depth);
-        line!("external_selfplay_workers", self.external_selfplay_workers);
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
@@ -513,6 +531,9 @@ impl AzLoopFileConfig {
 
     fn normalize(mut self) -> Self {
         self.simulations = self.simulations.max(1);
+        self.low_simulations = self.low_simulations.max(1).min(self.simulations);
+        self.low_simulation_probability = self.low_simulation_probability.clamp(0.0, 1.0);
+        self.low_simulation_policy_weight = self.low_simulation_policy_weight.max(0.0);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
         self.lr_min = self.lr_min.max(0.0).min(self.lr);
@@ -544,6 +565,8 @@ impl AzLoopFileConfig {
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
+        self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
+        self.replay_recent_window_updates = self.replay_recent_window_updates.max(1);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
@@ -551,7 +574,6 @@ impl AzLoopFileConfig {
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.deblunder_q_gap = self.deblunder_q_gap.max(0.0);
         self.td_lambda = self.td_lambda.clamp(0.0, 1.0);
-        self.external_selfplay_depth = self.external_selfplay_depth.max(1);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
@@ -607,9 +629,6 @@ mod tests {
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("deblunder_q_gap = 0.15\n"));
         assert!(text.contains("td_lambda = 0.95\n"));
-        assert!(text.contains("external_selfplay_exe = \"\"\n"));
-        assert!(text.contains("external_selfplay_depth = 10\n"));
-        assert!(text.contains("external_selfplay_workers = 0\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
@@ -627,9 +646,6 @@ mod tests {
         assert!((parsed.lr - 0.001).abs() < 1e-9);
         assert!((parsed.deblunder_q_gap - 0.15).abs() < 1e-6);
         assert!((parsed.td_lambda - 0.95).abs() < 1e-6);
-        assert_eq!(parsed.external_selfplay_exe, "");
-        assert_eq!(parsed.external_selfplay_depth, 10);
-        assert_eq!(parsed.external_selfplay_workers, 0);
     }
 }
 

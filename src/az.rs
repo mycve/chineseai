@@ -36,10 +36,10 @@ pub use alphazero::{
     alphazero_search_with_history_and_rules, cp_from_q,
 };
 pub use play::{
-    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_external_selfplay_data,
-    generate_selfplay_data, play_arena_games_from_positions,
+    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
+    play_arena_games_from_positions,
 };
-pub use replay::AzExperiencePool;
+pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
@@ -575,6 +575,9 @@ pub struct AzLoopConfig {
     pub games: usize,
     pub max_plies: usize,
     pub simulations: usize,
+    pub low_simulations: usize,
+    pub low_simulation_probability: f32,
+    pub low_simulation_policy_weight: f32,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
@@ -614,16 +617,10 @@ pub struct AzLoopConfig {
 pub struct AzLoopReport {
     pub games: usize,
     pub samples: usize,
-    pub native_games: usize,
-    pub native_samples: usize,
-    pub external_games: usize,
-    pub external_samples: usize,
     pub total_games_generated: usize,
     pub total_samples_generated: usize,
-    pub total_native_games: usize,
-    pub total_native_samples: usize,
-    pub total_external_games: usize,
-    pub total_external_samples: usize,
+    pub avg_search_simulations: f32,
+    pub low_simulation_rate: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -672,6 +669,16 @@ pub struct AzLoopReport {
     pub train_samples: usize,
     pub pool_samples: usize,
     pub pool_capacity: usize,
+    pub replay_chunks: usize,
+    pub replay_oldest_update: u32,
+    pub replay_newest_update: u32,
+    pub replay_avg_update: f32,
+    pub replay_window_updates: u32,
+    pub replay_newest_update_fraction: f32,
+    pub train_fast_sample_rate: f32,
+    pub train_policy_weight_mean: f32,
+    pub train_value_weight_mean: f32,
+    pub train_recent_sample_rate: f32,
     pub terminal_no_legal_moves: usize,
     pub terminal_red_general_missing: usize,
     pub terminal_black_general_missing: usize,
@@ -769,6 +776,9 @@ pub struct AzTrainingSample {
     pub value: f32,
     pub side_sign: f32,
     pub moves_left: f32,
+    pub policy_weight: f32,
+    pub value_weight: f32,
+    pub search_simulations: u32,
     pub meta: AzSampleMeta,
 }
 
@@ -1839,6 +1849,9 @@ pub fn benchmark_training(
             value,
             side_sign: 1.0,
             moves_left: 0.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
             meta: AzSampleMeta::default(),
         });
         if index + 1 == sample_count {
@@ -2211,6 +2224,9 @@ fn generate_policy_fit_samples(
             value: value.clamp(-1.0, 1.0),
             side_sign: if side == Color::Red { 1.0 } else { -1.0 },
             moves_left: 0.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
             meta: AzSampleMeta::default(),
         });
     }
@@ -2907,7 +2923,8 @@ fn dense_move_index(mv: Move) -> usize {
 
 #[cfg(test)]
 fn replay_pool_test_fixture() -> AzExperiencePool {
-    let sample = AzTrainingSample {
+    fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
+        AzTrainingSample {
         features: vec![1, 2, 3],
         move_indices: vec![0, 1],
         policy: vec![0.6, 0.4],
@@ -2915,10 +2932,13 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
         value: 0.1,
         side_sign: 1.0,
         moves_left: 0.0,
+        policy_weight: 1.0,
+        value_weight: 1.0,
+        search_simulations: 0,
         meta: AzSampleMeta {
-            generation_update: 7,
-            game_id: 42,
-            ply: 9,
+            generation_update: update,
+            game_id,
+            ply,
             root_q: 0.11,
             best_q: 0.33,
             played_q: 0.02,
@@ -2928,9 +2948,13 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             played_index: 0,
             deblundered: true,
         },
-    };
+    }
+    }
     let mut pool = AzExperiencePool::new(100);
-    pool.add_games(vec![vec![sample.clone()], vec![sample.clone(), sample]]);
+    pool.add_games(vec![
+        vec![sample(7, 42, 9)],
+        vec![sample(7, 43, 1), sample(7, 43, 2)],
+    ]);
     pool
 }
 
@@ -3037,6 +3061,9 @@ mod tests {
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3047,6 +3074,9 @@ mod tests {
                 value: 0.5,
                 side_sign: -1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
         ];
@@ -3068,6 +3098,9 @@ mod tests {
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3078,6 +3111,9 @@ mod tests {
                 value: 0.5,
                 side_sign: -1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
         ];
@@ -3099,6 +3135,9 @@ mod tests {
                 value: 0.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3109,6 +3148,9 @@ mod tests {
                 value: 0.0,
                 side_sign: -1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
         ];
@@ -3166,6 +3208,9 @@ mod tests {
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3176,6 +3221,9 @@ mod tests {
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3186,6 +3234,9 @@ mod tests {
                 value: 0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3196,6 +3247,9 @@ mod tests {
                 value: -0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
         ];
@@ -3220,6 +3274,9 @@ mod tests {
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3230,6 +3287,9 @@ mod tests {
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3240,6 +3300,9 @@ mod tests {
                 value: 0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3250,6 +3313,9 @@ mod tests {
                 value: -0.5,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
         ];
@@ -3288,6 +3354,9 @@ mod tests {
                 value: 1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3298,6 +3367,9 @@ mod tests {
                 value: -1.0,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3308,6 +3380,9 @@ mod tests {
                 value: 0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
@@ -3318,6 +3393,9 @@ mod tests {
                 value: -0.75,
                 side_sign: 1.0,
                 moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
                 meta: AzSampleMeta::default(),
             },
         ];
@@ -3421,5 +3499,84 @@ mod tests {
         assert!((loaded_samples[0].meta.best_q - 0.33).abs() < 1e-6);
         assert_eq!(loaded_samples[0].meta.played_visits, 13);
         assert!(loaded_samples[0].meta.deblundered);
+    }
+
+    #[test]
+    fn replay_pool_prunes_whole_game_chunks() {
+        fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
+            AzTrainingSample {
+                features: vec![1],
+                move_indices: vec![0],
+                policy: vec![1.0],
+                value_wdl: scalar_value_to_wdl_target(0.0),
+                value: 0.0,
+                side_sign: 1.0,
+                moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
+                meta: AzSampleMeta {
+                    generation_update: update,
+                    game_id,
+                    ply,
+                    ..AzSampleMeta::default()
+                },
+            }
+        }
+
+        let mut pool = AzExperiencePool::new(4);
+        pool.add_games(vec![
+            vec![sample(1, 1, 0), sample(1, 1, 1)],
+            vec![sample(2, 2, 0), sample(2, 2, 1)],
+            vec![sample(3, 3, 0), sample(3, 3, 1)],
+        ]);
+
+        let stats = pool.window_stats();
+        assert_eq!(pool.sample_count(), 4);
+        assert_eq!(stats.chunks, 2);
+        assert_eq!(stats.oldest_generation_update, 2);
+        assert_eq!(stats.newest_generation_update, 3);
+        assert_eq!(stats.window_updates, 2);
+        assert!((stats.newest_update_sample_fraction - 0.5).abs() < 1e-6);
+        assert_eq!(pool.all_sample_groups().len(), 2);
+    }
+
+    #[test]
+    fn replay_pool_mixed_recent_sampling_uses_requested_recent_fraction() {
+        fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
+            AzTrainingSample {
+                features: vec![1],
+                move_indices: vec![0],
+                policy: vec![1.0],
+                value_wdl: scalar_value_to_wdl_target(0.0),
+                value: 0.0,
+                side_sign: 1.0,
+                moves_left: 0.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
+                meta: AzSampleMeta {
+                    generation_update: update,
+                    game_id,
+                    ply,
+                    ..AzSampleMeta::default()
+                },
+            }
+        }
+
+        let mut pool = AzExperiencePool::new(12);
+        for update in 1..=4 {
+            pool.add_games(vec![vec![
+                sample(update, update as u64, 0),
+                sample(update, update as u64, 1),
+                sample(update, update as u64, 2),
+            ]]);
+        }
+        let mut rng = SplitMix64::new(123);
+        let batch = pool.sample_mixed_recent(10, 0.4, 2, &mut rng);
+
+        assert_eq!(batch.samples.len(), 10);
+        assert_eq!(batch.recent_samples, 4);
+        assert_eq!(batch.full_window_samples, 6);
     }
 }
