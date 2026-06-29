@@ -4,9 +4,10 @@ use candle_nn::ops::log_softmax;
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_HEADS, PIECE_ATTENTION_SIZE,
     PIECE_ATTENTION_TOTAL_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
-    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features,
-    policy_move_sparse_indices, policy_move_to_features, policy_move_transposed_sparse_indices,
+    POLICY_TOWER_BLOCKS, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE,
+    STRUCTURAL_RANK_SIZE, TRUNK_INNER_MULT, VALUE_HEAD_SIZE, VALUE_TOWER_BLOCKS, WDL_HEAD_SIZE,
+    dataloader::PackedBatch, policy_move_from_features, policy_move_sparse_indices,
+    policy_move_to_features, policy_move_transposed_sparse_indices,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
@@ -25,6 +26,12 @@ pub(super) struct AzCandleModel {
     piece_attention_query: Var,
     piece_attention_value: Var,
     piece_attention_output: Var,
+    policy_tower_hidden: Var,
+    policy_tower_bias: Var,
+    policy_tower_output: Var,
+    value_tower_hidden: Var,
+    value_tower_bias: Var,
+    value_tower_output: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
@@ -127,8 +134,57 @@ impl AzCandleModel {
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
+        let trunk_inner = hidden_size * TRUNK_INNER_MULT;
+        let mut policy_hidden = hidden.clone();
+        for block in 0..POLICY_TOWER_BLOCKS {
+            let tower_hidden =
+                self.policy_tower_hidden
+                    .narrow(0, block * trunk_inner, trunk_inner)?;
+            let tower_bias = self
+                .policy_tower_bias
+                .narrow(0, block * trunk_inner, trunk_inner)?;
+            let tower_output =
+                self.policy_tower_output
+                    .narrow(0, block * hidden_size, hidden_size)?;
+            let tower = policy_hidden
+                .matmul(&tower_hidden.t()?)?
+                .broadcast_add(&tower_bias)?
+                .silu()?;
+            let residual = tower.matmul(&tower_output.t()?)?;
+            policy_hidden = (policy_hidden + residual)?;
+            let tower_rms = policy_hidden
+                .sqr()?
+                .mean_keepdim(1)?
+                .affine(1.0, RMS_NORM_EPS)?
+                .sqrt()?;
+            policy_hidden = policy_hidden.broadcast_div(&tower_rms)?;
+        }
+        let mut value_hidden = hidden.clone();
+        for block in 0..VALUE_TOWER_BLOCKS {
+            let tower_hidden =
+                self.value_tower_hidden
+                    .narrow(0, block * trunk_inner, trunk_inner)?;
+            let tower_bias = self
+                .value_tower_bias
+                .narrow(0, block * trunk_inner, trunk_inner)?;
+            let tower_output =
+                self.value_tower_output
+                    .narrow(0, block * hidden_size, hidden_size)?;
+            let tower = value_hidden
+                .matmul(&tower_hidden.t()?)?
+                .broadcast_add(&tower_bias)?
+                .silu()?;
+            let residual = tower.matmul(&tower_output.t()?)?;
+            value_hidden = (value_hidden + residual)?;
+            let tower_rms = value_hidden
+                .sqr()?
+                .mean_keepdim(1)?
+                .affine(1.0, RMS_NORM_EPS)?
+                .sqrt()?;
+            value_hidden = value_hidden.broadcast_div(&tower_rms)?;
+        }
 
-        let value_head = hidden
+        let value_head = value_hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
@@ -137,7 +193,7 @@ impl AzCandleModel {
             .broadcast_add(&self.value_head_bias2)?
             .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
-        let moves_left_head = hidden
+        let moves_left_head = value_hidden
             .matmul(&self.moves_left_hidden.t()?)?
             .broadcast_add(&self.moves_left_bias_hidden)?
             .relu()?;
@@ -145,16 +201,16 @@ impl AzCandleModel {
             .matmul(&self.moves_left_output.reshape((VALUE_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
         let policy_bias = self.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
-        let policy_from_scores = hidden.matmul(&self.policy_from_hidden.t()?)?;
-        let policy_to_scores = hidden.matmul(&self.policy_to_hidden.t()?)?;
+        let policy_from_scores = policy_hidden.matmul(&self.policy_from_hidden.t()?)?;
+        let policy_to_scores = policy_hidden.matmul(&self.policy_to_hidden.t()?)?;
         let policy_from_logits = policy_from_scores.matmul(&self.policy_move_from_features.t()?)?;
         let policy_to_logits = policy_to_scores.matmul(&self.policy_move_to_features.t()?)?;
-        let policy_pair_context = hidden
+        let policy_pair_context = policy_hidden
             .matmul(&self.policy_pair_context_hidden.t()?)?
             .broadcast_add(&self.policy_pair_context_bias)?
             .relu()?;
         let policy_pair_logits = policy_pair_context.matmul(&self.policy_pair_embedding.t()?)?;
-        let policy_move_context = hidden.matmul(&self.policy_move_context_hidden.t()?)?;
+        let policy_move_context = policy_hidden.matmul(&self.policy_move_context_hidden.t()?)?;
         let policy_move_logits = policy_move_context.matmul(&self.policy_move_embedding.t()?)?;
         let token_from_to_logits = square_tokens
             .flatten_to(1)?
@@ -339,6 +395,36 @@ impl AzCandleModel {
                 (hidden, PIECE_ATTENTION_TOTAL_SIZE),
                 device,
             )?,
+            policy_tower_hidden: var_from_slice(
+                &model.policy_tower_hidden,
+                (POLICY_TOWER_BLOCKS * TRUNK_INNER_MULT * hidden, hidden),
+                device,
+            )?,
+            policy_tower_bias: var_from_slice(
+                &model.policy_tower_bias,
+                POLICY_TOWER_BLOCKS * TRUNK_INNER_MULT * hidden,
+                device,
+            )?,
+            policy_tower_output: var_from_slice(
+                &model.policy_tower_output,
+                (POLICY_TOWER_BLOCKS * hidden, TRUNK_INNER_MULT * hidden),
+                device,
+            )?,
+            value_tower_hidden: var_from_slice(
+                &model.value_tower_hidden,
+                (VALUE_TOWER_BLOCKS * TRUNK_INNER_MULT * hidden, hidden),
+                device,
+            )?,
+            value_tower_bias: var_from_slice(
+                &model.value_tower_bias,
+                VALUE_TOWER_BLOCKS * TRUNK_INNER_MULT * hidden,
+                device,
+            )?,
+            value_tower_output: var_from_slice(
+                &model.value_tower_output,
+                (VALUE_TOWER_BLOCKS * hidden, TRUNK_INNER_MULT * hidden),
+                device,
+            )?,
             value_head_hidden: var_from_slice(
                 &model.value_head_hidden,
                 (VALUE_HEAD_SIZE, hidden),
@@ -448,6 +534,12 @@ impl AzCandleModel {
         vars.push(self.piece_attention_query.clone());
         vars.push(self.piece_attention_value.clone());
         vars.push(self.piece_attention_output.clone());
+        vars.push(self.policy_tower_hidden.clone());
+        vars.push(self.policy_tower_bias.clone());
+        vars.push(self.policy_tower_output.clone());
+        vars.push(self.value_tower_hidden.clone());
+        vars.push(self.value_tower_bias.clone());
+        vars.push(self.value_tower_output.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_hidden2.clone());
@@ -492,6 +584,12 @@ impl AzCandleModel {
             &self.piece_attention_output,
             &mut model.piece_attention_output,
         )?;
+        copy_var(&self.policy_tower_hidden, &mut model.policy_tower_hidden)?;
+        copy_var(&self.policy_tower_bias, &mut model.policy_tower_bias)?;
+        copy_var(&self.policy_tower_output, &mut model.policy_tower_output)?;
+        copy_var(&self.value_tower_hidden, &mut model.value_tower_hidden)?;
+        copy_var(&self.value_tower_bias, &mut model.value_tower_bias)?;
+        copy_var(&self.value_tower_output, &mut model.value_tower_output)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_hidden2, &mut model.value_head_hidden2)?;

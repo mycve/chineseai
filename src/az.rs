@@ -48,6 +48,9 @@ pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
+pub(super) const POLICY_TOWER_BLOCKS: usize = 2;
+pub(super) const VALUE_TOWER_BLOCKS: usize = 1;
+pub(super) const TRUNK_INNER_MULT: usize = 2;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 const PIECE_ATTENTION_HEADS: usize = 1;
@@ -164,6 +167,30 @@ macro_rules! az_weight_tensors {
         $visit!(piece_attention_query, [PIECE_ATTENTION_HEADS, $h]);
         $visit!(piece_attention_value, [PIECE_ATTENTION_TOTAL_SIZE, $h]);
         $visit!(piece_attention_output, [$h, PIECE_ATTENTION_TOTAL_SIZE]);
+        $visit!(
+            policy_tower_hidden,
+            [POLICY_TOWER_BLOCKS * TRUNK_INNER_MULT * $h, $h]
+        );
+        $visit!(
+            policy_tower_bias,
+            [POLICY_TOWER_BLOCKS * TRUNK_INNER_MULT * $h]
+        );
+        $visit!(
+            policy_tower_output,
+            [POLICY_TOWER_BLOCKS * $h, TRUNK_INNER_MULT * $h]
+        );
+        $visit!(
+            value_tower_hidden,
+            [VALUE_TOWER_BLOCKS * TRUNK_INNER_MULT * $h, $h]
+        );
+        $visit!(
+            value_tower_bias,
+            [VALUE_TOWER_BLOCKS * TRUNK_INNER_MULT * $h]
+        );
+        $visit!(
+            value_tower_output,
+            [VALUE_TOWER_BLOCKS * $h, TRUNK_INNER_MULT * $h]
+        );
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_hidden2, [VALUE_HEAD_SIZE, VALUE_HEAD_SIZE]);
@@ -236,6 +263,9 @@ pub(super) struct AzEvalScratch {
     attention_values: Vec<f32>,
     attention_context: Vec<f32>,
     attention_token: Vec<f32>,
+    trunk: Vec<f32>,
+    policy_hidden: Vec<f32>,
+    value_hidden: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
 }
@@ -257,6 +287,9 @@ impl AzEvalScratch {
             attention_values: Vec::with_capacity(64 * PIECE_ATTENTION_SIZE),
             attention_context: vec![0.0; PIECE_ATTENTION_TOTAL_SIZE],
             attention_token: vec![0.0; hidden_size],
+            trunk: vec![0.0; hidden_size * TRUNK_INNER_MULT],
+            policy_hidden: vec![0.0; hidden_size],
+            value_hidden: vec![0.0; hidden_size],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -507,6 +540,12 @@ pub struct AzNnue {
     pub piece_attention_query: Vec<f32>,
     pub piece_attention_value: Vec<f32>,
     pub piece_attention_output: Vec<f32>,
+    pub policy_tower_hidden: Vec<f32>,
+    pub policy_tower_bias: Vec<f32>,
+    pub policy_tower_output: Vec<f32>,
+    pub value_tower_hidden: Vec<f32>,
+    pub value_tower_bias: Vec<f32>,
+    pub value_tower_output: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_hidden2: Vec<f32>,
@@ -545,6 +584,12 @@ impl Clone for AzNnue {
             piece_attention_query: self.piece_attention_query.clone(),
             piece_attention_value: self.piece_attention_value.clone(),
             piece_attention_output: self.piece_attention_output.clone(),
+            policy_tower_hidden: self.policy_tower_hidden.clone(),
+            policy_tower_bias: self.policy_tower_bias.clone(),
+            policy_tower_output: self.policy_tower_output.clone(),
+            value_tower_hidden: self.value_tower_hidden.clone(),
+            value_tower_bias: self.value_tower_bias.clone(),
+            value_tower_output: self.value_tower_output.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_hidden2: self.value_head_hidden2.clone(),
@@ -883,6 +928,21 @@ impl AzNnue {
         // Sparse attention starts as an exact residual no-op. Training can then
         // open the output gate without perturbing the first self-play games.
         let piece_attention_output = vec![0.0; hidden_size * PIECE_ATTENTION_TOTAL_SIZE];
+        let trunk_inner = hidden_size * TRUNK_INNER_MULT;
+        let policy_tower_hidden = (0..POLICY_TOWER_BLOCKS * trunk_inner * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
+            .collect();
+        let policy_tower_bias = vec![0.0; POLICY_TOWER_BLOCKS * trunk_inner];
+        let policy_tower_output = (0..POLICY_TOWER_BLOCKS * hidden_size * trunk_inner)
+            .map(|_| rng.weight((2.0 / trunk_inner.max(1) as f32).sqrt() * 0.1))
+            .collect();
+        let value_tower_hidden = (0..VALUE_TOWER_BLOCKS * trunk_inner * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
+            .collect();
+        let value_tower_bias = vec![0.0; VALUE_TOWER_BLOCKS * trunk_inner];
+        let value_tower_output = (0..VALUE_TOWER_BLOCKS * hidden_size * trunk_inner)
+            .map(|_| rng.weight((2.0 / trunk_inner.max(1) as f32).sqrt() * 0.1))
+            .collect();
         // Start value-neutral. A random value head can evaluate startpos as a
         // large red/black advantage before any training, and MCTS amplifies
         // that noise into the first self-play dataset.
@@ -935,6 +995,12 @@ impl AzNnue {
             piece_attention_query,
             piece_attention_value,
             piece_attention_output,
+            policy_tower_hidden,
+            policy_tower_bias,
+            policy_tower_output,
+            value_tower_hidden,
+            value_tower_bias,
+            value_tower_output,
             value_head_hidden,
             value_head_bias,
             value_head_hidden2,
@@ -996,6 +1062,12 @@ impl AzNnue {
             piece_attention_query: load_candle_f32_tensor(&tensors, "piece_attention_query")?,
             piece_attention_value: load_candle_f32_tensor(&tensors, "piece_attention_value")?,
             piece_attention_output: load_candle_f32_tensor(&tensors, "piece_attention_output")?,
+            policy_tower_hidden: load_candle_f32_tensor(&tensors, "policy_tower_hidden")?,
+            policy_tower_bias: load_candle_f32_tensor(&tensors, "policy_tower_bias")?,
+            policy_tower_output: load_candle_f32_tensor(&tensors, "policy_tower_output")?,
+            value_tower_hidden: load_candle_f32_tensor(&tensors, "value_tower_hidden")?,
+            value_tower_bias: load_candle_f32_tensor(&tensors, "value_tower_bias")?,
+            value_tower_output: load_candle_f32_tensor(&tensors, "value_tower_output")?,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_hidden2: load_candle_f32_tensor(&tensors, "value_head_hidden2")?,
@@ -1090,16 +1162,35 @@ impl AzNnue {
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
+        scratch.policy_hidden.copy_from_slice(&scratch.hidden);
+        scratch.value_hidden.copy_from_slice(&scratch.hidden);
+        self.apply_tower_blocks_into(
+            &mut scratch.policy_hidden,
+            &mut scratch.trunk,
+            &self.policy_tower_hidden,
+            &self.policy_tower_bias,
+            &self.policy_tower_output,
+            POLICY_TOWER_BLOCKS,
+        );
+        self.apply_tower_blocks_into(
+            &mut scratch.value_hidden,
+            &mut scratch.trunk,
+            &self.value_tower_hidden,
+            &self.value_tower_bias,
+            &self.value_tower_output,
+            VALUE_TOWER_BLOCKS,
+        );
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
             self.value_wdl_from_hidden_into(
-                &scratch.hidden,
+                &scratch.value_hidden,
                 &features,
                 &mut scratch.value_head,
                 &mut scratch.value_head2,
             )
         };
-        let moves_left = self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head);
+        let moves_left =
+            self.moves_left_from_hidden_into(&scratch.value_hidden, &mut scratch.value_head);
         self.square_tokens_from_features_into(
             &features,
             &mut scratch.square_tokens,
@@ -1144,10 +1235,28 @@ impl AzNnue {
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
+        scratch.policy_hidden.copy_from_slice(&scratch.hidden);
+        scratch.value_hidden.copy_from_slice(&scratch.hidden);
+        self.apply_tower_blocks_into(
+            &mut scratch.policy_hidden,
+            &mut scratch.trunk,
+            &self.policy_tower_hidden,
+            &self.policy_tower_bias,
+            &self.policy_tower_output,
+            POLICY_TOWER_BLOCKS,
+        );
+        self.apply_tower_blocks_into(
+            &mut scratch.value_hidden,
+            &mut scratch.trunk,
+            &self.value_tower_hidden,
+            &self.value_tower_bias,
+            &self.value_tower_output,
+            VALUE_TOWER_BLOCKS,
+        );
         let features = extract_sparse_features_az_canonical(position, history);
         let value = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
+            self.value_from_hidden_into(&scratch.value_hidden, &features, &mut scratch.value_head)
         };
         self.square_tokens_from_features_into(
             &features,
@@ -1181,8 +1290,8 @@ impl AzNnue {
     ) -> f32 {
         {
             crate::scope_profile!("az.eval.policy_embeddings");
-            self.policy_pair_context_into(&scratch.hidden, &mut scratch.policy_pair_context);
-            self.policy_move_context_into(&scratch.hidden, &mut scratch.policy_move_context);
+            self.policy_pair_context_into(&scratch.policy_hidden, &mut scratch.policy_pair_context);
+            self.policy_move_context_into(&scratch.policy_hidden, &mut scratch.policy_move_context);
         }
         scratch.logits.resize(moves.len(), 0.0);
         let move_map = move_map();
@@ -1211,7 +1320,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_square_scores");
             self.policy_square_scores_for_squares_into(
-                &scratch.hidden,
+                &scratch.policy_hidden,
                 &from_squares[..from_count],
                 &to_squares[..to_count],
                 &mut scratch.policy_from_scores,
@@ -1691,6 +1800,35 @@ impl AzNnue {
         softplus(logit)
     }
 
+    fn apply_tower_blocks_into(
+        &self,
+        hidden: &mut [f32],
+        trunk: &mut Vec<f32>,
+        tower_hidden: &[f32],
+        tower_bias: &[f32],
+        tower_output: &[f32],
+        blocks: usize,
+    ) {
+        let h = self.hidden_size;
+        let inner = h * TRUNK_INNER_MULT;
+        trunk.resize(inner, 0.0);
+        for block in 0..blocks {
+            let hidden_base = block * inner * h;
+            let bias_base = block * inner;
+            for (unit, value) in trunk.iter_mut().enumerate().take(inner) {
+                let row = &tower_hidden[hidden_base + unit * h..hidden_base + (unit + 1) * h];
+                *value = dot_product(hidden, row) + tower_bias[bias_base + unit];
+                *value = silu(*value);
+            }
+            let output_base = block * h * inner;
+            for out in 0..h {
+                let row = &tower_output[output_base + out * inner..output_base + (out + 1) * inner];
+                hidden[out] += dot_product(trunk, row);
+            }
+            rms_norm_in_place(hidden);
+        }
+    }
+
     fn policy_square_scores_for_squares_into(
         &self,
         hidden: &[f32],
@@ -2162,11 +2300,11 @@ fn policy_fit_epoch_report(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct PolicyFitEval {
-    target_entropy: f32,
-    policy_ce: f32,
-    value_ce: f32,
-    value_mse: f32,
+pub struct PolicyFitEval {
+    pub target_entropy: f32,
+    pub policy_ce: f32,
+    pub value_ce: f32,
+    pub value_mse: f32,
 }
 
 fn generate_policy_fit_samples(
@@ -2233,7 +2371,7 @@ fn generate_policy_fit_samples(
     samples
 }
 
-fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEval {
+pub fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEval {
     if samples.is_empty() {
         return PolicyFitEval::default();
     }
@@ -2254,8 +2392,26 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
         );
         relu_in_place(&mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
+        scratch.policy_hidden.copy_from_slice(&scratch.hidden);
+        scratch.value_hidden.copy_from_slice(&scratch.hidden);
+        model.apply_tower_blocks_into(
+            &mut scratch.policy_hidden,
+            &mut scratch.trunk,
+            &model.policy_tower_hidden,
+            &model.policy_tower_bias,
+            &model.policy_tower_output,
+            POLICY_TOWER_BLOCKS,
+        );
+        model.apply_tower_blocks_into(
+            &mut scratch.value_hidden,
+            &mut scratch.trunk,
+            &model.value_tower_hidden,
+            &model.value_tower_bias,
+            &model.value_tower_output,
+            VALUE_TOWER_BLOCKS,
+        );
         let (value_wdl, value_pred) = model.value_wdl_from_hidden_into(
-            &scratch.hidden,
+            &scratch.value_hidden,
             &sample.features,
             &mut scratch.value_head,
             &mut scratch.value_head2,
@@ -2269,8 +2425,8 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
                 value_ce -= target * pred.max(1.0e-8).ln();
             }
         }
-        model.policy_pair_context_into(&scratch.hidden, &mut scratch.policy_pair_context);
-        model.policy_move_context_into(&scratch.hidden, &mut scratch.policy_move_context);
+        model.policy_pair_context_into(&scratch.policy_hidden, &mut scratch.policy_pair_context);
+        model.policy_move_context_into(&scratch.policy_hidden, &mut scratch.policy_move_context);
         scratch.logits.resize(sample.move_indices.len(), 0.0);
         scratch.policy_from_scores.resize(BOARD_SIZE, 0.0);
         scratch.policy_to_scores.resize(BOARD_SIZE, 0.0);
@@ -2296,7 +2452,7 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
             }
         }
         model.policy_square_scores_for_squares_into(
-            &scratch.hidden,
+            &scratch.policy_hidden,
             &from_squares[..from_count],
             &to_squares[..to_count],
             &mut scratch.policy_from_scores,
@@ -2368,7 +2524,7 @@ fn softmax_fixed3(logits: [f32; 3]) -> [f32; 3] {
     out
 }
 
-pub(super) fn scalar_value_to_wdl_target(value: f32) -> [f32; 3] {
+pub fn scalar_value_to_wdl_target(value: f32) -> [f32; 3] {
     let value = value.clamp(-1.0, 1.0);
     if value >= 0.0 {
         [value, 1.0 - value, 0.0]
@@ -2400,6 +2556,10 @@ fn softplus(value: f32) -> f32 {
     } else {
         value.exp().ln_1p()
     }
+}
+
+fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {
@@ -2909,7 +3069,7 @@ pub(super) fn policy_move_transposed_sparse_indices() -> &'static [u32] {
     })
 }
 
-fn dense_move_index(mv: Move) -> usize {
+pub fn dense_move_index(mv: Move) -> usize {
     let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
     let dense = move_map().sparse_to_dense[sparse];
     debug_assert!(
@@ -2919,6 +3079,18 @@ fn dense_move_index(mv: Move) -> usize {
         mv.to
     );
     dense as usize
+}
+
+pub fn az_position_features(position: &Position) -> Vec<usize> {
+    extract_sparse_features_az_canonical(position, &[])
+}
+
+pub fn dense_move_space() -> usize {
+    DENSE_MOVE_SPACE
+}
+
+pub fn az_input_size() -> usize {
+    AZ_NNUE_INPUT_SIZE
 }
 
 #[cfg(test)]
