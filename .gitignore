@@ -13,3 +13,7 @@ runs
 *azloop*
 *.log
 tools
+eval/*.csv
+eval/*.fens
+eval/*.sqlite
+eval/torch/
