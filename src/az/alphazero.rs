@@ -1129,14 +1129,8 @@ mod tests {
     fn search_value_scale_reduces_non_terminal_network_value() {
         let position = Position::startpos();
         let mut model = AzNnue::random(4, 7);
-        model.value_head_hidden.fill(0.0);
-        model.value_head_hidden2.fill(0.0);
-        model.value_head_output.fill(0.0);
-        model.value_head_bias.fill(0.0);
-        model.value_head_bias2.fill(0.0);
-        model.value_head_bias[0] = 1.0;
-        model.value_head_bias2[0] = 1.0;
-        model.value_head_output[0] = 2.0;
+        model.value_head_bias[0] = 2.0;
+        model.value_head_output[0] = 1.0;
 
         let full = alphazero_search(
             &position,

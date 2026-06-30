@@ -9,18 +9,15 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        SplitMix64, alphazero_search, az_input_size, az_position_features,
-        benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
-        benchmark_training, dense_move_index, dense_move_space, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, policy_fit_eval,
-        scalar_value_to_wdl_target, train_samples_weighted,
+        AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
+        alphazero_search, benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace,
+        benchmark_policy_fit, benchmark_training, generate_selfplay_data,
+        global_training_step_sample_count, play_arena_games_from_positions, train_samples_weighted,
     },
-    nnue::canonical_move,
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
-    xiangqi::{Color, Move, Position, RuleOutcome},
+    xiangqi::{Move, Position, RuleOutcome},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, params};
@@ -88,10 +85,6 @@ enum CliCommand {
     PikafishLabelRandom(PikafishLabelRandomArgs),
     /// Evaluate a model against Pikafish labels stored in SQLite.
     PikafishLabelEval(PikafishLabelEvalArgs),
-    /// Train one or more epochs from fixed Pikafish label SQLite splits.
-    AzTrainPikafishLabels(AzTrainPikafishLabelsArgs),
-    /// Export fixed Pikafish label split into PyTorch-friendly binary arrays.
-    AzExportPikafishLabels(AzExportPikafishLabelsArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -317,12 +310,6 @@ struct PikafishLabelRandomArgs {
     /// Pikafish search depth.
     #[arg(long, default_value_t = 8)]
     depth: u32,
-    /// Parallel Pikafish UCI worker processes.
-    #[arg(long, default_value_t = 1)]
-    workers: usize,
-    /// Commit SQLite rows after this many newly labeled positions.
-    #[arg(long, default_value_t = 1000)]
-    commit_every: usize,
     /// Regenerate the FEN file even when it already exists.
     #[arg(long)]
     regenerate: bool,
@@ -352,67 +339,6 @@ struct PikafishLabelEvalArgs {
     /// Limit number of positions; 0 means all.
     #[arg(long, default_value_t = 0)]
     limit: usize,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai az-train-pikafish-labels model.safetensors eval/pikafish-random-1m-d8-20260629.sqlite --epochs 1 --train-limit 200000 --valid-limit 50000 --output model-pika1.safetensors")]
-struct AzTrainPikafishLabelsArgs {
-    /// Student model path to load before supervised training.
-    model: String,
-    /// SQLite labels produced by pikafish-label-random.
-    sqlite: String,
-    /// Output model path. Defaults to overwriting model.
-    #[arg(long)]
-    output: Option<String>,
-    /// Training epochs over loaded train samples.
-    #[arg(long, default_value_t = 1)]
-    epochs: usize,
-    /// Max train split samples to load. 0 means all train rows.
-    #[arg(long, default_value_t = 0)]
-    train_limit: usize,
-    /// Max valid split samples to evaluate. 0 means all valid rows.
-    #[arg(long, default_value_t = 50000)]
-    valid_limit: usize,
-    /// Micro-batch size per visible GPU.
-    #[arg(long, default_value_t = 4096)]
-    batch_size_per_gpu: usize,
-    /// Learning rate.
-    #[arg(long, default_value_t = 0.0003)]
-    lr: f32,
-    /// Random seed for sample order.
-    #[arg(long, default_value_t = 20260629)]
-    seed: u64,
-    /// Centipawn scale used by tanh(cp / scale) value target.
-    #[arg(long, default_value_t = 600.0)]
-    cp_scale: f32,
-    /// Value loss weight.
-    #[arg(long, default_value_t = 1.0)]
-    value_weight: f32,
-    /// Policy loss weight.
-    #[arg(long, default_value_t = 1.0)]
-    policy_weight: f32,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai az-export-pikafish-labels eval/pikafish-random-1m-d8-20260629.sqlite eval/torch/train200k --split train --limit 200000")]
-struct AzExportPikafishLabelsArgs {
-    /// SQLite labels produced by pikafish-label-random.
-    sqlite: String,
-    /// Output file prefix. Writes <prefix>.meta.json and sibling .bin arrays.
-    output_prefix: String,
-    /// Label split to export.
-    #[arg(long, default_value = "train")]
-    split: String,
-    /// Max rows to export. 0 means all rows in split.
-    #[arg(long, default_value_t = 0)]
-    limit: usize,
-    /// Centipawn scale used by tanh(cp / scale) value target.
-    #[arg(long, default_value_t = 600.0)]
-    cp_scale: f32,
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
@@ -1276,302 +1202,6 @@ fn build_async_training_report(
         terminal_resign_black: pending.selfplay.terminal.resign_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
     }
-}
-
-fn run_az_train_pikafish_labels(cmd: AzTrainPikafishLabelsArgs) -> io::Result<()> {
-    let started = Instant::now();
-    let mut model = AzNnue::load(&cmd.model)?;
-    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
-    let train_samples = load_pikafish_label_training_samples(
-        &conn,
-        "train",
-        cmd.train_limit,
-        cmd.cp_scale,
-        cmd.value_weight,
-        cmd.policy_weight,
-    )
-    .map_err(sqlite_io_error)?;
-    let valid_samples = load_pikafish_label_training_samples(
-        &conn,
-        "valid",
-        cmd.valid_limit,
-        cmd.cp_scale,
-        cmd.value_weight,
-        cmd.policy_weight,
-    )
-    .map_err(sqlite_io_error)?;
-    if train_samples.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("no train samples loaded from {}", cmd.sqlite),
-        ));
-    }
-    println!(
-        "az-train-pikafish-labels: model={} sqlite={} train={} valid={} epochs={} batch_per_gpu={} lr={} cp_scale={}",
-        cmd.model,
-        cmd.sqlite,
-        train_samples.len(),
-        valid_samples.len(),
-        cmd.epochs.max(1),
-        cmd.batch_size_per_gpu.max(1),
-        cmd.lr,
-        cmd.cp_scale
-    );
-
-    let initial_train_eval = policy_fit_eval(&model, &train_samples);
-    let initial_valid_eval = policy_fit_eval(&model, &valid_samples);
-    print_policy_fit_eval("initial_train", &initial_train_eval, train_samples.len());
-    print_policy_fit_eval("initial_valid", &initial_valid_eval, valid_samples.len());
-
-    let mut rng = SplitMix64::new(cmd.seed);
-    let stats = train_samples_weighted(
-        &mut model,
-        &train_samples,
-        cmd.epochs.max(1),
-        cmd.lr,
-        cmd.batch_size_per_gpu.max(1),
-        &mut rng,
-        AzTrainLossWeights {
-            value: cmd.value_weight,
-            policy: cmd.policy_weight,
-        },
-    );
-
-    let final_train_eval = policy_fit_eval(&model, &train_samples);
-    let final_valid_eval = policy_fit_eval(&model, &valid_samples);
-    print_policy_fit_eval("final_train", &final_train_eval, train_samples.len());
-    print_policy_fit_eval("final_valid", &final_valid_eval, valid_samples.len());
-    println!(
-        "az-train-pikafish-labels: train_loss={:.6} value_loss={:.6} policy_ce={:.6} elapsed={:.1}s",
-        stats.loss,
-        stats.value_loss,
-        stats.policy_ce,
-        started.elapsed().as_secs_f32()
-    );
-
-    let output = cmd.output.as_deref().unwrap_or(&cmd.model);
-    model.save(output)?;
-    println!("az-train-pikafish-labels: saved {}", output);
-    Ok(())
-}
-
-fn print_policy_fit_eval(prefix: &str, eval: &chineseai::az::PolicyFitEval, samples: usize) {
-    println!(
-        "{prefix}: samples={} targetH={:.6} value_ce={:.6} value_mse={:.6} policy_ce={:.6} policy_kl={:.6}",
-        samples,
-        eval.target_entropy,
-        eval.value_ce,
-        eval.value_mse,
-        eval.policy_ce,
-        eval.policy_ce - eval.target_entropy
-    );
-}
-
-fn load_pikafish_label_training_samples(
-    conn: &Connection,
-    split: &str,
-    limit: usize,
-    cp_scale: f32,
-    value_weight: f32,
-    policy_weight: f32,
-) -> rusqlite::Result<Vec<AzTrainingSample>> {
-    let mut query =
-        "SELECT id, fen, bestmove, best_score_cp, best_mate FROM pikafish_labels WHERE split = ?1 ORDER BY id"
-            .to_string();
-    if limit > 0 {
-        query.push_str(" LIMIT ?2");
-    }
-    let mut stmt = conn.prepare(&query)?;
-    let rows = if limit > 0 {
-        stmt.query_map(params![split, limit as i64], |row| {
-            Ok(PikafishTrainLabelRow {
-                id: row.get(0)?,
-                fen: row.get(1)?,
-                bestmove: row.get(2)?,
-                best_score_cp: row.get(3)?,
-                best_mate: row.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        stmt.query_map(params![split], |row| {
-            Ok(PikafishTrainLabelRow {
-                id: row.get(0)?,
-                fen: row.get(1)?,
-                bestmove: row.get(2)?,
-                best_score_cp: row.get(3)?,
-                best_mate: row.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    let mut samples = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(sample) =
-            pikafish_label_row_to_training_sample(row, cp_scale, value_weight, policy_weight)
-        {
-            samples.push(sample);
-        }
-    }
-    Ok(samples)
-}
-
-#[derive(Clone, Debug)]
-struct PikafishTrainLabelRow {
-    id: i64,
-    fen: String,
-    bestmove: String,
-    best_score_cp: Option<i32>,
-    best_mate: Option<i32>,
-}
-
-fn pikafish_label_row_to_training_sample(
-    row: PikafishTrainLabelRow,
-    cp_scale: f32,
-    value_weight: f32,
-    policy_weight: f32,
-) -> Option<AzTrainingSample> {
-    let position = Position::from_fen(&row.fen).ok()?;
-    let side = position.side_to_move();
-    let label_move = position.parse_uci_move(&row.bestmove)?;
-    let legal_moves = position.legal_moves();
-    if legal_moves.is_empty() {
-        return None;
-    }
-    let mut move_indices = Vec::with_capacity(legal_moves.len());
-    let mut policy = Vec::with_capacity(legal_moves.len());
-    let canonical_label = dense_move_index(canonical_move(side, label_move));
-    for mv in legal_moves {
-        let move_index = dense_move_index(canonical_move(side, mv));
-        move_indices.push(move_index);
-        policy.push((move_index == canonical_label) as u8 as f32);
-    }
-    if !policy.iter().any(|&p| p > 0.0) {
-        return None;
-    }
-    let value = pikafish_score_to_value(row.best_score_cp, row.best_mate, cp_scale);
-    Some(AzTrainingSample {
-        features: az_position_features(&position),
-        move_indices,
-        policy,
-        value_wdl: scalar_value_to_wdl_target(value),
-        value,
-        side_sign: if side == Color::Red { 1.0 } else { -1.0 },
-        moves_left: 0.0,
-        policy_weight,
-        value_weight,
-        search_simulations: 0,
-        meta: AzSampleMeta {
-            game_id: row.id.max(0) as u64,
-            ..AzSampleMeta::default()
-        },
-    })
-}
-
-fn pikafish_score_to_value(score_cp: Option<i32>, mate: Option<i32>, cp_scale: f32) -> f32 {
-    if let Some(mate) = mate {
-        return if mate > 0 { 0.99 } else { -0.99 };
-    }
-    let scale = cp_scale.max(1.0);
-    ((score_cp.unwrap_or(0) as f32) / scale).tanh()
-}
-
-fn run_az_export_pikafish_labels(cmd: AzExportPikafishLabelsArgs) -> io::Result<()> {
-    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
-    let samples =
-        load_pikafish_label_training_samples(&conn, &cmd.split, cmd.limit, cmd.cp_scale, 1.0, 1.0)
-            .map_err(sqlite_io_error)?;
-    if samples.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("no {} samples loaded from {}", cmd.split, cmd.sqlite),
-        ));
-    }
-    let max_features = samples
-        .iter()
-        .map(|sample| sample.features.len())
-        .max()
-        .unwrap_or(0);
-    let max_legal_moves = samples
-        .iter()
-        .map(|sample| sample.move_indices.len())
-        .max()
-        .unwrap_or(0);
-    let prefix = Path::new(&cmd.output_prefix);
-    if let Some(parent) = prefix
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    let features_path = prefixed_path(prefix, "features.i32.bin");
-    let legals_path = prefixed_path(prefix, "legal_moves.i32.bin");
-    let targets_path = prefixed_path(prefix, "target_moves.i64.bin");
-    let values_path = prefixed_path(prefix, "values.f32.bin");
-    let meta_path = prefixed_path(prefix, "meta.json");
-    let mut features_writer = BufWriter::new(fs::File::create(&features_path)?);
-    let mut legals_writer = BufWriter::new(fs::File::create(&legals_path)?);
-    let mut targets_writer = BufWriter::new(fs::File::create(&targets_path)?);
-    let mut values_writer = BufWriter::new(fs::File::create(&values_path)?);
-
-    for sample in &samples {
-        let target_move = sample
-            .move_indices
-            .iter()
-            .zip(&sample.policy)
-            .find_map(|(&move_index, &prob)| (prob > 0.0).then_some(move_index))
-            .ok_or_else(|| io::Error::other("sample has no policy target"))?;
-        write_i32_padded(&mut features_writer, &sample.features, max_features)?;
-        write_i32_padded(&mut legals_writer, &sample.move_indices, max_legal_moves)?;
-        targets_writer.write_all(&(target_move as i64).to_le_bytes())?;
-        values_writer.write_all(&sample.value.to_le_bytes())?;
-    }
-    features_writer.flush()?;
-    legals_writer.flush()?;
-    targets_writer.flush()?;
-    values_writer.flush()?;
-
-    let meta = format!(
-        "{{\n  \"samples\": {},\n  \"max_features\": {},\n  \"max_legal_moves\": {},\n  \"input_size\": {},\n  \"move_space\": {},\n  \"split\": \"{}\",\n  \"features\": \"{}\",\n  \"legal_moves\": \"{}\",\n  \"target_moves\": \"{}\",\n  \"values\": \"{}\"\n}}\n",
-        samples.len(),
-        max_features,
-        max_legal_moves,
-        az_input_size(),
-        dense_move_space(),
-        json_escape(&cmd.split),
-        json_escape(&features_path.to_string_lossy()),
-        json_escape(&legals_path.to_string_lossy()),
-        json_escape(&targets_path.to_string_lossy()),
-        json_escape(&values_path.to_string_lossy())
-    );
-    fs::write(&meta_path, meta)?;
-    println!(
-        "az-export-pikafish-labels: split={} samples={} max_features={} max_legal_moves={} prefix={}",
-        cmd.split,
-        samples.len(),
-        max_features,
-        max_legal_moves,
-        cmd.output_prefix
-    );
-    Ok(())
-}
-
-fn prefixed_path(prefix: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}.{}", prefix.display(), suffix))
-}
-
-fn write_i32_padded(writer: &mut impl Write, values: &[usize], width: usize) -> io::Result<()> {
-    for index in 0..width {
-        let value = values.get(index).map_or(-1, |&value| value as i32);
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    Ok(())
-}
-
-fn json_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn train_batch_source_stats(
@@ -4060,14 +3690,6 @@ fn main() {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
         }
-        Some(CliCommand::AzTrainPikafishLabels(cmd)) => {
-            run_az_train_pikafish_labels(cmd)
-                .unwrap_or_else(|err| panic!("az-train-pikafish-labels failed: {err}"));
-        }
-        Some(CliCommand::AzExportPikafishLabels(cmd)) => {
-            run_az_export_pikafish_labels(cmd)
-                .unwrap_or_else(|err| panic!("az-export-pikafish-labels failed: {err}"));
-        }
     };
     chineseai::profile::print_report();
 }
@@ -4581,12 +4203,11 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
     {
         fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
+    let mut conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pikafish_labels (
             id INTEGER PRIMARY KEY,
             fen TEXT NOT NULL UNIQUE,
-            split TEXT NOT NULL DEFAULT 'train',
             side_to_move TEXT NOT NULL,
             depth INTEGER NOT NULL,
             bestmove TEXT NOT NULL,
@@ -4595,124 +4216,54 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
             best_pv TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);
-        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_split ON pikafish_labels(split);",
+        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
     )
     .map_err(sqlite_io_error)?;
     migrate_pikafish_label_schema(&conn).map_err(sqlite_io_error)?;
-    ensure_pikafish_label_split_column(&conn).map_err(sqlite_io_error)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
-        PRAGMA temp_store=MEMORY;",
-    )
-    .map_err(sqlite_io_error)?;
+    let tx = conn.transaction().map_err(sqlite_io_error)?;
+    let mut writer = BufWriter::new(fs::File::create(output_path)?);
+    writeln!(
+        writer,
+        "index,fen,side_to_move,depth,bestmove,best_score_cp,best_mate,best_pv"
+    )?;
 
-    let mut existing = HashSet::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT fen FROM pikafish_labels WHERE depth = ?1")
-            .map_err(sqlite_io_error)?;
-        let rows = stmt
-            .query_map(params![cmd.depth.max(1) as i64], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(sqlite_io_error)?;
-        for row in rows {
-            existing.insert(row.map_err(sqlite_io_error)?);
-        }
-    }
-
-    let mut jobs = Vec::new();
+    let mut engine = PikafishLabelUci::spawn(Path::new(&cmd.pikafish_exe))?;
     for (index, fen) in fens.iter().enumerate() {
-        if existing.contains(fen) {
-            continue;
-        }
         let position = Position::from_fen(fen).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid FEN at {}: {err}", index + 1),
             )
         })?;
+        let (bestmove, pvs) = engine.query(fen, cmd.depth.max(1))?;
+        let best = pvs.iter().find(|pv| pv.multipv == 1);
+        let best_pv = best.map(|pv| pv.moves.join(" ")).unwrap_or_default();
         let side_to_move = match position.side_to_move() {
             chineseai::xiangqi::Color::Red => "w",
             chineseai::xiangqi::Color::Black => "b",
         };
-        jobs.push(PikafishLabelJob {
-            index,
-            fen: fen.clone(),
-            split: pikafish_label_split(index).to_string(),
-            side_to_move: side_to_move.to_string(),
-        });
-    }
-
-    let csv_append = output_path.exists() && !cmd.regenerate;
-    let mut writer = BufWriter::new(
-        fs::OpenOptions::new()
-            .create(true)
-            .append(csv_append)
-            .write(true)
-            .truncate(!csv_append)
-            .open(output_path)?,
-    );
-    if !csv_append {
-        writeln!(
+        write!(
             writer,
-            "index,fen,split,side_to_move,depth,bestmove,best_score_cp,best_mate,best_pv"
+            "{},{},{},{},{},{},{},{}",
+            index,
+            csv_escape(fen),
+            side_to_move,
+            cmd.depth.max(1),
+            csv_escape(&bestmove),
+            best.and_then(|pv| pv.score_cp)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            best.and_then(|pv| pv.mate)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            csv_escape(&best_pv)
         )?;
-    }
-
-    println!(
-        "pikafish-label-random: total_fens={} already_labeled={} pending={} workers={} depth={} sqlite={}",
-        fens.len(),
-        existing.len(),
-        jobs.len(),
-        cmd.workers.max(1),
-        cmd.depth.max(1),
-        sqlite_path.display()
-    );
-    if jobs.is_empty() {
-        writer.flush()?;
-        return Ok(());
-    }
-
-    let started = Instant::now();
-    let pending = fens.len() - existing.len();
-    let mut inserted = 0usize;
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(sqlite_io_error)?;
-    label_pikafish_jobs_parallel(
-        Path::new(&cmd.pikafish_exe),
-        jobs,
-        cmd.depth.max(1),
-        cmd.workers.max(1),
-        |result| {
-            let best = result.pvs.iter().find(|pv| pv.multipv == 1);
-            let best_pv = best.map(|pv| pv.moves.join(" ")).unwrap_or_default();
-            write!(
-                writer,
-                "{},{},{},{},{},{},{},{},{}",
-                result.index,
-                csv_escape(&result.fen),
-                result.split,
-                result.side_to_move,
-                cmd.depth.max(1),
-                csv_escape(&result.bestmove),
-                best.and_then(|pv| pv.score_cp)
-                    .map(|v| v.to_string())
-                    .unwrap_or_default(),
-                best.and_then(|pv| pv.mate)
-                    .map(|v| v.to_string())
-                    .unwrap_or_default(),
-                csv_escape(&best_pv)
-            )?;
-            writeln!(writer)?;
-            conn.execute(
+        writeln!(writer)?;
+        tx.execute(
             "INSERT INTO pikafish_labels (
-                id, fen, split, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP)
+                id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
             ON CONFLICT(fen) DO UPDATE SET
-                split=excluded.split,
                 side_to_move=excluded.side_to_move,
                 depth=excluded.depth,
                 bestmove=excluded.bestmove,
@@ -4721,150 +4272,30 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
                 best_pv=excluded.best_pv,
                 updated_at=CURRENT_TIMESTAMP",
             params![
-                result.index as i64,
-                result.fen,
-                result.split,
-                result.side_to_move,
+                index as i64,
+                fen,
+                side_to_move,
                 cmd.depth.max(1) as i64,
-                result.bestmove,
+                bestmove,
                 best.and_then(|pv| pv.score_cp).map(i64::from),
                 best.and_then(|pv| pv.mate).map(i64::from),
                 best_pv,
             ],
         )
         .map_err(sqlite_io_error)?;
-            inserted += 1;
-            if inserted.is_multiple_of(cmd.commit_every.max(1)) {
-                conn.execute_batch("COMMIT; BEGIN IMMEDIATE")
-                    .map_err(sqlite_io_error)?;
-                writer.flush()?;
-                println!(
-                    "pikafish-label-random: committed {}/{} new labels elapsed={:.1}s",
-                    inserted,
-                    pending,
-                    started.elapsed().as_secs_f32()
-                );
-            } else if inserted == pending {
-                println!(
-                    "pikafish-label-random: labeled {}/{} -> {} {} elapsed={:.1}s",
-                    inserted,
-                    pending,
-                    output_path.display(),
-                    sqlite_path.display(),
-                    started.elapsed().as_secs_f32()
-                );
-            }
-            Ok(())
-        },
-    )?;
-    writer.flush()?;
-    conn.execute_batch("COMMIT").map_err(sqlite_io_error)?;
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct PikafishLabelJob {
-    index: usize,
-    fen: String,
-    split: String,
-    side_to_move: String,
-}
-
-#[derive(Clone, Debug)]
-struct PikafishLabelResult {
-    index: usize,
-    fen: String,
-    split: String,
-    side_to_move: String,
-    bestmove: String,
-    pvs: Vec<PikafishPv>,
-}
-
-fn label_pikafish_jobs_parallel(
-    pikafish_exe: &Path,
-    jobs: Vec<PikafishLabelJob>,
-    depth: u32,
-    workers: usize,
-    mut on_result: impl FnMut(PikafishLabelResult) -> io::Result<()>,
-) -> io::Result<()> {
-    let total = jobs.len();
-    let (job_tx, job_rx) = mpsc::channel::<PikafishLabelJob>();
-    let job_rx = Arc::new(Mutex::new(job_rx));
-    let (result_tx, result_rx) = mpsc::channel::<io::Result<PikafishLabelResult>>();
-    let exe = pikafish_exe.to_path_buf();
-    let worker_count = workers.max(1).min(total.max(1));
-
-    thread::scope(|scope| {
-        for worker_id in 0..worker_count {
-            let job_rx = Arc::clone(&job_rx);
-            let result_tx = result_tx.clone();
-            let exe = exe.clone();
-            scope.spawn(move || {
-                let mut engine = match PikafishLabelUci::spawn(&exe) {
-                    Ok(engine) => engine,
-                    Err(err) => {
-                        let _ = result_tx.send(Err(err));
-                        return;
-                    }
-                };
-                loop {
-                    let job = {
-                        let guard = job_rx.lock().expect("pikafish job receiver poisoned");
-                        guard.recv()
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    let result =
-                        engine
-                            .query(&job.fen, depth)
-                            .map(|(bestmove, pvs)| PikafishLabelResult {
-                                index: job.index,
-                                fen: job.fen,
-                                split: job.split,
-                                side_to_move: job.side_to_move,
-                                bestmove,
-                                pvs,
-                            });
-                    if result_tx.send(result).is_err() {
-                        break;
-                    }
-                }
-                eprintln!("pikafish-label-random: worker {worker_id} stopped");
-            });
+        if (index + 1) % 100 == 0 || index + 1 == fens.len() {
+            println!(
+                "pikafish-label-random: labeled {}/{} -> {} {}",
+                index + 1,
+                fens.len(),
+                output_path.display(),
+                sqlite_path.display()
+            );
         }
-        drop(result_tx);
-        for job in jobs {
-            job_tx
-                .send(job)
-                .map_err(|_| io::Error::other("pikafish label workers stopped"))?;
-        }
-        drop(job_tx);
-
-        let mut done = 0usize;
-        for received in result_rx {
-            on_result(received?)?;
-            done += 1;
-            if done % 100 == 0 || done == total {
-                println!("pikafish-label-random: searched {done}/{total}");
-            }
-        }
-        if done != total {
-            return Err(io::Error::other(format!(
-                "pikafish label workers returned {}/{} results",
-                done, total
-            )));
-        }
-        Ok(())
-    })
-}
-
-fn pikafish_label_split(index: usize) -> &'static str {
-    match index % 20 {
-        18 => "valid",
-        19 => "test",
-        _ => "train",
     }
+    writer.flush()?;
+    tx.commit().map_err(sqlite_io_error)?;
+    Ok(())
 }
 
 fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
@@ -4884,7 +4315,6 @@ fn migrate_pikafish_label_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE pikafish_labels (
             id INTEGER PRIMARY KEY,
             fen TEXT NOT NULL UNIQUE,
-            split TEXT NOT NULL DEFAULT 'train',
             side_to_move TEXT NOT NULL,
             depth INTEGER NOT NULL,
             bestmove TEXT NOT NULL,
@@ -4894,28 +4324,13 @@ fn migrate_pikafish_label_schema(conn: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         INSERT OR REPLACE INTO pikafish_labels (
-            id, fen, split, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
+            id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
         )
-        SELECT id, fen, 'train', side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
+        SELECT id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
         FROM pikafish_labels_old;
         DROP TABLE pikafish_labels_old;
-        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);
-        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_split ON pikafish_labels(split);",
+        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
     )
-}
-
-fn ensure_pikafish_label_split_column(conn: &Connection) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(pikafish_labels)")?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|column| column == "split") {
-        conn.execute_batch(
-            "ALTER TABLE pikafish_labels ADD COLUMN split TEXT NOT NULL DEFAULT 'train';
-            CREATE INDEX IF NOT EXISTS idx_pikafish_labels_split ON pikafish_labels(split);",
-        )?;
-    }
-    Ok(())
 }
 
 fn generate_random_eval_fens(
