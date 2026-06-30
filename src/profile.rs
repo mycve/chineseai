@@ -118,11 +118,15 @@ mod imp {
 }
 
 #[cfg(feature = "profile")]
-pub use imp::{ScopeTimer, print_report, report};
+pub use imp::{ScopeTimer, flush_thread, print_report, report};
 
 #[cfg(not(feature = "profile"))]
 #[inline(always)]
 pub fn print_report() {}
+
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+pub fn flush_thread() {}
 
 #[macro_export]
 macro_rules! scope_profile {

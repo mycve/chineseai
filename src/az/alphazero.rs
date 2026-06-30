@@ -106,7 +106,10 @@ pub fn alphazero_search_with_history_and_rules(
         limits,
     );
     let root = tree.root;
-    tree.expand(root);
+    {
+        crate::scope_profile!("az.search.root_expand");
+        tree.expand(root);
+    }
     if tree.nodes[root].children.is_empty() {
         return AzSearchResult {
             best_move: None,
@@ -123,9 +126,12 @@ pub fn alphazero_search_with_history_and_rules(
     }
 
     let mut used = 0usize;
-    for _ in 0..limits.simulations {
-        tree.simulate(root, 0);
-        used += 1;
+    {
+        crate::scope_profile!("az.search.simulations");
+        for _ in 0..limits.simulations {
+            tree.simulate(root, 0);
+            used += 1;
+        }
     }
 
     let root_node = &tree.nodes[root];
@@ -141,7 +147,10 @@ pub fn alphazero_search_with_history_and_rules(
     } else {
         root_node.value_wdl
     };
-    let policy = tree.root_policy(root);
+    let policy = {
+        crate::scope_profile!("az.search.root_policy");
+        tree.root_policy(root)
+    };
     let mut candidates = root_node
         .children
         .iter()
@@ -349,14 +358,19 @@ impl<'a> AzTree<'a> {
     }
 
     fn expand(&mut self, node_index: usize) -> AzEvalOutput {
+        crate::scope_profile!("az.search.expand");
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
 
-        if let Some(value) = terminal_value(
-            &self.nodes[node_index].position,
-            &self.nodes[node_index].rule_history,
-        ) {
+        let terminal = {
+            crate::scope_profile!("az.search.terminal_value");
+            terminal_value(
+                &self.nodes[node_index].position,
+                &self.nodes[node_index].rule_history,
+            )
+        };
+        if let Some(value) = terminal {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].children.clear();
             self.nodes[node_index].value = value;
@@ -370,16 +384,19 @@ impl<'a> AzTree<'a> {
             };
         }
 
-        let moves = if node_index == self.root {
-            self.root_moves.clone().unwrap_or_else(|| {
+        let moves = {
+            crate::scope_profile!("az.search.expand_legal_moves");
+            if node_index == self.root {
+                self.root_moves.clone().unwrap_or_else(|| {
+                    self.nodes[node_index]
+                        .position
+                        .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+                })
+            } else {
                 self.nodes[node_index]
                     .position
                     .legal_moves_with_rules(&self.nodes[node_index].rule_history)
-            })
-        } else {
-            self.nodes[node_index]
-                .position
-                .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+            }
         };
         if moves.is_empty() {
             self.nodes[node_index].children.clear();
@@ -394,18 +411,24 @@ impl<'a> AzTree<'a> {
             };
         }
 
-        let mut eval = self.model.evaluate_with_scratch_output(
-            &self.nodes[node_index].position,
-            &self.nodes[node_index].history,
-            &moves,
-            &mut self.eval_scratch,
-        );
+        let mut eval = {
+            crate::scope_profile!("az.search.nn_eval");
+            self.model.evaluate_with_scratch_output(
+                &self.nodes[node_index].position,
+                &self.nodes[node_index].history,
+                &moves,
+                &mut self.eval_scratch,
+            )
+        };
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
         eval.value *= self.value_scale;
-        let priors = softmax_into(
-            &self.eval_scratch.logits[..moves.len()],
-            &mut self.eval_scratch.priors,
-        );
+        let priors = {
+            crate::scope_profile!("az.search.softmax");
+            softmax_into(
+                &self.eval_scratch.logits[..moves.len()],
+                &mut self.eval_scratch.priors,
+            )
+        };
         let raw_priors = priors.clone();
         if node_index == self.root
             && self.root_dirichlet_alpha > 0.0
@@ -418,21 +441,24 @@ impl<'a> AzTree<'a> {
                 self.root_noise_seed,
             );
         }
-        self.nodes[node_index].children = moves
-            .into_iter()
-            .zip(priors.drain(..))
-            .zip(raw_priors)
-            .map(|((mv, prior), raw_prior)| AzChild {
-                mv,
-                raw_prior,
-                prior,
-                visits: 0,
-                value_sum: 0.0,
-                value_wdl_sum: [0.0; 3],
-                moves_left_sum: 0.0,
-                child: None,
-            })
-            .collect();
+        {
+            crate::scope_profile!("az.search.children_build");
+            self.nodes[node_index].children = moves
+                .into_iter()
+                .zip(priors.drain(..))
+                .zip(raw_priors)
+                .map(|((mv, prior), raw_prior)| AzChild {
+                    mv,
+                    raw_prior,
+                    prior,
+                    visits: 0,
+                    value_sum: 0.0,
+                    value_wdl_sum: [0.0; 3],
+                    moves_left_sum: 0.0,
+                    child: None,
+                })
+                .collect();
+        }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
         self.nodes[node_index].moves_left = eval.moves_left;
@@ -441,6 +467,7 @@ impl<'a> AzTree<'a> {
     }
 
     fn simulate(&mut self, node_index: usize, depth: usize) -> AzEvalOutput {
+        crate::scope_profile!("az.search.simulate");
         if depth >= self.max_depth {
             let eval = self.cutoff_value(node_index);
             self.add_node_visit(node_index, eval);
@@ -459,7 +486,10 @@ impl<'a> AzTree<'a> {
             self.record_leaf_depth(depth, false);
             return eval;
         }
-        let child_index = self.select_child(node_index);
+        let child_index = {
+            crate::scope_profile!("az.search.select_child");
+            self.select_child(node_index)
+        };
         self.simulate_child(node_index, child_index, depth + 1)
     }
 
@@ -469,23 +499,34 @@ impl<'a> AzTree<'a> {
         child_index: usize,
         child_depth: usize,
     ) -> AzEvalOutput {
+        crate::scope_profile!("az.search.simulate_child");
         let child_node =
             if let Some(child_node) = self.nodes[node_index].children[child_index].child {
                 child_node
             } else {
+                crate::scope_profile!("az.search.create_child");
                 let mv = self.nodes[node_index].children[child_index].mv;
                 let mut child_position = self.nodes[node_index].position.clone();
-                let child_history = clone_history_with_appended_move(
-                    &self.nodes[node_index].history,
-                    &child_position,
-                    mv,
-                );
+                let child_history = {
+                    crate::scope_profile!("az.search.clone_history");
+                    clone_history_with_appended_move(
+                        &self.nodes[node_index].history,
+                        &child_position,
+                        mv,
+                    )
+                };
                 let child_rule_entry = child_position.rule_history_entry_after_move(mv);
-                child_position.make_move(mv);
-                let child_rule_history = clone_rule_history_with_appended_entry(
-                    &self.nodes[node_index].rule_history,
-                    child_rule_entry,
-                );
+                {
+                    crate::scope_profile!("az.search.child_make_move");
+                    child_position.make_move(mv);
+                }
+                let child_rule_history = {
+                    crate::scope_profile!("az.search.clone_rule_history");
+                    clone_rule_history_with_appended_entry(
+                        &self.nodes[node_index].rule_history,
+                        child_rule_entry,
+                    )
+                };
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
@@ -519,13 +560,18 @@ impl<'a> AzTree<'a> {
     }
 
     fn cutoff_value(&mut self, node_index: usize) -> AzEvalOutput {
+        crate::scope_profile!("az.search.cutoff_value");
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
-        if let Some(value) = terminal_value(
-            &self.nodes[node_index].position,
-            &self.nodes[node_index].rule_history,
-        ) {
+        let terminal = {
+            crate::scope_profile!("az.search.terminal_value");
+            terminal_value(
+                &self.nodes[node_index].position,
+                &self.nodes[node_index].rule_history,
+            )
+        };
+        if let Some(value) = terminal {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
@@ -536,9 +582,12 @@ impl<'a> AzTree<'a> {
                 moves_left: 0.0,
             };
         }
-        let moves = self.nodes[node_index]
-            .position
-            .legal_moves_with_rules(&self.nodes[node_index].rule_history);
+        let moves = {
+            crate::scope_profile!("az.search.expand_legal_moves");
+            self.nodes[node_index]
+                .position
+                .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+        };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
@@ -549,12 +598,15 @@ impl<'a> AzTree<'a> {
                 moves_left: 0.0,
             };
         }
-        let mut eval = self.model.evaluate_with_scratch_output(
-            &self.nodes[node_index].position,
-            &self.nodes[node_index].history,
-            &moves,
-            &mut self.eval_scratch,
-        );
+        let mut eval = {
+            crate::scope_profile!("az.search.nn_eval");
+            self.model.evaluate_with_scratch_output(
+                &self.nodes[node_index].position,
+                &self.nodes[node_index].history,
+                &moves,
+                &mut self.eval_scratch,
+            )
+        };
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
         eval.value *= self.value_scale;
         self.nodes[node_index].value = eval.value;

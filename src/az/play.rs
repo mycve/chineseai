@@ -234,6 +234,7 @@ impl AzSelfplayData {
 }
 
 pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    crate::scope_profile!("az.selfplay.generate");
     let workers = config.workers.max(1).min(config.games.max(1));
     if workers == 1 || config.games <= 1 {
         return generate_selfplay_chunk(model, config);
@@ -253,7 +254,9 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
                 worker_config.games = games;
                 worker_config.workers = 1;
                 worker_config.seed ^= (worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                generate_selfplay_chunk(&shared_model, &worker_config)
+                let chunk = generate_selfplay_chunk(&shared_model, &worker_config);
+                crate::profile::flush_thread();
+                chunk
             })
             .collect::<Vec<_>>()
     });
@@ -303,6 +306,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
 }
 
 fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    crate::scope_profile!("az.selfplay.chunk");
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
     let mut red_wins = 0usize;
@@ -359,7 +363,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            let legal = position.legal_moves_with_rules(&rule_history);
+            let legal = {
+                crate::scope_profile!("az.selfplay.root_legal_moves");
+                position.legal_moves_with_rules(&rule_history)
+            };
             if legal.is_empty() {
                 result = Some(if position.side_to_move() == Color::Red {
                     -1.0
@@ -375,36 +382,40 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             search_simulations.simulations_sum += search_simulation_count;
             search_simulations.low_searches +=
                 usize::from(search_simulation_count < config.simulations);
-            let search = alphazero_search_with_history_and_rules(
-                &position,
-                &history,
-                Some(rule_history.clone()),
-                Some(legal),
-                model,
-                AzSearchLimits {
-                    simulations: search_simulation_count,
-                    seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                    cpuct: config.cpuct,
-                    cpuct_at_root: config.cpuct_at_root,
-                    cpuct_base: config.cpuct_base,
-                    cpuct_factor: config.cpuct_factor,
-                    cpuct_base_at_root: config.cpuct_base_at_root,
-                    cpuct_factor_at_root: config.cpuct_factor_at_root,
-                    max_depth: 0,
-                    root_dirichlet_alpha: config.root_dirichlet_alpha,
-                    root_exploration_fraction: config.root_exploration_fraction,
-                    fpu_value: config.fpu_value,
-                    fpu_value_at_root: config.fpu_value_at_root,
-                    draw_score: config.draw_score,
-                    moves_left_max_effect: config.moves_left_max_effect,
-                    moves_left_slope: config.moves_left_slope,
-                    moves_left_threshold: config.moves_left_threshold,
-                    moves_left_constant_factor: config.moves_left_constant_factor,
-                    moves_left_scaled_factor: config.moves_left_scaled_factor,
-                    moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-                    value_scale: 1.0,
-                },
-            );
+            let search = {
+                crate::scope_profile!("az.selfplay.search");
+                alphazero_search_with_history_and_rules(
+                    &position,
+                    &history,
+                    Some(rule_history.clone()),
+                    Some(legal),
+                    model,
+                    AzSearchLimits {
+                        simulations: search_simulation_count,
+                        seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
+                        cpuct: config.cpuct,
+                        cpuct_at_root: config.cpuct_at_root,
+                        cpuct_base: config.cpuct_base,
+                        cpuct_factor: config.cpuct_factor,
+                        cpuct_base_at_root: config.cpuct_base_at_root,
+                        cpuct_factor_at_root: config.cpuct_factor_at_root,
+                        max_depth: 0,
+                        root_dirichlet_alpha: config.root_dirichlet_alpha,
+                        root_exploration_fraction: config.root_exploration_fraction,
+                        fpu_value: config.fpu_value,
+                        fpu_value_at_root: config.fpu_value_at_root,
+                        draw_score: config.draw_score,
+                        moves_left_max_effect: config.moves_left_max_effect,
+                        moves_left_slope: config.moves_left_slope,
+                        moves_left_threshold: config.moves_left_threshold,
+                        moves_left_constant_factor: config.moves_left_constant_factor,
+                        moves_left_scaled_factor: config.moves_left_scaled_factor,
+                        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+                        value_scale: 1.0,
+                    },
+                )
+            };
+            crate::scope_profile!("az.selfplay.post_search");
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
             raw_prior_top1_sum += shape.raw_prior_top1;
@@ -516,17 +527,20 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     boundary_red: (best_q * side_sign).clamp(-1.0, 1.0),
                 });
             }
-            game_samples.push(make_training_sample(
-                &position,
-                &history,
-                &search.candidates,
-                search.value_q,
-                config.policy_softmax_temp,
-                rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-                move_meta.sample,
-                search_simulation_count,
-                policy_weight_for_search(config, search_simulation_count),
-            ));
+            {
+                crate::scope_profile!("az.selfplay.make_sample");
+                game_samples.push(make_training_sample(
+                    &position,
+                    &history,
+                    &search.candidates,
+                    search.value_q,
+                    config.policy_softmax_temp,
+                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                    move_meta.sample,
+                    search_simulation_count,
+                    policy_weight_for_search(config, search_simulation_count),
+                ));
+            }
             append_history(&mut history, &position, mv);
             rule_history.push(position.rule_history_entry_after_move(mv));
             position.make_move(mv);
@@ -541,7 +555,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 terminal.black_general_missing += 1;
                 break;
             }
-            if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
+            let rule_outcome = {
+                crate::scope_profile!("az.selfplay.rule_outcome");
+                position.rule_outcome_with_history(&rule_history)
+            };
+            if let Some(rule_outcome) = rule_outcome {
                 result = Some(match rule_outcome {
                     RuleOutcome::Draw(_) => 0.0,
                     RuleOutcome::Win(Color::Red) => 1.0,
@@ -579,8 +597,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         plies_total += plies;
 
-        assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
-        assign_moves_left_targets(&mut game_samples, config.max_plies);
+        {
+            crate::scope_profile!("az.selfplay.finalize_game");
+            assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
+            assign_moves_left_targets(&mut game_samples, config.max_plies);
+        }
         samples.extend(game_samples.clone());
         games.push(game_samples);
     }
