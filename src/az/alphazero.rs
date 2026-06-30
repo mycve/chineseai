@@ -515,11 +515,13 @@ impl<'a> AzTree<'a> {
                         mv,
                     )
                 };
-                let child_rule_entry = child_position.rule_history_entry_after_move(mv);
+                let mover = child_position.side_to_move();
                 {
                     crate::scope_profile!("az.search.child_make_move");
                     child_position.make_move(mv);
                 }
+                let child_rule_entry =
+                    child_position.rule_history_entry_after_moved(mover, mv.to as usize);
                 let child_rule_history = {
                     crate::scope_profile!("az.search.clone_rule_history");
                     clone_rule_history_with_appended_entry(

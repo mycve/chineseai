@@ -542,8 +542,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 ));
             }
             append_history(&mut history, &position, mv);
-            rule_history.push(position.rule_history_entry_after_move(mv));
+            let mover = position.side_to_move();
             position.make_move(mv);
+            rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
 
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
@@ -1197,8 +1198,9 @@ fn play_arena_game(
             return 0.0;
         };
         append_history(&mut history, &position, mv);
-        rule_history.push(position.rule_history_entry_after_move(mv));
+        let mover = position.side_to_move();
         position.make_move(mv);
+        rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
 
         if !position.has_general(Color::Red) {
             return -1.0;

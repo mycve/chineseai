@@ -15,6 +15,7 @@ impl Position {
     }
 
     pub fn rule_history_entry(&self, mover: Option<Color>) -> RuleHistoryEntry {
+        crate::scope_profile!("xiangqi.rule_history_entry");
         let (chased_mask, chased_piece_mask) =
             mover.map_or((0, 0), |color| self.chased_masks_by(color));
         RuleHistoryEntry {
@@ -28,21 +29,41 @@ impl Position {
     }
 
     pub fn rule_history_entry_after_move(&self, mv: Move) -> RuleHistoryEntry {
-        let mut next = self.clone();
+        crate::scope_profile!("xiangqi.rule_history_after_move");
+        let mut next = {
+            crate::scope_profile!("xiangqi.rule_history.clone_position");
+            self.clone()
+        };
         let mover = self.side_to_move;
-        next.make_move(mv);
-        let (chased_mask, chased_piece_mask) = next.chased_masks_by_origin(mover, mv.to as usize);
+        {
+            crate::scope_profile!("xiangqi.rule_history.make_move");
+            next.make_move(mv);
+        }
+        next.rule_history_entry_after_moved(mover, mv.to as usize)
+    }
+
+    pub fn rule_history_entry_after_moved(&self, mover: Color, origin: usize) -> RuleHistoryEntry {
+        crate::scope_profile!("xiangqi.rule_history_after_moved");
+        let (chased_mask, chased_piece_mask) = {
+            crate::scope_profile!("xiangqi.rule_history.chased_origin");
+            self.chased_masks_by_origin(mover, origin)
+        };
+        let gives_check = {
+            crate::scope_profile!("xiangqi.rule_history.gives_check");
+            self.in_check(self.side_to_move)
+        };
         RuleHistoryEntry {
-            hash: next.hash,
-            side_to_move: next.side_to_move,
+            hash: self.hash,
+            side_to_move: self.side_to_move,
             mover: Some(mover),
-            gives_check: next.in_check(next.side_to_move),
+            gives_check,
             chased_mask,
             chased_piece_mask,
         }
     }
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
+        crate::scope_profile!("xiangqi.rule_outcome_with_history");
         if self.halfmove_clock >= 120 {
             return Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120));
         }
@@ -50,6 +71,7 @@ impl Position {
     }
 
     pub fn rule_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
+        crate::scope_profile!("xiangqi.rule_outcome");
         let current_index = history.len().checked_sub(1)?;
         let current = history[current_index];
         let repeated_indices = history[..current_index]

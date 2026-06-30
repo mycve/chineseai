@@ -238,6 +238,7 @@ pub(super) struct AzEvalScratch {
     attention_token: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
+    square_token_squares: Vec<usize>,
 }
 
 impl AzEvalScratch {
@@ -259,6 +260,7 @@ impl AzEvalScratch {
             attention_token: vec![0.0; hidden_size],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
+            square_token_squares: Vec::with_capacity(BOARD_SIZE),
         }
     }
 }
@@ -1078,6 +1080,9 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
+        }
+        {
+            crate::scope_profile!("az.eval.sparse_attention");
             self.add_sparse_attention_into(
                 &features,
                 &mut scratch.hidden,
@@ -1086,6 +1091,9 @@ impl AzNnue {
                 &mut scratch.attention_context,
                 &mut scratch.attention_token,
             );
+        }
+        {
+            crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
@@ -1098,12 +1106,10 @@ impl AzNnue {
                 &mut scratch.value_head2,
             )
         };
-        let moves_left = self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head);
-        self.square_tokens_from_features_into(
-            &features,
-            &mut scratch.square_tokens,
-            &mut scratch.attention_token,
-        );
+        let moves_left = {
+            crate::scope_profile!("az.eval.moves_left_head");
+            self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
+        };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
         AzEvalOutput {
             value_wdl,
@@ -1132,6 +1138,7 @@ impl AzNnue {
                 &mut scratch.hidden,
             );
             let features = extract_sparse_features_az_canonical(position, history);
+            crate::scope_profile!("az.eval.sparse_attention");
             self.add_sparse_attention_into(
                 &features,
                 &mut scratch.hidden,
@@ -1140,6 +1147,9 @@ impl AzNnue {
                 &mut scratch.attention_context,
                 &mut scratch.attention_token,
             );
+        }
+        {
+            crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
@@ -1148,11 +1158,6 @@ impl AzNnue {
             crate::scope_profile!("az.eval.value_head");
             self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
-        self.square_tokens_from_features_into(
-            &features,
-            &mut scratch.square_tokens,
-            &mut scratch.attention_token,
-        );
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch)
     }
 
@@ -1215,6 +1220,17 @@ impl AzNnue {
                 &to_squares[..to_count],
                 &mut scratch.policy_from_scores,
                 &mut scratch.policy_to_scores,
+            );
+        }
+        {
+            crate::scope_profile!("az.eval.square_tokens");
+            self.square_tokens_for_squares_into(
+                features,
+                &from_squares[..from_count],
+                &to_squares[..to_count],
+                &mut scratch.square_tokens,
+                &mut scratch.square_token_squares,
+                &mut scratch.attention_token,
             );
         }
         {
@@ -1407,6 +1423,7 @@ impl AzNnue {
         context: &mut Vec<f32>,
         token: &mut Vec<f32>,
     ) {
+        crate::scope_profile!("az.eval.sparse_attention.body");
         if features.is_empty() || !self.piece_attention_enabled {
             return;
         }
@@ -1434,13 +1451,16 @@ impl AzNnue {
                 if feature >= PIECE_SQUARE_INPUT_SIZE {
                     continue;
                 }
-                self.sparse_attention_token_into(
-                    feature,
-                    us_king_bucket,
-                    them_king_bucket,
-                    token.as_mut_slice(),
-                    use_avx2,
-                );
+                {
+                    crate::scope_profile!("az.eval.attention_token");
+                    self.sparse_attention_token_into(
+                        feature,
+                        us_king_bucket,
+                        them_king_bucket,
+                        token.as_mut_slice(),
+                        use_avx2,
+                    );
+                }
                 scores.push(dot_product(
                     token,
                     &self.piece_attention_query[query_base..query_base + hidden_size],
@@ -1595,15 +1615,29 @@ impl AzNnue {
         }
     }
 
-    fn square_tokens_from_features_into(
+    fn square_tokens_for_squares_into(
         &self,
         features: &[usize],
+        from_squares: &[usize],
+        to_squares: &[usize],
         out: &mut Vec<f32>,
+        active_squares: &mut Vec<usize>,
         token: &mut Vec<f32>,
     ) {
+        crate::scope_profile!("az.eval.square_tokens.body");
         out.resize(BOARD_SIZE * self.hidden_size, 0.0);
-        out.fill(0.0);
+        for &sq in active_squares.iter() {
+            let start = sq * self.hidden_size;
+            out[start..start + self.hidden_size].fill(0.0);
+        }
+        active_squares.clear();
         token.resize(self.hidden_size, 0.0);
+        let mut feature_by_square = [usize::MAX; BOARD_SIZE];
+        for &feature in features {
+            if feature < PIECE_SQUARE_INPUT_SIZE {
+                feature_by_square[feature % BOARD_SIZE] = feature;
+            }
+        }
         let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
         let use_avx2 = {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1615,19 +1649,23 @@ impl AzNnue {
                 false
             }
         };
-        for &feature in features {
-            if feature >= PIECE_SQUARE_INPUT_SIZE {
+        for &sq in from_squares.iter().chain(to_squares) {
+            let feature = feature_by_square[sq];
+            if feature == usize::MAX {
                 continue;
             }
-            let sq = feature % BOARD_SIZE;
-            self.sparse_attention_token_into(
-                feature,
-                us_king_bucket,
-                them_king_bucket,
-                token.as_mut_slice(),
-                use_avx2,
-            );
+            {
+                crate::scope_profile!("az.eval.square_token");
+                self.sparse_attention_token_into(
+                    feature,
+                    us_king_bucket,
+                    them_king_bucket,
+                    token.as_mut_slice(),
+                    use_avx2,
+                );
+            }
             out[sq * self.hidden_size..(sq + 1) * self.hidden_size].copy_from_slice(token);
+            active_squares.push(sq);
         }
     }
 
@@ -2301,9 +2339,12 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
             &mut scratch.policy_from_scores,
             &mut scratch.policy_to_scores,
         );
-        model.square_tokens_from_features_into(
+        model.square_tokens_for_squares_into(
             &sample.features,
+            &from_squares[..from_count],
+            &to_squares[..to_count],
             &mut scratch.square_tokens,
+            &mut scratch.square_token_squares,
             &mut scratch.attention_token,
         );
         for (index, &move_index) in sample.move_indices.iter().enumerate() {
