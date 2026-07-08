@@ -14,9 +14,14 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 25;
-/// 解压后体积极限（防恶意或损坏文件占满内存）。
-const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 2usize << 30;
+const REPLAY_FILE_VERSION: u32 = 26;
+/// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
+const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
+const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";
+#[cfg(not(test))]
+const REPLAY_COMPRESS_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const REPLAY_COMPRESS_CHUNK_BYTES: usize = 512;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
 const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
 
@@ -500,21 +505,19 @@ impl AzExperiencePool {
             return Ok(());
         }
         let inner = self.encode_replay_payload()?;
-        if inner.len() > REPLAY_MAX_DECOMPRESSED_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "replay snapshot raw size {} exceeds {}",
-                    inner.len(),
-                    REPLAY_MAX_DECOMPRESSED_BYTES
-                ),
-            ));
-        }
-        let compressed = compress_prepend_size(&inner);
-        let mut file_blob = Vec::with_capacity(8 + compressed.len());
+        let mut file_blob = Vec::new();
         file_blob.extend_from_slice(REPLAY_MAGIC);
         replay_push_u32(&mut file_blob, REPLAY_FILE_VERSION);
-        file_blob.extend_from_slice(&compressed);
+        file_blob.extend_from_slice(REPLAY_CHUNKED_MARKER);
+        replay_push_u64(&mut file_blob, inner.len() as u64);
+        let chunk_count = inner.len().div_ceil(REPLAY_COMPRESS_CHUNK_BYTES);
+        replay_push_u64(&mut file_blob, chunk_count as u64);
+        for chunk in inner.chunks(REPLAY_COMPRESS_CHUNK_BYTES) {
+            let compressed = compress_prepend_size(chunk);
+            replay_push_u32(&mut file_blob, chunk.len() as u32);
+            replay_push_u64(&mut file_blob, compressed.len() as u64);
+            file_blob.extend_from_slice(&compressed);
+        }
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         fs::write(&tmp, &file_blob)?;
         if path.exists() {
@@ -545,18 +548,76 @@ impl AzExperiencePool {
                 format!("replay unsupported version {ver} (expected v{REPLAY_FILE_VERSION})"),
             ));
         }
-        let inner = decompress_size_prepended(&file_blob[8..]).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("replay lz4 decompress: {err:?}"),
-            )
-        })?;
-        if inner.len() > REPLAY_MAX_DECOMPRESSED_BYTES {
+        if file_blob.len() < 12 || &file_blob[8..12] != REPLAY_CHUNKED_MARKER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "replay decompressed size over cap",
+                "replay missing chunked snapshot marker",
             ));
         }
+        let inner = Self::decompress_chunked_snapshot(&file_blob[12..])?;
         Self::decode_replay_payload(&inner, capacity, ver)
+    }
+
+    fn decompress_chunked_snapshot(data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut reader = Cursor::new(data);
+        let total_len = replay_read_u64(&mut reader)? as usize;
+        if total_len > REPLAY_MAX_DECOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay chunked snapshot: decompressed size over cap",
+            ));
+        }
+        let chunk_count = replay_read_u64(&mut reader)? as usize;
+        if chunk_count > 1_000_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay chunked snapshot: absurd chunk count",
+            ));
+        }
+        let mut inner = Vec::with_capacity(total_len);
+        for _ in 0..chunk_count {
+            let raw_len = replay_read_u32(&mut reader)? as usize;
+            let compressed_len = replay_read_u64(&mut reader)? as usize;
+            if raw_len > REPLAY_COMPRESS_CHUNK_BYTES || compressed_len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "replay chunked snapshot: invalid chunk size",
+                ));
+            }
+            let start = reader.position() as usize;
+            let end = start.checked_add(compressed_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "replay chunked snapshot: chunk size overflow",
+                )
+            })?;
+            if end > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "replay chunked snapshot: truncated chunk",
+                ));
+            }
+            let chunk = decompress_size_prepended(&data[start..end]).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("replay chunked lz4 decompress: {err:?}"),
+                )
+            })?;
+            if chunk.len() != raw_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "replay chunked snapshot: raw chunk size mismatch",
+                ));
+            }
+            inner.extend_from_slice(&chunk);
+            reader.set_position(end as u64);
+        }
+        if inner.len() != total_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay chunked snapshot: total size mismatch",
+            ));
+        }
+        Ok(inner)
     }
 }

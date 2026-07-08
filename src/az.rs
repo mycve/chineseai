@@ -6,7 +6,7 @@ use candle_nn::VarMap;
 
 mod alphazero;
 #[cfg(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 mod candle_model;
@@ -16,7 +16,7 @@ mod replay;
 mod train;
 mod train_gpu;
 #[cfg(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 #[path = "az/train_gpu_candle.rs"]
@@ -3416,6 +3416,9 @@ mod tests {
         let _ = fs::remove_file(&path);
         let pool = super::replay_pool_test_fixture();
         pool.save_snapshot_lz4(&path).unwrap();
+        let file_blob = fs::read(&path).unwrap();
+        assert_eq!(&file_blob[0..4], b"AZRP");
+        assert_eq!(&file_blob[8..12], b"CHNK");
         let loaded = AzExperiencePool::load_snapshot_lz4(&path, 100).unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.sample_count(), pool.sample_count());

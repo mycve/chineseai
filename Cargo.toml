@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 tensorboard-rs = "0.5"
 byteorder = "1.5"
-candle-core = { version = "0.10.2", features = ["cuda"] }
+candle-core = "0.10.2"
 candle-nn = "0.10.2"
 rayon = "1.12"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
@@ -22,7 +22,11 @@ gpu-train = []
 nccl-train = ["gpu-train", "candle-core/nccl"]
 profile = []
 
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10.2", features = ["accelerate", "metal"] }
+
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+candle-core = { version = "0.10.2", features = ["cuda"] }
 tikv-jemallocator = "0.6"
 
 [profile.release]

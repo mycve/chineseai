@@ -1,30 +1,30 @@
 #[cfg(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 use super::train_gpu_candle as candle;
 
 #[cfg(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 pub(super) use candle::{GpuTrainer, train_samples_gpu};
 
 #[cfg(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 pub(crate) use candle::training_cuda_device_count;
 
 #[cfg(not(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 )))]
 #[derive(Debug)]
 pub(super) struct GpuTrainer;
 
 #[cfg(not(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 )))]
 pub(crate) fn training_cuda_device_count() -> usize {
@@ -32,7 +32,7 @@ pub(crate) fn training_cuda_device_count() -> usize {
 }
 
 #[cfg(not(any(
-    feature = "gpu-train",
+    all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 )))]
 pub(super) fn train_samples_gpu(
