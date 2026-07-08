@@ -580,6 +580,7 @@ pub struct AzLoopConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
+    pub opening_policy_zero_plies: usize,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,

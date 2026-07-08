@@ -10,6 +10,7 @@ pub struct AzLoopFileConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
+    pub opening_policy_zero_plies: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -86,6 +87,7 @@ impl Default for AzLoopFileConfig {
             low_simulations: 256,
             low_simulation_probability: 0.35,
             low_simulation_policy_weight: 0.35,
+            opening_policy_zero_plies: 4,
             selfplay_samples_per_update: 240000,
             lr: 0.001,
             lr_min: 0.0001,
@@ -164,6 +166,7 @@ struct AzLoopTomlConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
+    pub opening_policy_zero_plies: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -258,6 +261,7 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             low_simulations: config.low_simulations,
             low_simulation_probability: config.low_simulation_probability,
             low_simulation_policy_weight: config.low_simulation_policy_weight,
+            opening_policy_zero_plies: config.opening_policy_zero_plies,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -342,6 +346,7 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             low_simulations: config.low_simulations,
             low_simulation_probability: config.low_simulation_probability,
             low_simulation_policy_weight: config.low_simulation_policy_weight,
+            opening_policy_zero_plies: config.opening_policy_zero_plies,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -448,6 +453,7 @@ impl AzLoopFileConfig {
             "low_simulation_policy_weight",
             f(self.low_simulation_policy_weight)
         );
+        line!("opening_policy_zero_plies", self.opening_policy_zero_plies);
         line!(
             "selfplay_samples_per_update",
             self.selfplay_samples_per_update
@@ -577,6 +583,7 @@ impl AzLoopFileConfig {
         self.lr_decay_factor = self.lr_decay_factor.clamp(0.0, 1.0);
         self.batch_size = self.batch_size.max(1);
         self.max_plies = self.max_plies.max(1);
+        self.opening_policy_zero_plies = self.opening_policy_zero_plies.min(self.max_plies);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
         self.temperature_start = self.temperature_start.max(0.0);
@@ -638,6 +645,7 @@ mod tests {
 
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0001\n"));
+        assert!(text.contains("opening_policy_zero_plies = 4\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("temperature_endgame = 0.5\n"));
         assert!(text.contains("temperature_decay_delay_plies = 20\n"));
