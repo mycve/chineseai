@@ -1,4 +1,5 @@
 pub mod az;
+pub mod cpu_topology;
 pub mod nnue;
 mod obk_zobrist;
 pub mod opening_book;

@@ -964,7 +964,24 @@ struct TrainerEvent {
 
 struct SharedSelfplayModel {
     version: u64,
-    model: AzNnue,
+    models_by_numa_node: Vec<Arc<AzNnue>>,
+}
+
+fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> Vec<Arc<AzNnue>> {
+    thread::scope(|scope| {
+        numa_nodes
+            .iter()
+            .map(|&(_node, cpu)| {
+                scope.spawn(move || {
+                    let _ = chineseai::cpu_topology::pin_current_thread(cpu);
+                    Arc::new(model.clone())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("NUMA model replica thread panicked"))
+            .collect()
+    })
 }
 
 #[derive(Default)]
@@ -2431,19 +2448,48 @@ fn main() {
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
+            let cpu_placements = chineseai::cpu_topology::cpu_placements();
+            let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
+            let selfplay_worker_count = config.workers.max(1).min(cpu_placements.len().max(1));
             let (selfplay_tx, selfplay_rx) =
-                mpsc::sync_channel::<SelfplayBatch>(config.workers.max(1) * 2);
+                mpsc::sync_channel::<SelfplayBatch>(selfplay_worker_count * 2);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
+            let physical_cpus = cpu_placements
+                .iter()
+                .filter(|placement| placement.smt_level == 0)
+                .count();
+            let smt_workers = selfplay_worker_count.saturating_sub(physical_cpus);
+            println!(
+                "cpu      : allowed={} physical={} numa_nodes={} selfplay_workers={} physical_workers={} smt_workers={} affinity={} model_replicas={}",
+                cpu_placements.len(),
+                physical_cpus,
+                numa_nodes.len(),
+                selfplay_worker_count,
+                selfplay_worker_count.min(physical_cpus),
+                smt_workers,
+                if cfg!(target_os = "linux") {
+                    "on"
+                } else {
+                    "unsupported"
+                },
+                numa_nodes.len(),
+            );
+            let initial_numa_models = build_numa_model_replicas(&selfplay_model, &numa_nodes);
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
-                version: 0,
-                model: selfplay_model.clone(),
+                version: start_update.saturating_sub(1) as u64,
+                models_by_numa_node: initial_numa_models,
             }));
             let mut arena_reference_model = initial_arena_reference_model;
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
             let selfplay_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
-            let mut selfplay_handles = Vec::with_capacity(config.workers.max(1));
-            for worker_id in 0..config.workers.max(1) {
+            let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
+            for worker_id in 0..selfplay_worker_count {
+                let placement = cpu_placements[worker_id % cpu_placements.len()];
+                let model_slot = numa_nodes
+                    .iter()
+                    .position(|&(node, _)| node == placement.node)
+                    .unwrap_or(0);
                 let selfplay_stop = stop_requested.clone();
                 let selfplay_config = config.clone();
                 let selfplay_opening_positions = opening_positions.clone();
@@ -2452,12 +2498,15 @@ fn main() {
                 let selfplay_pause = Arc::clone(&selfplay_pause);
                 let selfplay_generation = Arc::clone(&selfplay_generation);
                 selfplay_handles.push(thread::spawn(move || {
+                    if let Err(err) = chineseai::cpu_topology::pin_current_thread(placement.cpu) {
+                        eprintln!(
+                            "warning: failed to pin selfplay worker {worker_id} to cpu {}: {err}",
+                            placement.cpu
+                        );
+                    }
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
-                    let mut local_model = AzNnue::random_with_arch(
-                        selfplay_config.arch(),
-                        selfplay_config.seed ^ worker_id as u64,
-                    );
+                    let mut local_model: Option<Arc<AzNnue>> = None;
                     while !selfplay_stop.load(Ordering::SeqCst) {
                         {
                             let (pause_lock, pause_cvar) = &*selfplay_pause;
@@ -2478,7 +2527,8 @@ fn main() {
                                 .read()
                                 .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
                             if shared.version != local_version {
-                                local_model = shared.model.clone();
+                                local_model =
+                                    Some(Arc::clone(&shared.models_by_numa_node[model_slot]));
                                 local_version = shared.version;
                             }
                         }
@@ -2497,7 +2547,12 @@ fn main() {
                             &selfplay_opening_positions,
                         );
                         let started = Instant::now();
-                        let data = generate_selfplay_data(&local_model, &loop_config);
+                        let data = generate_selfplay_data(
+                            local_model
+                                .as_deref()
+                                .expect("selfplay model not initialized"),
+                            &loop_config,
+                        );
                         let batch = SelfplayBatch {
                             data,
                             selfplay_seconds: started.elapsed().as_secs_f32(),
@@ -3268,11 +3323,12 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
+                let updated_numa_models = build_numa_model_replicas(&candidate_model, &numa_nodes);
                 {
                     let mut shared = shared_model
                         .write()
                         .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                    shared.model = candidate_model.clone();
+                    shared.models_by_numa_node = updated_numa_models;
                     shared.version = shared.version.wrapping_add(1);
                 }
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {

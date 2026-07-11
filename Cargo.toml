@@ -28,6 +28,7 @@ candle-core = { version = "0.10.2", features = ["accelerate", "metal"] }
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 candle-core = { version = "0.10.2", features = ["cuda"] }
 tikv-jemallocator = "0.6"
+libc = "0.2"
 
 [profile.release]
 lto = "fat"
