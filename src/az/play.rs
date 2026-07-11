@@ -460,7 +460,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                     search_simulation_count,
-                    policy_weight_for_search(config, search_simulation_count, ply),
+                    policy_weight_for_search(config, search_simulation_count),
                 ));
                 result = Some(if position.side_to_move() == Color::Red {
                     terminal.resign_red += 1;
@@ -538,7 +538,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta.sample,
                     search_simulation_count,
-                    policy_weight_for_search(config, search_simulation_count, ply),
+                    policy_weight_for_search(config, search_simulation_count),
                 ));
             }
             append_history(&mut history, &position, mv);
@@ -661,10 +661,8 @@ fn search_simulations_for_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> us
     }
 }
 
-fn policy_weight_for_search(config: &AzLoopConfig, search_simulations: usize, ply: usize) -> f32 {
-    if ply < config.opening_policy_zero_plies {
-        0.0
-    } else if search_simulations < config.simulations.max(1) {
+fn policy_weight_for_search(config: &AzLoopConfig, search_simulations: usize) -> f32 {
+    if search_simulations < config.simulations.max(1) {
         config.low_simulation_policy_weight.max(0.0)
     } else {
         1.0
@@ -1273,7 +1271,6 @@ mod tests {
             low_simulations: 1,
             low_simulation_probability: 0.0,
             low_simulation_policy_weight: 1.0,
-            opening_policy_zero_plies: 0,
             seed: 1,
             workers: 1,
             generation_update: 0,
@@ -1321,20 +1318,6 @@ mod tests {
         assert!((report.score_rate() - 0.54).abs() < 1e-6);
         assert!(report.promotes_with_lower_bound(0.50, 1.0));
         assert!(!report.promotes_with_lower_bound(0.50, 1.64));
-    }
-
-    #[test]
-    fn opening_policy_zero_plies_suppresses_early_policy_targets() {
-        let mut config = test_config();
-        config.simulations = 8;
-        config.low_simulations = 4;
-        config.low_simulation_policy_weight = 0.35;
-        config.opening_policy_zero_plies = 4;
-
-        assert_eq!(policy_weight_for_search(&config, 8, 0), 0.0);
-        assert_eq!(policy_weight_for_search(&config, 4, 3), 0.0);
-        assert_eq!(policy_weight_for_search(&config, 4, 4), 0.35);
-        assert_eq!(policy_weight_for_search(&config, 8, 4), 1.0);
     }
 
     #[test]
