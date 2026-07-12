@@ -11,8 +11,8 @@ use candle_core::{
 };
 
 use super::{
-    AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, MOVES_LEFT_AUX_WEIGHT,
-    WDL_HEAD_SIZE,
+    AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, AzValueMomentStats,
+    MOVES_LEFT_AUX_WEIGHT, WDL_HEAD_SIZE,
     candle_model::{AzCandleModel, BatchTensors},
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
@@ -665,6 +665,35 @@ impl GpuReplica {
         let loss_sum = (weighted_value_loss + weighted_policy_ce + weighted_moves_left_loss)?;
         let loss_tensor = (loss_sum / global_batch_len as f64)?;
 
+        let mut phase_value = [AzValueMomentStats::default(); 3];
+        let value_sq = value.sqr()?;
+        let target_sq = batch_tensors.values.sqr()?;
+        let pred_target = value.broadcast_mul(&batch_tensors.values)?;
+        let error_sq = (&value - &batch_tensors.values)?.sqr()?;
+        let mut phase_moment_tensors = Vec::with_capacity(3 * 7);
+        for phase in 0..3 {
+            let mask = batch_tensors
+                .value_phase_masks
+                .narrow(1, phase, 1)?
+                .squeeze(1)?;
+            phase_moment_tensors.push(mask.sum_all()?);
+            phase_moment_tensors.push((&value * &mask)?.sum_all()?);
+            phase_moment_tensors.push((&value_sq * &mask)?.sum_all()?);
+            phase_moment_tensors.push((&batch_tensors.values * &mask)?.sum_all()?);
+            phase_moment_tensors.push((&target_sq * &mask)?.sum_all()?);
+            phase_moment_tensors.push((&pred_target * &mask)?.sum_all()?);
+            phase_moment_tensors.push((&error_sq * &mask)?.sum_all()?);
+        }
+        let phase_moments = Tensor::stack(&phase_moment_tensors, 0)?.to_vec1::<f32>()?;
+        for (phase_stats, values) in phase_value.iter_mut().zip(phase_moments.chunks_exact(7)) {
+            phase_stats.samples = values[0].round().max(0.0) as usize;
+            phase_stats.pred_sum = values[1];
+            phase_stats.pred_sq_sum = values[2];
+            phase_stats.target_sum = values[3];
+            phase_stats.target_sq_sum = values[4];
+            phase_stats.pred_target_sum = values[5];
+            phase_stats.error_sq_sum = values[6];
+        }
         let value_sse = value_sse.to_scalar::<f32>()?;
         let value_ce = value_ce.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
@@ -682,6 +711,7 @@ impl GpuReplica {
                 .to_scalar::<f32>()?,
             value_error_sq_sum: value_sse,
             samples: batch_tensors.batch_size,
+            phase_value,
         };
         Ok(BatchLossOutput { loss_tensor, stats })
     }

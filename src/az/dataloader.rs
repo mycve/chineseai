@@ -114,6 +114,7 @@ pub(super) struct PackedBatch {
     pub moves_left: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
+    pub value_phase_masks: Vec<f32>,
 }
 
 impl PackedBatch {
@@ -158,6 +159,7 @@ impl PackedBatch {
             moves_left: vec![0.0f32; batch_size],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
+            value_phase_masks: vec![0.0f32; batch_size * 3],
         };
 
         for (row, &sample_index) in batch.iter().enumerate() {
@@ -170,6 +172,14 @@ impl PackedBatch {
             packed.moves_left[row] = sample.moves_left.max(0.0);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
+            let phase = if sample.meta.ply < 40 {
+                0
+            } else if sample.meta.ply < 120 {
+                1
+            } else {
+                2
+            };
+            packed.value_phase_masks[row * 3 + phase] = 1.0;
         }
         packed
     }

@@ -1128,6 +1128,22 @@ fn build_async_training_report(
     let value_corr =
         value_cov / (value_pred_var.max(1.0e-12).sqrt() * value_target_var.max(1.0e-12).sqrt());
     let value_calibration = value_cov / value_pred_var.max(1.0e-12);
+    let phase_value = std::array::from_fn(|phase| {
+        let phase_stats = stats.phase_value[phase];
+        let count = phase_stats.samples.max(1) as f32;
+        let pred_mean = phase_stats.pred_sum / count;
+        let target_mean = phase_stats.target_sum / count;
+        let pred_var = (phase_stats.pred_sq_sum / count - pred_mean * pred_mean).max(0.0);
+        let target_var = (phase_stats.target_sq_sum / count - target_mean * target_mean).max(0.0);
+        let covariance = phase_stats.pred_target_sum / count - pred_mean * target_mean;
+        chineseai::az::AzPhaseValueReport {
+            samples: phase_stats.samples,
+            rmse: (phase_stats.error_sq_sum / count).max(0.0).sqrt(),
+            corr: (covariance / (pred_var.max(1.0e-12).sqrt() * target_var.max(1.0e-12).sqrt()))
+                .clamp(-1.0, 1.0),
+            calibration: covariance / pred_var.max(1.0e-12),
+        }
+    });
     AzLoopReport {
         games: selfplay_games,
         samples: selfplay_samples,
@@ -1158,6 +1174,7 @@ fn build_async_training_report(
             .sqrt(),
         value_corr: value_corr.clamp(-1.0, 1.0),
         value_calibration,
+        phase_value,
         policy_ce: stats.policy_ce,
         policy_kl: stats.policy_ce - root_visit_entropy,
         root_visit_entropy,
@@ -2900,7 +2917,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} phaseQ(o={}/{:.3}/{:.3}/{:.3} m={}/{:.3}/{:.3}/{:.3} e={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2937,6 +2954,18 @@ fn main() {
                     report.value_target_rms,
                     report.value_corr,
                     report.value_calibration,
+                    report.phase_value[0].samples,
+                    report.phase_value[0].rmse,
+                    report.phase_value[0].corr,
+                    report.phase_value[0].calibration,
+                    report.phase_value[1].samples,
+                    report.phase_value[1].rmse,
+                    report.phase_value[1].corr,
+                    report.phase_value[1].calibration,
+                    report.phase_value[2].samples,
+                    report.phase_value[2].rmse,
+                    report.phase_value[2].corr,
+                    report.phase_value[2].calibration,
                     report.policy_kl,
                     policy_target_entropy,
                     report.learning_rate,
@@ -2990,6 +3019,33 @@ fn main() {
                     update,
                     report.value_calibration,
                 );
+                for (phase, name) in ["opening", "midgame", "endgame"].into_iter().enumerate() {
+                    let phase_value = report.phase_value[phase];
+                    log_scalar(
+                        &mut tb,
+                        &format!("train/value_{name}_samples"),
+                        update,
+                        phase_value.samples as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("train/value_{name}_rmse"),
+                        update,
+                        phase_value.rmse,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("train/value_{name}_corr"),
+                        update,
+                        phase_value.corr,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("train/value_{name}_calibration"),
+                        update,
+                        phase_value.calibration,
+                    );
+                }
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
                 log_scalar(&mut tb, "train/policy_kl", update, report.policy_kl);
                 log_scalar(&mut tb, "train/lr", update, report.learning_rate);

@@ -586,6 +586,7 @@ pub struct AzLoopReport {
     pub value_target_rms: f32,
     pub value_corr: f32,
     pub value_calibration: f32,
+    pub phase_value: [AzPhaseValueReport; 3],
     pub policy_ce: f32,
     pub policy_kl: f32,
     pub root_visit_entropy: f32,
@@ -643,6 +644,14 @@ pub struct AzLoopReport {
     pub terminal_resign_red: usize,
     pub terminal_resign_black: usize,
     pub terminal_max_plies: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzPhaseValueReport {
+    pub samples: usize,
+    pub rmse: f32,
+    pub corr: f32,
+    pub calibration: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -767,6 +776,18 @@ pub struct AzTrainStats {
     pub value_pred_target_sum: f32,
     pub value_error_sq_sum: f32,
     pub samples: usize,
+    pub phase_value: [AzValueMomentStats; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzValueMomentStats {
+    pub pred_sum: f32,
+    pub pred_sq_sum: f32,
+    pub target_sum: f32,
+    pub target_sq_sum: f32,
+    pub pred_target_sum: f32,
+    pub error_sq_sum: f32,
+    pub samples: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -797,6 +818,15 @@ impl AzTrainStats {
         self.value_pred_target_sum += other.value_pred_target_sum;
         self.value_error_sq_sum += other.value_error_sq_sum;
         self.samples += other.samples;
+        for (left, right) in self.phase_value.iter_mut().zip(other.phase_value) {
+            left.pred_sum += right.pred_sum;
+            left.pred_sq_sum += right.pred_sq_sum;
+            left.target_sum += right.target_sum;
+            left.target_sq_sum += right.target_sq_sum;
+            left.pred_target_sum += right.pred_target_sum;
+            left.error_sq_sum += right.error_sq_sum;
+            left.samples += right.samples;
+        }
     }
 }
 
