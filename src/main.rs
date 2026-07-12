@@ -2447,8 +2447,12 @@ fn main() {
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
             let selfplay_worker_count = config.workers.max(1).min(cpu_placements.len().max(1));
+            // Trainer在一次GPU反向传播期间不会消费自博弈结果。双worker容量在高吞吐
+            // 服务器上会很快填满，令全部worker周期性阻塞在send。保留有界背压，
+            // 但缓冲足够覆盖一个训练窗口。
+            let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(8).max(32);
             let (selfplay_tx, selfplay_rx) =
-                mpsc::sync_channel::<SelfplayBatch>(selfplay_worker_count * 2);
+                mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
             let physical_cpus = cpu_placements
                 .iter()
@@ -2456,13 +2460,14 @@ fn main() {
                 .count();
             let smt_workers = selfplay_worker_count.saturating_sub(physical_cpus);
             println!(
-                "cpu      : allowed={} physical={} numa_nodes={} selfplay_workers={} physical_workers={} smt_workers={} affinity={} model_replicas={}",
+                "cpu      : allowed={} physical={} numa_nodes={} selfplay_workers={} physical_workers={} smt_workers={} selfplay_queue={} affinity={} model_replicas={}",
                 cpu_placements.len(),
                 physical_cpus,
                 numa_nodes.len(),
                 selfplay_worker_count,
                 selfplay_worker_count.min(physical_cpus),
                 smt_workers,
+                selfplay_queue_capacity,
                 if cfg!(target_os = "linux") {
                     "on"
                 } else {
@@ -2561,6 +2566,32 @@ fn main() {
                 }));
             }
             drop(selfplay_tx);
+            // 独立收集线程持续排空worker结果，并在CPU侧组装完整更新批次。
+            // GPU训练期间下一批仍可并行生成；只缓存一个完整更新，限制模型滞后。
+            let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingTrainingData>(1);
+            let collector_config = config.clone();
+            let collector_start_update = start_update;
+            let collector_handle = thread::spawn(move || {
+                let mut pending = PendingTrainingData::default();
+                let mut batch_index = 0usize;
+                while let Ok(batch) = selfplay_rx.recv() {
+                    pending.push(batch);
+                    let required_samples = if collector_start_update == 1 && batch_index == 0 {
+                        collector_config
+                            .train_warmup_samples
+                            .max(collector_config.selfplay_samples_per_update)
+                    } else {
+                        collector_config.selfplay_samples_per_update
+                    };
+                    if pending.selfplay.samples.len() < required_samples {
+                        continue;
+                    }
+                    if ready_tx.send(std::mem::take(&mut pending)).is_err() {
+                        break;
+                    }
+                    batch_index += 1;
+                }
+            });
             let trainer_stop = stop_requested.clone();
             let trainer_interrupted = interrupted.clone();
             let trainer_config = config.clone();
@@ -2569,39 +2600,18 @@ fn main() {
             let trainer_handle = thread::spawn(move || {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
-                let mut pending = PendingTrainingData::default();
                 let mut total_games_generated = 0usize;
                 let mut total_samples_generated = 0usize;
                 let mut train_index = 0usize;
                 let min_train_samples =
                     global_training_step_sample_count(trainer_config.batch_size);
-                'training: while let Ok(batch) = selfplay_rx.recv() {
+                'training: while let Ok(pending) = ready_rx.recv() {
                     if let Some(pool) = trainer_pool.as_mut() {
-                        pool.add_games(batch.data.games.clone());
+                        pool.add_games(pending.selfplay.games.clone());
                     }
-                    total_games_generated += batch.data.games.len();
-                    total_samples_generated += batch.data.samples.len();
-                    pending.push(batch);
-                    while let Ok(batch) = selfplay_rx.try_recv() {
-                        if let Some(pool) = trainer_pool.as_mut() {
-                            pool.add_games(batch.data.games.clone());
-                        }
-                        total_games_generated += batch.data.games.len();
-                        total_samples_generated += batch.data.samples.len();
-                        pending.push(batch);
-                    }
+                    total_games_generated += pending.selfplay.games.len();
+                    total_samples_generated += pending.selfplay.samples.len();
                     if trainer_stop.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    let required_selfplay_samples = if trainer_start_update == 1 && train_index == 0
-                    {
-                        trainer_config
-                            .train_warmup_samples
-                            .max(trainer_config.selfplay_samples_per_update)
-                    } else {
-                        trainer_config.selfplay_samples_per_update
-                    };
-                    if pending.selfplay.samples.len() < required_selfplay_samples {
                         continue;
                     }
                     if trainer_stop.load(Ordering::SeqCst) {
@@ -2649,7 +2659,7 @@ fn main() {
                     );
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
-                        std::mem::take(&mut pending),
+                        pending,
                         total_games_generated,
                         total_samples_generated,
                         stats,
@@ -2671,14 +2681,6 @@ fn main() {
                         break 'training;
                     }
                     train_index += 1;
-                    while let Ok(batch) = selfplay_rx.try_recv() {
-                        if let Some(pool) = trainer_pool.as_mut() {
-                            pool.add_games(batch.data.games.clone());
-                        }
-                        total_games_generated += batch.data.games.len();
-                        total_samples_generated += batch.data.samples.len();
-                        pending.push(batch);
-                    }
                 }
                 if let Some(pool) = trainer_pool.as_mut()
                     && trainer_interrupted.load(Ordering::SeqCst)
@@ -3591,6 +3593,9 @@ fn main() {
                     .join()
                     .unwrap_or_else(|_| panic!("selfplay thread panicked"));
             }
+            collector_handle
+                .join()
+                .unwrap_or_else(|_| panic!("selfplay collector thread panicked"));
             trainer_handle
                 .join()
                 .unwrap_or_else(|_| panic!("training thread panicked"));
