@@ -56,6 +56,31 @@ pub(super) const STRUCTURAL_RANK_SIZE: usize = BOARD_RANKS;
 pub(super) const STRUCTURAL_FILE_SIZE: usize = BOARD_FILES;
 pub(super) const STRUCTURAL_KING_PIECE_SIZE: usize = 2 * V2_KING_BUCKETS * 14;
 
+pub fn inference_simd_backend() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return "avx2+fma-4acc";
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return "avx2";
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return "avx2";
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return "neon";
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        "scalar"
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct StructuralPieceSquare {
     pub piece_index: usize,

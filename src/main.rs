@@ -1651,6 +1651,7 @@ fn main() {
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
             println!("search       : alphazero");
+            println!("simd         : {}", chineseai::az::inference_simd_backend());
             println!("cpuct        : {cpuct}");
             println!("total_sims   : {total_sims}");
             println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
