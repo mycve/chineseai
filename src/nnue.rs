@@ -39,11 +39,39 @@ pub fn extract_sparse_features_az_canonical(
     position: &Position,
     history: &[HistoryMove],
 ) -> Vec<usize> {
-    let side = position.side_to_move();
-    let mut features = extract_sparse_features_az_canonical_current(position);
-    add_az_canonical_history_features(side, history, &mut features);
+    let mut features = Vec::with_capacity(96);
+    fill_sparse_features_az_canonical(position, history, &mut features);
     features.sort_unstable();
     features
+}
+
+/// 填充面向走子方的 NNUE 稀疏特征，复用调用方缓冲区。
+///
+/// 推理只对特征行求和，不依赖特征顺序，因此热路径不做排序，也不产生堆分配。
+/// 需要稳定顺序（例如序列化或测试）时使用 `extract_sparse_features_az_canonical`。
+#[inline]
+pub fn fill_sparse_features_az_canonical(
+    position: &Position,
+    history: &[HistoryMove],
+    features: &mut Vec<usize>,
+) {
+    features.clear();
+    features.reserve(32 + history.len().min(HISTORY_PLIES) * HISTORY_EVENT_TYPES);
+    let side = position.side_to_move();
+    for sq in 0..BOARD_SIZE {
+        let Some(piece) = position.piece_at(sq) else {
+            continue;
+        };
+        let rel_color = if piece.color == side {
+            Color::Red
+        } else {
+            Color::Black
+        };
+        let rel_sq = orient_square(side, sq);
+        let piece_index = absolute_piece_index(rel_color, piece.kind);
+        features.push(piece_index * BOARD_SIZE + rel_sq);
+    }
+    add_az_canonical_history_features(side, history, features);
 }
 
 pub fn extract_sparse_features_az_absolute_current(position: &Position) -> Vec<usize> {

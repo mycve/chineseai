@@ -1,7 +1,7 @@
 use crate::nnue::HistoryMove;
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
-use super::{AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
+use super::{AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
 
 const DEFAULT_CPUCT: f32 = 1.5;
 const DEFAULT_CPUCT_BASE: f32 = 19652.0;
@@ -236,6 +236,7 @@ struct AzTree<'a> {
 
 struct AzNode {
     position: Position,
+    accumulator: AzEvalAccumulator,
     history: Vec<HistoryMove>,
     rule_history: Vec<RuleHistoryEntry>,
     children: Vec<AzChild>,
@@ -289,8 +290,10 @@ impl<'a> AzTree<'a> {
         limits: AzSearchLimits,
     ) -> Self {
         let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1));
+        let accumulator = AzEvalAccumulator::new(model, &position);
         nodes.push(AzNode {
             position,
+            accumulator,
             history,
             rule_history,
             children: Vec::new(),
@@ -413,8 +416,9 @@ impl<'a> AzTree<'a> {
 
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
-            self.model.evaluate_with_scratch_output(
+            self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
+                &self.nodes[node_index].accumulator,
                 &self.nodes[node_index].history,
                 &moves,
                 &mut self.eval_scratch,
@@ -507,6 +511,9 @@ impl<'a> AzTree<'a> {
                 crate::scope_profile!("az.search.create_child");
                 let mv = self.nodes[node_index].children[child_index].mv;
                 let mut child_position = self.nodes[node_index].position.clone();
+                let moved = child_position.piece_at(mv.from as usize).unwrap();
+                let captured = child_position.piece_at(mv.to as usize);
+                let mut child_accumulator = self.nodes[node_index].accumulator.clone();
                 let child_history = {
                     crate::scope_profile!("az.search.clone_history");
                     clone_history_with_appended_move(
@@ -520,6 +527,14 @@ impl<'a> AzTree<'a> {
                     crate::scope_profile!("az.search.child_make_move");
                     child_position.make_move(mv);
                 }
+                child_accumulator.apply_transition(
+                    self.model,
+                    &self.nodes[node_index].position,
+                    &child_position,
+                    mv,
+                    moved,
+                    captured,
+                );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv.to as usize);
                 let child_rule_history = {
@@ -532,6 +547,7 @@ impl<'a> AzTree<'a> {
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
+                    accumulator: child_accumulator,
                     history: child_history,
                     rule_history: child_rule_history,
                     children: Vec::new(),
@@ -602,8 +618,9 @@ impl<'a> AzTree<'a> {
         }
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
-            self.model.evaluate_with_scratch_output(
+            self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
+                &self.nodes[node_index].accumulator,
                 &self.nodes[node_index].history,
                 &moves,
                 &mut self.eval_scratch,

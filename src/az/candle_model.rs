@@ -1,9 +1,7 @@
 use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
-use candle_nn::ops::log_softmax;
 
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_ATTENTION_HEADS, PIECE_ATTENTION_SIZE,
-    PIECE_ATTENTION_TOTAL_SIZE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
     VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features,
     policy_move_sparse_indices, policy_move_to_features, policy_move_transposed_sparse_indices,
@@ -22,9 +20,6 @@ pub(super) struct AzCandleModel {
     input_file_hidden: Var,
     input_king_piece_hidden: Var,
     hidden_bias: Var,
-    piece_attention_query: Var,
-    piece_attention_value: Var,
-    piece_attention_output: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
@@ -93,33 +88,6 @@ impl AzCandleModel {
             .broadcast_mul(&batch.feature_mask)?
             .sum(1)?
             .broadcast_add(&self.hidden_bias)?;
-        let attention_scores = feature_embeddings
-            .unsqueeze(2)?
-            .broadcast_mul(&self.piece_attention_query.reshape((
-                1,
-                1,
-                PIECE_ATTENTION_HEADS,
-                hidden_size,
-            ))?)?
-            .sum(3)?;
-        let attention_mask = batch.structural_mask.squeeze(2)?.affine(1.0e9, -1.0e9)?;
-        let attention_scores = attention_scores.broadcast_add(&attention_mask.unsqueeze(2)?)?;
-        let attention_weights = log_softmax(&attention_scores, 1)?.exp()?.unsqueeze(3)?;
-        let attention_values = feature_embeddings
-            .flatten_to(1)?
-            .matmul(&self.piece_attention_value.t()?)?
-            .reshape((
-                bsz,
-                batch.max_features,
-                PIECE_ATTENTION_HEADS,
-                PIECE_ATTENTION_SIZE,
-            ))?;
-        let attention_context = attention_values
-            .broadcast_mul(&attention_weights)?
-            .sum(1)?
-            .reshape((bsz, PIECE_ATTENTION_TOTAL_SIZE))?;
-        let attention_residual = attention_context.matmul(&self.piece_attention_output.t()?)?;
-        let sparse_pre = (sparse_pre + attention_residual)?;
         let sparse_hidden = sparse_pre.relu()?;
         let rms = sparse_hidden
             .sqr()?
@@ -324,21 +292,6 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            piece_attention_query: var_from_slice(
-                &model.piece_attention_query,
-                (PIECE_ATTENTION_HEADS, hidden),
-                device,
-            )?,
-            piece_attention_value: var_from_slice(
-                &model.piece_attention_value,
-                (PIECE_ATTENTION_TOTAL_SIZE, hidden),
-                device,
-            )?,
-            piece_attention_output: var_from_slice(
-                &model.piece_attention_output,
-                (hidden, PIECE_ATTENTION_TOTAL_SIZE),
-                device,
-            )?,
             value_head_hidden: var_from_slice(
                 &model.value_head_hidden,
                 (VALUE_HEAD_SIZE, hidden),
@@ -445,9 +398,6 @@ impl AzCandleModel {
         vars.push(self.input_file_hidden.clone());
         vars.push(self.input_king_piece_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.piece_attention_query.clone());
-        vars.push(self.piece_attention_value.clone());
-        vars.push(self.piece_attention_output.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_hidden2.clone());
@@ -480,18 +430,6 @@ impl AzCandleModel {
             &mut model.input_king_piece_hidden,
         )?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
-        copy_var(
-            &self.piece_attention_query,
-            &mut model.piece_attention_query,
-        )?;
-        copy_var(
-            &self.piece_attention_value,
-            &mut model.piece_attention_value,
-        )?;
-        copy_var(
-            &self.piece_attention_output,
-            &mut model.piece_attention_output,
-        )?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_hidden2, &mut model.value_head_hidden2)?;
@@ -535,7 +473,6 @@ impl AzCandleModel {
             &self.policy_to_token_from_hidden,
             &mut model.policy_to_token_from_hidden,
         )?;
-        model.refresh_policy_derived_caches();
         Ok(())
     }
 
