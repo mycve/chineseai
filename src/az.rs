@@ -180,8 +180,6 @@ macro_rules! az_weight_tensors {
             policy_move_embedding,
             [DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE]
         );
-        $visit!(policy_from_token_to_hidden, [BOARD_SIZE, $h]);
-        $visit!(policy_to_token_from_hidden, [BOARD_SIZE, $h]);
     };
 }
 
@@ -226,11 +224,8 @@ pub(super) struct AzEvalScratch {
     policy_move_context: Vec<f32>,
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
-    square_tokens: Vec<f32>,
-    piece_token: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
-    square_token_squares: Vec<usize>,
 }
 
 impl AzEvalScratch {
@@ -246,11 +241,8 @@ impl AzEvalScratch {
             policy_move_context: vec![0.0; POLICY_MOVE_EMBED_SIZE],
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
-            square_tokens: vec![0.0; BOARD_SIZE * hidden_size],
-            piece_token: vec![0.0; hidden_size],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
-            square_token_squares: Vec::with_capacity(BOARD_SIZE),
         }
     }
 }
@@ -468,8 +460,6 @@ pub struct AzNnue {
     pub policy_pair_embedding: Vec<f32>,
     pub policy_move_context_hidden: Vec<f32>,
     pub policy_move_embedding: Vec<f32>,
-    pub policy_from_token_to_hidden: Vec<f32>,
-    pub policy_to_token_from_hidden: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -502,8 +492,6 @@ impl Clone for AzNnue {
             policy_pair_embedding: self.policy_pair_embedding.clone(),
             policy_move_context_hidden: self.policy_move_context_hidden.clone(),
             policy_move_embedding: self.policy_move_embedding.clone(),
-            policy_from_token_to_hidden: self.policy_from_token_to_hidden.clone(),
-            policy_to_token_from_hidden: self.policy_to_token_from_hidden.clone(),
             gpu_trainer: None,
         }
     }
@@ -847,8 +835,6 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
         let policy_move_embedding = vec![0.0; DENSE_MOVE_SPACE * POLICY_MOVE_EMBED_SIZE];
-        let policy_from_token_to_hidden = vec![0.0; BOARD_SIZE * hidden_size];
-        let policy_to_token_from_hidden = vec![0.0; BOARD_SIZE * hidden_size];
         Self {
             hidden_size,
             arch,
@@ -875,8 +861,6 @@ impl AzNnue {
             policy_pair_embedding,
             policy_move_context_hidden,
             policy_move_embedding,
-            policy_from_token_to_hidden,
-            policy_to_token_from_hidden,
             gpu_trainer: None,
         }
     }
@@ -937,14 +921,6 @@ impl AzNnue {
                 "policy_move_context_hidden",
             )?,
             policy_move_embedding: load_candle_f32_tensor(&tensors, "policy_move_embedding")?,
-            policy_from_token_to_hidden: load_candle_f32_tensor(
-                &tensors,
-                "policy_from_token_to_hidden",
-            )?,
-            policy_to_token_from_hidden: load_candle_f32_tensor(
-                &tensors,
-                "policy_to_token_from_hidden",
-            )?,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -1046,15 +1022,24 @@ impl AzNnue {
                 1.0,
             );
         }
-        relu_in_place(&mut scratch.hidden);
-        rms_norm_in_place(&mut scratch.hidden);
-        let (value_wdl, value) = self.value_wdl_from_hidden_into(
-            &scratch.hidden,
-            &features,
-            &mut scratch.value_head,
-            &mut scratch.value_head2,
-        );
-        let moves_left = self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head);
+        {
+            crate::scope_profile!("az.eval.activation_norm");
+            relu_in_place(&mut scratch.hidden);
+            rms_norm_in_place(&mut scratch.hidden);
+        }
+        let (value_wdl, value) = {
+            crate::scope_profile!("az.eval.value_head");
+            self.value_wdl_from_hidden_into(
+                &scratch.hidden,
+                &features,
+                &mut scratch.value_head,
+                &mut scratch.value_head2,
+            )
+        };
+        let moves_left = {
+            crate::scope_profile!("az.eval.moves_left_head");
+            self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
+        };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
         scratch.features = features;
         AzEvalOutput {
@@ -1112,17 +1097,6 @@ impl AzNnue {
             );
         }
         {
-            crate::scope_profile!("az.eval.square_tokens");
-            self.square_tokens_for_squares_into(
-                features,
-                &from_squares[..from_count],
-                &to_squares[..to_count],
-                &mut scratch.square_tokens,
-                &mut scratch.square_token_squares,
-                &mut scratch.piece_token,
-            );
-        }
-        {
             crate::scope_profile!("az.eval.policy_logits");
             for (index, mv) in moves.iter().enumerate() {
                 let canonical = canonical_move(side, *mv);
@@ -1140,7 +1114,6 @@ impl AzNnue {
                     &scratch.policy_move_context,
                     &scratch.policy_from_scores,
                     &scratch.policy_to_scores,
-                    &scratch.square_tokens,
                     move_index,
                 );
             }
@@ -1302,171 +1275,6 @@ impl AzNnue {
         self.add_factorized_structure_into(features, hidden);
     }
 
-    fn piece_token_into(
-        &self,
-        feature: usize,
-        us_king_bucket: usize,
-        them_king_bucket: usize,
-        token: &mut [f32],
-        use_avx2: bool,
-    ) {
-        let hidden_size = self.hidden_size;
-        token.copy_from_slice(
-            &self.input_hidden[feature * hidden_size..(feature + 1) * hidden_size],
-        );
-        let Some(structural) = decode_current_piece_square_feature(feature) else {
-            return;
-        };
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            if use_avx2 {
-                // SAFETY: caller only sets use_avx2 after runtime AVX2 detection.
-                unsafe {
-                    self.add_piece_token_structure_avx2(
-                        token,
-                        structural,
-                        us_king_bucket,
-                        them_king_bucket,
-                    );
-                }
-                return;
-            }
-        }
-        add_scaled_feature_row(
-            token,
-            &self.input_piece_hidden,
-            hidden_size,
-            structural.piece_index,
-            1.0,
-        );
-        add_scaled_feature_row(
-            token,
-            &self.input_rank_hidden,
-            hidden_size,
-            structural.rank,
-            1.0,
-        );
-        add_scaled_feature_row(
-            token,
-            &self.input_file_hidden,
-            hidden_size,
-            structural.file,
-            1.0,
-        );
-        add_scaled_feature_row(
-            token,
-            &self.input_king_piece_hidden,
-            hidden_size,
-            structural_king_piece_index(0, us_king_bucket, structural.piece_index),
-            1.0,
-        );
-        add_scaled_feature_row(
-            token,
-            &self.input_king_piece_hidden,
-            hidden_size,
-            structural_king_piece_index(1, them_king_bucket, structural.piece_index),
-            1.0,
-        );
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe fn add_piece_token_structure_avx2(
-        &self,
-        token: &mut [f32],
-        structural: StructuralPieceSquare,
-        us_king_bucket: usize,
-        them_king_bucket: usize,
-    ) {
-        unsafe {
-            add_feature_row_avx2(
-                token,
-                feature_row(
-                    &self.input_piece_hidden,
-                    self.hidden_size,
-                    structural.piece_index,
-                ),
-            );
-            add_feature_row_avx2(
-                token,
-                feature_row(&self.input_rank_hidden, self.hidden_size, structural.rank),
-            );
-            add_feature_row_avx2(
-                token,
-                feature_row(&self.input_file_hidden, self.hidden_size, structural.file),
-            );
-            add_feature_row_avx2(
-                token,
-                feature_row(
-                    &self.input_king_piece_hidden,
-                    self.hidden_size,
-                    structural_king_piece_index(0, us_king_bucket, structural.piece_index),
-                ),
-            );
-            add_feature_row_avx2(
-                token,
-                feature_row(
-                    &self.input_king_piece_hidden,
-                    self.hidden_size,
-                    structural_king_piece_index(1, them_king_bucket, structural.piece_index),
-                ),
-            );
-        }
-    }
-
-    fn square_tokens_for_squares_into(
-        &self,
-        features: &[usize],
-        from_squares: &[usize],
-        to_squares: &[usize],
-        out: &mut Vec<f32>,
-        active_squares: &mut Vec<usize>,
-        token: &mut Vec<f32>,
-    ) {
-        crate::scope_profile!("az.eval.square_tokens.body");
-        out.resize(BOARD_SIZE * self.hidden_size, 0.0);
-        for &sq in active_squares.iter() {
-            let start = sq * self.hidden_size;
-            out[start..start + self.hidden_size].fill(0.0);
-        }
-        active_squares.clear();
-        token.resize(self.hidden_size, 0.0);
-        let mut feature_by_square = [usize::MAX; BOARD_SIZE];
-        for &feature in features {
-            if feature < PIECE_SQUARE_INPUT_SIZE {
-                feature_by_square[feature % BOARD_SIZE] = feature;
-            }
-        }
-        let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
-        let use_avx2 = {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                self.hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2")
-            }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                false
-            }
-        };
-        for &sq in from_squares.iter().chain(to_squares) {
-            let feature = feature_by_square[sq];
-            if feature == usize::MAX {
-                continue;
-            }
-            {
-                crate::scope_profile!("az.eval.square_token");
-                self.piece_token_into(
-                    feature,
-                    us_king_bucket,
-                    them_king_bucket,
-                    token.as_mut_slice(),
-                    use_avx2,
-                );
-            }
-            out[sq * self.hidden_size..(sq + 1) * self.hidden_size].copy_from_slice(token);
-            active_squares.push(sq);
-        }
-    }
-
     #[allow(dead_code)]
     fn value_from_hidden_into(
         &self,
@@ -1609,7 +1417,6 @@ impl AzNnue {
         policy_move_context: &[f32],
         from_scores: &[f32],
         to_scores: &[f32],
-        square_tokens: &[f32],
         move_index: usize,
     ) -> f32 {
         let sparse = move_map().dense_to_sparse[move_index] as usize;
@@ -1627,16 +1434,6 @@ impl AzNnue {
                 policy_move_context,
                 &self.policy_move_embedding[move_index * POLICY_MOVE_EMBED_SIZE
                     ..(move_index + 1) * POLICY_MOVE_EMBED_SIZE],
-            )
-            + dot_product(
-                &square_tokens[from * self.hidden_size..(from + 1) * self.hidden_size],
-                &self.policy_from_token_to_hidden
-                    [to * self.hidden_size..(to + 1) * self.hidden_size],
-            )
-            + dot_product(
-                &square_tokens[to * self.hidden_size..(to + 1) * self.hidden_size],
-                &self.policy_to_token_from_hidden
-                    [from * self.hidden_size..(from + 1) * self.hidden_size],
             )
     }
 }
@@ -2129,21 +1926,12 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
             &mut scratch.policy_from_scores,
             &mut scratch.policy_to_scores,
         );
-        model.square_tokens_for_squares_into(
-            &sample.features,
-            &from_squares[..from_count],
-            &to_squares[..to_count],
-            &mut scratch.square_tokens,
-            &mut scratch.square_token_squares,
-            &mut scratch.piece_token,
-        );
         for (index, &move_index) in sample.move_indices.iter().enumerate() {
             scratch.logits[index] = model.policy_logit_from_hidden_index(
                 &scratch.policy_pair_context,
                 &scratch.policy_move_context,
                 &scratch.policy_from_scores,
                 &scratch.policy_to_scores,
-                &scratch.square_tokens,
                 move_index,
             );
         }
@@ -2708,37 +2496,6 @@ pub(super) fn policy_move_to_features() -> &'static [f32] {
     })
 }
 
-#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-pub(super) fn policy_move_sparse_indices() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static INDICES: OnceLock<Vec<u32>> = OnceLock::new();
-    INDICES.get_or_init(|| {
-        move_map()
-            .dense_to_sparse
-            .iter()
-            .map(|&sparse| sparse as u32)
-            .collect()
-    })
-}
-
-#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-pub(super) fn policy_move_transposed_sparse_indices() -> &'static [u32] {
-    use std::sync::OnceLock;
-    static INDICES: OnceLock<Vec<u32>> = OnceLock::new();
-    INDICES.get_or_init(|| {
-        move_map()
-            .dense_to_sparse
-            .iter()
-            .map(|&sparse| {
-                let sparse = sparse as usize;
-                let from = sparse / BOARD_SIZE;
-                let to = sparse % BOARD_SIZE;
-                (to * BOARD_SIZE + from) as u32
-            })
-            .collect()
-    })
-}
-
 fn dense_move_index(mv: Move) -> usize {
     let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
     let dense = move_map().sparse_to_dense[sparse];
@@ -3122,14 +2879,6 @@ mod tests {
             loaded.policy_move_context_hidden
         );
         assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
-        assert_eq!(
-            model.policy_from_token_to_hidden,
-            loaded.policy_from_token_to_hidden
-        );
-        assert_eq!(
-            model.policy_to_token_from_hidden,
-            loaded.policy_to_token_from_hidden
-        );
     }
 
     #[test]

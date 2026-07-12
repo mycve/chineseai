@@ -4,7 +4,7 @@ use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
     VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features,
-    policy_move_sparse_indices, policy_move_to_features, policy_move_transposed_sparse_indices,
+    policy_move_to_features,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
@@ -37,12 +37,8 @@ pub(super) struct AzCandleModel {
     policy_pair_embedding: Var,
     policy_move_context_hidden: Var,
     policy_move_embedding: Var,
-    policy_from_token_to_hidden: Var,
-    policy_to_token_from_hidden: Var,
     policy_move_from_features: Tensor,
     policy_move_to_features: Tensor,
-    policy_move_sparse_indices: Tensor,
-    policy_move_transposed_sparse_indices: Tensor,
 }
 
 impl AzCandleModel {
@@ -79,11 +75,6 @@ impl AzCandleModel {
         let structural_embeddings = (structural_embeddings + structural_them_king_piece)?;
         let structural_embeddings = structural_embeddings.broadcast_mul(&batch.structural_mask)?;
         let feature_embeddings = (feature_embeddings + structural_embeddings)?;
-        let square_tokens = feature_embeddings
-            .flatten_to(1)?
-            .index_select(&batch.square_token_feature_indices.flatten_all()?, 0)?
-            .reshape((bsz, BOARD_SIZE, hidden_size))?
-            .broadcast_mul(&batch.square_token_mask)?;
         let sparse_pre = feature_embeddings
             .broadcast_mul(&batch.feature_mask)?
             .sum(1)?
@@ -124,22 +115,9 @@ impl AzCandleModel {
         let policy_pair_logits = policy_pair_context.matmul(&self.policy_pair_embedding.t()?)?;
         let policy_move_context = hidden.matmul(&self.policy_move_context_hidden.t()?)?;
         let policy_move_logits = policy_move_context.matmul(&self.policy_move_embedding.t()?)?;
-        let token_from_to_logits = square_tokens
-            .flatten_to(1)?
-            .matmul(&self.policy_from_token_to_hidden.t()?)?
-            .reshape((bsz, BOARD_SIZE * BOARD_SIZE))?
-            .index_select(&self.policy_move_sparse_indices, 1)?;
-        let token_to_from_logits = square_tokens
-            .flatten_to(1)?
-            .matmul(&self.policy_to_token_from_hidden.t()?)?
-            .reshape((bsz, BOARD_SIZE * BOARD_SIZE))?
-            .index_select(&self.policy_move_transposed_sparse_indices, 1)?;
-        let policy_logits = ((((((policy_from_logits + policy_to_logits)?
-            + policy_pair_logits)?
+        let policy_logits = (((policy_from_logits + policy_to_logits)? + policy_pair_logits)?
             + policy_move_logits)?
-            + token_from_to_logits)?
-            + token_to_from_logits)?
-            .broadcast_add(&policy_bias))?;
+            .broadcast_add(&policy_bias)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -166,8 +144,6 @@ pub(super) struct BatchTensors {
     pub(super) structural_us_king_piece_indices: Tensor,
     pub(super) structural_them_king_piece_indices: Tensor,
     pub(super) structural_mask: Tensor,
-    pub(super) square_token_feature_indices: Tensor,
-    pub(super) square_token_mask: Tensor,
     pub(super) policy_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
@@ -224,16 +200,6 @@ impl BatchTensors {
             structural_mask: Tensor::from_vec(
                 packed.structural_mask,
                 (batch_size, max_features, 1),
-                device,
-            )?,
-            square_token_feature_indices: Tensor::from_vec(
-                packed.square_token_feature_indices,
-                (batch_size, BOARD_SIZE),
-                device,
-            )?,
-            square_token_mask: Tensor::from_vec(
-                packed.square_token_mask,
-                (batch_size, BOARD_SIZE, 1),
                 device,
             )?,
             policy_indices: Tensor::from_vec(
@@ -357,16 +323,6 @@ impl AzCandleModel {
                 (DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE),
                 device,
             )?,
-            policy_from_token_to_hidden: var_from_slice(
-                &model.policy_from_token_to_hidden,
-                (BOARD_SIZE, hidden),
-                device,
-            )?,
-            policy_to_token_from_hidden: var_from_slice(
-                &model.policy_to_token_from_hidden,
-                (BOARD_SIZE, hidden),
-                device,
-            )?,
             policy_move_from_features: Tensor::from_vec(
                 policy_move_from_features().to_vec(),
                 (DENSE_MOVE_SPACE, BOARD_SIZE),
@@ -375,16 +331,6 @@ impl AzCandleModel {
             policy_move_to_features: Tensor::from_vec(
                 policy_move_to_features().to_vec(),
                 (DENSE_MOVE_SPACE, BOARD_SIZE),
-                device,
-            )?,
-            policy_move_sparse_indices: Tensor::from_vec(
-                policy_move_sparse_indices().to_vec(),
-                DENSE_MOVE_SPACE,
-                device,
-            )?,
-            policy_move_transposed_sparse_indices: Tensor::from_vec(
-                policy_move_transposed_sparse_indices().to_vec(),
-                DENSE_MOVE_SPACE,
                 device,
             )?,
         })
@@ -415,8 +361,6 @@ impl AzCandleModel {
         vars.push(self.policy_pair_embedding.clone());
         vars.push(self.policy_move_context_hidden.clone());
         vars.push(self.policy_move_embedding.clone());
-        vars.push(self.policy_from_token_to_hidden.clone());
-        vars.push(self.policy_to_token_from_hidden.clone());
         vars
     }
 
@@ -464,14 +408,6 @@ impl AzCandleModel {
         copy_var(
             &self.policy_move_embedding,
             &mut model.policy_move_embedding,
-        )?;
-        copy_var(
-            &self.policy_from_token_to_hidden,
-            &mut model.policy_from_token_to_hidden,
-        )?;
-        copy_var(
-            &self.policy_to_token_from_hidden,
-            &mut model.policy_to_token_from_hidden,
         )?;
         Ok(())
     }
