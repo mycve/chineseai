@@ -23,13 +23,12 @@ mod train_gpu;
 mod train_gpu_candle;
 
 use crate::nnue::{
-    AZ_NNUE_INPUT_SIZE, HistoryMove, V2_KING_BUCKETS, add_az_absolute_history_features,
-    az_absolute_general_bucket, az_absolute_piece_king_feature,
-    az_absolute_piece_non_king_features, az_absolute_side_to_move_feature,
-    az_absolute_strategic_features, canonical_move, extract_sparse_features_az_absolute_current,
-    extract_sparse_features_az_canonical,
+    AZ_NNUE_INPUT_SIZE, HistoryMove, V2_KING_BUCKETS, add_az_canonical_history_features,
+    canonical_move, extract_sparse_features_az_canonical, fill_sparse_features_az_canonical,
 };
-use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position};
+use crate::xiangqi::{
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
+};
 
 pub use alphazero::{
     AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search,
@@ -50,9 +49,6 @@ pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
-const PIECE_ATTENTION_HEADS: usize = 1;
-pub(super) const PIECE_ATTENTION_SIZE: usize = 32;
-const PIECE_ATTENTION_TOTAL_SIZE: usize = PIECE_ATTENTION_HEADS * PIECE_ATTENTION_SIZE;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(super) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub(super) const STRUCTURAL_PIECE_SIZE: usize = 14;
@@ -161,9 +157,6 @@ macro_rules! az_weight_tensors {
         $visit!(input_file_hidden, [STRUCTURAL_FILE_SIZE, $h]);
         $visit!(input_king_piece_hidden, [STRUCTURAL_KING_PIECE_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
-        $visit!(piece_attention_query, [PIECE_ATTENTION_HEADS, $h]);
-        $visit!(piece_attention_value, [PIECE_ATTENTION_TOTAL_SIZE, $h]);
-        $visit!(piece_attention_output, [$h, PIECE_ATTENTION_TOTAL_SIZE]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_hidden2, [VALUE_HEAD_SIZE, VALUE_HEAD_SIZE]);
@@ -222,6 +215,8 @@ impl Default for AzNnueArch {
     }
 }
 pub(super) struct AzEvalScratch {
+    // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
+    features: Vec<usize>,
     hidden: Vec<f32>,
     #[allow(dead_code)]
     history_features: Vec<usize>,
@@ -232,10 +227,7 @@ pub(super) struct AzEvalScratch {
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
     square_tokens: Vec<f32>,
-    attention_scores: Vec<f32>,
-    attention_values: Vec<f32>,
-    attention_context: Vec<f32>,
-    attention_token: Vec<f32>,
+    piece_token: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
     square_token_squares: Vec<usize>,
@@ -245,6 +237,7 @@ impl AzEvalScratch {
     pub(super) fn new(arch: AzNnueArch) -> Self {
         let hidden_size = arch.hidden_size;
         Self {
+            features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
             history_features: Vec::with_capacity(16),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
@@ -254,10 +247,7 @@ impl AzEvalScratch {
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
             square_tokens: vec![0.0; BOARD_SIZE * hidden_size],
-            attention_scores: Vec::with_capacity(64),
-            attention_values: Vec::with_capacity(64 * PIECE_ATTENTION_SIZE),
-            attention_context: vec![0.0; PIECE_ATTENTION_TOTAL_SIZE],
-            attention_token: vec![0.0; hidden_size],
+            piece_token: vec![0.0; hidden_size],
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
             square_token_squares: Vec::with_capacity(BOARD_SIZE),
@@ -265,33 +255,37 @@ impl AzEvalScratch {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// 搜索节点使用的双视角 NNUE 累加器，不包含随每步老化的历史特征。
 #[derive(Clone, Debug)]
-struct AzEvalAccumulator {
-    hidden_sum: Vec<f32>,
+pub(super) struct AzEvalAccumulator {
+    hidden_sum: [Vec<f32>; 2],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AzEvalAccumulator {
-    fn new(model: &AzNnue, position: &Position) -> Self {
+    pub(super) fn new(model: &AzNnue, position: &Position) -> Self {
         let mut accumulator = Self {
-            hidden_sum: vec![0.0; model.hidden_size],
+            hidden_sum: [vec![0.0; model.hidden_size], vec![0.0; model.hidden_size]],
         };
-        accumulator.refresh_from_position(model, position);
+        accumulator.refresh(model, position);
         accumulator
     }
 
-    fn refresh_from_position(&mut self, model: &AzNnue, position: &Position) {
-        self.hidden_sum.resize(model.hidden_size, 0.0);
-        self.hidden_sum.copy_from_slice(&model.hidden_bias);
-        let features = extract_sparse_features_az_absolute_current(position);
-        for feature in features {
-            self.add_feature(model, feature);
+    fn refresh(&mut self, model: &AzNnue, position: &Position) {
+        for perspective in [Color::Red, Color::Black] {
+            let index = color_index(perspective);
+            let mut features = Vec::with_capacity(32);
+            for sq in 0..BOARD_SIZE {
+                if let Some(piece) = position.piece_at(sq) {
+                    let relative_color = if piece.color == perspective { 0 } else { 7 };
+                    let piece_index = relative_color + piece_kind_index(piece.kind);
+                    features.push(piece_index * BOARD_SIZE + canonical_square_for(perspective, sq));
+                }
+            }
+            model.input_embedding_linear_into(&features, &mut self.hidden_sum[index]);
         }
     }
 
-    #[allow(dead_code)]
-    fn apply_transition(
+    pub(super) fn apply_transition(
         &mut self,
         model: &AzNnue,
         before: &Position,
@@ -300,199 +294,150 @@ impl AzEvalAccumulator {
         moved: Piece,
         captured: Option<Piece>,
     ) {
-        self.replace_side_feature(model, before, after);
-        self.replace_strategic_features(model, before, after);
-
-        let old_red_bucket = az_absolute_general_bucket(before, Color::Red);
-        let new_red_bucket = az_absolute_general_bucket(after, Color::Red);
-        let old_black_bucket = az_absolute_general_bucket(before, Color::Black);
-        let new_black_bucket = az_absolute_general_bucket(after, Color::Black);
-        let red_king_changed = old_red_bucket != new_red_bucket;
-        let black_king_changed = old_black_bucket != new_black_bucket;
-
-        self.remove_non_king_piece_features(model, mv.from as usize, moved);
-        if let Some(captured) = captured {
-            self.remove_non_king_piece_features(model, mv.to as usize, captured);
-        }
-        self.add_non_king_piece_features(model, mv.to as usize, moved);
-
-        if red_king_changed {
-            self.replace_all_king_features(
+        for perspective in [Color::Red, Color::Black] {
+            let before_buckets = canonical_buckets_for_perspective(before, perspective);
+            let after_buckets = canonical_buckets_for_perspective(after, perspective);
+            if before_buckets != after_buckets {
+                // 将帅移动会改变所有棋子的王桶结构项，少见且必须完整刷新。
+                self.refresh(model, after);
+                return;
+            }
+            let hidden = &mut self.hidden_sum[color_index(perspective)];
+            add_canonical_piece_contribution(
                 model,
-                before,
-                after,
-                Color::Red,
-                old_red_bucket,
-                new_red_bucket,
-            );
-        } else {
-            self.remove_piece_king_feature(
-                model,
-                Color::Red,
-                old_red_bucket,
+                hidden,
+                perspective,
+                before_buckets,
                 mv.from as usize,
                 moved,
+                -1.0,
             );
             if let Some(captured) = captured {
-                self.remove_piece_king_feature(
+                add_canonical_piece_contribution(
                     model,
-                    Color::Red,
-                    old_red_bucket,
+                    hidden,
+                    perspective,
+                    before_buckets,
                     mv.to as usize,
                     captured,
+                    -1.0,
                 );
             }
-            self.add_piece_king_feature(model, Color::Red, new_red_bucket, mv.to as usize, moved);
-        }
-
-        if black_king_changed {
-            self.replace_all_king_features(
+            add_canonical_piece_contribution(
                 model,
-                before,
-                after,
-                Color::Black,
-                old_black_bucket,
-                new_black_bucket,
-            );
-        } else {
-            self.remove_piece_king_feature(
-                model,
-                Color::Black,
-                old_black_bucket,
-                mv.from as usize,
-                moved,
-            );
-            if let Some(captured) = captured {
-                self.remove_piece_king_feature(
-                    model,
-                    Color::Black,
-                    old_black_bucket,
-                    mv.to as usize,
-                    captured,
-                );
-            }
-            self.add_piece_king_feature(
-                model,
-                Color::Black,
-                new_black_bucket,
+                hidden,
+                perspective,
+                after_buckets,
                 mv.to as usize,
                 moved,
+                1.0,
             );
         }
     }
 
-    #[allow(dead_code)]
-    fn replace_side_feature(&mut self, model: &AzNnue, before: &Position, after: &Position) {
-        if let Some(feature) = az_absolute_side_to_move_feature(before) {
-            self.sub_feature(model, feature);
-        }
-        if let Some(feature) = az_absolute_side_to_move_feature(after) {
-            self.add_feature(model, feature);
-        }
+    fn hidden_for(&self, side: Color) -> &[f32] {
+        &self.hidden_sum[color_index(side)]
     }
+}
 
-    #[allow(dead_code)]
-    fn replace_strategic_features(&mut self, model: &AzNnue, before: &Position, after: &Position) {
-        let mut features = Vec::with_capacity(8);
-        az_absolute_strategic_features(before, &mut features);
-        for feature in features.drain(..) {
-            self.sub_feature(model, feature);
-        }
-        az_absolute_strategic_features(after, &mut features);
-        for feature in features {
-            self.add_feature(model, feature);
-        }
+fn canonical_buckets_for_perspective(position: &Position, perspective: Color) -> (usize, usize) {
+    let us = position
+        .general_square(perspective)
+        .map(|sq| canonical_general_bucket(0, canonical_square_for(perspective, sq)))
+        .unwrap_or(4);
+    let them = position
+        .general_square(perspective.opposite())
+        .map(|sq| canonical_general_bucket(7, canonical_square_for(perspective, sq)))
+        .unwrap_or(4);
+    (us, them)
+}
+
+fn add_canonical_piece_contribution(
+    model: &AzNnue,
+    hidden: &mut [f32],
+    perspective: Color,
+    buckets: (usize, usize),
+    sq: usize,
+    piece: Piece,
+    scale: f32,
+) {
+    let relative_color = if piece.color == perspective { 0 } else { 7 };
+    let piece_index = relative_color + piece_kind_index(piece.kind);
+    let relative_square = canonical_square_for(perspective, sq);
+    let feature = piece_index * BOARD_SIZE + relative_square;
+    let rank = relative_square / BOARD_FILES;
+    let file = relative_square % BOARD_FILES;
+    add_scaled_feature_row(
+        hidden,
+        &model.input_hidden,
+        model.hidden_size,
+        feature,
+        scale,
+    );
+    add_scaled_feature_row(
+        hidden,
+        &model.input_piece_hidden,
+        model.hidden_size,
+        piece_index,
+        scale,
+    );
+    add_scaled_feature_row(
+        hidden,
+        &model.input_rank_hidden,
+        model.hidden_size,
+        rank,
+        scale,
+    );
+    add_scaled_feature_row(
+        hidden,
+        &model.input_file_hidden,
+        model.hidden_size,
+        file,
+        scale,
+    );
+    add_scaled_feature_row(
+        hidden,
+        &model.input_king_piece_hidden,
+        model.hidden_size,
+        structural_king_piece_index(0, buckets.0, piece_index),
+        scale,
+    );
+    add_scaled_feature_row(
+        hidden,
+        &model.input_king_piece_hidden,
+        model.hidden_size,
+        structural_king_piece_index(1, buckets.1, piece_index),
+        scale,
+    );
+}
+
+#[inline(always)]
+fn canonical_square_for(perspective: Color, sq: usize) -> usize {
+    if perspective == Color::Red {
+        sq
+    } else {
+        BOARD_SIZE - 1 - sq
     }
+}
 
-    #[allow(dead_code)]
-    fn add_non_king_piece_features(&mut self, model: &AzNnue, sq: usize, piece: Piece) {
-        let mut features = Vec::with_capacity(3);
-        az_absolute_piece_non_king_features(sq, piece, &mut features);
-        for feature in features {
-            self.add_feature(model, feature);
-        }
+#[inline(always)]
+const fn color_index(color: Color) -> usize {
+    match color {
+        Color::Red => 0,
+        Color::Black => 1,
     }
+}
 
-    #[allow(dead_code)]
-    fn remove_non_king_piece_features(&mut self, model: &AzNnue, sq: usize, piece: Piece) {
-        let mut features = Vec::with_capacity(3);
-        az_absolute_piece_non_king_features(sq, piece, &mut features);
-        for feature in features {
-            self.sub_feature(model, feature);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn replace_all_king_features(
-        &mut self,
-        model: &AzNnue,
-        before: &Position,
-        after: &Position,
-        perspective: Color,
-        old_bucket: usize,
-        new_bucket: usize,
-    ) {
-        for sq in 0..BOARD_SIZE {
-            if let Some(piece) = before.piece_at(sq) {
-                self.remove_piece_king_feature(model, perspective, old_bucket, sq, piece);
-            }
-        }
-        for sq in 0..BOARD_SIZE {
-            if let Some(piece) = after.piece_at(sq) {
-                self.add_piece_king_feature(model, perspective, new_bucket, sq, piece);
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn add_piece_king_feature(
-        &mut self,
-        model: &AzNnue,
-        perspective: Color,
-        bucket: usize,
-        sq: usize,
-        piece: Piece,
-    ) {
-        self.add_feature(
-            model,
-            az_absolute_piece_king_feature(perspective, bucket, sq, piece),
-        );
-    }
-
-    #[allow(dead_code)]
-    fn remove_piece_king_feature(
-        &mut self,
-        model: &AzNnue,
-        perspective: Color,
-        bucket: usize,
-        sq: usize,
-        piece: Piece,
-    ) {
-        self.sub_feature(
-            model,
-            az_absolute_piece_king_feature(perspective, bucket, sq, piece),
-        );
-    }
-
-    fn add_feature(&mut self, model: &AzNnue, feature: usize) {
-        add_scaled_feature_row(
-            &mut self.hidden_sum,
-            &model.input_hidden,
-            model.hidden_size,
-            feature,
-            1.0,
-        );
-    }
-
-    #[allow(dead_code)]
-    fn sub_feature(&mut self, model: &AzNnue, feature: usize) {
-        add_scaled_feature_row(
-            &mut self.hidden_sum,
-            &model.input_hidden,
-            model.hidden_size,
-            feature,
-            -1.0,
-        );
+#[inline(always)]
+const fn piece_kind_index(kind: PieceKind) -> usize {
+    match kind {
+        PieceKind::General => 0,
+        PieceKind::Advisor => 1,
+        PieceKind::Elephant => 2,
+        PieceKind::Horse => 3,
+        PieceKind::Rook => 4,
+        PieceKind::Cannon => 5,
+        PieceKind::Soldier => 6,
     }
 }
 
@@ -506,9 +451,6 @@ pub struct AzNnue {
     pub input_file_hidden: Vec<f32>,
     pub input_king_piece_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
-    pub piece_attention_query: Vec<f32>,
-    pub piece_attention_value: Vec<f32>,
-    pub piece_attention_output: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_hidden2: Vec<f32>,
@@ -528,7 +470,6 @@ pub struct AzNnue {
     pub policy_move_embedding: Vec<f32>,
     pub policy_from_token_to_hidden: Vec<f32>,
     pub policy_to_token_from_hidden: Vec<f32>,
-    piece_attention_enabled: bool,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -544,9 +485,6 @@ impl Clone for AzNnue {
             input_file_hidden: self.input_file_hidden.clone(),
             input_king_piece_hidden: self.input_king_piece_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
-            piece_attention_query: self.piece_attention_query.clone(),
-            piece_attention_value: self.piece_attention_value.clone(),
-            piece_attention_output: self.piece_attention_output.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_hidden2: self.value_head_hidden2.clone(),
@@ -566,7 +504,6 @@ impl Clone for AzNnue {
             policy_move_embedding: self.policy_move_embedding.clone(),
             policy_from_token_to_hidden: self.policy_from_token_to_hidden.clone(),
             policy_to_token_from_hidden: self.policy_to_token_from_hidden.clone(),
-            piece_attention_enabled: self.piece_attention_enabled,
             gpu_trainer: None,
         }
     }
@@ -851,14 +788,6 @@ impl AzTrainStats {
 }
 
 impl AzNnue {
-    #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-    pub(super) fn refresh_policy_derived_caches(&mut self) {
-        self.piece_attention_enabled = self
-            .piece_attention_output
-            .iter()
-            .any(|&value| value != 0.0);
-    }
-
     pub fn random_with_arch(arch: AzNnueArch, seed: u64) -> Self {
         if let Err(err) = arch.validate() {
             panic!("AzNnue::random_with_arch: invalid arch ({err})");
@@ -875,15 +804,11 @@ impl AzNnue {
         let input_file_hidden = vec![0.0; STRUCTURAL_FILE_SIZE * hidden_size];
         let input_king_piece_hidden = vec![0.0; STRUCTURAL_KING_PIECE_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
-        let piece_attention_query = (0..PIECE_ATTENTION_HEADS * hidden_size)
-            .map(|_| rng.weight((1.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        let piece_attention_value = (0..PIECE_ATTENTION_TOTAL_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        // Sparse attention starts as an exact residual no-op. Training can then
-        // open the output gate without perturbing the first self-play games.
-        let piece_attention_output = vec![0.0; hidden_size * PIECE_ATTENTION_TOTAL_SIZE];
+        // 保持相同 seed 下其余权重与旧结构一致，便于公平比较删除注意力前后的速度和棋力。
+        // 旧注意力初始化消耗 33 * hidden_size 个随机数，但这些权重不再存储。
+        for _ in 0..33 * hidden_size {
+            let _ = rng.next_u64();
+        }
         // Start value-neutral. A random value head can evaluate startpos as a
         // large red/black advantage before any training, and MCTS amplifies
         // that noise into the first self-play dataset.
@@ -933,9 +858,6 @@ impl AzNnue {
             input_file_hidden,
             input_king_piece_hidden,
             hidden_bias,
-            piece_attention_query,
-            piece_attention_value,
-            piece_attention_output,
             value_head_hidden,
             value_head_bias,
             value_head_hidden2,
@@ -955,10 +877,8 @@ impl AzNnue {
             policy_move_embedding,
             policy_from_token_to_hidden,
             policy_to_token_from_hidden,
-            piece_attention_enabled: false,
             gpu_trainer: None,
         }
-        .with_refreshed_derived_flags()
     }
 
     pub fn random(hidden_size: usize, seed: u64) -> Self {
@@ -994,9 +914,6 @@ impl AzNnue {
             input_file_hidden: load_candle_f32_tensor(&tensors, "input_file_hidden")?,
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             hidden_bias,
-            piece_attention_query: load_candle_f32_tensor(&tensors, "piece_attention_query")?,
-            piece_attention_value: load_candle_f32_tensor(&tensors, "piece_attention_value")?,
-            piece_attention_output: load_candle_f32_tensor(&tensors, "piece_attention_output")?,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_hidden2: load_candle_f32_tensor(&tensors, "value_head_hidden2")?,
@@ -1028,20 +945,10 @@ impl AzNnue {
                 &tensors,
                 "policy_to_token_from_hidden",
             )?,
-            piece_attention_enabled: false,
             gpu_trainer: None,
         };
-        let model = model.with_refreshed_derived_flags();
         model.validate()?;
         Ok(model)
-    }
-
-    fn with_refreshed_derived_flags(mut self) -> Self {
-        self.piece_attention_enabled = self
-            .piece_attention_output
-            .iter()
-            .any(|&value| value != 0.0);
-        self
     }
 
     pub fn evaluate_value(
@@ -1073,24 +980,14 @@ impl AzNnue {
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_with_scratch");
-        let features = {
+        let mut features = std::mem::take(&mut scratch.features);
+        {
             crate::scope_profile!("az.eval.extract_features");
-            extract_sparse_features_az_canonical(position, history)
-        };
+            fill_sparse_features_az_canonical(position, history, &mut features);
+        }
         {
             crate::scope_profile!("az.eval.input_embedding");
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
-        }
-        {
-            crate::scope_profile!("az.eval.sparse_attention");
-            self.add_sparse_attention_into(
-                &features,
-                &mut scratch.hidden,
-                &mut scratch.attention_scores,
-                &mut scratch.attention_values,
-                &mut scratch.attention_context,
-                &mut scratch.attention_token,
-            );
         }
         {
             crate::scope_profile!("az.eval.activation_norm");
@@ -1111,6 +1008,7 @@ impl AzNnue {
             self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
         };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
+        scratch.features = features;
         AzEvalOutput {
             value_wdl,
             value,
@@ -1118,60 +1016,51 @@ impl AzNnue {
         }
     }
 
-    #[allow(dead_code)]
-    fn evaluate_accumulator_with_scratch(
+    pub(super) fn evaluate_incremental_with_scratch_output(
         &self,
         position: &Position,
         accumulator: &AzEvalAccumulator,
         history: &[HistoryMove],
         moves: &[Move],
         scratch: &mut AzEvalScratch,
-    ) -> f32 {
-        crate::scope_profile!("az.evaluate_accumulator_with_scratch");
-        {
-            crate::scope_profile!("az.eval.input_embedding");
-            scratch.hidden.resize(self.hidden_size, 0.0);
-            scratch.hidden.copy_from_slice(&accumulator.hidden_sum);
-            self.add_history_features_to_hidden(
-                history,
-                &mut scratch.history_features,
+    ) -> AzEvalOutput {
+        crate::scope_profile!("az.evaluate_incremental_with_scratch");
+        let mut features = std::mem::take(&mut scratch.features);
+        fill_sparse_features_az_canonical(position, history, &mut features);
+        scratch.hidden.resize(self.hidden_size, 0.0);
+        scratch
+            .hidden
+            .copy_from_slice(accumulator.hidden_for(position.side_to_move()));
+        scratch.history_features.clear();
+        add_az_canonical_history_features(
+            position.side_to_move(),
+            history,
+            &mut scratch.history_features,
+        );
+        for &feature in &scratch.history_features {
+            add_scaled_feature_row(
                 &mut scratch.hidden,
-            );
-            let features = extract_sparse_features_az_canonical(position, history);
-            crate::scope_profile!("az.eval.sparse_attention");
-            self.add_sparse_attention_into(
-                &features,
-                &mut scratch.hidden,
-                &mut scratch.attention_scores,
-                &mut scratch.attention_values,
-                &mut scratch.attention_context,
-                &mut scratch.attention_token,
+                &self.input_hidden,
+                self.hidden_size,
+                feature,
+                1.0,
             );
         }
-        {
-            crate::scope_profile!("az.eval.activation_norm");
-            relu_in_place(&mut scratch.hidden);
-            rms_norm_in_place(&mut scratch.hidden);
-        }
-        let features = extract_sparse_features_az_canonical(position, history);
-        let value = {
-            crate::scope_profile!("az.eval.value_head");
-            self.value_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
-        };
-        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch)
-    }
-
-    #[allow(dead_code)]
-    fn add_history_features_to_hidden(
-        &self,
-        history: &[HistoryMove],
-        features: &mut Vec<usize>,
-        hidden: &mut [f32],
-    ) {
-        features.clear();
-        add_az_absolute_history_features(history, features);
-        for &feature in features.iter() {
-            add_scaled_feature_row(hidden, &self.input_hidden, self.hidden_size, feature, 1.0);
+        relu_in_place(&mut scratch.hidden);
+        rms_norm_in_place(&mut scratch.hidden);
+        let (value_wdl, value) = self.value_wdl_from_hidden_into(
+            &scratch.hidden,
+            &features,
+            &mut scratch.value_head,
+            &mut scratch.value_head2,
+        );
+        let moves_left = self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head);
+        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
+        scratch.features = features;
+        AzEvalOutput {
+            value_wdl,
+            value,
+            moves_left,
         }
     }
 
@@ -1230,7 +1119,7 @@ impl AzNnue {
                 &to_squares[..to_count],
                 &mut scratch.square_tokens,
                 &mut scratch.square_token_squares,
-                &mut scratch.attention_token,
+                &mut scratch.piece_token,
             );
         }
         {
@@ -1413,98 +1302,7 @@ impl AzNnue {
         self.add_factorized_structure_into(features, hidden);
     }
 
-    #[allow(dead_code)]
-    fn add_sparse_attention_into(
-        &self,
-        features: &[usize],
-        hidden: &mut [f32],
-        scores: &mut Vec<f32>,
-        values: &mut Vec<f32>,
-        context: &mut Vec<f32>,
-        token: &mut Vec<f32>,
-    ) {
-        crate::scope_profile!("az.eval.sparse_attention.body");
-        if features.is_empty() || !self.piece_attention_enabled {
-            return;
-        }
-        let hidden_size = self.hidden_size;
-        context.resize(PIECE_ATTENTION_TOTAL_SIZE, 0.0);
-        context.fill(0.0);
-        token.resize(hidden_size, 0.0);
-        let (us_king_bucket, them_king_bucket) = canonical_general_buckets_from_features(features);
-        let use_avx2 = {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2")
-            }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                false
-            }
-        };
-        for head in 0..PIECE_ATTENTION_HEADS {
-            scores.clear();
-            values.clear();
-            let query_base = head * hidden_size;
-            let value_head_base = head * PIECE_ATTENTION_SIZE;
-            for &feature in features {
-                if feature >= PIECE_SQUARE_INPUT_SIZE {
-                    continue;
-                }
-                {
-                    crate::scope_profile!("az.eval.attention_token");
-                    self.sparse_attention_token_into(
-                        feature,
-                        us_king_bucket,
-                        them_king_bucket,
-                        token.as_mut_slice(),
-                        use_avx2,
-                    );
-                }
-                scores.push(dot_product(
-                    token,
-                    &self.piece_attention_query[query_base..query_base + hidden_size],
-                ));
-                for attention_feature in 0..PIECE_ATTENTION_SIZE {
-                    let value_index = value_head_base + attention_feature;
-                    let row = &self.piece_attention_value
-                        [value_index * hidden_size..(value_index + 1) * hidden_size];
-                    values.push(dot_product(token, row));
-                }
-            }
-            if scores.is_empty() {
-                continue;
-            }
-            let max_score = scores
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, |left, right| left.max(right));
-            let mut weight_sum = 0.0f32;
-            for score in scores.iter_mut() {
-                *score = (*score - max_score).exp();
-                weight_sum += *score;
-            }
-            if !weight_sum.is_finite() || weight_sum <= 0.0 {
-                continue;
-            }
-            for (token_index, &weight) in scores.iter().enumerate() {
-                let weight = weight / weight_sum;
-                let value_base = token_index * PIECE_ATTENTION_SIZE;
-                for attention_feature in 0..PIECE_ATTENTION_SIZE {
-                    context[value_head_base + attention_feature] +=
-                        weight * values[value_base + attention_feature];
-                }
-            }
-        }
-        for (hidden_index, hidden_value) in hidden.iter_mut().enumerate() {
-            let row = &self.piece_attention_output[hidden_index * PIECE_ATTENTION_TOTAL_SIZE
-                ..(hidden_index + 1) * PIECE_ATTENTION_TOTAL_SIZE];
-            *hidden_value += dot_product(context, row);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn sparse_attention_token_into(
+    fn piece_token_into(
         &self,
         feature: usize,
         us_king_bucket: usize,
@@ -1524,7 +1322,7 @@ impl AzNnue {
             if use_avx2 {
                 // SAFETY: caller only sets use_avx2 after runtime AVX2 detection.
                 unsafe {
-                    self.add_sparse_attention_token_structure_avx2(
+                    self.add_piece_token_structure_avx2(
                         token,
                         structural,
                         us_king_bucket,
@@ -1572,7 +1370,7 @@ impl AzNnue {
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe fn add_sparse_attention_token_structure_avx2(
+    unsafe fn add_piece_token_structure_avx2(
         &self,
         token: &mut [f32],
         structural: StructuralPieceSquare,
@@ -1656,7 +1454,7 @@ impl AzNnue {
             }
             {
                 crate::scope_profile!("az.eval.square_token");
-                self.sparse_attention_token_into(
+                self.piece_token_into(
                     feature,
                     us_king_bucket,
                     them_king_bucket,
@@ -2281,14 +2079,6 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
     let mut value_mse = 0.0f32;
     for sample in samples {
         model.input_embedding_linear_into(&sample.features, &mut scratch.hidden);
-        model.add_sparse_attention_into(
-            &sample.features,
-            &mut scratch.hidden,
-            &mut scratch.attention_scores,
-            &mut scratch.attention_values,
-            &mut scratch.attention_context,
-            &mut scratch.attention_token,
-        );
         relu_in_place(&mut scratch.hidden);
         rms_norm_in_place(&mut scratch.hidden);
         let (value_wdl, value_pred) = model.value_wdl_from_hidden_into(
@@ -2345,7 +2135,7 @@ fn policy_fit_eval(model: &AzNnue, samples: &[AzTrainingSample]) -> PolicyFitEva
             &to_squares[..to_count],
             &mut scratch.square_tokens,
             &mut scratch.square_token_squares,
-            &mut scratch.attention_token,
+            &mut scratch.piece_token,
         );
         for (index, &move_index) in sample.move_indices.iter().enumerate() {
             scratch.logits[index] = model.policy_logit_from_hidden_index(
@@ -3025,71 +2815,6 @@ mod tests {
     }
 
     #[test]
-    fn az_eval_accumulator_tracks_absolute_features_across_moves() {
-        let model = AzNnue::random_with_arch(AzNnueArch::with_hidden_size(64), 7);
-        let mut position = Position::startpos();
-        let mut accumulator = AzEvalAccumulator::new(&model, &position);
-        assert_accumulator_matches_full_features(&model, &position, &accumulator);
-
-        let mut rng = SplitMix64::new(20260521);
-        for _ in 0..60 {
-            let moves = position.legal_moves();
-            if moves.is_empty() {
-                break;
-            }
-            let mv = moves[(rng.next_u64() as usize) % moves.len()];
-            let before = position.clone();
-            let moved = before.piece_at(mv.from as usize).unwrap();
-            let captured = before.piece_at(mv.to as usize);
-            position.make_move(mv);
-            accumulator.apply_transition(&model, &before, &position, mv, moved, captured);
-            assert_accumulator_matches_full_features(&model, &position, &accumulator);
-
-            let legal = position.legal_moves();
-            let mut full_scratch = AzEvalScratch::new(model.arch);
-            let mut acc_scratch = AzEvalScratch::new(model.arch);
-            let full = model.evaluate_with_scratch(&position, &[], &legal, &mut full_scratch);
-            let via_acc = model.evaluate_accumulator_with_scratch(
-                &position,
-                &accumulator,
-                &[],
-                &legal,
-                &mut acc_scratch,
-            );
-            assert!(
-                (full - via_acc).abs() < 1e-5,
-                "full={full} via_acc={via_acc} fen={}",
-                position.to_fen()
-            );
-        }
-    }
-
-    fn assert_accumulator_matches_full_features(
-        model: &AzNnue,
-        position: &Position,
-        accumulator: &AzEvalAccumulator,
-    ) {
-        let mut expected = model.hidden_bias.clone();
-        for feature in extract_sparse_features_az_absolute_current(position) {
-            add_scaled_feature_row(
-                &mut expected,
-                &model.input_hidden,
-                model.hidden_size,
-                feature,
-                1.0,
-            );
-        }
-        assert_eq!(expected.len(), accumulator.hidden_sum.len());
-        for (index, (&left, &right)) in expected.iter().zip(&accumulator.hidden_sum).enumerate() {
-            assert!(
-                (left - right).abs() < 1e-4,
-                "accumulator mismatch at {index}: expected={left} got={right} fen={}",
-                position.to_fen()
-            );
-        }
-    }
-
-    #[test]
     fn scalar_value_head_starts_neutral() {
         let model = AzNnue::random(16, 7);
         let mut scratch = AzEvalScratch::new(model.arch);
@@ -3371,9 +3096,6 @@ mod tests {
             loaded.input_king_piece_hidden
         );
         assert_eq!(model.hidden_bias, loaded.hidden_bias);
-        assert_eq!(model.piece_attention_query, loaded.piece_attention_query);
-        assert_eq!(model.piece_attention_value, loaded.piece_attention_value);
-        assert_eq!(model.piece_attention_output, loaded.piece_attention_output);
         assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
         assert_eq!(model.value_head_bias, loaded.value_head_bias);
         assert_eq!(model.value_head_hidden2, loaded.value_head_hidden2);
