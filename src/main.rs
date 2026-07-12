@@ -2381,6 +2381,12 @@ fn main() {
             });
             let mut tb = SummaryWriter::new(&tb_dir);
             let opening_positions = load_opening_positions(&config.opening_fens_path);
+            let next_selfplay_generation = replay_pool
+                .as_ref()
+                .map(AzExperiencePool::max_generation_update)
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
             let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
                 * config.train_epochs_per_update as f32)
                 / config.selfplay_samples_per_update.max(1) as f32;
@@ -2500,7 +2506,10 @@ fn main() {
             let mut arena_reference_model = initial_arena_reference_model;
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
-            let selfplay_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            println!("generation: next_selfplay={next_selfplay_generation}");
+            let selfplay_generation = Arc::new(std::sync::atomic::AtomicU64::new(
+                next_selfplay_generation as u64,
+            ));
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
             for worker_id in 0..selfplay_worker_count {
                 let placement = cpu_placements[worker_id % cpu_placements.len()];

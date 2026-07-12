@@ -566,7 +566,10 @@ impl<'a> AzTree<'a> {
         let eval = AzEvalOutput {
             value_wdl: flip_wdl(child_eval.value_wdl),
             value: -child_eval.value,
-            moves_left: child_eval.moves_left,
+            // moves-left由子节点视角预测“从子节点到终局”的剩余步数。
+            // 回传到父节点边时必须计入刚走的这一着；否则不同搜索深度的
+            // 叶子会被直接混合，utility会错误偏爱搜索得更深的分支。
+            moves_left: child_eval.moves_left + 1.0,
         };
         let child = &mut self.nodes[node_index].children[child_index];
         child.visits += 1;

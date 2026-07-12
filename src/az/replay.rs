@@ -357,8 +357,9 @@ impl AzExperiencePool {
     fn recent_flat_indices(&self, recent_window_updates: u32) -> Vec<usize> {
         let newest = self
             .chunks
-            .back()
+            .iter()
             .map(|chunk| chunk.generation_update)
+            .max()
             .unwrap_or(0);
         let oldest_recent = newest.saturating_sub(recent_window_updates.saturating_sub(1));
         let mut out = Vec::new();
@@ -414,14 +415,11 @@ impl AzExperiencePool {
         }
         let oldest = self
             .chunks
-            .front()
+            .iter()
             .map(|chunk| chunk.generation_update)
+            .min()
             .unwrap_or(0);
-        let newest = self
-            .chunks
-            .back()
-            .map(|chunk| chunk.generation_update)
-            .unwrap_or(0);
+        let newest = self.max_generation_update();
         let mut weighted_sum = 0u64;
         let mut by_update = BTreeMap::<u32, usize>::new();
         for chunk in &self.chunks {
@@ -442,6 +440,14 @@ impl AzExperiencePool {
             window_updates: newest.saturating_sub(oldest).saturating_add(1),
             recent_window_sample_fraction: recent_samples as f32 / self.sample_count as f32,
         }
+    }
+
+    pub fn max_generation_update(&self) -> u32 {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.generation_update)
+            .max()
+            .unwrap_or(0)
     }
 
     fn encode_replay_payload(&self) -> io::Result<Vec<u8>> {
