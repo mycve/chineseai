@@ -251,6 +251,18 @@ fn rule_entry_ignores_protected_chase_target() {
     assert_ne!(unprotected_chased & (1u128 << index(4, 4)), 0);
 }
 
+#[test]
+fn rule_entry_ignores_cannon_chase_of_protected_crossed_soldier() {
+    // 实战残局：红炮d1隔着红仕e1可以打黑卒f1，但黑炮f8隔着
+    // 黑仕f7保护该卒。有根的过河卒不能被记为红方长捉目标。
+    let position = Position::from_fen("4k4/4ac3/5a3/9/9/9/9/4B4/3CAp3/4K4 w").unwrap();
+    let soldier = index(5, 8);
+    assert!(position.is_piece_protected(soldier, Color::Black));
+
+    let chased = position.rule_history_entry(Some(Color::Red)).chased_mask;
+    assert_eq!(chased & (1u128 << soldier), 0);
+}
+
 fn test_rule_entry(
     hash: u64,
     side_to_move: Color,
