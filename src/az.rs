@@ -2033,6 +2033,14 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        if left.len() >= 64
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: runtime detection above guarantees AVX2 and FMA support.
+            return unsafe { dot_product_avx2_fma(left, right) };
+        }
         if left.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: runtime detection above guarantees AVX2 support.
             return unsafe { dot_product_avx2(left, right) };
@@ -2074,6 +2082,15 @@ fn add_scaled_feature_row(
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        if hidden_size >= 64
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: runtime detection above guarantees AVX2 and FMA support.
+            unsafe { add_scaled_feature_row_avx2_fma(hidden, row, scale) };
+            return;
+        }
         if hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: runtime detection above guarantees AVX2 support.
             unsafe {
@@ -2156,6 +2173,50 @@ unsafe fn add_scaled_feature_row_neon(hidden: &mut [f32], row: &[f32], scale: f3
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_avx2_fma(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let chunks = left.len() / 32;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    for chunk in 0..chunks {
+        let index = chunk * 32;
+        unsafe {
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index)),
+                _mm256_loadu_ps(right.as_ptr().add(index)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index + 8)),
+                _mm256_loadu_ps(right.as_ptr().add(index + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index + 16)),
+                _mm256_loadu_ps(right.as_ptr().add(index + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index + 24)),
+                _mm256_loadu_ps(right.as_ptr().add(index + 24)),
+                acc3,
+            );
+        }
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut lanes = [0.0f32; 8];
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    let mut sum = lanes.iter().sum::<f32>();
+    for index in (chunks * 32)..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -2238,6 +2299,29 @@ unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
     }
     for index in (chunks * 8)..hidden.len() {
         hidden[index] += row[index];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn add_scaled_feature_row_avx2_fma(hidden: &mut [f32], row: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let scale_scalar = scale;
+    let scale = _mm256_set1_ps(scale_scalar);
+    let chunks = hidden.len() / 8;
+    for chunk in 0..chunks {
+        let index = chunk * 8;
+        unsafe {
+            let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
+            let right = _mm256_loadu_ps(row.as_ptr().add(index));
+            _mm256_storeu_ps(
+                hidden.as_mut_ptr().add(index),
+                _mm256_fmadd_ps(right, scale, left),
+            );
+        }
+    }
+    for index in (chunks * 8)..hidden.len() {
+        hidden[index] += row[index] * scale_scalar;
     }
 }
 
