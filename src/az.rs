@@ -59,11 +59,6 @@ pub(super) const STRUCTURAL_KING_PIECE_SIZE: usize = 2 * V2_KING_BUCKETS * 14;
 pub fn inference_simd_backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("fma")
-        {
-            return "avx512f+fma-4acc";
-        }
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             return "avx2+fma-4acc";
@@ -2065,14 +2060,6 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     {
         #[cfg(target_arch = "x86_64")]
         if left.len() >= 64
-            && std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("fma")
-        {
-            // SAFETY: runtime detection above guarantees AVX-512F and FMA support.
-            return unsafe { dot_product_avx512_fma(left, right) };
-        }
-        #[cfg(target_arch = "x86_64")]
-        if left.len() >= 64
             && std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma")
         {
@@ -2208,50 +2195,6 @@ unsafe fn add_scaled_feature_row_neon(hidden: &mut [f32], row: &[f32], scale: f3
     for index in (chunks * 4)..hidden.len() {
         hidden[index] += row[index] * scale;
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-unsafe fn dot_product_avx512_fma(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    let chunks = left.len() / 64;
-    let mut acc0 = _mm512_setzero_ps();
-    let mut acc1 = _mm512_setzero_ps();
-    let mut acc2 = _mm512_setzero_ps();
-    let mut acc3 = _mm512_setzero_ps();
-    for chunk in 0..chunks {
-        let index = chunk * 64;
-        unsafe {
-            acc0 = _mm512_fmadd_ps(
-                _mm512_loadu_ps(left.as_ptr().add(index)),
-                _mm512_loadu_ps(right.as_ptr().add(index)),
-                acc0,
-            );
-            acc1 = _mm512_fmadd_ps(
-                _mm512_loadu_ps(left.as_ptr().add(index + 16)),
-                _mm512_loadu_ps(right.as_ptr().add(index + 16)),
-                acc1,
-            );
-            acc2 = _mm512_fmadd_ps(
-                _mm512_loadu_ps(left.as_ptr().add(index + 32)),
-                _mm512_loadu_ps(right.as_ptr().add(index + 32)),
-                acc2,
-            );
-            acc3 = _mm512_fmadd_ps(
-                _mm512_loadu_ps(left.as_ptr().add(index + 48)),
-                _mm512_loadu_ps(right.as_ptr().add(index + 48)),
-                acc3,
-            );
-        }
-    }
-    let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
-    let mut lanes = [0.0f32; 16];
-    unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
-    let mut sum = lanes.iter().sum::<f32>();
-    for index in (chunks * 64)..left.len() {
-        sum += left[index] * right[index];
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
