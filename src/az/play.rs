@@ -194,6 +194,8 @@ pub struct AzSelfplayData {
     pub reroot_best_repairs: usize,
     pub reroot_temperature_checks: usize,
     pub reroot_temperature_repairs: usize,
+    pub reroot_best_policy_mass: f32,
+    pub reroot_temperature_policy_mass: f32,
     pub best_played_q_gap_sum: f32,
     pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
@@ -249,6 +251,8 @@ impl AzSelfplayData {
         self.reroot_best_repairs += other.reroot_best_repairs;
         self.reroot_temperature_checks += other.reroot_temperature_checks;
         self.reroot_temperature_repairs += other.reroot_temperature_repairs;
+        self.reroot_best_policy_mass += other.reroot_best_policy_mass;
+        self.reroot_temperature_policy_mass += other.reroot_temperature_policy_mass;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
         self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
@@ -333,6 +337,8 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.reroot_best_repairs += chunk.reroot_best_repairs;
         merged.reroot_temperature_checks += chunk.reroot_temperature_checks;
         merged.reroot_temperature_repairs += chunk.reroot_temperature_repairs;
+        merged.reroot_best_policy_mass += chunk.reroot_best_policy_mass;
+        merged.reroot_temperature_policy_mass += chunk.reroot_temperature_policy_mass;
         merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
         merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
         merged.best_q_sum += chunk.best_q_sum;
@@ -391,6 +397,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut reroot_best_repairs = 0usize;
     let mut reroot_temperature_checks = 0usize;
     let mut reroot_temperature_repairs = 0usize;
+    let mut reroot_best_policy_mass = 0.0f32;
+    let mut reroot_temperature_policy_mass = 0.0f32;
     let mut best_played_q_gap_sum = 0.0f32;
     let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
@@ -485,8 +493,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     reroot_repairs += 1;
                     if played_best {
                         reroot_best_repairs += 1;
+                        reroot_best_policy_mass += repair.policy_transfer;
                     } else {
                         reroot_temperature_repairs += 1;
+                        reroot_temperature_policy_mass += repair.policy_transfer;
                     }
                     reroot_repair_q_gap_sum += repair.q_gap;
                     reroot_repair_max_q_gap = reroot_repair_max_q_gap.max(repair.q_gap);
@@ -754,6 +764,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         reroot_best_repairs,
         reroot_temperature_checks,
         reroot_temperature_repairs,
+        reroot_best_policy_mass,
+        reroot_temperature_policy_mass,
         best_played_q_gap_sum,
         played_top_visit_ratio_sum,
         best_q_sum,
@@ -959,10 +971,13 @@ fn reroot_repair_eligible(
     current_search_simulations: usize,
     config: &AzLoopConfig,
 ) -> bool {
-    if config.reroot_repair_q_gap <= 0.0
-        || config.reroot_repair_max_transfer <= 0.0
-        || previous_sample.meta.deblundered
-    {
+    let played_best = previous_sample.meta.played_index == previous_sample.meta.best_index;
+    let repair_enabled = if played_best {
+        config.reroot_repair_best_max_transfer > 0.0
+    } else {
+        config.reroot_repair_max_transfer > 0.0 && config.reroot_repair_temperature_scale > 0.0
+    };
+    if config.reroot_repair_q_gap <= 0.0 || !repair_enabled || previous_sample.meta.deblundered {
         return false;
     }
     if config.reroot_repair_require_full_search {
@@ -993,16 +1008,17 @@ fn apply_reroot_policy_repair(
         return None;
     }
     let played_probability = previous_sample.policy[played_index].max(0.0);
-    let temperature_scale = if previous_sample.meta.played_index == previous_sample.meta.best_index
-    {
-        1.0
+    let played_best = previous_sample.meta.played_index == previous_sample.meta.best_index;
+    let policy_transfer = if played_best {
+        q_gap
+            .min(config.reroot_repair_best_max_transfer.clamp(0.0, 1.0))
+            .min(played_probability * 0.5)
     } else {
-        config.reroot_repair_temperature_scale.clamp(0.0, 1.0)
+        ((q_gap - threshold)
+            .min(config.reroot_repair_max_transfer.clamp(0.0, 1.0))
+            .min(played_probability * 0.75))
+            * config.reroot_repair_temperature_scale.clamp(0.0, 1.0)
     };
-    let policy_transfer = ((q_gap - threshold)
-        .min(config.reroot_repair_max_transfer.clamp(0.0, 1.0))
-        .min(played_probability * 0.75))
-        * temperature_scale;
     if policy_transfer <= 0.0 {
         return None;
     }
@@ -1029,6 +1045,11 @@ fn apply_reroot_policy_repair(
     for (index, probability) in alternatives {
         let weight = probability.max(1.0e-12).sqrt() / weight_sum;
         previous_sample.policy[index] += policy_transfer * weight;
+    }
+    if played_best {
+        previous_sample.policy_weight = previous_sample
+            .policy_weight
+            .max(config.reroot_repair_best_policy_weight.max(0.0));
     }
     Some(RerootRepairResult {
         q_gap,
@@ -1677,6 +1698,8 @@ mod tests {
             reroot_repair_candidates: 4,
             reroot_repair_require_full_search: true,
             reroot_repair_temperature_scale: 0.5,
+            reroot_repair_best_max_transfer: 0.35,
+            reroot_repair_best_policy_weight: 2.0,
             opening_positions: Vec::new(),
             resign_percentage: 0.0,
             resign_playthrough: 0.0,
@@ -1796,8 +1819,9 @@ mod tests {
         let repair = apply_reroot_policy_repair(&mut sample, 0.40, &config).unwrap();
 
         assert!((repair.q_gap - 0.60).abs() < 1e-6);
-        assert!((repair.policy_transfer - 0.25).abs() < 1e-6);
-        assert!((sample.policy[0] - 0.45).abs() < 1e-6);
+        assert!((repair.policy_transfer - 0.35).abs() < 1e-6);
+        assert!((sample.policy[0] - 0.35).abs() < 1e-6);
+        assert!((sample.policy_weight - 2.0).abs() < 1e-6);
         assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!((sample.value - 0.25).abs() < 1e-6);
     }
