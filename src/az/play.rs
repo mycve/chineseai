@@ -6,7 +6,7 @@ use crate::nnue::{
     HistoryMove, canonical_move, extract_sparse_features_az_canonical, mirror_file_move,
     mirror_sparse_features_az_absolute_file,
 };
-use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
+use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
@@ -182,6 +182,9 @@ pub struct AzSelfplayData {
     pub sampled_moves: usize,
     pub sampled_best_moves: usize,
     pub deblundered_moves: usize,
+    pub guardian_positions: usize,
+    pub guardian_candidates_checked: usize,
+    pub guardian_promotions: usize,
     pub best_played_q_gap_sum: f32,
     pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
@@ -223,6 +226,9 @@ impl AzSelfplayData {
         self.sampled_moves += other.sampled_moves;
         self.sampled_best_moves += other.sampled_best_moves;
         self.deblundered_moves += other.deblundered_moves;
+        self.guardian_positions += other.guardian_positions;
+        self.guardian_candidates_checked += other.guardian_candidates_checked;
+        self.guardian_promotions += other.guardian_promotions;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
         self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
@@ -293,6 +299,9 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.sampled_moves += chunk.sampled_moves;
         merged.sampled_best_moves += chunk.sampled_best_moves;
         merged.deblundered_moves += chunk.deblundered_moves;
+        merged.guardian_positions += chunk.guardian_positions;
+        merged.guardian_candidates_checked += chunk.guardian_candidates_checked;
+        merged.guardian_promotions += chunk.guardian_promotions;
         merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
         merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
         merged.best_q_sum += chunk.best_q_sum;
@@ -339,6 +348,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut sampled_moves = 0usize;
     let mut sampled_best_moves = 0usize;
     let mut deblundered_moves = 0usize;
+    let mut guardian_positions = 0usize;
+    let mut guardian_candidates_checked = 0usize;
+    let mut guardian_promotions = 0usize;
     let mut best_played_q_gap_sum = 0.0f32;
     let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
@@ -416,6 +428,20 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 )
             };
             crate::scope_profile!("az.selfplay.post_search");
+            let guardian_patch = guardian_policy_patch(
+                model,
+                config,
+                &position,
+                &history,
+                &rule_history,
+                &search.candidates,
+                &mut rng,
+            );
+            if let Some(patch) = &guardian_patch {
+                guardian_positions += 1;
+                guardian_candidates_checked += patch.checked;
+                guardian_promotions += patch.promoted_indices.len();
+            }
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
             raw_prior_top1_sum += shape.raw_prior_top1;
@@ -451,7 +477,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.seed ^ game_index as u64,
                     ply,
                 );
-                game_samples.push(make_training_sample(
+                let mut sample = make_training_sample(
                     &position,
                     &history,
                     &search.candidates,
@@ -461,7 +487,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     meta,
                     search_simulation_count,
                     policy_weight_for_search(config, search_simulation_count),
-                ));
+                );
+                apply_guardian_policy_patch(
+                    &mut sample,
+                    guardian_patch.as_ref(),
+                    config.guardian_policy_transfer,
+                );
+                game_samples.push(sample);
                 result = Some(if position.side_to_move() == Color::Red {
                     terminal.resign_red += 1;
                     -1.0
@@ -529,7 +561,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
             {
                 crate::scope_profile!("az.selfplay.make_sample");
-                game_samples.push(make_training_sample(
+                let mut sample = make_training_sample(
                     &position,
                     &history,
                     &search.candidates,
@@ -539,7 +571,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     move_meta.sample,
                     search_simulation_count,
                     policy_weight_for_search(config, search_simulation_count),
-                ));
+                );
+                apply_guardian_policy_patch(
+                    &mut sample,
+                    guardian_patch.as_ref(),
+                    config.guardian_policy_transfer,
+                );
+                game_samples.push(sample);
             }
             append_history(&mut history, &position, mv);
             let mover = position.side_to_move();
@@ -639,6 +677,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         sampled_moves,
         sampled_best_moves,
         deblundered_moves,
+        guardian_positions,
+        guardian_candidates_checked,
+        guardian_promotions,
         best_played_q_gap_sum,
         played_top_visit_ratio_sum,
         best_q_sum,
@@ -666,6 +707,170 @@ fn policy_weight_for_search(config: &AzLoopConfig, search_simulations: usize) ->
         config.low_simulation_policy_weight.max(0.0)
     } else {
         1.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GuardianPolicyPatch {
+    incumbent_index: usize,
+    promoted_indices: Vec<usize>,
+    checked: usize,
+}
+
+fn guardian_policy_patch(
+    model: &AzNnue,
+    config: &AzLoopConfig,
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: &[RuleHistoryEntry],
+    candidates: &[AzCandidate],
+    rng: &mut SplitMix64,
+) -> Option<GuardianPolicyPatch> {
+    if candidates.len() < 2
+        || config.guardian_sample_rate <= 0.0
+        || rng.unit_f32() >= config.guardian_sample_rate.clamp(0.0, 1.0)
+    {
+        return None;
+    }
+    let incumbent_index = candidates
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.visits
+                .cmp(&right.visits)
+                .then_with(|| left.policy.total_cmp(&right.policy))
+        })
+        .map(|(index, _)| index)?;
+    let mut challenger_indices = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (index != incumbent_index
+                && candidate.prior <= config.guardian_prior_max
+                && candidate.visits <= config.guardian_visits_max)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if challenger_indices.is_empty() {
+        return None;
+    }
+    for index in (1..challenger_indices.len()).rev() {
+        let swap = (rng.next_u64() as usize) % (index + 1);
+        challenger_indices.swap(index, swap);
+    }
+    challenger_indices.truncate(config.guardian_candidates.max(1));
+
+    let incumbent_q = guardian_child_q(
+        model,
+        config,
+        position,
+        history,
+        rule_history,
+        candidates[incumbent_index].mv,
+        rng.next_u64(),
+    );
+    let mut promoted_indices = Vec::new();
+    for &index in &challenger_indices {
+        let challenger_q = guardian_child_q(
+            model,
+            config,
+            position,
+            history,
+            rule_history,
+            candidates[index].mv,
+            rng.next_u64(),
+        );
+        if challenger_q >= incumbent_q + config.guardian_q_margin {
+            promoted_indices.push(index);
+        }
+    }
+    Some(GuardianPolicyPatch {
+        incumbent_index,
+        promoted_indices,
+        checked: challenger_indices.len(),
+    })
+}
+
+fn guardian_child_q(
+    model: &AzNnue,
+    config: &AzLoopConfig,
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: &[RuleHistoryEntry],
+    mv: Move,
+    seed: u64,
+) -> f32 {
+    let mut child_history = history.to_vec();
+    append_history(&mut child_history, position, mv);
+    let mut child_rules = rule_history.to_vec();
+    child_rules.push(position.rule_history_entry_after_move(mv));
+    let mut child = position.clone();
+    child.make_move(mv);
+    let legal = child.legal_moves_with_rules(&child_rules);
+    -alphazero_search_with_history_and_rules(
+        &child,
+        &child_history,
+        Some(child_rules),
+        Some(legal),
+        model,
+        AzSearchLimits {
+            simulations: config.guardian_simulations.max(1),
+            seed,
+            cpuct: config.cpuct,
+            cpuct_at_root: config.cpuct_at_root,
+            cpuct_base: config.cpuct_base,
+            cpuct_factor: config.cpuct_factor,
+            cpuct_base_at_root: config.cpuct_base_at_root,
+            cpuct_factor_at_root: config.cpuct_factor_at_root,
+            max_depth: 0,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            fpu_value: config.fpu_value,
+            fpu_value_at_root: config.fpu_value_at_root,
+            draw_score: config.draw_score,
+            moves_left_max_effect: config.moves_left_max_effect,
+            moves_left_slope: config.moves_left_slope,
+            moves_left_threshold: config.moves_left_threshold,
+            moves_left_constant_factor: config.moves_left_constant_factor,
+            moves_left_scaled_factor: config.moves_left_scaled_factor,
+            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+            value_scale: 1.0,
+        },
+    )
+    .value_q
+}
+
+fn apply_guardian_policy_patch(
+    sample: &mut AzTrainingSample,
+    patch: Option<&GuardianPolicyPatch>,
+    max_transfer: f32,
+) {
+    let Some(patch) = patch else {
+        return;
+    };
+    if patch.promoted_indices.is_empty() || patch.incumbent_index >= sample.policy.len() {
+        return;
+    }
+    let promoted = patch
+        .promoted_indices
+        .iter()
+        .copied()
+        .filter(|&index| index < sample.policy.len() && index != patch.incumbent_index)
+        .collect::<Vec<_>>();
+    if promoted.is_empty() {
+        return;
+    }
+    let incumbent_probability = sample.policy[patch.incumbent_index];
+    let transfer = max_transfer
+        .clamp(0.0, 1.0)
+        .min(incumbent_probability * 0.75);
+    if transfer <= 0.0 {
+        return;
+    }
+    sample.policy[patch.incumbent_index] -= transfer;
+    let each = transfer / promoted.len() as f32;
+    for index in promoted {
+        sample.policy[index] += each;
     }
 }
 
@@ -1298,6 +1503,13 @@ mod tests {
             moves_left_scaled_factor: 0.0,
             moves_left_quadratic_factor: 0.0,
             policy_softmax_temp: 1.0,
+            guardian_sample_rate: 0.0,
+            guardian_candidates: 4,
+            guardian_simulations: 200,
+            guardian_prior_max: 0.02,
+            guardian_visits_max: 8,
+            guardian_q_margin: 0.10,
+            guardian_policy_transfer: 0.15,
             opening_positions: Vec::new(),
             resign_percentage: 0.0,
             resign_playthrough: 0.0,
@@ -1382,6 +1594,26 @@ mod tests {
         assert!((samples[1].value + 0.6).abs() < 1e-6);
         assert!((samples[2].value + 0.5).abs() < 1e-6);
         assert!((samples[3].value + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn guardian_patch_shares_transfer_between_promoted_moves() {
+        let mut sample = sample(0.25, 1.0);
+        sample.policy = vec![0.60, 0.01, 0.20, 0.19];
+        let patch = GuardianPolicyPatch {
+            incumbent_index: 0,
+            promoted_indices: vec![1, 3],
+            checked: 4,
+        };
+
+        apply_guardian_policy_patch(&mut sample, Some(&patch), 0.15);
+
+        assert!((sample.policy[0] - 0.45).abs() < 1e-6);
+        assert!((sample.policy[1] - 0.085).abs() < 1e-6);
+        assert!((sample.policy[2] - 0.20).abs() < 1e-6);
+        assert!((sample.policy[3] - 0.265).abs() < 1e-6);
+        assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((sample.value - 0.25).abs() < 1e-6);
     }
 
     #[test]

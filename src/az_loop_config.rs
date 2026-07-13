@@ -45,6 +45,13 @@ pub struct AzLoopFileConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub guardian_sample_rate: f32,
+    pub guardian_candidates: usize,
+    pub guardian_simulations: usize,
+    pub guardian_prior_max: f32,
+    pub guardian_visits_max: u32,
+    pub guardian_q_margin: f32,
+    pub guardian_policy_transfer: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -82,21 +89,21 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 512,
-            low_simulations: 256,
+            simulations: 2000,
+            low_simulations: 1000,
             low_simulation_probability: 0.35,
-            low_simulation_policy_weight: 0.35,
+            low_simulation_policy_weight: 0.5,
             selfplay_samples_per_update: 240000,
             lr: 0.001,
-            lr_min: 0.0001,
-            lr_decay_start_update: 800,
-            lr_decay_interval: 1000,
-            lr_decay_factor: 0.33333334,
+            lr_min: 0.0005,
+            lr_decay_start_update: 100,
+            lr_decay_interval: 200,
+            lr_decay_factor: 0.9,
             batch_size: 1024,
-            max_plies: 300,
+            max_plies: 150,
             hidden_size: 192,
-            seed: 20260412,
-            workers: 250,
+            seed: 20260420,
+            workers: 200,
             temperature_start: 0.9,
             temperature_endgame: 0.5,
             temperature_decay_delay_plies: 20,
@@ -104,7 +111,7 @@ impl Default for AzLoopFileConfig {
             temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
             cpuct: 0.65,
-            cpuct_at_root: 2.53,
+            cpuct_at_root: 2.0,
             cpuct_base: 19652.0,
             cpuct_factor: 2.0,
             cpuct_base_at_root: 19652.0,
@@ -115,21 +122,28 @@ impl Default for AzLoopFileConfig {
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
             moves_left_max_effect: 0.25,
-            moves_left_slope: 0.002,
-            moves_left_threshold: 0.6,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.15,
-            moves_left_quadratic_factor: 0.85,
+            moves_left_slope: 0.004,
+            moves_left_threshold: 0.7,
+            moves_left_constant_factor: 0.05,
+            moves_left_scaled_factor: 0.20,
+            moves_left_quadratic_factor: 0.75,
             policy_softmax_temp: 1.45,
+            guardian_sample_rate: 0.01,
+            guardian_candidates: 4,
+            guardian_simulations: 200,
+            guardian_prior_max: 0.02,
+            guardian_visits_max: 8,
+            guardian_q_margin: 0.10,
+            guardian_policy_transfer: 0.15,
             opening_fens_path: String::new(),
-            resign_percentage: 1.0,
+            resign_percentage: 0.8,
             resign_playthrough: 20.0,
             replay_capacity: 5000000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_window_updates: 5000,
             train_warmup_samples: 240000,
-            train_samples_per_update: 120000,
-            train_epochs_per_update: 1,
+            train_samples_per_update: 240000,
+            train_epochs_per_update: 2,
             mirror_probability: 0.3,
             deblunder_q_gap: 0.15,
             train_value_weight: 1.0,
@@ -141,7 +155,7 @@ impl Default for AzLoopFileConfig {
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
-            arena_processes: 250,
+            arena_processes: 200,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 300,
             arena_opening_plies_min: 6,
@@ -149,7 +163,7 @@ impl Default for AzLoopFileConfig {
             pikafish_label_eval_sqlite: "eval/pikafish-random-5000-d8.sqlite".into(),
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
-            pikafish_label_eval_simulations: 256,
+            pikafish_label_eval_simulations: 1600,
             pikafish_label_eval_cpuct: 1.5,
             tensorboard_logdir: "runs/chineseai".into(),
         }
@@ -199,6 +213,13 @@ struct AzLoopTomlConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub guardian_sample_rate: f32,
+    pub guardian_candidates: usize,
+    pub guardian_simulations: usize,
+    pub guardian_prior_max: f32,
+    pub guardian_visits_max: u32,
+    pub guardian_q_margin: f32,
+    pub guardian_policy_transfer: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -293,6 +314,13 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             moves_left_scaled_factor: config.moves_left_scaled_factor,
             moves_left_quadratic_factor: config.moves_left_quadratic_factor,
             policy_softmax_temp: config.policy_softmax_temp,
+            guardian_sample_rate: config.guardian_sample_rate,
+            guardian_candidates: config.guardian_candidates,
+            guardian_simulations: config.guardian_simulations,
+            guardian_prior_max: config.guardian_prior_max,
+            guardian_visits_max: config.guardian_visits_max,
+            guardian_q_margin: config.guardian_q_margin,
+            guardian_policy_transfer: config.guardian_policy_transfer,
             opening_fens_path: config.opening_fens_path.clone(),
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -377,6 +405,13 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             moves_left_scaled_factor: config.moves_left_scaled_factor,
             moves_left_quadratic_factor: config.moves_left_quadratic_factor,
             policy_softmax_temp: config.policy_softmax_temp,
+            guardian_sample_rate: config.guardian_sample_rate,
+            guardian_candidates: config.guardian_candidates,
+            guardian_simulations: config.guardian_simulations,
+            guardian_prior_max: config.guardian_prior_max,
+            guardian_visits_max: config.guardian_visits_max,
+            guardian_q_margin: config.guardian_q_margin,
+            guardian_policy_transfer: config.guardian_policy_transfer,
             opening_fens_path: config.opening_fens_path,
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -498,6 +533,13 @@ impl AzLoopFileConfig {
             f(self.moves_left_quadratic_factor)
         );
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
+        line!("guardian_sample_rate", f(self.guardian_sample_rate));
+        line!("guardian_candidates", self.guardian_candidates);
+        line!("guardian_simulations", self.guardian_simulations);
+        line!("guardian_prior_max", f(self.guardian_prior_max));
+        line!("guardian_visits_max", self.guardian_visits_max);
+        line!("guardian_q_margin", f(self.guardian_q_margin));
+        line!("guardian_policy_transfer", f(self.guardian_policy_transfer));
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -599,6 +641,12 @@ impl AzLoopFileConfig {
         self.moves_left_slope = self.moves_left_slope.max(0.0);
         self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
+        self.guardian_sample_rate = self.guardian_sample_rate.clamp(0.0, 1.0);
+        self.guardian_candidates = self.guardian_candidates.max(1);
+        self.guardian_simulations = self.guardian_simulations.max(1);
+        self.guardian_prior_max = self.guardian_prior_max.clamp(0.0, 1.0);
+        self.guardian_q_margin = self.guardian_q_margin.max(0.0);
+        self.guardian_policy_transfer = self.guardian_policy_transfer.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -637,7 +685,7 @@ mod tests {
         let text = AzLoopFileConfig::default().to_file_text();
 
         assert!(text.contains("lr = 0.001\n"));
-        assert!(text.contains("lr_min = 0.0001\n"));
+        assert!(text.contains("lr_min = 0.0005\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("temperature_endgame = 0.5\n"));
         assert!(text.contains("temperature_decay_delay_plies = 20\n"));
@@ -646,7 +694,7 @@ mod tests {
         assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
         assert!(text.contains("cpuct = 0.65\n"));
-        assert!(text.contains("cpuct_at_root = 2.53\n"));
+        assert!(text.contains("cpuct_at_root = 2.0\n"));
         assert!(text.contains("cpuct_base = 19652.0\n"));
         assert!(text.contains("cpuct_factor = 2.0\n"));
         assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
@@ -655,14 +703,21 @@ mod tests {
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("moves_left_max_effect = 0.25\n"));
-        assert!(text.contains("moves_left_slope = 0.002\n"));
-        assert!(text.contains("moves_left_threshold = 0.6\n"));
-        assert!(text.contains("moves_left_constant_factor = 0.0\n"));
-        assert!(text.contains("moves_left_scaled_factor = 0.15\n"));
-        assert!(text.contains("moves_left_quadratic_factor = 0.85\n"));
+        assert!(text.contains("moves_left_slope = 0.004\n"));
+        assert!(text.contains("moves_left_threshold = 0.7\n"));
+        assert!(text.contains("moves_left_constant_factor = 0.05\n"));
+        assert!(text.contains("moves_left_scaled_factor = 0.2\n"));
+        assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("guardian_sample_rate = 0.01\n"));
+        assert!(text.contains("guardian_candidates = 4\n"));
+        assert!(text.contains("guardian_simulations = 200\n"));
+        assert!(text.contains("guardian_prior_max = 0.02\n"));
+        assert!(text.contains("guardian_visits_max = 8\n"));
+        assert!(text.contains("guardian_q_margin = 0.1\n"));
+        assert!(text.contains("guardian_policy_transfer = 0.15\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
-        assert!(text.contains("resign_percentage = 1.0\n"));
+        assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("selfplay_samples_per_update = 240000\n"));
         assert!(text.contains("replay_recent_window_updates = 5000\n"));
@@ -677,7 +732,7 @@ mod tests {
         );
         assert!(text.contains("pikafish_label_eval_interval = 20\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
-        assert!(text.contains("pikafish_label_eval_simulations = 256\n"));
+        assert!(text.contains("pikafish_label_eval_simulations = 1600\n"));
         assert!(text.contains("pikafish_label_eval_cpuct = 1.5\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("gumbel"));
