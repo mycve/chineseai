@@ -10,10 +10,12 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
-        alphazero_search, benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace,
-        benchmark_policy_fit, benchmark_training, generate_selfplay_data,
-        global_training_step_sample_count, play_arena_games_from_positions, train_samples_weighted,
+        alphazero_search, alphazero_search_with_history_and_rules, benchmark_fixed_policy_fit,
+        benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit, benchmark_training,
+        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
+        train_samples_weighted,
     },
+    nnue::HistoryMove,
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -145,6 +147,15 @@ struct AzSearchArgs {
     /// Enable moves-left utility.
     #[arg(long, default_value_t = true)]
     moves_left_utility: bool,
+    /// Independently re-search this many top-visited root moves after making each move.
+    #[arg(long, default_value_t = 0)]
+    verify_top: usize,
+    /// Independently re-search specific root moves (repeat the option for multiple moves).
+    #[arg(long = "verify-move")]
+    verify_moves: Vec<String>,
+    /// Simulations for every independent child verification; 0 uses the root simulation count.
+    #[arg(long, default_value_t = 0)]
+    verify_sims: usize,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -1540,33 +1551,30 @@ fn main() {
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
-            let result = alphazero_search(
-                &position,
-                &model,
-                AzSearchLimits {
-                    simulations,
-                    seed: 0,
-                    cpuct,
-                    cpuct_at_root,
-                    cpuct_base: cmd.cpuct_base.max(1.0),
-                    cpuct_factor: cmd.cpuct_factor.max(0.0),
-                    cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
-                    cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
-                    max_depth: cmd.max_depth,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: 0.23,
-                    fpu_value_at_root: 1.0,
-                    draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                    moves_left_max_effect: if cmd.moves_left_utility { 0.25 } else { 0.0 },
-                    moves_left_slope: if cmd.moves_left_utility { 0.002 } else { 0.0 },
-                    moves_left_threshold: 0.6,
-                    moves_left_constant_factor: 0.0,
-                    moves_left_scaled_factor: if cmd.moves_left_utility { 0.15 } else { 0.0 },
-                    moves_left_quadratic_factor: if cmd.moves_left_utility { 0.85 } else { 0.0 },
-                    value_scale: 1.0,
-                },
-            );
+            let search_limits = AzSearchLimits {
+                simulations,
+                seed: 0,
+                cpuct,
+                cpuct_at_root,
+                cpuct_base: cmd.cpuct_base.max(1.0),
+                cpuct_factor: cmd.cpuct_factor.max(0.0),
+                cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
+                cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
+                max_depth: cmd.max_depth,
+                root_dirichlet_alpha: 0.0,
+                root_exploration_fraction: 0.0,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
+                draw_score: cmd.draw_score.clamp(-1.0, 1.0),
+                moves_left_max_effect: if cmd.moves_left_utility { 0.25 } else { 0.0 },
+                moves_left_slope: if cmd.moves_left_utility { 0.002 } else { 0.0 },
+                moves_left_threshold: 0.6,
+                moves_left_constant_factor: 0.0,
+                moves_left_scaled_factor: if cmd.moves_left_utility { 0.15 } else { 0.0 },
+                moves_left_quadratic_factor: if cmd.moves_left_utility { 0.85 } else { 0.0 },
+                value_scale: 1.0,
+            };
+            let result = alphazero_search(&position, &model, search_limits);
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
@@ -1628,6 +1636,77 @@ fn main() {
                     candidate.moves_left,
                     candidate.prior,
                     candidate.policy
+                );
+            }
+            let verify_sims = if cmd.verify_sims == 0 {
+                simulations
+            } else {
+                cmd.verify_sims
+            };
+            let mut verify_moves = by_visits
+                .iter()
+                .take(cmd.verify_top)
+                .map(|candidate| candidate.mv)
+                .collect::<Vec<_>>();
+            for text in &cmd.verify_moves {
+                let mv = position.parse_uci_move(text).unwrap_or_else(|| {
+                    panic!("invalid or illegal --verify-move `{text}` for this position")
+                });
+                if !verify_moves.contains(&mv) {
+                    verify_moves.push(mv);
+                }
+            }
+            if !verify_moves.is_empty() {
+                println!("verify_children: sims={verify_sims}");
+            }
+            for mv in verify_moves {
+                let Some(root_candidate) = result.candidates.iter().find(|item| item.mv == mv)
+                else {
+                    println!("verify: {mv} unavailable_at_root");
+                    continue;
+                };
+                let moved = position
+                    .piece_at(mv.from as usize)
+                    .expect("verified move must have a moving piece");
+                let captured = position.piece_at(mv.to as usize);
+                let history = vec![HistoryMove {
+                    piece: moved,
+                    captured,
+                    mv,
+                }];
+                let mut rule_history = position.initial_rule_history();
+                rule_history.push(position.rule_history_entry_after_move(mv));
+                let mut child = position.clone();
+                child.make_move(mv);
+                let child_legal = child.legal_moves_with_rules(&rule_history);
+                let child_nn_q = model.evaluate_value(&child, &history, &child_legal);
+                let mut verify_limits = search_limits;
+                verify_limits.simulations = verify_sims.max(1);
+                verify_limits.seed = 0;
+                let verified = alphazero_search_with_history_and_rules(
+                    &child,
+                    &history,
+                    Some(rule_history),
+                    Some(child_legal),
+                    &model,
+                    verify_limits,
+                );
+                let verified_root_q = -verified.value_q;
+                let verified_root_cp = -verified.value_cp;
+                println!(
+                    "verify: {} root_q={:.3} root_visits={} prior={:.5} child_nn_q={:.3} verified_q={:.3} verified_cp={} delta={:+.3} child_best={}",
+                    mv,
+                    root_candidate.q,
+                    root_candidate.visits,
+                    root_candidate.prior,
+                    -child_nn_q,
+                    verified_root_q,
+                    verified_root_cp,
+                    verified_root_q - root_candidate.q,
+                    verified
+                        .best_move
+                        .map(|best| best.to_string())
+                        .unwrap_or_else(|| "(none)".into())
                 );
             }
         }
