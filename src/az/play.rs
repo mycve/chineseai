@@ -190,6 +190,10 @@ pub struct AzSelfplayData {
     pub reroot_repair_q_gap_sum: f32,
     pub reroot_repair_max_q_gap: f32,
     pub reroot_repair_policy_mass: f32,
+    pub reroot_best_checks: usize,
+    pub reroot_best_repairs: usize,
+    pub reroot_temperature_checks: usize,
+    pub reroot_temperature_repairs: usize,
     pub best_played_q_gap_sum: f32,
     pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
@@ -241,6 +245,10 @@ impl AzSelfplayData {
             .reroot_repair_max_q_gap
             .max(other.reroot_repair_max_q_gap);
         self.reroot_repair_policy_mass += other.reroot_repair_policy_mass;
+        self.reroot_best_checks += other.reroot_best_checks;
+        self.reroot_best_repairs += other.reroot_best_repairs;
+        self.reroot_temperature_checks += other.reroot_temperature_checks;
+        self.reroot_temperature_repairs += other.reroot_temperature_repairs;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
         self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
@@ -321,6 +329,10 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
             .reroot_repair_max_q_gap
             .max(chunk.reroot_repair_max_q_gap);
         merged.reroot_repair_policy_mass += chunk.reroot_repair_policy_mass;
+        merged.reroot_best_checks += chunk.reroot_best_checks;
+        merged.reroot_best_repairs += chunk.reroot_best_repairs;
+        merged.reroot_temperature_checks += chunk.reroot_temperature_checks;
+        merged.reroot_temperature_repairs += chunk.reroot_temperature_repairs;
         merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
         merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
         merged.best_q_sum += chunk.best_q_sum;
@@ -375,6 +387,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut reroot_repair_q_gap_sum = 0.0f32;
     let mut reroot_repair_max_q_gap = 0.0f32;
     let mut reroot_repair_policy_mass = 0.0f32;
+    let mut reroot_best_checks = 0usize;
+    let mut reroot_best_repairs = 0usize;
+    let mut reroot_temperature_checks = 0usize;
+    let mut reroot_temperature_repairs = 0usize;
     let mut best_played_q_gap_sum = 0.0f32;
     let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
@@ -456,10 +472,22 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 && reroot_repair_eligible(previous_sample, search_simulation_count, config)
             {
                 reroot_repair_checks += 1;
+                let played_best =
+                    previous_sample.meta.played_index == previous_sample.meta.best_index;
+                if played_best {
+                    reroot_best_checks += 1;
+                } else {
+                    reroot_temperature_checks += 1;
+                }
                 if let Some(repair) =
                     apply_reroot_policy_repair(previous_sample, search.value_q, config)
                 {
                     reroot_repairs += 1;
+                    if played_best {
+                        reroot_best_repairs += 1;
+                    } else {
+                        reroot_temperature_repairs += 1;
+                    }
                     reroot_repair_q_gap_sum += repair.q_gap;
                     reroot_repair_max_q_gap = reroot_repair_max_q_gap.max(repair.q_gap);
                     reroot_repair_policy_mass += repair.policy_transfer;
@@ -722,6 +750,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         reroot_repair_q_gap_sum,
         reroot_repair_max_q_gap,
         reroot_repair_policy_mass,
+        reroot_best_checks,
+        reroot_best_repairs,
+        reroot_temperature_checks,
+        reroot_temperature_repairs,
         best_played_q_gap_sum,
         played_top_visit_ratio_sum,
         best_q_sum,
@@ -961,9 +993,16 @@ fn apply_reroot_policy_repair(
         return None;
     }
     let played_probability = previous_sample.policy[played_index].max(0.0);
-    let policy_transfer = (q_gap - threshold)
+    let temperature_scale = if previous_sample.meta.played_index == previous_sample.meta.best_index
+    {
+        1.0
+    } else {
+        config.reroot_repair_temperature_scale.clamp(0.0, 1.0)
+    };
+    let policy_transfer = ((q_gap - threshold)
         .min(config.reroot_repair_max_transfer.clamp(0.0, 1.0))
-        .min(played_probability * 0.75);
+        .min(played_probability * 0.75))
+        * temperature_scale;
     if policy_transfer <= 0.0 {
         return None;
     }
@@ -1637,6 +1676,7 @@ mod tests {
             reroot_repair_max_transfer: 0.25,
             reroot_repair_candidates: 4,
             reroot_repair_require_full_search: true,
+            reroot_repair_temperature_scale: 0.5,
             opening_positions: Vec::new(),
             resign_percentage: 0.0,
             resign_playthrough: 0.0,
@@ -1772,6 +1812,23 @@ mod tests {
         sample.meta.deblundered = true;
 
         assert!(!reroot_repair_eligible(&sample, 1, &config));
+    }
+
+    #[test]
+    fn reroot_repair_halves_temperature_move_correction() {
+        let config = test_config();
+        let mut sample = sample(0.25, 1.0);
+        sample.policy = vec![0.70, 0.20, 0.08, 0.02];
+        sample.search_simulations = 1;
+        sample.meta.best_index = 1;
+        sample.meta.played_index = 0;
+        sample.meta.played_q = 0.20;
+
+        let repair = apply_reroot_policy_repair(&mut sample, 0.40, &config).unwrap();
+
+        assert!((repair.policy_transfer - 0.125).abs() < 1e-6);
+        assert!((sample.policy[0] - 0.575).abs() < 1e-6);
+        assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
     #[test]
