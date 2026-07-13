@@ -52,6 +52,10 @@ pub struct AzLoopFileConfig {
     pub guardian_visits_max: u32,
     pub guardian_q_margin: f32,
     pub guardian_policy_transfer: f32,
+    pub reroot_repair_q_gap: f32,
+    pub reroot_repair_max_transfer: f32,
+    pub reroot_repair_candidates: usize,
+    pub reroot_repair_require_full_search: bool,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -135,6 +139,10 @@ impl Default for AzLoopFileConfig {
             guardian_visits_max: 8,
             guardian_q_margin: 0.10,
             guardian_policy_transfer: 0.15,
+            reroot_repair_q_gap: 0.15,
+            reroot_repair_max_transfer: 0.25,
+            reroot_repair_candidates: 4,
+            reroot_repair_require_full_search: true,
             opening_fens_path: String::new(),
             resign_percentage: 0.8,
             resign_playthrough: 20.0,
@@ -220,6 +228,10 @@ struct AzLoopTomlConfig {
     pub guardian_visits_max: u32,
     pub guardian_q_margin: f32,
     pub guardian_policy_transfer: f32,
+    pub reroot_repair_q_gap: f32,
+    pub reroot_repair_max_transfer: f32,
+    pub reroot_repair_candidates: usize,
+    pub reroot_repair_require_full_search: bool,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -321,6 +333,10 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             guardian_visits_max: config.guardian_visits_max,
             guardian_q_margin: config.guardian_q_margin,
             guardian_policy_transfer: config.guardian_policy_transfer,
+            reroot_repair_q_gap: config.reroot_repair_q_gap,
+            reroot_repair_max_transfer: config.reroot_repair_max_transfer,
+            reroot_repair_candidates: config.reroot_repair_candidates,
+            reroot_repair_require_full_search: config.reroot_repair_require_full_search,
             opening_fens_path: config.opening_fens_path.clone(),
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -412,6 +428,10 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             guardian_visits_max: config.guardian_visits_max,
             guardian_q_margin: config.guardian_q_margin,
             guardian_policy_transfer: config.guardian_policy_transfer,
+            reroot_repair_q_gap: config.reroot_repair_q_gap,
+            reroot_repair_max_transfer: config.reroot_repair_max_transfer,
+            reroot_repair_candidates: config.reroot_repair_candidates,
+            reroot_repair_require_full_search: config.reroot_repair_require_full_search,
             opening_fens_path: config.opening_fens_path,
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -540,6 +560,16 @@ impl AzLoopFileConfig {
         line!("guardian_visits_max", self.guardian_visits_max);
         line!("guardian_q_margin", f(self.guardian_q_margin));
         line!("guardian_policy_transfer", f(self.guardian_policy_transfer));
+        line!("reroot_repair_q_gap", f(self.reroot_repair_q_gap));
+        line!(
+            "reroot_repair_max_transfer",
+            f(self.reroot_repair_max_transfer)
+        );
+        line!("reroot_repair_candidates", self.reroot_repair_candidates);
+        line!(
+            "reroot_repair_require_full_search",
+            self.reroot_repair_require_full_search
+        );
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -647,6 +677,9 @@ impl AzLoopFileConfig {
         self.guardian_prior_max = self.guardian_prior_max.clamp(0.0, 1.0);
         self.guardian_q_margin = self.guardian_q_margin.max(0.0);
         self.guardian_policy_transfer = self.guardian_policy_transfer.clamp(0.0, 1.0);
+        self.reroot_repair_q_gap = self.reroot_repair_q_gap.max(0.0);
+        self.reroot_repair_max_transfer = self.reroot_repair_max_transfer.clamp(0.0, 1.0);
+        self.reroot_repair_candidates = self.reroot_repair_candidates.max(1);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -716,6 +749,10 @@ mod tests {
         assert!(text.contains("guardian_visits_max = 8\n"));
         assert!(text.contains("guardian_q_margin = 0.1\n"));
         assert!(text.contains("guardian_policy_transfer = 0.15\n"));
+        assert!(text.contains("reroot_repair_q_gap = 0.15\n"));
+        assert!(text.contains("reroot_repair_max_transfer = 0.25\n"));
+        assert!(text.contains("reroot_repair_candidates = 4\n"));
+        assert!(text.contains("reroot_repair_require_full_search = true\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));

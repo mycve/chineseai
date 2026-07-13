@@ -185,6 +185,11 @@ pub struct AzSelfplayData {
     pub guardian_positions: usize,
     pub guardian_candidates_checked: usize,
     pub guardian_promotions: usize,
+    pub reroot_repair_checks: usize,
+    pub reroot_repairs: usize,
+    pub reroot_repair_q_gap_sum: f32,
+    pub reroot_repair_max_q_gap: f32,
+    pub reroot_repair_policy_mass: f32,
     pub best_played_q_gap_sum: f32,
     pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
@@ -229,6 +234,13 @@ impl AzSelfplayData {
         self.guardian_positions += other.guardian_positions;
         self.guardian_candidates_checked += other.guardian_candidates_checked;
         self.guardian_promotions += other.guardian_promotions;
+        self.reroot_repair_checks += other.reroot_repair_checks;
+        self.reroot_repairs += other.reroot_repairs;
+        self.reroot_repair_q_gap_sum += other.reroot_repair_q_gap_sum;
+        self.reroot_repair_max_q_gap = self
+            .reroot_repair_max_q_gap
+            .max(other.reroot_repair_max_q_gap);
+        self.reroot_repair_policy_mass += other.reroot_repair_policy_mass;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
         self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
@@ -302,6 +314,13 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.guardian_positions += chunk.guardian_positions;
         merged.guardian_candidates_checked += chunk.guardian_candidates_checked;
         merged.guardian_promotions += chunk.guardian_promotions;
+        merged.reroot_repair_checks += chunk.reroot_repair_checks;
+        merged.reroot_repairs += chunk.reroot_repairs;
+        merged.reroot_repair_q_gap_sum += chunk.reroot_repair_q_gap_sum;
+        merged.reroot_repair_max_q_gap = merged
+            .reroot_repair_max_q_gap
+            .max(chunk.reroot_repair_max_q_gap);
+        merged.reroot_repair_policy_mass += chunk.reroot_repair_policy_mass;
         merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
         merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
         merged.best_q_sum += chunk.best_q_sum;
@@ -351,6 +370,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut guardian_positions = 0usize;
     let mut guardian_candidates_checked = 0usize;
     let mut guardian_promotions = 0usize;
+    let mut reroot_repair_checks = 0usize;
+    let mut reroot_repairs = 0usize;
+    let mut reroot_repair_q_gap_sum = 0.0f32;
+    let mut reroot_repair_max_q_gap = 0.0f32;
+    let mut reroot_repair_policy_mass = 0.0f32;
     let mut best_played_q_gap_sum = 0.0f32;
     let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
@@ -428,6 +452,19 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 )
             };
             crate::scope_profile!("az.selfplay.post_search");
+            if let Some(previous_sample) = game_samples.last_mut()
+                && reroot_repair_eligible(previous_sample, search_simulation_count, config)
+            {
+                reroot_repair_checks += 1;
+                if let Some(repair) =
+                    apply_reroot_policy_repair(previous_sample, search.value_q, config)
+                {
+                    reroot_repairs += 1;
+                    reroot_repair_q_gap_sum += repair.q_gap;
+                    reroot_repair_max_q_gap = reroot_repair_max_q_gap.max(repair.q_gap);
+                    reroot_repair_policy_mass += repair.policy_transfer;
+                }
+            }
             let guardian_patch = guardian_policy_patch(
                 model,
                 config,
@@ -680,6 +717,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         guardian_positions,
         guardian_candidates_checked,
         guardian_promotions,
+        reroot_repair_checks,
+        reroot_repairs,
+        reroot_repair_q_gap_sum,
+        reroot_repair_max_q_gap,
+        reroot_repair_policy_mass,
         best_played_q_gap_sum,
         played_top_visit_ratio_sum,
         best_q_sum,
@@ -872,6 +914,87 @@ fn apply_guardian_policy_patch(
     for index in promoted {
         sample.policy[index] += each;
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RerootRepairResult {
+    q_gap: f32,
+    policy_transfer: f32,
+}
+
+fn reroot_repair_eligible(
+    previous_sample: &AzTrainingSample,
+    current_search_simulations: usize,
+    config: &AzLoopConfig,
+) -> bool {
+    if config.reroot_repair_q_gap <= 0.0
+        || config.reroot_repair_max_transfer <= 0.0
+        || previous_sample.meta.deblundered
+    {
+        return false;
+    }
+    if config.reroot_repair_require_full_search {
+        let full = config.simulations.max(1);
+        if (previous_sample.search_simulations as usize) < full || current_search_simulations < full
+        {
+            return false;
+        }
+    }
+    usize::from(previous_sample.meta.played_index) < previous_sample.policy.len()
+        && previous_sample.policy.len() > 1
+}
+
+fn apply_reroot_policy_repair(
+    previous_sample: &mut AzTrainingSample,
+    current_root_q: f32,
+    config: &AzLoopConfig,
+) -> Option<RerootRepairResult> {
+    let played_index = usize::from(previous_sample.meta.played_index);
+    if played_index >= previous_sample.policy.len() || previous_sample.policy.len() < 2 {
+        return None;
+    }
+    // 当前根为对手视角，反号后才是上一手走子方对该已走走法的重新定根估值。
+    let realized_previous_q = -current_root_q;
+    let q_gap = previous_sample.meta.played_q - realized_previous_q;
+    let threshold = config.reroot_repair_q_gap.max(0.0);
+    if q_gap <= threshold {
+        return None;
+    }
+    let played_probability = previous_sample.policy[played_index].max(0.0);
+    let policy_transfer = (q_gap - threshold)
+        .min(config.reroot_repair_max_transfer.clamp(0.0, 1.0))
+        .min(played_probability * 0.75);
+    if policy_transfer <= 0.0 {
+        return None;
+    }
+
+    let mut alternatives = previous_sample
+        .policy
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, _)| *index != played_index)
+        .collect::<Vec<_>>();
+    alternatives.sort_by(|left, right| right.1.total_cmp(&left.1));
+    alternatives.truncate(config.reroot_repair_candidates.max(1));
+    if alternatives.is_empty() {
+        return None;
+    }
+    let weight_sum = alternatives
+        .iter()
+        .map(|(_, probability)| probability.max(1.0e-12).sqrt())
+        .sum::<f32>()
+        .max(1.0e-12);
+
+    previous_sample.policy[played_index] -= policy_transfer;
+    for (index, probability) in alternatives {
+        let weight = probability.max(1.0e-12).sqrt() / weight_sum;
+        previous_sample.policy[index] += policy_transfer * weight;
+    }
+    Some(RerootRepairResult {
+        q_gap,
+        policy_transfer,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1510,6 +1633,10 @@ mod tests {
             guardian_visits_max: 8,
             guardian_q_margin: 0.10,
             guardian_policy_transfer: 0.15,
+            reroot_repair_q_gap: 0.15,
+            reroot_repair_max_transfer: 0.25,
+            reroot_repair_candidates: 4,
+            reroot_repair_require_full_search: true,
             opening_positions: Vec::new(),
             resign_percentage: 0.0,
             resign_playthrough: 0.0,
@@ -1614,6 +1741,37 @@ mod tests {
         assert!((sample.policy[3] - 0.265).abs() < 1e-6);
         assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!((sample.value - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reroot_repair_reduces_a_revalidated_bad_played_move() {
+        let config = test_config();
+        let mut sample = sample(0.25, 1.0);
+        sample.policy = vec![0.70, 0.20, 0.08, 0.02];
+        sample.search_simulations = 1;
+        sample.meta.played_index = 0;
+        sample.meta.played_q = 0.20;
+
+        assert!(reroot_repair_eligible(&sample, 1, &config));
+        let repair = apply_reroot_policy_repair(&mut sample, 0.40, &config).unwrap();
+
+        assert!((repair.q_gap - 0.60).abs() < 1e-6);
+        assert!((repair.policy_transfer - 0.25).abs() < 1e-6);
+        assert!((sample.policy[0] - 0.45).abs() < 1e-6);
+        assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((sample.value - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reroot_repair_does_not_overlap_deblunder() {
+        let config = test_config();
+        let mut sample = sample(0.0, 1.0);
+        sample.policy = vec![0.75, 0.25];
+        sample.search_simulations = 1;
+        sample.meta.played_q = 0.5;
+        sample.meta.deblundered = true;
+
+        assert!(!reroot_repair_eligible(&sample, 1, &config));
     }
 
     #[test]
