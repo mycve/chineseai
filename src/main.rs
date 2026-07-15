@@ -1078,20 +1078,6 @@ fn build_az_loop_config(
         moves_left_scaled_factor: config.moves_left_scaled_factor,
         moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
-        guardian_sample_rate: config.guardian_sample_rate,
-        guardian_candidates: config.guardian_candidates,
-        guardian_simulations: config.guardian_simulations,
-        guardian_prior_max: config.guardian_prior_max,
-        guardian_visits_max: config.guardian_visits_max,
-        guardian_q_margin: config.guardian_q_margin,
-        guardian_policy_transfer: config.guardian_policy_transfer,
-        reroot_repair_q_gap: config.reroot_repair_q_gap,
-        reroot_repair_max_transfer: config.reroot_repair_max_transfer,
-        reroot_repair_candidates: config.reroot_repair_candidates,
-        reroot_repair_require_full_search: config.reroot_repair_require_full_search,
-        reroot_repair_temperature_scale: config.reroot_repair_temperature_scale,
-        reroot_repair_best_max_transfer: config.reroot_repair_best_max_transfer,
-        reroot_repair_best_policy_weight: config.reroot_repair_best_policy_weight,
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
@@ -1230,21 +1216,6 @@ fn build_async_training_report(
             / opening_shape_count,
         sampled_best_rate: pending.selfplay.sampled_best_moves as f32 / sampled_moves,
         deblunder_rate: pending.selfplay.deblundered_moves as f32 / sampled_moves,
-        guardian_positions: pending.selfplay.guardian_positions,
-        guardian_candidates_checked: pending.selfplay.guardian_candidates_checked,
-        guardian_promotions: pending.selfplay.guardian_promotions,
-        reroot_repair_checks: pending.selfplay.reroot_repair_checks,
-        reroot_repairs: pending.selfplay.reroot_repairs,
-        reroot_repair_avg_q_gap: pending.selfplay.reroot_repair_q_gap_sum
-            / pending.selfplay.reroot_repairs.max(1) as f32,
-        reroot_repair_max_q_gap: pending.selfplay.reroot_repair_max_q_gap,
-        reroot_repair_policy_mass: pending.selfplay.reroot_repair_policy_mass,
-        reroot_best_checks: pending.selfplay.reroot_best_checks,
-        reroot_best_repairs: pending.selfplay.reroot_best_repairs,
-        reroot_temperature_checks: pending.selfplay.reroot_temperature_checks,
-        reroot_temperature_repairs: pending.selfplay.reroot_temperature_repairs,
-        reroot_best_policy_mass: pending.selfplay.reroot_best_policy_mass,
-        reroot_temperature_policy_mass: pending.selfplay.reroot_temperature_policy_mass,
         avg_best_played_q_gap: pending.selfplay.best_played_q_gap_sum / sampled_moves,
         avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
@@ -1954,20 +1925,6 @@ fn main() {
                     moves_left_scaled_factor: 0.15,
                     moves_left_quadratic_factor: 0.85,
                     policy_softmax_temp: 1.45,
-                    guardian_sample_rate: 0.0,
-                    guardian_candidates: 4,
-                    guardian_simulations: 200,
-                    guardian_prior_max: 0.02,
-                    guardian_visits_max: 8,
-                    guardian_q_margin: 0.10,
-                    guardian_policy_transfer: 0.15,
-                    reroot_repair_q_gap: 0.0,
-                    reroot_repair_max_transfer: 0.0,
-                    reroot_repair_candidates: 4,
-                    reroot_repair_require_full_search: true,
-                    reroot_repair_temperature_scale: 0.5,
-                    reroot_repair_best_max_transfer: 0.35,
-                    reroot_repair_best_policy_weight: 2.0,
                     opening_positions: Vec::new(),
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
@@ -2195,20 +2152,6 @@ fn main() {
                     moves_left_scaled_factor: 0.15,
                     moves_left_quadratic_factor: 0.85,
                     policy_softmax_temp: 1.45,
-                    guardian_sample_rate: 0.0,
-                    guardian_candidates: 4,
-                    guardian_simulations: 200,
-                    guardian_prior_max: 0.02,
-                    guardian_visits_max: 8,
-                    guardian_q_margin: 0.10,
-                    guardian_policy_transfer: 0.15,
-                    reroot_repair_q_gap: 0.0,
-                    reroot_repair_max_transfer: 0.0,
-                    reroot_repair_candidates: 4,
-                    reroot_repair_require_full_search: true,
-                    reroot_repair_temperature_scale: 0.5,
-                    reroot_repair_best_max_transfer: 0.35,
-                    reroot_repair_best_policy_weight: 2.0,
                     opening_positions: Vec::new(),
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
@@ -2536,7 +2479,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},updates={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} guardian(rate={},candidates={},sims={},prior_max={},visits_max={},q_margin={},transfer={}) reroot_repair(q_gap={},transfer={},candidates={},full_search={},temp_scale={},best_transfer={},best_pw={}) train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},updates={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.low_simulations,
@@ -2582,20 +2525,6 @@ fn main() {
                 config.replay_capacity,
                 config.mirror_probability,
                 config.deblunder_q_gap,
-                config.guardian_sample_rate,
-                config.guardian_candidates,
-                config.guardian_simulations,
-                config.guardian_prior_max,
-                config.guardian_visits_max,
-                config.guardian_q_margin,
-                config.guardian_policy_transfer,
-                config.reroot_repair_q_gap,
-                config.reroot_repair_max_transfer,
-                config.reroot_repair_candidates,
-                config.reroot_repair_require_full_search,
-                config.reroot_repair_temperature_scale,
-                config.reroot_repair_best_max_transfer,
-                config.reroot_repair_best_policy_weight,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
@@ -3084,7 +3013,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} phaseQ(o={}/{:.3}/{:.3}/{:.3} m={}/{:.3}/{:.3}/{:.3} e={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} guard={}/{}/{} reroot={}/{}/{:.3}/{:.3}/{:.1} rb={}/{}/{:.1} rt={}/{}/{:.1} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} phaseQ(o={}/{:.3}/{:.3}/{:.3} m={}/{:.3}/{:.3}/{:.3} e={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3148,20 +3077,6 @@ fn main() {
                     report.visited_actions,
                     report.sampled_best_rate,
                     report.deblunder_rate,
-                    report.guardian_positions,
-                    report.guardian_candidates_checked,
-                    report.guardian_promotions,
-                    report.reroot_repairs,
-                    report.reroot_repair_checks,
-                    report.reroot_repair_avg_q_gap,
-                    report.reroot_repair_max_q_gap,
-                    report.reroot_repair_policy_mass,
-                    report.reroot_best_repairs,
-                    report.reroot_best_checks,
-                    report.reroot_best_policy_mass,
-                    report.reroot_temperature_repairs,
-                    report.reroot_temperature_checks,
-                    report.reroot_temperature_policy_mass,
                     report.avg_best_played_q_gap,
                     report.avg_played_top_visit_ratio,
                     report.avg_best_q,
@@ -3423,116 +3338,6 @@ fn main() {
                     "stats/deblunder_rate",
                     update,
                     report.deblunder_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/guardian_positions",
-                    update,
-                    report.guardian_positions as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/guardian_candidates_checked",
-                    update,
-                    report.guardian_candidates_checked as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/guardian_promotions",
-                    update,
-                    report.guardian_promotions as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/guardian_promotion_rate",
-                    update,
-                    report.guardian_promotions as f32
-                        / report.guardian_candidates_checked.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_repair_checks",
-                    update,
-                    report.reroot_repair_checks as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_repairs",
-                    update,
-                    report.reroot_repairs as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_repair_rate",
-                    update,
-                    report.reroot_repairs as f32 / report.reroot_repair_checks.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_repair_avg_q_gap",
-                    update,
-                    report.reroot_repair_avg_q_gap,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_repair_max_q_gap",
-                    update,
-                    report.reroot_repair_max_q_gap,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_repair_policy_mass",
-                    update,
-                    report.reroot_repair_policy_mass,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_best_checks",
-                    update,
-                    report.reroot_best_checks as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_best_repairs",
-                    update,
-                    report.reroot_best_repairs as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_best_repair_rate",
-                    update,
-                    report.reroot_best_repairs as f32 / report.reroot_best_checks.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_best_policy_mass",
-                    update,
-                    report.reroot_best_policy_mass,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_temperature_checks",
-                    update,
-                    report.reroot_temperature_checks as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_temperature_repairs",
-                    update,
-                    report.reroot_temperature_repairs as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_temperature_repair_rate",
-                    update,
-                    report.reroot_temperature_repairs as f32
-                        / report.reroot_temperature_checks.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/reroot_temperature_policy_mass",
-                    update,
-                    report.reroot_temperature_policy_mass,
                 );
                 log_scalar(
                     &mut tb,

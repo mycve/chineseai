@@ -6,7 +6,7 @@ use crate::nnue::{
     HistoryMove, canonical_move, extract_sparse_features_az_canonical, mirror_file_move,
     mirror_sparse_features_az_absolute_file,
 };
-use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
@@ -182,20 +182,6 @@ pub struct AzSelfplayData {
     pub sampled_moves: usize,
     pub sampled_best_moves: usize,
     pub deblundered_moves: usize,
-    pub guardian_positions: usize,
-    pub guardian_candidates_checked: usize,
-    pub guardian_promotions: usize,
-    pub reroot_repair_checks: usize,
-    pub reroot_repairs: usize,
-    pub reroot_repair_q_gap_sum: f32,
-    pub reroot_repair_max_q_gap: f32,
-    pub reroot_repair_policy_mass: f32,
-    pub reroot_best_checks: usize,
-    pub reroot_best_repairs: usize,
-    pub reroot_temperature_checks: usize,
-    pub reroot_temperature_repairs: usize,
-    pub reroot_best_policy_mass: f32,
-    pub reroot_temperature_policy_mass: f32,
     pub best_played_q_gap_sum: f32,
     pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
@@ -237,22 +223,6 @@ impl AzSelfplayData {
         self.sampled_moves += other.sampled_moves;
         self.sampled_best_moves += other.sampled_best_moves;
         self.deblundered_moves += other.deblundered_moves;
-        self.guardian_positions += other.guardian_positions;
-        self.guardian_candidates_checked += other.guardian_candidates_checked;
-        self.guardian_promotions += other.guardian_promotions;
-        self.reroot_repair_checks += other.reroot_repair_checks;
-        self.reroot_repairs += other.reroot_repairs;
-        self.reroot_repair_q_gap_sum += other.reroot_repair_q_gap_sum;
-        self.reroot_repair_max_q_gap = self
-            .reroot_repair_max_q_gap
-            .max(other.reroot_repair_max_q_gap);
-        self.reroot_repair_policy_mass += other.reroot_repair_policy_mass;
-        self.reroot_best_checks += other.reroot_best_checks;
-        self.reroot_best_repairs += other.reroot_best_repairs;
-        self.reroot_temperature_checks += other.reroot_temperature_checks;
-        self.reroot_temperature_repairs += other.reroot_temperature_repairs;
-        self.reroot_best_policy_mass += other.reroot_best_policy_mass;
-        self.reroot_temperature_policy_mass += other.reroot_temperature_policy_mass;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
         self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
@@ -323,22 +293,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.sampled_moves += chunk.sampled_moves;
         merged.sampled_best_moves += chunk.sampled_best_moves;
         merged.deblundered_moves += chunk.deblundered_moves;
-        merged.guardian_positions += chunk.guardian_positions;
-        merged.guardian_candidates_checked += chunk.guardian_candidates_checked;
-        merged.guardian_promotions += chunk.guardian_promotions;
-        merged.reroot_repair_checks += chunk.reroot_repair_checks;
-        merged.reroot_repairs += chunk.reroot_repairs;
-        merged.reroot_repair_q_gap_sum += chunk.reroot_repair_q_gap_sum;
-        merged.reroot_repair_max_q_gap = merged
-            .reroot_repair_max_q_gap
-            .max(chunk.reroot_repair_max_q_gap);
-        merged.reroot_repair_policy_mass += chunk.reroot_repair_policy_mass;
-        merged.reroot_best_checks += chunk.reroot_best_checks;
-        merged.reroot_best_repairs += chunk.reroot_best_repairs;
-        merged.reroot_temperature_checks += chunk.reroot_temperature_checks;
-        merged.reroot_temperature_repairs += chunk.reroot_temperature_repairs;
-        merged.reroot_best_policy_mass += chunk.reroot_best_policy_mass;
-        merged.reroot_temperature_policy_mass += chunk.reroot_temperature_policy_mass;
         merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
         merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
         merged.best_q_sum += chunk.best_q_sum;
@@ -385,20 +339,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut sampled_moves = 0usize;
     let mut sampled_best_moves = 0usize;
     let mut deblundered_moves = 0usize;
-    let mut guardian_positions = 0usize;
-    let mut guardian_candidates_checked = 0usize;
-    let mut guardian_promotions = 0usize;
-    let mut reroot_repair_checks = 0usize;
-    let mut reroot_repairs = 0usize;
-    let mut reroot_repair_q_gap_sum = 0.0f32;
-    let mut reroot_repair_max_q_gap = 0.0f32;
-    let mut reroot_repair_policy_mass = 0.0f32;
-    let mut reroot_best_checks = 0usize;
-    let mut reroot_best_repairs = 0usize;
-    let mut reroot_temperature_checks = 0usize;
-    let mut reroot_temperature_repairs = 0usize;
-    let mut reroot_best_policy_mass = 0.0f32;
-    let mut reroot_temperature_policy_mass = 0.0f32;
     let mut best_played_q_gap_sum = 0.0f32;
     let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
@@ -476,47 +416,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 )
             };
             crate::scope_profile!("az.selfplay.post_search");
-            if let Some(previous_sample) = game_samples.last_mut()
-                && reroot_repair_eligible(previous_sample, search_simulation_count, config)
-            {
-                reroot_repair_checks += 1;
-                let played_best =
-                    previous_sample.meta.played_index == previous_sample.meta.best_index;
-                if played_best {
-                    reroot_best_checks += 1;
-                } else {
-                    reroot_temperature_checks += 1;
-                }
-                if let Some(repair) =
-                    apply_reroot_policy_repair(previous_sample, search.value_q, config)
-                {
-                    reroot_repairs += 1;
-                    if played_best {
-                        reroot_best_repairs += 1;
-                        reroot_best_policy_mass += repair.policy_transfer;
-                    } else {
-                        reroot_temperature_repairs += 1;
-                        reroot_temperature_policy_mass += repair.policy_transfer;
-                    }
-                    reroot_repair_q_gap_sum += repair.q_gap;
-                    reroot_repair_max_q_gap = reroot_repair_max_q_gap.max(repair.q_gap);
-                    reroot_repair_policy_mass += repair.policy_transfer;
-                }
-            }
-            let guardian_patch = guardian_policy_patch(
-                model,
-                config,
-                &position,
-                &history,
-                &rule_history,
-                &search.candidates,
-                &mut rng,
-            );
-            if let Some(patch) = &guardian_patch {
-                guardian_positions += 1;
-                guardian_candidates_checked += patch.checked;
-                guardian_promotions += patch.promoted_indices.len();
-            }
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
             raw_prior_top1_sum += shape.raw_prior_top1;
@@ -552,7 +451,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.seed ^ game_index as u64,
                     ply,
                 );
-                let mut sample = make_training_sample(
+                let sample = make_training_sample(
                     &position,
                     &history,
                     &search.candidates,
@@ -562,11 +461,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     meta,
                     search_simulation_count,
                     policy_weight_for_search(config, search_simulation_count),
-                );
-                apply_guardian_policy_patch(
-                    &mut sample,
-                    guardian_patch.as_ref(),
-                    config.guardian_policy_transfer,
                 );
                 game_samples.push(sample);
                 result = Some(if position.side_to_move() == Color::Red {
@@ -636,7 +530,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
             {
                 crate::scope_profile!("az.selfplay.make_sample");
-                let mut sample = make_training_sample(
+                let sample = make_training_sample(
                     &position,
                     &history,
                     &search.candidates,
@@ -646,11 +540,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     move_meta.sample,
                     search_simulation_count,
                     policy_weight_for_search(config, search_simulation_count),
-                );
-                apply_guardian_policy_patch(
-                    &mut sample,
-                    guardian_patch.as_ref(),
-                    config.guardian_policy_transfer,
                 );
                 game_samples.push(sample);
             }
@@ -752,20 +641,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         sampled_moves,
         sampled_best_moves,
         deblundered_moves,
-        guardian_positions,
-        guardian_candidates_checked,
-        guardian_promotions,
-        reroot_repair_checks,
-        reroot_repairs,
-        reroot_repair_q_gap_sum,
-        reroot_repair_max_q_gap,
-        reroot_repair_policy_mass,
-        reroot_best_checks,
-        reroot_best_repairs,
-        reroot_temperature_checks,
-        reroot_temperature_repairs,
-        reroot_best_policy_mass,
-        reroot_temperature_policy_mass,
         best_played_q_gap_sum,
         played_top_visit_ratio_sum,
         best_q_sum,
@@ -794,267 +669,6 @@ fn policy_weight_for_search(config: &AzLoopConfig, search_simulations: usize) ->
     } else {
         1.0
     }
-}
-
-#[derive(Clone, Debug)]
-struct GuardianPolicyPatch {
-    incumbent_index: usize,
-    promoted_indices: Vec<usize>,
-    checked: usize,
-}
-
-fn guardian_policy_patch(
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    position: &Position,
-    history: &[HistoryMove],
-    rule_history: &[RuleHistoryEntry],
-    candidates: &[AzCandidate],
-    rng: &mut SplitMix64,
-) -> Option<GuardianPolicyPatch> {
-    if candidates.len() < 2
-        || config.guardian_sample_rate <= 0.0
-        || rng.unit_f32() >= config.guardian_sample_rate.clamp(0.0, 1.0)
-    {
-        return None;
-    }
-    let incumbent_index = candidates
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| {
-            left.visits
-                .cmp(&right.visits)
-                .then_with(|| left.policy.total_cmp(&right.policy))
-        })
-        .map(|(index, _)| index)?;
-    let mut challenger_indices = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            (index != incumbent_index
-                && candidate.prior <= config.guardian_prior_max
-                && candidate.visits <= config.guardian_visits_max)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    if challenger_indices.is_empty() {
-        return None;
-    }
-    for index in (1..challenger_indices.len()).rev() {
-        let swap = (rng.next_u64() as usize) % (index + 1);
-        challenger_indices.swap(index, swap);
-    }
-    challenger_indices.truncate(config.guardian_candidates.max(1));
-
-    let incumbent_q = guardian_child_q(
-        model,
-        config,
-        position,
-        history,
-        rule_history,
-        candidates[incumbent_index].mv,
-        rng.next_u64(),
-    );
-    let mut promoted_indices = Vec::new();
-    for &index in &challenger_indices {
-        let challenger_q = guardian_child_q(
-            model,
-            config,
-            position,
-            history,
-            rule_history,
-            candidates[index].mv,
-            rng.next_u64(),
-        );
-        if challenger_q >= incumbent_q + config.guardian_q_margin {
-            promoted_indices.push(index);
-        }
-    }
-    Some(GuardianPolicyPatch {
-        incumbent_index,
-        promoted_indices,
-        checked: challenger_indices.len(),
-    })
-}
-
-fn guardian_child_q(
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    position: &Position,
-    history: &[HistoryMove],
-    rule_history: &[RuleHistoryEntry],
-    mv: Move,
-    seed: u64,
-) -> f32 {
-    let mut child_history = history.to_vec();
-    append_history(&mut child_history, position, mv);
-    let mut child_rules = rule_history.to_vec();
-    child_rules.push(position.rule_history_entry_after_move(mv));
-    let mut child = position.clone();
-    child.make_move(mv);
-    let legal = child.legal_moves_with_rules(&child_rules);
-    -alphazero_search_with_history_and_rules(
-        &child,
-        &child_history,
-        Some(child_rules),
-        Some(legal),
-        model,
-        AzSearchLimits {
-            simulations: config.guardian_simulations.max(1),
-            seed,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            max_depth: 0,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
-            draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            value_scale: 1.0,
-        },
-    )
-    .value_q
-}
-
-fn apply_guardian_policy_patch(
-    sample: &mut AzTrainingSample,
-    patch: Option<&GuardianPolicyPatch>,
-    max_transfer: f32,
-) {
-    let Some(patch) = patch else {
-        return;
-    };
-    if patch.promoted_indices.is_empty() || patch.incumbent_index >= sample.policy.len() {
-        return;
-    }
-    let promoted = patch
-        .promoted_indices
-        .iter()
-        .copied()
-        .filter(|&index| index < sample.policy.len() && index != patch.incumbent_index)
-        .collect::<Vec<_>>();
-    if promoted.is_empty() {
-        return;
-    }
-    let incumbent_probability = sample.policy[patch.incumbent_index];
-    let transfer = max_transfer
-        .clamp(0.0, 1.0)
-        .min(incumbent_probability * 0.75);
-    if transfer <= 0.0 {
-        return;
-    }
-    sample.policy[patch.incumbent_index] -= transfer;
-    let each = transfer / promoted.len() as f32;
-    for index in promoted {
-        sample.policy[index] += each;
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RerootRepairResult {
-    q_gap: f32,
-    policy_transfer: f32,
-}
-
-fn reroot_repair_eligible(
-    previous_sample: &AzTrainingSample,
-    current_search_simulations: usize,
-    config: &AzLoopConfig,
-) -> bool {
-    let played_best = previous_sample.meta.played_index == previous_sample.meta.best_index;
-    let repair_enabled = if played_best {
-        config.reroot_repair_best_max_transfer > 0.0
-    } else {
-        config.reroot_repair_max_transfer > 0.0 && config.reroot_repair_temperature_scale > 0.0
-    };
-    if config.reroot_repair_q_gap <= 0.0 || !repair_enabled || previous_sample.meta.deblundered {
-        return false;
-    }
-    if config.reroot_repair_require_full_search {
-        let full = config.simulations.max(1);
-        if (previous_sample.search_simulations as usize) < full || current_search_simulations < full
-        {
-            return false;
-        }
-    }
-    usize::from(previous_sample.meta.played_index) < previous_sample.policy.len()
-        && previous_sample.policy.len() > 1
-}
-
-fn apply_reroot_policy_repair(
-    previous_sample: &mut AzTrainingSample,
-    current_root_q: f32,
-    config: &AzLoopConfig,
-) -> Option<RerootRepairResult> {
-    let played_index = usize::from(previous_sample.meta.played_index);
-    if played_index >= previous_sample.policy.len() || previous_sample.policy.len() < 2 {
-        return None;
-    }
-    // 当前根为对手视角，反号后才是上一手走子方对该已走走法的重新定根估值。
-    let realized_previous_q = -current_root_q;
-    let q_gap = previous_sample.meta.played_q - realized_previous_q;
-    let threshold = config.reroot_repair_q_gap.max(0.0);
-    if q_gap <= threshold {
-        return None;
-    }
-    let played_probability = previous_sample.policy[played_index].max(0.0);
-    let played_best = previous_sample.meta.played_index == previous_sample.meta.best_index;
-    let policy_transfer = if played_best {
-        q_gap
-            .min(config.reroot_repair_best_max_transfer.clamp(0.0, 1.0))
-            .min(played_probability * 0.5)
-    } else {
-        ((q_gap - threshold)
-            .min(config.reroot_repair_max_transfer.clamp(0.0, 1.0))
-            .min(played_probability * 0.75))
-            * config.reroot_repair_temperature_scale.clamp(0.0, 1.0)
-    };
-    if policy_transfer <= 0.0 {
-        return None;
-    }
-
-    let mut alternatives = previous_sample
-        .policy
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(index, _)| *index != played_index)
-        .collect::<Vec<_>>();
-    alternatives.sort_by(|left, right| right.1.total_cmp(&left.1));
-    alternatives.truncate(config.reroot_repair_candidates.max(1));
-    if alternatives.is_empty() {
-        return None;
-    }
-    let weight_sum = alternatives
-        .iter()
-        .map(|(_, probability)| probability.max(1.0e-12).sqrt())
-        .sum::<f32>()
-        .max(1.0e-12);
-
-    previous_sample.policy[played_index] -= policy_transfer;
-    for (index, probability) in alternatives {
-        let weight = probability.max(1.0e-12).sqrt() / weight_sum;
-        previous_sample.policy[index] += policy_transfer * weight;
-    }
-    if played_best {
-        previous_sample.policy_weight = previous_sample
-            .policy_weight
-            .max(config.reroot_repair_best_policy_weight.max(0.0));
-    }
-    Some(RerootRepairResult {
-        q_gap,
-        policy_transfer,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1686,20 +1300,6 @@ mod tests {
             moves_left_scaled_factor: 0.0,
             moves_left_quadratic_factor: 0.0,
             policy_softmax_temp: 1.0,
-            guardian_sample_rate: 0.0,
-            guardian_candidates: 4,
-            guardian_simulations: 200,
-            guardian_prior_max: 0.02,
-            guardian_visits_max: 8,
-            guardian_q_margin: 0.10,
-            guardian_policy_transfer: 0.15,
-            reroot_repair_q_gap: 0.15,
-            reroot_repair_max_transfer: 0.25,
-            reroot_repair_candidates: 4,
-            reroot_repair_require_full_search: true,
-            reroot_repair_temperature_scale: 0.5,
-            reroot_repair_best_max_transfer: 0.35,
-            reroot_repair_best_policy_weight: 2.0,
             opening_positions: Vec::new(),
             resign_percentage: 0.0,
             resign_playthrough: 0.0,
@@ -1784,75 +1384,6 @@ mod tests {
         assert!((samples[1].value + 0.6).abs() < 1e-6);
         assert!((samples[2].value + 0.5).abs() < 1e-6);
         assert!((samples[3].value + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn guardian_patch_shares_transfer_between_promoted_moves() {
-        let mut sample = sample(0.25, 1.0);
-        sample.policy = vec![0.60, 0.01, 0.20, 0.19];
-        let patch = GuardianPolicyPatch {
-            incumbent_index: 0,
-            promoted_indices: vec![1, 3],
-            checked: 4,
-        };
-
-        apply_guardian_policy_patch(&mut sample, Some(&patch), 0.15);
-
-        assert!((sample.policy[0] - 0.45).abs() < 1e-6);
-        assert!((sample.policy[1] - 0.085).abs() < 1e-6);
-        assert!((sample.policy[2] - 0.20).abs() < 1e-6);
-        assert!((sample.policy[3] - 0.265).abs() < 1e-6);
-        assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert!((sample.value - 0.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn reroot_repair_reduces_a_revalidated_bad_played_move() {
-        let config = test_config();
-        let mut sample = sample(0.25, 1.0);
-        sample.policy = vec![0.70, 0.20, 0.08, 0.02];
-        sample.search_simulations = 1;
-        sample.meta.played_index = 0;
-        sample.meta.played_q = 0.20;
-
-        assert!(reroot_repair_eligible(&sample, 1, &config));
-        let repair = apply_reroot_policy_repair(&mut sample, 0.40, &config).unwrap();
-
-        assert!((repair.q_gap - 0.60).abs() < 1e-6);
-        assert!((repair.policy_transfer - 0.35).abs() < 1e-6);
-        assert!((sample.policy[0] - 0.35).abs() < 1e-6);
-        assert!((sample.policy_weight - 2.0).abs() < 1e-6);
-        assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert!((sample.value - 0.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn reroot_repair_does_not_overlap_deblunder() {
-        let config = test_config();
-        let mut sample = sample(0.0, 1.0);
-        sample.policy = vec![0.75, 0.25];
-        sample.search_simulations = 1;
-        sample.meta.played_q = 0.5;
-        sample.meta.deblundered = true;
-
-        assert!(!reroot_repair_eligible(&sample, 1, &config));
-    }
-
-    #[test]
-    fn reroot_repair_halves_temperature_move_correction() {
-        let config = test_config();
-        let mut sample = sample(0.25, 1.0);
-        sample.policy = vec![0.70, 0.20, 0.08, 0.02];
-        sample.search_simulations = 1;
-        sample.meta.best_index = 1;
-        sample.meta.played_index = 0;
-        sample.meta.played_q = 0.20;
-
-        let repair = apply_reroot_policy_repair(&mut sample, 0.40, &config).unwrap();
-
-        assert!((repair.policy_transfer - 0.125).abs() < 1e-6);
-        assert!((sample.policy[0] - 0.575).abs() < 1e-6);
-        assert!((sample.policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
     #[test]
