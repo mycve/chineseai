@@ -111,10 +111,11 @@ pub fn alphazero_search_with_history_and_rules(
         tree.expand(root);
     }
     if tree.nodes[root].children.is_empty() {
+        let value_q = wdl_utility(tree.nodes[root].value_wdl, tree.draw_score);
         return AzSearchResult {
             best_move: None,
-            value_q: tree.nodes[root].value,
-            value_cp: cp_from_q(tree.nodes[root].value),
+            value_q,
+            value_cp: cp_from_q(value_q),
             value_wdl: tree.nodes[root].value_wdl,
             simulations: 0,
             search_depth_avg: 0.0,
@@ -131,15 +132,13 @@ pub fn alphazero_search_with_history_and_rules(
         for _ in 0..limits.simulations {
             tree.simulate(root, 0);
             used += 1;
+            if tree.nodes[root].proven.is_some() {
+                break;
+            }
         }
     }
 
     let root_node = &tree.nodes[root];
-    let searched_value = if root_node.visits > 0 {
-        root_node.value_sum / root_node.visits as f32
-    } else {
-        root_node.value
-    };
     let searched_wdl = if root_node.visits > 0 {
         root_node
             .value_wdl_sum
@@ -147,6 +146,7 @@ pub fn alphazero_search_with_history_and_rules(
     } else {
         root_node.value_wdl
     };
+    let searched_value = wdl_utility(searched_wdl, tree.draw_score);
     let policy = {
         crate::scope_profile!("az.search.root_policy");
         tree.root_policy(root)
@@ -158,7 +158,7 @@ pub fn alphazero_search_with_history_and_rules(
         .map(|(child, policy)| AzCandidate {
             mv: child.mv,
             visits: child.visits,
-            q: child.q(tree.draw_score),
+            q: tree.child_q(root, child),
             moves_left: child.moves_left(),
             raw_prior: child.raw_prior,
             prior: child.prior,
@@ -241,12 +241,49 @@ struct AzNode {
     rule_history: Vec<RuleHistoryEntry>,
     children: Vec<AzChild>,
     visits: u32,
-    value_sum: f32,
     value_wdl_sum: [f32; 3],
     value: f32,
     value_wdl: [f32; 3],
     moves_left: f32,
     expanded: bool,
+    /// Exact game-theoretic result, only populated from rule terminals or
+    /// minimax propagation of already proven children.
+    proven: Option<ProvenOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProvenOutcome {
+    Loss,
+    Draw,
+    Win,
+}
+
+impl ProvenOutcome {
+    fn from_value(value: f32) -> Self {
+        if value > 0.0 {
+            Self::Win
+        } else if value < 0.0 {
+            Self::Loss
+        } else {
+            Self::Draw
+        }
+    }
+
+    fn value(self) -> f32 {
+        match self {
+            Self::Loss => -1.0,
+            Self::Draw => 0.0,
+            Self::Win => 1.0,
+        }
+    }
+
+    fn flipped(self) -> Self {
+        match self {
+            Self::Loss => Self::Win,
+            Self::Draw => Self::Draw,
+            Self::Win => Self::Loss,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -255,7 +292,6 @@ struct AzChild {
     raw_prior: f32,
     prior: f32,
     visits: u32,
-    value_sum: f32,
     value_wdl_sum: [f32; 3],
     moves_left_sum: f32,
     child: Option<usize>,
@@ -266,8 +302,7 @@ impl AzChild {
         if self.visits == 0 {
             0.0
         } else {
-            let _ = draw_score;
-            self.value_sum / self.visits as f32
+            wdl_sum_utility(self.value_wdl_sum, self.visits, draw_score)
         }
     }
 
@@ -298,12 +333,12 @@ impl<'a> AzTree<'a> {
             rule_history,
             children: Vec::new(),
             visits: 0,
-            value_sum: 0.0,
             value_wdl_sum: [0.0; 3],
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
             moves_left: 0.0,
             expanded: false,
+            proven: None,
         });
         Self {
             nodes,
@@ -380,6 +415,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].moves_left = 0.0;
             self.nodes[node_index].expanded = true;
+            self.nodes[node_index].proven = Some(ProvenOutcome::from_value(value));
             return AzEvalOutput {
                 value_wdl,
                 value,
@@ -407,6 +443,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
             self.nodes[node_index].moves_left = 0.0;
             self.nodes[node_index].expanded = true;
+            self.nodes[node_index].proven = Some(ProvenOutcome::Loss);
             return AzEvalOutput {
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
@@ -456,7 +493,6 @@ impl<'a> AzTree<'a> {
                     raw_prior,
                     prior,
                     visits: 0,
-                    value_sum: 0.0,
                     value_wdl_sum: [0.0; 3],
                     moves_left_sum: 0.0,
                     child: None,
@@ -472,6 +508,12 @@ impl<'a> AzTree<'a> {
 
     fn simulate(&mut self, node_index: usize, depth: usize) -> AzEvalOutput {
         crate::scope_profile!("az.search.simulate");
+        if self.nodes[node_index].proven.is_some() {
+            let eval = self.node_eval(node_index);
+            self.add_node_visit(node_index, eval);
+            self.record_leaf_depth(depth, false);
+            return eval;
+        }
         if depth >= self.max_depth {
             let eval = self.cutoff_value(node_index);
             self.add_node_visit(node_index, eval);
@@ -552,17 +594,19 @@ impl<'a> AzTree<'a> {
                     rule_history: child_rule_history,
                     children: Vec::new(),
                     visits: 0,
-                    value_sum: 0.0,
                     value_wdl_sum: [0.0; 3],
                     value: 0.0,
                     value_wdl: [0.0, 1.0, 0.0],
                     moves_left: 0.0,
                     expanded: false,
+                    proven: None,
                 });
                 self.nodes[node_index].children[child_index].child = Some(child_node);
                 child_node
             };
+        let child_was_proven = self.nodes[child_node].proven.is_some();
         let child_eval = self.simulate(child_node, child_depth);
+        let child_became_proven = !child_was_proven && self.nodes[child_node].proven.is_some();
         let eval = AzEvalOutput {
             value_wdl: flip_wdl(child_eval.value_wdl),
             value: -child_eval.value,
@@ -573,11 +617,14 @@ impl<'a> AzTree<'a> {
         };
         let child = &mut self.nodes[node_index].children[child_index];
         child.visits += 1;
-        child.value_sum += eval.value;
         add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
         child.moves_left_sum += eval.moves_left;
         self.add_node_visit(node_index, eval);
-        eval
+        if child_became_proven && self.refresh_proven(node_index) {
+            self.node_eval(node_index)
+        } else {
+            eval
+        }
     }
 
     fn cutoff_value(&mut self, node_index: usize) -> AzEvalOutput {
@@ -597,6 +644,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].moves_left = 0.0;
+            self.nodes[node_index].proven = Some(ProvenOutcome::from_value(value));
             return AzEvalOutput {
                 value_wdl,
                 value,
@@ -613,6 +661,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
             self.nodes[node_index].moves_left = 0.0;
+            self.nodes[node_index].proven = Some(ProvenOutcome::Loss);
             return AzEvalOutput {
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
@@ -647,8 +696,59 @@ impl<'a> AzTree<'a> {
 
     fn add_node_visit(&mut self, node_index: usize, eval: AzEvalOutput) {
         self.nodes[node_index].visits += 1;
-        self.nodes[node_index].value_sum += eval.value;
         add_wdl(&mut self.nodes[node_index].value_wdl_sum, eval.value_wdl);
+    }
+
+    /// Propagate only exact terminal knowledge. A parent is won as soon as one
+    /// child is a proven loss; otherwise it is proven only after every child is
+    /// proven. This is the safe core of Lc0's sticky-endgame behavior.
+    fn refresh_proven(&mut self, node_index: usize) -> bool {
+        if self.nodes[node_index].proven.is_some() || self.nodes[node_index].children.is_empty() {
+            return self.nodes[node_index].proven.is_some();
+        }
+
+        let proof = derive_parent_proof(self.nodes[node_index].children.iter().map(|child| {
+            child.child.and_then(|child_node| {
+                self.nodes[child_node]
+                    .proven
+                    .map(|outcome| (outcome, self.nodes[child_node].moves_left))
+            })
+        }));
+        let Some((outcome, moves_left)) = proof else {
+            return false;
+        };
+
+        let value = outcome.value();
+        let value_wdl = scalar_terminal_wdl(value);
+        let node = &mut self.nodes[node_index];
+        node.proven = Some(outcome);
+        node.value = value;
+        node.value_wdl = value_wdl;
+        node.moves_left = moves_left;
+        // Once proven, do not let earlier approximate NN samples dilute the
+        // exact result at this node.
+        node.value_wdl_sum = value_wdl.map(|part| part * node.visits as f32);
+        true
+    }
+
+    fn node_draw_score(&self, node_index: usize) -> f32 {
+        if self.nodes[node_index].position.side_to_move()
+            == self.nodes[self.root].position.side_to_move()
+        {
+            self.draw_score
+        } else {
+            -self.draw_score
+        }
+    }
+
+    fn child_q(&self, node_index: usize, child: &AzChild) -> f32 {
+        let draw_score = self.node_draw_score(node_index);
+        if let Some(child_node) = child.child
+            && let Some(outcome) = self.nodes[child_node].proven
+        {
+            return proven_utility(outcome.flipped(), draw_score);
+        }
+        child.q(draw_score)
     }
 
     fn record_leaf_depth(&mut self, depth: usize, cutoff: bool) {
@@ -675,7 +775,7 @@ impl<'a> AzTree<'a> {
         let fpu_value = if is_root {
             self.fpu_value_at_root
         } else {
-            alphazero_fpu_value_reduction(node, self.fpu_value, self.draw_score)
+            alphazero_fpu_value_reduction(node, self.fpu_value, self.node_draw_score(node_index))
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
         self.nodes[node_index]
@@ -683,10 +783,22 @@ impl<'a> AzTree<'a> {
             .iter()
             .enumerate()
             .max_by(|(left_index, left_child), (right_index, right_child)| {
-                let left_score =
-                    self.child_score(node, left_child, fpu_value, parent_visits_sqrt, cpuct);
-                let right_score =
-                    self.child_score(node, right_child, fpu_value, parent_visits_sqrt, cpuct);
+                let left_score = self.child_score(
+                    node_index,
+                    node,
+                    left_child,
+                    fpu_value,
+                    parent_visits_sqrt,
+                    cpuct,
+                );
+                let right_score = self.child_score(
+                    node_index,
+                    node,
+                    right_child,
+                    fpu_value,
+                    parent_visits_sqrt,
+                    cpuct,
+                );
                 left_score
                     .total_cmp(&right_score)
                     .then_with(|| left_child.prior.total_cmp(&right_child.prior))
@@ -702,13 +814,12 @@ impl<'a> AzTree<'a> {
             .iter()
             .enumerate()
             .max_by(|(left_index, left_child), (right_index, right_child)| {
-                left_child
-                    .visits
-                    .cmp(&right_child.visits)
+                self.child_proof_rank(left_child)
+                    .cmp(&self.child_proof_rank(right_child))
+                    .then_with(|| left_child.visits.cmp(&right_child.visits))
                     .then_with(|| {
-                        left_child
-                            .q(self.draw_score)
-                            .total_cmp(&right_child.q(self.draw_score))
+                        self.child_q(node_index, left_child)
+                            .total_cmp(&self.child_q(node_index, right_child))
                     })
                     .then_with(|| left_child.prior.total_cmp(&right_child.prior))
                     .then_with(|| right_index.cmp(left_index))
@@ -741,19 +852,38 @@ impl<'a> AzTree<'a> {
 
     fn child_score(
         &self,
+        node_index: usize,
         parent: &AzNode,
         child: &AzChild,
         fpu_value: f32,
         parent_visits_sqrt: f32,
         cpuct: f32,
     ) -> f32 {
+        if self.child_proven_outcome(child) == Some(ProvenOutcome::Loss) {
+            return f32::NEG_INFINITY;
+        }
         let q = if child.visits > 0 {
-            child.q(self.draw_score)
+            self.child_q(node_index, child)
         } else {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
         q + u + self.moves_left_utility(parent, child, q)
+    }
+
+    fn child_proven_outcome(&self, child: &AzChild) -> Option<ProvenOutcome> {
+        child
+            .child
+            .and_then(|child_node| self.nodes[child_node].proven)
+            .map(ProvenOutcome::flipped)
+    }
+
+    fn child_proof_rank(&self, child: &AzChild) -> u8 {
+        match self.child_proven_outcome(child) {
+            Some(ProvenOutcome::Win) => 2,
+            Some(ProvenOutcome::Loss) => 0,
+            Some(ProvenOutcome::Draw) | None => 1,
+        }
     }
 
     fn moves_left_utility(&self, parent: &AzNode, child: &AzChild, q: f32) -> f32 {
@@ -817,12 +947,70 @@ impl<'a> AzTree<'a> {
     }
 }
 
+fn wdl_utility(wdl: [f32; 3], draw_score: f32) -> f32 {
+    (wdl[0] - wdl[2] + draw_score * wdl[1]).clamp(-1.0, 1.0)
+}
+
+fn wdl_sum_utility(wdl_sum: [f32; 3], visits: u32, draw_score: f32) -> f32 {
+    if visits == 0 {
+        return 0.0;
+    }
+    wdl_utility(wdl_sum.map(|part| part / visits as f32), draw_score)
+}
+
+fn proven_utility(outcome: ProvenOutcome, draw_score: f32) -> f32 {
+    match outcome {
+        ProvenOutcome::Loss => -1.0,
+        ProvenOutcome::Draw => draw_score,
+        ProvenOutcome::Win => 1.0,
+    }
+}
+
+fn derive_parent_proof(
+    children: impl IntoIterator<Item = Option<(ProvenOutcome, f32)>>,
+) -> Option<(ProvenOutcome, f32)> {
+    let mut winning_moves_left = f32::INFINITY;
+    let mut drawing_moves_left = f32::INFINITY;
+    let mut losing_moves_left = 0.0f32;
+    let mut has_unknown = false;
+    let mut has_draw = false;
+    let mut has_child = false;
+
+    for child in children {
+        has_child = true;
+        let Some((child_outcome, child_moves_left)) = child else {
+            has_unknown = true;
+            continue;
+        };
+        let moves_left = child_moves_left + 1.0;
+        match child_outcome.flipped() {
+            ProvenOutcome::Win => winning_moves_left = winning_moves_left.min(moves_left),
+            ProvenOutcome::Draw => {
+                has_draw = true;
+                drawing_moves_left = drawing_moves_left.min(moves_left);
+            }
+            ProvenOutcome::Loss => losing_moves_left = losing_moves_left.max(moves_left),
+        }
+    }
+
+    if !has_child {
+        None
+    } else if winning_moves_left.is_finite() {
+        Some((ProvenOutcome::Win, winning_moves_left))
+    } else if has_unknown {
+        None
+    } else if has_draw {
+        Some((ProvenOutcome::Draw, drawing_moves_left))
+    } else {
+        Some((ProvenOutcome::Loss, losing_moves_left))
+    }
+}
+
 fn alphazero_fpu_value_reduction(node: &AzNode, reduction: f32, draw_score: f32) -> f32 {
     let parent_q = if node.visits > 0 {
-        let _ = draw_score;
-        node.value_sum / node.visits as f32
+        wdl_sum_utility(node.value_wdl_sum, node.visits, draw_score)
     } else {
-        node.value
+        wdl_utility(node.value_wdl, draw_score)
     };
     if reduction <= 0.0 {
         return parent_q;
@@ -1031,6 +1219,72 @@ mod tests {
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
 
     #[test]
+    fn wdl_q_applies_draw_score_instead_of_discarding_draw_probability() {
+        let child = AzChild {
+            mv: Position::startpos().legal_moves()[0],
+            raw_prior: 1.0,
+            prior: 1.0,
+            visits: 4,
+            value_wdl_sum: [1.0, 2.0, 1.0],
+            moves_left_sum: 0.0,
+            child: None,
+        };
+
+        assert!((child.q(0.0) - 0.0).abs() < 1e-6);
+        assert!((child.q(0.6) - 0.3).abs() < 1e-6);
+        assert!((child.q(-0.6) + 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn draw_preference_is_kept_in_the_root_players_perspective() {
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let model = AzNnue::random(4, 17);
+        let mut tree = AzTree::new(
+            position.clone(),
+            Vec::new(),
+            position.initial_rule_history(),
+            Some(vec![legal[0]]),
+            &model,
+            AzSearchLimits {
+                draw_score: 0.4,
+                ..AzSearchLimits::default()
+            },
+        );
+
+        tree.expand(tree.root);
+        tree.simulate_child(tree.root, 0, 1);
+        let child_node = tree.nodes[tree.root].children[0].child.unwrap();
+        assert!((tree.node_draw_score(tree.root) - 0.4).abs() < 1e-6);
+        assert!((tree.node_draw_score(child_node) + 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn proven_parent_requires_a_forced_result() {
+        use ProvenOutcome::{Draw, Loss, Win};
+
+        assert_eq!(
+            derive_parent_proof([Some((Loss, 2.0)), None]),
+            Some((Win, 3.0)),
+            "one child lost for the opponent proves a win immediately"
+        );
+        assert_eq!(
+            derive_parent_proof([Some((Win, 2.0)), None]),
+            None,
+            "a losing line plus an unexplored line is not a proof"
+        );
+        assert_eq!(
+            derive_parent_proof([Some((Win, 2.0)), Some((Draw, 5.0))]),
+            Some((Draw, 6.0))
+        );
+        assert_eq!(
+            derive_parent_proof([Some((Win, 2.0)), Some((Win, 7.0))]),
+            Some((Loss, 8.0)),
+            "a forced loss keeps the longest proven continuation"
+        );
+    }
+
+    #[test]
     fn alphazero_search_populates_visit_distribution() {
         let model = AzNnue::random(4, 7);
         let result = alphazero_search(
@@ -1179,7 +1433,6 @@ mod tests {
                 raw_prior: 0.10,
                 prior: 0.10,
                 visits: 1,
-                value_sum: 0.0,
                 value_wdl_sum: [0.0, 1.0, 0.0],
                 moves_left_sum: 0.0,
                 child: None,
@@ -1189,7 +1442,6 @@ mod tests {
                 raw_prior: 0.90,
                 prior: 0.90,
                 visits: 1,
-                value_sum: 0.0,
                 value_wdl_sum: [0.0, 1.0, 0.0],
                 moves_left_sum: 0.0,
                 child: None,
