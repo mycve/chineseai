@@ -2363,7 +2363,7 @@ fn main() {
 
             let config_arch = config.arch();
             let model_path = Path::new(&config.model_path);
-            let model = if model_path.exists() {
+            let (model, resumed_model) = if model_path.exists() {
                 println!("model    : load {}", config.model_path);
                 match AzNnue::load(model_path) {
                     Ok(model) => {
@@ -2380,24 +2380,27 @@ fn main() {
                             )
                         });
                         println!("resume   : consumed `{}` into memory", model_path.display());
-                        model
+                        (model, true)
                     }
                     Err(err) => {
                         println!(
                             "model    : reinit {} as random nnue ({err})",
                             config.model_path
                         );
-                        AzNnue::random_with_arch(config_arch, config.seed)
+                        (AzNnue::random_with_arch(config_arch, config.seed), false)
                     }
                 }
             } else if config.arena_interval > 0 && best_path.exists() {
                 println!("model    : load best `{}` as current", best_path.display());
-                AzNnue::load(&best_path).unwrap_or_else(|err| {
-                    panic!("failed to load best model `{}`: {err}", best_path.display());
-                })
+                (
+                    AzNnue::load(&best_path).unwrap_or_else(|err| {
+                        panic!("failed to load best model `{}`: {err}", best_path.display());
+                    }),
+                    true,
+                )
             } else {
                 println!("model    : init {}", config.model_path);
-                AzNnue::random_with_arch(config_arch, config.seed)
+                (AzNnue::random_with_arch(config_arch, config.seed), false)
             };
             let selfplay_model = {
                 println!("selfplay : start from latest `{}`", config.model_path);
@@ -2684,13 +2687,22 @@ fn main() {
             // GPU训练期间下一批仍可并行生成；只缓存一个完整更新，限制模型滞后。
             let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingTrainingData>(1);
             let collector_config = config.clone();
-            let collector_start_update = start_update;
+            let collector_needs_warmup = !resumed_model;
+            println!(
+                "warmup   : {} (model={})",
+                if collector_needs_warmup {
+                    format!("{} samples", config.train_warmup_samples)
+                } else {
+                    "skipped".to_string()
+                },
+                if resumed_model { "resumed" } else { "random" }
+            );
             let collector_handle = thread::spawn(move || {
                 let mut pending = PendingTrainingData::default();
                 let mut batch_index = 0usize;
                 while let Ok(batch) = selfplay_rx.recv() {
                     pending.push(batch);
-                    let required_samples = if collector_start_update == 1 && batch_index == 0 {
+                    let required_samples = if collector_needs_warmup && batch_index == 0 {
                         collector_config
                             .train_warmup_samples
                             .max(collector_config.selfplay_samples_per_update)
