@@ -82,11 +82,11 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 2000,
-            low_simulations: 1000,
-            low_simulation_probability: 0.35,
-            low_simulation_policy_weight: 0.5,
-            selfplay_samples_per_update: 240000,
+            simulations: 3000,
+            low_simulations: 1500,
+            low_simulation_probability: 0.5,
+            low_simulation_policy_weight: 0.05,
+            selfplay_samples_per_update: 120000,
             lr: 0.001,
             lr_min: 0.0005,
             lr_decay_start_update: 100,
@@ -96,7 +96,7 @@ impl Default for AzLoopFileConfig {
             max_plies: 150,
             hidden_size: 192,
             seed: 20260420,
-            workers: 200,
+            workers: 192,
             temperature_start: 0.9,
             temperature_endgame: 0.5,
             temperature_decay_delay_plies: 20,
@@ -124,14 +124,14 @@ impl Default for AzLoopFileConfig {
             opening_fens_path: String::new(),
             resign_percentage: 0.8,
             resign_playthrough: 20.0,
-            replay_capacity: 5000000,
+            replay_capacity: 1000000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_window_updates: 5000,
             train_warmup_samples: 240000,
-            train_samples_per_update: 240000,
+            train_samples_per_update: 120000,
             train_epochs_per_update: 2,
             mirror_probability: 0.3,
-            deblunder_q_gap: 0.15,
+            deblunder_q_gap: 0.05,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -141,7 +141,7 @@ impl Default for AzLoopFileConfig {
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
-            arena_processes: 200,
+            arena_processes: 192,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 300,
             arena_opening_plies_min: 6,
@@ -149,7 +149,7 @@ impl Default for AzLoopFileConfig {
             pikafish_label_eval_sqlite: "eval/pikafish-random-5000-d8.sqlite".into(),
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
-            pikafish_label_eval_simulations: 1600,
+            pikafish_label_eval_simulations: 3000,
             pikafish_label_eval_cpuct: 1.5,
             tensorboard_logdir: "runs/chineseai".into(),
         }
@@ -664,9 +664,17 @@ mod tests {
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("selfplay_samples_per_update = 240000\n"));
+        assert!(text.contains("simulations = 3000\n"));
+        assert!(text.contains("low_simulations = 1500\n"));
+        assert!(text.contains("low_simulation_probability = 0.5\n"));
+        assert!(text.contains("low_simulation_policy_weight = 0.05\n"));
+        assert!(text.contains("selfplay_samples_per_update = 120000\n"));
+        assert!(text.contains("workers = 192\n"));
+        assert!(text.contains("replay_capacity = 1000000\n"));
+        assert!(text.contains("train_samples_per_update = 120000\n"));
         assert!(text.contains("replay_recent_window_updates = 5000\n"));
-        assert!(text.contains("deblunder_q_gap = 0.15\n"));
+        assert!(text.contains("deblunder_q_gap = 0.05\n"));
+        assert!(text.contains("arena_processes = 192\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
@@ -677,7 +685,7 @@ mod tests {
         );
         assert!(text.contains("pikafish_label_eval_interval = 20\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
-        assert!(text.contains("pikafish_label_eval_simulations = 1600\n"));
+        assert!(text.contains("pikafish_label_eval_simulations = 3000\n"));
         assert!(text.contains("pikafish_label_eval_cpuct = 1.5\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("gumbel"));
@@ -690,7 +698,7 @@ mod tests {
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
         assert!((parsed.lr - 0.001).abs() < 1e-9);
-        assert!((parsed.deblunder_q_gap - 0.15).abs() < 1e-6);
+        assert!((parsed.deblunder_q_gap - 0.05).abs() < 1e-6);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
     }
