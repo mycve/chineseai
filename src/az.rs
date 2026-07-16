@@ -785,6 +785,7 @@ pub struct AzTrainStats {
     pub value_loss: f32,
     pub policy_ce: f32,
     pub legal_moves_loss: f32,
+    pub value_weight_sum: f32,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -828,6 +829,7 @@ impl AzTrainStats {
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
         self.legal_moves_loss += other.legal_moves_loss;
+        self.value_weight_sum += other.value_weight_sum;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;

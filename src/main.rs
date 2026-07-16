@@ -1126,7 +1126,7 @@ fn build_async_training_report(
         .started
         .map(|started| started.elapsed().as_secs_f32())
         .unwrap_or(train_seconds);
-    let train_stat_samples = stats.samples.max(1) as f32;
+    let train_stat_samples = stats.value_weight_sum.max(1.0);
     let root_visit_entropy =
         pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
@@ -3026,7 +3026,7 @@ fn main() {
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} legal_aux={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} phaseQ(o={}/{:.3}/{:.3}/{:.3} m={}/{:.3}/{:.3}/{:.3} e={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D/T={}/{}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} legal_aux={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} phaseQ(o={}/{:.3}/{:.3}/{:.3} m={}/{:.3}/{:.3}/{:.3} e={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3050,6 +3050,7 @@ fn main() {
                     report.red_wins,
                     report.black_wins,
                     report.draws,
+                    report.terminal_max_plies,
                     report.red_wins as f32 / report.games.max(1) as f32,
                     report.avg_plies,
                     report.avg_search_simulations,

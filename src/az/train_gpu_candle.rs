@@ -123,7 +123,7 @@ pub(super) fn train_samples_gpu(
     if stats.samples > 0 {
         let denom = stats.samples as f32;
         stats.loss /= denom;
-        stats.value_loss /= denom;
+        stats.value_loss /= stats.value_weight_sum.max(1.0);
         stats.policy_ce /= denom;
         stats.legal_moves_loss /= denom;
     }
@@ -633,15 +633,22 @@ impl GpuReplica {
         let value_probs = value_log_probs.exp()?;
         let value = wdl_probs_to_q(&value_probs)?.squeeze(1)?;
         let value_error = (&value - &batch_tensors.values)?;
-        let value_sse = value_error.sqr()?.sum_all()?;
+        let value_error_sq = value_error.sqr()?;
+        let value_sse = value_error_sq
+            .broadcast_mul(&batch_tensors.value_weights)?
+            .sum_all()?;
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
-        let value_ce = value_ce_per_sample.sum_all()?;
+        let value_ce = value_ce_per_sample
+            .broadcast_mul(&batch_tensors.value_weights)?
+            .sum_all()?;
         let moves_left_pred = tensor_softplus(&forward.moves_left_logits)?.squeeze(1)?;
         let moves_left_error =
             (&tensor_log1p(&moves_left_pred)? - &tensor_log1p(&batch_tensors.moves_left)?)?;
         let moves_left_sse_per_sample = moves_left_error.sqr()?;
-        let moves_left_sse = moves_left_sse_per_sample.sum_all()?;
+        let moves_left_sse = moves_left_sse_per_sample
+            .broadcast_mul(&batch_tensors.value_weights)?
+            .sum_all()?;
         let legal_moves_pred = tensor_softplus(&forward.legal_moves_logits)?.squeeze(1)?;
         let legal_moves_error =
             (&tensor_log1p(&legal_moves_pred)? - &tensor_log1p(&batch_tensors.legal_moves)?)?;
@@ -683,10 +690,11 @@ impl GpuReplica {
         let error_sq = (&value - &batch_tensors.values)?.sqr()?;
         let mut phase_moment_tensors = Vec::with_capacity(3 * 7);
         for phase in 0..3 {
-            let mask = batch_tensors
+            let phase_mask = batch_tensors
                 .value_phase_masks
                 .narrow(1, phase, 1)?
                 .squeeze(1)?;
+            let mask = phase_mask.broadcast_mul(&batch_tensors.value_weights)?;
             phase_moment_tensors.push(mask.sum_all()?);
             phase_moment_tensors.push((&value * &mask)?.sum_all()?);
             phase_moment_tensors.push((&value_sq * &mask)?.sum_all()?);
@@ -708,6 +716,11 @@ impl GpuReplica {
         let value_sse = value_sse.to_scalar::<f32>()?;
         let value_ce = value_ce.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
+        let value_weight_sum = batch_tensors.value_weights.sum_all()?.to_scalar::<f32>()?;
+        let weighted_value = value.broadcast_mul(&batch_tensors.value_weights)?;
+        let weighted_target = batch_tensors
+            .values
+            .broadcast_mul(&batch_tensors.value_weights)?;
         let stats = AzTrainStats {
             loss: value_ce
                 + policy_ce
@@ -716,12 +729,23 @@ impl GpuReplica {
             value_loss: value_ce,
             policy_ce,
             legal_moves_loss: legal_moves_sse.to_scalar::<f32>()?,
-            value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
-            value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
-            value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,
-            value_target_sq_sum: batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?,
+            value_weight_sum,
+            value_pred_sum: weighted_value.sum_all()?.to_scalar::<f32>()?,
+            value_pred_sq_sum: value
+                .sqr()?
+                .broadcast_mul(&batch_tensors.value_weights)?
+                .sum_all()?
+                .to_scalar::<f32>()?,
+            value_target_sum: weighted_target.sum_all()?.to_scalar::<f32>()?,
+            value_target_sq_sum: batch_tensors
+                .values
+                .sqr()?
+                .broadcast_mul(&batch_tensors.value_weights)?
+                .sum_all()?
+                .to_scalar::<f32>()?,
             value_pred_target_sum: value
                 .broadcast_mul(&batch_tensors.values)?
+                .broadcast_mul(&batch_tensors.value_weights)?
                 .sum_all()?
                 .to_scalar::<f32>()?,
             value_error_sq_sum: value_sse,

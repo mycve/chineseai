@@ -588,22 +588,34 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
         }
-        if result.is_none() {
+        let truncated = result.is_none();
+        if truncated {
             terminal.max_plies += 1;
         }
 
         let result: f32 = result.unwrap_or(0.0);
-        match result.total_cmp(&0.0) {
-            std::cmp::Ordering::Greater => red_wins += 1,
-            std::cmp::Ordering::Less => black_wins += 1,
-            std::cmp::Ordering::Equal => draws += 1,
+        if !truncated {
+            match result.total_cmp(&0.0) {
+                std::cmp::Ordering::Greater => red_wins += 1,
+                std::cmp::Ordering::Less => black_wins += 1,
+                std::cmp::Ordering::Equal => draws += 1,
+            }
         }
         plies_total += plies;
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            assign_deblundered_value_targets(&mut game_samples, result, &deblunder_events, config);
-            assign_moves_left_targets(&mut game_samples, config.max_plies);
+            if truncated {
+                assign_truncated_targets(&mut game_samples);
+            } else {
+                assign_deblundered_value_targets(
+                    &mut game_samples,
+                    result,
+                    &deblunder_events,
+                    config,
+                );
+                assign_moves_left_targets(&mut game_samples, config.max_plies);
+            }
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -876,6 +888,17 @@ fn assign_value_targets(
         let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
         sample.value_wdl = scalar_value_to_wdl_target(side_result);
         sample.value = side_result;
+    }
+}
+
+/// 安全步数上限不是规则和棋。截断样本仍保留Policy和合法走法监督，
+/// 但最终胜负与剩余步数未知，不能作为Value/moves-left标签。
+fn assign_truncated_targets(samples: &mut [AzTrainingSample]) {
+    for sample in samples {
+        sample.value_wdl = [0.0, 1.0, 0.0];
+        sample.value = 0.0;
+        sample.moves_left = 0.0;
+        sample.value_weight = 0.0;
     }
 }
 
@@ -1399,6 +1422,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3.0, 2.0, 1.0]
         );
+    }
+
+    #[test]
+    fn truncated_games_keep_policy_but_mask_value_and_moves_left() {
+        let mut samples = vec![sample(0.8, 1.0), sample(-0.4, -1.0)];
+        samples[0].policy_weight = 0.5;
+        samples[0].moves_left = 12.0;
+        samples[1].moves_left = 4.0;
+
+        assign_truncated_targets(&mut samples);
+
+        assert_eq!(samples[0].policy_weight, 0.5);
+        assert_eq!(samples[1].policy_weight, 1.0);
+        for sample in samples {
+            assert_eq!(sample.value_wdl, [0.0, 1.0, 0.0]);
+            assert_eq!(sample.value, 0.0);
+            assert_eq!(sample.moves_left, 0.0);
+            assert_eq!(sample.value_weight, 0.0);
+        }
     }
 
     #[test]

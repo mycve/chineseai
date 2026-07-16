@@ -93,7 +93,7 @@ impl Default for AzLoopFileConfig {
             lr_decay_interval: 200,
             lr_decay_factor: 0.9,
             batch_size: 1024,
-            max_plies: 150,
+            max_plies: 300,
             hidden_size: 192,
             seed: 20260420,
             workers: 192,
@@ -670,6 +670,7 @@ mod tests {
         assert!(text.contains("low_simulation_policy_weight = 0.5\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
+        assert!(text.contains("max_plies = 300\n"));
         assert!(text.contains("replay_capacity = 1000000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));
         assert!(text.contains("replay_recent_window_updates = 5000\n"));
