@@ -85,7 +85,7 @@ impl Default for AzLoopFileConfig {
             simulations: 3000,
             low_simulations: 1500,
             low_simulation_probability: 0.5,
-            low_simulation_policy_weight: 0.05,
+            low_simulation_policy_weight: 0.5,
             selfplay_samples_per_update: 120000,
             lr: 0.001,
             lr_min: 0.0005,
@@ -667,7 +667,7 @@ mod tests {
         assert!(text.contains("simulations = 3000\n"));
         assert!(text.contains("low_simulations = 1500\n"));
         assert!(text.contains("low_simulation_probability = 0.5\n"));
-        assert!(text.contains("low_simulation_policy_weight = 0.05\n"));
+        assert!(text.contains("low_simulation_policy_weight = 0.5\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("replay_capacity = 1000000\n"));
