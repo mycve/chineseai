@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use crate::nnue::{
     HistoryMove, canonical_move, extract_sparse_features_az_canonical, mirror_file_move,
-    mirror_sparse_features_az_absolute_file,
+    mirror_sparse_features_az_canonical_file,
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
@@ -745,7 +745,7 @@ fn make_training_sample(
         .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
     if mirror_file {
-        mirror_sparse_features_az_absolute_file(&mut features);
+        mirror_sparse_features_az_canonical_file(&mut features);
         for mv in &mut moves {
             *mv = mirror_file_move(*mv);
         }

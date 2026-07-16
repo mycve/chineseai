@@ -14,7 +14,8 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-const REPLAY_FILE_VERSION: u32 = 26;
+// v27 将 canonical 历史特征从旧表偏移重排到紧凑输入表；旧快照不能混用。
+const REPLAY_FILE_VERSION: u32 = 27;
 /// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
 const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";

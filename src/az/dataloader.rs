@@ -112,6 +112,7 @@ pub(super) struct PackedBatch {
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
+    pub legal_moves: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
@@ -157,6 +158,7 @@ impl PackedBatch {
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
+            legal_moves: vec![0.0f32; batch_size],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
             value_phase_masks: vec![0.0f32; batch_size * 3],
@@ -170,6 +172,11 @@ impl PackedBatch {
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.moves_left[row] = sample.moves_left.max(0.0);
+            packed.legal_moves[row] = sample
+                .move_indices
+                .iter()
+                .filter(|&&move_index| move_index < DENSE_MOVE_SPACE)
+                .count() as f32;
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
             let phase = if sample.meta.ply < 40 {
@@ -424,6 +431,7 @@ mod tests {
         assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
         assert_eq!(packed.values, vec![1.0, 1.0]);
         assert_eq!(packed.moves_left, vec![0.0, 0.0]);
+        assert_eq!(packed.legal_moves, vec![2.0, 2.0]);
     }
 
     #[test]

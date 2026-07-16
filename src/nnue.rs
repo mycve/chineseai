@@ -2,7 +2,9 @@ use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, piece_base_value,
 };
 
+/// 旧 absolute 编码包含一个行棋方标志；canonical 编码不需要该标志。
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
+pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
 pub const V2_INPUT_SIZE: usize = INPUT_SIZE + 2 * V2_KING_BUCKETS * 14 * BOARD_SIZE;
 pub const HISTORY_PLIES: usize = 8;
@@ -17,7 +19,10 @@ const STRATEGIC_INPUT_SIZE: usize = STRATEGIC_STATES * STRATEGIC_BUCKETS;
 const AZ_ROW_INPUT_OFFSET: usize = V3_INPUT_SIZE;
 const AZ_COL_INPUT_OFFSET: usize = AZ_ROW_INPUT_OFFSET + ROW_INPUT_SIZE;
 const AZ_STRATEGIC_INPUT_OFFSET: usize = AZ_COL_INPUT_OFFSET + COL_INPUT_SIZE;
-pub const AZ_NNUE_INPUT_SIZE: usize = AZ_STRATEGIC_INPUT_OFFSET + STRATEGIC_INPUT_SIZE;
+/// 旧 absolute 特征表的完整尺寸，仅供旧特征工具和测试使用。
+pub const LEGACY_AZ_NNUE_INPUT_SIZE: usize = AZ_STRATEGIC_INPUT_OFFSET + STRATEGIC_INPUT_SIZE;
+/// 当前网络只使用 canonical 棋子位置和最近 8 ply 历史。
+pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE + HISTORY_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -178,13 +183,13 @@ pub fn add_az_canonical_history_features(
             Color::Black
         };
         let piece_index = absolute_piece_index(rel_color, entry.piece.kind);
-        out.push(history_feature_index(
+        out.push(canonical_history_feature_index(
             age,
             0,
             piece_index,
             orient_square(side, entry.mv.from as usize),
         ));
-        out.push(history_feature_index(
+        out.push(canonical_history_feature_index(
             age,
             1,
             piece_index,
@@ -274,6 +279,28 @@ pub fn mirror_sparse_features_az_absolute_file(features: &mut [usize]) {
     features.sort_unstable();
 }
 
+/// 镜像当前网络使用的紧凑 canonical 特征。
+pub fn mirror_sparse_features_az_canonical_file(features: &mut [usize]) {
+    for feature in features.iter_mut() {
+        if *feature < CANONICAL_PIECE_INPUT_SIZE {
+            let piece_index = *feature / BOARD_SIZE;
+            let sq = *feature % BOARD_SIZE;
+            *feature = piece_index * BOARD_SIZE + mirror_file_square(sq);
+        } else if *feature < AZ_NNUE_INPUT_SIZE {
+            let offset = *feature - CANONICAL_PIECE_INPUT_SIZE;
+            let sq = offset % BOARD_SIZE;
+            let partial = offset / BOARD_SIZE;
+            let piece_index = partial % 14;
+            let partial = partial / 14;
+            let event = partial % HISTORY_EVENT_TYPES;
+            let age = partial / HISTORY_EVENT_TYPES;
+            *feature =
+                canonical_history_feature_index(age, event, piece_index, mirror_file_square(sq));
+        }
+    }
+    features.sort_unstable();
+}
+
 fn mirror_sparse_feature_az_absolute_file(feature: usize) -> usize {
     if feature == INPUT_SIZE - 1 {
         return feature;
@@ -308,7 +335,7 @@ fn mirror_sparse_feature_az_absolute_file(feature: usize) -> usize {
         let age = partial / HISTORY_EVENT_TYPES;
         return history_feature_index(age, event, piece_index, mirror_file_square(sq));
     }
-    if feature < AZ_NNUE_INPUT_SIZE {
+    if feature < LEGACY_AZ_NNUE_INPUT_SIZE {
         let offset = feature - AZ_ROW_INPUT_OFFSET;
         if offset < ROW_INPUT_SIZE {
             return feature;
@@ -336,6 +363,16 @@ fn king_aware_feature_index(
 
 fn history_feature_index(age: usize, event: usize, piece_index: usize, sq: usize) -> usize {
     V2_INPUT_SIZE + (((age * HISTORY_EVENT_TYPES + event) * 14 + piece_index) * BOARD_SIZE + sq)
+}
+
+fn canonical_history_feature_index(
+    age: usize,
+    event: usize,
+    piece_index: usize,
+    sq: usize,
+) -> usize {
+    CANONICAL_PIECE_INPUT_SIZE
+        + (((age * HISTORY_EVENT_TYPES + event) * 14 + piece_index) * BOARD_SIZE + sq)
 }
 
 fn az_row_feature_index(piece_index: usize, rank: usize) -> usize {
@@ -450,7 +487,11 @@ mod tests {
         let history_from = history_feature_index(0, 0, piece_index, history[0].mv.from as usize);
         let history_to = history_feature_index(0, 1, piece_index, history[0].mv.to as usize);
 
-        assert!(features.iter().all(|feature| *feature < AZ_NNUE_INPUT_SIZE));
+        assert!(
+            features
+                .iter()
+                .all(|feature| *feature < LEGACY_AZ_NNUE_INPUT_SIZE)
+        );
         assert!(features.contains(&history_from));
         assert!(features.contains(&history_to));
         assert!(features.iter().any(|feature| *feature < INPUT_SIZE - 1));
@@ -474,6 +515,24 @@ mod tests {
         assert!(features.contains(&black_general_as_us));
         assert!(features.contains(&red_general_as_them));
         assert!(!features.contains(&(INPUT_SIZE - 1)));
+    }
+
+    #[test]
+    fn canonical_history_uses_compact_input_range() {
+        let position = Position::startpos();
+        let history = [HistoryMove {
+            piece: position.piece_at(64).unwrap(),
+            captured: None,
+            mv: Move::new(64, 55),
+        }];
+        let features = extract_sparse_features_az_canonical(&position, &history);
+        assert_eq!(AZ_NNUE_INPUT_SIZE, 21_420);
+        assert!(features.iter().all(|&feature| feature < AZ_NNUE_INPUT_SIZE));
+        assert!(
+            features
+                .iter()
+                .any(|&feature| feature >= CANONICAL_PIECE_INPUT_SIZE)
+        );
     }
 
     #[test]
