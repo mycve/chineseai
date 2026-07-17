@@ -82,28 +82,28 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 3000,
-            low_simulations: 1500,
-            low_simulation_probability: 0.5,
+            simulations: 4000,
+            low_simulations: 2000,
+            low_simulation_probability: 0.2,
             low_simulation_policy_weight: 0.5,
             selfplay_samples_per_update: 120000,
-            lr: 0.001,
-            lr_min: 0.0005,
+            lr: 0.0005,
+            lr_min: 0.0001,
             lr_decay_start_update: 100,
             lr_decay_interval: 200,
             lr_decay_factor: 0.9,
-            batch_size: 1024,
-            max_plies: 300,
-            hidden_size: 192,
+            batch_size: 256,
+            max_plies: 200,
+            hidden_size: 256,
             seed: 20260420,
             workers: 192,
             temperature_start: 0.9,
             temperature_endgame: 0.5,
-            temperature_decay_delay_plies: 20,
+            temperature_decay_delay_plies: 30,
             temperature_decay_plies: 60,
             temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
-            cpuct: 0.65,
+            cpuct: 0.90,
             cpuct_at_root: 2.0,
             cpuct_base: 19652.0,
             cpuct_factor: 2.0,
@@ -124,12 +124,12 @@ impl Default for AzLoopFileConfig {
             opening_fens_path: String::new(),
             resign_percentage: 0.8,
             resign_playthrough: 20.0,
-            replay_capacity: 1000000,
+            replay_capacity: 2000000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_window_updates: 5000,
             train_warmup_samples: 240000,
-            train_samples_per_update: 120000,
-            train_epochs_per_update: 2,
+            train_samples_per_update: 240000,
+            train_epochs_per_update: 1,
             mirror_probability: 0.3,
             deblunder_q_gap: 0.05,
             train_value_weight: 1.0,
@@ -636,16 +636,16 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.contains("lr = 0.001\n"));
-        assert!(text.contains("lr_min = 0.0005\n"));
+        assert!(text.contains("lr = 0.0005\n"));
+        assert!(text.contains("lr_min = 0.0001\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("temperature_endgame = 0.5\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 20\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 30\n"));
         assert!(text.contains("temperature_decay_plies = 60\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
-        assert!(text.contains("cpuct = 0.65\n"));
+        assert!(text.contains("cpuct = 0.9\n"));
         assert!(text.contains("cpuct_at_root = 2.0\n"));
         assert!(text.contains("cpuct_base = 19652.0\n"));
         assert!(text.contains("cpuct_factor = 2.0\n"));
@@ -664,15 +664,18 @@ mod tests {
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("simulations = 3000\n"));
-        assert!(text.contains("low_simulations = 1500\n"));
-        assert!(text.contains("low_simulation_probability = 0.5\n"));
+        assert!(text.contains("simulations = 4000\n"));
+        assert!(text.contains("low_simulations = 2000\n"));
+        assert!(text.contains("low_simulation_probability = 0.2\n"));
         assert!(text.contains("low_simulation_policy_weight = 0.5\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
-        assert!(text.contains("max_plies = 300\n"));
-        assert!(text.contains("replay_capacity = 1000000\n"));
-        assert!(text.contains("train_samples_per_update = 120000\n"));
+        assert!(text.contains("batch_size = 256\n"));
+        assert!(text.contains("max_plies = 200\n"));
+        assert!(text.contains("hidden_size = 256\n"));
+        assert!(text.contains("replay_capacity = 2000000\n"));
+        assert!(text.contains("train_samples_per_update = 240000\n"));
+        assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("replay_recent_window_updates = 5000\n"));
         assert!(text.contains("deblunder_q_gap = 0.05\n"));
         assert!(text.contains("arena_processes = 192\n"));
@@ -698,7 +701,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.001).abs() < 1e-9);
+        assert!((parsed.lr - 0.0005).abs() < 1e-9);
         assert!((parsed.deblunder_q_gap - 0.05).abs() < 1e-6);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
