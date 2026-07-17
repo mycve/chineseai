@@ -891,14 +891,22 @@ fn assign_value_targets(
     }
 }
 
-/// 安全步数上限不是规则和棋。截断样本仍保留Policy和合法走法监督，
-/// 但最终胜负与剩余步数未知，不能作为Value/moves-left标签。
+/// 安全步数上限不是规则和棋。最终胜负与剩余步数未知，不能作为
+/// Value/moves-left标签。Policy只保留前半局的完整权重，第三个四分之一
+/// 降权，最后四分之一屏蔽，避免无推进残局的大量相关样本主导自蒸馏。
 fn assign_truncated_targets(samples: &mut [AzTrainingSample]) {
-    for sample in samples {
+    let full_policy_end = samples.len() / 2;
+    let reduced_policy_end = samples.len() * 3 / 4;
+    for (index, sample) in samples.iter_mut().enumerate() {
         sample.value_wdl = [0.0, 1.0, 0.0];
         sample.value = 0.0;
         sample.moves_left = 0.0;
         sample.value_weight = 0.0;
+        if index >= reduced_policy_end {
+            sample.policy_weight = 0.0;
+        } else if index >= full_policy_end {
+            sample.policy_weight *= 0.25;
+        }
     }
 }
 
@@ -1425,17 +1433,22 @@ mod tests {
     }
 
     #[test]
-    fn truncated_games_keep_policy_but_mask_value_and_moves_left() {
-        let mut samples = vec![sample(0.8, 1.0), sample(-0.4, -1.0)];
-        samples[0].policy_weight = 0.5;
-        samples[0].moves_left = 12.0;
-        samples[1].moves_left = 4.0;
+    fn truncated_games_taper_policy_and_mask_value_and_moves_left() {
+        let mut samples = vec![sample(0.8, 1.0); 8];
+        for (index, sample) in samples.iter_mut().enumerate() {
+            sample.policy_weight = if index % 2 == 0 { 0.5 } else { 1.0 };
+            sample.moves_left = (8 - index) as f32;
+        }
 
         assign_truncated_targets(&mut samples);
 
         assert_eq!(samples[0].policy_weight, 0.5);
-        assert_eq!(samples[1].policy_weight, 1.0);
-        for sample in samples {
+        assert_eq!(samples[3].policy_weight, 1.0);
+        assert_eq!(samples[4].policy_weight, 0.125);
+        assert_eq!(samples[5].policy_weight, 0.25);
+        assert_eq!(samples[6].policy_weight, 0.0);
+        assert_eq!(samples[7].policy_weight, 0.0);
+        for sample in &samples {
             assert_eq!(sample.value_wdl, [0.0, 1.0, 0.0]);
             assert_eq!(sample.value, 0.0);
             assert_eq!(sample.moves_left, 0.0);
