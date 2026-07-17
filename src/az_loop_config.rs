@@ -94,7 +94,7 @@ impl Default for AzLoopFileConfig {
             lr_decay_factor: 0.9,
             batch_size: 256,
             max_plies: 200,
-            hidden_size: 256,
+            hidden_size: 192,
             seed: 20260420,
             workers: 192,
             temperature_start: 0.9,
@@ -124,7 +124,7 @@ impl Default for AzLoopFileConfig {
             opening_fens_path: String::new(),
             resign_percentage: 0.8,
             resign_playthrough: 20.0,
-            replay_capacity: 2000000,
+            replay_capacity: 1000000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_window_updates: 5000,
             train_warmup_samples: 240000,
@@ -672,8 +672,8 @@ mod tests {
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));
         assert!(text.contains("max_plies = 200\n"));
-        assert!(text.contains("hidden_size = 256\n"));
-        assert!(text.contains("replay_capacity = 2000000\n"));
+        assert!(text.contains("hidden_size = 192\n"));
+        assert!(text.contains("replay_capacity = 1000000\n"));
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("replay_recent_window_updates = 5000\n"));
