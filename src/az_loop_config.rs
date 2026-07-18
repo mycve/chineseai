@@ -50,12 +50,11 @@ pub struct AzLoopFileConfig {
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
-    pub replay_recent_window_updates: u32,
+    pub replay_recent_games: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
     pub mirror_probability: f32,
-    pub deblunder_q_gap: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -126,12 +125,11 @@ impl Default for AzLoopFileConfig {
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
             replay_recent_sample_fraction: 0.4,
-            replay_recent_window_updates: 5000,
+            replay_recent_games: 5000,
             train_warmup_samples: 240000,
             train_samples_per_update: 240000,
             train_epochs_per_update: 1,
             mirror_probability: 0.3,
-            deblunder_q_gap: 0.05,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -204,12 +202,11 @@ struct AzLoopTomlConfig {
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
-    pub replay_recent_window_updates: u32,
+    pub replay_recent_games: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
     pub mirror_probability: f32,
-    pub deblunder_q_gap: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -298,12 +295,11 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
             replay_recent_sample_fraction: config.replay_recent_sample_fraction,
-            replay_recent_window_updates: config.replay_recent_window_updates,
+            replay_recent_games: config.replay_recent_games,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
             mirror_probability: config.mirror_probability,
-            deblunder_q_gap: config.deblunder_q_gap,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -382,12 +378,11 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             resign_playthrough: config.resign_playthrough,
             replay_capacity: config.replay_capacity,
             replay_recent_sample_fraction: config.replay_recent_sample_fraction,
-            replay_recent_window_updates: config.replay_recent_window_updates,
+            replay_recent_games: config.replay_recent_games,
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
             mirror_probability: config.mirror_probability,
-            deblunder_q_gap: config.deblunder_q_gap,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -506,15 +501,11 @@ impl AzLoopFileConfig {
             "replay_recent_sample_fraction",
             f(self.replay_recent_sample_fraction)
         );
-        line!(
-            "replay_recent_window_updates",
-            self.replay_recent_window_updates
-        );
+        line!("replay_recent_games", self.replay_recent_games);
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("train_epochs_per_update", self.train_epochs_per_update);
         line!("mirror_probability", f(self.mirror_probability));
-        line!("deblunder_q_gap", f(self.deblunder_q_gap));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
@@ -602,13 +593,12 @@ impl AzLoopFileConfig {
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
-        self.replay_recent_window_updates = self.replay_recent_window_updates.max(1);
+        self.replay_recent_games = self.replay_recent_games.max(1);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
-        self.deblunder_q_gap = self.deblunder_q_gap.max(0.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
@@ -676,8 +666,7 @@ mod tests {
         assert!(text.contains("replay_capacity = 1000000\n"));
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
-        assert!(text.contains("replay_recent_window_updates = 5000\n"));
-        assert!(text.contains("deblunder_q_gap = 0.05\n"));
+        assert!(text.contains("replay_recent_games = 5000\n"));
         assert!(text.contains("arena_processes = 192\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
@@ -702,9 +691,21 @@ mod tests {
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
         assert!((parsed.lr - 0.0005).abs() < 1e-9);
-        assert!((parsed.deblunder_q_gap - 0.05).abs() < 1e-6);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
+    }
+
+    #[test]
+    fn removed_config_names_are_rejected() {
+        for removed in [
+            "replay_recent_window_updates = 5000\n",
+            "deblunder_q_gap = 0.05\n",
+        ] {
+            let error = toml::from_str::<AzLoopTomlConfig>(removed)
+                .expect_err("removed config keys must not be accepted");
+            let key = removed.split_once(' ').unwrap().0;
+            assert!(error.to_string().contains(key));
+        }
     }
 }
 

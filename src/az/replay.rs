@@ -15,7 +15,8 @@ use super::{
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
 // v27 将 canonical 历史特征从旧表偏移重排到紧凑输入表；旧快照不能混用。
-const REPLAY_FILE_VERSION: u32 = 27;
+// v28 removes an obsolete per-sample marker.
+const REPLAY_FILE_VERSION: u32 = 28;
 /// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
 const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";
@@ -101,7 +102,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_u32(out, sample.meta.played_visits);
     replay_push_u32(out, sample.meta.best_index as u32);
     replay_push_u32(out, sample.meta.played_index as u32);
-    replay_push_u32(out, u32::from(sample.meta.deblundered));
     Ok(())
 }
 
@@ -144,7 +144,7 @@ pub struct AzReplayWindowStats {
     pub oldest_generation_update: u32,
     pub newest_generation_update: u32,
     pub avg_generation_update: f32,
-    pub window_updates: u32,
+    pub window_games: u32,
     pub recent_window_sample_fraction: f32,
 }
 
@@ -217,7 +217,6 @@ fn decode_az_training_sample<R: Read>(
         played_visits: replay_read_u32(reader)?,
         best_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
         played_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
-        deblundered: replay_read_u32(reader)? != 0,
     };
     Ok(AzTrainingSample {
         features,
@@ -325,13 +324,13 @@ impl AzExperiencePool {
         &self,
         count: usize,
         recent_fraction: f32,
-        recent_window_updates: u32,
+        recent_games: u32,
         rng: &mut SplitMix64,
     ) -> AzReplaySampleBatch {
         if self.sample_count == 0 || count == 0 {
             return AzReplaySampleBatch::default();
         }
-        let recent_indices = self.recent_flat_indices(recent_window_updates.max(1));
+        let recent_indices = self.recent_flat_indices(recent_games.max(1));
         if recent_indices.is_empty() {
             return AzReplaySampleBatch {
                 samples: self.sample_uniform(count, rng),
@@ -355,14 +354,14 @@ impl AzExperiencePool {
         }
     }
 
-    fn recent_flat_indices(&self, recent_window_updates: u32) -> Vec<usize> {
+    fn recent_flat_indices(&self, recent_games: u32) -> Vec<usize> {
         let newest = self
             .chunks
             .iter()
             .map(|chunk| chunk.generation_update)
             .max()
             .unwrap_or(0);
-        let oldest_recent = newest.saturating_sub(recent_window_updates.saturating_sub(1));
+        let oldest_recent = newest.saturating_sub(recent_games.saturating_sub(1));
         let mut out = Vec::new();
         let mut flat = 0usize;
         for chunk in &self.chunks {
@@ -410,7 +409,7 @@ impl AzExperiencePool {
             .collect()
     }
 
-    pub fn window_stats(&self, recent_window_updates: u32) -> AzReplayWindowStats {
+    pub fn window_stats(&self, recent_games: u32) -> AzReplayWindowStats {
         if self.sample_count == 0 {
             return AzReplayWindowStats::default();
         }
@@ -427,7 +426,7 @@ impl AzExperiencePool {
             weighted_sum += chunk.generation_update as u64 * chunk.len() as u64;
             *by_update.entry(chunk.generation_update).or_default() += chunk.len();
         }
-        let recent_oldest = newest.saturating_sub(recent_window_updates.max(1).saturating_sub(1));
+        let recent_oldest = newest.saturating_sub(recent_games.max(1).saturating_sub(1));
         let recent_samples = by_update
             .iter()
             .filter_map(|(&update, &count)| (update >= recent_oldest).then_some(count))
@@ -438,7 +437,7 @@ impl AzExperiencePool {
             oldest_generation_update: oldest,
             newest_generation_update: newest,
             avg_generation_update: weighted_sum as f32 / self.sample_count as f32,
-            window_updates: newest.saturating_sub(oldest).saturating_add(1),
+            window_games: newest.saturating_sub(oldest).saturating_add(1),
             recent_window_sample_fraction: recent_samples as f32 / self.sample_count as f32,
         }
     }

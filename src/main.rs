@@ -9,11 +9,11 @@ use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, SplitMix64,
-        alphazero_search, alphazero_search_with_history_and_rules, benchmark_fixed_policy_fit,
-        benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit, benchmark_training,
-        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples_weighted,
+        AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
+        SplitMix64, alphazero_search, alphazero_search_with_history_and_rules,
+        benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
+        benchmark_training, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions, train_samples_weighted,
     },
     nnue::HistoryMove,
     opening_book::ObkBook,
@@ -478,7 +478,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "ls{}_lsp{}_lspw{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_dbg{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -491,7 +491,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.low_simulation_probability),
         f32_slug(config.low_simulation_policy_weight),
         f32_slug(config.replay_recent_sample_fraction),
-        config.replay_recent_window_updates,
+        config.replay_recent_games,
         f32_slug(config.lr_min),
         config.lr_decay_start_update,
         config.lr_decay_interval,
@@ -517,7 +517,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
-        f32_slug(config.deblunder_q_gap),
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
@@ -589,7 +588,7 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     config.train_warmup_samples = config.train_samples_per_update;
     config.replay_capacity = 80000;
     config.replay_recent_sample_fraction = 0.4;
-    config.replay_recent_window_updates = 5000;
+    config.replay_recent_games = 5000;
     config.train_epochs_per_update = 1;
     config.hidden_size = cmd.hidden.max(1);
     config.workers = cmd.workers.max(1);
@@ -784,9 +783,6 @@ struct AzSelfplayFitBenchArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.5)]
     mirror_probability: f32,
-    /// Q gap that marks a sampled move as a value-repair blunder.
-    #[arg(long, default_value_t = 0.15)]
-    deblunder_q_gap: f32,
     /// Save generated fixed self-play data as replay lz4.
     #[arg(long)]
     replay_out: Option<String>,
@@ -870,9 +866,6 @@ struct AzReplayGenerateFixedArgs {
     /// File-mirror augmentation probability.
     #[arg(long, default_value_t = 0.3)]
     mirror_probability: f32,
-    /// Q gap that marks a sampled move as a value-repair blunder.
-    #[arg(long, default_value_t = 0.15)]
-    deblunder_q_gap: f32,
 }
 
 #[derive(Args, Debug)]
@@ -1024,7 +1017,11 @@ struct TrainBatchSourceStats {
     fast_sample_rate: f32,
     policy_weight_mean: f32,
     value_weight_mean: f32,
-    recent_sample_rate: f32,
+    recent_quota_rate: f32,
+    actual_recent_sample_rate: f32,
+    policy_target_entropy: f32,
+    policy_target_top1: f32,
+    policy_target_top2: f32,
 }
 
 impl PendingTrainingData {
@@ -1082,7 +1079,6 @@ fn build_az_loop_config(
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
-        deblunder_q_gap: config.deblunder_q_gap,
     }
 }
 
@@ -1193,8 +1189,10 @@ fn build_async_training_report(
         value_calibration,
         phase_value,
         policy_ce: stats.policy_ce,
+        policy_target_entropy: train_source.policy_target_entropy,
         legal_moves_loss: stats.legal_moves_loss,
-        policy_kl: stats.policy_ce - root_visit_entropy,
+        moves_left_loss: stats.moves_left_loss,
+        policy_kl: stats.policy_ce - train_source.policy_target_entropy,
         root_visit_entropy,
         entropy_opening: pending.selfplay.entropy_opening_sum
             / pending.selfplay.entropy_opening_count.max(1) as f32,
@@ -1216,7 +1214,6 @@ fn build_async_training_report(
         opening_visited_actions: pending.selfplay.opening_visited_actions_sum as f32
             / opening_shape_count,
         sampled_best_rate: pending.selfplay.sampled_best_moves as f32 / sampled_moves,
-        deblunder_rate: pending.selfplay.deblundered_moves as f32 / sampled_moves,
         avg_best_played_q_gap: pending.selfplay.best_played_q_gap_sum / sampled_moves,
         avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
@@ -1234,12 +1231,15 @@ fn build_async_training_report(
         replay_oldest_update: replay_window.oldest_generation_update,
         replay_newest_update: replay_window.newest_generation_update,
         replay_avg_update: replay_window.avg_generation_update,
-        replay_window_updates: replay_window.window_updates,
+        replay_window_games: replay_window.window_games,
         replay_recent_window_fraction: replay_window.recent_window_sample_fraction,
         train_fast_sample_rate: train_source.fast_sample_rate,
         train_policy_weight_mean: train_source.policy_weight_mean,
         train_value_weight_mean: train_source.value_weight_mean,
-        train_recent_sample_rate: train_source.recent_sample_rate,
+        train_recent_quota_rate: train_source.recent_quota_rate,
+        train_actual_recent_sample_rate: train_source.actual_recent_sample_rate,
+        train_policy_target_top1: train_source.policy_target_top1,
+        train_policy_target_top2: train_source.policy_target_top2,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
@@ -1259,7 +1259,9 @@ fn build_async_training_report(
 fn train_batch_source_stats(
     samples: &[AzTrainingSample],
     full_simulations: usize,
-    recent_samples: usize,
+    recent_quota_samples: usize,
+    newest_generation: u32,
+    recent_window_games: u32,
 ) -> TrainBatchSourceStats {
     if samples.is_empty() {
         return TrainBatchSourceStats::default();
@@ -1268,19 +1270,66 @@ fn train_batch_source_stats(
     let mut fast = 0usize;
     let mut policy_weight_sum = 0.0f32;
     let mut value_weight_sum = 0.0f32;
+    let mut actual_recent = 0usize;
+    let mut target_entropy_sum = 0.0f32;
+    let mut target_top1_sum = 0.0f32;
+    let mut target_top2_sum = 0.0f32;
+    let recent_oldest =
+        newest_generation.saturating_sub(recent_window_games.max(1).saturating_sub(1));
     for sample in samples {
         fast += usize::from(
             sample.search_simulations > 0 && sample.search_simulations < full_simulations,
         );
         policy_weight_sum += sample.policy_weight.max(0.0);
         value_weight_sum += sample.value_weight.max(0.0);
+        actual_recent += usize::from(sample.meta.generation_update >= recent_oldest);
+        let active_targets = sample
+            .move_indices
+            .iter()
+            .zip(&sample.policy)
+            .filter_map(|(&move_index, &target)| {
+                (move_index < DENSE_MOVE_SPACE).then_some(target.max(0.0))
+            })
+            .collect::<Vec<_>>();
+        let target_sum = active_targets.iter().copied().sum::<f32>();
+        let uniform_target = if active_targets.is_empty() {
+            0.0
+        } else {
+            1.0 / active_targets.len() as f32
+        };
+        let normalize_target = |target: f32| {
+            if target_sum.is_finite() && target_sum > 1.0e-12 {
+                target / target_sum
+            } else {
+                uniform_target
+            }
+        };
+        let mut top = [0.0f32; 2];
+        for &target in &active_targets {
+            let p = normalize_target(target);
+            if p > 0.0 {
+                target_entropy_sum -= p * p.ln();
+            }
+            if p > top[0] {
+                top[1] = top[0];
+                top[0] = p;
+            } else if p > top[1] {
+                top[1] = p;
+            }
+        }
+        target_top1_sum += top[0];
+        target_top2_sum += top[0] + top[1];
     }
     let denom = samples.len() as f32;
     TrainBatchSourceStats {
         fast_sample_rate: fast as f32 / denom,
         policy_weight_mean: policy_weight_sum / denom,
         value_weight_mean: value_weight_sum / denom,
-        recent_sample_rate: recent_samples.min(samples.len()) as f32 / denom,
+        recent_quota_rate: recent_quota_samples.min(samples.len()) as f32 / denom,
+        actual_recent_sample_rate: actual_recent as f32 / denom,
+        policy_target_entropy: target_entropy_sum / denom,
+        policy_target_top1: target_top1_sum / denom,
+        policy_target_top2: target_top2_sum / denom,
     }
 }
 
@@ -1930,7 +1979,6 @@ fn main() {
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
-                    deblunder_q_gap: cmd.deblunder_q_gap,
                 };
                 let selfplay_started = Instant::now();
                 let data = generate_selfplay_data(&model, &config);
@@ -2157,7 +2205,6 @@ fn main() {
                     resign_percentage: 0.0,
                     resign_playthrough: 100.0,
                     mirror_probability: cmd.mirror_probability,
-                    deblunder_q_gap: cmd.deblunder_q_gap,
                 };
                 let data = generate_selfplay_data(&model, &config);
                 total_games += data.games.len();
@@ -2483,14 +2530,14 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},updates={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} deblunder_q_gap={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.low_simulations,
                 config.low_simulation_probability,
                 config.low_simulation_policy_weight,
                 config.replay_recent_sample_fraction,
-                config.replay_recent_window_updates,
+                config.replay_recent_games,
                 config.selfplay_samples_per_update,
                 effective_train_to_selfplay_ratio,
                 config.lr,
@@ -2528,7 +2575,6 @@ fn main() {
                 config.resign_playthrough,
                 config.replay_capacity,
                 config.mirror_probability,
-                config.deblunder_q_gap,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,
@@ -2756,7 +2802,7 @@ fn main() {
                     let sampled_batch = pool.sample_mixed_recent(
                         trainer_config.train_samples_per_update,
                         trainer_config.replay_recent_sample_fraction,
-                        trainer_config.replay_recent_window_updates,
+                        trainer_config.replay_recent_games,
                         &mut rng,
                     );
                     let train_data = sampled_batch.samples;
@@ -2767,6 +2813,8 @@ fn main() {
                         &train_data,
                         trainer_config.simulations,
                         sampled_batch.recent_samples,
+                        pool.max_generation_update(),
+                        trainer_config.replay_recent_games,
                     );
                     let train_update = trainer_start_update.saturating_add(train_index);
                     let current_lr = learning_rate_for_update(&trainer_config, train_update);
@@ -2794,7 +2842,7 @@ fn main() {
                         train_seconds,
                         pool.sample_count(),
                         pool.capacity(),
-                        pool.window_stats(trainer_config.replay_recent_window_updates),
+                        pool.window_stats(trainer_config.replay_recent_games),
                         train_source_stats,
                     );
                     if trainer_tx
@@ -2884,7 +2932,6 @@ fn main() {
                                         opening_q_top1_abs: 0.0,
                                         opening_visited_actions: 0.0,
                                         sampled_best_rate: 0.0,
-                                        deblunder_rate: 0.0,
                                         avg_best_played_q_gap: 0.0,
                                         avg_played_top_visit_ratio: 0.0,
                                         avg_best_q: 0.0,
@@ -2958,7 +3005,6 @@ fn main() {
                                         opening_q_top1_abs: 0.0,
                                         opening_visited_actions: 0.0,
                                         sampled_best_rate: 0.0,
-                                        deblunder_rate: 0.0,
                                         avg_best_played_q_gap: 0.0,
                                         avg_played_top_visit_ratio: 0.0,
                                         avg_best_q: 0.0,
@@ -3024,9 +3070,8 @@ fn main() {
                     None
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
-                let policy_target_entropy = report.policy_ce - report.policy_kl;
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} upd={}-{} span={} recent_frac={:.3}) train_src(recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_rate={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} loss={:.4} wdl_ce={:.4} legal_aux={:.4} q_rmse={:.4} q_mu={:.3}/{:.3} q_rms={:.3}/{:.3} q_corr={:.3} q_cal={:.3} phaseQ(o={}/{:.3}/{:.3}/{:.3} m={}/{:.3}/{:.3}/{:.3} e={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} targetH={:.4} lr={:.6} rootH={:.3} openH={:.3} midH={:.3} rawP={:.3}/{:.3} tgtP={:.3}/{:.3} qgap={:.3} qabs={:.3} visitA={:.1} sampBest={:.3} debl={:.3} playGap={:.3} visitRatio={:.3} bestQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3041,9 +3086,10 @@ fn main() {
                     report.replay_chunks,
                     report.replay_oldest_update,
                     report.replay_newest_update,
-                    report.replay_window_updates,
+                    report.replay_window_games,
                     report.replay_recent_window_fraction,
-                    report.train_recent_sample_rate,
+                    report.train_recent_quota_rate,
+                    report.train_actual_recent_sample_rate,
                     report.train_fast_sample_rate,
                     report.train_policy_weight_mean,
                     report.train_value_weight_mean,
@@ -3057,6 +3103,7 @@ fn main() {
                     report.loss,
                     report.value_loss,
                     report.legal_moves_loss,
+                    report.moves_left_loss,
                     value_rmse,
                     report.value_pred_mean,
                     report.value_target_mean,
@@ -3077,7 +3124,7 @@ fn main() {
                     report.phase_value[2].corr,
                     report.phase_value[2].calibration,
                     report.policy_kl,
-                    policy_target_entropy,
+                    report.policy_target_entropy,
                     report.learning_rate,
                     report.root_visit_entropy,
                     report.entropy_opening,
@@ -3086,11 +3133,12 @@ fn main() {
                     report.raw_prior_top2,
                     report.policy_top1,
                     report.policy_top2,
+                    report.train_policy_target_top1,
+                    report.train_policy_target_top2,
                     report.root_q_gap,
                     report.root_q_top1_abs,
                     report.visited_actions,
                     report.sampled_best_rate,
-                    report.deblunder_rate,
                     report.avg_best_played_q_gap,
                     report.avg_played_top_visit_ratio,
                     report.avg_best_q,
@@ -3107,13 +3155,19 @@ fn main() {
                             path.display()
                         ))
                 );
-                log_scalar(&mut tb, "train/loss", update, report.loss);
-                log_scalar(&mut tb, "train/value_loss", update, report.value_loss);
+                log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
+                log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
                 log_scalar(
                     &mut tb,
-                    "train/legal_moves_loss",
+                    "train/legal_moves_log_mse",
                     update,
                     report.legal_moves_loss,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/moves_left_log_mse",
+                    update,
+                    report.moves_left_loss,
                 );
                 log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
                 log_scalar(
@@ -3135,7 +3189,10 @@ fn main() {
                     update,
                     report.value_calibration,
                 );
-                for (phase, name) in ["opening", "midgame", "endgame"].into_iter().enumerate() {
+                for (phase, name) in ["ply_0_39", "ply_40_119", "ply_120_plus"]
+                    .into_iter()
+                    .enumerate()
+                {
                     let phase_value = report.phase_value[phase];
                     log_scalar(
                         &mut tb,
@@ -3164,6 +3221,24 @@ fn main() {
                 }
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
                 log_scalar(&mut tb, "train/policy_kl", update, report.policy_kl);
+                log_scalar(
+                    &mut tb,
+                    "train/policy_target_entropy",
+                    update,
+                    report.policy_target_entropy,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/policy_target_top1",
+                    update,
+                    report.train_policy_target_top1,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/policy_target_top2",
+                    update,
+                    report.train_policy_target_top2,
+                );
                 log_scalar(&mut tb, "train/lr", update, report.learning_rate);
                 log_scalar(
                     &mut tb,
@@ -3205,9 +3280,15 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "train/recent_sample_rate",
+                    "train/recent_quota_rate",
                     update,
-                    report.train_recent_sample_rate,
+                    report.train_recent_quota_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "train/actual_recent_sample_rate",
+                    update,
+                    report.train_actual_recent_sample_rate,
                 );
                 log_scalar(
                     &mut tb,
@@ -3241,27 +3322,27 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "replay/oldest_update",
+                    "replay/oldest_generation_game",
                     update,
                     report.replay_oldest_update as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "replay/newest_update",
+                    "replay/newest_generation_game",
                     update,
                     report.replay_newest_update as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "replay/avg_update",
+                    "replay/avg_generation_game",
                     update,
                     report.replay_avg_update,
                 );
                 log_scalar(
                     &mut tb,
-                    "replay/window_updates",
+                    "replay/window_games",
                     update,
-                    report.replay_window_updates as f32,
+                    report.replay_window_games as f32,
                 );
                 log_scalar(
                     &mut tb,
@@ -3272,17 +3353,22 @@ fn main() {
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
                 log_scalar(
                     &mut tb,
-                    "stats/root_visit_entropy",
+                    "selfplay/visit_policy_entropy",
                     update,
                     report.root_visit_entropy,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/entropy_opening",
+                    "selfplay/visit_policy_entropy_ply_0_89",
                     update,
                     report.entropy_opening,
                 );
-                log_scalar(&mut tb, "stats/entropy_mid", update, report.entropy_mid);
+                log_scalar(
+                    &mut tb,
+                    "selfplay/visit_policy_entropy_ply_90_plus",
+                    update,
+                    report.entropy_mid,
+                );
                 log_scalar(
                     &mut tb,
                     "stats/raw_prior_top1",
@@ -3295,12 +3381,22 @@ fn main() {
                     update,
                     report.raw_prior_top2,
                 );
-                log_scalar(&mut tb, "stats/policy_top1", update, report.policy_top1);
-                log_scalar(&mut tb, "stats/policy_top2", update, report.policy_top2);
-                log_scalar(&mut tb, "stats/root_q_gap", update, report.root_q_gap);
                 log_scalar(
                     &mut tb,
-                    "stats/root_q_top1_abs",
+                    "selfplay/visit_policy_top1",
+                    update,
+                    report.policy_top1,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/visit_policy_top2",
+                    update,
+                    report.policy_top2,
+                );
+                log_scalar(&mut tb, "stats/top_q_gap", update, report.root_q_gap);
+                log_scalar(
+                    &mut tb,
+                    "stats/max_child_q_abs",
                     update,
                     report.root_q_top1_abs,
                 );
@@ -3312,52 +3408,51 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/opening_raw_prior_top1",
+                    "selfplay/raw_prior_top1_ply_0_89",
                     update,
                     report.opening_raw_prior_top1,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/opening_raw_prior_top2",
+                    "selfplay/raw_prior_top2_ply_0_89",
                     update,
                     report.opening_raw_prior_top2,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/opening_policy_top1",
+                    "selfplay/visit_policy_top1_ply_0_89",
                     update,
                     report.opening_policy_top1,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/opening_policy_top2",
+                    "selfplay/visit_policy_top2_ply_0_89",
                     update,
                     report.opening_policy_top2,
                 );
-                log_scalar(&mut tb, "stats/opening_q_gap", update, report.opening_q_gap);
                 log_scalar(
                     &mut tb,
-                    "stats/opening_q_top1_abs",
+                    "stats/top_q_gap_ply_0_89",
+                    update,
+                    report.opening_q_gap,
+                );
+                log_scalar(
+                    &mut tb,
+                    "stats/max_child_q_abs_ply_0_89",
                     update,
                     report.opening_q_top1_abs,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/opening_visited_actions",
+                    "stats/visited_actions_ply_0_89",
                     update,
                     report.opening_visited_actions,
                 );
                 log_scalar(
                     &mut tb,
-                    "stats/sampled_best_rate",
+                    "stats/sampled_top_q_rate",
                     update,
                     report.sampled_best_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/deblunder_rate",
-                    update,
-                    report.deblunder_rate,
                 );
                 log_scalar(
                     &mut tb,
@@ -3371,7 +3466,7 @@ fn main() {
                     update,
                     report.avg_played_top_visit_ratio,
                 );
-                log_scalar(&mut tb, "stats/avg_best_q", update, report.avg_best_q);
+                log_scalar(&mut tb, "stats/avg_max_child_q", update, report.avg_best_q);
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
                 log_scalar(
                     &mut tb,
@@ -3663,10 +3758,11 @@ fn main() {
                         match eval_result {
                             Ok(stats) => {
                                 println!(
-                                    "pikafish-label {update:04}: sqlite={} positions={} legal={} sims={} threads={} top1={:.3}% top2={:.3}% top4={:.3}% top8={:.3}% prior_top1={:.3}% value_corr={:.4} value_mae={:.4} elapsed={:.1}s",
+                                    "pikafish-label {update:04}: sqlite={} evaluated={} legal={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% value_corr={:.4} value_mae={:.4} elapsed={:.1}s",
                                     config.pikafish_label_eval_sqlite,
                                     stats.count,
                                     stats.legal_bestmove,
+                                    stats.value_count(),
                                     config.pikafish_label_eval_simulations,
                                     config.arena_processes,
                                     100.0 * stats.top1_rate(),
@@ -3680,39 +3776,45 @@ fn main() {
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/positions",
+                                    "pikafish_label/evaluated_positions",
                                     update,
                                     stats.count as f32,
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/top1",
+                                    "pikafish_label/search_top1",
                                     update,
                                     stats.top1_rate(),
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/top2",
+                                    "pikafish_label/search_top2",
                                     update,
                                     stats.top2_rate(),
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/top4",
+                                    "pikafish_label/search_top4",
                                     update,
                                     stats.top4_rate(),
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/top8",
+                                    "pikafish_label/search_top8",
                                     update,
                                     stats.top8_rate(),
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/prior_top1",
+                                    "pikafish_label/raw_prior_top1",
                                     update,
                                     stats.prior_top1_rate(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/value_labels",
+                                    update,
+                                    stats.value_count() as f32,
                                 );
                                 log_scalar(
                                     &mut tb,
@@ -3945,6 +4047,7 @@ struct LabelEvalStats {
     top4_hits: usize,
     top8_hits: usize,
     prior_top1_hits: usize,
+    value_pairs: usize,
     value_q_sum: f64,
     cp_tanh_sum: f64,
     value_q_sq_sum: f64,
@@ -3962,6 +4065,7 @@ impl LabelEvalStats {
         self.top4_hits += other.top4_hits;
         self.top8_hits += other.top8_hits;
         self.prior_top1_hits += other.prior_top1_hits;
+        self.value_pairs += other.value_pairs;
         self.value_q_sum += other.value_q_sum;
         self.cp_tanh_sum += other.cp_tanh_sum;
         self.value_q_sq_sum += other.value_q_sq_sum;
@@ -3995,7 +4099,7 @@ impl LabelEvalStats {
     }
 
     fn value_mae_tanh_cp(&self) -> f32 {
-        (self.abs_value_error_sum / self.denom() as f64) as f32
+        (self.abs_value_error_sum / self.value_count().max(1) as f64) as f32
     }
 
     fn push_value_pair(&mut self, value_q: f32, score_cp: Option<i32>) {
@@ -4004,6 +4108,7 @@ impl LabelEvalStats {
         };
         let target = ((score_cp as f64) / 600.0).tanh();
         let value = value_q as f64;
+        self.value_pairs += 1;
         self.value_q_sum += value;
         self.cp_tanh_sum += target;
         self.value_q_sq_sum += value * value;
@@ -4013,7 +4118,7 @@ impl LabelEvalStats {
     }
 
     fn value_count(&self) -> usize {
-        self.count
+        self.value_pairs
     }
 
     fn value_corr(&self) -> f64 {
@@ -4064,11 +4169,12 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
     )?;
 
     println!(
-        "pikafish-label-eval: model={} sqlite={} positions={} legal_labels={} sims={} top1={:.3}% top2={:.3}% top4={:.3}% top8={:.3}% prior_top1={:.3}% value_corr={:.4} value_mae_tanh_cp={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% value_corr={:.4} value_mae_tanh_cp={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
         stats.legal_bestmove,
+        stats.value_count(),
         cmd.simulations.max(1),
         100.0 * stats.top1_rate(),
         100.0 * stats.top2_rate(),
@@ -4143,7 +4249,7 @@ fn evaluate_pikafish_labels(
         if result
             .candidates
             .iter()
-            .max_by(|left, right| left.policy.total_cmp(&right.policy))
+            .max_by(|left, right| left.raw_prior.total_cmp(&right.raw_prior))
             .is_some_and(|candidate| candidate.mv == label_move)
         {
             stats.prior_top1_hits += 1;
@@ -4534,6 +4640,61 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
 
 fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+    use chineseai::az::AzSampleMeta;
+
+    fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
+        AzTrainingSample {
+            features: vec![0],
+            move_indices: (0..policy.len()).collect(),
+            policy,
+            value_wdl: [0.0, 1.0, 0.0],
+            value: 0.0,
+            side_sign: 1.0,
+            moves_left: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 2_000,
+            meta: AzSampleMeta {
+                generation_update: generation,
+                ..AzSampleMeta::default()
+            },
+        }
+    }
+
+    #[test]
+    fn train_source_reports_actual_recent_and_real_target_shape() {
+        let samples = vec![
+            reporting_sample(10, vec![3.0, 1.0]),
+            reporting_sample(5, vec![2.0, 2.0]),
+        ];
+        let stats = train_batch_source_stats(&samples, 4_000, 1, 10, 3);
+
+        assert!((stats.recent_quota_rate - 0.5).abs() < 1e-6);
+        assert!((stats.actual_recent_sample_rate - 0.5).abs() < 1e-6);
+        let expected_entropy =
+            (-(0.75f32 * 0.75f32.ln() + 0.25f32 * 0.25f32.ln()) - 0.5f32.ln()) / 2.0;
+        assert!((stats.policy_target_entropy - expected_entropy).abs() < 1e-6);
+        assert!((stats.policy_target_top1 - 0.625).abs() < 1e-6);
+        assert!((stats.policy_target_top2 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pikafish_value_metrics_count_only_rows_with_scores() {
+        let mut stats = LabelEvalStats {
+            count: 2,
+            ..LabelEvalStats::default()
+        };
+        stats.push_value_pair(0.25, None);
+        stats.push_value_pair(0.25, Some(0));
+
+        assert_eq!(stats.value_count(), 1);
+        assert!((stats.value_mae_tanh_cp() - 0.25).abs() < 1e-6);
+    }
 }
 
 fn migrate_pikafish_label_schema(conn: &Connection) -> rusqlite::Result<()> {

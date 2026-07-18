@@ -42,7 +42,7 @@ pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
 pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
-const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
+pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
@@ -575,7 +575,6 @@ pub struct AzLoopConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
-    pub deblunder_q_gap: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -602,7 +601,9 @@ pub struct AzLoopReport {
     pub value_calibration: f32,
     pub phase_value: [AzPhaseValueReport; 3],
     pub policy_ce: f32,
+    pub policy_target_entropy: f32,
     pub legal_moves_loss: f32,
+    pub moves_left_loss: f32,
     pub policy_kl: f32,
     pub root_visit_entropy: f32,
     pub entropy_opening: f32,
@@ -622,7 +623,6 @@ pub struct AzLoopReport {
     pub opening_q_top1_abs: f32,
     pub opening_visited_actions: f32,
     pub sampled_best_rate: f32,
-    pub deblunder_rate: f32,
     pub avg_best_played_q_gap: f32,
     pub avg_played_top_visit_ratio: f32,
     pub avg_best_q: f32,
@@ -640,12 +640,15 @@ pub struct AzLoopReport {
     pub replay_oldest_update: u32,
     pub replay_newest_update: u32,
     pub replay_avg_update: f32,
-    pub replay_window_updates: u32,
+    pub replay_window_games: u32,
     pub replay_recent_window_fraction: f32,
     pub train_fast_sample_rate: f32,
     pub train_policy_weight_mean: f32,
     pub train_value_weight_mean: f32,
-    pub train_recent_sample_rate: f32,
+    pub train_recent_quota_rate: f32,
+    pub train_actual_recent_sample_rate: f32,
+    pub train_policy_target_top1: f32,
+    pub train_policy_target_top2: f32,
     pub terminal_no_legal_moves: usize,
     pub terminal_red_general_missing: usize,
     pub terminal_black_general_missing: usize,
@@ -769,7 +772,6 @@ pub struct AzSampleMeta {
     pub played_visits: u32,
     pub best_index: u16,
     pub played_index: u16,
-    pub deblundered: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -781,10 +783,12 @@ pub(super) struct AzEvalOutput {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTrainStats {
+    /// Mean optimized objective after a completed training call, including all weights.
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
     pub legal_moves_loss: f32,
+    pub moves_left_loss: f32,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -828,6 +832,7 @@ impl AzTrainStats {
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
         self.legal_moves_loss += other.legal_moves_loss;
+        self.moves_left_loss += other.moves_left_loss;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;
@@ -2826,7 +2831,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
                 played_visits: 13,
                 best_index: 1,
                 played_index: 0,
-                deblundered: true,
             },
         }
     }
@@ -3200,7 +3204,6 @@ mod tests {
         assert_eq!(loaded_samples[0].meta.ply, 9);
         assert!((loaded_samples[0].meta.best_q - 0.33).abs() < 1e-6);
         assert_eq!(loaded_samples[0].meta.played_visits, 13);
-        assert!(loaded_samples[0].meta.deblundered);
     }
 
     #[test]
@@ -3238,7 +3241,7 @@ mod tests {
         assert_eq!(stats.chunks, 2);
         assert_eq!(stats.oldest_generation_update, 2);
         assert_eq!(stats.newest_generation_update, 3);
-        assert_eq!(stats.window_updates, 2);
+        assert_eq!(stats.window_games, 2);
         assert!((stats.recent_window_sample_fraction - 0.5).abs() < 1e-6);
         assert_eq!(pool.all_sample_groups().len(), 2);
     }

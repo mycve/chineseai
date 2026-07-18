@@ -126,6 +126,7 @@ pub(super) fn train_samples_gpu(
         stats.value_loss /= denom;
         stats.policy_ce /= denom;
         stats.legal_moves_loss /= denom;
+        stats.moves_left_loss /= denom;
     }
     let trainer = model
         .gpu_trainer
@@ -674,6 +675,7 @@ impl GpuReplica {
             .affine(LEGAL_MOVES_AUX_WEIGHT as f64, 0.0)?;
         let loss_sum = (((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?
             + weighted_legal_moves_loss)?;
+        let optimized_loss_sum = loss_sum.to_scalar::<f32>()?;
         let loss_tensor = (loss_sum / global_batch_len as f64)?;
 
         let mut phase_value = [AzValueMomentStats::default(); 3];
@@ -709,13 +711,11 @@ impl GpuReplica {
         let value_ce = value_ce.to_scalar::<f32>()?;
         let policy_ce = policy_ce.to_scalar::<f32>()?;
         let stats = AzTrainStats {
-            loss: value_ce
-                + policy_ce
-                + moves_left_sse.to_scalar::<f32>()? * MOVES_LEFT_AUX_WEIGHT
-                + legal_moves_sse.to_scalar::<f32>()? * LEGAL_MOVES_AUX_WEIGHT,
+            loss: optimized_loss_sum,
             value_loss: value_ce,
             policy_ce,
             legal_moves_loss: legal_moves_sse.to_scalar::<f32>()?,
+            moves_left_loss: moves_left_sse.to_scalar::<f32>()?,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
             value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
             value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,
