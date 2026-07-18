@@ -37,7 +37,7 @@ pub(crate) fn training_cuda_device_count() -> usize {
 )))]
 pub(super) fn train_samples_gpu(
     _model: &mut super::AzNnue,
-    _samples: &[super::AzTrainingSample],
+    _samples: std::sync::Arc<Vec<super::AzTrainingSample>>,
     _epochs: usize,
     _lr: f32,
     _batch_size: usize,

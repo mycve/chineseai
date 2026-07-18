@@ -13,7 +13,7 @@ use chineseai::{
         SplitMix64, alphazero_search, alphazero_search_with_history_and_rules,
         benchmark_fixed_policy_fit, benchmark_fixed_policy_fit_with_trace, benchmark_policy_fit,
         benchmark_training, generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples_weighted,
+        play_arena_games_from_positions, train_samples_weighted_owned,
     },
     nnue::HistoryMove,
     opening_book::ObkBook,
@@ -1105,6 +1105,7 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
 
 fn build_async_training_report(
     pending: PendingTrainingData,
+    selfplay_games: usize,
     total_games_generated: usize,
     total_samples_generated: usize,
     stats: chineseai::az::AzTrainStats,
@@ -1116,7 +1117,6 @@ fn build_async_training_report(
     replay_window: chineseai::az::AzReplayWindowStats,
     train_source: TrainBatchSourceStats,
 ) -> AzLoopReport {
-    let selfplay_games = pending.selfplay.games.len();
     let selfplay_samples = pending.selfplay.samples.len();
     let total_seconds = pending
         .started
@@ -2327,10 +2327,11 @@ fn main() {
             print_fixed_replay_fit_stats("initial", &initial_stats);
             for update in 1..=updates {
                 let draw = sample_fixed_training_batch(&train_samples, draw_count, &mut rng);
+                let drawn_samples = draw.len();
                 let train_started = Instant::now();
-                let stats = train_samples_weighted(
+                let stats = train_samples_weighted_owned(
                     &mut model,
-                    &draw,
+                    draw,
                     epochs,
                     lr,
                     batch_size,
@@ -2357,7 +2358,7 @@ fn main() {
                         stats.loss,
                         stats.value_loss,
                         stats.policy_ce,
-                        draw.len() * epochs,
+                        drawn_samples * epochs,
                         train_seconds,
                         started.elapsed().as_secs_f32()
                     );
@@ -2369,7 +2370,7 @@ fn main() {
                         stats.loss,
                         stats.value_loss,
                         stats.policy_ce,
-                        draw.len() * epochs,
+                        drawn_samples * epochs,
                         train_seconds,
                         started.elapsed().as_secs_f32()
                     );
@@ -2777,12 +2778,14 @@ fn main() {
                 let mut train_index = 0usize;
                 let min_train_samples =
                     global_training_step_sample_count(trainer_config.batch_size);
-                'training: while let Ok(pending) = ready_rx.recv() {
+                'training: while let Ok(mut pending) = ready_rx.recv() {
+                    let pending_games = pending.selfplay.games.len();
+                    let pending_samples = pending.selfplay.samples.len();
                     if let Some(pool) = trainer_pool.as_mut() {
-                        pool.add_games(pending.selfplay.games.clone());
+                        pool.add_games(std::mem::take(&mut pending.selfplay.games));
                     }
-                    total_games_generated += pending.selfplay.games.len();
-                    total_samples_generated += pending.selfplay.samples.len();
+                    total_games_generated += pending_games;
+                    total_samples_generated += pending_samples;
                     if trainer_stop.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -2809,6 +2812,7 @@ fn main() {
                     if train_data.is_empty() {
                         continue;
                     }
+                    let train_data_len = train_data.len();
                     let train_source_stats = train_batch_source_stats(
                         &train_data,
                         trainer_config.simulations,
@@ -2819,9 +2823,9 @@ fn main() {
                     let train_update = trainer_start_update.saturating_add(train_index);
                     let current_lr = learning_rate_for_update(&trainer_config, train_update);
                     let train_started = Instant::now();
-                    let stats = train_samples_weighted(
+                    let stats = train_samples_weighted_owned(
                         &mut trainer_model,
-                        &train_data,
+                        train_data,
                         trainer_config.train_epochs_per_update,
                         current_lr,
                         trainer_config.batch_size,
@@ -2834,11 +2838,12 @@ fn main() {
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
                         pending,
+                        pending_games,
                         total_games_generated,
                         total_samples_generated,
                         stats,
                         current_lr,
-                        train_data.len(),
+                        train_data_len,
                         train_seconds,
                         pool.sample_count(),
                         pool.capacity(),

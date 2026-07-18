@@ -1,4 +1,6 @@
-﻿use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
+﻿use std::sync::Arc;
+
+use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
 
 pub fn global_training_step_sample_count(batch_size_per_gpu: usize) -> usize {
     batch_size_per_gpu.max(1) * super::train_gpu::training_cuda_device_count()
@@ -26,6 +28,46 @@ pub fn train_samples(
 pub fn train_samples_weighted(
     model: &mut AzNnue,
     samples: &[AzTrainingSample],
+    epochs: usize,
+    lr: f32,
+    batch_size: usize,
+    rng: &mut SplitMix64,
+    loss_weights: AzTrainLossWeights,
+) -> AzTrainStats {
+    train_samples_weighted_shared(
+        model,
+        Arc::new(samples.to_vec()),
+        epochs,
+        lr,
+        batch_size,
+        rng,
+        loss_weights,
+    )
+}
+
+pub fn train_samples_weighted_owned(
+    model: &mut AzNnue,
+    samples: Vec<AzTrainingSample>,
+    epochs: usize,
+    lr: f32,
+    batch_size: usize,
+    rng: &mut SplitMix64,
+    loss_weights: AzTrainLossWeights,
+) -> AzTrainStats {
+    train_samples_weighted_shared(
+        model,
+        Arc::new(samples),
+        epochs,
+        lr,
+        batch_size,
+        rng,
+        loss_weights,
+    )
+}
+
+fn train_samples_weighted_shared(
+    model: &mut AzNnue,
+    samples: Arc<Vec<AzTrainingSample>>,
     epochs: usize,
     lr: f32,
     batch_size: usize,

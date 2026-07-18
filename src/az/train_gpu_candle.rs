@@ -61,7 +61,7 @@ pub(crate) fn training_cuda_device_count() -> usize {
 
 pub(super) fn train_samples_gpu(
     model: &mut AzNnue,
-    samples: &[AzTrainingSample],
+    samples: Arc<Vec<AzTrainingSample>>,
     epochs: usize,
     lr: f32,
     per_gpu_batch_size: usize,
@@ -80,7 +80,6 @@ pub(super) fn train_samples_gpu(
         model.gpu_trainer = Some(Box::new(GpuTrainer::new(model, lr)?));
     }
     let mut stats = AzTrainStats::default();
-    let samples = Arc::new(samples.to_vec());
     let profile_enabled = train_profile_enabled();
     let mut profile = TrainProfile::default();
     {

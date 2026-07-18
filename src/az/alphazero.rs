@@ -1,11 +1,65 @@
 use crate::nnue::HistoryMove;
-use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
 
 use super::{AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
 
 const DEFAULT_CPUCT: f32 = 1.5;
 const DEFAULT_CPUCT_BASE: f32 = 19652.0;
 const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
+const NO_CHILD: u32 = u32::MAX;
+
+const EMPTY_HISTORY_MOVE: HistoryMove = HistoryMove {
+    piece: Piece {
+        color: Color::Red,
+        kind: PieceKind::General,
+    },
+    captured: None,
+    mv: Move { from: 0, to: 0 },
+};
+
+#[derive(Clone, Copy, Debug)]
+struct SearchHistory {
+    entries: [HistoryMove; crate::nnue::HISTORY_PLIES],
+    len: u8,
+}
+
+impl SearchHistory {
+    fn from_slice(history: &[HistoryMove]) -> Self {
+        let tail = history.len().saturating_sub(crate::nnue::HISTORY_PLIES);
+        let history = &history[tail..];
+        let mut out = Self {
+            entries: [EMPTY_HISTORY_MOVE; crate::nnue::HISTORY_PLIES],
+            len: history.len() as u8,
+        };
+        out.entries[..history.len()].copy_from_slice(history);
+        out
+    }
+
+    fn as_slice(&self) -> &[HistoryMove] {
+        &self.entries[..self.len as usize]
+    }
+
+    fn with_appended_move(&self, position: &Position, mv: Move) -> Self {
+        let Some(piece) = position.piece_at(mv.from as usize) else {
+            return *self;
+        };
+        let mut out = *self;
+        let entry = HistoryMove {
+            piece,
+            captured: position.piece_at(mv.to as usize),
+            mv,
+        };
+        let len = out.len as usize;
+        if len < crate::nnue::HISTORY_PLIES {
+            out.entries[len] = entry;
+            out.len += 1;
+        } else {
+            out.entries.copy_within(1..crate::nnue::HISTORY_PLIES, 0);
+            out.entries[crate::nnue::HISTORY_PLIES - 1] = entry;
+        }
+        out
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
@@ -234,7 +288,7 @@ struct AzTree<'a> {
 struct AzNode {
     position: Position,
     accumulator: AzEvalAccumulator,
-    history: Vec<HistoryMove>,
+    history: SearchHistory,
     rule_history: Vec<RuleHistoryEntry>,
     children: Vec<AzChild>,
     visits: u32,
@@ -253,10 +307,21 @@ struct AzChild {
     visits: u32,
     value_wdl_sum: [f32; 3],
     moves_left_sum: f32,
-    child: Option<usize>,
+    child: u32,
 }
 
 impl AzChild {
+    fn child_node(&self) -> Option<usize> {
+        (self.child != NO_CHILD).then_some(self.child as usize)
+    }
+
+    fn set_child_node(&mut self, child: usize) {
+        self.child = u32::try_from(child)
+            .ok()
+            .filter(|&child| child != NO_CHILD)
+            .expect("MCTS node index exceeds compact child range");
+    }
+
     fn q(&self, draw_score: f32) -> f32 {
         if self.visits == 0 {
             0.0
@@ -277,7 +342,7 @@ impl AzChild {
 impl<'a> AzTree<'a> {
     fn new(
         position: Position,
-        history: Vec<HistoryMove>,
+        history: SearchHistory,
         rule_history: Vec<RuleHistoryEntry>,
         root_moves: Option<Vec<Move>>,
         model: &'a AzNnue,
@@ -412,7 +477,7 @@ impl<'a> AzTree<'a> {
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.nodes[node_index].accumulator,
-                &self.nodes[node_index].history,
+                self.nodes[node_index].history.as_slice(),
                 &moves,
                 &mut self.eval_scratch,
             )
@@ -451,7 +516,7 @@ impl<'a> AzTree<'a> {
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
                     moves_left_sum: 0.0,
-                    child: None,
+                    child: NO_CHILD,
                 })
                 .collect();
         }
@@ -497,7 +562,7 @@ impl<'a> AzTree<'a> {
     ) -> AzEvalOutput {
         crate::scope_profile!("az.search.simulate_child");
         let child_node =
-            if let Some(child_node) = self.nodes[node_index].children[child_index].child {
+            if let Some(child_node) = self.nodes[node_index].children[child_index].child_node() {
                 child_node
             } else {
                 crate::scope_profile!("az.search.create_child");
@@ -508,11 +573,9 @@ impl<'a> AzTree<'a> {
                 let mut child_accumulator = self.nodes[node_index].accumulator.clone();
                 let child_history = {
                     crate::scope_profile!("az.search.clone_history");
-                    clone_history_with_appended_move(
-                        &self.nodes[node_index].history,
-                        &child_position,
-                        mv,
-                    )
+                    self.nodes[node_index]
+                        .history
+                        .with_appended_move(&child_position, mv)
                 };
                 let mover = child_position.side_to_move();
                 {
@@ -550,7 +613,7 @@ impl<'a> AzTree<'a> {
                     moves_left: 0.0,
                     expanded: false,
                 });
-                self.nodes[node_index].children[child_index].child = Some(child_node);
+                self.nodes[node_index].children[child_index].set_child_node(child_node);
                 child_node
             };
         let child_eval = self.simulate(child_node, child_depth);
@@ -614,7 +677,7 @@ impl<'a> AzTree<'a> {
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.nodes[node_index].accumulator,
-                &self.nodes[node_index].history,
+                self.nodes[node_index].history.as_slice(),
                 &moves,
                 &mut self.eval_scratch,
             )
@@ -1014,17 +1077,6 @@ pub(super) fn append_history(history: &mut Vec<HistoryMove>, position: &Position
     }
 }
 
-fn clone_history_with_appended_move(
-    history: &[HistoryMove],
-    position: &Position,
-    mv: Move,
-) -> Vec<HistoryMove> {
-    let mut out = Vec::with_capacity((history.len() + 1).min(crate::nnue::HISTORY_PLIES));
-    out.extend_from_slice(history);
-    append_history(&mut out, position, mv);
-    out
-}
-
 fn clone_rule_history_with_appended_entry(
     rule_history: &[RuleHistoryEntry],
     entry: RuleHistoryEntry,
@@ -1035,22 +1087,46 @@ fn clone_rule_history_with_appended_entry(
     out
 }
 
-fn truncate_history(history: &[HistoryMove]) -> Vec<HistoryMove> {
-    history
-        .iter()
-        .rev()
-        .take(crate::nnue::HISTORY_PLIES)
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+fn truncate_history(history: &[HistoryMove]) -> SearchHistory {
+    SearchHistory::from_slice(history)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
+
+    #[test]
+    fn inline_search_history_matches_existing_history_updates() {
+        let mut position = Position::startpos();
+        let mut expected = Vec::new();
+        let mut actual = SearchHistory::from_slice(&expected);
+
+        for _ in 0..(crate::nnue::HISTORY_PLIES + 4) {
+            let mv = position.legal_moves()[0];
+            append_history(&mut expected, &position, mv);
+            actual = actual.with_appended_move(&position, mv);
+            assert_eq!(actual.as_slice(), expected.as_slice());
+            position.make_move(mv);
+        }
+    }
+
+    #[test]
+    fn child_node_index_uses_compact_sentinel_representation() {
+        assert!(std::mem::size_of::<AzChild>() <= 40);
+        let mut child = AzChild {
+            mv: Position::startpos().legal_moves()[0],
+            raw_prior: 1.0,
+            prior: 1.0,
+            visits: 0,
+            value_wdl_sum: [0.0; 3],
+            moves_left_sum: 0.0,
+            child: NO_CHILD,
+        };
+        assert_eq!(child.child_node(), None);
+        child.set_child_node(17);
+        assert_eq!(child.child_node(), Some(17));
+    }
 
     #[test]
     fn wdl_q_applies_draw_score_instead_of_discarding_draw_probability() {
@@ -1061,7 +1137,7 @@ mod tests {
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
             moves_left_sum: 0.0,
-            child: None,
+            child: NO_CHILD,
         };
 
         assert!((child.q(0.0) - 0.0).abs() < 1e-6);
@@ -1076,7 +1152,7 @@ mod tests {
         let model = AzNnue::random(4, 17);
         let mut tree = AzTree::new(
             position.clone(),
-            Vec::new(),
+            SearchHistory::from_slice(&[]),
             position.initial_rule_history(),
             Some(vec![legal[0]]),
             &model,
@@ -1088,7 +1164,7 @@ mod tests {
 
         tree.expand(tree.root);
         tree.simulate_child(tree.root, 0, 1);
-        let child_node = tree.nodes[tree.root].children[0].child.unwrap();
+        let child_node = tree.nodes[tree.root].children[0].child_node().unwrap();
         assert!((tree.node_draw_score(tree.root) - 0.4).abs() < 1e-6);
         assert!((tree.node_draw_score(child_node) + 0.4).abs() < 1e-6);
     }
@@ -1217,7 +1293,7 @@ mod tests {
 
         let mut tree = AzTree::new(
             position.clone(),
-            Vec::new(),
+            SearchHistory::from_slice(&[]),
             position.initial_rule_history(),
             None,
             &model,
@@ -1244,7 +1320,7 @@ mod tests {
                 visits: 1,
                 value_wdl_sum: [0.0, 1.0, 0.0],
                 moves_left_sum: 0.0,
-                child: None,
+                child: NO_CHILD,
             },
             AzChild {
                 mv: legal[1],
@@ -1253,7 +1329,7 @@ mod tests {
                 visits: 1,
                 value_wdl_sum: [0.0, 1.0, 0.0],
                 moves_left_sum: 0.0,
-                child: None,
+                child: NO_CHILD,
             },
         ];
 
@@ -1353,7 +1429,7 @@ mod tests {
         let model = AzNnue::random(4, 11);
         let mut tree = AzTree::new(
             position.clone(),
-            Vec::new(),
+            SearchHistory::from_slice(&[]),
             rule_history,
             Some(vec![mv]),
             &model,
@@ -1365,7 +1441,7 @@ mod tests {
         );
         tree.expand(tree.root);
         tree.simulate_child(tree.root, 0, 1);
-        let child_node = tree.nodes[tree.root].children[0].child.unwrap();
+        let child_node = tree.nodes[tree.root].children[0].child_node().unwrap();
         assert_eq!(
             tree.nodes[child_node].rule_history.last().copied(),
             Some(expected)
@@ -1380,7 +1456,7 @@ mod tests {
         let model = AzNnue::random(4, 7);
         let mut tree = AzTree::new(
             position,
-            Vec::new(),
+            SearchHistory::from_slice(&[]),
             Position::startpos().initial_rule_history(),
             Some(root_moves.clone()),
             &model,
@@ -1391,7 +1467,9 @@ mod tests {
         assert_eq!(tree.nodes[tree.root].children.len(), 1);
         let child_index = 0;
         tree.simulate_child(tree.root, child_index, 1);
-        let child_node = tree.nodes[tree.root].children[child_index].child.unwrap();
+        let child_node = tree.nodes[tree.root].children[child_index]
+            .child_node()
+            .unwrap();
         tree.expand(child_node);
         assert_ne!(tree.nodes[child_node].children.len(), root_moves.len());
     }

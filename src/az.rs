@@ -39,7 +39,10 @@ pub use play::{
     play_arena_games_from_positions,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
-pub use train::{global_training_step_sample_count, train_samples, train_samples_weighted};
+pub use train::{
+    global_training_step_sample_count, train_samples, train_samples_weighted,
+    train_samples_weighted_owned,
+};
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
