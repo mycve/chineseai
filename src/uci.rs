@@ -1,7 +1,18 @@
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
+use crate::az::{
+    AzNnue, AzSearchControl, AzSearchLimits, alphazero_search_with_history_and_rules_controlled,
+};
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
-use crate::xiangqi::{Position, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome};
 use std::io::{self, BufRead, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
+const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 struct UciState {
@@ -9,7 +20,7 @@ struct UciState {
     history: Vec<HistoryMove>,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
-    model: Option<AzNnue>,
+    model: Option<Arc<AzNnue>>,
     simulations: usize,
     threads: usize,
     cpuct: f32,
@@ -27,6 +38,7 @@ struct UciState {
     moves_left_constant_factor: f32,
     moves_left_scaled_factor: f32,
     moves_left_quadratic_factor: f32,
+    move_overhead_ms: u64,
     seed: u64,
 }
 
@@ -55,14 +67,28 @@ impl Default for UciState {
             moves_left_constant_factor: 0.0,
             moves_left_scaled_factor: 0.15,
             moves_left_quadratic_factor: 0.85,
+            move_overhead_ms: 30,
             seed: 20260409,
         }
+    }
+}
+
+struct ActiveSearch {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl ActiveSearch {
+    fn stop_and_join(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.join();
     }
 }
 
 pub fn run_uci() {
     let stdin = io::stdin();
     let mut state = UciState::default();
+    let mut active_search: Option<ActiveSearch> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
             break;
@@ -70,6 +96,12 @@ pub fn run_uci() {
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        if active_search
+            .as_ref()
+            .is_some_and(|search| search.handle.is_finished())
+        {
+            let _ = active_search.take().unwrap().handle.join();
         }
         match line.split_whitespace().next() {
             Some("uci") => print_uci_id(),
@@ -79,18 +111,38 @@ pub fn run_uci() {
                 flush();
             }
             Some("ucinewgame") => {
+                stop_active_search(&mut active_search);
                 state.position = Position::startpos();
                 state.history.clear();
                 state.rule_history = state.position.initial_rule_history();
                 state.seed = 20260409;
             }
-            Some("setoption") => handle_setoption(line, &mut state),
-            Some("position") => handle_position(line, &mut state),
-            Some("go") => handle_go(line, &mut state),
-            Some("stop") => {}
-            Some("quit") => break,
+            Some("setoption") => {
+                stop_active_search(&mut active_search);
+                handle_setoption(line, &mut state);
+            }
+            Some("position") => {
+                stop_active_search(&mut active_search);
+                handle_position(line, &mut state);
+            }
+            Some("go") => {
+                stop_active_search(&mut active_search);
+                active_search = Some(start_go(line, &mut state));
+            }
+            Some("stop") => stop_active_search(&mut active_search),
+            Some("quit") => {
+                stop_active_search(&mut active_search);
+                break;
+            }
             _ => {}
         }
+    }
+    stop_active_search(&mut active_search);
+}
+
+fn stop_active_search(active_search: &mut Option<ActiveSearch>) {
+    if let Some(search) = active_search.take() {
+        search.stop_and_join();
     }
 }
 
@@ -115,6 +167,7 @@ fn print_uci_id() {
     println!("option name MovesLeftConstantFactor type string default 0.0");
     println!("option name MovesLeftScaledFactor type string default 0.15");
     println!("option name MovesLeftQuadraticFactor type string default 0.85");
+    println!("option name MoveOverhead type spin default 30 min 0 max 5000");
     println!("uciok");
     flush();
 }
@@ -123,14 +176,16 @@ fn ensure_model(state: &mut UciState) {
     if state.model.is_some() {
         return;
     }
-    state.model = Some(AzNnue::load(&state.eval_file).unwrap_or_else(|err| {
-        println!(
-            "info string failed to load {}, using random model: {}",
-            state.eval_file, err
-        );
-        flush();
-        AzNnue::random(128, state.seed)
-    }));
+    state.model = Some(Arc::new(AzNnue::load(&state.eval_file).unwrap_or_else(
+        |err| {
+            println!(
+                "info string failed to load {}, using random model: {}",
+                state.eval_file, err
+            );
+            flush();
+            AzNnue::random(128, state.seed)
+        },
+    )));
 }
 
 fn handle_setoption(line: &str, state: &mut UciState) {
@@ -231,6 +286,12 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .parse::<f32>()
                 .unwrap_or(state.moves_left_quadratic_factor);
         }
+        "moveoverhead" => {
+            state.move_overhead_ms = value
+                .parse::<u64>()
+                .unwrap_or(state.move_overhead_ms)
+                .min(5_000);
+        }
         _ => {}
     }
 }
@@ -310,28 +371,154 @@ fn position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry])
     )
 }
 
-fn handle_go(_line: &str, state: &mut UciState) {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct GoParams {
+    searchmoves: Vec<String>,
+    wtime_ms: Option<u64>,
+    btime_ms: Option<u64>,
+    winc_ms: u64,
+    binc_ms: u64,
+    moves_to_go: Option<u64>,
+    move_time_ms: Option<u64>,
+    nodes: Option<usize>,
+    depth: Option<usize>,
+    infinite: bool,
+}
+
+fn parse_go(line: &str) -> GoParams {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    let mut params = GoParams::default();
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        match token {
+            "searchmoves" => {
+                index += 1;
+                while index < tokens.len() && !is_go_keyword(tokens[index]) {
+                    params.searchmoves.push(tokens[index].to_owned());
+                    index += 1;
+                }
+                continue;
+            }
+            "wtime" => params.wtime_ms = parse_next(&tokens, index),
+            "btime" => params.btime_ms = parse_next(&tokens, index),
+            "winc" => params.winc_ms = parse_next(&tokens, index).unwrap_or(0),
+            "binc" => params.binc_ms = parse_next(&tokens, index).unwrap_or(0),
+            "movestogo" => params.moves_to_go = parse_next(&tokens, index),
+            "movetime" => params.move_time_ms = parse_next(&tokens, index),
+            "nodes" => params.nodes = parse_next(&tokens, index),
+            "depth" => params.depth = parse_next(&tokens, index),
+            "infinite" => params.infinite = true,
+            _ => {
+                index += 1;
+                continue;
+            }
+        }
+        index += 2;
+    }
+    params
+}
+
+fn parse_next<T: std::str::FromStr>(tokens: &[&str], index: usize) -> Option<T> {
+    tokens.get(index + 1)?.parse().ok()
+}
+
+fn is_go_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "searchmoves"
+            | "ponder"
+            | "wtime"
+            | "btime"
+            | "winc"
+            | "binc"
+            | "movestogo"
+            | "depth"
+            | "nodes"
+            | "mate"
+            | "movetime"
+            | "infinite"
+    )
+}
+
+fn time_budget_ms(params: &GoParams, side: Color, move_overhead_ms: u64) -> Option<u64> {
+    if let Some(move_time_ms) = params.move_time_ms {
+        return Some(
+            move_time_ms
+                .saturating_sub(move_overhead_ms)
+                .clamp(1, MAX_UCI_TIME_MS),
+        );
+    }
+    if params.infinite {
+        return None;
+    }
+    let (remaining_ms, increment_ms) = match side {
+        Color::Red => (params.wtime_ms?, params.winc_ms),
+        Color::Black => (params.btime_ms?, params.binc_ms),
+    };
+    let usable_ms = remaining_ms.saturating_sub(move_overhead_ms).max(1);
+    let moves = params.moves_to_go.unwrap_or(24).max(1);
+    let target_ms = usable_ms / moves + increment_ms.saturating_mul(3) / 4;
+    let maximum_ms = (usable_ms / 5).max(1);
+    Some(target_ms.clamp(1, maximum_ms).min(MAX_UCI_TIME_MS))
+}
+
+fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
     ensure_model(state);
-    let simulations = state.simulations.max(1);
+    let params = parse_go(line);
+    let snapshot = state.clone();
+    state.seed = state.seed.wrapping_add(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let search_stop = Arc::clone(&stop);
+    let handle = thread::spawn(move || run_go_search(snapshot, params, search_stop));
+    ActiveSearch { stop, handle }
+}
+
+fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let model = state.model.as_ref().expect("model was loaded");
 
     if position_is_rule_draw(&state.position, &state.rule_history) {
-        println!("info depth 0 nodes 0 time 0 score cp 0 pv draw");
-        println!("bestmove draw");
+        println!("info depth 0 nodes 0 time 0 score cp 0");
+        println!("bestmove 0000");
         flush();
         return;
     }
 
-    let legal = state.position.legal_moves_with_rules(&state.rule_history);
+    let mut legal = state.position.legal_moves_with_rules(&state.rule_history);
+    if !params.searchmoves.is_empty() {
+        legal.retain(|mv| {
+            params
+                .searchmoves
+                .iter()
+                .any(|text| state.position.parse_uci_move(text) == Some(*mv))
+        });
+    }
 
     if legal.is_empty() {
         println!("info depth 1 nodes 0 time 0 score cp -32000");
+        println!("bestmove 0000");
         flush();
         return;
     }
 
-    let started = std::time::Instant::now();
-    let result = alphazero_search_with_history_and_rules(
+    let budget_ms = time_budget_ms(
+        &params,
+        state.position.side_to_move(),
+        state.move_overhead_ms,
+    );
+    let has_time_control = budget_ms.is_some() || params.infinite;
+    let simulations = params
+        .nodes
+        .unwrap_or(if has_time_control {
+            MAX_UCI_SIMULATIONS
+        } else {
+            state.simulations.max(1)
+        })
+        .clamp(1, MAX_UCI_SIMULATIONS);
+    let started = Instant::now();
+    let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
+    let control = AzSearchControl::new(stop, deadline);
+    let result = alphazero_search_with_history_and_rules_controlled(
         &state.position,
         &state.history,
         Some(state.rule_history.clone()),
@@ -346,7 +533,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
             cpuct_factor: state.cpuct_factor,
             cpuct_base_at_root: state.cpuct_base_at_root,
             cpuct_factor_at_root: state.cpuct_factor_at_root,
-            max_depth: 0,
+            max_depth: params.depth.unwrap_or(0),
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
             fpu_value: state.fpu_value,
@@ -360,8 +547,8 @@ fn handle_go(_line: &str, state: &mut UciState) {
             moves_left_quadratic_factor: state.moves_left_quadratic_factor,
             value_scale: 1.0,
         },
+        Some(&control),
     );
-    state.seed = state.seed.wrapping_add(1);
     match result.best_move {
         Some(mv) => {
             let best_text = mv.to_string();
@@ -390,9 +577,7 @@ fn handle_go(_line: &str, state: &mut UciState) {
                 started.elapsed().as_millis(),
                 result.value_cp
             );
-            if position_is_rule_draw(&state.position, &state.rule_history) {
-                println!("bestmove draw");
-            }
+            println!("bestmove 0000");
         }
     }
     flush();
@@ -408,4 +593,39 @@ fn uci_wdl(probabilities: [f32; 3]) -> [u16; 3] {
 
 fn flush() {
     let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_standard_go_time_and_search_limits() {
+        let params = parse_go(
+            "go searchmoves a0a1 b0b1 wtime 60000 btime 50000 winc 1000 binc 500 \
+             movestogo 20 nodes 1234 depth 12",
+        );
+
+        assert_eq!(params.searchmoves, ["a0a1", "b0b1"]);
+        assert_eq!(params.wtime_ms, Some(60_000));
+        assert_eq!(params.btime_ms, Some(50_000));
+        assert_eq!(params.winc_ms, 1_000);
+        assert_eq!(params.binc_ms, 500);
+        assert_eq!(params.moves_to_go, Some(20));
+        assert_eq!(params.nodes, Some(1_234));
+        assert_eq!(params.depth, Some(12));
+    }
+
+    #[test]
+    fn movetime_and_clock_budget_reserve_overhead() {
+        let move_time = parse_go("go movetime 1000");
+        assert_eq!(time_budget_ms(&move_time, Color::Red, 30), Some(970));
+
+        let clock = parse_go("go wtime 60000 btime 30000 winc 1000 binc 0 movestogo 20");
+        assert_eq!(time_budget_ms(&clock, Color::Red, 30), Some(3_748));
+        assert_eq!(time_budget_ms(&clock, Color::Black, 30), Some(1_498));
+
+        let infinite = parse_go("go infinite");
+        assert_eq!(time_budget_ms(&infinite, Color::Red, 30), None);
+    }
 }

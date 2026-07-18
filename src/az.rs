@@ -31,8 +31,9 @@ use crate::xiangqi::{
 };
 
 pub use alphazero::{
-    AzCandidate, AzSearchLimits, AzSearchResult, alphazero_search,
-    alphazero_search_with_history_and_rules, cp_from_q,
+    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, alphazero_search,
+    alphazero_search_with_history_and_rules, alphazero_search_with_history_and_rules_controlled,
+    cp_from_q,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,

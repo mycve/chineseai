@@ -1,5 +1,10 @@
 use crate::nnue::HistoryMove;
 use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Instant;
 
 use super::{AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
 
@@ -142,6 +147,25 @@ pub struct AzSearchResult {
     pub candidates: Vec<AzCandidate>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AzSearchControl {
+    stop: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl AzSearchControl {
+    pub fn new(stop: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
+        Self { stop, deadline }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
 pub fn alphazero_search_with_history_and_rules(
     position: &Position,
     history: &[HistoryMove],
@@ -149,6 +173,26 @@ pub fn alphazero_search_with_history_and_rules(
     root_moves: Option<Vec<Move>>,
     model: &AzNnue,
     limits: AzSearchLimits,
+) -> AzSearchResult {
+    alphazero_search_with_history_and_rules_controlled(
+        position,
+        history,
+        rule_history,
+        root_moves,
+        model,
+        limits,
+        None,
+    )
+}
+
+pub fn alphazero_search_with_history_and_rules_controlled(
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    control: Option<&AzSearchControl>,
 ) -> AzSearchResult {
     crate::scope_profile!("az.alphazero_search");
     let mut tree = AzTree::new(
@@ -184,6 +228,9 @@ pub fn alphazero_search_with_history_and_rules(
     {
         crate::scope_profile!("az.search.simulations");
         for _ in 0..limits.simulations {
+            if control.is_some_and(AzSearchControl::should_stop) {
+                break;
+            }
             tree.simulate(root, 0);
             used += 1;
         }
@@ -348,7 +395,7 @@ impl<'a> AzTree<'a> {
         model: &'a AzNnue,
         limits: AzSearchLimits,
     ) -> Self {
-        let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1));
+        let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1).min(16_384));
         let accumulator = AzEvalAccumulator::new(model, &position);
         nodes.push(AzNode {
             position,
@@ -1126,6 +1173,27 @@ mod tests {
         assert_eq!(child.child_node(), None);
         child.set_child_node(17);
         assert_eq!(child.child_node(), Some(17));
+    }
+
+    #[test]
+    fn stopped_search_returns_root_result_without_running_simulations() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let control = AzSearchControl::new(stop, None);
+        let result = alphazero_search_with_history_and_rules_controlled(
+            &Position::startpos(),
+            &[],
+            None,
+            None,
+            &AzNnue::random(4, 19),
+            AzSearchLimits {
+                simulations: 128,
+                ..AzSearchLimits::default()
+            },
+            Some(&control),
+        );
+
+        assert_eq!(result.simulations, 0);
+        assert!(result.best_move.is_some());
     }
 
     #[test]
