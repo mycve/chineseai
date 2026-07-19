@@ -4,7 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
 
@@ -12,6 +12,8 @@ const DEFAULT_CPUCT: f32 = 1.5;
 const DEFAULT_CPUCT_BASE: f32 = 19652.0;
 const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
 const NO_CHILD: u32 = u32::MAX;
+const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
+const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 const EMPTY_HISTORY_MOVE: HistoryMove = HistoryMove {
     piece: Piece {
@@ -194,6 +196,28 @@ pub fn alphazero_search_with_history_and_rules_controlled(
     limits: AzSearchLimits,
     control: Option<&AzSearchControl>,
 ) -> AzSearchResult {
+    alphazero_search_with_history_and_rules_controlled_with_progress(
+        position,
+        history,
+        rule_history,
+        root_moves,
+        model,
+        limits,
+        control,
+        None,
+    )
+}
+
+pub fn alphazero_search_with_history_and_rules_controlled_with_progress(
+    position: &Position,
+    history: &[HistoryMove],
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    control: Option<&AzSearchControl>,
+    mut progress: Option<&mut dyn FnMut(&AzSearchResult)>,
+) -> AzSearchResult {
     crate::scope_profile!("az.alphazero_search");
     let mut tree = AzTree::new(
         position.clone(),
@@ -225,6 +249,7 @@ pub fn alphazero_search_with_history_and_rules_controlled(
     }
 
     let mut used = 0usize;
+    let mut last_progress = Instant::now();
     {
         crate::scope_profile!("az.search.simulations");
         for _ in 0..limits.simulations {
@@ -233,59 +258,19 @@ pub fn alphazero_search_with_history_and_rules_controlled(
             }
             tree.simulate(root, 0);
             used += 1;
+            if used % SEARCH_PROGRESS_POLL_SIMULATIONS == 0
+                && progress.is_some()
+                && last_progress.elapsed() >= SEARCH_PROGRESS_INTERVAL
+            {
+                let snapshot = tree.search_result(used);
+                if let Some(callback) = progress.as_deref_mut() {
+                    callback(&snapshot);
+                }
+                last_progress = Instant::now();
+            }
         }
     }
-
-    let root_node = &tree.nodes[root];
-    let searched_wdl = if root_node.visits > 0 {
-        root_node
-            .value_wdl_sum
-            .map(|value| value / root_node.visits as f32)
-    } else {
-        root_node.value_wdl
-    };
-    let searched_value = wdl_utility(searched_wdl, tree.draw_score);
-    let policy = {
-        crate::scope_profile!("az.search.root_policy");
-        tree.root_policy(root)
-    };
-    let mut candidates = root_node
-        .children
-        .iter()
-        .zip(policy)
-        .map(|(child, policy)| AzCandidate {
-            mv: child.mv,
-            visits: child.visits,
-            q: child.q(tree.draw_score),
-            moves_left: child.moves_left(),
-            raw_prior: child.raw_prior,
-            prior: child.prior,
-            policy,
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        right
-            .policy
-            .total_cmp(&left.policy)
-            .then_with(|| right.visits.cmp(&left.visits))
-            .then_with(|| right.q.total_cmp(&left.q))
-    });
-    let best_move = tree
-        .best_root_child(root)
-        .map(|child_index| tree.nodes[root].children[child_index].mv)
-        .or_else(|| candidates.first().map(|candidate| candidate.mv));
-    AzSearchResult {
-        best_move,
-        value_q: searched_value,
-        value_cp: cp_from_q(searched_value),
-        value_wdl: searched_wdl,
-        simulations: used,
-        search_depth_avg: tree.search_depth_avg(),
-        search_depth_max: tree.search_depth_max,
-        search_depth_limit: tree.max_depth,
-        search_depth_cutoffs: tree.search_depth_cutoffs,
-        candidates,
-    }
+    tree.search_result(used)
 }
 
 pub fn alphazero_search(
@@ -387,6 +372,59 @@ impl AzChild {
 }
 
 impl<'a> AzTree<'a> {
+    fn search_result(&self, simulations: usize) -> AzSearchResult {
+        let root_node = &self.nodes[self.root];
+        let searched_wdl = if root_node.visits > 0 {
+            root_node
+                .value_wdl_sum
+                .map(|value| value / root_node.visits as f32)
+        } else {
+            root_node.value_wdl
+        };
+        let searched_value = wdl_utility(searched_wdl, self.draw_score);
+        let policy = {
+            crate::scope_profile!("az.search.root_policy");
+            self.root_policy(self.root)
+        };
+        let mut candidates = root_node
+            .children
+            .iter()
+            .zip(policy)
+            .map(|(child, policy)| AzCandidate {
+                mv: child.mv,
+                visits: child.visits,
+                q: child.q(self.draw_score),
+                moves_left: child.moves_left(),
+                raw_prior: child.raw_prior,
+                prior: child.prior,
+                policy,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .policy
+                .total_cmp(&left.policy)
+                .then_with(|| right.visits.cmp(&left.visits))
+                .then_with(|| right.q.total_cmp(&left.q))
+        });
+        let best_move = self
+            .best_root_child(self.root)
+            .map(|child_index| root_node.children[child_index].mv)
+            .or_else(|| candidates.first().map(|candidate| candidate.mv));
+        AzSearchResult {
+            best_move,
+            value_q: searched_value,
+            value_cp: cp_from_q(searched_value),
+            value_wdl: searched_wdl,
+            simulations,
+            search_depth_avg: self.search_depth_avg(),
+            search_depth_max: self.search_depth_max,
+            search_depth_limit: self.max_depth,
+            search_depth_cutoffs: self.search_depth_cutoffs,
+            candidates,
+        }
+    }
+
     fn new(
         position: Position,
         history: SearchHistory,

@@ -1,5 +1,6 @@
 use crate::az::{
-    AzNnue, AzSearchControl, AzSearchLimits, alphazero_search_with_history_and_rules_controlled,
+    AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult,
+    alphazero_search_with_history_and_rules_controlled_with_progress,
 };
 use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome};
@@ -501,7 +502,11 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AzSearchControl::new(stop, deadline);
-    let result = alphazero_search_with_history_and_rules_controlled(
+    let mut report_progress = |progress: &AzSearchResult| {
+        print_search_info(progress, started);
+        flush();
+    };
+    let result = alphazero_search_with_history_and_rules_controlled_with_progress(
         &state.position,
         &state.history,
         Some(state.rule_history.clone()),
@@ -531,26 +536,12 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             value_scale: 1.0,
         },
         Some(&control),
+        Some(&mut report_progress),
     );
     match result.best_move {
         Some(mv) => {
             let best_text = mv.to_string();
-            let elapsed_ms = started.elapsed().as_millis();
-            let nps = (result.simulations as u128 * 1000 / elapsed_ms.max(1)) as usize;
-            let wdl = uci_wdl(result.value_wdl);
-            println!(
-                "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
-                result.search_depth_avg.round() as usize,
-                result.search_depth_max,
-                result.simulations,
-                nps,
-                elapsed_ms,
-                result.value_cp,
-                wdl[0],
-                wdl[1],
-                wdl[2],
-                best_text
-            );
+            print_search_info(&result, started);
             println!("bestmove {best_text}");
         }
         None => {
@@ -564,6 +555,39 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         }
     }
     flush();
+}
+
+fn print_search_info(result: &AzSearchResult, started: Instant) {
+    let elapsed_ms = started.elapsed().as_millis();
+    let nps = (result.simulations as u128 * 1000 / elapsed_ms.max(1)) as usize;
+    let wdl = uci_wdl(result.value_wdl);
+    match result.best_move {
+        Some(mv) => println!(
+            "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
+            result.search_depth_avg.round() as usize,
+            result.search_depth_max,
+            result.simulations,
+            nps,
+            elapsed_ms,
+            result.value_cp,
+            wdl[0],
+            wdl[1],
+            wdl[2],
+            mv
+        ),
+        None => println!(
+            "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {}",
+            result.search_depth_avg.round() as usize,
+            result.search_depth_max,
+            result.simulations,
+            nps,
+            elapsed_ms,
+            result.value_cp,
+            wdl[0],
+            wdl[1],
+            wdl[2]
+        ),
+    }
 }
 
 fn uci_wdl(probabilities: [f32; 3]) -> [u16; 3] {
