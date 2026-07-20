@@ -10,6 +10,10 @@ pub struct AzLoopFileConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
+    pub branch_reanalysis_probability: f32,
+    pub branch_reanalysis_top_visit_threshold: f32,
+    pub branch_reanalysis_simulations: usize,
+    pub branch_reanalysis_policy_weight: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -85,6 +89,12 @@ impl Default for AzLoopFileConfig {
             low_simulations: 2000,
             low_simulation_probability: 0.2,
             low_simulation_policy_weight: 0.5,
+            // A conservative experiment: re-search only a small, concentrated
+            // subset of roots. The main self-play temperature/noise stays intact.
+            branch_reanalysis_probability: 0.02,
+            branch_reanalysis_top_visit_threshold: 0.45,
+            branch_reanalysis_simulations: 50_000,
+            branch_reanalysis_policy_weight: 2.0,
             selfplay_samples_per_update: 120000,
             lr: 0.0005,
             lr_min: 0.0001,
@@ -162,6 +172,10 @@ struct AzLoopTomlConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
+    pub branch_reanalysis_probability: f32,
+    pub branch_reanalysis_top_visit_threshold: f32,
+    pub branch_reanalysis_simulations: usize,
+    pub branch_reanalysis_policy_weight: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -255,6 +269,10 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             low_simulations: config.low_simulations,
             low_simulation_probability: config.low_simulation_probability,
             low_simulation_policy_weight: config.low_simulation_policy_weight,
+            branch_reanalysis_probability: config.branch_reanalysis_probability,
+            branch_reanalysis_top_visit_threshold: config.branch_reanalysis_top_visit_threshold,
+            branch_reanalysis_simulations: config.branch_reanalysis_simulations,
+            branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -338,6 +356,10 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             low_simulations: config.low_simulations,
             low_simulation_probability: config.low_simulation_probability,
             low_simulation_policy_weight: config.low_simulation_policy_weight,
+            branch_reanalysis_probability: config.branch_reanalysis_probability,
+            branch_reanalysis_top_visit_threshold: config.branch_reanalysis_top_visit_threshold,
+            branch_reanalysis_simulations: config.branch_reanalysis_simulations,
+            branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -442,6 +464,22 @@ impl AzLoopFileConfig {
         line!(
             "low_simulation_policy_weight",
             f(self.low_simulation_policy_weight)
+        );
+        line!(
+            "branch_reanalysis_probability",
+            f(self.branch_reanalysis_probability)
+        );
+        line!(
+            "branch_reanalysis_top_visit_threshold",
+            f(self.branch_reanalysis_top_visit_threshold)
+        );
+        line!(
+            "branch_reanalysis_simulations",
+            self.branch_reanalysis_simulations
+        );
+        line!(
+            "branch_reanalysis_policy_weight",
+            f(self.branch_reanalysis_policy_weight)
         );
         line!(
             "selfplay_samples_per_update",
@@ -561,6 +599,10 @@ impl AzLoopFileConfig {
         self.low_simulations = self.low_simulations.max(1).min(self.simulations);
         self.low_simulation_probability = self.low_simulation_probability.clamp(0.0, 1.0);
         self.low_simulation_policy_weight = self.low_simulation_policy_weight.max(0.0);
+        self.branch_reanalysis_probability = self.branch_reanalysis_probability.clamp(0.0, 1.0);
+        self.branch_reanalysis_top_visit_threshold =
+            self.branch_reanalysis_top_visit_threshold.clamp(0.0, 1.0);
+        self.branch_reanalysis_policy_weight = self.branch_reanalysis_policy_weight.max(0.0);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
         self.lr_min = self.lr_min.max(0.0).min(self.lr);
@@ -658,6 +700,10 @@ mod tests {
         assert!(text.contains("low_simulations = 2000\n"));
         assert!(text.contains("low_simulation_probability = 0.2\n"));
         assert!(text.contains("low_simulation_policy_weight = 0.5\n"));
+        assert!(text.contains("branch_reanalysis_probability = 0.02\n"));
+        assert!(text.contains("branch_reanalysis_top_visit_threshold = 0.45\n"));
+        assert!(text.contains("branch_reanalysis_simulations = 50000\n"));
+        assert!(text.contains("branch_reanalysis_policy_weight = 2.0\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));
@@ -690,6 +736,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
+        assert_eq!(parsed.branch_reanalysis_simulations, 50_000);
         assert!((parsed.lr - 0.0005).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);

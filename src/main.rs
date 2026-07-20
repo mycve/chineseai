@@ -478,7 +478,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "ls{}_lsp{}_lspw{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_brp{}_brt{}_brs{}_brw{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -523,6 +523,10 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
+        f32_slug(config.branch_reanalysis_probability),
+        f32_slug(config.branch_reanalysis_top_visit_threshold),
+        config.branch_reanalysis_simulations,
+        f32_slug(config.branch_reanalysis_policy_weight),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -583,6 +587,8 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     config.low_simulations = 256;
     config.low_simulation_probability = 0.35;
     config.low_simulation_policy_weight = 0.35;
+    config.branch_reanalysis_probability = 0.0;
+    config.branch_reanalysis_simulations = 0;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
     config.train_warmup_samples = config.train_samples_per_update;
@@ -1048,6 +1054,10 @@ fn build_az_loop_config(
         low_simulations: config.low_simulations,
         low_simulation_probability: config.low_simulation_probability,
         low_simulation_policy_weight: config.low_simulation_policy_weight,
+        branch_reanalysis_probability: config.branch_reanalysis_probability,
+        branch_reanalysis_top_visit_threshold: config.branch_reanalysis_top_visit_threshold,
+        branch_reanalysis_simulations: config.branch_reanalysis_simulations,
+        branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
         seed,
         workers,
         generation_update,
@@ -1129,6 +1139,7 @@ fn build_async_training_report(
     let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
     let sampled_moves = pending.selfplay.sampled_moves.max(1) as f32;
     let search_count = pending.selfplay.search_simulations.searches.max(1) as f32;
+    let branch_count = pending.selfplay.branch_reanalysis.searches.max(1) as f32;
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1165,6 +1176,17 @@ fn build_async_training_report(
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
         low_simulation_rate: pending.selfplay.search_simulations.low_searches as f32 / search_count,
+        branch_reanalysis_rate: pending.selfplay.branch_reanalysis.searches as f32 / search_count,
+        branch_reanalysis_avg_simulations: pending.selfplay.branch_reanalysis.simulations_sum
+            as f32
+            / branch_count,
+        branch_reanalysis_move_flip_rate: pending.selfplay.branch_reanalysis.best_move_changed
+            as f32
+            / branch_count,
+        branch_reanalysis_value_delta_abs: pending.selfplay.branch_reanalysis.value_delta_abs_sum
+            / branch_count,
+        branch_reanalysis_policy_kl: pending.selfplay.branch_reanalysis.policy_kl_sum
+            / branch_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -1948,6 +1970,10 @@ fn main() {
                     low_simulations: simulations,
                     low_simulation_probability: 0.0,
                     low_simulation_policy_weight: 1.0,
+                    branch_reanalysis_probability: 0.0,
+                    branch_reanalysis_top_visit_threshold: 1.0,
+                    branch_reanalysis_simulations: 0,
+                    branch_reanalysis_policy_weight: 1.0,
                     seed,
                     workers,
                     generation_update: 0,
@@ -2174,6 +2200,10 @@ fn main() {
                     low_simulations: simulations,
                     low_simulation_probability: 0.0,
                     low_simulation_policy_weight: 1.0,
+                    branch_reanalysis_probability: 0.0,
+                    branch_reanalysis_top_visit_threshold: 1.0,
+                    branch_reanalysis_simulations: 0,
+                    branch_reanalysis_policy_weight: 1.0,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
                     generation_update: 0,
@@ -2604,6 +2634,13 @@ fn main() {
                 config.pikafish_label_eval_cpuct,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
+            );
+            println!(
+                "branch   : deterministic_reanalysis(probability={}, top_visit_threshold={}, simulations={}, policy_weight={}; mainline_temperature_and_noise=unchanged)",
+                config.branch_reanalysis_probability,
+                config.branch_reanalysis_top_visit_threshold,
+                config.branch_reanalysis_simulations,
+                config.branch_reanalysis_policy_weight,
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -3076,7 +3113,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} branch(rate={:.3} sims={:.0} flip={:.3} |dV|={:.3} kl={:.3}) opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3105,6 +3142,11 @@ fn main() {
                     report.avg_plies,
                     report.avg_search_simulations,
                     report.low_simulation_rate,
+                    report.branch_reanalysis_rate,
+                    report.branch_reanalysis_avg_simulations,
+                    report.branch_reanalysis_move_flip_rate,
+                    report.branch_reanalysis_value_delta_abs,
+                    report.branch_reanalysis_policy_kl,
                     report.loss,
                     report.value_loss,
                     report.legal_moves_loss,
@@ -3268,6 +3310,36 @@ fn main() {
                     "selfplay/low_simulation_rate",
                     update,
                     report.low_simulation_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/reanalysis_rate",
+                    update,
+                    report.branch_reanalysis_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/avg_simulations",
+                    update,
+                    report.branch_reanalysis_avg_simulations,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/best_move_flip_rate",
+                    update,
+                    report.branch_reanalysis_move_flip_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/value_delta_abs",
+                    update,
+                    report.branch_reanalysis_value_delta_abs,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/policy_kl",
+                    update,
+                    report.branch_reanalysis_policy_kl,
                 );
                 log_scalar(
                     &mut tb,

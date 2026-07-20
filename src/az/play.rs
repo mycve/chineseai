@@ -38,6 +38,28 @@ pub struct AzSearchSimulationStats {
     pub simulations_sum: usize,
 }
 
+/// Diagnostics for deterministic, no-noise re-searches performed inside normal
+/// self-play. They quantify whether extra internal compute actually changes a
+/// training target, rather than merely adding cost.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzBranchReanalysisStats {
+    pub searches: usize,
+    pub simulations_sum: usize,
+    pub best_move_changed: usize,
+    pub value_delta_abs_sum: f32,
+    pub policy_kl_sum: f32,
+}
+
+impl AzBranchReanalysisStats {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.searches += other.searches;
+        self.simulations_sum += other.simulations_sum;
+        self.best_move_changed += other.best_move_changed;
+        self.value_delta_abs_sum += other.value_delta_abs_sum;
+        self.policy_kl_sum += other.policy_kl_sum;
+    }
+}
+
 impl AzSearchSimulationStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.searches += other.searches;
@@ -175,6 +197,7 @@ pub struct AzSelfplayData {
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
     pub search_simulations: AzSearchSimulationStats,
+    pub branch_reanalysis: AzBranchReanalysisStats,
 }
 
 impl AzSelfplayData {
@@ -216,6 +239,7 @@ impl AzSelfplayData {
         self.terminal.add_assign(&other.terminal);
         self.search_simulations
             .add_assign(&other.search_simulations);
+        self.branch_reanalysis.add_assign(&other.branch_reanalysis);
     }
 }
 
@@ -286,6 +310,9 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged
             .search_simulations
             .add_assign(&chunk.search_simulations);
+        merged
+            .branch_reanalysis
+            .add_assign(&chunk.branch_reanalysis);
     }
     merged
 }
@@ -329,6 +356,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
+    let mut branch_reanalysis = AzBranchReanalysisStats::default();
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -398,6 +426,44 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     },
                 )
             };
+            // The ordinary root above is deliberately left untouched: it keeps the
+            // configured temperature/noise behaviour.  A small subset of highly
+            // concentrated roots gets a separate deterministic re-search, whose
+            // policy becomes the training target and whose best move continues the
+            // game.  This is the self-correction branch, not an external teacher.
+            let branch = if should_run_branch_reanalysis(config, &search, &mut rng) {
+                let branch = alphazero_search_with_history_and_rules(
+                    &position,
+                    &history,
+                    Some(rule_history.clone()),
+                    None,
+                    model,
+                    deterministic_branch_limits(config, rng.next_u64()),
+                );
+                branch_reanalysis.searches += 1;
+                branch_reanalysis.simulations_sum += config.branch_reanalysis_simulations;
+                branch_reanalysis.best_move_changed +=
+                    usize::from(branch.best_move != search.best_move);
+                branch_reanalysis.value_delta_abs_sum += (branch.value_q - search.value_q).abs();
+                branch_reanalysis.policy_kl_sum +=
+                    policy_kl(&search.candidates, &branch.candidates);
+                Some(branch)
+            } else {
+                None
+            };
+            let search = branch.as_ref().unwrap_or(&search);
+            let effective_search_simulations = if branch.is_some() {
+                config.branch_reanalysis_simulations
+            } else {
+                search_simulation_count
+            };
+            let effective_policy_weight =
+                policy_weight_for_search(config, effective_search_simulations)
+                    * if branch.is_some() {
+                        config.branch_reanalysis_policy_weight
+                    } else {
+                        1.0
+                    };
             crate::scope_profile!("az.selfplay.post_search");
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
@@ -442,8 +508,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
-                    search_simulation_count,
-                    policy_weight_for_search(config, search_simulation_count),
+                    effective_search_simulations,
+                    effective_policy_weight,
                 );
                 game_samples.push(sample);
                 result = Some(if position.side_to_move() == Color::Red {
@@ -455,7 +521,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 break;
             }
-            let temperature = temperature_for_ply(config, ply);
+            // Only the branch root is deterministic; following roots immediately
+            // resume the unchanged main-line temperature schedule.
+            let temperature = if branch.is_some() {
+                0.0
+            } else {
+                temperature_for_ply(config, ply)
+            };
             let mv_opt = if temperature <= 1e-6 {
                 search.best_move.or_else(|| {
                     choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
@@ -507,8 +579,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
-                    search_simulation_count,
-                    policy_weight_for_search(config, search_simulation_count),
+                    effective_search_simulations,
+                    effective_policy_weight,
                 );
                 game_samples.push(sample);
             }
@@ -615,7 +687,70 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         played_q_sum,
         terminal,
         search_simulations,
+        branch_reanalysis,
     }
+}
+
+fn should_run_branch_reanalysis(
+    config: &AzLoopConfig,
+    search: &super::AzSearchResult,
+    rng: &mut SplitMix64,
+) -> bool {
+    if config.branch_reanalysis_simulations == 0
+        || config.branch_reanalysis_probability <= 0.0
+        || search.candidates.is_empty()
+    {
+        return false;
+    }
+    let top_visit_policy = search
+        .candidates
+        .iter()
+        .map(|candidate| candidate.policy)
+        .fold(0.0f32, f32::max);
+    top_visit_policy >= config.branch_reanalysis_top_visit_threshold
+        && rng.unit_f32() < config.branch_reanalysis_probability
+}
+
+fn deterministic_branch_limits(config: &AzLoopConfig, seed: u64) -> AzSearchLimits {
+    AzSearchLimits {
+        simulations: config.branch_reanalysis_simulations,
+        seed,
+        cpuct: config.cpuct,
+        cpuct_at_root: config.cpuct_at_root,
+        cpuct_base: config.cpuct_base,
+        cpuct_factor: config.cpuct_factor,
+        cpuct_base_at_root: config.cpuct_base_at_root,
+        cpuct_factor_at_root: config.cpuct_factor_at_root,
+        max_depth: 0,
+        root_dirichlet_alpha: 0.0,
+        root_exploration_fraction: 0.0,
+        fpu_value: config.fpu_value,
+        fpu_value_at_root: config.fpu_value_at_root,
+        draw_score: config.draw_score,
+        moves_left_max_effect: config.moves_left_max_effect,
+        moves_left_slope: config.moves_left_slope,
+        moves_left_threshold: config.moves_left_threshold,
+        moves_left_constant_factor: config.moves_left_constant_factor,
+        moves_left_scaled_factor: config.moves_left_scaled_factor,
+        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+        value_scale: 1.0,
+    }
+}
+
+fn policy_kl(source: &[AzCandidate], target: &[AzCandidate]) -> f32 {
+    source
+        .iter()
+        .filter_map(|left| {
+            let p = left.policy.max(0.0);
+            (p > 1.0e-8).then(|| {
+                let q = target
+                    .iter()
+                    .find(|right| right.mv == left.mv)
+                    .map_or(1.0e-8, |right| right.policy.max(1.0e-8));
+                p * (p / q).ln()
+            })
+        })
+        .sum()
 }
 
 fn search_simulations_for_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> usize {

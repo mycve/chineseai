@@ -548,6 +548,15 @@ pub struct AzLoopConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
+    /// Probability of re-searching an eligible self-play root with a deterministic,
+    /// no-noise branch. The normal self-play temperature/noise schedule is unchanged.
+    pub branch_reanalysis_probability: f32,
+    /// A root must have at least this top visit-policy mass before it is eligible.
+    pub branch_reanalysis_top_visit_threshold: f32,
+    /// Search budget for an eligible deterministic branch. 0 disables the feature.
+    pub branch_reanalysis_simulations: usize,
+    /// Extra policy-loss weight for a deterministic branch target.
+    pub branch_reanalysis_policy_weight: f32,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
@@ -589,6 +598,11 @@ pub struct AzLoopReport {
     pub total_samples_generated: usize,
     pub avg_search_simulations: f32,
     pub low_simulation_rate: f32,
+    pub branch_reanalysis_rate: f32,
+    pub branch_reanalysis_avg_simulations: f32,
+    pub branch_reanalysis_move_flip_rate: f32,
+    pub branch_reanalysis_value_delta_abs: f32,
+    pub branch_reanalysis_policy_kl: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
