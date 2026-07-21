@@ -477,7 +477,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "ls{}_lsp{}_lspw{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
+            "hs{}_hsp{}_hss{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
@@ -487,9 +487,9 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.hidden_size,
         config.max_plies,
         config.workers,
-        config.low_simulations,
-        f32_slug(config.low_simulation_probability),
-        f32_slug(config.low_simulation_policy_weight),
+        config.high_simulations,
+        f32_slug(config.high_simulation_probability),
+        config.high_simulation_start_plies,
         f32_slug(config.replay_recent_sample_fraction),
         config.replay_recent_games,
         f32_slug(config.lr_min),
@@ -580,9 +580,6 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     let mut config = AzLoopFileConfig::default();
     config.model_path = cmd.model.clone();
     config.simulations = 512;
-    config.low_simulations = 256;
-    config.low_simulation_probability = 0.35;
-    config.low_simulation_policy_weight = 0.35;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
     config.train_warmup_samples = config.train_samples_per_update;
@@ -1045,9 +1042,9 @@ fn build_az_loop_config(
         games: 1,
         max_plies: config.max_plies,
         simulations: config.simulations,
-        low_simulations: config.low_simulations,
-        low_simulation_probability: config.low_simulation_probability,
-        low_simulation_policy_weight: config.low_simulation_policy_weight,
+        high_simulations: config.high_simulations,
+        high_simulation_probability: config.high_simulation_probability,
+        high_simulation_start_plies: config.high_simulation_start_plies,
         seed,
         workers,
         generation_update,
@@ -1164,7 +1161,8 @@ fn build_async_training_report(
         total_samples_generated,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
-        low_simulation_rate: pending.selfplay.search_simulations.low_searches as f32 / search_count,
+        high_simulation_rate: pending.selfplay.search_simulations.high_searches as f32
+            / search_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -1945,9 +1943,9 @@ fn main() {
                     games,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
-                    low_simulations: simulations,
-                    low_simulation_probability: 0.0,
-                    low_simulation_policy_weight: 1.0,
+                    high_simulations: simulations,
+                    high_simulation_probability: 0.0,
+                    high_simulation_start_plies: cmd.max_plies.max(1),
                     seed,
                     workers,
                     generation_update: 0,
@@ -2171,9 +2169,9 @@ fn main() {
                     games: batch_games,
                     max_plies: cmd.max_plies.max(1),
                     simulations,
-                    low_simulations: simulations,
-                    low_simulation_probability: 0.0,
-                    low_simulation_policy_weight: 1.0,
+                    high_simulations: simulations,
+                    high_simulation_probability: 0.0,
+                    high_simulation_start_plies: cmd.max_plies.max(1),
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
                     generation_update: 0,
@@ -2531,12 +2529,12 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} low_sims={} low_prob={} low_policy_weight={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} high_sims={} high_prob={} high_start={}ply replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
-                config.low_simulations,
-                config.low_simulation_probability,
-                config.low_simulation_policy_weight,
+                config.high_simulations,
+                config.high_simulation_probability,
+                config.high_simulation_start_plies,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
                 config.selfplay_samples_per_update,
@@ -3104,7 +3102,7 @@ fn main() {
                     report.red_wins as f32 / report.games.max(1) as f32,
                     report.avg_plies,
                     report.avg_search_simulations,
-                    report.low_simulation_rate,
+                    report.high_simulation_rate,
                     report.loss,
                     report.value_loss,
                     report.legal_moves_loss,
@@ -3265,9 +3263,9 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "selfplay/low_simulation_rate",
+                    "selfplay/high_simulation_rate",
                     update,
-                    report.low_simulation_rate,
+                    report.high_simulation_rate,
                 );
                 log_scalar(
                     &mut tb,

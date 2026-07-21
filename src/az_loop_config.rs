@@ -7,9 +7,12 @@ pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 pub struct AzLoopFileConfig {
     pub model_path: String,
     pub simulations: usize,
-    pub low_simulations: usize,
-    pub low_simulation_probability: f32,
-    pub low_simulation_policy_weight: f32,
+    /// 进入中局后用于发现隐藏反击的额外搜索预算；不低于常规预算。
+    pub high_simulations: usize,
+    /// 到达 high_simulation_start_plies 后，节点使用额外预算的概率。
+    pub high_simulation_probability: f32,
+    /// 启用额外预算前的半回合数。
+    pub high_simulation_start_plies: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -82,9 +85,9 @@ impl Default for AzLoopFileConfig {
         Self {
             model_path: "model.safetensors".into(),
             simulations: 4000,
-            low_simulations: 2000,
-            low_simulation_probability: 0.2,
-            low_simulation_policy_weight: 0.5,
+            high_simulations: 20000,
+            high_simulation_probability: 0.1,
+            high_simulation_start_plies: 20,
             selfplay_samples_per_update: 120000,
             lr: 0.0005,
             lr_min: 0.0001,
@@ -159,9 +162,16 @@ impl Default for AzLoopFileConfig {
 struct AzLoopTomlConfig {
     pub model_path: String,
     pub simulations: usize,
+    // 兼容旧配置：这些字段已不再写出，也不影响自博弈预算。
+    #[serde(skip_serializing)]
     pub low_simulations: usize,
+    #[serde(skip_serializing)]
     pub low_simulation_probability: f32,
+    #[serde(skip_serializing)]
     pub low_simulation_policy_weight: f32,
+    pub high_simulations: usize,
+    pub high_simulation_probability: f32,
+    pub high_simulation_start_plies: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -252,9 +262,12 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
         Self {
             model_path: config.model_path.clone(),
             simulations: config.simulations,
-            low_simulations: config.low_simulations,
-            low_simulation_probability: config.low_simulation_probability,
-            low_simulation_policy_weight: config.low_simulation_policy_weight,
+            low_simulations: 0,
+            low_simulation_probability: 0.0,
+            low_simulation_policy_weight: 0.0,
+            high_simulations: config.high_simulations,
+            high_simulation_probability: config.high_simulation_probability,
+            high_simulation_start_plies: config.high_simulation_start_plies,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -335,9 +348,9 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
         Self {
             model_path: config.model_path,
             simulations: config.simulations,
-            low_simulations: config.low_simulations,
-            low_simulation_probability: config.low_simulation_probability,
-            low_simulation_policy_weight: config.low_simulation_policy_weight,
+            high_simulations: config.high_simulations,
+            high_simulation_probability: config.high_simulation_probability,
+            high_simulation_start_plies: config.high_simulation_start_plies,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -434,14 +447,14 @@ impl AzLoopFileConfig {
         }
         line!("model_path", q(&self.model_path));
         line!("simulations", self.simulations);
-        line!("low_simulations", self.low_simulations);
+        line!("high_simulations", self.high_simulations);
         line!(
-            "low_simulation_probability",
-            f(self.low_simulation_probability)
+            "high_simulation_probability",
+            f(self.high_simulation_probability)
         );
         line!(
-            "low_simulation_policy_weight",
-            f(self.low_simulation_policy_weight)
+            "high_simulation_start_plies",
+            self.high_simulation_start_plies
         );
         line!(
             "selfplay_samples_per_update",
@@ -558,9 +571,9 @@ impl AzLoopFileConfig {
 
     fn normalize(mut self) -> Self {
         self.simulations = self.simulations.max(1);
-        self.low_simulations = self.low_simulations.max(1).min(self.simulations);
-        self.low_simulation_probability = self.low_simulation_probability.clamp(0.0, 1.0);
-        self.low_simulation_policy_weight = self.low_simulation_policy_weight.max(0.0);
+        self.high_simulations = self.high_simulations.max(self.simulations);
+        self.high_simulation_probability = self.high_simulation_probability.clamp(0.0, 1.0);
+        self.high_simulation_start_plies = self.high_simulation_start_plies.min(self.max_plies);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
         self.lr_min = self.lr_min.max(0.0).min(self.lr);
@@ -655,9 +668,12 @@ mod tests {
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("simulations = 4000\n"));
-        assert!(text.contains("low_simulations = 2000\n"));
-        assert!(text.contains("low_simulation_probability = 0.2\n"));
-        assert!(text.contains("low_simulation_policy_weight = 0.5\n"));
+        assert!(!text.contains("low_simulations"));
+        assert!(!text.contains("low_simulation_probability"));
+        assert!(!text.contains("low_simulation_policy_weight"));
+        assert!(text.contains("high_simulations = 20000\n"));
+        assert!(text.contains("high_simulation_probability = 0.1\n"));
+        assert!(text.contains("high_simulation_start_plies = 20\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));
@@ -693,6 +709,12 @@ mod tests {
         assert!((parsed.lr - 0.0005).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
+
+        let legacy = AzLoopFileConfig::parse(
+            "low_simulations = 2000\nlow_simulation_probability = 0.2\nlow_simulation_policy_weight = 0.5\n",
+        );
+        assert_eq!(legacy.high_simulations, 20000);
+        assert!((legacy.high_simulation_probability - 0.1).abs() < 1e-9);
     }
 
     #[test]
