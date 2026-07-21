@@ -19,6 +19,8 @@ const HIGH_CONFIDENCE_Q_ADVANTAGE: f32 = 0.10;
 const HIGH_CONFIDENCE_POLICY_MASS: f32 = 0.50;
 const LEAF_VERIFY_MAX_CANDIDATES: usize = 6;
 const LEAF_VERIFY_POLICY_MIX: f32 = 0.75;
+const ENDGAME_REPAIR_MIN_Q_ADVANTAGE: f32 = 0.04;
+const ENDGAME_REPAIR_MIN_POLICY_MASS: f32 = 0.35;
 
 #[derive(Clone, Debug)]
 struct LeafVerification {
@@ -71,6 +73,25 @@ pub struct AzBranchReanalysisStats {
     pub verified_candidate_sum: usize,
     pub verified_capture_candidates: usize,
     pub verified_check_candidates: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzEndgameRepairStats {
+    pub probes: usize,
+    pub accepted: usize,
+    pub rejected_no_flip: usize,
+    pub rejected_low_advantage: usize,
+    pub verifier: AzBranchReanalysisStats,
+}
+
+impl AzEndgameRepairStats {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.probes += other.probes;
+        self.accepted += other.accepted;
+        self.rejected_no_flip += other.rejected_no_flip;
+        self.rejected_low_advantage += other.rejected_low_advantage;
+        self.verifier.add_assign(&other.verifier);
+    }
 }
 
 impl AzBranchReanalysisStats {
@@ -270,6 +291,7 @@ pub struct AzSelfplayData {
     pub branch_reanalysis_phase: [AzBranchReanalysisStats; 3],
     pub phase_root_counts: [usize; 3],
     pub endgame_audit: AzBranchReanalysisStats,
+    pub endgame_repair: AzEndgameRepairStats,
 }
 
 impl AzSelfplayData {
@@ -327,6 +349,7 @@ impl AzSelfplayData {
             *left += right;
         }
         self.endgame_audit.add_assign(&other.endgame_audit);
+        self.endgame_repair.add_assign(&other.endgame_repair);
     }
 }
 
@@ -462,6 +485,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut branch_reanalysis_phase = [AzBranchReanalysisStats::default(); 3];
     let mut phase_root_counts = [0usize; 3];
     let mut endgame_audit = AzBranchReanalysisStats::default();
+    let mut endgame_repair = AzEndgameRepairStats::default();
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -567,6 +591,53 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     verification.check_count,
                 );
                 Some(branch)
+            } else if should_probe_endgame_repair(config, ply, &mut rng) {
+                let verification = independent_leaf_verification(
+                    &position,
+                    &history,
+                    &rule_history,
+                    model,
+                    config,
+                    &search,
+                    rng.next_u64(),
+                );
+                endgame_repair.probes += 1;
+                endgame_repair.verifier.record(
+                    &search,
+                    &verification.search,
+                    config.branch_reanalysis_simulations,
+                    verification.candidate_count,
+                    verification.capture_count,
+                    verification.check_count,
+                );
+                if endgame_repair_accepts(&search, &verification.search) {
+                    endgame_repair.accepted += 1;
+                    branch_high_confidence = branch_reanalysis.record(
+                        &search,
+                        &verification.search,
+                        config.branch_reanalysis_simulations,
+                        verification.candidate_count,
+                        verification.capture_count,
+                        verification.check_count,
+                    );
+                    branch_reanalysis_phase[phase_for_ply(ply)].record(
+                        &search,
+                        &verification.search,
+                        config.branch_reanalysis_simulations,
+                        verification.candidate_count,
+                        verification.capture_count,
+                        verification.check_count,
+                    );
+                    Some(verification.search)
+                } else {
+                    let moved = verification.search.best_move != search.best_move;
+                    if !moved {
+                        endgame_repair.rejected_no_flip += 1;
+                    } else {
+                        endgame_repair.rejected_low_advantage += 1;
+                    }
+                    None
+                }
             } else {
                 None
             };
@@ -834,6 +905,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         branch_reanalysis_phase,
         phase_root_counts,
         endgame_audit,
+        endgame_repair,
     }
 }
 
@@ -850,6 +922,36 @@ fn should_run_endgame_audit(config: &AzLoopConfig, ply: usize, rng: &mut SplitMi
         && config.branch_reanalysis_simulations > 0
         && config.branch_endgame_audit_probability > 0.0
         && rng.unit_f32() < config.branch_endgame_audit_probability
+}
+
+fn should_probe_endgame_repair(config: &AzLoopConfig, ply: usize, rng: &mut SplitMix64) -> bool {
+    phase_for_ply(ply) == 2
+        && config.branch_reanalysis_simulations > 0
+        && config.branch_endgame_repair_probability > 0.0
+        && rng.unit_f32() < config.branch_endgame_repair_probability
+}
+
+fn endgame_repair_accepts(shallow: &AzSearchResult, verified: &AzSearchResult) -> bool {
+    let (Some(shallow_move), Some(verified_move)) = (shallow.best_move, verified.best_move) else {
+        return false;
+    };
+    if shallow_move == verified_move {
+        return false;
+    }
+    let shallow_q = verified
+        .candidates
+        .iter()
+        .find(|candidate| candidate.mv == shallow_move)
+        .map_or(-1.0, |candidate| candidate.q);
+    let Some(winner) = verified
+        .candidates
+        .iter()
+        .find(|candidate| candidate.mv == verified_move)
+    else {
+        return false;
+    };
+    winner.q - shallow_q >= ENDGAME_REPAIR_MIN_Q_ADVANTAGE
+        && winner.policy >= ENDGAME_REPAIR_MIN_POLICY_MASS
 }
 
 fn independent_leaf_verification(

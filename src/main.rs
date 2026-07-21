@@ -589,6 +589,7 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     config.low_simulation_policy_weight = 0.35;
     config.branch_reanalysis_probability = 0.0;
     config.branch_reanalysis_simulations = 0;
+    config.branch_endgame_repair_probability = 0.0;
     config.branch_endgame_audit_probability = 0.0;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
@@ -1061,6 +1062,7 @@ fn build_az_loop_config(
         branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
         branch_reanalysis_high_confidence_policy_weight: config
             .branch_reanalysis_high_confidence_policy_weight,
+        branch_endgame_repair_probability: config.branch_endgame_repair_probability,
         branch_endgame_audit_probability: config.branch_endgame_audit_probability,
         seed,
         workers,
@@ -1173,6 +1175,18 @@ fn build_async_training_report(
         verify_capture_candidates: audit.verified_capture_candidates as f32 / audit_count,
         verify_check_candidates: audit.verified_check_candidates as f32 / audit_count,
     };
+    let repair = pending.selfplay.endgame_repair;
+    let repair_probes = repair.probes.max(1) as f32;
+    let repair_flips = repair.verifier.flipped_q_advantage_count.max(1) as f32;
+    let branch_endgame_repair = chineseai::az::AzEndgameRepairReport {
+        probe_rate: repair.probes as f32 / phase_root_counts[2].max(1) as f32,
+        accepted_rate: repair.accepted as f32 / repair_probes,
+        verifier_flip_rate: repair.verifier.best_move_changed as f32 / repair_probes,
+        verifier_flipped_q_advantage: repair.verifier.flipped_q_advantage_sum / repair_flips,
+        rejected_no_flip_rate: repair.rejected_no_flip as f32 / repair_probes,
+        rejected_low_advantage_rate: repair.rejected_low_advantage as f32 / repair_probes,
+        verify_avg_candidates: repair.verifier.verified_candidate_sum as f32 / repair_probes,
+    };
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1242,6 +1256,7 @@ fn build_async_training_report(
             as f32
             / branch_count,
         branch_reanalysis_phase,
+        branch_endgame_repair,
         branch_endgame_audit,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
@@ -2031,6 +2046,7 @@ fn main() {
                     branch_reanalysis_simulations: 0,
                     branch_reanalysis_policy_weight: 1.0,
                     branch_reanalysis_high_confidence_policy_weight: 1.0,
+                    branch_endgame_repair_probability: 0.0,
                     branch_endgame_audit_probability: 0.0,
                     seed,
                     workers,
@@ -2263,6 +2279,7 @@ fn main() {
                     branch_reanalysis_simulations: 0,
                     branch_reanalysis_policy_weight: 1.0,
                     branch_reanalysis_high_confidence_policy_weight: 1.0,
+                    branch_endgame_repair_probability: 0.0,
                     branch_endgame_audit_probability: 0.0,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
@@ -2696,11 +2713,12 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "branch   : independent_leaf_verify(probability={}, top_visit_threshold={}, total_simulations={}, policy_weight={}, endgame_audit_probability={}, max_candidates=6, policy_mix=0.75; mainline_temperature_and_noise=unchanged)",
+                "branch   : independent_leaf_verify(probability={}, top_visit_threshold={}, total_simulations={}, policy_weight={}, endgame_repair_probability={}, endgame_audit_probability={}, max_candidates=6, policy_mix=0.75; mainline_temperature_and_noise=unchanged)",
                 config.branch_reanalysis_probability,
                 config.branch_reanalysis_top_visit_threshold,
                 config.branch_reanalysis_simulations,
                 config.branch_reanalysis_policy_weight,
+                config.branch_endgame_repair_probability,
                 config.branch_endgame_audit_probability,
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
@@ -3287,6 +3305,16 @@ fn main() {
                     report.branch_reanalysis_phase[2].verify_avg_candidates,
                 );
                 println!(
+                    "endgame-repair {update:04}: probe={:.3} accept={:.3} verifier_flip={:.3} adv={:.3} reject(no_flip={:.3} low_adv={:.3}) cand={:.1}",
+                    report.branch_endgame_repair.probe_rate,
+                    report.branch_endgame_repair.accepted_rate,
+                    report.branch_endgame_repair.verifier_flip_rate,
+                    report.branch_endgame_repair.verifier_flipped_q_advantage,
+                    report.branch_endgame_repair.rejected_no_flip_rate,
+                    report.branch_endgame_repair.rejected_low_advantage_rate,
+                    report.branch_endgame_repair.verify_avg_candidates,
+                );
+                println!(
                     "endgame-audit {update:04}: rate={:.4} flip={:.3} |dV|={:.3} kl={:.3} cand={:.1} cap={:.1} chk={:.1}",
                     report.branch_endgame_audit.rate,
                     report.branch_endgame_audit.move_flip_rate,
@@ -3493,6 +3521,48 @@ fn main() {
                         branch.verify_avg_candidates,
                     );
                 }
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/probe_rate",
+                    update,
+                    report.branch_endgame_repair.probe_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/accepted_rate",
+                    update,
+                    report.branch_endgame_repair.accepted_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/verifier_flip_rate",
+                    update,
+                    report.branch_endgame_repair.verifier_flip_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/flipped_q_advantage",
+                    update,
+                    report.branch_endgame_repair.verifier_flipped_q_advantage,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/rejected_no_flip_rate",
+                    update,
+                    report.branch_endgame_repair.rejected_no_flip_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/rejected_low_advantage_rate",
+                    update,
+                    report.branch_endgame_repair.rejected_low_advantage_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_repair/avg_verified_candidates",
+                    update,
+                    report.branch_endgame_repair.verify_avg_candidates,
+                );
                 log_scalar(
                     &mut tb,
                     "endgame_audit/rate",
