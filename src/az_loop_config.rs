@@ -102,7 +102,7 @@ impl Default for AzLoopFileConfig {
             // Uniform late-game probes compensate for the concentrated-root
             // branch selection bias. Only independently verified, gated flips
             // are admitted, so this raises correction coverage rather than noise.
-            branch_endgame_repair_probability: 0.05,
+            branch_endgame_repair_probability: 0.08,
             branch_endgame_audit_probability: 0.002,
             selfplay_samples_per_update: 120000,
             lr: 0.0005,
@@ -744,7 +744,7 @@ mod tests {
         assert!(text.contains("branch_reanalysis_simulations = 50000\n"));
         assert!(text.contains("branch_reanalysis_policy_weight = 2.0\n"));
         assert!(text.contains("branch_reanalysis_high_confidence_policy_weight = 4.0\n"));
-        assert!(text.contains("branch_endgame_repair_probability = 0.05\n"));
+        assert!(text.contains("branch_endgame_repair_probability = 0.08\n"));
         assert!(text.contains("branch_endgame_audit_probability = 0.002\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));

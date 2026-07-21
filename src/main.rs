@@ -2714,7 +2714,7 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "branch   : direct_high_budget_correction=disabled audit_simulations={} random_ply_scout_probability={} all_legal_children_per_leaf=500 scout_branches=2 endgame_audit_probability={}; mainline_temperature_and_noise=unchanged",
+                "branch   : direct_high_budget_correction=disabled audit_simulations={} random_ply_scout_probability={} scout_ply_range=40..100 all_legal_children_per_leaf=500 scout_branches=2 endgame_audit_probability={}; mainline_temperature_and_noise=unchanged",
                 config.branch_reanalysis_simulations,
                 config.branch_endgame_repair_probability,
                 config.branch_endgame_audit_probability,
@@ -3283,24 +3283,6 @@ fn main() {
                             " checkpoint={}",
                             path.display()
                         ))
-                );
-                println!(
-                    "branch-phase {update:04}: opening(rate={:.3} flip={:.3} high={:.3} adv={:.3} cand={:.1}) mid(rate={:.3} flip={:.3} high={:.3} adv={:.3} cand={:.1}) end(rate={:.3} flip={:.3} high={:.3} adv={:.3} cand={:.1})",
-                    report.branch_reanalysis_phase[0].rate,
-                    report.branch_reanalysis_phase[0].move_flip_rate,
-                    report.branch_reanalysis_phase[0].high_confidence_flip_rate,
-                    report.branch_reanalysis_phase[0].flipped_q_advantage,
-                    report.branch_reanalysis_phase[0].verify_avg_candidates,
-                    report.branch_reanalysis_phase[1].rate,
-                    report.branch_reanalysis_phase[1].move_flip_rate,
-                    report.branch_reanalysis_phase[1].high_confidence_flip_rate,
-                    report.branch_reanalysis_phase[1].flipped_q_advantage,
-                    report.branch_reanalysis_phase[1].verify_avg_candidates,
-                    report.branch_reanalysis_phase[2].rate,
-                    report.branch_reanalysis_phase[2].move_flip_rate,
-                    report.branch_reanalysis_phase[2].high_confidence_flip_rate,
-                    report.branch_reanalysis_phase[2].flipped_q_advantage,
-                    report.branch_reanalysis_phase[2].verify_avg_candidates,
                 );
                 println!(
                     "endgame-scout {update:04}: probe={:.4} flip={:.3} branches/probe={:.3} verifier_adv={:.3} reject(no_flip={:.3}) cand={:.1}",

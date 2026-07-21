@@ -22,9 +22,8 @@ const LEAF_VERIFY_EXPLORER_SLOTS: usize = 1;
 const LEAF_VERIFY_POLICY_MIX: f32 = 0.75;
 const ENDGAME_SCOUT_SIMULATIONS_PER_LEAF: usize = 500;
 const ENDGAME_SCOUT_BRANCHES: usize = 2;
-// Branch suffixes carry real terminal labels for both heads. Equal weighting keeps
-// this rare coverage visible in replay without creating a policy/value mismatch.
-const SCOUT_SUFFIX_TRAIN_WEIGHT: f32 = 4.0;
+const SCOUT_MIN_PLY: usize = 40;
+const SCOUT_MAX_PLY_EXCLUSIVE: usize = 100;
 
 #[derive(Clone, Debug)]
 struct LeafVerification {
@@ -919,11 +918,12 @@ fn should_run_endgame_audit(config: &AzLoopConfig, ply: usize, rng: &mut SplitMi
 fn random_endgame_scout_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> Option<usize> {
     if config.branch_endgame_repair_probability <= 0.0
         || rng.unit_f32() >= config.branch_endgame_repair_probability
-        || config.max_plies <= 40
+        || config.max_plies <= SCOUT_MIN_PLY
     {
         return None;
     }
-    Some(40 + (rng.next_u64() as usize % (config.max_plies - 40)))
+    let upper = config.max_plies.min(SCOUT_MAX_PLY_EXCLUSIVE);
+    Some(SCOUT_MIN_PLY + (rng.next_u64() as usize % (upper.saturating_sub(SCOUT_MIN_PLY).max(1))))
 }
 
 fn endgame_repair_accepts(shallow: &AzSearchResult, verified: &AzSearchResult) -> bool {
@@ -1032,8 +1032,8 @@ fn generate_normal_suffix(
             rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
             meta,
             simulations,
-            policy_weight_for_search(config, simulations) * SCOUT_SUFFIX_TRAIN_WEIGHT,
-            SCOUT_SUFFIX_TRAIN_WEIGHT,
+            policy_weight_for_search(config, simulations),
+            1.0,
         ));
         append_history(&mut history, &position, mv);
         let mover = position.side_to_move();
