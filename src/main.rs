@@ -2713,7 +2713,7 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "branch   : independent_leaf_verify(probability={}, top_visit_threshold={}, total_simulations={}, policy_weight={}, endgame_repair_probability={}, endgame_audit_probability={}, max_candidates=6, policy_mix=0.75; mainline_temperature_and_noise=unchanged)",
+                "branch   : independent_leaf_verify(probability={}, top_visit_threshold={}, total_simulations={}, policy_weight={}, endgame_repair_probability={}, endgame_repair_min_q_advantage=0.02, endgame_audit_probability={}, max_candidates=6, policy_mix=0.75; mainline_temperature_and_noise=unchanged)",
                 config.branch_reanalysis_probability,
                 config.branch_reanalysis_top_visit_threshold,
                 config.branch_reanalysis_simulations,

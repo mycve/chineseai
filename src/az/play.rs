@@ -19,7 +19,10 @@ const HIGH_CONFIDENCE_Q_ADVANTAGE: f32 = 0.10;
 const HIGH_CONFIDENCE_POLICY_MASS: f32 = 0.50;
 const LEAF_VERIFY_MAX_CANDIDATES: usize = 6;
 const LEAF_VERIFY_POLICY_MIX: f32 = 0.75;
-const ENDGAME_REPAIR_MIN_Q_ADVANTAGE: f32 = 0.04;
+// Endgame leaf verification shows typical genuine flip advantages around 0.01-0.02.
+// Keep a positive margin, but do not discard almost every verified correction by
+// applying the opening-scale 0.04 threshold here.
+const ENDGAME_REPAIR_MIN_Q_ADVANTAGE: f32 = 0.02;
 const ENDGAME_REPAIR_MIN_POLICY_MASS: f32 = 0.35;
 
 #[derive(Clone, Debug)]
