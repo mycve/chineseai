@@ -603,6 +603,8 @@ pub struct AzLoopReport {
     pub branch_reanalysis_move_flip_rate: f32,
     pub branch_reanalysis_value_delta_abs: f32,
     pub branch_reanalysis_policy_kl: f32,
+    pub branch_reanalysis_flipped_q_advantage: f32,
+    pub branch_reanalysis_high_confidence_flip_rate: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,

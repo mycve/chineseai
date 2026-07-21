@@ -48,6 +48,12 @@ pub struct AzBranchReanalysisStats {
     pub best_move_changed: usize,
     pub value_delta_abs_sum: f32,
     pub policy_kl_sum: f32,
+    /// At a flipped root, the deep-search Q of its selected move minus the
+    /// deep-search Q of the shallow selected move.
+    pub flipped_q_advantage_sum: f32,
+    pub flipped_q_advantage_count: usize,
+    /// Flips with a material Q advantage and a concentrated deep visit policy.
+    pub high_confidence_flips: usize,
 }
 
 impl AzBranchReanalysisStats {
@@ -57,6 +63,9 @@ impl AzBranchReanalysisStats {
         self.best_move_changed += other.best_move_changed;
         self.value_delta_abs_sum += other.value_delta_abs_sum;
         self.policy_kl_sum += other.policy_kl_sum;
+        self.flipped_q_advantage_sum += other.flipped_q_advantage_sum;
+        self.flipped_q_advantage_count += other.flipped_q_advantage_count;
+        self.high_confidence_flips += other.high_confidence_flips;
     }
 }
 
@@ -447,6 +456,25 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 branch_reanalysis.value_delta_abs_sum += (branch.value_q - search.value_q).abs();
                 branch_reanalysis.policy_kl_sum +=
                     policy_kl(&search.candidates, &branch.candidates);
+                if let (Some(shallow_move), Some(deep_move)) = (search.best_move, branch.best_move)
+                    && shallow_move != deep_move
+                {
+                    let shallow_q = branch
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.mv == shallow_move)
+                        .map_or(0.0, |candidate| candidate.q);
+                    let deep = branch
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.mv == deep_move)
+                        .expect("deep best move must be a deep-search candidate");
+                    let q_advantage = deep.q - shallow_q;
+                    branch_reanalysis.flipped_q_advantage_sum += q_advantage;
+                    branch_reanalysis.flipped_q_advantage_count += 1;
+                    branch_reanalysis.high_confidence_flips +=
+                        usize::from(q_advantage >= 0.10 && deep.policy >= 0.50);
+                }
                 Some(branch)
             } else {
                 None

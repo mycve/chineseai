@@ -1140,6 +1140,11 @@ fn build_async_training_report(
     let sampled_moves = pending.selfplay.sampled_moves.max(1) as f32;
     let search_count = pending.selfplay.search_simulations.searches.max(1) as f32;
     let branch_count = pending.selfplay.branch_reanalysis.searches.max(1) as f32;
+    let branch_flip_count = pending
+        .selfplay
+        .branch_reanalysis
+        .flipped_q_advantage_count
+        .max(1) as f32;
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1186,6 +1191,16 @@ fn build_async_training_report(
         branch_reanalysis_value_delta_abs: pending.selfplay.branch_reanalysis.value_delta_abs_sum
             / branch_count,
         branch_reanalysis_policy_kl: pending.selfplay.branch_reanalysis.policy_kl_sum
+            / branch_count,
+        branch_reanalysis_flipped_q_advantage: pending
+            .selfplay
+            .branch_reanalysis
+            .flipped_q_advantage_sum
+            / branch_flip_count,
+        branch_reanalysis_high_confidence_flip_rate: pending
+            .selfplay
+            .branch_reanalysis
+            .high_confidence_flips as f32
             / branch_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
@@ -3113,7 +3128,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} branch(rate={:.3} sims={:.0} flip={:.3} |dV|={:.3} kl={:.3}) opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} branch(rate={:.3} sims={:.0} flip={:.3} |dV|={:.3} kl={:.3} flipAdv={:.3} highFlip={:.3}) opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3147,6 +3162,8 @@ fn main() {
                     report.branch_reanalysis_move_flip_rate,
                     report.branch_reanalysis_value_delta_abs,
                     report.branch_reanalysis_policy_kl,
+                    report.branch_reanalysis_flipped_q_advantage,
+                    report.branch_reanalysis_high_confidence_flip_rate,
                     report.loss,
                     report.value_loss,
                     report.legal_moves_loss,
@@ -3340,6 +3357,18 @@ fn main() {
                     "branch/policy_kl",
                     update,
                     report.branch_reanalysis_policy_kl,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/flipped_q_advantage",
+                    update,
+                    report.branch_reanalysis_flipped_q_advantage,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/high_confidence_flip_rate",
+                    update,
+                    report.branch_reanalysis_high_confidence_flip_rate,
                 );
                 log_scalar(
                     &mut tb,
