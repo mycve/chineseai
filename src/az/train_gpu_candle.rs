@@ -662,7 +662,7 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.value_weights)?
             .sum_all()?
             .affine(MOVES_LEFT_AUX_WEIGHT as f64, 0.0)?;
-        let loss_sum = (((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?)?;
+        let loss_sum = ((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?;
         let optimized_loss_sum = loss_sum.to_scalar::<f32>()?;
         let loss_tensor = (loss_sum / global_batch_len as f64)?;
 

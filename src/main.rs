@@ -3465,48 +3465,6 @@ fn main() {
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
                 log_scalar(
                     &mut tb,
-                    "selfplay/games_per_second",
-                    update,
-                    report.games_per_second,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/samples_per_second",
-                    update,
-                    report.samples_per_second,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/samples_per_second",
-                    update,
-                    report.train_samples_per_second,
-                );
-                log_scalar(
-                    &mut tb,
-                    "timing/train_seconds",
-                    update,
-                    report.train_seconds,
-                );
-                log_scalar(
-                    &mut tb,
-                    "timing/update_seconds",
-                    update,
-                    report.total_seconds,
-                );
-                log_scalar(
-                    &mut tb,
-                    "outcome/red_win_rate",
-                    update,
-                    report.red_wins as f32 / report.games.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "outcome/black_win_rate",
-                    update,
-                    report.black_wins as f32 / report.games.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
                     "terminal/checkmate_no_legal_moves",
                     update,
                     report.terminal_no_legal_moves as f32,
