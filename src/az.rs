@@ -54,7 +54,6 @@ pub(super) const WDL_HEAD_SIZE: usize = 3;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-pub(super) const LEGAL_MOVES_AUX_WEIGHT: f32 = 0.01;
 const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(super) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub(super) const STRUCTURAL_PIECE_SIZE: usize = 14;
@@ -197,10 +196,6 @@ macro_rules! az_weight_tensors {
         $visit!(moves_left_bias_hidden, [VALUE_HEAD_SIZE]);
         $visit!(moves_left_output, [VALUE_HEAD_SIZE]);
         $visit!(moves_left_bias, [1]);
-        $visit!(legal_moves_hidden, [VALUE_HEAD_SIZE, $h]);
-        $visit!(legal_moves_bias_hidden, [VALUE_HEAD_SIZE]);
-        $visit!(legal_moves_output, [VALUE_HEAD_SIZE]);
-        $visit!(legal_moves_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_from_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_to_hidden, [BOARD_SIZE, $h]);
@@ -487,10 +482,6 @@ pub struct AzNnue {
     pub moves_left_bias_hidden: Vec<f32>,
     pub moves_left_output: Vec<f32>,
     pub moves_left_bias: Vec<f32>,
-    pub legal_moves_hidden: Vec<f32>,
-    pub legal_moves_bias_hidden: Vec<f32>,
-    pub legal_moves_output: Vec<f32>,
-    pub legal_moves_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_from_hidden: Vec<f32>,
     pub policy_to_hidden: Vec<f32>,
@@ -523,10 +514,6 @@ impl Clone for AzNnue {
             moves_left_bias_hidden: self.moves_left_bias_hidden.clone(),
             moves_left_output: self.moves_left_output.clone(),
             moves_left_bias: self.moves_left_bias.clone(),
-            legal_moves_hidden: self.legal_moves_hidden.clone(),
-            legal_moves_bias_hidden: self.legal_moves_bias_hidden.clone(),
-            legal_moves_output: self.legal_moves_output.clone(),
-            legal_moves_bias: self.legal_moves_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_from_hidden: self.policy_from_hidden.clone(),
             policy_to_hidden: self.policy_to_hidden.clone(),
@@ -606,7 +593,6 @@ pub struct AzLoopReport {
     pub phase_value: [AzPhaseValueReport; 3],
     pub policy_ce: f32,
     pub policy_target_entropy: f32,
-    pub legal_moves_loss: f32,
     pub moves_left_loss: f32,
     pub policy_kl: f32,
     pub root_visit_entropy: f32,
@@ -791,7 +777,6 @@ pub struct AzTrainStats {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
-    pub legal_moves_loss: f32,
     pub moves_left_loss: f32,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
@@ -835,7 +820,6 @@ impl AzTrainStats {
         self.loss += other.loss;
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
-        self.legal_moves_loss += other.legal_moves_loss;
         self.moves_left_loss += other.moves_left_loss;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
@@ -898,12 +882,6 @@ impl AzNnue {
         let moves_left_bias_hidden = vec![0.0; VALUE_HEAD_SIZE];
         let moves_left_output = vec![0.0; VALUE_HEAD_SIZE];
         let moves_left_bias = vec![0.0; 1];
-        let legal_moves_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
-            .collect();
-        let legal_moves_bias_hidden = vec![0.0; VALUE_HEAD_SIZE];
-        let legal_moves_output = vec![0.0; VALUE_HEAD_SIZE];
-        let legal_moves_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
@@ -940,10 +918,6 @@ impl AzNnue {
             moves_left_bias_hidden,
             moves_left_output,
             moves_left_bias,
-            legal_moves_hidden,
-            legal_moves_bias_hidden,
-            legal_moves_output,
-            legal_moves_bias,
             policy_move_bias,
             policy_from_hidden,
             policy_to_hidden,
@@ -998,10 +972,6 @@ impl AzNnue {
             moves_left_bias_hidden: load_candle_f32_tensor(&tensors, "moves_left_bias_hidden")?,
             moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
             moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
-            legal_moves_hidden: load_candle_f32_tensor(&tensors, "legal_moves_hidden")?,
-            legal_moves_bias_hidden: load_candle_f32_tensor(&tensors, "legal_moves_bias_hidden")?,
-            legal_moves_output: load_candle_f32_tensor(&tensors, "legal_moves_output")?,
-            legal_moves_bias: load_candle_f32_tensor(&tensors, "legal_moves_bias")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
@@ -3163,13 +3133,6 @@ mod tests {
         assert_eq!(model.moves_left_bias_hidden, loaded.moves_left_bias_hidden);
         assert_eq!(model.moves_left_output, loaded.moves_left_output);
         assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
-        assert_eq!(model.legal_moves_hidden, loaded.legal_moves_hidden);
-        assert_eq!(
-            model.legal_moves_bias_hidden,
-            loaded.legal_moves_bias_hidden
-        );
-        assert_eq!(model.legal_moves_output, loaded.legal_moves_output);
-        assert_eq!(model.legal_moves_bias, loaded.legal_moves_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
         assert_eq!(model.policy_from_hidden, loaded.policy_from_hidden);
         assert_eq!(model.policy_to_hidden, loaded.policy_to_hidden);

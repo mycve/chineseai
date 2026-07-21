@@ -12,7 +12,7 @@ use candle_core::{
 
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, AzValueMomentStats,
-    LEGAL_MOVES_AUX_WEIGHT, MOVES_LEFT_AUX_WEIGHT, WDL_HEAD_SIZE,
+    MOVES_LEFT_AUX_WEIGHT, WDL_HEAD_SIZE,
     candle_model::{AzCandleModel, BatchTensors},
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
@@ -124,7 +124,6 @@ pub(super) fn train_samples_gpu(
         stats.loss /= denom;
         stats.value_loss /= denom;
         stats.policy_ce /= denom;
-        stats.legal_moves_loss /= denom;
         stats.moves_left_loss /= denom;
     }
     let trainer = model
@@ -642,11 +641,6 @@ impl GpuReplica {
             (&tensor_log1p(&moves_left_pred)? - &tensor_log1p(&batch_tensors.moves_left)?)?;
         let moves_left_sse_per_sample = moves_left_error.sqr()?;
         let moves_left_sse = moves_left_sse_per_sample.sum_all()?;
-        let legal_moves_pred = tensor_softplus(&forward.legal_moves_logits)?.squeeze(1)?;
-        let legal_moves_error =
-            (&tensor_log1p(&legal_moves_pred)? - &tensor_log1p(&batch_tensors.legal_moves)?)?;
-        let legal_moves_sse_per_sample = legal_moves_error.sqr()?;
-        let legal_moves_sse = legal_moves_sse_per_sample.sum_all()?;
 
         let legal_policy_logits = forward
             .policy_logits
@@ -668,12 +662,7 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.value_weights)?
             .sum_all()?
             .affine(MOVES_LEFT_AUX_WEIGHT as f64, 0.0)?;
-        let weighted_legal_moves_loss = legal_moves_sse_per_sample
-            .broadcast_mul(&batch_tensors.policy_weights)?
-            .sum_all()?
-            .affine(LEGAL_MOVES_AUX_WEIGHT as f64, 0.0)?;
-        let loss_sum = (((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?
-            + weighted_legal_moves_loss)?;
+        let loss_sum = (((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?)?;
         let optimized_loss_sum = loss_sum.to_scalar::<f32>()?;
         let loss_tensor = (loss_sum / global_batch_len as f64)?;
 
@@ -713,7 +702,6 @@ impl GpuReplica {
             loss: optimized_loss_sum,
             value_loss: value_ce,
             policy_ce,
-            legal_moves_loss: legal_moves_sse.to_scalar::<f32>()?,
             moves_left_loss: moves_left_sse.to_scalar::<f32>()?,
             value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
             value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,

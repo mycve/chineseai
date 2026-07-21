@@ -1188,7 +1188,6 @@ fn build_async_training_report(
         phase_value,
         policy_ce: stats.policy_ce,
         policy_target_entropy: train_source.policy_target_entropy,
-        legal_moves_loss: stats.legal_moves_loss,
         moves_left_loss: stats.moves_left_loss,
         policy_kl: stats.policy_ce - train_source.policy_target_entropy,
         root_visit_entropy,
@@ -3074,7 +3073,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} high_sim={:.3} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3105,7 +3104,6 @@ fn main() {
                     report.high_simulation_rate,
                     report.loss,
                     report.value_loss,
-                    report.legal_moves_loss,
                     report.moves_left_loss,
                     value_rmse,
                     report.value_pred_mean,
@@ -3160,12 +3158,6 @@ fn main() {
                 );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
                 log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
-                log_scalar(
-                    &mut tb,
-                    "train/legal_moves_log_mse",
-                    update,
-                    report.legal_moves_loss,
-                );
                 log_scalar(
                     &mut tb,
                     "train/moves_left_log_mse",
