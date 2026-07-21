@@ -1147,6 +1147,26 @@ fn build_async_training_report(
         .branch_reanalysis
         .flipped_q_advantage_count
         .max(1) as f32;
+    let phase_root_counts = [
+        pending.selfplay.opening_shape_count,
+        pending.selfplay.entropy_mid_count,
+        pending
+            .selfplay
+            .shape_count
+            .saturating_sub(pending.selfplay.opening_shape_count)
+            .saturating_sub(pending.selfplay.entropy_mid_count),
+    ];
+    let branch_reanalysis_phase = std::array::from_fn(|phase| {
+        let stats = pending.selfplay.branch_reanalysis_phase[phase];
+        let searches = stats.searches.max(1) as f32;
+        let flips = stats.flipped_q_advantage_count.max(1) as f32;
+        chineseai::az::AzBranchPhaseReport {
+            rate: stats.searches as f32 / phase_root_counts[phase].max(1) as f32,
+            move_flip_rate: stats.best_move_changed as f32 / searches,
+            high_confidence_flip_rate: stats.high_confidence_flips as f32 / searches,
+            flipped_q_advantage: stats.flipped_q_advantage_sum / flips,
+        }
+    });
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1204,6 +1224,7 @@ fn build_async_training_report(
             .branch_reanalysis
             .high_confidence_flips as f32
             / branch_count,
+        branch_reanalysis_phase,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -3223,6 +3244,21 @@ fn main() {
                             path.display()
                         ))
                 );
+                println!(
+                    "branch-phase {update:04}: opening(rate={:.3} flip={:.3} high={:.3} adv={:.3}) mid(rate={:.3} flip={:.3} high={:.3} adv={:.3}) end(rate={:.3} flip={:.3} high={:.3} adv={:.3})",
+                    report.branch_reanalysis_phase[0].rate,
+                    report.branch_reanalysis_phase[0].move_flip_rate,
+                    report.branch_reanalysis_phase[0].high_confidence_flip_rate,
+                    report.branch_reanalysis_phase[0].flipped_q_advantage,
+                    report.branch_reanalysis_phase[1].rate,
+                    report.branch_reanalysis_phase[1].move_flip_rate,
+                    report.branch_reanalysis_phase[1].high_confidence_flip_rate,
+                    report.branch_reanalysis_phase[1].flipped_q_advantage,
+                    report.branch_reanalysis_phase[2].rate,
+                    report.branch_reanalysis_phase[2].move_flip_rate,
+                    report.branch_reanalysis_phase[2].high_confidence_flip_rate,
+                    report.branch_reanalysis_phase[2].flipped_q_advantage,
+                );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
                 log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
                 log_scalar(
@@ -3374,6 +3410,28 @@ fn main() {
                     update,
                     report.branch_reanalysis_high_confidence_flip_rate,
                 );
+                for (phase, name) in ["opening", "midgame", "endgame"].into_iter().enumerate() {
+                    let branch = report.branch_reanalysis_phase[phase];
+                    log_scalar(&mut tb, &format!("branch/{name}/rate"), update, branch.rate);
+                    log_scalar(
+                        &mut tb,
+                        &format!("branch/{name}/move_flip_rate"),
+                        update,
+                        branch.move_flip_rate,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("branch/{name}/high_confidence_flip_rate"),
+                        update,
+                        branch.high_confidence_flip_rate,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("branch/{name}/flipped_q_advantage"),
+                        update,
+                        branch.flipped_q_advantage,
+                    );
+                }
                 log_scalar(
                     &mut tb,
                     "train/train_to_selfplay_ratio",

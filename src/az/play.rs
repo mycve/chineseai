@@ -70,6 +70,40 @@ impl AzBranchReanalysisStats {
         self.flipped_q_advantage_count += other.flipped_q_advantage_count;
         self.high_confidence_flips += other.high_confidence_flips;
     }
+
+    fn record(
+        &mut self,
+        shallow: &super::AzSearchResult,
+        deep: &super::AzSearchResult,
+        simulations: usize,
+    ) -> bool {
+        self.searches += 1;
+        self.simulations_sum += simulations;
+        self.best_move_changed += usize::from(deep.best_move != shallow.best_move);
+        self.value_delta_abs_sum += (deep.value_q - shallow.value_q).abs();
+        self.policy_kl_sum += policy_kl(&shallow.candidates, &deep.candidates);
+        let mut high_confidence = false;
+        if let (Some(shallow_move), Some(deep_move)) = (shallow.best_move, deep.best_move)
+            && shallow_move != deep_move
+        {
+            let shallow_q = deep
+                .candidates
+                .iter()
+                .find(|candidate| candidate.mv == shallow_move)
+                .map_or(0.0, |candidate| candidate.q);
+            let deep = deep
+                .candidates
+                .iter()
+                .find(|candidate| candidate.mv == deep_move)
+                .expect("deep best move must be a deep-search candidate");
+            let q_advantage = deep.q - shallow_q;
+            self.flipped_q_advantage_sum += q_advantage;
+            self.flipped_q_advantage_count += 1;
+            high_confidence = is_high_confidence_branch_flip(q_advantage, deep.policy);
+            self.high_confidence_flips += usize::from(high_confidence);
+        }
+        high_confidence
+    }
 }
 
 impl AzSearchSimulationStats {
@@ -210,6 +244,7 @@ pub struct AzSelfplayData {
     pub terminal: AzTerminalStats,
     pub search_simulations: AzSearchSimulationStats,
     pub branch_reanalysis: AzBranchReanalysisStats,
+    pub branch_reanalysis_phase: [AzBranchReanalysisStats; 3],
 }
 
 impl AzSelfplayData {
@@ -252,6 +287,13 @@ impl AzSelfplayData {
         self.search_simulations
             .add_assign(&other.search_simulations);
         self.branch_reanalysis.add_assign(&other.branch_reanalysis);
+        for (left, right) in self
+            .branch_reanalysis_phase
+            .iter_mut()
+            .zip(other.branch_reanalysis_phase)
+        {
+            left.add_assign(&right);
+        }
     }
 }
 
@@ -325,6 +367,13 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged
             .branch_reanalysis
             .add_assign(&chunk.branch_reanalysis);
+        for (left, right) in merged
+            .branch_reanalysis_phase
+            .iter_mut()
+            .zip(chunk.branch_reanalysis_phase)
+        {
+            left.add_assign(&right);
+        }
     }
     merged
 }
@@ -369,6 +418,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
     let mut branch_reanalysis = AzBranchReanalysisStats::default();
+    let mut branch_reanalysis_phase = [AzBranchReanalysisStats::default(); 3];
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -453,33 +503,16 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     model,
                     deterministic_branch_limits(config, rng.next_u64()),
                 );
-                branch_reanalysis.searches += 1;
-                branch_reanalysis.simulations_sum += config.branch_reanalysis_simulations;
-                branch_reanalysis.best_move_changed +=
-                    usize::from(branch.best_move != search.best_move);
-                branch_reanalysis.value_delta_abs_sum += (branch.value_q - search.value_q).abs();
-                branch_reanalysis.policy_kl_sum +=
-                    policy_kl(&search.candidates, &branch.candidates);
-                if let (Some(shallow_move), Some(deep_move)) = (search.best_move, branch.best_move)
-                    && shallow_move != deep_move
-                {
-                    let shallow_q = branch
-                        .candidates
-                        .iter()
-                        .find(|candidate| candidate.mv == shallow_move)
-                        .map_or(0.0, |candidate| candidate.q);
-                    let deep = branch
-                        .candidates
-                        .iter()
-                        .find(|candidate| candidate.mv == deep_move)
-                        .expect("deep best move must be a deep-search candidate");
-                    let q_advantage = deep.q - shallow_q;
-                    branch_reanalysis.flipped_q_advantage_sum += q_advantage;
-                    branch_reanalysis.flipped_q_advantage_count += 1;
-                    branch_high_confidence =
-                        is_high_confidence_branch_flip(q_advantage, deep.policy);
-                    branch_reanalysis.high_confidence_flips += usize::from(branch_high_confidence);
-                }
+                branch_high_confidence = branch_reanalysis.record(
+                    &search,
+                    &branch,
+                    config.branch_reanalysis_simulations,
+                );
+                branch_reanalysis_phase[phase_for_ply(ply)].record(
+                    &search,
+                    &branch,
+                    config.branch_reanalysis_simulations,
+                );
                 Some(branch)
             } else {
                 None
@@ -723,6 +756,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         terminal,
         search_simulations,
         branch_reanalysis,
+        branch_reanalysis_phase,
+    }
+}
+
+fn phase_for_ply(ply: usize) -> usize {
+    match ply {
+        0..=39 => 0,
+        40..=119 => 1,
+        _ => 2,
     }
 }
 

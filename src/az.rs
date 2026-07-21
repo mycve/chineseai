@@ -607,6 +607,7 @@ pub struct AzLoopReport {
     pub branch_reanalysis_policy_kl: f32,
     pub branch_reanalysis_flipped_q_advantage: f32,
     pub branch_reanalysis_high_confidence_flip_rate: f32,
+    pub branch_reanalysis_phase: [AzBranchPhaseReport; 3],
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -684,6 +685,14 @@ pub struct AzLoopReport {
     pub terminal_resign_red: usize,
     pub terminal_resign_black: usize,
     pub terminal_max_plies: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzBranchPhaseReport {
+    pub rate: f32,
+    pub move_flip_rate: f32,
+    pub high_confidence_flip_rate: f32,
+    pub flipped_q_advantage: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
