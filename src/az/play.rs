@@ -14,6 +14,9 @@ use super::{
     alphazero_search_with_history_and_rules, dense_move_index, scalar_value_to_wdl_target,
 };
 
+const HIGH_CONFIDENCE_Q_ADVANTAGE: f32 = 0.10;
+const HIGH_CONFIDENCE_POLICY_MASS: f32 = 0.50;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
     pub no_legal_moves: usize,
@@ -440,6 +443,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             // concentrated roots gets a separate deterministic re-search, whose
             // policy becomes the training target and whose best move continues the
             // game.  This is the self-correction branch, not an external teacher.
+            let mut branch_high_confidence = false;
             let branch = if should_run_branch_reanalysis(config, &search, &mut rng) {
                 let branch = alphazero_search_with_history_and_rules(
                     &position,
@@ -472,8 +476,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     let q_advantage = deep.q - shallow_q;
                     branch_reanalysis.flipped_q_advantage_sum += q_advantage;
                     branch_reanalysis.flipped_q_advantage_count += 1;
-                    branch_reanalysis.high_confidence_flips +=
-                        usize::from(q_advantage >= 0.10 && deep.policy >= 0.50);
+                    branch_high_confidence =
+                        is_high_confidence_branch_flip(q_advantage, deep.policy);
+                    branch_reanalysis.high_confidence_flips += usize::from(branch_high_confidence);
                 }
                 Some(branch)
             } else {
@@ -487,7 +492,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             };
             let effective_policy_weight =
                 policy_weight_for_search(config, effective_search_simulations)
-                    * if branch.is_some() {
+                    * if branch_high_confidence {
+                        config.branch_reanalysis_high_confidence_policy_weight
+                    } else if branch.is_some() {
                         config.branch_reanalysis_policy_weight
                     } else {
                         1.0
@@ -779,6 +786,10 @@ fn policy_kl(source: &[AzCandidate], target: &[AzCandidate]) -> f32 {
             })
         })
         .sum()
+}
+
+fn is_high_confidence_branch_flip(q_advantage: f32, deep_policy: f32) -> bool {
+    q_advantage >= HIGH_CONFIDENCE_Q_ADVANTAGE && deep_policy >= HIGH_CONFIDENCE_POLICY_MASS
 }
 
 fn search_simulations_for_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> usize {

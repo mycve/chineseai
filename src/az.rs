@@ -557,6 +557,8 @@ pub struct AzLoopConfig {
     pub branch_reanalysis_simulations: usize,
     /// Extra policy-loss weight for a deterministic branch target.
     pub branch_reanalysis_policy_weight: f32,
+    /// Policy-loss weight reserved for a high-confidence branch correction.
+    pub branch_reanalysis_high_confidence_policy_weight: f32,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
