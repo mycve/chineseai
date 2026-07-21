@@ -92,9 +92,9 @@ impl Default for AzLoopFileConfig {
             low_simulations: 2000,
             low_simulation_probability: 0.2,
             low_simulation_policy_weight: 0.5,
-            // A conservative experiment: re-search only a small, concentrated
-            // subset of roots. The main self-play temperature/noise stays intact.
-            branch_reanalysis_probability: 0.02,
+            // Retained for config compatibility; direct high-budget policy
+            // correction is disabled. High-budget search is audit-only.
+            branch_reanalysis_probability: 0.0,
             branch_reanalysis_top_visit_threshold: 0.45,
             branch_reanalysis_simulations: 50_000,
             branch_reanalysis_policy_weight: 2.0,
@@ -102,7 +102,7 @@ impl Default for AzLoopFileConfig {
             // Uniform late-game probes compensate for the concentrated-root
             // branch selection bias. Only independently verified, gated flips
             // are admitted, so this raises correction coverage rather than noise.
-            branch_endgame_repair_probability: 0.03,
+            branch_endgame_repair_probability: 0.05,
             branch_endgame_audit_probability: 0.002,
             selfplay_samples_per_update: 120000,
             lr: 0.0005,
@@ -739,12 +739,12 @@ mod tests {
         assert!(text.contains("low_simulations = 2000\n"));
         assert!(text.contains("low_simulation_probability = 0.2\n"));
         assert!(text.contains("low_simulation_policy_weight = 0.5\n"));
-        assert!(text.contains("branch_reanalysis_probability = 0.02\n"));
+        assert!(text.contains("branch_reanalysis_probability = 0.0\n"));
         assert!(text.contains("branch_reanalysis_top_visit_threshold = 0.45\n"));
         assert!(text.contains("branch_reanalysis_simulations = 50000\n"));
         assert!(text.contains("branch_reanalysis_policy_weight = 2.0\n"));
         assert!(text.contains("branch_reanalysis_high_confidence_policy_weight = 4.0\n"));
-        assert!(text.contains("branch_endgame_repair_probability = 0.03\n"));
+        assert!(text.contains("branch_endgame_repair_probability = 0.05\n"));
         assert!(text.contains("branch_endgame_audit_probability = 0.002\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));

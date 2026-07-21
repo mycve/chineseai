@@ -1179,8 +1179,9 @@ fn build_async_training_report(
     let repair_probes = repair.probes.max(1) as f32;
     let repair_flips = repair.verifier.flipped_q_advantage_count.max(1) as f32;
     let branch_endgame_repair = chineseai::az::AzEndgameRepairReport {
-        probe_rate: repair.probes as f32 / phase_root_counts[2].max(1) as f32,
+        probe_rate: repair.probes as f32 / selfplay_games.max(1) as f32,
         accepted_rate: repair.accepted as f32 / repair_probes,
+        branches_per_probe: repair.branches_spawned as f32 / repair_probes,
         verifier_flip_rate: repair.verifier.best_move_changed as f32 / repair_probes,
         verifier_flipped_q_advantage: repair.verifier.flipped_q_advantage_sum / repair_flips,
         rejected_no_flip_rate: repair.rejected_no_flip as f32 / repair_probes,
@@ -2713,11 +2714,8 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "branch   : independent_leaf_verify(probability={}, top_visit_threshold={}, total_simulations={}, policy_weight={}, endgame_repair_probability={}, endgame_repair_min_q_advantage=0.02, endgame_repair_policy_weight=24, endgame_audit_probability={}, max_candidates=6, policy_mix=0.75; mainline_temperature_and_noise=unchanged)",
-                config.branch_reanalysis_probability,
-                config.branch_reanalysis_top_visit_threshold,
+                "branch   : direct_high_budget_correction=disabled audit_simulations={} random_ply_scout_probability={} all_legal_children_per_leaf=500 scout_branches=2 endgame_audit_probability={}; mainline_temperature_and_noise=unchanged",
                 config.branch_reanalysis_simulations,
-                config.branch_reanalysis_policy_weight,
                 config.branch_endgame_repair_probability,
                 config.branch_endgame_audit_probability,
             );
@@ -3305,13 +3303,12 @@ fn main() {
                     report.branch_reanalysis_phase[2].verify_avg_candidates,
                 );
                 println!(
-                    "endgame-repair {update:04}: probe={:.3} accept={:.3} verifier_flip={:.3} adv={:.3} reject(no_flip={:.3} low_adv={:.3}) cand={:.1}",
+                    "endgame-scout {update:04}: probe={:.4} flip={:.3} branches/probe={:.3} verifier_adv={:.3} reject(no_flip={:.3}) cand={:.1}",
                     report.branch_endgame_repair.probe_rate,
-                    report.branch_endgame_repair.accepted_rate,
                     report.branch_endgame_repair.verifier_flip_rate,
+                    report.branch_endgame_repair.branches_per_probe,
                     report.branch_endgame_repair.verifier_flipped_q_advantage,
                     report.branch_endgame_repair.rejected_no_flip_rate,
-                    report.branch_endgame_repair.rejected_low_advantage_rate,
                     report.branch_endgame_repair.verify_avg_candidates,
                 );
                 println!(

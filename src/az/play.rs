@@ -18,16 +18,13 @@ use super::{
 const HIGH_CONFIDENCE_Q_ADVANTAGE: f32 = 0.10;
 const HIGH_CONFIDENCE_POLICY_MASS: f32 = 0.50;
 const LEAF_VERIFY_MAX_CANDIDATES: usize = 6;
+const LEAF_VERIFY_EXPLORER_SLOTS: usize = 1;
 const LEAF_VERIFY_POLICY_MIX: f32 = 0.75;
-// Endgame leaf verification shows typical genuine flip advantages around 0.01-0.02.
-// Keep a positive margin, but do not discard almost every verified correction by
-// applying the opening-scale 0.04 threshold here.
-const ENDGAME_REPAIR_MIN_Q_ADVANTAGE: f32 = 0.02;
-const ENDGAME_REPAIR_MIN_POLICY_MASS: f32 = 0.35;
-// Accepted endgame repairs are rare (uniform probe × verified flip × gate).
-// A normal 2x branch weight is numerically lost in a million-sample replay, so
-// amplify policy imitation only; its value target remains the played game's result.
-const ENDGAME_REPAIR_POLICY_WEIGHT: f32 = 24.0;
+const ENDGAME_SCOUT_SIMULATIONS_PER_LEAF: usize = 500;
+const ENDGAME_SCOUT_BRANCHES: usize = 2;
+// Branch suffixes carry real terminal labels for both heads. Equal weighting keeps
+// this rare coverage visible in replay without creating a policy/value mismatch.
+const SCOUT_SUFFIX_TRAIN_WEIGHT: f32 = 4.0;
 
 #[derive(Clone, Debug)]
 struct LeafVerification {
@@ -35,6 +32,8 @@ struct LeafVerification {
     candidate_count: usize,
     capture_count: usize,
     check_count: usize,
+    explorer_count: usize,
+    verified_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -80,12 +79,14 @@ pub struct AzBranchReanalysisStats {
     pub verified_candidate_sum: usize,
     pub verified_capture_candidates: usize,
     pub verified_check_candidates: usize,
+    pub verified_explorer_candidates: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzEndgameRepairStats {
     pub probes: usize,
     pub accepted: usize,
+    pub branches_spawned: usize,
     pub rejected_no_flip: usize,
     pub rejected_low_advantage: usize,
     pub verifier: AzBranchReanalysisStats,
@@ -95,6 +96,7 @@ impl AzEndgameRepairStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.probes += other.probes;
         self.accepted += other.accepted;
+        self.branches_spawned += other.branches_spawned;
         self.rejected_no_flip += other.rejected_no_flip;
         self.rejected_low_advantage += other.rejected_low_advantage;
         self.verifier.add_assign(&other.verifier);
@@ -114,6 +116,7 @@ impl AzBranchReanalysisStats {
         self.verified_candidate_sum += other.verified_candidate_sum;
         self.verified_capture_candidates += other.verified_capture_candidates;
         self.verified_check_candidates += other.verified_check_candidates;
+        self.verified_explorer_candidates += other.verified_explorer_candidates;
     }
 
     fn record(
@@ -124,12 +127,14 @@ impl AzBranchReanalysisStats {
         candidate_count: usize,
         capture_count: usize,
         check_count: usize,
+        explorer_count: usize,
     ) -> bool {
         self.searches += 1;
         self.simulations_sum += simulations;
         self.verified_candidate_sum += candidate_count;
         self.verified_capture_candidates += capture_count;
         self.verified_check_candidates += check_count;
+        self.verified_explorer_candidates += explorer_count;
         self.best_move_changed += usize::from(deep.best_move != shallow.best_move);
         self.value_delta_abs_sum += (deep.value_q - shallow.value_q).abs();
         self.policy_kl_sum += policy_kl(&shallow.candidates, &deep.candidates);
@@ -488,8 +493,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
-    let mut branch_reanalysis = AzBranchReanalysisStats::default();
-    let mut branch_reanalysis_phase = [AzBranchReanalysisStats::default(); 3];
+    let branch_reanalysis = AzBranchReanalysisStats::default();
+    let branch_reanalysis_phase = [AzBranchReanalysisStats::default(); 3];
     let mut phase_root_counts = [0usize; 3];
     let mut endgame_audit = AzBranchReanalysisStats::default();
     let mut endgame_repair = AzEndgameRepairStats::default();
@@ -506,6 +511,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
+        let mut repair_suffixes = Vec::new();
+        let mut spawned_repair_suffixes = false;
+        let scout_target_ply = random_endgame_scout_ply(config, &mut rng);
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
 
         for ply in 0..config.max_plies {
@@ -563,15 +571,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     },
                 )
             };
-            // The ordinary root above is deliberately left untouched: it keeps the
-            // configured temperature/noise behaviour. A small subset of highly
-            // concentrated roots gets independent deterministic child searches;
-            // their verified policy becomes the training target and their best
-            // move continues the game. This is self-correction, not an external
-            // teacher and not a forced-line search change.
-            let mut branch_high_confidence = false;
-            let mut branch_is_endgame_repair = false;
-            let branch = if should_run_branch_reanalysis(config, &search, &mut rng) {
+            // The ordinary root remains the main line. Independent search is an
+            // exploration trigger only: it creates real terminal-labelled suffixes
+            // instead of directly imposing a high-budget policy target.
+            if !spawned_repair_suffixes && scout_target_ply == Some(ply) {
                 let verification = independent_leaf_verification(
                     &position,
                     &history,
@@ -580,64 +583,46 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config,
                     &search,
                     rng.next_u64(),
-                );
-                let branch = verification.search;
-                branch_high_confidence = branch_reanalysis.record(
-                    &search,
-                    &branch,
-                    config.branch_reanalysis_simulations,
-                    verification.candidate_count,
-                    verification.capture_count,
-                    verification.check_count,
-                );
-                branch_reanalysis_phase[phase_for_ply(ply)].record(
-                    &search,
-                    &branch,
-                    config.branch_reanalysis_simulations,
-                    verification.candidate_count,
-                    verification.capture_count,
-                    verification.check_count,
-                );
-                Some(branch)
-            } else if should_probe_endgame_repair(config, ply, &mut rng) {
-                let verification = independent_leaf_verification(
-                    &position,
-                    &history,
-                    &rule_history,
-                    model,
-                    config,
-                    &search,
-                    rng.next_u64(),
+                    Some(ENDGAME_SCOUT_SIMULATIONS_PER_LEAF),
+                    true,
                 );
                 endgame_repair.probes += 1;
                 endgame_repair.verifier.record(
                     &search,
                     &verification.search,
-                    config.branch_reanalysis_simulations,
+                    verification.search.simulations,
                     verification.candidate_count,
                     verification.capture_count,
                     verification.check_count,
+                    verification.explorer_count,
                 );
                 if endgame_repair_accepts(&search, &verification.search) {
                     endgame_repair.accepted += 1;
-                    branch_is_endgame_repair = true;
-                    branch_high_confidence = branch_reanalysis.record(
+                    let suffix_count_before = repair_suffixes.len();
+                    for mv in endgame_scout_branch_moves(
                         &search,
                         &verification.search,
-                        config.branch_reanalysis_simulations,
-                        verification.candidate_count,
-                        verification.capture_count,
-                        verification.check_count,
-                    );
-                    branch_reanalysis_phase[phase_for_ply(ply)].record(
-                        &search,
-                        &verification.search,
-                        config.branch_reanalysis_simulations,
-                        verification.candidate_count,
-                        verification.capture_count,
-                        verification.check_count,
-                    );
-                    Some(verification.search)
+                        &verification.verified_indices,
+                    ) {
+                        let mut branch_position = position.clone();
+                        let mut branch_history = history.clone();
+                        append_history(&mut branch_history, &branch_position, mv);
+                        let mover = branch_position.side_to_move();
+                        branch_position.make_move(mv);
+                        let mut branch_rules = rule_history.clone();
+                        branch_rules.push(
+                            branch_position.rule_history_entry_after_moved(mover, mv.to as usize),
+                        );
+                        repair_suffixes.push((
+                            branch_position,
+                            branch_history,
+                            branch_rules,
+                            ply + 1,
+                        ));
+                    }
+                    endgame_repair.branches_spawned +=
+                        repair_suffixes.len().saturating_sub(suffix_count_before);
+                    spawned_repair_suffixes = !repair_suffixes.is_empty();
                 } else {
                     let moved = verification.search.best_move != search.best_move;
                     if !moved {
@@ -645,11 +630,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     } else {
                         endgame_repair.rejected_low_advantage += 1;
                     }
-                    None
                 }
-            } else {
-                None
-            };
+            }
             if should_run_endgame_audit(config, ply, &mut rng) {
                 // Always use a fresh verification here. Otherwise an audited
                 // endgame that happened to be a training branch would bias the
@@ -662,6 +644,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config,
                     &search,
                     rng.next_u64(),
+                    None,
+                    false,
                 );
                 endgame_audit.record(
                     &search,
@@ -670,25 +654,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     audit.candidate_count,
                     audit.capture_count,
                     audit.check_count,
+                    audit.explorer_count,
                 );
             }
-            let search = branch.as_ref().unwrap_or(&search);
-            let effective_search_simulations = if branch.is_some() {
-                config.branch_reanalysis_simulations
-            } else {
-                search_simulation_count
-            };
+            let effective_search_simulations = search_simulation_count;
             let effective_policy_weight =
-                policy_weight_for_search(config, effective_search_simulations)
-                    * if branch_is_endgame_repair {
-                        ENDGAME_REPAIR_POLICY_WEIGHT
-                    } else if branch_high_confidence {
-                        config.branch_reanalysis_high_confidence_policy_weight
-                    } else if branch.is_some() {
-                        config.branch_reanalysis_policy_weight
-                    } else {
-                        1.0
-                    };
+                policy_weight_for_search(config, effective_search_simulations);
+            let effective_value_weight = 1.0;
             crate::scope_profile!("az.selfplay.post_search");
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
@@ -735,6 +707,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     meta,
                     effective_search_simulations,
                     effective_policy_weight,
+                    effective_value_weight,
                 );
                 game_samples.push(sample);
                 result = Some(if position.side_to_move() == Color::Red {
@@ -746,13 +719,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 break;
             }
-            // Only the branch root is deterministic; following roots immediately
-            // resume the unchanged main-line temperature schedule.
-            let temperature = if branch.is_some() {
-                0.0
-            } else {
-                temperature_for_ply(config, ply)
-            };
+            let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
                 search.best_move.or_else(|| {
                     choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
@@ -806,6 +773,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     move_meta,
                     effective_search_simulations,
                     effective_policy_weight,
+                    effective_value_weight,
                 );
                 game_samples.push(sample);
             }
@@ -873,6 +841,19 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
+        for (branch_position, branch_history, branch_rules, branch_ply) in repair_suffixes {
+            let suffix = generate_normal_suffix(
+                model,
+                config,
+                branch_position,
+                branch_history,
+                branch_rules,
+                branch_ply,
+                rng.next_u64(),
+            );
+            samples.extend(suffix.clone());
+            games.push(suffix);
+        }
     }
 
     AzSelfplayData {
@@ -935,34 +916,141 @@ fn should_run_endgame_audit(config: &AzLoopConfig, ply: usize, rng: &mut SplitMi
         && rng.unit_f32() < config.branch_endgame_audit_probability
 }
 
-fn should_probe_endgame_repair(config: &AzLoopConfig, ply: usize, rng: &mut SplitMix64) -> bool {
-    phase_for_ply(ply) == 2
-        && config.branch_reanalysis_simulations > 0
-        && config.branch_endgame_repair_probability > 0.0
-        && rng.unit_f32() < config.branch_endgame_repair_probability
+fn random_endgame_scout_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> Option<usize> {
+    if config.branch_endgame_repair_probability <= 0.0
+        || rng.unit_f32() >= config.branch_endgame_repair_probability
+        || config.max_plies <= 40
+    {
+        return None;
+    }
+    Some(40 + (rng.next_u64() as usize % (config.max_plies - 40)))
 }
 
 fn endgame_repair_accepts(shallow: &AzSearchResult, verified: &AzSearchResult) -> bool {
-    let (Some(shallow_move), Some(verified_move)) = (shallow.best_move, verified.best_move) else {
-        return false;
-    };
-    if shallow_move == verified_move {
-        return false;
+    // The scout is exploration only. Real terminal outcomes validate its suffix;
+    // its Q estimate is never used as a value target or acceptance threshold.
+    shallow.best_move != verified.best_move
+}
+
+fn endgame_scout_branch_moves(
+    main: &AzSearchResult,
+    scout: &AzSearchResult,
+    verified_indices: &[usize],
+) -> Vec<Move> {
+    let mut indices = verified_indices.to_vec();
+    indices.sort_by(|&left, &right| {
+        scout.candidates[right]
+            .q
+            .total_cmp(&scout.candidates[left].q)
+    });
+    indices
+        .into_iter()
+        .map(|index| scout.candidates[index].mv)
+        .filter(|&mv| Some(mv) != main.best_move)
+        .take(ENDGAME_SCOUT_BRANCHES)
+        .collect()
+}
+
+fn generate_normal_suffix(
+    model: &AzNnue,
+    config: &AzLoopConfig,
+    mut position: Position,
+    mut history: Vec<HistoryMove>,
+    mut rule_history: Vec<crate::xiangqi::RuleHistoryEntry>,
+    start_ply: usize,
+    seed: u64,
+) -> Vec<AzTrainingSample> {
+    let mut rng = SplitMix64::new(seed);
+    let mut samples = Vec::new();
+    let mut result = None;
+    for ply in start_ply..config.max_plies {
+        let legal = position.legal_moves_with_rules(&rule_history);
+        if legal.is_empty() {
+            result = Some(if position.side_to_move() == Color::Red {
+                -1.0
+            } else {
+                1.0
+            });
+            break;
+        }
+        let simulations = search_simulations_for_ply(config, &mut rng);
+        let search = alphazero_search_with_history_and_rules(
+            &position,
+            &history,
+            Some(rule_history.clone()),
+            Some(legal),
+            model,
+            AzSearchLimits {
+                simulations,
+                seed: rng.next_u64(),
+                cpuct: config.cpuct,
+                cpuct_at_root: config.cpuct_at_root,
+                cpuct_base: config.cpuct_base,
+                cpuct_factor: config.cpuct_factor,
+                cpuct_base_at_root: config.cpuct_base_at_root,
+                cpuct_factor_at_root: config.cpuct_factor_at_root,
+                max_depth: 0,
+                root_dirichlet_alpha: config.root_dirichlet_alpha,
+                root_exploration_fraction: config.root_exploration_fraction,
+                fpu_value: config.fpu_value,
+                fpu_value_at_root: config.fpu_value_at_root,
+                draw_score: config.draw_score,
+                moves_left_max_effect: config.moves_left_max_effect,
+                moves_left_slope: config.moves_left_slope,
+                moves_left_threshold: config.moves_left_threshold,
+                moves_left_constant_factor: config.moves_left_constant_factor,
+                moves_left_scaled_factor: config.moves_left_scaled_factor,
+                moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+                value_scale: 1.0,
+            },
+        );
+        let temperature = temperature_for_ply(config, ply);
+        let Some(mv) = choose_selfplay_move(
+            &search.candidates,
+            temperature,
+            config.temperature_value_cutoff,
+            config.temperature_visit_offset,
+            &mut rng,
+        ) else {
+            result = Some(0.0);
+            break;
+        };
+        let meta = move_search_meta(
+            &search.candidates,
+            mv,
+            search.value_q,
+            config.generation_update,
+            seed,
+            ply,
+        );
+        samples.push(make_training_sample(
+            &position,
+            &history,
+            &search.candidates,
+            search.value_q,
+            config.policy_softmax_temp,
+            rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+            meta,
+            simulations,
+            policy_weight_for_search(config, simulations) * SCOUT_SUFFIX_TRAIN_WEIGHT,
+            SCOUT_SUFFIX_TRAIN_WEIGHT,
+        ));
+        append_history(&mut history, &position, mv);
+        let mover = position.side_to_move();
+        position.make_move(mv);
+        rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
+        if let Some(outcome) = position.rule_outcome_with_history(&rule_history) {
+            result = Some(match outcome {
+                RuleOutcome::Draw(_) => 0.0,
+                RuleOutcome::Win(Color::Red) => 1.0,
+                RuleOutcome::Win(Color::Black) => -1.0,
+            });
+            break;
+        }
     }
-    let shallow_q = verified
-        .candidates
-        .iter()
-        .find(|candidate| candidate.mv == shallow_move)
-        .map_or(-1.0, |candidate| candidate.q);
-    let Some(winner) = verified
-        .candidates
-        .iter()
-        .find(|candidate| candidate.mv == verified_move)
-    else {
-        return false;
-    };
-    winner.q - shallow_q >= ENDGAME_REPAIR_MIN_Q_ADVANTAGE
-        && winner.policy >= ENDGAME_REPAIR_MIN_POLICY_MASS
+    assign_value_targets(&mut samples, result.unwrap_or(0.0), config);
+    assign_moves_left_targets(&mut samples, config.max_plies);
+    samples
 }
 
 fn independent_leaf_verification(
@@ -973,17 +1061,23 @@ fn independent_leaf_verification(
     config: &AzLoopConfig,
     shallow: &AzSearchResult,
     seed: u64,
+    scout_simulations_per_leaf: Option<usize>,
+    verify_all_legal_children: bool,
 ) -> LeafVerification {
-    let (selected, capture_count, check_count) = select_leaf_verify_candidates(position, shallow);
+    let (selected, capture_count, check_count, explorer_count) =
+        select_leaf_verify_candidates(position, shallow, seed, verify_all_legal_children);
     if selected.is_empty() {
         return LeafVerification {
             search: shallow.clone(),
             candidate_count: 0,
             capture_count: 0,
             check_count: 0,
+            explorer_count: 0,
+            verified_indices: Vec::new(),
         };
     }
-    let per_candidate = (config.branch_reanalysis_simulations / selected.len()).max(1);
+    let per_candidate = scout_simulations_per_leaf
+        .unwrap_or_else(|| (config.branch_reanalysis_simulations / selected.len()).max(1));
     let mut verified_q = vec![None; shallow.candidates.len()];
     for &index in &selected {
         let mv = shallow.candidates[index].mv;
@@ -1057,7 +1151,7 @@ fn independent_leaf_verification(
             value_q,
             value_cp: cp_from_q(value_q),
             value_wdl: shallow.value_wdl,
-            simulations: config.branch_reanalysis_simulations,
+            simulations: per_candidate.saturating_mul(selected.len()),
             search_depth_avg: 0.0,
             search_depth_max: 0,
             search_depth_limit: per_candidate,
@@ -1067,13 +1161,17 @@ fn independent_leaf_verification(
         candidate_count: selected.len(),
         capture_count,
         check_count,
+        explorer_count,
+        verified_indices: selected,
     }
 }
 
 fn select_leaf_verify_candidates(
     position: &Position,
     shallow: &AzSearchResult,
-) -> (Vec<usize>, usize, usize) {
+    seed: u64,
+    verify_all_legal_children: bool,
+) -> (Vec<usize>, usize, usize, usize) {
     let mut captures = Vec::new();
     let mut checks = Vec::new();
     for (index, candidate) in shallow.candidates.iter().enumerate() {
@@ -1086,9 +1184,19 @@ fn select_leaf_verify_candidates(
             checks.push(index);
         }
     }
+    if verify_all_legal_children {
+        return (
+            (0..shallow.candidates.len()).collect(),
+            captures.len(),
+            checks.len(),
+            0,
+        );
+    }
     let mut selected = Vec::new();
     let mut push = |index: usize| {
-        if selected.len() < LEAF_VERIFY_MAX_CANDIDATES && !selected.contains(&index) {
+        if selected.len() < LEAF_VERIFY_MAX_CANDIDATES - LEAF_VERIFY_EXPLORER_SLOTS
+            && !selected.contains(&index)
+        {
             selected.push(index);
         }
     };
@@ -1136,27 +1244,16 @@ fn select_leaf_verify_candidates(
         .iter()
         .filter(|&&index| checks.contains(&index))
         .count();
-    (selected, selected_captures, selected_checks)
-}
-
-fn should_run_branch_reanalysis(
-    config: &AzLoopConfig,
-    search: &super::AzSearchResult,
-    rng: &mut SplitMix64,
-) -> bool {
-    if config.branch_reanalysis_simulations == 0
-        || config.branch_reanalysis_probability <= 0.0
-        || search.candidates.is_empty()
+    let explorer_pool = (0..shallow.candidates.len())
+        .filter(|index| !selected.contains(index))
+        .collect::<Vec<_>>();
+    let explorer_count = usize::from(!explorer_pool.is_empty());
+    if let Some(&index) =
+        explorer_pool.get((seed as usize).wrapping_rem(explorer_pool.len().max(1)))
     {
-        return false;
+        selected.push(index);
     }
-    let top_visit_policy = search
-        .candidates
-        .iter()
-        .map(|candidate| candidate.policy)
-        .fold(0.0f32, f32::max);
-    top_visit_policy >= config.branch_reanalysis_top_visit_threshold
-        && rng.unit_f32() < config.branch_reanalysis_probability
+    (selected, selected_captures, selected_checks, explorer_count)
 }
 
 fn deterministic_branch_limits(config: &AzLoopConfig, seed: u64) -> AzSearchLimits {
@@ -1290,6 +1387,7 @@ fn make_training_sample(
     meta: AzSampleMeta,
     search_simulations: usize,
     policy_weight: f32,
+    value_weight: f32,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
@@ -1328,7 +1426,7 @@ fn make_training_sample(
         side_sign,
         moves_left: 0.0,
         policy_weight: policy_weight.max(0.0),
-        value_weight: 1.0,
+        value_weight: value_weight.max(0.0),
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
     }
@@ -1815,6 +1913,7 @@ mod tests {
             true,
             AzSampleMeta::default(),
             1,
+            1.0,
             1.0,
         );
 
