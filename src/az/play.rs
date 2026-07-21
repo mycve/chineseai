@@ -10,30 +10,9 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::alphazero::append_history;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzSearchResult,
-    AzTrainingSample, SplitMix64, alphazero_search_with_history_and_rules, cp_from_q,
-    dense_move_index, scalar_value_to_wdl_target,
+    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
+    alphazero_search_with_history_and_rules, dense_move_index, scalar_value_to_wdl_target,
 };
-
-const HIGH_CONFIDENCE_Q_ADVANTAGE: f32 = 0.10;
-const HIGH_CONFIDENCE_POLICY_MASS: f32 = 0.50;
-const LEAF_VERIFY_MAX_CANDIDATES: usize = 6;
-const LEAF_VERIFY_EXPLORER_SLOTS: usize = 1;
-const LEAF_VERIFY_POLICY_MIX: f32 = 0.75;
-const ENDGAME_SCOUT_SIMULATIONS_PER_LEAF: usize = 500;
-const ENDGAME_SCOUT_BRANCHES: usize = 2;
-const SCOUT_MIN_PLY: usize = 40;
-const SCOUT_MAX_PLY_EXCLUSIVE: usize = 100;
-
-#[derive(Clone, Debug)]
-struct LeafVerification {
-    search: AzSearchResult,
-    candidate_count: usize,
-    capture_count: usize,
-    check_count: usize,
-    explorer_count: usize,
-    verified_indices: Vec<usize>,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
@@ -57,108 +36,6 @@ pub struct AzSearchSimulationStats {
     pub searches: usize,
     pub low_searches: usize,
     pub simulations_sum: usize,
-}
-
-/// Diagnostics for deterministic, no-noise re-searches performed inside normal
-/// self-play. They quantify whether extra internal compute actually changes a
-/// training target, rather than merely adding cost.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AzBranchReanalysisStats {
-    pub searches: usize,
-    pub simulations_sum: usize,
-    pub best_move_changed: usize,
-    pub value_delta_abs_sum: f32,
-    pub policy_kl_sum: f32,
-    /// At a flipped root, the deep-search Q of its selected move minus the
-    /// deep-search Q of the shallow selected move.
-    pub flipped_q_advantage_sum: f32,
-    pub flipped_q_advantage_count: usize,
-    /// Flips with a material Q advantage and a concentrated deep visit policy.
-    pub high_confidence_flips: usize,
-    pub verified_candidate_sum: usize,
-    pub verified_capture_candidates: usize,
-    pub verified_check_candidates: usize,
-    pub verified_explorer_candidates: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AzEndgameRepairStats {
-    pub probes: usize,
-    pub accepted: usize,
-    pub branches_spawned: usize,
-    pub rejected_no_flip: usize,
-    pub rejected_low_advantage: usize,
-    pub verifier: AzBranchReanalysisStats,
-}
-
-impl AzEndgameRepairStats {
-    pub fn add_assign(&mut self, other: &Self) {
-        self.probes += other.probes;
-        self.accepted += other.accepted;
-        self.branches_spawned += other.branches_spawned;
-        self.rejected_no_flip += other.rejected_no_flip;
-        self.rejected_low_advantage += other.rejected_low_advantage;
-        self.verifier.add_assign(&other.verifier);
-    }
-}
-
-impl AzBranchReanalysisStats {
-    pub fn add_assign(&mut self, other: &Self) {
-        self.searches += other.searches;
-        self.simulations_sum += other.simulations_sum;
-        self.best_move_changed += other.best_move_changed;
-        self.value_delta_abs_sum += other.value_delta_abs_sum;
-        self.policy_kl_sum += other.policy_kl_sum;
-        self.flipped_q_advantage_sum += other.flipped_q_advantage_sum;
-        self.flipped_q_advantage_count += other.flipped_q_advantage_count;
-        self.high_confidence_flips += other.high_confidence_flips;
-        self.verified_candidate_sum += other.verified_candidate_sum;
-        self.verified_capture_candidates += other.verified_capture_candidates;
-        self.verified_check_candidates += other.verified_check_candidates;
-        self.verified_explorer_candidates += other.verified_explorer_candidates;
-    }
-
-    fn record(
-        &mut self,
-        shallow: &super::AzSearchResult,
-        deep: &super::AzSearchResult,
-        simulations: usize,
-        candidate_count: usize,
-        capture_count: usize,
-        check_count: usize,
-        explorer_count: usize,
-    ) -> bool {
-        self.searches += 1;
-        self.simulations_sum += simulations;
-        self.verified_candidate_sum += candidate_count;
-        self.verified_capture_candidates += capture_count;
-        self.verified_check_candidates += check_count;
-        self.verified_explorer_candidates += explorer_count;
-        self.best_move_changed += usize::from(deep.best_move != shallow.best_move);
-        self.value_delta_abs_sum += (deep.value_q - shallow.value_q).abs();
-        self.policy_kl_sum += policy_kl(&shallow.candidates, &deep.candidates);
-        let mut high_confidence = false;
-        if let (Some(shallow_move), Some(deep_move)) = (shallow.best_move, deep.best_move)
-            && shallow_move != deep_move
-        {
-            let shallow_q = deep
-                .candidates
-                .iter()
-                .find(|candidate| candidate.mv == shallow_move)
-                .map_or(0.0, |candidate| candidate.q);
-            let deep = deep
-                .candidates
-                .iter()
-                .find(|candidate| candidate.mv == deep_move)
-                .expect("deep best move must be a deep-search candidate");
-            let q_advantage = deep.q - shallow_q;
-            self.flipped_q_advantage_sum += q_advantage;
-            self.flipped_q_advantage_count += 1;
-            high_confidence = is_high_confidence_branch_flip(q_advantage, deep.policy);
-            self.high_confidence_flips += usize::from(high_confidence);
-        }
-        high_confidence
-    }
 }
 
 impl AzSearchSimulationStats {
@@ -298,11 +175,6 @@ pub struct AzSelfplayData {
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
     pub search_simulations: AzSearchSimulationStats,
-    pub branch_reanalysis: AzBranchReanalysisStats,
-    pub branch_reanalysis_phase: [AzBranchReanalysisStats; 3],
-    pub phase_root_counts: [usize; 3],
-    pub endgame_audit: AzBranchReanalysisStats,
-    pub endgame_repair: AzEndgameRepairStats,
 }
 
 impl AzSelfplayData {
@@ -344,23 +216,6 @@ impl AzSelfplayData {
         self.terminal.add_assign(&other.terminal);
         self.search_simulations
             .add_assign(&other.search_simulations);
-        self.branch_reanalysis.add_assign(&other.branch_reanalysis);
-        for (left, right) in self
-            .branch_reanalysis_phase
-            .iter_mut()
-            .zip(other.branch_reanalysis_phase)
-        {
-            left.add_assign(&right);
-        }
-        for (left, right) in self
-            .phase_root_counts
-            .iter_mut()
-            .zip(other.phase_root_counts)
-        {
-            *left += right;
-        }
-        self.endgame_audit.add_assign(&other.endgame_audit);
-        self.endgame_repair.add_assign(&other.endgame_repair);
     }
 }
 
@@ -431,24 +286,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged
             .search_simulations
             .add_assign(&chunk.search_simulations);
-        merged
-            .branch_reanalysis
-            .add_assign(&chunk.branch_reanalysis);
-        for (left, right) in merged
-            .branch_reanalysis_phase
-            .iter_mut()
-            .zip(chunk.branch_reanalysis_phase)
-        {
-            left.add_assign(&right);
-        }
-        for (left, right) in merged
-            .phase_root_counts
-            .iter_mut()
-            .zip(chunk.phase_root_counts)
-        {
-            *left += right;
-        }
-        merged.endgame_audit.add_assign(&chunk.endgame_audit);
     }
     merged
 }
@@ -492,11 +329,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
-    let branch_reanalysis = AzBranchReanalysisStats::default();
-    let branch_reanalysis_phase = [AzBranchReanalysisStats::default(); 3];
-    let mut phase_root_counts = [0usize; 3];
-    let mut endgame_audit = AzBranchReanalysisStats::default();
-    let mut endgame_repair = AzEndgameRepairStats::default();
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -510,12 +342,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
-        let mut repair_suffixes = Vec::new();
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            phase_root_counts[phase_for_ply(ply)] += 1;
             let legal = {
                 crate::scope_profile!("az.selfplay.root_legal_moves");
                 position.legal_moves_with_rules(&rule_history)
@@ -568,95 +398,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     },
                 )
             };
-            // The ordinary root remains the main line. Independent search is an
-            // exploration trigger only: it creates real terminal-labelled suffixes
-            // instead of directly imposing a high-budget policy target.
-            if should_run_scout(config, ply, &mut rng) {
-                let verification = independent_leaf_verification(
-                    &position,
-                    &history,
-                    &rule_history,
-                    model,
-                    config,
-                    &search,
-                    rng.next_u64(),
-                    Some(ENDGAME_SCOUT_SIMULATIONS_PER_LEAF),
-                    true,
-                );
-                endgame_repair.probes += 1;
-                endgame_repair.verifier.record(
-                    &search,
-                    &verification.search,
-                    verification.search.simulations,
-                    verification.candidate_count,
-                    verification.capture_count,
-                    verification.check_count,
-                    verification.explorer_count,
-                );
-                if endgame_repair_accepts(&search, &verification.search) {
-                    endgame_repair.accepted += 1;
-                    let suffix_count_before = repair_suffixes.len();
-                    for mv in endgame_scout_branch_moves(
-                        &search,
-                        &verification.search,
-                        &verification.verified_indices,
-                    ) {
-                        let mut branch_position = position.clone();
-                        let mut branch_history = history.clone();
-                        append_history(&mut branch_history, &branch_position, mv);
-                        let mover = branch_position.side_to_move();
-                        branch_position.make_move(mv);
-                        let mut branch_rules = rule_history.clone();
-                        branch_rules.push(
-                            branch_position.rule_history_entry_after_moved(mover, mv.to as usize),
-                        );
-                        repair_suffixes.push((
-                            branch_position,
-                            branch_history,
-                            branch_rules,
-                            ply + 1,
-                        ));
-                    }
-                    endgame_repair.branches_spawned +=
-                        repair_suffixes.len().saturating_sub(suffix_count_before);
-                } else {
-                    let moved = verification.search.best_move != search.best_move;
-                    if !moved {
-                        endgame_repair.rejected_no_flip += 1;
-                    } else {
-                        endgame_repair.rejected_low_advantage += 1;
-                    }
-                }
-            }
-            if should_run_endgame_audit(config, ply, &mut rng) {
-                // Always use a fresh verification here. Otherwise an audited
-                // endgame that happened to be a training branch would bias the
-                // audit toward the branch trigger condition.
-                let audit = independent_leaf_verification(
-                    &position,
-                    &history,
-                    &rule_history,
-                    model,
-                    config,
-                    &search,
-                    rng.next_u64(),
-                    None,
-                    false,
-                );
-                endgame_audit.record(
-                    &search,
-                    &audit.search,
-                    config.branch_reanalysis_simulations,
-                    audit.candidate_count,
-                    audit.capture_count,
-                    audit.check_count,
-                    audit.explorer_count,
-                );
-            }
-            let effective_search_simulations = search_simulation_count;
-            let effective_policy_weight =
-                policy_weight_for_search(config, effective_search_simulations);
-            let effective_value_weight = 1.0;
             crate::scope_profile!("az.selfplay.post_search");
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
@@ -701,9 +442,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
-                    effective_search_simulations,
-                    effective_policy_weight,
-                    effective_value_weight,
+                    search_simulation_count,
+                    policy_weight_for_search(config, search_simulation_count),
                 );
                 game_samples.push(sample);
                 result = Some(if position.side_to_move() == Color::Red {
@@ -767,9 +507,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
-                    effective_search_simulations,
-                    effective_policy_weight,
-                    effective_value_weight,
+                    search_simulation_count,
+                    policy_weight_for_search(config, search_simulation_count),
                 );
                 game_samples.push(sample);
             }
@@ -837,25 +576,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
-        for (branch_position, branch_history, branch_rules, branch_ply) in repair_suffixes {
-            let (suffix, suffix_result, suffix_plies) = generate_normal_suffix(
-                model,
-                config,
-                branch_position,
-                branch_history,
-                branch_rules,
-                branch_ply,
-                rng.next_u64(),
-            );
-            match suffix_result.total_cmp(&0.0) {
-                std::cmp::Ordering::Greater => red_wins += 1,
-                std::cmp::Ordering::Less => black_wins += 1,
-                std::cmp::Ordering::Equal => draws += 1,
-            }
-            plies_total += suffix_plies;
-            samples.extend(suffix.clone());
-            games.push(suffix);
-        }
     }
 
     AzSelfplayData {
@@ -895,411 +615,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         played_q_sum,
         terminal,
         search_simulations,
-        branch_reanalysis,
-        branch_reanalysis_phase,
-        phase_root_counts,
-        endgame_audit,
-        endgame_repair,
     }
-}
-
-fn phase_for_ply(ply: usize) -> usize {
-    match ply {
-        0..=39 => 0,
-        40..=119 => 1,
-        _ => 2,
-    }
-}
-
-fn should_run_endgame_audit(config: &AzLoopConfig, ply: usize, rng: &mut SplitMix64) -> bool {
-    phase_for_ply(ply) == 2
-        && config.branch_reanalysis_simulations > 0
-        && config.branch_endgame_audit_probability > 0.0
-        && rng.unit_f32() < config.branch_endgame_audit_probability
-}
-
-fn should_run_scout(config: &AzLoopConfig, ply: usize, rng: &mut SplitMix64) -> bool {
-    (SCOUT_MIN_PLY..SCOUT_MAX_PLY_EXCLUSIVE).contains(&ply)
-        && config.branch_endgame_repair_probability > 0.0
-        && rng.unit_f32() < config.branch_endgame_repair_probability
-}
-
-fn endgame_repair_accepts(shallow: &AzSearchResult, verified: &AzSearchResult) -> bool {
-    // The scout is exploration only. Real terminal outcomes validate its suffix;
-    // its Q estimate is never used as a value target or acceptance threshold.
-    shallow.best_move != verified.best_move
-}
-
-fn endgame_scout_branch_moves(
-    main: &AzSearchResult,
-    scout: &AzSearchResult,
-    verified_indices: &[usize],
-) -> Vec<Move> {
-    let mut indices = verified_indices.to_vec();
-    indices.sort_by(|&left, &right| {
-        scout.candidates[right]
-            .q
-            .total_cmp(&scout.candidates[left].q)
-    });
-    indices
-        .into_iter()
-        .map(|index| scout.candidates[index].mv)
-        .filter(|&mv| Some(mv) != main.best_move)
-        .take(ENDGAME_SCOUT_BRANCHES)
-        .collect()
-}
-
-fn generate_normal_suffix(
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    mut position: Position,
-    mut history: Vec<HistoryMove>,
-    mut rule_history: Vec<crate::xiangqi::RuleHistoryEntry>,
-    start_ply: usize,
-    seed: u64,
-) -> (Vec<AzTrainingSample>, f32, usize) {
-    let mut rng = SplitMix64::new(seed);
-    let mut samples = Vec::new();
-    let mut result = None;
-    for ply in start_ply..config.max_plies {
-        let legal = position.legal_moves_with_rules(&rule_history);
-        if legal.is_empty() {
-            result = Some(if position.side_to_move() == Color::Red {
-                -1.0
-            } else {
-                1.0
-            });
-            break;
-        }
-        let simulations = search_simulations_for_ply(config, &mut rng);
-        let search = alphazero_search_with_history_and_rules(
-            &position,
-            &history,
-            Some(rule_history.clone()),
-            Some(legal),
-            model,
-            AzSearchLimits {
-                simulations,
-                seed: rng.next_u64(),
-                cpuct: config.cpuct,
-                cpuct_at_root: config.cpuct_at_root,
-                cpuct_base: config.cpuct_base,
-                cpuct_factor: config.cpuct_factor,
-                cpuct_base_at_root: config.cpuct_base_at_root,
-                cpuct_factor_at_root: config.cpuct_factor_at_root,
-                max_depth: 0,
-                root_dirichlet_alpha: config.root_dirichlet_alpha,
-                root_exploration_fraction: config.root_exploration_fraction,
-                fpu_value: config.fpu_value,
-                fpu_value_at_root: config.fpu_value_at_root,
-                draw_score: config.draw_score,
-                moves_left_max_effect: config.moves_left_max_effect,
-                moves_left_slope: config.moves_left_slope,
-                moves_left_threshold: config.moves_left_threshold,
-                moves_left_constant_factor: config.moves_left_constant_factor,
-                moves_left_scaled_factor: config.moves_left_scaled_factor,
-                moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-                value_scale: 1.0,
-            },
-        );
-        let temperature = temperature_for_ply(config, ply);
-        let Some(mv) = choose_selfplay_move(
-            &search.candidates,
-            temperature,
-            config.temperature_value_cutoff,
-            config.temperature_visit_offset,
-            &mut rng,
-        ) else {
-            result = Some(0.0);
-            break;
-        };
-        let meta = move_search_meta(
-            &search.candidates,
-            mv,
-            search.value_q,
-            config.generation_update,
-            seed,
-            ply,
-        );
-        samples.push(make_training_sample(
-            &position,
-            &history,
-            &search.candidates,
-            search.value_q,
-            config.policy_softmax_temp,
-            rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-            meta,
-            simulations,
-            policy_weight_for_search(config, simulations),
-            1.0,
-        ));
-        append_history(&mut history, &position, mv);
-        let mover = position.side_to_move();
-        position.make_move(mv);
-        rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
-        if let Some(outcome) = position.rule_outcome_with_history(&rule_history) {
-            result = Some(match outcome {
-                RuleOutcome::Draw(_) => 0.0,
-                RuleOutcome::Win(Color::Red) => 1.0,
-                RuleOutcome::Win(Color::Black) => -1.0,
-            });
-            break;
-        }
-    }
-    let result = result.unwrap_or(0.0);
-    assign_value_targets(&mut samples, result, config);
-    assign_moves_left_targets(&mut samples, config.max_plies);
-    let plies = start_ply + samples.len();
-    (samples, result, plies)
-}
-
-fn independent_leaf_verification(
-    position: &Position,
-    history: &[HistoryMove],
-    rule_history: &[crate::xiangqi::RuleHistoryEntry],
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    shallow: &AzSearchResult,
-    seed: u64,
-    scout_simulations_per_leaf: Option<usize>,
-    verify_all_legal_children: bool,
-) -> LeafVerification {
-    let (selected, capture_count, check_count, explorer_count) =
-        select_leaf_verify_candidates(position, shallow, seed, verify_all_legal_children);
-    if selected.is_empty() {
-        return LeafVerification {
-            search: shallow.clone(),
-            candidate_count: 0,
-            capture_count: 0,
-            check_count: 0,
-            explorer_count: 0,
-            verified_indices: Vec::new(),
-        };
-    }
-    let per_candidate = scout_simulations_per_leaf
-        .unwrap_or_else(|| (config.branch_reanalysis_simulations / selected.len()).max(1));
-    let mut verified_q = vec![None; shallow.candidates.len()];
-    for &index in &selected {
-        let mv = shallow.candidates[index].mv;
-        let mut child = position.clone();
-        let mut child_history = history.to_vec();
-        append_history(&mut child_history, &child, mv);
-        let mover = child.side_to_move();
-        child.make_move(mv);
-        let mut child_rules = rule_history.to_vec();
-        child_rules.push(child.rule_history_entry_after_moved(mover, mv.to as usize));
-        let mut limits =
-            deterministic_branch_limits(config, seed ^ (index as u64).wrapping_mul(0x9E37_79B9));
-        limits.simulations = per_candidate;
-        let result = alphazero_search_with_history_and_rules(
-            &child,
-            &child_history,
-            Some(child_rules),
-            None,
-            model,
-            limits,
-        );
-        verified_q[index] = Some(-result.value_q);
-    }
-
-    let max_q = selected
-        .iter()
-        .filter_map(|&index| verified_q[index])
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut verified_mass = vec![0.0f32; shallow.candidates.len()];
-    let mut sum = 0.0;
-    for &index in &selected {
-        let weight = ((verified_q[index].unwrap_or(-1.0) - max_q) / 0.15).exp();
-        verified_mass[index] = weight;
-        sum += weight;
-    }
-    let mut candidates = shallow.candidates.clone();
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        if let Some(q) = verified_q[index] {
-            candidate.q = q;
-        }
-        let verified_policy = if sum > 0.0 {
-            verified_mass[index] / sum
-        } else {
-            0.0
-        };
-        candidate.policy = (1.0 - LEAF_VERIFY_POLICY_MIX) * candidate.policy
-            + LEAF_VERIFY_POLICY_MIX * verified_policy;
-    }
-    let policy_sum = candidates
-        .iter()
-        .map(|candidate| candidate.policy)
-        .sum::<f32>()
-        .max(1e-8);
-    for candidate in &mut candidates {
-        candidate.policy /= policy_sum;
-        candidate.visits = (candidate.policy * config.branch_reanalysis_simulations as f32) as u32;
-    }
-    let best_index = selected
-        .iter()
-        .copied()
-        .max_by(|&left, &right| {
-            verified_q[left]
-                .unwrap_or(-1.0)
-                .total_cmp(&verified_q[right].unwrap_or(-1.0))
-        })
-        .unwrap_or(0);
-    let value_q = verified_q[best_index].unwrap_or(shallow.value_q);
-    LeafVerification {
-        search: AzSearchResult {
-            best_move: Some(candidates[best_index].mv),
-            value_q,
-            value_cp: cp_from_q(value_q),
-            value_wdl: shallow.value_wdl,
-            simulations: per_candidate.saturating_mul(selected.len()),
-            search_depth_avg: 0.0,
-            search_depth_max: 0,
-            search_depth_limit: per_candidate,
-            search_depth_cutoffs: 0,
-            candidates,
-        },
-        candidate_count: selected.len(),
-        capture_count,
-        check_count,
-        explorer_count,
-        verified_indices: selected,
-    }
-}
-
-fn select_leaf_verify_candidates(
-    position: &Position,
-    shallow: &AzSearchResult,
-    seed: u64,
-    verify_all_legal_children: bool,
-) -> (Vec<usize>, usize, usize, usize) {
-    let mut captures = Vec::new();
-    let mut checks = Vec::new();
-    for (index, candidate) in shallow.candidates.iter().enumerate() {
-        if position.piece_at(candidate.mv.to as usize).is_some() {
-            captures.push(index);
-        }
-        let mut child = position.clone();
-        child.make_move(candidate.mv);
-        if child.in_check(child.side_to_move()) {
-            checks.push(index);
-        }
-    }
-    if verify_all_legal_children {
-        return (
-            (0..shallow.candidates.len()).collect(),
-            captures.len(),
-            checks.len(),
-            0,
-        );
-    }
-    let mut selected = Vec::new();
-    let mut push = |index: usize| {
-        if selected.len() < LEAF_VERIFY_MAX_CANDIDATES - LEAF_VERIFY_EXPLORER_SLOTS
-            && !selected.contains(&index)
-        {
-            selected.push(index);
-        }
-    };
-    let mut by_visits = (0..shallow.candidates.len()).collect::<Vec<_>>();
-    by_visits.sort_by_key(|&index| std::cmp::Reverse(shallow.candidates[index].visits));
-    for index in by_visits.into_iter().take(2) {
-        push(index);
-    }
-    // Preserve the main search's selected move even in tactically busy nodes.
-    if let Some(index) = shallow.best_move.and_then(|mv| {
-        shallow
-            .candidates
-            .iter()
-            .position(|candidate| candidate.mv == mv)
-    }) {
-        push(index);
-    }
-    // Captures and checks are then given priority over a prior-only candidate.
-    for &index in captures.iter().chain(checks.iter()) {
-        push(index);
-    }
-    let mut by_prior = (0..shallow.candidates.len()).collect::<Vec<_>>();
-    by_prior.sort_by(|&left, &right| {
-        shallow.candidates[right]
-            .raw_prior
-            .total_cmp(&shallow.candidates[left].raw_prior)
-    });
-    if let Some(index) = by_prior.first() {
-        push(*index);
-    }
-    let mut by_q = (0..shallow.candidates.len()).collect::<Vec<_>>();
-    by_q.sort_by(|&left, &right| {
-        shallow.candidates[right]
-            .q
-            .total_cmp(&shallow.candidates[left].q)
-    });
-    if let Some(index) = by_q.first() {
-        push(*index);
-    }
-    let selected_captures = selected
-        .iter()
-        .filter(|&&index| captures.contains(&index))
-        .count();
-    let selected_checks = selected
-        .iter()
-        .filter(|&&index| checks.contains(&index))
-        .count();
-    let explorer_pool = (0..shallow.candidates.len())
-        .filter(|index| !selected.contains(index))
-        .collect::<Vec<_>>();
-    let explorer_count = usize::from(!explorer_pool.is_empty());
-    if let Some(&index) =
-        explorer_pool.get((seed as usize).wrapping_rem(explorer_pool.len().max(1)))
-    {
-        selected.push(index);
-    }
-    (selected, selected_captures, selected_checks, explorer_count)
-}
-
-fn deterministic_branch_limits(config: &AzLoopConfig, seed: u64) -> AzSearchLimits {
-    AzSearchLimits {
-        simulations: config.branch_reanalysis_simulations,
-        seed,
-        cpuct: config.cpuct,
-        cpuct_at_root: config.cpuct_at_root,
-        cpuct_base: config.cpuct_base,
-        cpuct_factor: config.cpuct_factor,
-        cpuct_base_at_root: config.cpuct_base_at_root,
-        cpuct_factor_at_root: config.cpuct_factor_at_root,
-        max_depth: 0,
-        root_dirichlet_alpha: 0.0,
-        root_exploration_fraction: 0.0,
-        fpu_value: config.fpu_value,
-        fpu_value_at_root: config.fpu_value_at_root,
-        draw_score: config.draw_score,
-        moves_left_max_effect: config.moves_left_max_effect,
-        moves_left_slope: config.moves_left_slope,
-        moves_left_threshold: config.moves_left_threshold,
-        moves_left_constant_factor: config.moves_left_constant_factor,
-        moves_left_scaled_factor: config.moves_left_scaled_factor,
-        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-        value_scale: 1.0,
-    }
-}
-
-fn policy_kl(source: &[AzCandidate], target: &[AzCandidate]) -> f32 {
-    source
-        .iter()
-        .filter_map(|left| {
-            let p = left.policy.max(0.0);
-            (p > 1.0e-8).then(|| {
-                let q = target
-                    .iter()
-                    .find(|right| right.mv == left.mv)
-                    .map_or(1.0e-8, |right| right.policy.max(1.0e-8));
-                p * (p / q).ln()
-            })
-        })
-        .sum()
-}
-
-fn is_high_confidence_branch_flip(q_advantage: f32, deep_policy: f32) -> bool {
-    q_advantage >= HIGH_CONFIDENCE_Q_ADVANTAGE && deep_policy >= HIGH_CONFIDENCE_POLICY_MASS
 }
 
 fn search_simulations_for_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> usize {
@@ -1387,7 +703,6 @@ fn make_training_sample(
     meta: AzSampleMeta,
     search_simulations: usize,
     policy_weight: f32,
-    value_weight: f32,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
@@ -1426,7 +741,7 @@ fn make_training_sample(
         side_sign,
         moves_left: 0.0,
         policy_weight: policy_weight.max(0.0),
-        value_weight: value_weight.max(0.0),
+        value_weight: 1.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
     }
@@ -1913,7 +1228,6 @@ mod tests {
             true,
             AzSampleMeta::default(),
             1,
-            1.0,
             1.0,
         );
 

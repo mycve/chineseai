@@ -478,7 +478,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "ls{}_lsp{}_lspw{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_brp{}_brt{}_brs{}_brw{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -523,10 +523,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
-        f32_slug(config.branch_reanalysis_probability),
-        f32_slug(config.branch_reanalysis_top_visit_threshold),
-        config.branch_reanalysis_simulations,
-        f32_slug(config.branch_reanalysis_policy_weight),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -587,10 +583,6 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     config.low_simulations = 256;
     config.low_simulation_probability = 0.35;
     config.low_simulation_policy_weight = 0.35;
-    config.branch_reanalysis_probability = 0.0;
-    config.branch_reanalysis_simulations = 0;
-    config.branch_endgame_repair_probability = 0.0;
-    config.branch_endgame_audit_probability = 0.0;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
     config.train_warmup_samples = config.train_samples_per_update;
@@ -1056,14 +1048,6 @@ fn build_az_loop_config(
         low_simulations: config.low_simulations,
         low_simulation_probability: config.low_simulation_probability,
         low_simulation_policy_weight: config.low_simulation_policy_weight,
-        branch_reanalysis_probability: config.branch_reanalysis_probability,
-        branch_reanalysis_top_visit_threshold: config.branch_reanalysis_top_visit_threshold,
-        branch_reanalysis_simulations: config.branch_reanalysis_simulations,
-        branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
-        branch_reanalysis_high_confidence_policy_weight: config
-            .branch_reanalysis_high_confidence_policy_weight,
-        branch_endgame_repair_probability: config.branch_endgame_repair_probability,
-        branch_endgame_audit_probability: config.branch_endgame_audit_probability,
         seed,
         workers,
         generation_update,
@@ -1145,49 +1129,6 @@ fn build_async_training_report(
     let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
     let sampled_moves = pending.selfplay.sampled_moves.max(1) as f32;
     let search_count = pending.selfplay.search_simulations.searches.max(1) as f32;
-    let branch_count = pending.selfplay.branch_reanalysis.searches.max(1) as f32;
-    let branch_flip_count = pending
-        .selfplay
-        .branch_reanalysis
-        .flipped_q_advantage_count
-        .max(1) as f32;
-    let phase_root_counts = pending.selfplay.phase_root_counts;
-    let branch_reanalysis_phase = std::array::from_fn(|phase| {
-        let stats = pending.selfplay.branch_reanalysis_phase[phase];
-        let searches = stats.searches.max(1) as f32;
-        let flips = stats.flipped_q_advantage_count.max(1) as f32;
-        chineseai::az::AzBranchPhaseReport {
-            rate: stats.searches as f32 / phase_root_counts[phase].max(1) as f32,
-            move_flip_rate: stats.best_move_changed as f32 / searches,
-            high_confidence_flip_rate: stats.high_confidence_flips as f32 / searches,
-            flipped_q_advantage: stats.flipped_q_advantage_sum / flips,
-            verify_avg_candidates: stats.verified_candidate_sum as f32 / searches,
-        }
-    });
-    let audit = pending.selfplay.endgame_audit;
-    let audit_count = audit.searches.max(1) as f32;
-    let branch_endgame_audit = chineseai::az::AzBranchAuditReport {
-        rate: audit.searches as f32 / phase_root_counts[2].max(1) as f32,
-        move_flip_rate: audit.best_move_changed as f32 / audit_count,
-        value_delta_abs: audit.value_delta_abs_sum / audit_count,
-        policy_kl: audit.policy_kl_sum / audit_count,
-        verify_avg_candidates: audit.verified_candidate_sum as f32 / audit_count,
-        verify_capture_candidates: audit.verified_capture_candidates as f32 / audit_count,
-        verify_check_candidates: audit.verified_check_candidates as f32 / audit_count,
-    };
-    let repair = pending.selfplay.endgame_repair;
-    let repair_probes = repair.probes.max(1) as f32;
-    let repair_flips = repair.verifier.flipped_q_advantage_count.max(1) as f32;
-    let branch_endgame_repair = chineseai::az::AzEndgameRepairReport {
-        probe_rate: repair.probes as f32 / selfplay_games.max(1) as f32,
-        accepted_rate: repair.accepted as f32 / repair_probes,
-        branches_per_probe: repair.branches_spawned as f32 / repair_probes,
-        verifier_flip_rate: repair.verifier.best_move_changed as f32 / repair_probes,
-        verifier_flipped_q_advantage: repair.verifier.flipped_q_advantage_sum / repair_flips,
-        rejected_no_flip_rate: repair.rejected_no_flip as f32 / repair_probes,
-        rejected_low_advantage_rate: repair.rejected_low_advantage as f32 / repair_probes,
-        verify_avg_candidates: repair.verifier.verified_candidate_sum as f32 / repair_probes,
-    };
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1224,41 +1165,6 @@ fn build_async_training_report(
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
         low_simulation_rate: pending.selfplay.search_simulations.low_searches as f32 / search_count,
-        branch_reanalysis_rate: pending.selfplay.branch_reanalysis.searches as f32 / search_count,
-        branch_reanalysis_avg_simulations: pending.selfplay.branch_reanalysis.simulations_sum
-            as f32
-            / branch_count,
-        branch_reanalysis_move_flip_rate: pending.selfplay.branch_reanalysis.best_move_changed
-            as f32
-            / branch_count,
-        branch_reanalysis_value_delta_abs: pending.selfplay.branch_reanalysis.value_delta_abs_sum
-            / branch_count,
-        branch_reanalysis_policy_kl: pending.selfplay.branch_reanalysis.policy_kl_sum
-            / branch_count,
-        branch_reanalysis_flipped_q_advantage: pending
-            .selfplay
-            .branch_reanalysis
-            .flipped_q_advantage_sum
-            / branch_flip_count,
-        branch_reanalysis_high_confidence_flip_rate: pending
-            .selfplay
-            .branch_reanalysis
-            .high_confidence_flips as f32
-            / branch_count,
-        branch_verify_avg_candidates: pending.selfplay.branch_reanalysis.verified_candidate_sum
-            as f32
-            / branch_count,
-        branch_verify_capture_candidates: pending
-            .selfplay
-            .branch_reanalysis
-            .verified_capture_candidates as f32
-            / branch_count,
-        branch_verify_check_candidates: pending.selfplay.branch_reanalysis.verified_check_candidates
-            as f32
-            / branch_count,
-        branch_reanalysis_phase,
-        branch_endgame_repair,
-        branch_endgame_audit,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -2042,13 +1948,6 @@ fn main() {
                     low_simulations: simulations,
                     low_simulation_probability: 0.0,
                     low_simulation_policy_weight: 1.0,
-                    branch_reanalysis_probability: 0.0,
-                    branch_reanalysis_top_visit_threshold: 1.0,
-                    branch_reanalysis_simulations: 0,
-                    branch_reanalysis_policy_weight: 1.0,
-                    branch_reanalysis_high_confidence_policy_weight: 1.0,
-                    branch_endgame_repair_probability: 0.0,
-                    branch_endgame_audit_probability: 0.0,
                     seed,
                     workers,
                     generation_update: 0,
@@ -2275,13 +2174,6 @@ fn main() {
                     low_simulations: simulations,
                     low_simulation_probability: 0.0,
                     low_simulation_policy_weight: 1.0,
-                    branch_reanalysis_probability: 0.0,
-                    branch_reanalysis_top_visit_threshold: 1.0,
-                    branch_reanalysis_simulations: 0,
-                    branch_reanalysis_policy_weight: 1.0,
-                    branch_reanalysis_high_confidence_policy_weight: 1.0,
-                    branch_endgame_repair_probability: 0.0,
-                    branch_endgame_audit_probability: 0.0,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
                     generation_update: 0,
@@ -2712,12 +2604,6 @@ fn main() {
                 config.pikafish_label_eval_cpuct,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
-            );
-            println!(
-                "branch   : direct_high_budget_correction=disabled audit_simulations={} per_root_scout_probability={} scout_ply_range=40..100 all_legal_children_per_leaf=500 scout_branches=2 endgame_audit_probability={}; mainline_temperature_and_noise=unchanged",
-                config.branch_reanalysis_simulations,
-                config.branch_endgame_repair_probability,
-                config.branch_endgame_audit_probability,
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -3274,25 +3160,6 @@ fn main() {
                             path.display()
                         ))
                 );
-                println!(
-                    "endgame-scout {update:04}: probes/game={:.3} flip={:.3} branches/probe={:.3} verifier_adv={:.3} reject(no_flip={:.3}) cand={:.1}",
-                    report.branch_endgame_repair.probe_rate,
-                    report.branch_endgame_repair.verifier_flip_rate,
-                    report.branch_endgame_repair.branches_per_probe,
-                    report.branch_endgame_repair.verifier_flipped_q_advantage,
-                    report.branch_endgame_repair.rejected_no_flip_rate,
-                    report.branch_endgame_repair.verify_avg_candidates,
-                );
-                println!(
-                    "endgame-audit {update:04}: rate={:.4} flip={:.3} |dV|={:.3} kl={:.3} cand={:.1} cap={:.1} chk={:.1}",
-                    report.branch_endgame_audit.rate,
-                    report.branch_endgame_audit.move_flip_rate,
-                    report.branch_endgame_audit.value_delta_abs,
-                    report.branch_endgame_audit.policy_kl,
-                    report.branch_endgame_audit.verify_avg_candidates,
-                    report.branch_endgame_audit.verify_capture_candidates,
-                    report.branch_endgame_audit.verify_check_candidates,
-                );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
                 log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
                 log_scalar(
@@ -3401,178 +3268,6 @@ fn main() {
                     "selfplay/low_simulation_rate",
                     update,
                     report.low_simulation_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/reanalysis_rate",
-                    update,
-                    report.branch_reanalysis_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/avg_simulations",
-                    update,
-                    report.branch_reanalysis_avg_simulations,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/best_move_flip_rate",
-                    update,
-                    report.branch_reanalysis_move_flip_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/value_delta_abs",
-                    update,
-                    report.branch_reanalysis_value_delta_abs,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/policy_kl",
-                    update,
-                    report.branch_reanalysis_policy_kl,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/flipped_q_advantage",
-                    update,
-                    report.branch_reanalysis_flipped_q_advantage,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/high_confidence_flip_rate",
-                    update,
-                    report.branch_reanalysis_high_confidence_flip_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/avg_verified_candidates",
-                    update,
-                    report.branch_verify_avg_candidates,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/capture_candidates",
-                    update,
-                    report.branch_verify_capture_candidates,
-                );
-                log_scalar(
-                    &mut tb,
-                    "branch/check_candidates",
-                    update,
-                    report.branch_verify_check_candidates,
-                );
-                for (phase, name) in ["opening", "midgame", "endgame"].into_iter().enumerate() {
-                    let branch = report.branch_reanalysis_phase[phase];
-                    log_scalar(&mut tb, &format!("branch/{name}/rate"), update, branch.rate);
-                    log_scalar(
-                        &mut tb,
-                        &format!("branch/{name}/move_flip_rate"),
-                        update,
-                        branch.move_flip_rate,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("branch/{name}/high_confidence_flip_rate"),
-                        update,
-                        branch.high_confidence_flip_rate,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("branch/{name}/flipped_q_advantage"),
-                        update,
-                        branch.flipped_q_advantage,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("branch/{name}/avg_verified_candidates"),
-                        update,
-                        branch.verify_avg_candidates,
-                    );
-                }
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/probe_rate",
-                    update,
-                    report.branch_endgame_repair.probe_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/accepted_rate",
-                    update,
-                    report.branch_endgame_repair.accepted_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/verifier_flip_rate",
-                    update,
-                    report.branch_endgame_repair.verifier_flip_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/flipped_q_advantage",
-                    update,
-                    report.branch_endgame_repair.verifier_flipped_q_advantage,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/rejected_no_flip_rate",
-                    update,
-                    report.branch_endgame_repair.rejected_no_flip_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/rejected_low_advantage_rate",
-                    update,
-                    report.branch_endgame_repair.rejected_low_advantage_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_repair/avg_verified_candidates",
-                    update,
-                    report.branch_endgame_repair.verify_avg_candidates,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/rate",
-                    update,
-                    report.branch_endgame_audit.rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/move_flip_rate",
-                    update,
-                    report.branch_endgame_audit.move_flip_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/value_delta_abs",
-                    update,
-                    report.branch_endgame_audit.value_delta_abs,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/policy_kl",
-                    update,
-                    report.branch_endgame_audit.policy_kl,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/avg_verified_candidates",
-                    update,
-                    report.branch_endgame_audit.verify_avg_candidates,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/capture_candidates",
-                    update,
-                    report.branch_endgame_audit.verify_capture_candidates,
-                );
-                log_scalar(
-                    &mut tb,
-                    "endgame_audit/check_candidates",
-                    update,
-                    report.branch_endgame_audit.verify_check_candidates,
                 );
                 log_scalar(
                     &mut tb,
