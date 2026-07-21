@@ -838,7 +838,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         samples.extend(game_samples.clone());
         games.push(game_samples);
         for (branch_position, branch_history, branch_rules, branch_ply) in repair_suffixes {
-            let suffix = generate_normal_suffix(
+            let (suffix, suffix_result, suffix_plies) = generate_normal_suffix(
                 model,
                 config,
                 branch_position,
@@ -847,6 +847,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 branch_ply,
                 rng.next_u64(),
             );
+            match suffix_result.total_cmp(&0.0) {
+                std::cmp::Ordering::Greater => red_wins += 1,
+                std::cmp::Ordering::Less => black_wins += 1,
+                std::cmp::Ordering::Equal => draws += 1,
+            }
+            plies_total += suffix_plies;
             samples.extend(suffix.clone());
             games.push(suffix);
         }
@@ -951,7 +957,7 @@ fn generate_normal_suffix(
     mut rule_history: Vec<crate::xiangqi::RuleHistoryEntry>,
     start_ply: usize,
     seed: u64,
-) -> Vec<AzTrainingSample> {
+) -> (Vec<AzTrainingSample>, f32, usize) {
     let mut rng = SplitMix64::new(seed);
     let mut samples = Vec::new();
     let mut result = None;
@@ -1040,9 +1046,11 @@ fn generate_normal_suffix(
             break;
         }
     }
-    assign_value_targets(&mut samples, result.unwrap_or(0.0), config);
+    let result = result.unwrap_or(0.0);
+    assign_value_targets(&mut samples, result, config);
     assign_moves_left_targets(&mut samples, config.max_plies);
-    samples
+    let plies = start_ply + samples.len();
+    (samples, result, plies)
 }
 
 fn independent_leaf_verification(
