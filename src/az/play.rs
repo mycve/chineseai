@@ -24,6 +24,10 @@ const LEAF_VERIFY_POLICY_MIX: f32 = 0.75;
 // applying the opening-scale 0.04 threshold here.
 const ENDGAME_REPAIR_MIN_Q_ADVANTAGE: f32 = 0.02;
 const ENDGAME_REPAIR_MIN_POLICY_MASS: f32 = 0.35;
+// Accepted endgame repairs are rare (uniform probe × verified flip × gate).
+// A normal 2x branch weight is numerically lost in a million-sample replay, so
+// amplify policy imitation only; its value target remains the played game's result.
+const ENDGAME_REPAIR_POLICY_WEIGHT: f32 = 24.0;
 
 #[derive(Clone, Debug)]
 struct LeafVerification {
@@ -566,6 +570,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             // move continues the game. This is self-correction, not an external
             // teacher and not a forced-line search change.
             let mut branch_high_confidence = false;
+            let mut branch_is_endgame_repair = false;
             let branch = if should_run_branch_reanalysis(config, &search, &mut rng) {
                 let verification = independent_leaf_verification(
                     &position,
@@ -615,6 +620,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 );
                 if endgame_repair_accepts(&search, &verification.search) {
                     endgame_repair.accepted += 1;
+                    branch_is_endgame_repair = true;
                     branch_high_confidence = branch_reanalysis.record(
                         &search,
                         &verification.search,
@@ -674,7 +680,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             };
             let effective_policy_weight =
                 policy_weight_for_search(config, effective_search_simulations)
-                    * if branch_high_confidence {
+                    * if branch_is_endgame_repair {
+                        ENDGAME_REPAIR_POLICY_WEIGHT
+                    } else if branch_high_confidence {
                         config.branch_reanalysis_high_confidence_policy_weight
                     } else if branch.is_some() {
                         config.branch_reanalysis_policy_weight
