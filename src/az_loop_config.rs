@@ -87,10 +87,10 @@ impl Default for AzLoopFileConfig {
             simulations: 4000,
             high_simulations: 20000,
             high_simulation_probability: 0.1,
-            high_simulation_start_plies: 20,
+            high_simulation_start_plies: 40,
             selfplay_samples_per_update: 120000,
-            lr: 0.0005,
-            lr_min: 0.0001,
+            lr: 0.0007,
+            lr_min: 0.00015,
             lr_decay_start_update: 100,
             lr_decay_interval: 200,
             lr_decay_factor: 0.9,
@@ -100,20 +100,20 @@ impl Default for AzLoopFileConfig {
             seed: 20260420,
             workers: 192,
             temperature_start: 0.9,
-            temperature_endgame: 0.5,
-            temperature_decay_delay_plies: 30,
-            temperature_decay_plies: 60,
-            temperature_value_cutoff: 0.12,
+            temperature_endgame: 0.20,
+            temperature_decay_delay_plies: 24,
+            temperature_decay_plies: 48,
+            temperature_value_cutoff: 0.18,
             temperature_visit_offset: -0.8,
-            cpuct: 0.90,
-            cpuct_at_root: 2.0,
-            cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
-            root_dirichlet_alpha: 0.12,
-            root_exploration_fraction: 0.1,
-            fpu_value: 0.23,
+            cpuct: 1.20,
+            cpuct_at_root: 2.20,
+            cpuct_base: 8192.0,
+            cpuct_factor: 1.0,
+            cpuct_base_at_root: 8192.0,
+            cpuct_factor_at_root: 1.0,
+            root_dirichlet_alpha: 0.15,
+            root_exploration_fraction: 0.12,
+            fpu_value: 0.0,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
             moves_left_max_effect: 0.25,
@@ -639,22 +639,22 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.contains("lr = 0.0005\n"));
-        assert!(text.contains("lr_min = 0.0001\n"));
+        assert!(text.contains("lr = 0.0007\n"));
+        assert!(text.contains("lr_min = 0.00015\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
-        assert!(text.contains("temperature_endgame = 0.5\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 30\n"));
-        assert!(text.contains("temperature_decay_plies = 60\n"));
+        assert!(text.contains("temperature_endgame = 0.2\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 24\n"));
+        assert!(text.contains("temperature_decay_plies = 48\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("temperature_value_cutoff = 0.12\n"));
+        assert!(text.contains("temperature_value_cutoff = 0.18\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
-        assert!(text.contains("cpuct = 0.9\n"));
-        assert!(text.contains("cpuct_at_root = 2.0\n"));
-        assert!(text.contains("cpuct_base = 19652.0\n"));
-        assert!(text.contains("cpuct_factor = 2.0\n"));
-        assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
-        assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
-        assert!(text.contains("fpu_value = 0.23\n"));
+        assert!(text.contains("cpuct = 1.2\n"));
+        assert!(text.contains("cpuct_at_root = 2.2\n"));
+        assert!(text.contains("cpuct_base = 8192.0\n"));
+        assert!(text.contains("cpuct_factor = 1.0\n"));
+        assert!(text.contains("cpuct_base_at_root = 8192.0\n"));
+        assert!(text.contains("cpuct_factor_at_root = 1.0\n"));
+        assert!(text.contains("fpu_value = 0.0\n"));
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("moves_left_max_effect = 0.25\n"));
@@ -673,7 +673,7 @@ mod tests {
         assert!(!text.contains("low_simulation_policy_weight"));
         assert!(text.contains("high_simulations = 20000\n"));
         assert!(text.contains("high_simulation_probability = 0.1\n"));
-        assert!(text.contains("high_simulation_start_plies = 20\n"));
+        assert!(text.contains("high_simulation_start_plies = 40\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));
@@ -706,7 +706,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.0005).abs() < 1e-9);
+        assert!((parsed.lr - 0.0007).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
 
