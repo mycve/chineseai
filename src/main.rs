@@ -1147,15 +1147,7 @@ fn build_async_training_report(
         .branch_reanalysis
         .flipped_q_advantage_count
         .max(1) as f32;
-    let phase_root_counts = [
-        pending.selfplay.opening_shape_count,
-        pending.selfplay.entropy_mid_count,
-        pending
-            .selfplay
-            .shape_count
-            .saturating_sub(pending.selfplay.opening_shape_count)
-            .saturating_sub(pending.selfplay.entropy_mid_count),
-    ];
+    let phase_root_counts = pending.selfplay.phase_root_counts;
     let branch_reanalysis_phase = std::array::from_fn(|phase| {
         let stats = pending.selfplay.branch_reanalysis_phase[phase];
         let searches = stats.searches.max(1) as f32;

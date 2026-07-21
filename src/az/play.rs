@@ -245,6 +245,7 @@ pub struct AzSelfplayData {
     pub search_simulations: AzSearchSimulationStats,
     pub branch_reanalysis: AzBranchReanalysisStats,
     pub branch_reanalysis_phase: [AzBranchReanalysisStats; 3],
+    pub phase_root_counts: [usize; 3],
 }
 
 impl AzSelfplayData {
@@ -293,6 +294,13 @@ impl AzSelfplayData {
             .zip(other.branch_reanalysis_phase)
         {
             left.add_assign(&right);
+        }
+        for (left, right) in self
+            .phase_root_counts
+            .iter_mut()
+            .zip(other.phase_root_counts)
+        {
+            *left += right;
         }
     }
 }
@@ -374,6 +382,13 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         {
             left.add_assign(&right);
         }
+        for (left, right) in merged
+            .phase_root_counts
+            .iter_mut()
+            .zip(chunk.phase_root_counts)
+        {
+            *left += right;
+        }
     }
     merged
 }
@@ -419,6 +434,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut search_simulations = AzSearchSimulationStats::default();
     let mut branch_reanalysis = AzBranchReanalysisStats::default();
     let mut branch_reanalysis_phase = [AzBranchReanalysisStats::default(); 3];
+    let mut phase_root_counts = [0usize; 3];
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -436,6 +452,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
+            phase_root_counts[phase_for_ply(ply)] += 1;
             let legal = {
                 crate::scope_profile!("az.selfplay.root_legal_moves");
                 position.legal_moves_with_rules(&rule_history)
@@ -757,6 +774,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         search_simulations,
         branch_reanalysis,
         branch_reanalysis_phase,
+        phase_root_counts,
     }
 }
 
