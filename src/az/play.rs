@@ -511,8 +511,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut result = None;
         let mut plies = 0usize;
         let mut repair_suffixes = Vec::new();
-        let mut spawned_repair_suffixes = false;
-        let scout_target_ply = random_endgame_scout_ply(config, &mut rng);
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
 
         for ply in 0..config.max_plies {
@@ -573,7 +571,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             // The ordinary root remains the main line. Independent search is an
             // exploration trigger only: it creates real terminal-labelled suffixes
             // instead of directly imposing a high-budget policy target.
-            if !spawned_repair_suffixes && scout_target_ply == Some(ply) {
+            if should_run_scout(config, ply, &mut rng) {
                 let verification = independent_leaf_verification(
                     &position,
                     &history,
@@ -621,7 +619,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     }
                     endgame_repair.branches_spawned +=
                         repair_suffixes.len().saturating_sub(suffix_count_before);
-                    spawned_repair_suffixes = !repair_suffixes.is_empty();
                 } else {
                     let moved = verification.search.best_move != search.best_move;
                     if !moved {
@@ -915,15 +912,10 @@ fn should_run_endgame_audit(config: &AzLoopConfig, ply: usize, rng: &mut SplitMi
         && rng.unit_f32() < config.branch_endgame_audit_probability
 }
 
-fn random_endgame_scout_ply(config: &AzLoopConfig, rng: &mut SplitMix64) -> Option<usize> {
-    if config.branch_endgame_repair_probability <= 0.0
-        || rng.unit_f32() >= config.branch_endgame_repair_probability
-        || config.max_plies <= SCOUT_MIN_PLY
-    {
-        return None;
-    }
-    let upper = config.max_plies.min(SCOUT_MAX_PLY_EXCLUSIVE);
-    Some(SCOUT_MIN_PLY + (rng.next_u64() as usize % (upper.saturating_sub(SCOUT_MIN_PLY).max(1))))
+fn should_run_scout(config: &AzLoopConfig, ply: usize, rng: &mut SplitMix64) -> bool {
+    (SCOUT_MIN_PLY..SCOUT_MAX_PLY_EXCLUSIVE).contains(&ply)
+        && config.branch_endgame_repair_probability > 0.0
+        && rng.unit_f32() < config.branch_endgame_repair_probability
 }
 
 fn endgame_repair_accepts(shallow: &AzSearchResult, verified: &AzSearchResult) -> bool {

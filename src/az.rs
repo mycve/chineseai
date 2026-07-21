@@ -560,8 +560,8 @@ pub struct AzLoopConfig {
     pub branch_reanalysis_policy_weight: f32,
     /// Policy-loss weight reserved for a high-confidence branch correction.
     pub branch_reanalysis_high_confidence_policy_weight: f32,
-    /// Per-game probability of scouting one randomly selected late-game ply,
-    /// independent of root policy concentration.
+    /// Per-root probability of independently scouting a ply in the configured
+    /// mid/end-game range, independent of root policy concentration.
     pub branch_endgame_repair_probability: f32,
     /// Uniform no-noise audit probability for late-game roots. Audit results are
     /// diagnostic only and never alter self-play targets or played moves.

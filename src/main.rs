@@ -2714,7 +2714,7 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "branch   : direct_high_budget_correction=disabled audit_simulations={} random_ply_scout_probability={} scout_ply_range=40..100 all_legal_children_per_leaf=500 scout_branches=2 endgame_audit_probability={}; mainline_temperature_and_noise=unchanged",
+                "branch   : direct_high_budget_correction=disabled audit_simulations={} per_root_scout_probability={} scout_ply_range=40..100 all_legal_children_per_leaf=500 scout_branches=2 endgame_audit_probability={}; mainline_temperature_and_noise=unchanged",
                 config.branch_reanalysis_simulations,
                 config.branch_endgame_repair_probability,
                 config.branch_endgame_audit_probability,
@@ -3190,7 +3190,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} branch(rate={:.3} sims={:.0} flip={:.3} |dV|={:.3} kl={:.3} flipAdv={:.3} highFlip={:.3} cand={:.1} cap={:.1} chk={:.1}) opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3219,16 +3219,6 @@ fn main() {
                     report.avg_plies,
                     report.avg_search_simulations,
                     report.low_simulation_rate,
-                    report.branch_reanalysis_rate,
-                    report.branch_reanalysis_avg_simulations,
-                    report.branch_reanalysis_move_flip_rate,
-                    report.branch_reanalysis_value_delta_abs,
-                    report.branch_reanalysis_policy_kl,
-                    report.branch_reanalysis_flipped_q_advantage,
-                    report.branch_reanalysis_high_confidence_flip_rate,
-                    report.branch_verify_avg_candidates,
-                    report.branch_verify_capture_candidates,
-                    report.branch_verify_check_candidates,
                     report.loss,
                     report.value_loss,
                     report.legal_moves_loss,
@@ -3285,7 +3275,7 @@ fn main() {
                         ))
                 );
                 println!(
-                    "endgame-scout {update:04}: probe={:.4} flip={:.3} branches/probe={:.3} verifier_adv={:.3} reject(no_flip={:.3}) cand={:.1}",
+                    "endgame-scout {update:04}: probes/game={:.3} flip={:.3} branches/probe={:.3} verifier_adv={:.3} reject(no_flip={:.3}) cand={:.1}",
                     report.branch_endgame_repair.probe_rate,
                     report.branch_endgame_repair.verifier_flip_rate,
                     report.branch_endgame_repair.branches_per_probe,
