@@ -15,6 +15,7 @@ pub struct AzLoopFileConfig {
     pub branch_reanalysis_simulations: usize,
     pub branch_reanalysis_policy_weight: f32,
     pub branch_reanalysis_high_confidence_policy_weight: f32,
+    pub branch_endgame_audit_probability: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -97,6 +98,7 @@ impl Default for AzLoopFileConfig {
             branch_reanalysis_simulations: 50_000,
             branch_reanalysis_policy_weight: 2.0,
             branch_reanalysis_high_confidence_policy_weight: 4.0,
+            branch_endgame_audit_probability: 0.002,
             selfplay_samples_per_update: 120000,
             lr: 0.0005,
             lr_min: 0.0001,
@@ -179,6 +181,7 @@ struct AzLoopTomlConfig {
     pub branch_reanalysis_simulations: usize,
     pub branch_reanalysis_policy_weight: f32,
     pub branch_reanalysis_high_confidence_policy_weight: f32,
+    pub branch_endgame_audit_probability: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -278,6 +281,7 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
             branch_reanalysis_high_confidence_policy_weight: config
                 .branch_reanalysis_high_confidence_policy_weight,
+            branch_endgame_audit_probability: config.branch_endgame_audit_probability,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -367,6 +371,7 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
             branch_reanalysis_high_confidence_policy_weight: config
                 .branch_reanalysis_high_confidence_policy_weight,
+            branch_endgame_audit_probability: config.branch_endgame_audit_probability,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -493,6 +498,10 @@ impl AzLoopFileConfig {
             f(self.branch_reanalysis_high_confidence_policy_weight)
         );
         line!(
+            "branch_endgame_audit_probability",
+            f(self.branch_endgame_audit_probability)
+        );
+        line!(
             "selfplay_samples_per_update",
             self.selfplay_samples_per_update
         );
@@ -617,6 +626,8 @@ impl AzLoopFileConfig {
         self.branch_reanalysis_high_confidence_policy_weight = self
             .branch_reanalysis_high_confidence_policy_weight
             .max(self.branch_reanalysis_policy_weight);
+        self.branch_endgame_audit_probability =
+            self.branch_endgame_audit_probability.clamp(0.0, 1.0);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
         self.lr_min = self.lr_min.max(0.0).min(self.lr);
@@ -719,6 +730,7 @@ mod tests {
         assert!(text.contains("branch_reanalysis_simulations = 50000\n"));
         assert!(text.contains("branch_reanalysis_policy_weight = 2.0\n"));
         assert!(text.contains("branch_reanalysis_high_confidence_policy_weight = 4.0\n"));
+        assert!(text.contains("branch_endgame_audit_probability = 0.002\n"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));

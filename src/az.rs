@@ -548,17 +548,21 @@ pub struct AzLoopConfig {
     pub low_simulations: usize,
     pub low_simulation_probability: f32,
     pub low_simulation_policy_weight: f32,
-    /// Probability of re-searching an eligible self-play root with a deterministic,
-    /// no-noise branch. The normal self-play temperature/noise schedule is unchanged.
+    /// Probability of independently verifying selected child nodes of an eligible
+    /// self-play root. The normal self-play temperature/noise schedule is unchanged.
     pub branch_reanalysis_probability: f32,
     /// A root must have at least this top visit-policy mass before it is eligible.
     pub branch_reanalysis_top_visit_threshold: f32,
-    /// Search budget for an eligible deterministic branch. 0 disables the feature.
+    /// Total search budget divided across independently verified child nodes.
+    /// 0 disables the feature.
     pub branch_reanalysis_simulations: usize,
-    /// Extra policy-loss weight for a deterministic branch target.
+    /// Extra policy-loss weight for an independently verified branch target.
     pub branch_reanalysis_policy_weight: f32,
     /// Policy-loss weight reserved for a high-confidence branch correction.
     pub branch_reanalysis_high_confidence_policy_weight: f32,
+    /// Uniform no-noise audit probability for late-game roots. Audit results are
+    /// diagnostic only and never alter self-play targets or played moves.
+    pub branch_endgame_audit_probability: f32,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
@@ -607,7 +611,11 @@ pub struct AzLoopReport {
     pub branch_reanalysis_policy_kl: f32,
     pub branch_reanalysis_flipped_q_advantage: f32,
     pub branch_reanalysis_high_confidence_flip_rate: f32,
+    pub branch_verify_avg_candidates: f32,
+    pub branch_verify_capture_candidates: f32,
+    pub branch_verify_check_candidates: f32,
     pub branch_reanalysis_phase: [AzBranchPhaseReport; 3],
+    pub branch_endgame_audit: AzBranchAuditReport,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -693,6 +701,18 @@ pub struct AzBranchPhaseReport {
     pub move_flip_rate: f32,
     pub high_confidence_flip_rate: f32,
     pub flipped_q_advantage: f32,
+    pub verify_avg_candidates: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzBranchAuditReport {
+    pub rate: f32,
+    pub move_flip_rate: f32,
+    pub value_delta_abs: f32,
+    pub policy_kl: f32,
+    pub verify_avg_candidates: f32,
+    pub verify_capture_candidates: f32,
+    pub verify_check_candidates: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -589,6 +589,7 @@ fn baseline_100_config(cmd: &AzBaseline100Args) -> AzLoopFileConfig {
     config.low_simulation_policy_weight = 0.35;
     config.branch_reanalysis_probability = 0.0;
     config.branch_reanalysis_simulations = 0;
+    config.branch_endgame_audit_probability = 0.0;
     config.selfplay_samples_per_update = 12000;
     config.train_samples_per_update = 24000;
     config.train_warmup_samples = config.train_samples_per_update;
@@ -1060,6 +1061,7 @@ fn build_az_loop_config(
         branch_reanalysis_policy_weight: config.branch_reanalysis_policy_weight,
         branch_reanalysis_high_confidence_policy_weight: config
             .branch_reanalysis_high_confidence_policy_weight,
+        branch_endgame_audit_probability: config.branch_endgame_audit_probability,
         seed,
         workers,
         generation_update,
@@ -1157,8 +1159,20 @@ fn build_async_training_report(
             move_flip_rate: stats.best_move_changed as f32 / searches,
             high_confidence_flip_rate: stats.high_confidence_flips as f32 / searches,
             flipped_q_advantage: stats.flipped_q_advantage_sum / flips,
+            verify_avg_candidates: stats.verified_candidate_sum as f32 / searches,
         }
     });
+    let audit = pending.selfplay.endgame_audit;
+    let audit_count = audit.searches.max(1) as f32;
+    let branch_endgame_audit = chineseai::az::AzBranchAuditReport {
+        rate: audit.searches as f32 / phase_root_counts[2].max(1) as f32,
+        move_flip_rate: audit.best_move_changed as f32 / audit_count,
+        value_delta_abs: audit.value_delta_abs_sum / audit_count,
+        policy_kl: audit.policy_kl_sum / audit_count,
+        verify_avg_candidates: audit.verified_candidate_sum as f32 / audit_count,
+        verify_capture_candidates: audit.verified_capture_candidates as f32 / audit_count,
+        verify_check_candidates: audit.verified_check_candidates as f32 / audit_count,
+    };
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -1216,7 +1230,19 @@ fn build_async_training_report(
             .branch_reanalysis
             .high_confidence_flips as f32
             / branch_count,
+        branch_verify_avg_candidates: pending.selfplay.branch_reanalysis.verified_candidate_sum
+            as f32
+            / branch_count,
+        branch_verify_capture_candidates: pending
+            .selfplay
+            .branch_reanalysis
+            .verified_capture_candidates as f32
+            / branch_count,
+        branch_verify_check_candidates: pending.selfplay.branch_reanalysis.verified_check_candidates
+            as f32
+            / branch_count,
         branch_reanalysis_phase,
+        branch_endgame_audit,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -2005,6 +2031,7 @@ fn main() {
                     branch_reanalysis_simulations: 0,
                     branch_reanalysis_policy_weight: 1.0,
                     branch_reanalysis_high_confidence_policy_weight: 1.0,
+                    branch_endgame_audit_probability: 0.0,
                     seed,
                     workers,
                     generation_update: 0,
@@ -2236,6 +2263,7 @@ fn main() {
                     branch_reanalysis_simulations: 0,
                     branch_reanalysis_policy_weight: 1.0,
                     branch_reanalysis_high_confidence_policy_weight: 1.0,
+                    branch_endgame_audit_probability: 0.0,
                     seed: seed.wrapping_add(batch_index as u64 * 0x9E37_79B9_7F4A_7C15),
                     workers,
                     generation_update: 0,
@@ -2668,11 +2696,12 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "branch   : deterministic_reanalysis(probability={}, top_visit_threshold={}, simulations={}, policy_weight={}; mainline_temperature_and_noise=unchanged)",
+                "branch   : independent_leaf_verify(probability={}, top_visit_threshold={}, total_simulations={}, policy_weight={}, endgame_audit_probability={}, max_candidates=6, policy_mix=0.75; mainline_temperature_and_noise=unchanged)",
                 config.branch_reanalysis_probability,
                 config.branch_reanalysis_top_visit_threshold,
                 config.branch_reanalysis_simulations,
                 config.branch_reanalysis_policy_weight,
+                config.branch_endgame_audit_probability,
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -3145,7 +3174,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} branch(rate={:.3} sims={:.0} flip={:.3} |dV|={:.3} kl={:.3} flipAdv={:.3} highFlip={:.3}) opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} low_sim={:.3} branch(rate={:.3} sims={:.0} flip={:.3} |dV|={:.3} kl={:.3} flipAdv={:.3} highFlip={:.3} cand={:.1} cap={:.1} chk={:.1}) opt_loss={:.4} wdl_ce={:.4} legal_log_mse={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -3181,6 +3210,9 @@ fn main() {
                     report.branch_reanalysis_policy_kl,
                     report.branch_reanalysis_flipped_q_advantage,
                     report.branch_reanalysis_high_confidence_flip_rate,
+                    report.branch_verify_avg_candidates,
+                    report.branch_verify_capture_candidates,
+                    report.branch_verify_check_candidates,
                     report.loss,
                     report.value_loss,
                     report.legal_moves_loss,
@@ -3237,19 +3269,32 @@ fn main() {
                         ))
                 );
                 println!(
-                    "branch-phase {update:04}: opening(rate={:.3} flip={:.3} high={:.3} adv={:.3}) mid(rate={:.3} flip={:.3} high={:.3} adv={:.3}) end(rate={:.3} flip={:.3} high={:.3} adv={:.3})",
+                    "branch-phase {update:04}: opening(rate={:.3} flip={:.3} high={:.3} adv={:.3} cand={:.1}) mid(rate={:.3} flip={:.3} high={:.3} adv={:.3} cand={:.1}) end(rate={:.3} flip={:.3} high={:.3} adv={:.3} cand={:.1})",
                     report.branch_reanalysis_phase[0].rate,
                     report.branch_reanalysis_phase[0].move_flip_rate,
                     report.branch_reanalysis_phase[0].high_confidence_flip_rate,
                     report.branch_reanalysis_phase[0].flipped_q_advantage,
+                    report.branch_reanalysis_phase[0].verify_avg_candidates,
                     report.branch_reanalysis_phase[1].rate,
                     report.branch_reanalysis_phase[1].move_flip_rate,
                     report.branch_reanalysis_phase[1].high_confidence_flip_rate,
                     report.branch_reanalysis_phase[1].flipped_q_advantage,
+                    report.branch_reanalysis_phase[1].verify_avg_candidates,
                     report.branch_reanalysis_phase[2].rate,
                     report.branch_reanalysis_phase[2].move_flip_rate,
                     report.branch_reanalysis_phase[2].high_confidence_flip_rate,
                     report.branch_reanalysis_phase[2].flipped_q_advantage,
+                    report.branch_reanalysis_phase[2].verify_avg_candidates,
+                );
+                println!(
+                    "endgame-audit {update:04}: rate={:.4} flip={:.3} |dV|={:.3} kl={:.3} cand={:.1} cap={:.1} chk={:.1}",
+                    report.branch_endgame_audit.rate,
+                    report.branch_endgame_audit.move_flip_rate,
+                    report.branch_endgame_audit.value_delta_abs,
+                    report.branch_endgame_audit.policy_kl,
+                    report.branch_endgame_audit.verify_avg_candidates,
+                    report.branch_endgame_audit.verify_capture_candidates,
+                    report.branch_endgame_audit.verify_check_candidates,
                 );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
                 log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
@@ -3402,6 +3447,24 @@ fn main() {
                     update,
                     report.branch_reanalysis_high_confidence_flip_rate,
                 );
+                log_scalar(
+                    &mut tb,
+                    "branch/avg_verified_candidates",
+                    update,
+                    report.branch_verify_avg_candidates,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/capture_candidates",
+                    update,
+                    report.branch_verify_capture_candidates,
+                );
+                log_scalar(
+                    &mut tb,
+                    "branch/check_candidates",
+                    update,
+                    report.branch_verify_check_candidates,
+                );
                 for (phase, name) in ["opening", "midgame", "endgame"].into_iter().enumerate() {
                     let branch = report.branch_reanalysis_phase[phase];
                     log_scalar(&mut tb, &format!("branch/{name}/rate"), update, branch.rate);
@@ -3423,7 +3486,55 @@ fn main() {
                         update,
                         branch.flipped_q_advantage,
                     );
+                    log_scalar(
+                        &mut tb,
+                        &format!("branch/{name}/avg_verified_candidates"),
+                        update,
+                        branch.verify_avg_candidates,
+                    );
                 }
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/rate",
+                    update,
+                    report.branch_endgame_audit.rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/move_flip_rate",
+                    update,
+                    report.branch_endgame_audit.move_flip_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/value_delta_abs",
+                    update,
+                    report.branch_endgame_audit.value_delta_abs,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/policy_kl",
+                    update,
+                    report.branch_endgame_audit.policy_kl,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/avg_verified_candidates",
+                    update,
+                    report.branch_endgame_audit.verify_avg_candidates,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/capture_candidates",
+                    update,
+                    report.branch_endgame_audit.verify_capture_candidates,
+                );
+                log_scalar(
+                    &mut tb,
+                    "endgame_audit/check_candidates",
+                    update,
+                    report.branch_endgame_audit.verify_check_candidates,
+                );
                 log_scalar(
                     &mut tb,
                     "train/train_to_selfplay_ratio",
