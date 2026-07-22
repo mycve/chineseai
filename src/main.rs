@@ -150,6 +150,9 @@ struct AzSearchArgs {
     /// Simulations for every independent child verification; 0 uses the root simulation count.
     #[arg(long, default_value_t = 0)]
     verify_sims: usize,
+    /// Apply legal UCI moves before searching; repeat for a move sequence.
+    #[arg(long = "move")]
+    moves: Vec<String>,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -1153,7 +1156,25 @@ fn main() {
             let cpuct = cmd.cpuct.max(0.0);
             let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let fen = cmd.fen.join(" ");
-            let position = parse_position(&fen);
+            let mut position = parse_position(&fen);
+            let mut history = Vec::with_capacity(cmd.moves.len());
+            let mut rule_history = position.initial_rule_history();
+            for text in &cmd.moves {
+                let mv = position.parse_uci_move(text).unwrap_or_else(|| {
+                    panic!("invalid or illegal --move `{text}` for this position")
+                });
+                let moved = position
+                    .piece_at(mv.from as usize)
+                    .expect("legal move must have a moving piece");
+                let captured = position.piece_at(mv.to as usize);
+                history.push(HistoryMove {
+                    piece: moved,
+                    captured,
+                    mv,
+                });
+                rule_history.push(position.rule_history_entry_after_move(mv));
+                position.make_move(mv);
+            }
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
@@ -1180,7 +1201,14 @@ fn main() {
                 moves_left_quadratic_factor: if cmd.moves_left_utility { 0.75 } else { 0.0 },
                 value_scale: 1.0,
             };
-            let result = alphazero_search(&position, &model, search_limits);
+            let result = alphazero_search_with_history_and_rules(
+                &position,
+                &history,
+                Some(rule_history.clone()),
+                None,
+                &model,
+                search_limits,
+            );
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
@@ -1277,24 +1305,25 @@ fn main() {
                     .piece_at(mv.from as usize)
                     .expect("verified move must have a moving piece");
                 let captured = position.piece_at(mv.to as usize);
-                let history = vec![HistoryMove {
+                let mut child_history = history.clone();
+                child_history.push(HistoryMove {
                     piece: moved,
                     captured,
                     mv,
-                }];
-                let mut rule_history = position.initial_rule_history();
-                rule_history.push(position.rule_history_entry_after_move(mv));
+                });
+                let mut child_rule_history = rule_history.clone();
+                child_rule_history.push(position.rule_history_entry_after_move(mv));
                 let mut child = position.clone();
                 child.make_move(mv);
-                let child_legal = child.legal_moves_with_rules(&rule_history);
-                let child_nn_q = model.evaluate_value(&child, &history, &child_legal);
+                let child_legal = child.legal_moves_with_rules(&child_rule_history);
+                let child_nn_q = model.evaluate_value(&child, &child_history, &child_legal);
                 let mut verify_limits = search_limits;
                 verify_limits.simulations = verify_sims.max(1);
                 verify_limits.seed = 0;
                 let verified = alphazero_search_with_history_and_rules(
                     &child,
-                    &history,
-                    Some(rule_history),
+                    &child_history,
+                    Some(child_rule_history),
                     Some(child_legal),
                     &model,
                     verify_limits,
