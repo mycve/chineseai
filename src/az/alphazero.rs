@@ -287,6 +287,7 @@ pub fn cp_from_q(q: f32) -> i32 {
 
 struct AzTree<'a> {
     nodes: Vec<AzNode>,
+    accumulator_arena: Vec<f32>,
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
     root: usize,
@@ -315,13 +316,16 @@ struct AzTree<'a> {
     search_depth_max: usize,
     search_depth_cutoffs: usize,
     eval_scratch: AzEvalScratch,
+    root_rule_history: Vec<RuleHistoryEntry>,
+    rule_history_scratch: Vec<RuleHistoryEntry>,
 }
 
 struct AzNode {
     position: Position,
-    accumulator: AzEvalAccumulator,
+    accumulator_offset: u32,
     history: SearchHistory,
-    rule_history: Vec<RuleHistoryEntry>,
+    parent: u32,
+    rule_entry: Option<RuleHistoryEntry>,
     children: Vec<AzChild>,
     visits: u32,
     value_wdl_sum: [f32; 3],
@@ -435,11 +439,19 @@ impl<'a> AzTree<'a> {
     ) -> Self {
         let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1).min(16_384));
         let accumulator = AzEvalAccumulator::new(model, &position);
+        let mut accumulator_arena = Vec::with_capacity(
+            limits
+                .simulations
+                .saturating_add(1)
+                .saturating_mul(model.hidden_size * 2),
+        );
+        accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         nodes.push(AzNode {
             position,
-            accumulator,
+            accumulator_offset: 0,
             history,
-            rule_history,
+            parent: NO_CHILD,
+            rule_entry: None,
             children: Vec::new(),
             visits: 0,
             value_wdl_sum: [0.0; 3],
@@ -450,6 +462,7 @@ impl<'a> AzTree<'a> {
         });
         Self {
             nodes,
+            accumulator_arena,
             model,
             root_moves,
             root: 0,
@@ -500,7 +513,25 @@ impl<'a> AzTree<'a> {
             search_depth_max: 0,
             search_depth_cutoffs: 0,
             eval_scratch: AzEvalScratch::new(model.arch),
+            rule_history_scratch: Vec::with_capacity(rule_history.len().saturating_add(64)),
+            root_rule_history: rule_history,
         }
+    }
+
+    fn prepare_rule_history(&mut self, node_index: usize) {
+        self.rule_history_scratch.clear();
+        self.rule_history_scratch
+            .extend_from_slice(&self.root_rule_history);
+        let root_len = self.rule_history_scratch.len();
+        let mut current = node_index;
+        while current != self.root {
+            let node = &self.nodes[current];
+            if let Some(entry) = node.rule_entry {
+                self.rule_history_scratch.push(entry);
+            }
+            current = node.parent as usize;
+        }
+        self.rule_history_scratch[root_len..].reverse();
     }
 
     fn expand(&mut self, node_index: usize) -> AzEvalOutput {
@@ -508,13 +539,11 @@ impl<'a> AzTree<'a> {
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
+        self.prepare_rule_history(node_index);
 
         let terminal = {
             crate::scope_profile!("az.search.terminal_value");
-            terminal_value(
-                &self.nodes[node_index].position,
-                &self.nodes[node_index].rule_history,
-            )
+            terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
         };
         if let Some(value) = terminal {
             let value_wdl = scalar_terminal_wdl(value);
@@ -536,12 +565,12 @@ impl<'a> AzTree<'a> {
                 self.root_moves.clone().unwrap_or_else(|| {
                     self.nodes[node_index]
                         .position
-                        .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+                        .legal_moves_with_rules(&self.rule_history_scratch)
                 })
             } else {
                 self.nodes[node_index]
                     .position
-                    .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+                    .legal_moves_with_rules(&self.rule_history_scratch)
             }
         };
         if moves.is_empty() {
@@ -559,9 +588,11 @@ impl<'a> AzTree<'a> {
 
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
+            let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
+            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
-                &self.nodes[node_index].accumulator,
+                &self.accumulator_arena[accumulator_start..accumulator_end],
                 self.nodes[node_index].history.as_slice(),
                 &moves,
                 &mut self.eval_scratch,
@@ -655,7 +686,11 @@ impl<'a> AzTree<'a> {
                 let mut child_position = self.nodes[node_index].position.clone();
                 let moved = child_position.piece_at(mv.from as usize).unwrap();
                 let captured = child_position.piece_at(mv.to as usize);
-                let mut child_accumulator = self.nodes[node_index].accumulator.clone();
+                let parent_accumulator_start = self.nodes[node_index].accumulator_offset as usize;
+                let parent_accumulator_end = parent_accumulator_start + self.model.hidden_size * 2;
+                let child_accumulator_offset = self.accumulator_arena.len();
+                self.accumulator_arena
+                    .extend_from_within(parent_accumulator_start..parent_accumulator_end);
                 let child_history = {
                     crate::scope_profile!("az.search.clone_history");
                     self.nodes[node_index]
@@ -667,29 +702,26 @@ impl<'a> AzTree<'a> {
                     crate::scope_profile!("az.search.child_make_move");
                     child_position.make_move(mv);
                 }
-                child_accumulator.apply_transition(
+                AzEvalAccumulator::apply_transition_to_hidden(
                     self.model,
                     &self.nodes[node_index].position,
                     &child_position,
                     mv,
                     moved,
                     captured,
+                    &mut self.accumulator_arena[child_accumulator_offset
+                        ..child_accumulator_offset + self.model.hidden_size * 2],
                 );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv.to as usize);
-                let child_rule_history = {
-                    crate::scope_profile!("az.search.clone_rule_history");
-                    clone_rule_history_with_appended_entry(
-                        &self.nodes[node_index].rule_history,
-                        child_rule_entry,
-                    )
-                };
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
-                    accumulator: child_accumulator,
+                    accumulator_offset: u32::try_from(child_accumulator_offset)
+                        .expect("MCTS accumulator arena exceeds compact offset range"),
                     history: child_history,
-                    rule_history: child_rule_history,
+                    parent: node_index as u32,
+                    rule_entry: Some(child_rule_entry),
                     children: Vec::new(),
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
@@ -723,12 +755,10 @@ impl<'a> AzTree<'a> {
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
+        self.prepare_rule_history(node_index);
         let terminal = {
             crate::scope_profile!("az.search.terminal_value");
-            terminal_value(
-                &self.nodes[node_index].position,
-                &self.nodes[node_index].rule_history,
-            )
+            terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
         };
         if let Some(value) = terminal {
             let value_wdl = scalar_terminal_wdl(value);
@@ -745,7 +775,7 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.expand_legal_moves");
             self.nodes[node_index]
                 .position
-                .legal_moves_with_rules(&self.nodes[node_index].rule_history)
+                .legal_moves_with_rules(&self.rule_history_scratch)
         };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
@@ -759,9 +789,11 @@ impl<'a> AzTree<'a> {
         }
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
+            let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
+            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
-                &self.nodes[node_index].accumulator,
+                &self.accumulator_arena[accumulator_start..accumulator_end],
                 self.nodes[node_index].history.as_slice(),
                 &moves,
                 &mut self.eval_scratch,
@@ -1162,16 +1194,6 @@ pub(super) fn append_history(history: &mut Vec<HistoryMove>, position: &Position
     }
 }
 
-fn clone_rule_history_with_appended_entry(
-    rule_history: &[RuleHistoryEntry],
-    entry: RuleHistoryEntry,
-) -> Vec<RuleHistoryEntry> {
-    let mut out = Vec::with_capacity(rule_history.len() + 1);
-    out.extend_from_slice(rule_history);
-    out.push(entry);
-    out
-}
-
 fn truncate_history(history: &[HistoryMove]) -> SearchHistory {
     SearchHistory::from_slice(history)
 }
@@ -1548,10 +1570,7 @@ mod tests {
         tree.expand(tree.root);
         tree.simulate_child(tree.root, 0, 1);
         let child_node = tree.nodes[tree.root].children[0].child_node().unwrap();
-        assert_eq!(
-            tree.nodes[child_node].rule_history.last().copied(),
-            Some(expected)
-        );
+        assert_eq!(tree.nodes[child_node].rule_entry, Some(expected));
     }
 
     #[test]

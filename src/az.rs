@@ -280,13 +280,13 @@ impl AzEvalScratch {
 /// 搜索节点使用的双视角 NNUE 累加器，不包含随每步老化的历史特征。
 #[derive(Clone, Debug)]
 pub(super) struct AzEvalAccumulator {
-    hidden_sum: [Vec<f32>; 2],
+    hidden_sum: Vec<f32>,
 }
 
 impl AzEvalAccumulator {
     pub(super) fn new(model: &AzNnue, position: &Position) -> Self {
         let mut accumulator = Self {
-            hidden_sum: [vec![0.0; model.hidden_size], vec![0.0; model.hidden_size]],
+            hidden_sum: vec![0.0; model.hidden_size * 2],
         };
         accumulator.refresh(model, position);
         accumulator
@@ -303,28 +303,35 @@ impl AzEvalAccumulator {
                     features.push(piece_index * BOARD_SIZE + canonical_square_for(perspective, sq));
                 }
             }
-            model.input_embedding_linear_into(&features, &mut self.hidden_sum[index]);
+            let start = index * model.hidden_size;
+            model.input_embedding_linear_into_slice(
+                &features,
+                &mut self.hidden_sum[start..start + model.hidden_size],
+            );
         }
     }
 
-    pub(super) fn apply_transition(
-        &mut self,
+    pub(super) fn apply_transition_to_hidden(
         model: &AzNnue,
         before: &Position,
         after: &Position,
         mv: Move,
         moved: Piece,
         captured: Option<Piece>,
+        hidden_sum: &mut [f32],
     ) {
+        debug_assert_eq!(hidden_sum.len(), model.hidden_size * 2);
         for perspective in [Color::Red, Color::Black] {
             let before_buckets = canonical_buckets_for_perspective(before, perspective);
             let after_buckets = canonical_buckets_for_perspective(after, perspective);
             if before_buckets != after_buckets {
                 // 将帅移动会改变所有棋子的王桶结构项，少见且必须完整刷新。
-                self.refresh(model, after);
+                let refreshed = Self::new(model, after);
+                hidden_sum.copy_from_slice(&refreshed.hidden_sum);
                 return;
             }
-            let hidden = &mut self.hidden_sum[color_index(perspective)];
+            let start = color_index(perspective) * model.hidden_size;
+            let hidden = &mut hidden_sum[start..start + model.hidden_size];
             add_canonical_piece_contribution(
                 model,
                 hidden,
@@ -357,8 +364,13 @@ impl AzEvalAccumulator {
         }
     }
 
-    fn hidden_for(&self, side: Color) -> &[f32] {
-        &self.hidden_sum[color_index(side)]
+    pub(super) fn hidden_for_slice(hidden_sum: &[f32], hidden_size: usize, side: Color) -> &[f32] {
+        let start = color_index(side) * hidden_size;
+        &hidden_sum[start..start + hidden_size]
+    }
+
+    pub(super) fn into_hidden_sum(self) -> Vec<f32> {
+        self.hidden_sum
     }
 }
 
@@ -994,18 +1006,20 @@ impl AzNnue {
     pub(super) fn evaluate_incremental_with_scratch_output(
         &self,
         position: &Position,
-        accumulator: &AzEvalAccumulator,
+        accumulator_hidden: &[f32],
         history: &[HistoryMove],
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_incremental_with_scratch");
-        let mut features = std::mem::take(&mut scratch.features);
-        fill_sparse_features_az_canonical(position, history, &mut features);
         scratch.hidden.resize(self.hidden_size, 0.0);
         scratch
             .hidden
-            .copy_from_slice(accumulator.hidden_for(position.side_to_move()));
+            .copy_from_slice(AzEvalAccumulator::hidden_for_slice(
+                accumulator_hidden,
+                self.hidden_size,
+                position.side_to_move(),
+            ));
         scratch.history_features.clear();
         add_az_canonical_history_features(
             position.side_to_move(),
@@ -1030,7 +1044,7 @@ impl AzNnue {
             crate::scope_profile!("az.eval.value_head");
             self.value_wdl_from_hidden_into(
                 &scratch.hidden,
-                &features,
+                &[],
                 &mut scratch.value_head,
                 &mut scratch.value_head2,
             )
@@ -1039,8 +1053,7 @@ impl AzNnue {
             crate::scope_profile!("az.eval.moves_left_head");
             self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
         };
-        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
-        scratch.features = features;
+        self.evaluate_prepared_hidden_with_scratch(position, &[], value, moves, scratch);
         AzEvalOutput {
             value_wdl,
             value,
@@ -1249,6 +1262,11 @@ impl AzNnue {
 
     fn input_embedding_linear_into(&self, features: &[usize], hidden: &mut Vec<f32>) {
         hidden.resize(self.hidden_size, 0.0);
+        self.input_embedding_linear_into_slice(features, hidden);
+    }
+
+    fn input_embedding_linear_into_slice(&self, features: &[usize], hidden: &mut [f32]) {
+        debug_assert_eq!(hidden.len(), self.hidden_size);
         hidden.copy_from_slice(&self.hidden_bias);
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
