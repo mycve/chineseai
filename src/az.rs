@@ -539,14 +539,31 @@ impl Clone for AzNnue {
     }
 }
 
+impl AzNnue {
+    pub fn update_capped_swa(&mut self, current: &Self, count: usize, max_models: usize) -> usize {
+        assert_eq!(self.arch, current.arch, "SWA model architecture mismatch");
+        let max_models = max_models.max(1);
+        let count = count.clamp(1, max_models);
+        let old_weight = count as f32 / (count + 1) as f32;
+        let new_weight = 1.0 / (count + 1) as f32;
+        macro_rules! blend_weight {
+            ($field:ident, $shape:expr) => {
+                debug_assert_eq!(self.$field.len(), current.$field.len());
+                for (average, &value) in self.$field.iter_mut().zip(&current.$field) {
+                    *average = *average * old_weight + value * new_weight;
+                }
+            };
+        }
+        az_weight_tensors!(blend_weight, self.hidden_size);
+        (count + 1).min(max_models)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AzLoopConfig {
     pub games: usize,
     pub max_plies: usize,
     pub simulations: usize,
-    pub high_simulations: usize,
-    pub high_simulation_probability: f32,
-    pub high_simulation_start_plies: usize,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
@@ -587,7 +604,6 @@ pub struct AzLoopReport {
     pub total_games_generated: usize,
     pub total_samples_generated: usize,
     pub avg_search_simulations: f32,
-    pub high_simulation_rate: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -2625,6 +2641,28 @@ mod tests {
             loaded.policy_move_context_hidden
         );
         assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
+    }
+
+    #[test]
+    fn capped_swa_averages_all_model_weights_and_caps_count() {
+        let mut average = AzNnue::random(4, 101);
+        let current = AzNnue::random(4, 202);
+        let first_before = average.input_hidden[17];
+        let last_before = average.policy_move_embedding[31];
+        let first_current = current.input_hidden[17];
+        let last_current = current.policy_move_embedding[31];
+
+        let mut count = average.update_capped_swa(&current, 1, 10);
+        assert_eq!(count, 2);
+        assert!((average.input_hidden[17] - (first_before + first_current) * 0.5).abs() < 1e-7);
+        assert!(
+            (average.policy_move_embedding[31] - (last_before + last_current) * 0.5).abs() < 1e-7
+        );
+
+        for _ in 0..20 {
+            count = average.update_capped_swa(&current, count, 10);
+        }
+        assert_eq!(count, 10);
     }
 
     #[test]

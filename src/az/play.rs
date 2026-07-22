@@ -34,14 +34,12 @@ pub struct AzTerminalStats {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzSearchSimulationStats {
     pub searches: usize,
-    pub high_searches: usize,
     pub simulations_sum: usize,
 }
 
 impl AzSearchSimulationStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.searches += other.searches;
-        self.high_searches += other.high_searches;
         self.simulations_sum += other.simulations_sum;
     }
 }
@@ -360,11 +358,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search_simulation_count = search_simulations_for_ply(config, ply, &mut rng);
+            let search_simulation_count = config.simulations.max(1);
             search_simulations.searches += 1;
             search_simulations.simulations_sum += search_simulation_count;
-            search_simulations.high_searches +=
-                usize::from(search_simulation_count > config.simulations);
             let search = {
                 crate::scope_profile!("az.selfplay.search");
                 alphazero_search_with_history_and_rules(
@@ -616,18 +612,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         terminal,
         search_simulations,
     }
-}
-
-fn search_simulations_for_ply(config: &AzLoopConfig, ply: usize, rng: &mut SplitMix64) -> usize {
-    let normal = config.simulations.max(1);
-    let high = config.high_simulations.max(normal);
-    if ply >= config.high_simulation_start_plies
-        && rng.unit_f32() < config.high_simulation_probability.clamp(0.0, 1.0)
-    {
-        return high;
-    }
-
-    normal
 }
 
 #[derive(Clone, Copy, Debug, Default)]

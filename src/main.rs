@@ -332,6 +332,25 @@ fn best_model_path(model_path: &str) -> PathBuf {
         .join("best.safetensors")
 }
 
+const SWA_MAX_MODELS: usize = 10;
+
+fn swa_model_path(model_path: &str) -> PathBuf {
+    Path::new(model_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("swa.safetensors")
+}
+
+fn update_swa_model(swa: &mut Option<AzNnue>, count: &mut usize, current: &AzNnue) {
+    if let Some(average) = swa {
+        *count = average.update_capped_swa(current, *count, SWA_MAX_MODELS);
+    } else {
+        *swa = Some(current.clone());
+        *count = 1;
+    }
+}
+
 fn az_loop_progress_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.progress"))
 }
@@ -345,6 +364,7 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
 struct AzLoopProgressState {
     next_update: usize,
     best_elo: f32,
+    swa_count: usize,
     #[serde(skip_serializing)]
     pikafish_depth: u32,
     #[serde(skip_serializing)]
@@ -356,6 +376,7 @@ impl Default for AzLoopProgressState {
         Self {
             next_update: 1,
             best_elo: 1500.0,
+            swa_count: 0,
             pikafish_depth: 1,
             pikafish_best_wins: 0,
         }
@@ -368,6 +389,7 @@ impl AzLoopProgressState {
         if !self.best_elo.is_finite() {
             self.best_elo = 1500.0;
         }
+        self.swa_count = self.swa_count.min(SWA_MAX_MODELS);
         self
     }
 }
@@ -398,12 +420,18 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
-fn save_az_loop_progress_pair(config_path: &str, next_update: usize, best_elo: f32) {
+fn save_az_loop_progress_pair(
+    config_path: &str,
+    next_update: usize,
+    best_elo: f32,
+    swa_count: usize,
+) {
     save_az_loop_progress(
         config_path,
         &AzLoopProgressState {
             next_update,
             best_elo,
+            swa_count,
             ..Default::default()
         },
     );
@@ -443,8 +471,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "hs{}_hsp{}_hss{}_rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_acp{}_rda{}_ref{}_sd{}"
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -453,9 +481,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.hidden_size,
         config.max_plies,
         config.workers,
-        config.high_simulations,
-        f32_slug(config.high_simulation_probability),
-        config.high_simulation_start_plies,
         f32_slug(config.replay_recent_sample_fraction),
         config.replay_recent_games,
         f32_slug(config.lr_min),
@@ -486,6 +511,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
+        config.arena_simulations,
         f32_slug(config.arena_cpuct),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
@@ -710,9 +736,6 @@ fn build_az_loop_config(
         games: 1,
         max_plies: config.max_plies,
         simulations: config.simulations,
-        high_simulations: config.high_simulations,
-        high_simulation_probability: config.high_simulation_probability,
-        high_simulation_start_plies: config.high_simulation_start_plies,
         seed,
         workers,
         generation_update,
@@ -828,8 +851,6 @@ fn build_async_training_report(
         total_games_generated,
         total_samples_generated,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
-            / search_count,
-        high_simulation_rate: pending.selfplay.search_simulations.high_searches as f32
             / search_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
@@ -1499,21 +1520,60 @@ fn main() {
                 println!("model    : init {}", config.model_path);
                 (AzNnue::random_with_arch(config_arch, config.seed), false)
             };
+            let swa_path = swa_model_path(&config.model_path);
+            let (mut swa_model, mut swa_count) = if resumed_model && swa_path.exists() {
+                let loaded = AzNnue::load(&swa_path).unwrap_or_else(|err| {
+                    panic!("failed to load SWA model `{}`: {err}", swa_path.display())
+                });
+                if loaded.arch != model.arch {
+                    panic!(
+                        "SWA model `{}` architecture {:?} differs from raw {:?}",
+                        swa_path.display(),
+                        loaded.arch,
+                        model.arch
+                    );
+                }
+                fs::remove_file(&swa_path).unwrap_or_else(|err| {
+                    panic!(
+                        "loaded SWA model but failed to remove consumed `{}`: {err}",
+                        swa_path.display()
+                    )
+                });
+                let count = progress_boot.swa_count.clamp(1, SWA_MAX_MODELS);
+                println!(
+                    "swa      : load `{}` count={}/{}",
+                    swa_path.display(),
+                    count,
+                    SWA_MAX_MODELS
+                );
+                (Some(loaded), count)
+            } else if resumed_model {
+                println!("swa      : initialize from resumed raw model count=1");
+                (Some(model.clone()), 1)
+            } else {
+                println!("swa      : initialize after first trained update");
+                (None, 0)
+            };
             let selfplay_model = {
-                println!("selfplay : start from latest `{}`", config.model_path);
-                model.clone()
+                if let Some(average) = swa_model.as_ref() {
+                    println!("selfplay : start from SWA count={swa_count}");
+                    average.clone()
+                } else {
+                    println!("selfplay : start from initial raw model");
+                    model.clone()
+                }
             };
             let initial_arena_reference_model = if config.arena_interval == 0 {
-                model.clone()
+                selfplay_model.clone()
             } else {
                 if !best_path.exists() {
-                    save_model(&model, &best_path);
+                    save_model(&selfplay_model, &best_path);
                 } else if let Err(err) = AzNnue::load(&best_path) {
                     println!(
-                        "best     : reset incompatible `{}` from current model ({err})",
+                        "best     : reset incompatible `{}` from deployed model ({err})",
                         best_path.display()
                     );
-                    save_model(&model, &best_path);
+                    save_model(&selfplay_model, &best_path);
                 }
                 AzNnue::load(&best_path).unwrap_or_else(|err| {
                     panic!("failed to load best model `{}`: {err}", best_path.display());
@@ -1580,12 +1640,10 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} high_sims={} high_prob={} high_start={}ply replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} swa_max_models={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
-                config.high_simulations,
-                config.high_simulation_probability,
-                config.high_simulation_start_plies,
+                SWA_MAX_MODELS,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
                 config.selfplay_samples_per_update,
@@ -1630,6 +1688,7 @@ fn main() {
                 config.checkpoint_interval,
                 config.max_checkpoints,
                 config.arena_interval,
+                config.arena_simulations,
                 config.arena_cpuct,
                 config.arena_promotion_rate,
                 config.arena_promotion_confidence_z,
@@ -2103,6 +2162,11 @@ fn main() {
                 if exited_after_ctrl_c {
                     break;
                 }
+                update_swa_model(&mut swa_model, &mut swa_count, &candidate_model);
+                let deployed_model = swa_model
+                    .as_ref()
+                    .expect("SWA model must exist after a trained update")
+                    .clone();
                 interrupt_save_model = Some(candidate_model.clone());
                 interrupt_save_next_update = update.saturating_add(1);
                 let checkpoint_saved = if config.checkpoint_interval > 0
@@ -2131,7 +2195,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} high_sim={:.3} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} swa_n={} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2159,7 +2223,7 @@ fn main() {
                     report.red_wins as f32 / report.games.max(1) as f32,
                     report.avg_plies,
                     report.avg_search_simulations,
-                    report.high_simulation_rate,
+                    swa_count,
                     report.loss,
                     report.value_loss,
                     report.moves_left_loss,
@@ -2305,17 +2369,12 @@ fn main() {
                 );
                 log_scalar(&mut tb, "selfplay/games", update, report.games as f32);
                 log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
+                log_scalar(&mut tb, "train/swa_count", update, swa_count as f32);
                 log_scalar(
                     &mut tb,
                     "selfplay/avg_search_simulations",
                     update,
                     report.avg_search_simulations,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/high_simulation_rate",
-                    update,
-                    report.high_simulation_rate,
                 );
                 log_scalar(
                     &mut tb,
@@ -2599,7 +2658,7 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                let updated_numa_models = build_numa_model_replicas(&candidate_model, &numa_nodes);
+                let updated_numa_models = build_numa_model_replicas(&deployed_model, &numa_nodes);
                 {
                     let mut shared = shared_model
                         .write()
@@ -2620,13 +2679,13 @@ fn main() {
                         let (arena_start_positions, arena_mode) =
                             build_arena_start_positions(&config, update);
                         let arena_position_count = arena_start_positions.len();
-                        let candidate = Arc::new(candidate_model.clone());
+                        let candidate = Arc::new(deployed_model.clone());
                         let baseline = Arc::new(arena_reference_model.clone());
                         let arena = run_arena_threads(ArenaThreadConfig {
                             candidate,
                             baseline,
                             eval_positions: Arc::new(arena_start_positions),
-                            simulations: config.simulations,
+                            simulations: config.arena_simulations,
                             max_plies: config.max_plies,
                             cpuct: config.arena_cpuct,
                             thread_count: config.arena_processes,
@@ -2643,14 +2702,14 @@ fn main() {
                             config.arena_promotion_confidence_z,
                         );
                         if promoted {
-                            arena_reference_model = candidate_model.clone();
+                            arena_reference_model = deployed_model.clone();
                             let best_checkpoint = save_best_checkpoint_model(
-                                &candidate_model,
+                                &deployed_model,
                                 &config.model_path,
                                 &config.checkpoint_dir,
                                 update,
                             );
-                            save_model(&candidate_model, &best_path);
+                            save_model(&deployed_model, &best_path);
                             arena_best_elo = candidate_elo;
                             println!("best     : saved {}", best_checkpoint.display());
                         }
@@ -2749,7 +2808,7 @@ fn main() {
                                 load_pikafish_label_rows(&conn, config.pikafish_label_eval_limit)
                                     .map_err(sqlite_io_error)?;
                             evaluate_pikafish_labels_parallel(
-                                Arc::new(candidate_model.clone()),
+                                Arc::new(deployed_model.clone()),
                                 rows,
                                 config.pikafish_label_eval_simulations,
                                 config.seed ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
@@ -2886,6 +2945,7 @@ fn main() {
                 .unwrap_or_else(|_| panic!("training thread panicked"));
             if exited_after_ctrl_c {
                 while let Ok(event) = trainer_rx.try_recv() {
+                    update_swa_model(&mut swa_model, &mut swa_count, &event.candidate_model);
                     interrupt_save_model = Some(event.candidate_model);
                     interrupt_save_next_update = update.saturating_add(1);
                     update = update.saturating_add(1);
@@ -2894,19 +2954,25 @@ fn main() {
             if exited_after_ctrl_c || exited_after_target_update {
                 if let Some(model) = interrupt_save_model.as_ref() {
                     save_model(model, Path::new(&config.model_path));
+                    if let Some(average) = swa_model.as_ref() {
+                        save_model(average, &swa_path);
+                    }
                     save_az_loop_progress_pair(
                         &config_path,
                         interrupt_save_next_update,
                         arena_best_elo,
+                        swa_count,
                     );
                     println!(
-                        "model    : {} save `{}` next_update={}",
+                        "model    : {} save raw=`{}` swa=`{}` swa_count={} next_update={}",
                         if exited_after_target_update {
                             "target"
                         } else {
                             "interrupt"
                         },
                         config.model_path,
+                        swa_path.display(),
+                        swa_count,
                         interrupt_save_next_update
                     );
                 } else {

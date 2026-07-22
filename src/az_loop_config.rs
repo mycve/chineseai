@@ -7,12 +7,6 @@ pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 pub struct AzLoopFileConfig {
     pub model_path: String,
     pub simulations: usize,
-    /// 进入中局后用于发现隐藏反击的额外搜索预算；不低于常规预算。
-    pub high_simulations: usize,
-    /// 到达 high_simulation_start_plies 后，节点使用额外预算的概率。
-    pub high_simulation_probability: f32,
-    /// 启用额外预算前的半回合数。
-    pub high_simulation_start_plies: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -64,6 +58,7 @@ pub struct AzLoopFileConfig {
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
     pub arena_interval: usize,
+    pub arena_simulations: usize,
     pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
@@ -84,10 +79,7 @@ impl Default for AzLoopFileConfig {
     fn default() -> Self {
         Self {
             model_path: "model.safetensors".into(),
-            simulations: 4000,
-            high_simulations: 20000,
-            high_simulation_probability: 0.1,
-            high_simulation_start_plies: 40,
+            simulations: 1600,
             selfplay_samples_per_update: 120000,
             lr: 0.0007,
             lr_min: 0.00015,
@@ -139,6 +131,7 @@ impl Default for AzLoopFileConfig {
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
             arena_interval: 20,
+            arena_simulations: 4000,
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
@@ -162,16 +155,6 @@ impl Default for AzLoopFileConfig {
 struct AzLoopTomlConfig {
     pub model_path: String,
     pub simulations: usize,
-    // 兼容旧配置：这些字段已不再写出，也不影响自博弈预算。
-    #[serde(skip_serializing)]
-    pub low_simulations: usize,
-    #[serde(skip_serializing)]
-    pub low_simulation_probability: f32,
-    #[serde(skip_serializing)]
-    pub low_simulation_policy_weight: f32,
-    pub high_simulations: usize,
-    pub high_simulation_probability: f32,
-    pub high_simulation_start_plies: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -223,6 +206,7 @@ struct AzLoopTomlConfig {
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
     pub arena_interval: usize,
+    pub arena_simulations: usize,
     pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
@@ -262,12 +246,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
         Self {
             model_path: config.model_path.clone(),
             simulations: config.simulations,
-            low_simulations: 0,
-            low_simulation_probability: 0.0,
-            low_simulation_policy_weight: 0.0,
-            high_simulations: config.high_simulations,
-            high_simulation_probability: config.high_simulation_probability,
-            high_simulation_start_plies: config.high_simulation_start_plies,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -319,6 +297,7 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             checkpoint_dir: config.checkpoint_dir.clone(),
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
+            arena_simulations: config.arena_simulations,
             arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
@@ -348,9 +327,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
         Self {
             model_path: config.model_path,
             simulations: config.simulations,
-            high_simulations: config.high_simulations,
-            high_simulation_probability: config.high_simulation_probability,
-            high_simulation_start_plies: config.high_simulation_start_plies,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
             lr: config.lr,
             lr_min: config.lr_min,
@@ -402,6 +378,7 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             checkpoint_dir: config.checkpoint_dir,
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
+            arena_simulations: config.arena_simulations,
             arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
@@ -447,15 +424,6 @@ impl AzLoopFileConfig {
         }
         line!("model_path", q(&self.model_path));
         line!("simulations", self.simulations);
-        line!("high_simulations", self.high_simulations);
-        line!(
-            "high_simulation_probability",
-            f(self.high_simulation_probability)
-        );
-        line!(
-            "high_simulation_start_plies",
-            self.high_simulation_start_plies
-        );
         line!(
             "selfplay_samples_per_update",
             self.selfplay_samples_per_update
@@ -525,6 +493,7 @@ impl AzLoopFileConfig {
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
         line!("arena_interval", self.arena_interval);
+        line!("arena_simulations", self.arena_simulations);
         line!("arena_cpuct", f(self.arena_cpuct));
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
         line!(
@@ -571,9 +540,6 @@ impl AzLoopFileConfig {
 
     fn normalize(mut self) -> Self {
         self.simulations = self.simulations.max(1);
-        self.high_simulations = self.high_simulations.max(self.simulations);
-        self.high_simulation_probability = self.high_simulation_probability.clamp(0.0, 1.0);
-        self.high_simulation_start_plies = self.high_simulation_start_plies.min(self.max_plies);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
         self.lr_min = self.lr_min.max(0.0).min(self.lr);
@@ -618,6 +584,7 @@ impl AzLoopFileConfig {
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
+        self.arena_simulations = self.arena_simulations.max(1);
         self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
         self.pikafish_label_eval_cpuct = self.pikafish_label_eval_cpuct.max(0.0);
@@ -667,13 +634,13 @@ mod tests {
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("simulations = 4000\n"));
+        assert!(text.contains("simulations = 1600\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));
-        assert!(text.contains("high_simulations = 20000\n"));
-        assert!(text.contains("high_simulation_probability = 0.1\n"));
-        assert!(text.contains("high_simulation_start_plies = 40\n"));
+        assert!(!text.contains("high_simulations"));
+        assert!(!text.contains("high_simulation_probability"));
+        assert!(!text.contains("high_simulation_start_plies"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));
@@ -689,6 +656,7 @@ mod tests {
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
         assert!(text.contains("arena_interval = 20\n"));
+        assert!(text.contains("arena_simulations = 4000\n"));
         assert!(
             text.contains("pikafish_label_eval_sqlite = \"eval/pikafish-random-5000-d8.sqlite\"\n")
         );
@@ -709,12 +677,6 @@ mod tests {
         assert!((parsed.lr - 0.0007).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
-
-        let legacy = AzLoopFileConfig::parse(
-            "low_simulations = 2000\nlow_simulation_probability = 0.2\nlow_simulation_policy_weight = 0.5\n",
-        );
-        assert_eq!(legacy.high_simulations, 20000);
-        assert!((legacy.high_simulation_probability - 0.1).abs() < 1e-9);
     }
 
     #[test]
@@ -722,6 +684,12 @@ mod tests {
         for removed in [
             "replay_recent_window_updates = 5000\n",
             "deblunder_q_gap = 0.05\n",
+            "low_simulations = 2000\n",
+            "low_simulation_probability = 0.2\n",
+            "low_simulation_policy_weight = 0.5\n",
+            "high_simulations = 20000\n",
+            "high_simulation_probability = 0.1\n",
+            "high_simulation_start_plies = 40\n",
         ] {
             let error = toml::from_str::<AzLoopTomlConfig>(removed)
                 .expect_err("removed config keys must not be accepted");
