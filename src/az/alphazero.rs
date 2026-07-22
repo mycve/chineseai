@@ -232,7 +232,7 @@ pub fn alphazero_search_with_history_and_rules_controlled_with_progress(
         crate::scope_profile!("az.search.root_expand");
         tree.expand(root);
     }
-    if tree.nodes[root].children.is_empty() {
+    if tree.nodes[root].children_len == 0 {
         let value_q = wdl_utility(tree.nodes[root].value_wdl, tree.draw_score);
         return AzSearchResult {
             best_move: None,
@@ -287,9 +287,11 @@ pub fn cp_from_q(q: f32) -> i32 {
 
 struct AzTree<'a> {
     nodes: Vec<AzNode>,
+    children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
+    root_raw_priors: Vec<f32>,
     root: usize,
     cpuct: f32,
     cpuct_at_root: f32,
@@ -326,7 +328,8 @@ struct AzNode {
     history: SearchHistory,
     parent: u32,
     rule_entry: Option<RuleHistoryEntry>,
-    children: Vec<AzChild>,
+    children_offset: u32,
+    children_len: u16,
     visits: u32,
     value_wdl_sum: [f32; 3],
     value: f32,
@@ -338,7 +341,6 @@ struct AzNode {
 #[derive(Clone)]
 struct AzChild {
     mv: Move,
-    raw_prior: f32,
     prior: f32,
     visits: u32,
     value_wdl_sum: [f32; 3],
@@ -378,6 +380,7 @@ impl AzChild {
 impl<'a> AzTree<'a> {
     fn search_result(&self, simulations: usize) -> AzSearchResult {
         let root_node = &self.nodes[self.root];
+        let root_children = self.node_children(self.root);
         let searched_wdl = if root_node.visits > 0 {
             root_node
                 .value_wdl_sum
@@ -390,16 +393,20 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.root_policy");
             self.root_policy(self.root)
         };
-        let mut candidates = root_node
-            .children
+        let mut candidates = root_children
             .iter()
             .zip(policy)
-            .map(|(child, policy)| AzCandidate {
+            .enumerate()
+            .map(|(index, (child, policy))| AzCandidate {
                 mv: child.mv,
                 visits: child.visits,
                 q: child.q(self.draw_score),
                 moves_left: child.moves_left(),
-                raw_prior: child.raw_prior,
+                raw_prior: self
+                    .root_raw_priors
+                    .get(index)
+                    .copied()
+                    .unwrap_or(child.prior),
                 prior: child.prior,
                 policy,
             })
@@ -413,7 +420,7 @@ impl<'a> AzTree<'a> {
         });
         let best_move = self
             .best_root_child(self.root)
-            .map(|child_index| root_node.children[child_index].mv)
+            .map(|child_index| root_children[child_index].mv)
             .or_else(|| candidates.first().map(|candidate| candidate.mv));
         AzSearchResult {
             best_move,
@@ -452,7 +459,8 @@ impl<'a> AzTree<'a> {
             history,
             parent: NO_CHILD,
             rule_entry: None,
-            children: Vec::new(),
+            children_offset: 0,
+            children_len: 0,
             visits: 0,
             value_wdl_sum: [0.0; 3],
             value: 0.0,
@@ -462,9 +470,11 @@ impl<'a> AzTree<'a> {
         });
         Self {
             nodes,
+            children: Vec::with_capacity(limits.simulations.saturating_mul(8)),
             accumulator_arena,
             model,
             root_moves,
+            root_raw_priors: Vec::new(),
             root: 0,
             cpuct: if limits.cpuct > 0.0 {
                 limits.cpuct
@@ -518,6 +528,35 @@ impl<'a> AzTree<'a> {
         }
     }
 
+    fn node_children(&self, node_index: usize) -> &[AzChild] {
+        let node = &self.nodes[node_index];
+        let start = node.children_offset as usize;
+        &self.children[start..start + node.children_len as usize]
+    }
+
+    fn node_children_mut(&mut self, node_index: usize) -> &mut [AzChild] {
+        let node = &self.nodes[node_index];
+        let start = node.children_offset as usize;
+        let len = node.children_len as usize;
+        &mut self.children[start..start + len]
+    }
+
+    #[cfg(test)]
+    fn set_node_children(
+        &mut self,
+        node_index: usize,
+        children: impl IntoIterator<Item = AzChild>,
+    ) {
+        debug_assert_eq!(self.nodes[node_index].children_len, 0);
+        let offset = self.children.len();
+        self.children.extend(children);
+        let len = self.children.len() - offset;
+        self.nodes[node_index].children_offset =
+            u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
+        self.nodes[node_index].children_len =
+            u16::try_from(len).expect("MCTS node has too many legal moves");
+    }
+
     fn prepare_rule_history(&mut self, node_index: usize) {
         self.rule_history_scratch.clear();
         self.rule_history_scratch
@@ -547,7 +586,6 @@ impl<'a> AzTree<'a> {
         };
         if let Some(value) = terminal {
             let value_wdl = scalar_terminal_wdl(value);
-            self.nodes[node_index].children.clear();
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].moves_left = 0.0;
@@ -574,7 +612,6 @@ impl<'a> AzTree<'a> {
             }
         };
         if moves.is_empty() {
-            self.nodes[node_index].children.clear();
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
             self.nodes[node_index].moves_left = 0.0;
@@ -607,7 +644,9 @@ impl<'a> AzTree<'a> {
                 &mut self.eval_scratch.priors,
             )
         };
-        let raw_priors = priors.clone();
+        if node_index == self.root {
+            self.root_raw_priors.clone_from(priors);
+        }
         if node_index == self.root
             && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
@@ -621,20 +660,26 @@ impl<'a> AzTree<'a> {
         }
         {
             crate::scope_profile!("az.search.children_build");
-            self.nodes[node_index].children = moves
-                .into_iter()
-                .zip(priors.drain(..))
-                .zip(raw_priors)
-                .map(|((mv, prior), raw_prior)| AzChild {
-                    mv,
-                    raw_prior,
-                    prior,
-                    visits: 0,
-                    value_wdl_sum: [0.0; 3],
-                    moves_left_sum: 0.0,
-                    child: NO_CHILD,
-                })
-                .collect();
+            let offset = self.children.len();
+            self.children
+                .extend(
+                    moves
+                        .into_iter()
+                        .zip(priors.drain(..))
+                        .map(|(mv, prior)| AzChild {
+                            mv,
+                            prior,
+                            visits: 0,
+                            value_wdl_sum: [0.0; 3],
+                            moves_left_sum: 0.0,
+                            child: NO_CHILD,
+                        }),
+                );
+            let len = self.children.len() - offset;
+            self.nodes[node_index].children_offset =
+                u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
+            self.nodes[node_index].children_len =
+                u16::try_from(len).expect("MCTS node has too many legal moves");
         }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
@@ -657,7 +702,7 @@ impl<'a> AzTree<'a> {
             self.record_leaf_depth(depth, false);
             return eval;
         }
-        if self.nodes[node_index].children.is_empty() {
+        if self.nodes[node_index].children_len == 0 {
             let eval = self.node_eval(node_index);
             self.add_node_visit(node_index, eval);
             self.record_leaf_depth(depth, false);
@@ -678,11 +723,11 @@ impl<'a> AzTree<'a> {
     ) -> AzEvalOutput {
         crate::scope_profile!("az.search.simulate_child");
         let child_node =
-            if let Some(child_node) = self.nodes[node_index].children[child_index].child_node() {
+            if let Some(child_node) = self.node_children(node_index)[child_index].child_node() {
                 child_node
             } else {
                 crate::scope_profile!("az.search.create_child");
-                let mv = self.nodes[node_index].children[child_index].mv;
+                let mv = self.node_children(node_index)[child_index].mv;
                 let mut child_position = self.nodes[node_index].position.clone();
                 let moved = child_position.piece_at(mv.from as usize).unwrap();
                 let captured = child_position.piece_at(mv.to as usize);
@@ -722,7 +767,8 @@ impl<'a> AzTree<'a> {
                     history: child_history,
                     parent: node_index as u32,
                     rule_entry: Some(child_rule_entry),
-                    children: Vec::new(),
+                    children_offset: 0,
+                    children_len: 0,
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
                     value: 0.0,
@@ -730,7 +776,7 @@ impl<'a> AzTree<'a> {
                     moves_left: 0.0,
                     expanded: false,
                 });
-                self.nodes[node_index].children[child_index].set_child_node(child_node);
+                self.node_children_mut(node_index)[child_index].set_child_node(child_node);
                 child_node
             };
         let child_eval = self.simulate(child_node, child_depth);
@@ -742,7 +788,7 @@ impl<'a> AzTree<'a> {
             // 叶子会被直接混合，utility会错误偏爱搜索得更深的分支。
             moves_left: child_eval.moves_left + 1.0,
         };
-        let child = &mut self.nodes[node_index].children[child_index];
+        let child = &mut self.node_children_mut(node_index)[child_index];
         child.visits += 1;
         add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
         child.moves_left_sum += eval.moves_left;
@@ -849,62 +895,73 @@ impl<'a> AzTree<'a> {
 
     fn select_child(&self, node_index: usize) -> usize {
         let node = &self.nodes[node_index];
+        let children = self.node_children(node_index);
         let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
         let is_root = node_index == self.root;
+        let draw_score = self.node_draw_score(node_index);
         let fpu_value = if is_root {
             self.fpu_value_at_root
         } else {
-            alphazero_fpu_value_reduction(node, self.fpu_value, self.node_draw_score(node_index))
+            alphazero_fpu_value_reduction(node, children, self.fpu_value, draw_score)
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
-        self.nodes[node_index]
-            .children
-            .iter()
-            .enumerate()
-            .max_by(|(left_index, left_child), (right_index, right_child)| {
-                let left_score = self.child_score(
-                    node_index,
-                    node,
-                    left_child,
-                    fpu_value,
-                    parent_visits_sqrt,
-                    cpuct,
-                );
-                let right_score = self.child_score(
-                    node_index,
-                    node,
-                    right_child,
-                    fpu_value,
-                    parent_visits_sqrt,
-                    cpuct,
-                );
-                left_score
-                    .total_cmp(&right_score)
-                    .then_with(|| left_child.prior.total_cmp(&right_child.prior))
-                    .then_with(|| right_index.cmp(left_index))
-            })
-            .map(|(index, _)| index)
-            .unwrap_or(0)
+        let Some(first) = children.first() else {
+            return 0;
+        };
+        let mut best_index = 0;
+        let mut best_prior = first.prior;
+        let mut best_score = self.child_score(
+            node,
+            first,
+            draw_score,
+            fpu_value,
+            parent_visits_sqrt,
+            cpuct,
+        );
+        for (index, child) in children.iter().enumerate().skip(1) {
+            let score = self.child_score(
+                node,
+                child,
+                draw_score,
+                fpu_value,
+                parent_visits_sqrt,
+                cpuct,
+            );
+            if score.total_cmp(&best_score).is_gt()
+                || (score.total_cmp(&best_score).is_eq()
+                    && child.prior.total_cmp(&best_prior).is_gt())
+            {
+                best_index = index;
+                best_prior = child.prior;
+                best_score = score;
+            }
+        }
+        best_index
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
-        self.nodes[node_index]
-            .children
-            .iter()
-            .enumerate()
-            .max_by(|(left_index, left_child), (right_index, right_child)| {
-                left_child
-                    .visits
-                    .cmp(&right_child.visits)
-                    .then_with(|| {
-                        left_child
-                            .q(self.node_draw_score(node_index))
-                            .total_cmp(&right_child.q(self.node_draw_score(node_index)))
-                    })
-                    .then_with(|| left_child.prior.total_cmp(&right_child.prior))
-                    .then_with(|| right_index.cmp(left_index))
-            })
-            .map(|(index, _)| index)
+        let draw_score = self.node_draw_score(node_index);
+        let children = self.node_children(node_index);
+        let first = children.first()?;
+        let mut best_index = 0;
+        let mut best_visits = first.visits;
+        let mut best_q = first.q(draw_score);
+        let mut best_prior = first.prior;
+        for (index, child) in children.iter().enumerate().skip(1) {
+            let q = child.q(draw_score);
+            if child.visits > best_visits
+                || (child.visits == best_visits
+                    && (q.total_cmp(&best_q).is_gt()
+                        || (q.total_cmp(&best_q).is_eq()
+                            && child.prior.total_cmp(&best_prior).is_gt())))
+            {
+                best_index = index;
+                best_visits = child.visits;
+                best_q = q;
+                best_prior = child.prior;
+            }
+        }
+        Some(best_index)
     }
 
     fn compute_cpuct(&self, visits: u32, is_root: bool) -> f32 {
@@ -932,15 +989,15 @@ impl<'a> AzTree<'a> {
 
     fn child_score(
         &self,
-        node_index: usize,
         parent: &AzNode,
         child: &AzChild,
+        draw_score: f32,
         fpu_value: f32,
         parent_visits_sqrt: f32,
         cpuct: f32,
     ) -> f32 {
         let q = if child.visits > 0 {
-            child.q(self.node_draw_score(node_index))
+            child.q(draw_score)
         } else {
             fpu_value
         };
@@ -977,32 +1034,25 @@ impl<'a> AzTree<'a> {
     }
 
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
-        let total_visits = self.nodes[node_index]
-            .children
+        let children = self.node_children(node_index);
+        let total_visits = children
             .iter()
             .map(|child| child.visits as f32)
             .sum::<f32>()
             .max(1.0);
-        if self.nodes[node_index]
-            .children
-            .iter()
-            .any(|child| child.visits > 0)
-        {
-            return self.nodes[node_index]
-                .children
+        if children.iter().any(|child| child.visits > 0) {
+            return children
                 .iter()
                 .map(|child| child.visits as f32 / total_visits)
                 .collect();
         }
 
-        let total_prior = self.nodes[node_index]
-            .children
+        let total_prior = children
             .iter()
             .map(|child| child.prior)
             .sum::<f32>()
             .max(1e-12);
-        self.nodes[node_index]
-            .children
+        children
             .iter()
             .map(|child| child.prior / total_prior)
             .collect()
@@ -1020,7 +1070,12 @@ fn wdl_sum_utility(wdl_sum: [f32; 3], visits: u32, draw_score: f32) -> f32 {
     wdl_utility(wdl_sum.map(|part| part / visits as f32), draw_score)
 }
 
-fn alphazero_fpu_value_reduction(node: &AzNode, reduction: f32, draw_score: f32) -> f32 {
+fn alphazero_fpu_value_reduction(
+    node: &AzNode,
+    children: &[AzChild],
+    reduction: f32,
+    draw_score: f32,
+) -> f32 {
     let parent_q = if node.visits > 0 {
         wdl_sum_utility(node.value_wdl_sum, node.visits, draw_score)
     } else {
@@ -1030,8 +1085,7 @@ fn alphazero_fpu_value_reduction(node: &AzNode, reduction: f32, draw_score: f32)
         return parent_q;
     }
 
-    let visited_prior = node
-        .children
+    let visited_prior = children
         .iter()
         .filter(|child| child.visits > 0)
         .map(|child| child.prior.max(0.0))
@@ -1223,7 +1277,6 @@ mod tests {
         assert!(std::mem::size_of::<AzChild>() <= 40);
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
-            raw_prior: 1.0,
             prior: 1.0,
             visits: 0,
             value_wdl_sum: [0.0; 3],
@@ -1260,7 +1313,6 @@ mod tests {
     fn wdl_q_applies_draw_score_instead_of_discarding_draw_probability() {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
-            raw_prior: 1.0,
             prior: 1.0,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
@@ -1292,7 +1344,7 @@ mod tests {
 
         tree.expand(tree.root);
         tree.simulate_child(tree.root, 0, 1);
-        let child_node = tree.nodes[tree.root].children[0].child_node().unwrap();
+        let child_node = tree.node_children(tree.root)[0].child_node().unwrap();
         assert!((tree.node_draw_score(tree.root) - 0.4).abs() < 1e-6);
         assert!((tree.node_draw_score(child_node) + 0.4).abs() < 1e-6);
     }
@@ -1440,26 +1492,27 @@ mod tests {
             },
         );
         tree.cpuct_at_root = 0.0;
-        tree.nodes[tree.root].children = vec![
-            AzChild {
-                mv: legal[0],
-                raw_prior: 0.10,
-                prior: 0.10,
-                visits: 1,
-                value_wdl_sum: [0.0, 1.0, 0.0],
-                moves_left_sum: 0.0,
-                child: NO_CHILD,
-            },
-            AzChild {
-                mv: legal[1],
-                raw_prior: 0.90,
-                prior: 0.90,
-                visits: 1,
-                value_wdl_sum: [0.0, 1.0, 0.0],
-                moves_left_sum: 0.0,
-                child: NO_CHILD,
-            },
-        ];
+        tree.set_node_children(
+            tree.root,
+            vec![
+                AzChild {
+                    mv: legal[0],
+                    prior: 0.10,
+                    visits: 1,
+                    value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
+                    child: NO_CHILD,
+                },
+                AzChild {
+                    mv: legal[1],
+                    prior: 0.90,
+                    visits: 1,
+                    value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
+                    child: NO_CHILD,
+                },
+            ],
+        );
 
         assert_eq!(tree.select_child(tree.root), 1);
     }
@@ -1569,7 +1622,7 @@ mod tests {
         );
         tree.expand(tree.root);
         tree.simulate_child(tree.root, 0, 1);
-        let child_node = tree.nodes[tree.root].children[0].child_node().unwrap();
+        let child_node = tree.node_children(tree.root)[0].child_node().unwrap();
         assert_eq!(tree.nodes[child_node].rule_entry, Some(expected));
     }
 
@@ -1589,14 +1642,14 @@ mod tests {
         );
 
         tree.expand(tree.root);
-        assert_eq!(tree.nodes[tree.root].children.len(), 1);
+        assert_eq!(tree.node_children(tree.root).len(), 1);
         let child_index = 0;
         tree.simulate_child(tree.root, child_index, 1);
-        let child_node = tree.nodes[tree.root].children[child_index]
+        let child_node = tree.node_children(tree.root)[child_index]
             .child_node()
             .unwrap();
         tree.expand(child_node);
-        assert_ne!(tree.nodes[child_node].children.len(), root_moves.len());
+        assert_ne!(tree.node_children(child_node).len(), root_moves.len());
     }
 
     #[test]
