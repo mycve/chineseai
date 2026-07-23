@@ -471,7 +471,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -507,6 +507,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
+        f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
         config.arena_simulations,
@@ -764,6 +765,7 @@ fn build_az_loop_config(
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
+        mirror_probability: config.mirror_probability,
     }
 }
 
@@ -1615,7 +1617,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} swa_max_models={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} swa_max_models={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 SWA_MAX_MODELS,
@@ -1657,6 +1659,7 @@ fn main() {
                 config.resign_percentage,
                 config.resign_playthrough,
                 config.replay_capacity,
+                config.mirror_probability,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,

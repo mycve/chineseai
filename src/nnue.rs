@@ -5,8 +5,6 @@ use crate::xiangqi::{
 /// 旧 absolute 编码包含一个行棋方标志；canonical 编码不需要该标志。
 pub const INPUT_SIZE: usize = BOARD_SIZE * 14 + 1;
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
-pub const AZ_SIDE_INPUT_OFFSET: usize = CANONICAL_PIECE_INPUT_SIZE;
-pub const AZ_SIDE_INPUT_SIZE: usize = 2;
 pub const V2_KING_BUCKETS: usize = 9;
 pub const V2_INPUT_SIZE: usize = INPUT_SIZE + 2 * V2_KING_BUCKETS * 14 * BOARD_SIZE;
 pub const HISTORY_PLIES: usize = 8;
@@ -23,11 +21,9 @@ const AZ_COL_INPUT_OFFSET: usize = AZ_ROW_INPUT_OFFSET + ROW_INPUT_SIZE;
 const AZ_STRATEGIC_INPUT_OFFSET: usize = AZ_COL_INPUT_OFFSET + COL_INPUT_SIZE;
 /// 旧 absolute 特征表的完整尺寸，仅供旧特征工具和测试使用。
 pub const LEGACY_AZ_NNUE_INPUT_SIZE: usize = AZ_STRATEGIC_INPUT_OFFSET + STRATEGIC_INPUT_SIZE;
-/// 当前网络使用固定红方坐标的棋子位置和行棋方。
-///
-/// 重复、长将、长捉等依赖历史的规则由环境精确处理，不再让网络从最近
-/// 若干步中近似推断。左右反射由网络内部的共享双分支严格处理。
-pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE + AZ_SIDE_INPUT_SIZE;
+/// 当前网络仅使用面向行棋方的 canonical 棋子位置，不输入历史步。
+/// 重复、长将、长捉等依赖历史的规则由环境精确处理。
+pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryMove {
     pub piece: Piece,
@@ -59,15 +55,21 @@ pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {
 #[inline]
 pub fn fill_sparse_features_az(position: &Position, features: &mut Vec<usize>) {
     features.clear();
-    features.reserve(33);
+    features.reserve(32);
+    let side = position.side_to_move();
     for sq in 0..BOARD_SIZE {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
-        let piece_index = absolute_piece_index(piece.color, piece.kind);
-        features.push(piece_index * BOARD_SIZE + sq);
+        let relative_color = if piece.color == side {
+            Color::Red
+        } else {
+            Color::Black
+        };
+        let relative_square = orient_square(side, sq);
+        let piece_index = absolute_piece_index(relative_color, piece.kind);
+        features.push(piece_index * BOARD_SIZE + relative_square);
     }
-    features.push(AZ_SIDE_INPUT_OFFSET + usize::from(position.side_to_move() == Color::Black));
 }
 
 pub fn extract_sparse_features_az_absolute_current(position: &Position) -> Vec<usize> {
@@ -202,21 +204,33 @@ pub fn mirror_file_move(mv: Move) -> Move {
     )
 }
 
+pub fn canonical_square(side: Color, sq: usize) -> usize {
+    orient_square(side, sq)
+}
+
+pub fn canonical_move(side: Color, mv: Move) -> Move {
+    Move::new(
+        canonical_square(side, mv.from as usize),
+        canonical_square(side, mv.to as usize),
+    )
+}
+
+pub fn mirror_sparse_features_az_canonical_file(features: &mut [usize]) {
+    for feature in features.iter_mut() {
+        if *feature < CANONICAL_PIECE_INPUT_SIZE {
+            let piece_index = *feature / BOARD_SIZE;
+            let sq = *feature % BOARD_SIZE;
+            *feature = piece_index * BOARD_SIZE + mirror_file_square(sq);
+        }
+    }
+    features.sort_unstable();
+}
+
 pub fn mirror_sparse_features_az_absolute_file(features: &mut [usize]) {
     for feature in features.iter_mut() {
         *feature = mirror_sparse_feature_az_absolute_file(*feature);
     }
     features.sort_unstable();
-}
-
-pub fn mirror_sparse_feature_az(feature: usize) -> usize {
-    if feature < CANONICAL_PIECE_INPUT_SIZE {
-        let piece_index = feature / BOARD_SIZE;
-        let sq = feature % BOARD_SIZE;
-        piece_index * BOARD_SIZE + mirror_file_square(sq)
-    } else {
-        feature
-    }
 }
 
 fn mirror_sparse_feature_az_absolute_file(feature: usize) -> usize {
@@ -411,24 +425,23 @@ mod tests {
     }
 
     #[test]
-    fn az_features_use_fixed_red_coordinates_and_side_feature() {
+    fn az_features_use_side_to_move_canonical_coordinates() {
         let position = Position::from_fen("4k4/9/9/9/4p4/9/9/9/9/4K4 b - - 0 1").unwrap();
         let features = extract_sparse_features_az(&position);
-        let black_general = absolute_piece_index(Color::Black, PieceKind::General) * BOARD_SIZE + 4;
-        let red_general = absolute_piece_index(Color::Red, PieceKind::General) * BOARD_SIZE + 85;
+        let us_general = absolute_piece_index(Color::Red, PieceKind::General) * BOARD_SIZE + 85;
+        let them_general = absolute_piece_index(Color::Black, PieceKind::General) * BOARD_SIZE + 4;
 
-        assert!(features.contains(&black_general));
-        assert!(features.contains(&red_general));
-        assert!(features.contains(&(AZ_SIDE_INPUT_OFFSET + 1)));
+        assert!(features.contains(&us_general));
+        assert!(features.contains(&them_general));
     }
 
     #[test]
-    fn az_features_use_only_current_board_and_side() {
+    fn az_features_use_only_current_board() {
         let position = Position::startpos();
         let features = extract_sparse_features_az(&position);
-        assert_eq!(AZ_NNUE_INPUT_SIZE, 1_262);
+        assert_eq!(AZ_NNUE_INPUT_SIZE, 1_260);
         assert!(features.iter().all(|&feature| feature < AZ_NNUE_INPUT_SIZE));
-        assert_eq!(features.len(), 33);
+        assert_eq!(features.len(), 32);
     }
 
     #[test]

@@ -381,7 +381,7 @@ impl<'a> AzTree<'a> {
             limits
                 .simulations
                 .saturating_add(1)
-                .saturating_mul(model.hidden_size),
+                .saturating_mul(model.hidden_size * 2),
         );
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         nodes.push(AzNode {
@@ -556,7 +556,7 @@ impl<'a> AzTree<'a> {
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size;
+            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
@@ -661,7 +661,7 @@ impl<'a> AzTree<'a> {
                 let moved = child_position.piece_at(mv.from as usize).unwrap();
                 let captured = child_position.piece_at(mv.to as usize);
                 let parent_accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-                let parent_accumulator_end = parent_accumulator_start + self.model.hidden_size;
+                let parent_accumulator_end = parent_accumulator_start + self.model.hidden_size * 2;
                 let child_accumulator_offset = self.accumulator_arena.len();
                 self.accumulator_arena
                     .extend_from_within(parent_accumulator_start..parent_accumulator_end);
@@ -678,7 +678,7 @@ impl<'a> AzTree<'a> {
                     moved,
                     captured,
                     &mut self.accumulator_arena[child_accumulator_offset
-                        ..child_accumulator_offset + self.model.hidden_size],
+                        ..child_accumulator_offset + self.model.hidden_size * 2],
                 );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv.to as usize);
@@ -758,7 +758,7 @@ impl<'a> AzTree<'a> {
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size;
+            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
