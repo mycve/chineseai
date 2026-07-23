@@ -46,8 +46,12 @@ pub use train::{
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
-pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
-pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
+// Policy is deliberately wider than the 192-wide incremental accumulator. The
+// pair branch is the only nonlinear move-specific interaction path, so it needs
+// enough rank to represent Xiangqi relations such as cannon screens, horse legs,
+// pins and discovered attacks without increasing every worker accumulator.
+pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 128;
+pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 64;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
