@@ -294,6 +294,7 @@ fn play_one_game(
                     root_exploration_fraction: 0.0,
                     fpu_value: 0.23,
                     fpu_value_at_root: 1.0,
+                    policy_softmax_temp: 1.0,
                     draw_score: 0.0,
                     moves_left_max_effect: 0.0,
                     moves_left_slope: 0.0,

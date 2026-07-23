@@ -92,19 +92,19 @@ impl Default for AzLoopFileConfig {
             seed: 20260420,
             workers: 192,
             temperature_start: 0.9,
-            temperature_endgame: 0.20,
-            temperature_decay_delay_plies: 24,
-            temperature_decay_plies: 48,
-            temperature_value_cutoff: 0.18,
+            temperature_endgame: 0.35,
+            temperature_decay_delay_plies: 30,
+            temperature_decay_plies: 60,
+            temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
             cpuct: 1.20,
-            cpuct_at_root: 2.20,
-            cpuct_base: 8192.0,
-            cpuct_factor: 1.0,
-            cpuct_base_at_root: 8192.0,
-            cpuct_factor_at_root: 1.0,
-            root_dirichlet_alpha: 0.15,
-            root_exploration_fraction: 0.12,
+            cpuct_at_root: 2.0,
+            cpuct_base: 19652.0,
+            cpuct_factor: 2.0,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 2.0,
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.10,
             fpu_value: 0.0,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
@@ -609,18 +609,20 @@ mod tests {
         assert!(text.contains("lr = 0.0007\n"));
         assert!(text.contains("lr_min = 0.00015\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
-        assert!(text.contains("temperature_endgame = 0.2\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 24\n"));
-        assert!(text.contains("temperature_decay_plies = 48\n"));
+        assert!(text.contains("temperature_endgame = 0.35\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 30\n"));
+        assert!(text.contains("temperature_decay_plies = 60\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("temperature_value_cutoff = 0.18\n"));
+        assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
         assert!(text.contains("cpuct = 1.2\n"));
-        assert!(text.contains("cpuct_at_root = 2.2\n"));
-        assert!(text.contains("cpuct_base = 8192.0\n"));
-        assert!(text.contains("cpuct_factor = 1.0\n"));
-        assert!(text.contains("cpuct_base_at_root = 8192.0\n"));
-        assert!(text.contains("cpuct_factor_at_root = 1.0\n"));
+        assert!(text.contains("cpuct_at_root = 2.0\n"));
+        assert!(text.contains("cpuct_base = 19652.0\n"));
+        assert!(text.contains("cpuct_factor = 2.0\n"));
+        assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
+        assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
+        assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
+        assert!(text.contains("root_exploration_fraction = 0.1\n"));
         assert!(text.contains("fpu_value = 0.0\n"));
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));

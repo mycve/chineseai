@@ -31,6 +31,8 @@ pub struct AzSearchLimits {
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
+    /// Divisor applied to policy logits before softmax. Values above 1 flatten priors.
+    pub policy_softmax_temp: f32,
     pub draw_score: f32,
     pub moves_left_max_effect: f32,
     pub moves_left_slope: f32,
@@ -57,6 +59,7 @@ impl Default for AzSearchLimits {
             root_exploration_fraction: 0.0,
             fpu_value: 0.23,
             fpu_value_at_root: 1.0,
+            policy_softmax_temp: 1.0,
             draw_score: 0.0,
             moves_left_max_effect: 0.25,
             moves_left_slope: 0.002,
@@ -237,6 +240,7 @@ struct AzTree<'a> {
     root_noise_seed: u64,
     fpu_value: f32,
     fpu_value_at_root: f32,
+    policy_softmax_temp: f32,
     draw_score: f32,
     moves_left_max_effect: f32,
     moves_left_slope: f32,
@@ -435,6 +439,7 @@ impl<'a> AzTree<'a> {
             root_noise_seed: limits.seed,
             fpu_value: limits.fpu_value.max(0.0),
             fpu_value_at_root: limits.fpu_value_at_root.clamp(-1.0, 1.0),
+            policy_softmax_temp: limits.policy_softmax_temp.max(1.0e-3),
             draw_score: limits.draw_score.clamp(-1.0, 1.0),
             moves_left_max_effect: limits.moves_left_max_effect.max(0.0),
             moves_left_slope: limits.moves_left_slope.max(0.0),
@@ -570,6 +575,7 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.softmax");
             softmax_into(
                 &self.eval_scratch.logits[..moves.len()],
+                self.policy_softmax_temp,
                 &mut self.eval_scratch.priors,
             )
         };
@@ -1074,7 +1080,11 @@ fn terminal_value(position: &Position, rule_history: &[RuleHistoryEntry]) -> Opt
     None
 }
 
-fn softmax_into<'a>(logits: &[f32], output: &'a mut Vec<f32>) -> &'a mut Vec<f32> {
+fn softmax_into<'a>(
+    logits: &[f32],
+    temperature: f32,
+    output: &'a mut Vec<f32>,
+) -> &'a mut Vec<f32> {
     output.clear();
     if logits.is_empty() {
         return output;
@@ -1082,8 +1092,9 @@ fn softmax_into<'a>(logits: &[f32], output: &'a mut Vec<f32>) -> &'a mut Vec<f32
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     output.reserve(logits.len());
+    let inverse_temperature = temperature.max(1.0e-3).recip();
     for &logit in logits {
-        let value = (logit - max_logit).exp();
+        let value = ((logit - max_logit) * inverse_temperature).exp();
         output.push(value);
         sum += value;
     }
@@ -1159,6 +1170,20 @@ fn sample_standard_normal(rng: &mut SplitMix64, salt: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
+
+    #[test]
+    fn policy_softmax_temperature_flattens_network_priors() {
+        let logits = [2.0, 0.0];
+        let mut normal = Vec::new();
+        let mut softened = Vec::new();
+
+        softmax_into(&logits, 1.0, &mut normal);
+        softmax_into(&logits, 2.0, &mut softened);
+
+        assert!(softened[0] < normal[0]);
+        assert!(softened[1] > normal[1]);
+        assert!((softened.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn child_node_index_uses_compact_sentinel_representation() {

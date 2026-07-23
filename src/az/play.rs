@@ -380,6 +380,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                         root_exploration_fraction: config.root_exploration_fraction,
                         fpu_value: config.fpu_value,
                         fpu_value_at_root: config.fpu_value_at_root,
+                        policy_softmax_temp: config.policy_softmax_temp,
                         draw_score: config.draw_score,
                         moves_left_max_effect: config.moves_left_max_effect,
                         moves_left_slope: config.moves_left_slope,
@@ -431,7 +432,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &position,
                     &search.candidates,
                     search.value_q,
-                    config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                     search_simulation_count,
@@ -495,7 +495,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &position,
                     &search.candidates,
                     search.value_q,
-                    config.policy_softmax_temp,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
                     search_simulation_count,
@@ -666,7 +665,6 @@ fn make_training_sample(
     position: &Position,
     candidates: &[AzCandidate],
     value: f32,
-    policy_softmax_temp: f32,
     mirror_file: bool,
     meta: AzSampleMeta,
     search_simulations: usize,
@@ -674,7 +672,6 @@ fn make_training_sample(
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
-    let policy_softmax_temp = policy_softmax_temp.max(1e-3);
     let mut features = extract_sparse_features_az(position);
     let mut moves = candidates
         .iter()
@@ -693,7 +690,7 @@ fn make_training_sample(
         .collect();
     let mut policy = candidates
         .iter()
-        .map(|candidate| candidate.policy.max(1e-12).powf(1.0 / policy_softmax_temp))
+        .map(|candidate| candidate.policy.max(0.0))
         .collect::<Vec<_>>();
     let total_policy = policy.iter().sum::<f32>().max(1e-12);
     for value in &mut policy {
@@ -857,83 +854,33 @@ fn temperature_move_weights(
     value_cutoff: f32,
     visit_offset: f32,
 ) -> Vec<f32> {
-    let best_q = candidates
+    let cutoff_anchor_q = candidates
         .iter()
-        .map(|candidate| candidate.q)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .max_by(|left, right| {
+            (left.visits as f32 + visit_offset).total_cmp(&(right.visits as f32 + visit_offset))
+        })
+        .map(|candidate| candidate.q);
     let inv_temperature = 1.0 / temperature.max(1e-3);
     let mut weights = candidates
         .iter()
         .map(|candidate| {
-            (candidate.visits as f32 - visit_offset)
+            (candidate.visits as f32 + visit_offset)
                 .max(1e-9)
                 .powf(inv_temperature)
         })
         .collect::<Vec<_>>();
 
-    if value_cutoff <= 0.0 || value_cutoff >= 1.0 || !best_q.is_finite() {
+    let Some(cutoff_anchor_q) = cutoff_anchor_q else {
+        return weights;
+    };
+    if value_cutoff <= 0.0 || value_cutoff >= 1.0 || !cutoff_anchor_q.is_finite() {
         return weights;
     }
 
-    const MIN_CUTOFF_CANDIDATES: usize = 8;
-    const MIN_CUTOFF_WEIGHT_MASS: f32 = 0.98;
-
-    let total_weight = weights.iter().sum::<f32>();
-    if total_weight <= 0.0 {
-        return weights;
-    }
-
-    let mut keep = candidates
-        .iter()
-        .map(|candidate| {
-            let best_win = (best_q + 1.0) * 0.5;
-            let win = (candidate.q + 1.0) * 0.5;
-            best_win - win <= value_cutoff
-        })
-        .collect::<Vec<_>>();
-    if keep.iter().filter(|&&kept| kept).count() < MIN_CUTOFF_CANDIDATES {
-        let mut ranked = candidates
-            .iter()
-            .enumerate()
-            .collect::<Vec<(usize, &AzCandidate)>>();
-        ranked.sort_by(|(_, left), (_, right)| {
-            right
-                .visits
-                .cmp(&left.visits)
-                .then_with(|| right.q.total_cmp(&left.q))
-        });
-        for (index, _) in ranked.into_iter().take(MIN_CUTOFF_CANDIDATES) {
-            keep[index] = true;
-        }
-    }
-
-    let kept_weight = weights
-        .iter()
-        .zip(&keep)
-        .filter_map(|(weight, kept)| kept.then_some(*weight))
-        .sum::<f32>();
-    if kept_weight / total_weight < MIN_CUTOFF_WEIGHT_MASS {
-        let mut ranked = weights
-            .iter()
-            .copied()
-            .enumerate()
-            .collect::<Vec<(usize, f32)>>();
-        ranked.sort_by(|(_, left), (_, right)| right.total_cmp(left));
-        let mut mass = kept_weight;
-        for (index, weight) in ranked {
-            if keep[index] {
-                continue;
-            }
-            keep[index] = true;
-            mass += weight;
-            if mass / total_weight >= MIN_CUTOFF_WEIGHT_MASS {
-                break;
-            }
-        }
-    }
-
-    for (weight, kept) in weights.iter_mut().zip(keep) {
-        if !kept {
+    // 配置值表示胜率差；Q=W-L，因此胜率差 value_cutoff 对应 2*value_cutoff 的 Q 差。
+    let min_q = cutoff_anchor_q - 2.0 * value_cutoff;
+    for (weight, candidate) in weights.iter_mut().zip(candidates) {
+        if candidate.q < min_q {
             *weight = 0.0;
         }
     }
@@ -1081,6 +1028,7 @@ fn play_arena_game(
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.23,
                 fpu_value_at_root: 1.0,
+                policy_softmax_temp: 1.0,
                 draw_score: 0.0,
                 moves_left_max_effect: 0.0,
                 moves_left_slope: 0.0,
@@ -1188,7 +1136,6 @@ mod tests {
             &position,
             &candidates,
             0.0,
-            1.45,
             true,
             AzSampleMeta::default(),
             1,
@@ -1207,6 +1154,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sample.move_indices, expected);
+        let expected_policy = candidates
+            .iter()
+            .map(|candidate| candidate.policy)
+            .collect::<Vec<_>>();
+        let expected_total = expected_policy.iter().sum::<f32>();
+        for (actual, expected) in sample.policy.iter().zip(expected_policy) {
+            assert!((actual - expected / expected_total).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -1266,23 +1221,30 @@ mod tests {
     }
 
     #[test]
-    fn temperature_value_cutoff_keeps_exploration_floor() {
-        let candidates = (0..12)
-            .map(|index| {
-                candidate_q(
-                    Move::new(index, index + 1),
-                    if index == 0 { 100 } else { 10 },
-                    0.90 - index as f32 * 0.10,
-                )
-            })
-            .collect::<Vec<_>>();
+    fn negative_visit_offset_is_added_like_lc0() {
+        let candidates = vec![
+            candidate_q(Move::new(0, 1), 1, 0.0),
+            candidate_q(Move::new(0, 2), 10, 0.0),
+        ];
+
+        let weights = temperature_move_weights(&candidates, 1.0, 0.0, -0.8);
+
+        assert!((weights[0] - 0.2).abs() < 1e-6);
+        assert!((weights[1] - 9.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn temperature_value_cutoff_is_anchored_to_most_visited_move() {
+        let candidates = vec![
+            candidate_q(Move::new(0, 1), 100, 0.40),
+            candidate_q(Move::new(0, 2), 5, 0.90),
+            candidate_q(Move::new(0, 3), 10, 0.05),
+        ];
 
         let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-        let kept = weights.iter().filter(|&&weight| weight > 0.0).count();
-        let total_without_cutoff = 100.0 + 11.0 * 10.0;
-        let kept_weight = weights.iter().sum::<f32>();
 
-        assert!(kept >= 8);
-        assert!(kept_weight / total_without_cutoff >= 0.98);
+        assert!(weights[0] > 0.0);
+        assert!(weights[1] > 0.0);
+        assert_eq!(weights[2], 0.0);
     }
 }
