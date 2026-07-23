@@ -18,30 +18,11 @@ pub struct AzLoopFileConfig {
     pub hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
+    pub gumbel_max_num_considered_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_q_value_scale: f32,
+    pub gumbel_q_maxvisit_init: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -59,7 +40,6 @@ pub struct AzLoopFileConfig {
     pub max_checkpoints: usize,
     pub arena_interval: usize,
     pub arena_simulations: usize,
-    pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
@@ -71,7 +51,6 @@ pub struct AzLoopFileConfig {
     pub pikafish_label_eval_interval: usize,
     pub pikafish_label_eval_limit: usize,
     pub pikafish_label_eval_simulations: usize,
-    pub pikafish_label_eval_cpuct: f32,
     pub tensorboard_logdir: String,
 }
 
@@ -91,30 +70,11 @@ impl Default for AzLoopFileConfig {
             hidden_size: 192,
             seed: 20260420,
             workers: 192,
-            temperature_start: 0.9,
-            temperature_endgame: 0.35,
-            temperature_decay_delay_plies: 30,
-            temperature_decay_plies: 60,
-            temperature_value_cutoff: 0.12,
-            temperature_visit_offset: -0.8,
-            cpuct: 1.20,
-            cpuct_at_root: 2.0,
-            cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
-            root_dirichlet_alpha: 0.12,
-            root_exploration_fraction: 0.10,
-            fpu_value: 0.0,
-            fpu_value_at_root: 1.0,
+            gumbel_max_num_considered_actions: 16,
+            gumbel_scale: 1.0,
+            gumbel_q_value_scale: 0.1,
+            gumbel_q_maxvisit_init: 50.0,
             draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.004,
-            moves_left_threshold: 0.7,
-            moves_left_constant_factor: 0.05,
-            moves_left_scaled_factor: 0.20,
-            moves_left_quadratic_factor: 0.75,
-            policy_softmax_temp: 1.45,
             opening_fens_path: String::new(),
             resign_percentage: 0.8,
             resign_playthrough: 20.0,
@@ -132,7 +92,6 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 20,
             arena_simulations: 4000,
-            arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_processes: 192,
@@ -144,7 +103,6 @@ impl Default for AzLoopFileConfig {
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
             pikafish_label_eval_simulations: 3000,
-            pikafish_label_eval_cpuct: 1.5,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -166,30 +124,11 @@ struct AzLoopTomlConfig {
     pub hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
+    pub gumbel_max_num_considered_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_q_value_scale: f32,
+    pub gumbel_q_maxvisit_init: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -207,7 +146,6 @@ struct AzLoopTomlConfig {
     pub max_checkpoints: usize,
     pub arena_interval: usize,
     pub arena_simulations: usize,
-    pub arena_cpuct: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
@@ -219,7 +157,6 @@ struct AzLoopTomlConfig {
     pub pikafish_label_eval_interval: usize,
     pub pikafish_label_eval_limit: usize,
     pub pikafish_label_eval_simulations: usize,
-    pub pikafish_label_eval_cpuct: f32,
     #[serde(skip_serializing)]
     pub arena_pikafish_exe: String,
     #[serde(skip_serializing)]
@@ -257,30 +194,11 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             hidden_size: config.hidden_size,
             seed: config.seed,
             workers: config.workers,
-            temperature_start: config.temperature_start,
-            temperature_endgame: config.temperature_endgame,
-            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-            temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
-            root_exploration_fraction: config.root_exploration_fraction,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
+            gumbel_max_num_considered_actions: config.gumbel_max_num_considered_actions,
+            gumbel_scale: config.gumbel_scale,
+            gumbel_q_value_scale: config.gumbel_q_value_scale,
+            gumbel_q_maxvisit_init: config.gumbel_q_maxvisit_init,
             draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            policy_softmax_temp: config.policy_softmax_temp,
             opening_fens_path: config.opening_fens_path.clone(),
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -298,7 +216,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
             arena_simulations: config.arena_simulations,
-            arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
@@ -310,7 +227,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             pikafish_label_eval_interval: config.pikafish_label_eval_interval,
             pikafish_label_eval_limit: config.pikafish_label_eval_limit,
             pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
-            pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
             arena_pikafish_exe: String::new(),
             arena_pikafish_start_update: 1,
             arena_pikafish_depth: 1,
@@ -338,30 +254,11 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             hidden_size: config.hidden_size,
             seed: config.seed,
             workers: config.workers,
-            temperature_start: config.temperature_start,
-            temperature_endgame: config.temperature_endgame,
-            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-            temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
-            root_exploration_fraction: config.root_exploration_fraction,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
+            gumbel_max_num_considered_actions: config.gumbel_max_num_considered_actions,
+            gumbel_scale: config.gumbel_scale,
+            gumbel_q_value_scale: config.gumbel_q_value_scale,
+            gumbel_q_maxvisit_init: config.gumbel_q_maxvisit_init,
             draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            policy_softmax_temp: config.policy_softmax_temp,
             opening_fens_path: config.opening_fens_path,
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -379,7 +276,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             max_checkpoints: config.max_checkpoints,
             arena_interval: config.arena_interval,
             arena_simulations: config.arena_simulations,
-            arena_cpuct: config.arena_cpuct,
             arena_promotion_rate: config.arena_promotion_rate,
             arena_promotion_confidence_z: config.arena_promotion_confidence_z,
             arena_processes: config.arena_processes,
@@ -391,7 +287,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             pikafish_label_eval_interval: config.pikafish_label_eval_interval,
             pikafish_label_eval_limit: config.pikafish_label_eval_limit,
             pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
-            pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
             tensorboard_logdir: config.tensorboard_logdir,
         }
     }
@@ -438,42 +333,14 @@ impl AzLoopFileConfig {
         line!("hidden_size", self.hidden_size);
         line!("seed", self.seed);
         line!("workers", self.workers);
-        line!("temperature_start", f(self.temperature_start));
-        line!("temperature_endgame", f(self.temperature_endgame));
         line!(
-            "temperature_decay_delay_plies",
-            self.temperature_decay_delay_plies
+            "gumbel_max_num_considered_actions",
+            self.gumbel_max_num_considered_actions
         );
-        line!("temperature_decay_plies", self.temperature_decay_plies);
-        line!("temperature_value_cutoff", f(self.temperature_value_cutoff));
-        line!("temperature_visit_offset", f(self.temperature_visit_offset));
-        line!("cpuct", f(self.cpuct));
-        line!("cpuct_at_root", f(self.cpuct_at_root));
-        line!("cpuct_base", f(self.cpuct_base));
-        line!("cpuct_factor", f(self.cpuct_factor));
-        line!("cpuct_base_at_root", f(self.cpuct_base_at_root));
-        line!("cpuct_factor_at_root", f(self.cpuct_factor_at_root));
-        line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
-        line!(
-            "root_exploration_fraction",
-            f(self.root_exploration_fraction)
-        );
-        line!("fpu_value", f(self.fpu_value));
-        line!("fpu_value_at_root", f(self.fpu_value_at_root));
+        line!("gumbel_scale", f(self.gumbel_scale));
+        line!("gumbel_q_value_scale", f(self.gumbel_q_value_scale));
+        line!("gumbel_q_maxvisit_init", f(self.gumbel_q_maxvisit_init));
         line!("draw_score", f(self.draw_score));
-        line!("moves_left_max_effect", f(self.moves_left_max_effect));
-        line!("moves_left_slope", f(self.moves_left_slope));
-        line!("moves_left_threshold", f(self.moves_left_threshold));
-        line!(
-            "moves_left_constant_factor",
-            f(self.moves_left_constant_factor)
-        );
-        line!("moves_left_scaled_factor", f(self.moves_left_scaled_factor));
-        line!(
-            "moves_left_quadratic_factor",
-            f(self.moves_left_quadratic_factor)
-        );
-        line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -494,7 +361,6 @@ impl AzLoopFileConfig {
         line!("max_checkpoints", self.max_checkpoints);
         line!("arena_interval", self.arena_interval);
         line!("arena_simulations", self.arena_simulations);
-        line!("arena_cpuct", f(self.arena_cpuct));
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
         line!(
             "arena_promotion_confidence_z",
@@ -517,10 +383,6 @@ impl AzLoopFileConfig {
         line!(
             "pikafish_label_eval_simulations",
             self.pikafish_label_eval_simulations
-        );
-        line!(
-            "pikafish_label_eval_cpuct",
-            f(self.pikafish_label_eval_cpuct)
         );
         line!("tensorboard_logdir", q(&self.tensorboard_logdir));
         out
@@ -549,26 +411,11 @@ impl AzLoopFileConfig {
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         self.workers = self.workers.max(1);
-        self.temperature_start = self.temperature_start.max(0.0);
-        self.temperature_endgame = self.temperature_endgame.max(0.0);
-        self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
-        self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
-        self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
-        self.cpuct = self.cpuct.max(0.0);
-        self.cpuct_at_root = self.cpuct_at_root.max(0.0);
-        self.cpuct_base = self.cpuct_base.max(1.0);
-        self.cpuct_factor = self.cpuct_factor.max(0.0);
-        self.cpuct_base_at_root = self.cpuct_base_at_root.max(1.0);
-        self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
-        self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
-        self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
-        self.fpu_value = self.fpu_value.max(0.0);
-        self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
+        self.gumbel_max_num_considered_actions = self.gumbel_max_num_considered_actions.max(1);
+        self.gumbel_scale = self.gumbel_scale.max(0.0);
+        self.gumbel_q_value_scale = self.gumbel_q_value_scale.max(0.0);
+        self.gumbel_q_maxvisit_init = self.gumbel_q_maxvisit_init.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
-        self.moves_left_max_effect = self.moves_left_max_effect.max(0.0);
-        self.moves_left_slope = self.moves_left_slope.max(0.0);
-        self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
-        self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -576,7 +423,6 @@ impl AzLoopFileConfig {
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
-        self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
@@ -587,7 +433,6 @@ impl AzLoopFileConfig {
         self.arena_simulations = self.arena_simulations.max(1);
         self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
-        self.pikafish_label_eval_cpuct = self.pikafish_label_eval_cpuct.max(0.0);
         if self.arena_opening_plies_min > self.arena_opening_plies_max {
             std::mem::swap(
                 &mut self.arena_opening_plies_min,
@@ -608,31 +453,11 @@ mod tests {
 
         assert!(text.contains("lr = 0.0007\n"));
         assert!(text.contains("lr_min = 0.00015\n"));
-        assert!(text.contains("temperature_start = 0.9\n"));
-        assert!(text.contains("temperature_endgame = 0.35\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 30\n"));
-        assert!(text.contains("temperature_decay_plies = 60\n"));
-        assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("temperature_value_cutoff = 0.12\n"));
-        assert!(text.contains("temperature_visit_offset = -0.8\n"));
-        assert!(text.contains("cpuct = 1.2\n"));
-        assert!(text.contains("cpuct_at_root = 2.0\n"));
-        assert!(text.contains("cpuct_base = 19652.0\n"));
-        assert!(text.contains("cpuct_factor = 2.0\n"));
-        assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
-        assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
-        assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
-        assert!(text.contains("root_exploration_fraction = 0.1\n"));
-        assert!(text.contains("fpu_value = 0.0\n"));
-        assert!(text.contains("fpu_value_at_root = 1.0\n"));
+        assert!(text.contains("gumbel_max_num_considered_actions = 16\n"));
+        assert!(text.contains("gumbel_scale = 1.0\n"));
+        assert!(text.contains("gumbel_q_value_scale = 0.1\n"));
+        assert!(text.contains("gumbel_q_maxvisit_init = 50.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("moves_left_max_effect = 0.25\n"));
-        assert!(text.contains("moves_left_slope = 0.004\n"));
-        assert!(text.contains("moves_left_threshold = 0.7\n"));
-        assert!(text.contains("moves_left_constant_factor = 0.05\n"));
-        assert!(text.contains("moves_left_scaled_factor = 0.2\n"));
-        assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
-        assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
@@ -665,9 +490,7 @@ mod tests {
         assert!(text.contains("pikafish_label_eval_interval = 20\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
         assert!(text.contains("pikafish_label_eval_simulations = 3000\n"));
-        assert!(text.contains("pikafish_label_eval_cpuct = 1.5\n"));
         assert!(!text.contains("root_exploration_plies"));
-        assert!(!text.contains("gumbel"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));
         assert!(!text.contains("arena_eval_fens"));
@@ -692,6 +515,9 @@ mod tests {
             "high_simulations = 20000\n",
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
+            "cpuct = 1.2\n",
+            "root_dirichlet_alpha = 0.12\n",
+            "temperature_start = 0.9\n",
         ] {
             let error = toml::from_str::<AzLoopTomlConfig>(removed)
                 .expect_err("removed config keys must not be accepted");

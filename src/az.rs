@@ -4,13 +4,13 @@ use std::path::Path;
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
-mod alphazero;
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl"))
 ))]
 mod candle_model;
 mod dataloader;
+mod gumbel;
 mod play;
 mod replay;
 mod train;
@@ -22,17 +22,15 @@ mod train_gpu;
 #[path = "az/train_gpu_candle.rs"]
 mod train_gpu_candle;
 
-use crate::nnue::{
-    AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, fill_sparse_features_az,
-};
+use crate::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, fill_sparse_features_az};
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
 };
 
-pub use alphazero::{
-    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, alphazero_search,
-    alphazero_search_with_rules, alphazero_search_with_rules_controlled,
-    alphazero_search_with_rules_controlled_with_progress, cp_from_q,
+pub use gumbel::{
+    GumbelCandidate, GumbelSearchControl, GumbelSearchLimits, GumbelSearchResult, cp_from_q,
+    gumbel_search, gumbel_search_with_rules, gumbel_search_with_rules_controlled,
+    gumbel_search_with_rules_controlled_with_progress,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -563,30 +561,11 @@ pub struct AzLoopConfig {
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
+    pub gumbel_max_num_considered_actions: usize,
+    pub gumbel_scale: f32,
+    pub gumbel_q_value_scale: f32,
+    pub gumbel_q_maxvisit_init: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
     pub opening_positions: Vec<Position>,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -619,7 +598,7 @@ pub struct AzLoopReport {
     pub policy_target_entropy: f32,
     pub moves_left_loss: f32,
     pub policy_kl: f32,
-    pub root_visit_entropy: f32,
+    pub root_improved_policy_entropy: f32,
     pub entropy_opening: f32,
     pub entropy_mid: f32,
     pub raw_prior_top1: f32,
@@ -950,11 +929,7 @@ impl AzNnue {
         Ok(model)
     }
 
-    pub fn evaluate_value(
-        &self,
-        position: &Position,
-        moves: &[Move],
-    ) -> f32 {
+    pub fn evaluate_value(&self, position: &Position, moves: &[Move]) -> f32 {
         let mut scratch = AzEvalScratch::new(self.arch);
         self.evaluate_with_scratch(position, moves, &mut scratch)
     }

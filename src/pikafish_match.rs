@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_rules};
+use crate::az::{AzNnue, GumbelSearchLimits, gumbel_search_with_rules};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 #[derive(Clone, Debug, Default)]
@@ -43,8 +43,6 @@ pub struct VsPikafishConfig {
     pub simulations: usize,
     pub seed: u64,
     pub parallel_games: usize,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,8 +71,6 @@ struct GameConfig {
     max_plies: usize,
     simulations: usize,
     seed: u64,
-    cpuct: f32,
-    cpuct_at_root: f32,
 }
 
 struct ExternalUci {
@@ -275,33 +271,20 @@ fn play_one_game(
             || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let search = alphazero_search_with_rules(
+            let search = gumbel_search_with_rules(
                 &position,
                 Some(rule_history.clone()),
                 Some(legal.clone()),
                 model,
-                AzSearchLimits {
+                GumbelSearchLimits {
                     simulations: config.simulations,
                     seed,
-                    cpuct: config.cpuct,
-                    cpuct_at_root: config.cpuct_at_root,
-                    cpuct_base: 19652.0,
-                    cpuct_factor: 2.0,
-                    cpuct_base_at_root: 19652.0,
-                    cpuct_factor_at_root: 2.0,
+                    max_num_considered_actions: 16,
+                    gumbel_scale: 0.0,
+                    q_value_scale: 0.1,
+                    q_maxvisit_init: 50.0,
                     max_depth: 0,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: 0.23,
-                    fpu_value_at_root: 1.0,
-                    policy_softmax_temp: 1.0,
                     draw_score: 0.0,
-                    moves_left_max_effect: 0.0,
-                    moves_left_slope: 0.0,
-                    moves_left_threshold: 0.6,
-                    moves_left_constant_factor: 0.0,
-                    moves_left_scaled_factor: 0.0,
-                    moves_left_quadratic_factor: 0.0,
                     value_scale: 1.0,
                 },
             );
@@ -412,8 +395,6 @@ pub fn run_vs_pikafish(
                             simulations: config.simulations,
                             seed: config.seed
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                            cpuct: config.cpuct,
-                            cpuct_at_root: config.cpuct_at_root,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));

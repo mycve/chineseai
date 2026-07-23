@@ -9,8 +9,8 @@ use crate::nnue::{
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_rules, dense_move_index, scalar_value_to_wdl_target,
+    AzLoopConfig, AzNnue, AzSampleMeta, AzTrainingSample, GumbelCandidate, GumbelSearchLimits,
+    SplitMix64, dense_move_index, gumbel_search_with_rules, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -361,33 +361,20 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             search_simulations.simulations_sum += search_simulation_count;
             let search = {
                 crate::scope_profile!("az.selfplay.search");
-                alphazero_search_with_rules(
+                gumbel_search_with_rules(
                     &position,
                     Some(rule_history.clone()),
                     Some(legal),
                     model,
-                    AzSearchLimits {
+                    GumbelSearchLimits {
                         simulations: search_simulation_count,
                         seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                        cpuct: config.cpuct,
-                        cpuct_at_root: config.cpuct_at_root,
-                        cpuct_base: config.cpuct_base,
-                        cpuct_factor: config.cpuct_factor,
-                        cpuct_base_at_root: config.cpuct_base_at_root,
-                        cpuct_factor_at_root: config.cpuct_factor_at_root,
+                        max_num_considered_actions: config.gumbel_max_num_considered_actions,
+                        gumbel_scale: config.gumbel_scale,
+                        q_value_scale: config.gumbel_q_value_scale,
+                        q_maxvisit_init: config.gumbel_q_maxvisit_init,
                         max_depth: 0,
-                        root_dirichlet_alpha: config.root_dirichlet_alpha,
-                        root_exploration_fraction: config.root_exploration_fraction,
-                        fpu_value: config.fpu_value,
-                        fpu_value_at_root: config.fpu_value_at_root,
-                        policy_softmax_temp: config.policy_softmax_temp,
                         draw_score: config.draw_score,
-                        moves_left_max_effect: config.moves_left_max_effect,
-                        moves_left_slope: config.moves_left_slope,
-                        moves_left_threshold: config.moves_left_threshold,
-                        moves_left_constant_factor: config.moves_left_constant_factor,
-                        moves_left_scaled_factor: config.moves_left_scaled_factor,
-                        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
                         value_scale: 1.0,
                     },
                 )
@@ -405,7 +392,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             shape_count += 1;
             entropy_all_sum += entropy;
             entropy_all_count += 1;
-            if ply < temperature_opening_plies(config) {
+            if ply < 90 {
                 entropy_opening_sum += entropy;
                 entropy_opening_count += 1;
                 opening_raw_prior_top1_sum += shape.raw_prior_top1;
@@ -447,20 +434,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 break;
             }
-            let temperature = temperature_for_ply(config, ply);
-            let mv_opt = if temperature <= 1e-6 {
-                search.best_move.or_else(|| {
-                    choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
-                })
-            } else {
-                choose_selfplay_move(
-                    &search.candidates,
-                    temperature,
-                    config.temperature_value_cutoff,
-                    config.temperature_visit_offset,
-                    &mut rng,
-                )
-            };
+            let mv_opt = search.best_move;
             let Some(mv) = mv_opt else {
                 result = Some(0.0);
                 break;
@@ -618,7 +592,7 @@ struct PolicyShapeStats {
     visited_actions: usize,
 }
 
-fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
+fn policy_shape_stats(candidates: &[GumbelCandidate]) -> PolicyShapeStats {
     let mut raw_top = [0.0f32; 2];
     let mut policy_top = [0.0f32; 2];
     let mut q_top = [f32::NEG_INFINITY; 2];
@@ -663,7 +637,7 @@ fn insert_top2(value: f32, top: &mut [f32; 2]) {
 
 fn make_training_sample(
     position: &Position,
-    candidates: &[AzCandidate],
+    candidates: &[GumbelCandidate],
     value: f32,
     mirror_file: bool,
     meta: AzSampleMeta,
@@ -713,7 +687,7 @@ fn make_training_sample(
 }
 
 fn root_search_meta(
-    candidates: &[AzCandidate],
+    candidates: &[GumbelCandidate],
     root_q: f32,
     generation_update: u32,
     game_id: u64,
@@ -741,7 +715,7 @@ fn root_search_meta(
 }
 
 fn move_search_meta(
-    candidates: &[AzCandidate],
+    candidates: &[GumbelCandidate],
     mv: Move,
     root_q: f32,
     generation_update: u32,
@@ -789,105 +763,7 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
     }
 }
 
-fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
-    if ply < config.temperature_decay_delay_plies {
-        return config.temperature_start;
-    }
-    if config.temperature_decay_plies == 0 {
-        return config.temperature_endgame;
-    }
-    let decay_ply = ply.saturating_sub(config.temperature_decay_delay_plies);
-    if decay_ply >= config.temperature_decay_plies {
-        return config.temperature_endgame;
-    }
-    let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
-    config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
-}
-
-fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
-    config
-        .temperature_decay_delay_plies
-        .saturating_add(config.temperature_decay_plies)
-}
-
-fn choose_selfplay_move(
-    candidates: &[AzCandidate],
-    temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
-    rng: &mut SplitMix64,
-) -> Option<Move> {
-    if temperature <= 1e-6 {
-        return candidates
-            .iter()
-            .max_by(|left, right| {
-                left.policy
-                    .total_cmp(&right.policy)
-                    .then_with(|| left.visits.cmp(&right.visits))
-            })
-            .map(|candidate| candidate.mv);
-    }
-
-    let weights = temperature_move_weights(candidates, temperature, value_cutoff, visit_offset);
-    let total = candidates
-        .iter()
-        .zip(&weights)
-        .map(|(_, weight)| *weight)
-        .sum::<f32>();
-    if total <= 0.0 {
-        return candidates.first().map(|candidate| candidate.mv);
-    }
-
-    let mut ticket = rng.unit_f32() * total;
-    for (candidate, weight) in candidates.iter().zip(weights) {
-        if ticket < weight {
-            return Some(candidate.mv);
-        }
-        ticket -= weight;
-    }
-    candidates.first().map(|candidate| candidate.mv)
-}
-
-fn temperature_move_weights(
-    candidates: &[AzCandidate],
-    temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
-) -> Vec<f32> {
-    let cutoff_anchor_q = candidates
-        .iter()
-        .max_by(|left, right| {
-            (left.visits as f32 + visit_offset).total_cmp(&(right.visits as f32 + visit_offset))
-        })
-        .map(|candidate| candidate.q);
-    let inv_temperature = 1.0 / temperature.max(1e-3);
-    let mut weights = candidates
-        .iter()
-        .map(|candidate| {
-            (candidate.visits as f32 + visit_offset)
-                .max(1e-9)
-                .powf(inv_temperature)
-        })
-        .collect::<Vec<_>>();
-
-    let Some(cutoff_anchor_q) = cutoff_anchor_q else {
-        return weights;
-    };
-    if value_cutoff <= 0.0 || value_cutoff >= 1.0 || !cutoff_anchor_q.is_finite() {
-        return weights;
-    }
-
-    // 配置值表示胜率差；Q=W-L，因此胜率差 value_cutoff 对应 2*value_cutoff 的 Q 差。
-    let min_q = cutoff_anchor_q - 2.0 * value_cutoff;
-    for (weight, candidate) in weights.iter_mut().zip(candidates) {
-        if candidate.q < min_q {
-            *weight = 0.0;
-        }
-    }
-    weights
-}
-
-fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
+fn policy_entropy(candidates: &[GumbelCandidate]) -> f32 {
     const EPS: f32 = 1e-10;
     let total = candidates
         .iter()
@@ -913,7 +789,6 @@ pub struct AzArenaConfig {
     pub games_as_black: usize,
     pub start_index: usize,
     pub seed: u64,
-    pub cpuct: f32,
 }
 
 pub fn play_arena_games_from_positions(
@@ -933,7 +808,6 @@ pub fn play_arena_games_from_positions(
             config.simulations,
             config.max_plies,
             game_seed,
-            config.cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -957,7 +831,6 @@ pub fn play_arena_games_from_positions(
             config.simulations,
             config.max_plies,
             game_seed,
-            config.cpuct,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -991,7 +864,6 @@ fn play_arena_game(
     simulations: usize,
     max_plies: usize,
     seed: u64,
-    cpuct: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut rule_history = position.initial_rule_history();
@@ -1009,33 +881,20 @@ fn play_arena_game(
         } else {
             black_model
         };
-        let result = alphazero_search_with_rules(
+        let result = gumbel_search_with_rules(
             &position,
             Some(rule_history.clone()),
             Some(legal),
             model,
-            AzSearchLimits {
+            GumbelSearchLimits {
                 simulations,
                 seed: seed ^ ((ply as u64) << 32),
-                cpuct,
-                cpuct_at_root: cpuct,
-                cpuct_base: 19652.0,
-                cpuct_factor: 2.0,
-                cpuct_base_at_root: 19652.0,
-                cpuct_factor_at_root: 2.0,
+                max_num_considered_actions: 16,
+                gumbel_scale: 0.0,
+                q_value_scale: 0.1,
+                q_maxvisit_init: 50.0,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
-                policy_softmax_temp: 1.0,
                 draw_score: 0.0,
-                moves_left_max_effect: 0.0,
-                moves_left_slope: 0.0,
-                moves_left_threshold: 0.6,
-                moves_left_constant_factor: 0.0,
-                moves_left_scaled_factor: 0.0,
-                moves_left_quadratic_factor: 0.0,
                 value_scale: 1.0,
             },
         );
@@ -1067,8 +926,8 @@ fn play_arena_game(
 mod tests {
     use super::*;
 
-    fn candidate(mv: Move, policy: f32) -> AzCandidate {
-        AzCandidate {
+    fn candidate(mv: Move, policy: f32) -> GumbelCandidate {
+        GumbelCandidate {
             mv,
             visits: (policy * 100.0) as u32,
             q: 0.0,
@@ -1076,18 +935,6 @@ mod tests {
             raw_prior: policy,
             prior: policy,
             policy,
-        }
-    }
-
-    fn candidate_q(mv: Move, visits: u32, q: f32) -> AzCandidate {
-        AzCandidate {
-            mv,
-            visits,
-            q,
-            moves_left: 0.0,
-            raw_prior: 0.0,
-            prior: 0.0,
-            policy: 0.0,
         }
     }
 
@@ -1203,48 +1050,5 @@ mod tests {
         assert_eq!(meta.played_index, 1);
         assert_eq!(meta.best_q, 0.7);
         assert_eq!(meta.played_q, 0.35);
-    }
-
-    #[test]
-    fn temperature_value_cutoff_uses_win_probability_gap() {
-        let mut candidates = vec![
-            candidate_q(Move::new(0, 1), 100, 0.80),
-            candidate_q(Move::new(0, 2), 1, 0.60),
-        ];
-        for index in 2..10 {
-            candidates.push(candidate_q(Move::new(index, index + 1), 10, 0.40));
-        }
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-
-        assert!(weights[1] > 0.0);
-    }
-
-    #[test]
-    fn negative_visit_offset_is_added_like_lc0() {
-        let candidates = vec![
-            candidate_q(Move::new(0, 1), 1, 0.0),
-            candidate_q(Move::new(0, 2), 10, 0.0),
-        ];
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.0, -0.8);
-
-        assert!((weights[0] - 0.2).abs() < 1e-6);
-        assert!((weights[1] - 9.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn temperature_value_cutoff_is_anchored_to_most_visited_move() {
-        let candidates = vec![
-            candidate_q(Move::new(0, 1), 100, 0.40),
-            candidate_q(Move::new(0, 2), 5, 0.90),
-            candidate_q(Move::new(0, 3), 10, 0.05),
-        ];
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-
-        assert!(weights[0] > 0.0);
-        assert!(weights[1] > 0.0);
-        assert_eq!(weights[2], 0.0);
     }
 }
