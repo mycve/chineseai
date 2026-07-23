@@ -16,7 +16,8 @@ const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
 // v27 将 canonical 历史特征从旧表偏移重排到紧凑输入表；旧快照不能混用。
 // v28 removes an obsolete per-sample marker.
-const REPLAY_FILE_VERSION: u32 = 28;
+// v29 switches from side-to-move canonical coordinates to fixed board coordinates.
+const REPLAY_FILE_VERSION: u32 = 29;
 /// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
 const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";

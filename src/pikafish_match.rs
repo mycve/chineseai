@@ -6,8 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_history_and_rules};
-use crate::nnue::{HISTORY_PLIES, HistoryMove};
+use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_rules};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 #[derive(Clone, Debug, Default)]
@@ -200,21 +199,9 @@ impl Drop for ExternalUci {
 
 fn apply_move_recorded(
     position: &mut Position,
-    history: &mut Vec<HistoryMove>,
     rule_history: &mut Vec<RuleHistoryEntry>,
     mv: Move,
 ) {
-    if let Some(piece) = position.piece_at(mv.from as usize) {
-        history.push(HistoryMove {
-            piece,
-            captured: position.piece_at(mv.to as usize),
-            mv,
-        });
-        let overflow = history.len().saturating_sub(HISTORY_PLIES);
-        if overflow > 0 {
-            history.drain(0..overflow);
-        }
-    }
     rule_history.push(position.rule_history_entry_after_move(mv));
     position.make_move(mv);
 }
@@ -266,7 +253,6 @@ fn play_one_game(
     let mut position = initial_position.clone();
     let initial_fen =
         (position.to_fen() != crate::xiangqi::STARTPOS_FEN).then(|| position.to_fen());
-    let mut history: Vec<HistoryMove> = Vec::new();
     let mut rule_history = position.initial_rule_history();
     let mut moves_uci: Vec<String> = Vec::new();
     let mut ply_count = 0usize;
@@ -289,9 +275,8 @@ fn play_one_game(
             || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let search = alphazero_search_with_history_and_rules(
+            let search = alphazero_search_with_rules(
                 &position,
-                &history,
                 Some(rule_history.clone()),
                 Some(legal.clone()),
                 model,
@@ -331,7 +316,7 @@ fn play_one_game(
                 ));
             };
             let uci = mv.to_string();
-            apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
+            apply_move_recorded(&mut position, &mut rule_history, mv);
             moves_uci.push(uci);
         } else {
             let token =
@@ -366,7 +351,7 @@ fn play_one_game(
                     position_command(initial_fen.as_deref(), &moves_uci),
                 ));
             }
-            apply_move_recorded(&mut position, &mut history, &mut rule_history, mv);
+            apply_move_recorded(&mut position, &mut rule_history, mv);
             moves_uci.push(token);
         }
         ply_count += 1;

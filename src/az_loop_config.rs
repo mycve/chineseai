@@ -51,7 +51,6 @@ pub struct AzLoopFileConfig {
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
-    pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -124,7 +123,6 @@ impl Default for AzLoopFileConfig {
             train_warmup_samples: 240000,
             train_samples_per_update: 240000,
             train_epochs_per_update: 1,
-            mirror_probability: 0.3,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -199,7 +197,6 @@ struct AzLoopTomlConfig {
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
-    pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
@@ -290,7 +287,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
-            mirror_probability: config.mirror_probability,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -371,7 +367,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             train_warmup_samples: config.train_warmup_samples,
             train_samples_per_update: config.train_samples_per_update,
             train_epochs_per_update: config.train_epochs_per_update,
-            mirror_probability: config.mirror_probability,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
             checkpoint_interval: config.checkpoint_interval,
@@ -486,7 +481,6 @@ impl AzLoopFileConfig {
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("train_epochs_per_update", self.train_epochs_per_update);
-        line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
@@ -577,7 +571,6 @@ impl AzLoopFileConfig {
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
-        self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
@@ -641,6 +634,7 @@ mod tests {
         assert!(!text.contains("high_simulations"));
         assert!(!text.contains("high_simulation_probability"));
         assert!(!text.contains("high_simulation_start_plies"));
+        assert!(!text.contains("mirror_probability"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 192\n"));
         assert!(text.contains("batch_size = 256\n"));
@@ -690,6 +684,7 @@ mod tests {
             "high_simulations = 20000\n",
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
+            "mirror_probability = 0.5\n",
         ] {
             let error = toml::from_str::<AzLoopTomlConfig>(removed)
                 .expect_err("removed config keys must not be accepted");

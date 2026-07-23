@@ -1,5 +1,4 @@
-use crate::nnue::HistoryMove;
-use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
+use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -14,59 +13,6 @@ const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
 const NO_CHILD: u32 = u32::MAX;
 const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-
-const EMPTY_HISTORY_MOVE: HistoryMove = HistoryMove {
-    piece: Piece {
-        color: Color::Red,
-        kind: PieceKind::General,
-    },
-    captured: None,
-    mv: Move { from: 0, to: 0 },
-};
-
-#[derive(Clone, Copy, Debug)]
-struct SearchHistory {
-    entries: [HistoryMove; crate::nnue::HISTORY_PLIES],
-    len: u8,
-}
-
-impl SearchHistory {
-    fn from_slice(history: &[HistoryMove]) -> Self {
-        let tail = history.len().saturating_sub(crate::nnue::HISTORY_PLIES);
-        let history = &history[tail..];
-        let mut out = Self {
-            entries: [EMPTY_HISTORY_MOVE; crate::nnue::HISTORY_PLIES],
-            len: history.len() as u8,
-        };
-        out.entries[..history.len()].copy_from_slice(history);
-        out
-    }
-
-    fn as_slice(&self) -> &[HistoryMove] {
-        &self.entries[..self.len as usize]
-    }
-
-    fn with_appended_move(&self, position: &Position, mv: Move) -> Self {
-        let Some(piece) = position.piece_at(mv.from as usize) else {
-            return *self;
-        };
-        let mut out = *self;
-        let entry = HistoryMove {
-            piece,
-            captured: position.piece_at(mv.to as usize),
-            mv,
-        };
-        let len = out.len as usize;
-        if len < crate::nnue::HISTORY_PLIES {
-            out.entries[len] = entry;
-            out.len += 1;
-        } else {
-            out.entries.copy_within(1..crate::nnue::HISTORY_PLIES, 0);
-            out.entries[crate::nnue::HISTORY_PLIES - 1] = entry;
-        }
-        out
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
@@ -168,37 +114,26 @@ impl AzSearchControl {
     }
 }
 
-pub fn alphazero_search_with_history_and_rules(
+pub fn alphazero_search_with_rules(
     position: &Position,
-    history: &[HistoryMove],
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    alphazero_search_with_history_and_rules_controlled(
-        position,
-        history,
-        rule_history,
-        root_moves,
-        model,
-        limits,
-        None,
-    )
+    alphazero_search_with_rules_controlled(position, rule_history, root_moves, model, limits, None)
 }
 
-pub fn alphazero_search_with_history_and_rules_controlled(
+pub fn alphazero_search_with_rules_controlled(
     position: &Position,
-    history: &[HistoryMove],
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
     model: &AzNnue,
     limits: AzSearchLimits,
     control: Option<&AzSearchControl>,
 ) -> AzSearchResult {
-    alphazero_search_with_history_and_rules_controlled_with_progress(
+    alphazero_search_with_rules_controlled_with_progress(
         position,
-        history,
         rule_history,
         root_moves,
         model,
@@ -208,9 +143,8 @@ pub fn alphazero_search_with_history_and_rules_controlled(
     )
 }
 
-pub fn alphazero_search_with_history_and_rules_controlled_with_progress(
+pub fn alphazero_search_with_rules_controlled_with_progress(
     position: &Position,
-    history: &[HistoryMove],
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
     model: &AzNnue,
@@ -221,7 +155,6 @@ pub fn alphazero_search_with_history_and_rules_controlled_with_progress(
     crate::scope_profile!("az.alphazero_search");
     let mut tree = AzTree::new(
         position.clone(),
-        truncate_history(history),
         rule_history.unwrap_or_else(|| position.initial_rule_history()),
         root_moves,
         model,
@@ -278,7 +211,7 @@ pub fn alphazero_search(
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    alphazero_search_with_history_and_rules(position, &[], None, None, model, limits)
+    alphazero_search_with_rules(position, None, None, model, limits)
 }
 
 pub fn cp_from_q(q: f32) -> i32 {
@@ -325,7 +258,6 @@ struct AzTree<'a> {
 struct AzNode {
     position: Position,
     accumulator_offset: u32,
-    history: SearchHistory,
     parent: u32,
     rule_entry: Option<RuleHistoryEntry>,
     children_offset: u32,
@@ -438,7 +370,6 @@ impl<'a> AzTree<'a> {
 
     fn new(
         position: Position,
-        history: SearchHistory,
         rule_history: Vec<RuleHistoryEntry>,
         root_moves: Option<Vec<Move>>,
         model: &'a AzNnue,
@@ -450,13 +381,12 @@ impl<'a> AzTree<'a> {
             limits
                 .simulations
                 .saturating_add(1)
-                .saturating_mul(model.hidden_size * 2),
+                .saturating_mul(model.hidden_size),
         );
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         nodes.push(AzNode {
             position,
             accumulator_offset: 0,
-            history,
             parent: NO_CHILD,
             rule_entry: None,
             children_offset: 0,
@@ -626,11 +556,10 @@ impl<'a> AzTree<'a> {
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
+            let accumulator_end = accumulator_start + self.model.hidden_size;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
-                self.nodes[node_index].history.as_slice(),
                 &moves,
                 &mut self.eval_scratch,
             )
@@ -732,16 +661,10 @@ impl<'a> AzTree<'a> {
                 let moved = child_position.piece_at(mv.from as usize).unwrap();
                 let captured = child_position.piece_at(mv.to as usize);
                 let parent_accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-                let parent_accumulator_end = parent_accumulator_start + self.model.hidden_size * 2;
+                let parent_accumulator_end = parent_accumulator_start + self.model.hidden_size;
                 let child_accumulator_offset = self.accumulator_arena.len();
                 self.accumulator_arena
                     .extend_from_within(parent_accumulator_start..parent_accumulator_end);
-                let child_history = {
-                    crate::scope_profile!("az.search.clone_history");
-                    self.nodes[node_index]
-                        .history
-                        .with_appended_move(&child_position, mv)
-                };
                 let mover = child_position.side_to_move();
                 {
                     crate::scope_profile!("az.search.child_make_move");
@@ -755,7 +678,7 @@ impl<'a> AzTree<'a> {
                     moved,
                     captured,
                     &mut self.accumulator_arena[child_accumulator_offset
-                        ..child_accumulator_offset + self.model.hidden_size * 2],
+                        ..child_accumulator_offset + self.model.hidden_size],
                 );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv.to as usize);
@@ -764,7 +687,6 @@ impl<'a> AzTree<'a> {
                     position: child_position,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
-                    history: child_history,
                     parent: node_index as u32,
                     rule_entry: Some(child_rule_entry),
                     children_offset: 0,
@@ -836,11 +758,10 @@ impl<'a> AzTree<'a> {
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
+            let accumulator_end = accumulator_start + self.model.hidden_size;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
-                self.nodes[node_index].history.as_slice(),
                 &moves,
                 &mut self.eval_scratch,
             )
@@ -1234,43 +1155,10 @@ fn sample_standard_normal(rng: &mut SplitMix64, salt: u64) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
 }
 
-pub(super) fn append_history(history: &mut Vec<HistoryMove>, position: &Position, mv: Move) {
-    if let Some(piece) = position.piece_at(mv.from as usize) {
-        history.push(HistoryMove {
-            piece,
-            captured: position.piece_at(mv.to as usize),
-            mv,
-        });
-        let overflow = history.len().saturating_sub(crate::nnue::HISTORY_PLIES);
-        if overflow > 0 {
-            history.drain(0..overflow);
-        }
-    }
-}
-
-fn truncate_history(history: &[HistoryMove]) -> SearchHistory {
-    SearchHistory::from_slice(history)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
-
-    #[test]
-    fn inline_search_history_matches_existing_history_updates() {
-        let mut position = Position::startpos();
-        let mut expected = Vec::new();
-        let mut actual = SearchHistory::from_slice(&expected);
-
-        for _ in 0..(crate::nnue::HISTORY_PLIES + 4) {
-            let mv = position.legal_moves()[0];
-            append_history(&mut expected, &position, mv);
-            actual = actual.with_appended_move(&position, mv);
-            assert_eq!(actual.as_slice(), expected.as_slice());
-            position.make_move(mv);
-        }
-    }
 
     #[test]
     fn child_node_index_uses_compact_sentinel_representation() {
@@ -1292,9 +1180,8 @@ mod tests {
     fn stopped_search_returns_root_result_without_running_simulations() {
         let stop = Arc::new(AtomicBool::new(true));
         let control = AzSearchControl::new(stop, None);
-        let result = alphazero_search_with_history_and_rules_controlled(
+        let result = alphazero_search_with_rules_controlled(
             &Position::startpos(),
-            &[],
             None,
             None,
             &AzNnue::random(4, 19),
@@ -1332,7 +1219,6 @@ mod tests {
         let model = AzNnue::random(4, 17);
         let mut tree = AzTree::new(
             position.clone(),
-            SearchHistory::from_slice(&[]),
             position.initial_rule_history(),
             Some(vec![legal[0]]),
             &model,
@@ -1473,7 +1359,6 @@ mod tests {
 
         let mut tree = AzTree::new(
             position.clone(),
-            SearchHistory::from_slice(&[]),
             position.initial_rule_history(),
             None,
             &model,
@@ -1554,22 +1439,17 @@ mod tests {
         let position = Position::startpos();
         let mv = position.legal_moves()[0];
         let mut node_position = position.clone();
-        let mut node_history = Vec::new();
         let mut node_rule_history = position.initial_rule_history();
 
         let mut manual_position = position;
-        let mut manual_history = Vec::new();
         let mut manual_rule_history = manual_position.initial_rule_history();
-        append_history(&mut manual_history, &manual_position, mv);
         manual_rule_history.push(manual_position.rule_history_entry_after_move(mv));
         manual_position.make_move(mv);
 
-        append_history(&mut node_history, &node_position, mv);
         node_rule_history.push(node_position.rule_history_entry_after_move(mv));
         node_position.make_move(mv);
 
         assert_eq!(node_position, manual_position);
-        assert_eq!(node_history, manual_history);
         assert_eq!(node_rule_history, manual_rule_history);
     }
 
@@ -1610,7 +1490,6 @@ mod tests {
         let model = AzNnue::random(4, 11);
         let mut tree = AzTree::new(
             position.clone(),
-            SearchHistory::from_slice(&[]),
             rule_history,
             Some(vec![mv]),
             &model,
@@ -1634,7 +1513,6 @@ mod tests {
         let model = AzNnue::random(4, 7);
         let mut tree = AzTree::new(
             position,
-            SearchHistory::from_slice(&[]),
             Position::startpos().initial_rule_history(),
             Some(root_moves.clone()),
             &model,

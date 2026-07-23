@@ -2,16 +2,12 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::nnue::{
-    HistoryMove, canonical_move, extract_sparse_features_az_canonical, mirror_file_move,
-    mirror_sparse_features_az_canonical_file,
-};
+use crate::nnue::extract_sparse_features_az;
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
 
-use super::alphazero::append_history;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_history_and_rules, dense_move_index, scalar_value_to_wdl_target,
+    alphazero_search_with_rules, dense_move_index, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -335,7 +331,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let index = (rng.next_u64() as usize) % config.opening_positions.len();
             config.opening_positions[index].clone()
         };
-        let mut history = Vec::new();
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
         let mut result = None;
@@ -363,9 +358,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             search_simulations.simulations_sum += search_simulation_count;
             let search = {
                 crate::scope_profile!("az.selfplay.search");
-                alphazero_search_with_history_and_rules(
+                alphazero_search_with_rules(
                     &position,
-                    &history,
                     Some(rule_history.clone()),
                     Some(legal),
                     model,
@@ -432,11 +426,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 );
                 let sample = make_training_sample(
                     &position,
-                    &history,
                     &search.candidates,
                     search.value_q,
                     config.policy_softmax_temp,
-                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                     search_simulation_count,
                     1.0,
@@ -497,18 +489,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 crate::scope_profile!("az.selfplay.make_sample");
                 let sample = make_training_sample(
                     &position,
-                    &history,
                     &search.candidates,
                     search.value_q,
                     config.policy_softmax_temp,
-                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
                     search_simulation_count,
                     1.0,
                 );
                 game_samples.push(sample);
             }
-            append_history(&mut history, &position, mv);
             let mover = position.side_to_move();
             position.make_move(mv);
             rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
@@ -670,11 +659,9 @@ fn insert_top2(value: f32, top: &mut [f32; 2]) {
 
 fn make_training_sample(
     position: &Position,
-    history: &[HistoryMove],
     candidates: &[AzCandidate],
     value: f32,
     policy_softmax_temp: f32,
-    mirror_file: bool,
     meta: AzSampleMeta,
     search_simulations: usize,
     policy_weight: f32,
@@ -682,22 +669,12 @@ fn make_training_sample(
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
     let policy_softmax_temp = policy_softmax_temp.max(1e-3);
-    let mut features = extract_sparse_features_az_canonical(position, history);
-    let mut moves = candidates
+    let features = extract_sparse_features_az(position);
+    let moves = candidates
         .iter()
         .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
-    if mirror_file {
-        mirror_sparse_features_az_canonical_file(&mut features);
-        for mv in &mut moves {
-            *mv = mirror_file_move(*mv);
-        }
-    }
-    let move_indices = moves
-        .iter()
-        .copied()
-        .map(|mv| dense_move_index(canonical_move(side, mv)))
-        .collect();
+    let move_indices = moves.iter().copied().map(dense_move_index).collect();
     let mut policy = candidates
         .iter()
         .map(|candidate| candidate.policy.max(1e-12).powf(1.0 / policy_softmax_temp))
@@ -1054,7 +1031,6 @@ fn play_arena_game(
     cpuct: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
-    let mut history = Vec::new();
     let mut rule_history = position.initial_rule_history();
     for ply in 0..max_plies {
         let legal = position.legal_moves_with_rules(&rule_history);
@@ -1070,9 +1046,8 @@ fn play_arena_game(
         } else {
             black_model
         };
-        let result = alphazero_search_with_history_and_rules(
+        let result = alphazero_search_with_rules(
             &position,
-            &history,
             Some(rule_history.clone()),
             Some(legal),
             model,
@@ -1103,7 +1078,6 @@ fn play_arena_game(
         let Some(mv) = result.best_move else {
             return 0.0;
         };
-        append_history(&mut history, &position, mv);
         let mover = position.side_to_move();
         position.make_move(mv);
         rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
@@ -1184,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_training_sample_mirrors_move_indices() {
+    fn training_sample_uses_fixed_board_move_indices() {
         let position =
             Position::from_fen("3ak4/9/2n1b4/p3p3p/4R4/2P6/P3P3P/2N1C4/4A4/2BAK3c b").unwrap();
         let moves = position.legal_moves();
@@ -1196,25 +1170,17 @@ mod tests {
             .collect::<Vec<_>>();
         let sample = make_training_sample(
             &position,
-            &[],
             &candidates,
             0.0,
             1.45,
-            true,
             AzSampleMeta::default(),
             1,
             1.0,
         );
 
-        let mirrored_position = position.mirror_files();
-        let mirrored_moves = candidates
+        let expected = candidates
             .iter()
-            .map(|candidate| mirror_file_move(candidate.mv))
-            .collect::<Vec<_>>();
-        let expected = mirrored_moves
-            .iter()
-            .copied()
-            .map(|mv| dense_move_index(canonical_move(mirrored_position.side_to_move(), mv)))
+            .map(|candidate| dense_move_index(candidate.mv))
             .collect::<Vec<_>>();
 
         assert_eq!(sample.move_indices, expected);

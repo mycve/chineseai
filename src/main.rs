@@ -10,11 +10,10 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
-        SplitMix64, alphazero_search, alphazero_search_with_history_and_rules, benchmark_training,
+        SplitMix64, alphazero_search, alphazero_search_with_rules, benchmark_training,
         generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
         train_samples_weighted_owned,
     },
-    nnue::HistoryMove,
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -472,7 +471,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -508,7 +507,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
-        f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
         config.arena_simulations,
@@ -766,7 +764,6 @@ fn build_az_loop_config(
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
-        mirror_probability: config.mirror_probability,
     }
 }
 
@@ -1178,20 +1175,10 @@ fn main() {
             let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let fen = cmd.fen.join(" ");
             let mut position = parse_position(&fen);
-            let mut history = Vec::with_capacity(cmd.moves.len());
             let mut rule_history = position.initial_rule_history();
             for text in &cmd.moves {
                 let mv = position.parse_uci_move(text).unwrap_or_else(|| {
                     panic!("invalid or illegal --move `{text}` for this position")
-                });
-                let moved = position
-                    .piece_at(mv.from as usize)
-                    .expect("legal move must have a moving piece");
-                let captured = position.piece_at(mv.to as usize);
-                history.push(HistoryMove {
-                    piece: moved,
-                    captured,
-                    mv,
                 });
                 rule_history.push(position.rule_history_entry_after_move(mv));
                 position.make_move(mv);
@@ -1222,9 +1209,8 @@ fn main() {
                 moves_left_quadratic_factor: if cmd.moves_left_utility { 0.75 } else { 0.0 },
                 value_scale: 1.0,
             };
-            let result = alphazero_search_with_history_and_rules(
+            let result = alphazero_search_with_rules(
                 &position,
-                &history,
                 Some(rule_history.clone()),
                 None,
                 &model,
@@ -1322,28 +1308,17 @@ fn main() {
                     println!("verify: {mv} unavailable_at_root");
                     continue;
                 };
-                let moved = position
-                    .piece_at(mv.from as usize)
-                    .expect("verified move must have a moving piece");
-                let captured = position.piece_at(mv.to as usize);
-                let mut child_history = history.clone();
-                child_history.push(HistoryMove {
-                    piece: moved,
-                    captured,
-                    mv,
-                });
                 let mut child_rule_history = rule_history.clone();
                 child_rule_history.push(position.rule_history_entry_after_move(mv));
                 let mut child = position.clone();
                 child.make_move(mv);
                 let child_legal = child.legal_moves_with_rules(&child_rule_history);
-                let child_nn_q = model.evaluate_value(&child, &child_history, &child_legal);
+                let child_nn_q = model.evaluate_value(&child, &child_legal);
                 let mut verify_limits = search_limits;
                 verify_limits.simulations = verify_sims.max(1);
                 verify_limits.seed = 0;
-                let verified = alphazero_search_with_history_and_rules(
+                let verified = alphazero_search_with_rules(
                     &child,
-                    &child_history,
                     Some(child_rule_history),
                     Some(child_legal),
                     &model,
@@ -1640,7 +1615,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} swa_max_models={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} swa_max_models={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(per_gpu)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 SWA_MAX_MODELS,
@@ -1682,7 +1657,6 @@ fn main() {
                 config.resign_percentage,
                 config.resign_playthrough,
                 config.replay_capacity,
-                config.mirror_probability,
                 config.train_value_weight,
                 config.train_policy_weight,
                 config.checkpoint_interval,

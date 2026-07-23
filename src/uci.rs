@@ -1,8 +1,7 @@
 use crate::az::{
     AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult,
-    alphazero_search_with_history_and_rules_controlled_with_progress,
+    alphazero_search_with_rules_controlled_with_progress,
 };
-use crate::nnue::{HISTORY_PLIES, HistoryMove};
 use crate::xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome};
 use std::io::{self, BufRead, Write};
 use std::sync::{
@@ -18,7 +17,6 @@ const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 #[derive(Clone, Debug)]
 struct UciState {
     position: Position,
-    history: Vec<HistoryMove>,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
     model: Option<Arc<AzNnue>>,
@@ -46,7 +44,6 @@ impl Default for UciState {
     fn default() -> Self {
         Self {
             position: Position::startpos(),
-            history: Vec::new(),
             rule_history: Position::startpos().initial_rule_history(),
             eval_file: "model.safetensors".into(),
             model: None,
@@ -112,7 +109,6 @@ pub fn run_uci() {
             Some("ucinewgame") => {
                 stop_active_search(&mut active_search);
                 state.position = Position::startpos();
-                state.history.clear();
                 state.rule_history = state.position.initial_rule_history();
                 state.seed = 20260409;
             }
@@ -292,16 +288,10 @@ fn handle_position(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     if tokens.get(1) == Some(&"startpos") {
         state.position = Position::startpos();
-        state.history.clear();
         state.rule_history = state.position.initial_rule_history();
         if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
             let move_list = &tokens[moves_index + 1..];
-            apply_uci_moves(
-                &mut state.position,
-                &mut state.history,
-                &mut state.rule_history,
-                move_list,
-            );
+            apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
         }
         return;
     }
@@ -312,16 +302,10 @@ fn handle_position(line: &str, state: &mut UciState) {
         let fen = tokens[2..fen_end].join(" ");
         if let Ok(position) = Position::from_fen(&fen) {
             state.position = position;
-            state.history.clear();
             state.rule_history = state.position.initial_rule_history();
             if let Some(moves_index) = moves_index {
                 let move_list = &tokens[moves_index + 1..];
-                apply_uci_moves(
-                    &mut state.position,
-                    &mut state.history,
-                    &mut state.rule_history,
-                    move_list,
-                );
+                apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
             }
         }
     }
@@ -329,7 +313,6 @@ fn handle_position(line: &str, state: &mut UciState) {
 
 fn apply_uci_moves(
     position: &mut Position,
-    history: &mut Vec<HistoryMove>,
     rule_history: &mut Vec<RuleHistoryEntry>,
     moves: &[&str],
 ) {
@@ -339,17 +322,6 @@ fn apply_uci_moves(
         };
         if !position.legal_moves_with_rules(rule_history).contains(&mv) {
             break;
-        }
-        if let Some(piece) = position.piece_at(mv.from as usize) {
-            history.push(HistoryMove {
-                piece,
-                captured: position.piece_at(mv.to as usize),
-                mv,
-            });
-            let overflow = history.len().saturating_sub(HISTORY_PLIES);
-            if overflow > 0 {
-                history.drain(0..overflow);
-            }
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
@@ -506,9 +478,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         print_search_info(progress, started);
         flush();
     };
-    let result = alphazero_search_with_history_and_rules_controlled_with_progress(
+    let result = alphazero_search_with_rules_controlled_with_progress(
         &state.position,
-        &state.history,
         Some(state.rule_history.clone()),
         Some(legal),
         model,
