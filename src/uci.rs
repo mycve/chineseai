@@ -12,6 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
+// MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
+const MAX_UCI_INFINITE_TREE_SIMULATIONS: usize = 100_000;
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
@@ -372,7 +374,11 @@ fn parse_go(line: &str) -> GoParams {
             "movetime" => params.move_time_ms = parse_next(&tokens, index),
             "nodes" => params.nodes = parse_next(&tokens, index),
             "depth" => params.depth = parse_next(&tokens, index),
-            "infinite" => params.infinite = true,
+            "infinite" => {
+                params.infinite = true;
+                index += 1;
+                continue;
+            }
             _ => {
                 index += 1;
                 continue;
@@ -463,17 +469,10 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
 
     let budget_ms = time_budget_ms(&params, state.position.side_to_move());
     let has_time_control = budget_ms.is_some() || params.infinite;
-    let simulations = params
-        .nodes
-        .unwrap_or(if has_time_control {
-            MAX_UCI_SIMULATIONS
-        } else {
-            state.simulations.max(1)
-        })
-        .clamp(1, MAX_UCI_SIMULATIONS);
+    let simulations = uci_simulation_limit(&params, state.simulations, has_time_control);
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
-    let control = AzSearchControl::new(stop, deadline);
+    let control = AzSearchControl::new(Arc::clone(&stop), deadline);
     let mut report_progress = |progress: &AzSearchResult| {
         print_search_info(progress, started);
         flush();
@@ -509,6 +508,11 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         Some(&control),
         Some(&mut report_progress),
     );
+    // UCI 规定无限分析在收到 `stop` 前不发送 bestmove。树达到安全上限后保留结果等待，
+    // 不再继续无界分配节点。
+    while params.infinite && !stop.load(Ordering::Relaxed) {
+        thread::park_timeout(Duration::from_millis(10));
+    }
     match result.best_move {
         Some(mv) => {
             let best_text = mv.to_string();
@@ -526,6 +530,21 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         }
     }
     flush();
+}
+
+fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: bool) -> usize {
+    let requested = params.nodes.unwrap_or(if params.infinite {
+        configured.max(1)
+    } else if has_time_control {
+        MAX_UCI_SIMULATIONS
+    } else {
+        configured.max(1)
+    });
+    if params.infinite {
+        requested.clamp(1, MAX_UCI_INFINITE_TREE_SIMULATIONS)
+    } else {
+        requested.clamp(1, MAX_UCI_SIMULATIONS)
+    }
 }
 
 fn print_search_info(result: &AzSearchResult, started: Instant) {
@@ -605,5 +624,23 @@ mod tests {
 
         let infinite = parse_go("go infinite");
         assert_eq!(time_budget_ms(&infinite, Color::Red), None);
+    }
+
+    #[test]
+    fn infinite_analysis_uses_a_bounded_tree() {
+        let infinite = parse_go("go infinite");
+        assert_eq!(uci_simulation_limit(&infinite, 10_000, true), 10_000);
+
+        let oversized = parse_go("go infinite nodes 100000000");
+        assert_eq!(
+            uci_simulation_limit(&oversized, 10_000, true),
+            MAX_UCI_INFINITE_TREE_SIMULATIONS
+        );
+
+        let timed = parse_go("go movetime 1000");
+        assert_eq!(
+            uci_simulation_limit(&timed, 10_000, true),
+            MAX_UCI_SIMULATIONS
+        );
     }
 }
