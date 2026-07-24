@@ -5,7 +5,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use super::{AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64};
+use super::{
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64, policy_repeat_features,
+    rule_context_features,
+};
 
 const DEFAULT_CPUCT: f32 = 1.5;
 const DEFAULT_CPUCT_BASE: f32 = 19652.0;
@@ -13,6 +16,8 @@ const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
 const NO_CHILD: u32 = u32::MAX;
 const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
+const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
@@ -379,14 +384,14 @@ impl<'a> AzTree<'a> {
         model: &'a AzNnue,
         limits: AzSearchLimits,
     ) -> Self {
-        let mut nodes = Vec::with_capacity(limits.simulations.saturating_add(1).min(16_384));
+        let initial_nodes = limits
+            .simulations
+            .saturating_add(1)
+            .min(INITIAL_TREE_NODE_CAPACITY);
+        let mut nodes = Vec::with_capacity(initial_nodes);
         let accumulator = AzEvalAccumulator::new(model, &position);
-        let mut accumulator_arena = Vec::with_capacity(
-            limits
-                .simulations
-                .saturating_add(1)
-                .saturating_mul(model.hidden_size * 2),
-        );
+        let mut accumulator_arena =
+            Vec::with_capacity(initial_nodes.saturating_mul(model.hidden_size.saturating_mul(2)));
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         nodes.push(AzNode {
             position,
@@ -404,7 +409,9 @@ impl<'a> AzTree<'a> {
         });
         Self {
             nodes,
-            children: Vec::with_capacity(limits.simulations.saturating_mul(8)),
+            children: Vec::with_capacity(
+                initial_nodes.saturating_mul(INITIAL_CHILDREN_PER_NODE_ESTIMATE),
+            ),
             accumulator_arena,
             model,
             root_moves,
@@ -532,18 +539,31 @@ impl<'a> AzTree<'a> {
             };
         }
 
-        let moves = {
+        let (moves, policy_repeats_history) = {
             crate::scope_profile!("az.search.expand_legal_moves");
             if node_index == self.root {
-                self.root_moves.clone().unwrap_or_else(|| {
+                if let Some(moves) = self.root_moves.clone() {
+                    let repeats = policy_repeat_features(
+                        &self.nodes[node_index].position,
+                        &self.rule_history_scratch,
+                        &moves,
+                    );
+                    (moves, repeats)
+                } else {
                     self.nodes[node_index]
                         .position
-                        .legal_moves_with_rules(&self.rule_history_scratch)
-                })
+                        .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
+                        .into_iter()
+                        .map(|(mv, repeat)| (mv, f32::from(repeat)))
+                        .unzip()
+                }
             } else {
                 self.nodes[node_index]
                     .position
-                    .legal_moves_with_rules(&self.rule_history_scratch)
+                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
+                    .into_iter()
+                    .map(|(mv, repeat)| (mv, f32::from(repeat)))
+                    .unzip()
             }
         };
         if moves.is_empty() {
@@ -566,6 +586,11 @@ impl<'a> AzTree<'a> {
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &moves,
+                &rule_context_features(
+                    &self.nodes[node_index].position,
+                    &self.rule_history_scratch,
+                ),
+                &policy_repeats_history,
                 &mut self.eval_scratch,
             )
         };
@@ -745,11 +770,14 @@ impl<'a> AzTree<'a> {
                 moves_left: 0.0,
             };
         }
-        let moves = {
+        let (moves, policy_repeats_history): (Vec<_>, Vec<_>) = {
             crate::scope_profile!("az.search.expand_legal_moves");
             self.nodes[node_index]
                 .position
-                .legal_moves_with_rules(&self.rule_history_scratch)
+                .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
+                .into_iter()
+                .map(|(mv, repeat)| (mv, f32::from(repeat)))
+                .unzip()
         };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
@@ -769,6 +797,11 @@ impl<'a> AzTree<'a> {
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &moves,
+                &rule_context_features(
+                    &self.nodes[node_index].position,
+                    &self.rule_history_scratch,
+                ),
+                &policy_repeats_history,
                 &mut self.eval_scratch,
             )
         };
@@ -1610,6 +1643,32 @@ mod tests {
         assert_eq!(
             position.rule_outcome_with_history(&rule_history),
             Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        );
+    }
+
+    #[test]
+    fn huge_timed_simulation_limit_uses_bounded_initial_capacity() {
+        let position = Position::startpos();
+        let model = AzNnue::random(4, 71);
+        let tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits {
+                simulations: usize::MAX,
+                ..AzSearchLimits::default()
+            },
+        );
+
+        assert_eq!(tree.nodes.capacity(), INITIAL_TREE_NODE_CAPACITY);
+        assert_eq!(
+            tree.accumulator_arena.capacity(),
+            INITIAL_TREE_NODE_CAPACITY * model.hidden_size * 2
+        );
+        assert_eq!(
+            tree.children.capacity(),
+            INITIAL_TREE_NODE_CAPACITY * INITIAL_CHILDREN_PER_NODE_ESTIMATE
         );
     }
 }

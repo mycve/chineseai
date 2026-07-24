@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
-const MAX_UCI_INFINITE_TREE_SIMULATIONS: usize = 100_000;
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
@@ -509,8 +508,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         Some(&control),
         Some(&mut report_progress),
     );
-    // UCI 规定无限分析在收到 `stop` 前不发送 bestmove。树达到安全上限后保留结果等待，
-    // 不再继续无界分配节点。
+    // UCI 规定无限分析在收到 `stop` 前不发送 bestmove。只有达到内部 u32
+    // 节点索引的表示上限时才会进入等待；正常分析不会受配置节点数限制。
     while params.infinite && !stop.load(Ordering::Relaxed) {
         thread::park_timeout(Duration::from_millis(10));
     }
@@ -535,17 +534,13 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
 
 fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: bool) -> usize {
     let requested = params.nodes.unwrap_or(if params.infinite {
-        configured.max(1)
+        MAX_UCI_SIMULATIONS
     } else if has_time_control {
         MAX_UCI_SIMULATIONS
     } else {
         configured.max(1)
     });
-    if params.infinite {
-        requested.clamp(1, MAX_UCI_INFINITE_TREE_SIMULATIONS)
-    } else {
-        requested.clamp(1, MAX_UCI_SIMULATIONS)
-    }
+    requested.clamp(1, MAX_UCI_SIMULATIONS)
 }
 
 fn print_search_info(result: &AzSearchResult, started: Instant) {
@@ -628,15 +623,15 @@ mod tests {
     }
 
     #[test]
-    fn infinite_analysis_uses_a_bounded_tree() {
+    fn infinite_analysis_runs_until_stop_or_explicit_nodes() {
         let infinite = parse_go("go infinite");
-        assert_eq!(uci_simulation_limit(&infinite, 10_000, true), 10_000);
-
-        let oversized = parse_go("go infinite nodes 100000000");
         assert_eq!(
-            uci_simulation_limit(&oversized, 10_000, true),
-            MAX_UCI_INFINITE_TREE_SIMULATIONS
+            uci_simulation_limit(&infinite, 10_000, true),
+            MAX_UCI_SIMULATIONS
         );
+
+        let explicit = parse_go("go infinite nodes 100000000");
+        assert_eq!(uci_simulation_limit(&explicit, 10_000, true), 100_000_000);
 
         let timed = parse_go("go movetime 1000");
         assert_eq!(

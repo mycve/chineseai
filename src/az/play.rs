@@ -6,11 +6,12 @@ use crate::nnue::{
     canonical_move, extract_sparse_features_az, mirror_file_move,
     mirror_sparse_features_az_canonical_file,
 };
-use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleOutcome};
+use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_rules, dense_move_index, scalar_value_to_wdl_target,
+    alphazero_search_with_rules, dense_move_index, policy_repeat_features, rule_context_features,
+    scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -430,6 +431,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 );
                 let sample = make_training_sample(
                     &position,
+                    &rule_history,
                     &search.candidates,
                     search.value_q,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
@@ -493,6 +495,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 crate::scope_profile!("az.selfplay.make_sample");
                 let sample = make_training_sample(
                     &position,
+                    &rule_history,
                     &search.candidates,
                     search.value_q,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
@@ -663,6 +666,7 @@ fn insert_top2(value: f32, top: &mut [f32; 2]) {
 
 fn make_training_sample(
     position: &Position,
+    rule_history: &[RuleHistoryEntry],
     candidates: &[AzCandidate],
     value: f32,
     mirror_file: bool,
@@ -677,6 +681,7 @@ fn make_training_sample(
         .iter()
         .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
+    let policy_repeats_history = policy_repeat_features(position, rule_history, &moves);
     if mirror_file {
         mirror_sparse_features_az_canonical_file(&mut features);
         for mv in &mut moves {
@@ -699,8 +704,10 @@ fn make_training_sample(
 
     AzTrainingSample {
         features,
+        rule_context: rule_context_features(position, rule_history),
         move_indices,
         policy,
+        policy_repeats_history,
         value_wdl: scalar_value_to_wdl_target(value),
         value: value.clamp(-1.0, 1.0),
         side_sign,
@@ -1094,8 +1101,10 @@ mod tests {
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
         AzTrainingSample {
             features: Vec::new(),
+            rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
             move_indices: Vec::new(),
             policy: Vec::new(),
+            policy_repeats_history: Vec::new(),
             value_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign,
@@ -1134,6 +1143,7 @@ mod tests {
             .collect::<Vec<_>>();
         let sample = make_training_sample(
             &position,
+            &position.initial_rule_history(),
             &candidates,
             0.0,
             true,

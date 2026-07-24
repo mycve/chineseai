@@ -645,6 +645,10 @@ impl GpuReplica {
         let legal_policy_logits = forward
             .policy_logits
             .gather(&batch_tensors.policy_indices, 1)?;
+        let repeat_logits = batch_tensors
+            .policy_repeats_history
+            .broadcast_mul(&forward.policy_repeat_logit)?;
+        let legal_policy_logits = (legal_policy_logits + repeat_logits)?;
         let masked_policy_logits = (&legal_policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;

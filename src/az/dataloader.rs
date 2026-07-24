@@ -8,8 +8,9 @@ use std::time::Instant;
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
 use super::{
-    AzTrainingSample, DENSE_MOVE_SPACE, WDL_HEAD_SIZE, canonical_general_buckets_from_features,
-    decode_current_piece_square_feature, normalize_wdl_target, structural_king_piece_index,
+    AzTrainingSample, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
+    canonical_general_buckets_from_features, decode_current_piece_square_feature,
+    normalize_wdl_target, structural_king_piece_index,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -109,9 +110,11 @@ pub(super) struct PackedBatch {
     pub policy_indices: Vec<u32>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
+    pub policy_repeats_history: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
+    pub rule_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
@@ -154,9 +157,11 @@ impl PackedBatch {
             policy_indices: vec![0u32; batch_size * max_policy_moves],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
+            policy_repeats_history: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
+            rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
             value_phase_masks: vec![0.0f32; batch_size * 3],
@@ -170,6 +175,8 @@ impl PackedBatch {
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.moves_left[row] = sample.moves_left.max(0.0);
+            packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
+                .copy_from_slice(&sample.rule_context);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
             let phase = if sample.meta.ply < 40 {
@@ -211,11 +218,21 @@ impl PackedBatch {
     fn pack_policy(&mut self, row: usize, sample: &AzTrainingSample) {
         let policy_base = row * self.max_policy_moves;
         let mut policy_offset = 0usize;
-        for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
+        for (sample_offset, (&move_index, &target)) in sample
+            .move_indices
+            .iter()
+            .zip(sample.policy.iter())
+            .enumerate()
+        {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_indices[policy_base + policy_offset] = move_index as u32;
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
+                self.policy_repeats_history[policy_base + policy_offset] = sample
+                    .policy_repeats_history
+                    .get(sample_offset)
+                    .copied()
+                    .unwrap_or(0.0);
                 policy_offset += 1;
             }
         }
@@ -368,8 +385,10 @@ mod tests {
     fn sample(index: usize) -> AzTrainingSample {
         AzTrainingSample {
             features: vec![index % AZ_NNUE_INPUT_SIZE],
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: vec![0, 1],
             policy: vec![1.0 + index as f32, 1.0],
+            policy_repeats_history: vec![0.0, 0.0],
             value_wdl: [1.0, 0.0, 0.0],
             value: 2.0,
             side_sign: 1.0,

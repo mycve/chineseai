@@ -3703,7 +3703,9 @@ mod reporting_tests {
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         AzTrainingSample {
             features: vec![0],
+            rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
             move_indices: (0..policy.len()).collect(),
+            policy_repeats_history: vec![0.0; policy.len()],
             policy,
             value_wdl: [0.0, 1.0, 0.0],
             value: 0.0,

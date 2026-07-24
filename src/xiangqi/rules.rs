@@ -128,9 +128,20 @@ impl Position {
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
         crate::scope_profile!("xiangqi.legal_moves_with_rules");
+        self.legal_moves_with_rules_and_repetition(history)
+            .into_iter()
+            .map(|(mv, _)| mv)
+            .collect()
+    }
+
+    pub fn legal_moves_with_rules_and_repetition(
+        &self,
+        history: &[RuleHistoryEntry],
+    ) -> Vec<(Move, bool)> {
+        crate::scope_profile!("xiangqi.legal_moves_with_rules_and_repetition");
         let legal = self.legal_moves();
         if legal.is_empty() {
-            return legal;
+            return Vec::new();
         }
 
         let current_entry = (!history.last().is_some_and(|entry| {
@@ -141,14 +152,14 @@ impl Position {
         let mover = self.side_to_move;
         legal
             .into_iter()
-            .filter(|&mv| {
+            .filter_map(|mv| {
                 let next_hash = self.hash_after_move(mv);
                 let next_side_to_move = mover.opposite();
-                if !history
-                    .iter()
-                    .any(|entry| entry.hash == next_hash && entry.side_to_move == next_side_to_move)
-                {
-                    return true;
+                let repeats_history = history.iter().any(|entry| {
+                    entry.hash == next_hash && entry.side_to_move == next_side_to_move
+                });
+                if !repeats_history {
+                    return Some((mv, false));
                 }
                 let mut next = self.clone();
                 next.make_move(mv);
@@ -159,10 +170,11 @@ impl Position {
                     next_history.push(entry);
                 }
                 next_history.push(self.rule_history_entry_after_move(mv));
-                !rule_outcome_forbidden_for_mover(
+                (!rule_outcome_forbidden_for_mover(
                     next.rule_outcome_with_history(&next_history),
                     mover,
-                )
+                ))
+                .then_some((mv, true))
             })
             .collect()
     }
