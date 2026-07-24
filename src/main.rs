@@ -321,6 +321,9 @@ struct PikafishLabelEvalArgs {
     /// Limit number of positions; 0 means all.
     #[arg(long, default_value_t = 0)]
     limit: usize,
+    /// Parallel evaluator threads.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
@@ -2807,7 +2810,7 @@ fn main() {
                         match eval_result {
                             Ok(stats) => {
                                 println!(
-                                    "pikafish-label {update:04}: sqlite={} evaluated={} legal={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% value_corr={:.4} value_mae={:.4} elapsed={:.1}s",
+                                    "pikafish-label {update:04}: sqlite={} evaluated={} legal={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae={:.4} search_value_corr={:.4} search_value_mae={:.4} elapsed={:.1}s",
                                     config.pikafish_label_eval_sqlite,
                                     stats.count,
                                     stats.legal_bestmove,
@@ -2819,6 +2822,8 @@ fn main() {
                                     100.0 * stats.top4_rate(),
                                     100.0 * stats.top8_rate(),
                                     100.0 * stats.prior_top1_rate(),
+                                    stats.raw_value_corr(),
+                                    stats.raw_value_mae_tanh_cp(),
                                     stats.value_corr(),
                                     stats.value_mae_tanh_cp(),
                                     started.elapsed().as_secs_f32()
@@ -2867,15 +2872,27 @@ fn main() {
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/value_corr",
+                                    "pikafish_label/search_value_corr",
                                     update,
                                     stats.value_corr() as f32,
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/value_mae_tanh_cp",
+                                    "pikafish_label/search_value_mae_tanh_cp",
                                     update,
                                     stats.value_mae_tanh_cp(),
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/raw_value_corr",
+                                    update,
+                                    stats.raw_value_corr() as f32,
+                                );
+                                log_scalar(
+                                    &mut tb,
+                                    "pikafish_label/raw_value_mae_tanh_cp",
+                                    update,
+                                    stats.raw_value_mae_tanh_cp(),
                                 );
                             }
                             Err(err) => {
@@ -3107,6 +3124,13 @@ struct LabelEvalStats {
     cp_tanh_sq_sum: f64,
     value_cp_cross_sum: f64,
     abs_value_error_sum: f64,
+    raw_value_pairs: usize,
+    raw_value_q_sum: f64,
+    raw_cp_tanh_sum: f64,
+    raw_value_q_sq_sum: f64,
+    raw_cp_tanh_sq_sum: f64,
+    raw_value_cp_cross_sum: f64,
+    raw_abs_value_error_sum: f64,
 }
 
 impl LabelEvalStats {
@@ -3125,6 +3149,13 @@ impl LabelEvalStats {
         self.cp_tanh_sq_sum += other.cp_tanh_sq_sum;
         self.value_cp_cross_sum += other.value_cp_cross_sum;
         self.abs_value_error_sum += other.abs_value_error_sum;
+        self.raw_value_pairs += other.raw_value_pairs;
+        self.raw_value_q_sum += other.raw_value_q_sum;
+        self.raw_cp_tanh_sum += other.raw_cp_tanh_sum;
+        self.raw_value_q_sq_sum += other.raw_value_q_sq_sum;
+        self.raw_cp_tanh_sq_sum += other.raw_cp_tanh_sq_sum;
+        self.raw_value_cp_cross_sum += other.raw_value_cp_cross_sum;
+        self.raw_abs_value_error_sum += other.raw_abs_value_error_sum;
     }
 
     fn denom(&self) -> f32 {
@@ -3174,6 +3205,40 @@ impl LabelEvalStats {
         self.value_pairs
     }
 
+    fn push_raw_value_pair(&mut self, value_q: f32, score_cp: Option<i32>) {
+        let Some(score_cp) = score_cp else {
+            return;
+        };
+        let target = ((score_cp as f64) / 600.0).tanh();
+        let value = value_q as f64;
+        self.raw_value_pairs += 1;
+        self.raw_value_q_sum += value;
+        self.raw_cp_tanh_sum += target;
+        self.raw_value_q_sq_sum += value * value;
+        self.raw_cp_tanh_sq_sum += target * target;
+        self.raw_value_cp_cross_sum += value * target;
+        self.raw_abs_value_error_sum += (value - target).abs();
+    }
+
+    fn raw_value_mae_tanh_cp(&self) -> f32 {
+        (self.raw_abs_value_error_sum / self.raw_value_pairs.max(1) as f64) as f32
+    }
+
+    fn raw_value_corr(&self) -> f64 {
+        let n = self.raw_value_pairs as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+        let cov = self.raw_value_cp_cross_sum - self.raw_value_q_sum * self.raw_cp_tanh_sum / n;
+        let left = self.raw_value_q_sq_sum - self.raw_value_q_sum * self.raw_value_q_sum / n;
+        let right = self.raw_cp_tanh_sq_sum - self.raw_cp_tanh_sum * self.raw_cp_tanh_sum / n;
+        if left <= 0.0 || right <= 0.0 {
+            0.0
+        } else {
+            cov / (left * right).sqrt()
+        }
+    }
+
     fn value_corr(&self) -> f64 {
         let n = self.value_count() as f64;
         if n <= 1.0 {
@@ -3207,33 +3272,32 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
     }
 
     let started = Instant::now();
-    let stats = evaluate_pikafish_labels(
-        &model,
-        &rows,
+    let stats = evaluate_pikafish_labels_parallel(
+        Arc::new(model),
+        rows,
         cmd.simulations.max(1),
         cmd.seed,
         cmd.cpuct.max(0.0),
         cmd.max_depth,
-        |done, total| {
-            if done % 100 == 0 || done == total {
-                println!("pikafish-label-eval: searched {done}/{total}");
-            }
-        },
+        cmd.threads,
     )?;
 
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% value_corr={:.4} value_mae_tanh_cp={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_tanh_cp={:.4} search_value_corr={:.4} search_value_mae_tanh_cp={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
         stats.legal_bestmove,
         stats.value_count(),
         cmd.simulations.max(1),
+        cmd.threads.max(1),
         100.0 * stats.top1_rate(),
         100.0 * stats.top2_rate(),
         100.0 * stats.top4_rate(),
         100.0 * stats.top8_rate(),
         100.0 * stats.prior_top1_rate(),
+        stats.raw_value_corr(),
+        stats.raw_value_mae_tanh_cp(),
         stats.value_corr(),
         stats.value_mae_tanh_cp(),
         started.elapsed().as_secs_f32()
@@ -3262,6 +3326,10 @@ fn evaluate_pikafish_labels(
             continue;
         };
         stats.legal_bestmove += 1;
+        let rule_history = position.initial_rule_history();
+        let legal_moves = position.legal_moves_with_rules(&rule_history);
+        let raw_value = model.evaluate_value_with_rules(&position, &rule_history, &legal_moves);
+        stats.push_raw_value_pair(raw_value, row.best_score_cp);
         let result = alphazero_search(
             &position,
             model,

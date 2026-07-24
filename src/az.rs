@@ -1040,6 +1040,23 @@ impl AzNnue {
         self.evaluate_with_scratch(position, moves, &mut scratch)
     }
 
+    pub fn evaluate_value_with_rules(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        moves: &[Move],
+    ) -> f32 {
+        let mut scratch = AzEvalScratch::new(self.arch);
+        self.evaluate_with_scratch_output(
+            position,
+            moves,
+            &rule_context_features(position, history),
+            &policy_repeat_features(position, history, moves),
+            &mut scratch,
+        )
+        .value
+    }
+
     pub(super) fn evaluate_with_scratch(
         &self,
         position: &Position,
