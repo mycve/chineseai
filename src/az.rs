@@ -46,6 +46,7 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
+pub(super) const POLICY_TRUNK_SIZE: usize = 32;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
@@ -180,6 +181,22 @@ fn load_candle_f32_tensor(
         .map_err(candle_io_error)
 }
 
+fn load_optional_candle_f32_tensor(
+    tensors: &candle_core::safetensors::MmapedSafetensors,
+    name: &str,
+    default: Vec<f32>,
+) -> io::Result<Vec<f32>> {
+    if tensors
+        .tensors()
+        .iter()
+        .any(|(tensor_name, _)| tensor_name == name)
+    {
+        load_candle_f32_tensor(tensors, name)
+    } else {
+        Ok(default)
+    }
+}
+
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h]);
@@ -201,6 +218,10 @@ macro_rules! az_weight_tensors {
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_repeat_weight, [1]);
         $visit!(policy_repeat_hidden, [$h]);
+        $visit!(policy_trunk_hidden, [POLICY_TRUNK_SIZE, $h]);
+        $visit!(policy_trunk_bias, [POLICY_TRUNK_SIZE]);
+        $visit!(policy_trunk_output, [$h, POLICY_TRUNK_SIZE]);
+        $visit!(policy_trunk_output_bias, [$h]);
         $visit!(policy_from_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_to_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_pair_context_hidden, [POLICY_PAIR_CONTEXT_SIZE, $h]);
@@ -250,6 +271,8 @@ pub(super) struct AzEvalScratch {
     // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
     features: Vec<usize>,
     hidden: Vec<f32>,
+    policy_hidden: Vec<f32>,
+    policy_trunk: Vec<f32>,
     value_head: Vec<f32>,
     value_head2: Vec<f32>,
     policy_pair_context: Vec<f32>,
@@ -266,6 +289,8 @@ impl AzEvalScratch {
         Self {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
+            policy_hidden: vec![0.0; hidden_size],
+            policy_trunk: vec![0.0; POLICY_TRUNK_SIZE],
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             value_head2: vec![0.0; VALUE_HEAD_SIZE],
             policy_pair_context: vec![0.0; POLICY_PAIR_CONTEXT_SIZE],
@@ -499,6 +524,10 @@ pub struct AzNnue {
     pub policy_move_bias: Vec<f32>,
     pub policy_repeat_weight: Vec<f32>,
     pub policy_repeat_hidden: Vec<f32>,
+    pub policy_trunk_hidden: Vec<f32>,
+    pub policy_trunk_bias: Vec<f32>,
+    pub policy_trunk_output: Vec<f32>,
+    pub policy_trunk_output_bias: Vec<f32>,
     pub policy_from_hidden: Vec<f32>,
     pub policy_to_hidden: Vec<f32>,
     pub policy_pair_context_hidden: Vec<f32>,
@@ -534,6 +563,10 @@ impl Clone for AzNnue {
             policy_move_bias: self.policy_move_bias.clone(),
             policy_repeat_weight: self.policy_repeat_weight.clone(),
             policy_repeat_hidden: self.policy_repeat_hidden.clone(),
+            policy_trunk_hidden: self.policy_trunk_hidden.clone(),
+            policy_trunk_bias: self.policy_trunk_bias.clone(),
+            policy_trunk_output: self.policy_trunk_output.clone(),
+            policy_trunk_output_bias: self.policy_trunk_output_bias.clone(),
             policy_from_hidden: self.policy_from_hidden.clone(),
             policy_to_hidden: self.policy_to_hidden.clone(),
             policy_pair_context_hidden: self.policy_pair_context_hidden.clone(),
@@ -920,6 +953,15 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_repeat_weight = vec![0.0; 1];
         let policy_repeat_hidden = vec![0.0; hidden_size];
+        // 低秩残差策略干线：第一层随机、第二层零初始化，因此新模型初始时
+        // 严格等价于旧策略头，随后可学习棋子之间的二阶组合关系。
+        let mut policy_trunk_rng = SplitMix64::new(seed ^ 0xA24B_AED4_963E_E407);
+        let policy_trunk_hidden = (0..POLICY_TRUNK_SIZE * hidden_size)
+            .map(|_| policy_trunk_rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
+            .collect();
+        let policy_trunk_bias = vec![0.0; POLICY_TRUNK_SIZE];
+        let policy_trunk_output = vec![0.0; hidden_size * POLICY_TRUNK_SIZE];
+        let policy_trunk_output_bias = vec![0.0; hidden_size];
         let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
@@ -959,6 +1001,10 @@ impl AzNnue {
             policy_move_bias,
             policy_repeat_weight,
             policy_repeat_hidden,
+            policy_trunk_hidden,
+            policy_trunk_bias,
+            policy_trunk_output,
+            policy_trunk_output_bias,
             policy_from_hidden,
             policy_to_hidden,
             policy_pair_context_hidden,
@@ -994,6 +1040,10 @@ impl AzNnue {
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
+        let mut policy_trunk_rng = SplitMix64::new(0xA24B_AED4_963E_E407 ^ hidden_size as u64);
+        let default_policy_trunk_hidden = (0..POLICY_TRUNK_SIZE * hidden_size)
+            .map(|_| policy_trunk_rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
+            .collect();
         let model = Self {
             hidden_size,
             arch,
@@ -1016,6 +1066,26 @@ impl AzNnue {
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
             policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
+            policy_trunk_hidden: load_optional_candle_f32_tensor(
+                &tensors,
+                "policy_trunk_hidden",
+                default_policy_trunk_hidden,
+            )?,
+            policy_trunk_bias: load_optional_candle_f32_tensor(
+                &tensors,
+                "policy_trunk_bias",
+                vec![0.0; POLICY_TRUNK_SIZE],
+            )?,
+            policy_trunk_output: load_optional_candle_f32_tensor(
+                &tensors,
+                "policy_trunk_output",
+                vec![0.0; hidden_size * POLICY_TRUNK_SIZE],
+            )?,
+            policy_trunk_output_bias: load_optional_candle_f32_tensor(
+                &tensors,
+                "policy_trunk_output_bias",
+                vec![0.0; hidden_size],
+            )?,
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
             policy_pair_context_hidden: load_candle_f32_tensor(
@@ -1183,8 +1253,13 @@ impl AzNnue {
     ) -> f32 {
         {
             crate::scope_profile!("az.eval.policy_embeddings");
-            self.policy_pair_context_into(&scratch.hidden, &mut scratch.policy_pair_context);
-            self.policy_move_context_into(&scratch.hidden, &mut scratch.policy_move_context);
+            self.policy_hidden_into(
+                &scratch.hidden,
+                &mut scratch.policy_trunk,
+                &mut scratch.policy_hidden,
+            );
+            self.policy_pair_context_into(&scratch.policy_hidden, &mut scratch.policy_pair_context);
+            self.policy_move_context_into(&scratch.policy_hidden, &mut scratch.policy_move_context);
         }
         scratch.logits.resize(moves.len(), 0.0);
         let move_map = move_map();
@@ -1213,7 +1288,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_square_scores");
             self.policy_square_scores_for_squares_into(
-                &scratch.hidden,
+                &scratch.policy_hidden,
                 &from_squares[..from_count],
                 &to_squares[..to_count],
                 &mut scratch.policy_from_scores,
@@ -1223,7 +1298,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_logits");
             let repeat_logit = self.policy_repeat_weight[0]
-                + dot_product(&scratch.hidden, &self.policy_repeat_hidden);
+                + dot_product(&scratch.policy_hidden, &self.policy_repeat_hidden);
             for (index, mv) in moves.iter().enumerate() {
                 let canonical = canonical_move(side, *mv);
                 let sparse = canonical.from as usize * BOARD_SIZE + canonical.to as usize;
@@ -1507,6 +1582,22 @@ impl AzNnue {
             let end = start + self.hidden_size;
             to_scores[square] = dot_product(hidden, &self.policy_to_hidden[start..end]);
         }
+    }
+
+    fn policy_hidden_into(&self, hidden: &[f32], trunk: &mut Vec<f32>, out: &mut Vec<f32>) {
+        trunk.resize(POLICY_TRUNK_SIZE, 0.0);
+        for (index, value) in trunk.iter_mut().enumerate() {
+            let row =
+                &self.policy_trunk_hidden[index * self.hidden_size..(index + 1) * self.hidden_size];
+            *value = (self.policy_trunk_bias[index] + dot_product(hidden, row)).max(0.0);
+        }
+        out.resize(self.hidden_size, 0.0);
+        for (index, value) in out.iter_mut().enumerate() {
+            let row = &self.policy_trunk_output
+                [index * POLICY_TRUNK_SIZE..(index + 1) * POLICY_TRUNK_SIZE];
+            *value = hidden[index] + self.policy_trunk_output_bias[index] + dot_product(trunk, row);
+        }
+        rms_norm_in_place(out);
     }
 
     fn policy_pair_context_into(&self, hidden: &[f32], out: &mut Vec<f32>) {
@@ -2772,6 +2863,13 @@ mod tests {
         assert_eq!(model.moves_left_output, loaded.moves_left_output);
         assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
+        assert_eq!(model.policy_trunk_hidden, loaded.policy_trunk_hidden);
+        assert_eq!(model.policy_trunk_bias, loaded.policy_trunk_bias);
+        assert_eq!(model.policy_trunk_output, loaded.policy_trunk_output);
+        assert_eq!(
+            model.policy_trunk_output_bias,
+            loaded.policy_trunk_output_bias
+        );
         assert_eq!(model.policy_from_hidden, loaded.policy_from_hidden);
         assert_eq!(model.policy_to_hidden, loaded.policy_to_hidden);
         assert_eq!(

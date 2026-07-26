@@ -18,6 +18,11 @@ const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
+/// 与网络先验无关的探索项。策略网络只负责安排探索顺序，不能把合法着压成
+/// 实际上的硬剪枝；该项保证低先验着随着父节点访问增长仍能获得搜索机会。
+const PRIOR_INDEPENDENT_EXPLORATION: f32 = 0.10;
+const CHECK_EXPLORATION_MULTIPLIER: f32 = 5.0;
+const CAPTURE_EXPLORATION_MULTIPLIER: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
@@ -283,6 +288,8 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     prior: f32,
+    is_capture: bool,
+    gives_check: bool,
     visits: u32,
     value_wdl_sum: [f32; 3],
     moves_left_sum: f32,
@@ -620,21 +627,27 @@ impl<'a> AzTree<'a> {
         }
         {
             crate::scope_profile!("az.search.children_build");
+            let tactical_flags = moves
+                .iter()
+                .map(|mv| move_tactical_flags(&self.nodes[node_index].position, *mv))
+                .collect::<Vec<_>>();
             let offset = self.children.len();
-            self.children
-                .extend(
-                    moves
-                        .into_iter()
-                        .zip(priors.drain(..))
-                        .map(|(mv, prior)| AzChild {
-                            mv,
-                            prior,
-                            visits: 0,
-                            value_wdl_sum: [0.0; 3],
-                            moves_left_sum: 0.0,
-                            child: NO_CHILD,
-                        }),
-                );
+            self.children.extend(
+                moves
+                    .into_iter()
+                    .zip(priors.drain(..))
+                    .zip(tactical_flags)
+                    .map(|((mv, prior), (is_capture, gives_check))| AzChild {
+                        mv,
+                        prior,
+                        is_capture,
+                        gives_check,
+                        visits: 0,
+                        value_wdl_sum: [0.0; 3],
+                        moves_left_sum: 0.0,
+                        child: NO_CHILD,
+                    }),
+            );
             let len = self.children.len() - offset;
             self.nodes[node_index].children_offset =
                 u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
@@ -658,6 +671,13 @@ impl<'a> AzTree<'a> {
         }
         if !self.nodes[node_index].expanded {
             let eval = self.expand(node_index);
+            // 唯一合法着不是需要由策略分配预算的“选择”。尤其在被将军时，
+            // 若停在应将前直接使用网络值，会把一条强制战术人为截断；父节点
+            // 必须再次选中同一分支，才能看到应将后的真实局面。连续穿过唯一
+            // 合法着，让一次模拟落在下一个真正存在选择的节点上。
+            if self.nodes[node_index].children_len == 1 {
+                return self.simulate_child(node_index, 0, depth + 1);
+            }
             self.add_node_visit(node_index, eval);
             self.record_leaf_depth(depth, false);
             return eval;
@@ -962,7 +982,17 @@ impl<'a> AzTree<'a> {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        q + u + self.moves_left_utility(parent, child, q)
+        let tactical_exploration = if child.gives_check {
+            CHECK_EXPLORATION_MULTIPLIER
+        } else if child.is_capture {
+            CAPTURE_EXPLORATION_MULTIPLIER
+        } else {
+            1.0
+        };
+        let independent_u = PRIOR_INDEPENDENT_EXPLORATION
+            * tactical_exploration
+            * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt();
+        q + u + independent_u + self.moves_left_utility(parent, child, q)
     }
 
     fn moves_left_utility(&self, parent: &AzNode, child: &AzChild, q: f32) -> f32 {
@@ -1017,6 +1047,14 @@ impl<'a> AzTree<'a> {
             .map(|child| child.prior / total_prior)
             .collect()
     }
+}
+
+fn move_tactical_flags(position: &Position, mv: Move) -> (bool, bool) {
+    let is_capture = position.piece_at(mv.to as usize).is_some();
+    let mut child = position.clone();
+    child.make_move(mv);
+    let gives_check = child.in_check(child.side_to_move());
+    (is_capture, gives_check)
 }
 
 fn wdl_utility(wdl: [f32; 3], draw_score: f32) -> f32 {
@@ -1219,11 +1257,48 @@ mod tests {
     }
 
     #[test]
+    fn tactical_flags_recognize_the_low_prior_mating_sacrifice() {
+        let position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
+        let mv = position.parse_uci_move("h2h0").unwrap();
+        assert_eq!(move_tactical_flags(&position, mv), (false, true));
+    }
+
+    #[test]
+    fn search_extends_through_a_forced_reply_in_one_simulation() {
+        let position =
+            Position::from_fen("4k1b2/4a4/4ba3/p8/4cN3/3n2N1P/c8/4C4/4A4/2B1KAB2 b").unwrap();
+        let checking_move = position.parse_uci_move("a3a0").unwrap();
+        let mut checked = position.clone();
+        checked.make_move(checking_move);
+        assert_eq!(checked.legal_moves(), [Move::from_uci("c0a2").unwrap()]);
+
+        let result = alphazero_search_with_rules(
+            &position,
+            None,
+            Some(vec![checking_move]),
+            &AzNnue::random(4, 23),
+            AzSearchLimits {
+                simulations: 1,
+                max_depth: 8,
+                ..AzSearchLimits::default()
+            },
+        );
+
+        assert_eq!(result.search_depth_max, 2);
+        assert_eq!(result.search_depth_cutoffs, 0);
+    }
+
+    #[test]
     fn child_node_index_uses_compact_sentinel_representation() {
         assert!(std::mem::size_of::<AzChild>() <= 40);
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
+            is_capture: false,
+            gives_check: false,
             visits: 0,
             value_wdl_sum: [0.0; 3],
             moves_left_sum: 0.0,
@@ -1259,6 +1334,8 @@ mod tests {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
+            is_capture: false,
+            gives_check: false,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
             moves_left_sum: 0.0,
@@ -1441,6 +1518,8 @@ mod tests {
                 AzChild {
                     mv: legal[0],
                     prior: 0.10,
+                    is_capture: false,
+                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     moves_left_sum: 0.0,
@@ -1449,6 +1528,8 @@ mod tests {
                 AzChild {
                     mv: legal[1],
                     prior: 0.90,
+                    is_capture: false,
+                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     moves_left_sum: 0.0,
