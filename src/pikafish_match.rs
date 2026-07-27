@@ -303,6 +303,7 @@ fn play_one_game(
                     moves_left_scaled_factor: 0.0,
                     moves_left_quadratic_factor: 0.0,
                     value_scale: 1.0,
+                    tactical_verifier: false,
                 },
             );
             seed = seed.wrapping_add(1);

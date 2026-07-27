@@ -137,6 +137,9 @@ struct AzSearchArgs {
     /// Draw value in Q = W - L + draw_score * D.
     #[arg(long, default_value_t = 0.0)]
     draw_score: f32,
+    /// Enable broad tactical exploration for diagnostic/verifier searches.
+    #[arg(long, default_value_t = false)]
+    tactical_verifier: bool,
     /// Enable moves-left utility.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     moves_left_utility: bool,
@@ -146,6 +149,9 @@ struct AzSearchArgs {
     /// Independently re-search specific root moves (repeat the option for multiple moves).
     #[arg(long = "verify-move")]
     verify_moves: Vec<String>,
+    /// Restrict the root search to these legal moves (repeat for multiple moves).
+    #[arg(long = "root-move")]
+    root_moves: Vec<String>,
     /// Simulations for every independent child verification; 0 uses the root simulation count.
     #[arg(long, default_value_t = 0)]
     verify_sims: usize,
@@ -361,32 +367,36 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
+const AZ_LOOP_PROGRESS_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct AzLoopProgressState {
+    format_version: u32,
     next_update: usize,
     best_elo: f32,
     swa_count: usize,
-    #[serde(skip_serializing)]
-    pikafish_depth: u32,
-    #[serde(skip_serializing)]
-    pikafish_best_wins: usize,
 }
 
 impl Default for AzLoopProgressState {
     fn default() -> Self {
         Self {
+            format_version: AZ_LOOP_PROGRESS_VERSION,
             next_update: 1,
             best_elo: 1500.0,
             swa_count: 0,
-            pikafish_depth: 1,
-            pikafish_best_wins: 0,
         }
     }
 }
 
 impl AzLoopProgressState {
     fn normalize(mut self) -> Self {
+        if self.format_version != AZ_LOOP_PROGRESS_VERSION {
+            panic!(
+                "unsupported AZ loop progress version {}; expected {}",
+                self.format_version, AZ_LOOP_PROGRESS_VERSION
+            );
+        }
         self.next_update = self.next_update.max(1);
         if !self.best_elo.is_finite() {
             self.best_elo = 1500.0;
@@ -765,6 +775,15 @@ fn build_az_loop_config(
         moves_left_scaled_factor: config.moves_left_scaled_factor,
         moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
+        tactical_verify_fraction: config.tactical_verify_fraction,
+        tactical_verify_min_simulations: config.tactical_verify_min_simulations,
+        tactical_verify_max_candidates: config.tactical_verify_max_candidates,
+        tactical_verify_min_visits: config.tactical_verify_min_visits,
+        tactical_verify_q_margin: config.tactical_verify_q_margin,
+        tactical_teacher_max_weight: config.tactical_teacher_max_weight,
+        tactical_deep_verify_rate: config.tactical_deep_verify_rate,
+        tactical_deep_verify_multiplier: config.tactical_deep_verify_multiplier,
+        tactical_deep_verify_q_window: config.tactical_deep_verify_q_window,
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
@@ -854,6 +873,18 @@ fn build_async_training_report(
         total_samples_generated,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
+        tactical_scout_searches: pending.selfplay.tactical_teacher.scout_searches,
+        tactical_proposals: pending.selfplay.tactical_teacher.proposals,
+        tactical_accepted: pending.selfplay.tactical_teacher.accepted,
+        tactical_deep_audits: pending.selfplay.tactical_teacher.deep_audits,
+        tactical_deep_accepted: pending.selfplay.tactical_teacher.deep_accepted,
+        tactical_extra_simulations_per_search: pending.selfplay.tactical_teacher.simulations_sum
+            as f32
+            / search_count,
+        tactical_teacher_weight: pending.selfplay.tactical_teacher.teacher_weight_sum
+            / pending.selfplay.tactical_teacher.accepted.max(1) as f32,
+        tactical_q_gap: pending.selfplay.tactical_teacher.q_gap_sum
+            / pending.selfplay.tactical_teacher.accepted.max(1) as f32,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -1149,6 +1180,7 @@ fn fixed_az_search_limits(
         moves_left_scaled_factor: 0.0,
         moves_left_quadratic_factor: 0.0,
         value_scale: 1.0,
+        tactical_verifier: false,
     }
 }
 
@@ -1169,7 +1201,7 @@ fn main() {
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
-            println!("aznnue   : initialized (nnue binary, magic AZB1)");
+            println!("aznnue   : initialized (safetensors, format v2)");
             println!("arch     : hidden={}", arch.hidden_size,);
             println!("seed     : {seed}");
             println!("output   : {output}");
@@ -1215,11 +1247,26 @@ fn main() {
                 moves_left_scaled_factor: if cmd.moves_left_utility { 0.20 } else { 0.0 },
                 moves_left_quadratic_factor: if cmd.moves_left_utility { 0.75 } else { 0.0 },
                 value_scale: 1.0,
+                tactical_verifier: cmd.tactical_verifier,
+            };
+            let root_moves = if cmd.root_moves.is_empty() {
+                None
+            } else {
+                Some(
+                    cmd.root_moves
+                        .iter()
+                        .map(|text| {
+                            position.parse_uci_move(text).unwrap_or_else(|| {
+                                panic!("invalid or illegal --root-move `{text}` for this position")
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
             };
             let result = alphazero_search_with_rules(
                 &position,
                 Some(rule_history.clone()),
-                None,
+                root_moves,
                 &model,
                 search_limits,
             );
@@ -1233,6 +1280,7 @@ fn main() {
             println!("fpu_value_at_root: {}", cmd.fpu_value_at_root);
             println!("draw_score: {}", cmd.draw_score);
             println!("moves_left_utility: {}", cmd.moves_left_utility);
+            println!("tactical_verifier: {}", cmd.tactical_verifier);
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
@@ -1465,39 +1513,42 @@ fn main() {
             let model_path = Path::new(&config.model_path);
             let (model, resumed_model) = if model_path.exists() {
                 println!("model    : load {}", config.model_path);
-                match AzNnue::load(model_path) {
-                    Ok(model) => {
-                        if model.arch != config_arch {
-                            println!(
-                                "model    : loaded arch={:?} differs from config arch={:?}; keep loaded arch",
-                                model.arch, config_arch
-                            );
-                        }
-                        fs::remove_file(model_path).unwrap_or_else(|err| {
-                            panic!(
-                                "loaded model but failed to remove consumed `{}`: {err}",
-                                model_path.display()
-                            )
-                        });
-                        println!("resume   : consumed `{}` into memory", model_path.display());
-                        (model, true)
-                    }
-                    Err(err) => {
-                        println!(
-                            "model    : reinit {} as random nnue ({err})",
-                            config.model_path
-                        );
-                        (AzNnue::random_with_arch(config_arch, config.seed), false)
-                    }
+                let model = AzNnue::load(model_path).unwrap_or_else(|err| {
+                    panic!(
+                        "refusing to resume incompatible model `{}`: {err}",
+                        model_path.display()
+                    )
+                });
+                if model.arch != config_arch {
+                    panic!(
+                        "model `{}` architecture {:?} differs from config {:?}",
+                        model_path.display(),
+                        model.arch,
+                        config_arch
+                    );
                 }
+                fs::remove_file(model_path).unwrap_or_else(|err| {
+                    panic!(
+                        "loaded model but failed to remove consumed `{}`: {err}",
+                        model_path.display()
+                    )
+                });
+                println!("resume   : consumed `{}` into memory", model_path.display());
+                (model, true)
             } else if config.arena_interval > 0 && best_path.exists() {
                 println!("model    : load best `{}` as current", best_path.display());
-                (
-                    AzNnue::load(&best_path).unwrap_or_else(|err| {
-                        panic!("failed to load best model `{}`: {err}", best_path.display());
-                    }),
-                    true,
-                )
+                let best = AzNnue::load(&best_path).unwrap_or_else(|err| {
+                    panic!("failed to load best model `{}`: {err}", best_path.display());
+                });
+                if best.arch != config_arch {
+                    panic!(
+                        "best model `{}` architecture {:?} differs from config {:?}",
+                        best_path.display(),
+                        best.arch,
+                        config_arch
+                    );
+                }
+                (best, true)
             } else {
                 println!("model    : init {}", config.model_path);
                 (AzNnue::random_with_arch(config_arch, config.seed), false)
@@ -1550,16 +1601,19 @@ fn main() {
             } else {
                 if !best_path.exists() {
                     save_model(&selfplay_model, &best_path);
-                } else if let Err(err) = AzNnue::load(&best_path) {
-                    println!(
-                        "best     : reset incompatible `{}` from deployed model ({err})",
-                        best_path.display()
-                    );
-                    save_model(&selfplay_model, &best_path);
                 }
-                AzNnue::load(&best_path).unwrap_or_else(|err| {
+                let reference = AzNnue::load(&best_path).unwrap_or_else(|err| {
                     panic!("failed to load best model `{}`: {err}", best_path.display());
-                })
+                });
+                if reference.arch != selfplay_model.arch {
+                    panic!(
+                        "best model `{}` architecture {:?} differs from self-play {:?}",
+                        best_path.display(),
+                        reference.arch,
+                        selfplay_model.arch
+                    );
+                }
+                reference
             };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
@@ -1585,11 +1639,10 @@ fn main() {
                         replay_pool = Some(pool);
                     }
                     Err(err) => {
-                        eprintln!(
-                            "replay   : corrupt snapshot `{}`: {err}; removing",
+                        panic!(
+                            "refusing incompatible replay snapshot `{}`: {err}",
                             replay_snapshot_path.display()
                         );
-                        let _ = fs::remove_file(&replay_snapshot_path);
                     }
                 }
             }
@@ -2177,7 +2230,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} swa_n={} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} swa_n={} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s tactical(scout={} proposal={} accept={} deep={}/{} extra_sims={:.1} weight={:.3} qgap={:.3}){}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2253,6 +2306,14 @@ fn main() {
                     report.samples_per_second,
                     report.train_samples_per_second,
                     started.elapsed().as_secs_f32(),
+                    report.tactical_scout_searches,
+                    report.tactical_proposals,
+                    report.tactical_accepted,
+                    report.tactical_deep_accepted,
+                    report.tactical_deep_audits,
+                    report.tactical_extra_simulations_per_search,
+                    report.tactical_teacher_weight,
+                    report.tactical_q_gap,
                     checkpoint_saved
                         .as_ref()
                         .map_or_else(String::new, |path| format!(
@@ -2357,6 +2418,54 @@ fn main() {
                     "selfplay/avg_search_simulations",
                     update,
                     report.avg_search_simulations,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_scout_searches",
+                    update,
+                    report.tactical_scout_searches as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_proposals",
+                    update,
+                    report.tactical_proposals as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_accepted",
+                    update,
+                    report.tactical_accepted as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_deep_audits",
+                    update,
+                    report.tactical_deep_audits as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_deep_accepted",
+                    update,
+                    report.tactical_deep_accepted as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_extra_simulations_per_search",
+                    update,
+                    report.tactical_extra_simulations_per_search,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_teacher_weight",
+                    update,
+                    report.tactical_teacher_weight,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/tactical_q_gap",
+                    update,
+                    report.tactical_q_gap,
                 );
                 log_scalar(
                     &mut tb,

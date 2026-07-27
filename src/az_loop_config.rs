@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
 
 pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
+const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 2;
 #[derive(Clone, Debug)]
 pub struct AzLoopFileConfig {
     pub model_path: String,
@@ -42,6 +43,15 @@ pub struct AzLoopFileConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub tactical_verify_fraction: f32,
+    pub tactical_verify_min_simulations: usize,
+    pub tactical_verify_max_candidates: usize,
+    pub tactical_verify_min_visits: u32,
+    pub tactical_verify_q_margin: f32,
+    pub tactical_teacher_max_weight: f32,
+    pub tactical_deep_verify_rate: f32,
+    pub tactical_deep_verify_multiplier: f32,
+    pub tactical_deep_verify_q_window: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -115,6 +125,15 @@ impl Default for AzLoopFileConfig {
             moves_left_scaled_factor: 0.20,
             moves_left_quadratic_factor: 0.75,
             policy_softmax_temp: 1.45,
+            tactical_verify_fraction: 0.25,
+            tactical_verify_min_simulations: 128,
+            tactical_verify_max_candidates: 8,
+            tactical_verify_min_visits: 8,
+            tactical_verify_q_margin: 0.08,
+            tactical_teacher_max_weight: 0.50,
+            tactical_deep_verify_rate: 0.01,
+            tactical_deep_verify_multiplier: 10.0,
+            tactical_deep_verify_q_window: 0.15,
             opening_fens_path: String::new(),
             resign_percentage: 0.8,
             resign_playthrough: 20.0,
@@ -153,6 +172,7 @@ impl Default for AzLoopFileConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AzLoopTomlConfig {
+    pub format_version: u32,
     pub model_path: String,
     pub simulations: usize,
     pub selfplay_samples_per_update: usize,
@@ -190,6 +210,15 @@ struct AzLoopTomlConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub tactical_verify_fraction: f32,
+    pub tactical_verify_min_simulations: usize,
+    pub tactical_verify_max_candidates: usize,
+    pub tactical_verify_min_visits: u32,
+    pub tactical_verify_q_margin: f32,
+    pub tactical_teacher_max_weight: f32,
+    pub tactical_deep_verify_rate: f32,
+    pub tactical_deep_verify_multiplier: f32,
+    pub tactical_deep_verify_q_window: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -220,18 +249,6 @@ struct AzLoopTomlConfig {
     pub pikafish_label_eval_limit: usize,
     pub pikafish_label_eval_simulations: usize,
     pub pikafish_label_eval_cpuct: f32,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_exe: String,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_start_update: usize,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_depth: u32,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_games: usize,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_parallel_games: usize,
-    #[serde(skip_serializing)]
-    pub arena_pikafish_promotion_rate: f32,
     pub tensorboard_logdir: String,
 }
 
@@ -244,6 +261,7 @@ impl Default for AzLoopTomlConfig {
 impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
     fn from(config: &AzLoopFileConfig) -> Self {
         Self {
+            format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: config.model_path.clone(),
             simulations: config.simulations,
             selfplay_samples_per_update: config.selfplay_samples_per_update,
@@ -281,6 +299,15 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             moves_left_scaled_factor: config.moves_left_scaled_factor,
             moves_left_quadratic_factor: config.moves_left_quadratic_factor,
             policy_softmax_temp: config.policy_softmax_temp,
+            tactical_verify_fraction: config.tactical_verify_fraction,
+            tactical_verify_min_simulations: config.tactical_verify_min_simulations,
+            tactical_verify_max_candidates: config.tactical_verify_max_candidates,
+            tactical_verify_min_visits: config.tactical_verify_min_visits,
+            tactical_verify_q_margin: config.tactical_verify_q_margin,
+            tactical_teacher_max_weight: config.tactical_teacher_max_weight,
+            tactical_deep_verify_rate: config.tactical_deep_verify_rate,
+            tactical_deep_verify_multiplier: config.tactical_deep_verify_multiplier,
+            tactical_deep_verify_q_window: config.tactical_deep_verify_q_window,
             opening_fens_path: config.opening_fens_path.clone(),
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -311,12 +338,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             pikafish_label_eval_limit: config.pikafish_label_eval_limit,
             pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
             pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
-            arena_pikafish_exe: String::new(),
-            arena_pikafish_start_update: 1,
-            arena_pikafish_depth: 1,
-            arena_pikafish_games: 1,
-            arena_pikafish_parallel_games: 1,
-            arena_pikafish_promotion_rate: 0.0,
             tensorboard_logdir: config.tensorboard_logdir.clone(),
         }
     }
@@ -362,6 +383,15 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             moves_left_scaled_factor: config.moves_left_scaled_factor,
             moves_left_quadratic_factor: config.moves_left_quadratic_factor,
             policy_softmax_temp: config.policy_softmax_temp,
+            tactical_verify_fraction: config.tactical_verify_fraction,
+            tactical_verify_min_simulations: config.tactical_verify_min_simulations,
+            tactical_verify_max_candidates: config.tactical_verify_max_candidates,
+            tactical_verify_min_visits: config.tactical_verify_min_visits,
+            tactical_verify_q_margin: config.tactical_verify_q_margin,
+            tactical_teacher_max_weight: config.tactical_teacher_max_weight,
+            tactical_deep_verify_rate: config.tactical_deep_verify_rate,
+            tactical_deep_verify_multiplier: config.tactical_deep_verify_multiplier,
+            tactical_deep_verify_q_window: config.tactical_deep_verify_q_window,
             opening_fens_path: config.opening_fens_path,
             resign_percentage: config.resign_percentage,
             resign_playthrough: config.resign_playthrough,
@@ -422,6 +452,7 @@ impl AzLoopFileConfig {
                 writeln!(out, "{} = {}", $name, $value).unwrap();
             };
         }
+        line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("simulations", self.simulations);
         line!(
@@ -474,6 +505,36 @@ impl AzLoopFileConfig {
             f(self.moves_left_quadratic_factor)
         );
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
+        line!("tactical_verify_fraction", f(self.tactical_verify_fraction));
+        line!(
+            "tactical_verify_min_simulations",
+            self.tactical_verify_min_simulations
+        );
+        line!(
+            "tactical_verify_max_candidates",
+            self.tactical_verify_max_candidates
+        );
+        line!(
+            "tactical_verify_min_visits",
+            self.tactical_verify_min_visits
+        );
+        line!("tactical_verify_q_margin", f(self.tactical_verify_q_margin));
+        line!(
+            "tactical_teacher_max_weight",
+            f(self.tactical_teacher_max_weight)
+        );
+        line!(
+            "tactical_deep_verify_rate",
+            f(self.tactical_deep_verify_rate)
+        );
+        line!(
+            "tactical_deep_verify_multiplier",
+            f(self.tactical_deep_verify_multiplier)
+        );
+        line!(
+            "tactical_deep_verify_q_window",
+            f(self.tactical_deep_verify_q_window)
+        );
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -529,6 +590,12 @@ impl AzLoopFileConfig {
     fn parse(text: &str) -> Self {
         let config = toml::from_str::<AzLoopTomlConfig>(text)
             .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
+        if config.format_version != AZ_LOOP_CONFIG_FORMAT_VERSION {
+            panic!(
+                "unsupported az-loop config format {}; expected {}",
+                config.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
+            );
+        }
         AzLoopFileConfig::from(config).normalize()
     }
 
@@ -569,6 +636,15 @@ impl AzLoopFileConfig {
         self.moves_left_slope = self.moves_left_slope.max(0.0);
         self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
+        self.tactical_verify_fraction = self.tactical_verify_fraction.clamp(0.0, 1.0);
+        self.tactical_verify_min_simulations = self.tactical_verify_min_simulations.max(1);
+        self.tactical_verify_max_candidates = self.tactical_verify_max_candidates.max(2);
+        self.tactical_verify_min_visits = self.tactical_verify_min_visits.max(1);
+        self.tactical_verify_q_margin = self.tactical_verify_q_margin.clamp(0.0, 2.0);
+        self.tactical_teacher_max_weight = self.tactical_teacher_max_weight.clamp(0.0, 1.0);
+        self.tactical_deep_verify_rate = self.tactical_deep_verify_rate.clamp(0.0, 1.0);
+        self.tactical_deep_verify_multiplier = self.tactical_deep_verify_multiplier.max(1.0);
+        self.tactical_deep_verify_q_window = self.tactical_deep_verify_q_window.clamp(0.0, 2.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -606,6 +682,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
+        assert!(text.starts_with("format_version = 2\n"));
         assert!(text.contains("lr = 0.0007\n"));
         assert!(text.contains("lr_min = 0.00015\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -623,6 +700,15 @@ mod tests {
         assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
+        assert!(text.contains("tactical_verify_fraction = 0.25\n"));
+        assert!(text.contains("tactical_verify_min_simulations = 128\n"));
+        assert!(text.contains("tactical_verify_max_candidates = 8\n"));
+        assert!(text.contains("tactical_verify_min_visits = 8\n"));
+        assert!(text.contains("tactical_verify_q_margin = 0.08\n"));
+        assert!(text.contains("tactical_teacher_max_weight = 0.5\n"));
+        assert!(text.contains("tactical_deep_verify_rate = 0.01\n"));
+        assert!(text.contains("tactical_deep_verify_multiplier = 10.0\n"));
+        assert!(text.contains("tactical_deep_verify_q_window = 0.15\n"));
         assert!(text.contains("fpu_value = 0.0\n"));
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
@@ -692,6 +778,9 @@ mod tests {
             "high_simulations = 20000\n",
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
+            "arena_pikafish_exe = \"./pikafish\"\n",
+            "arena_pikafish_depth = 10\n",
+            "arena_pikafish_games = 20\n",
         ] {
             let error = toml::from_str::<AzLoopTomlConfig>(removed)
                 .expect_err("removed config keys must not be accepted");

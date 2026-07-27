@@ -14,12 +14,8 @@ use super::{
 /// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-// v27 将 canonical 历史特征从旧表偏移重排到紧凑输入表；旧快照不能混用。
-// v28 removes an obsolete per-sample marker.
-// v29 removes neural-network history features; old snapshots use incompatible feature ids.
-// v30 adds compact rule-context scalars.
-// v31 adds candidate-level repeat-after-move policy features.
-const REPLAY_FILE_VERSION: u32 = 31;
+// v32 开始使用干净主搜索与独立战术教师；旧访问目标语义不同，禁止混入。
+const REPLAY_FILE_VERSION: u32 = 32;
 /// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
 const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";
@@ -169,16 +165,7 @@ fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()>
     encode_az_training_sample(out, &entry.sample)
 }
 
-fn decode_az_training_sample<R: Read>(
-    reader: &mut R,
-    version: u32,
-) -> io::Result<AzTrainingSample> {
-    if version != REPLAY_FILE_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "replay decode: incompatible replay sample version",
-        ));
-    }
+fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
     let nf = replay_read_u32(reader)?;
     if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
         return Err(io::Error::new(
@@ -253,8 +240,8 @@ fn decode_az_training_sample<R: Read>(
     })
 }
 
-fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
-    let sample = decode_az_training_sample(reader, version)?;
+fn decode_replay_entry<R: Read>(reader: &mut R) -> io::Result<ReplayEntry> {
+    let sample = decode_az_training_sample(reader)?;
     Ok(ReplayEntry { sample })
 }
 
@@ -484,7 +471,7 @@ impl AzExperiencePool {
         Ok(out)
     }
 
-    fn decode_replay_payload(data: &[u8], capacity: usize, version: u32) -> io::Result<Self> {
+    fn decode_replay_payload(data: &[u8], capacity: usize) -> io::Result<Self> {
         let mut reader = Cursor::new(data);
         let _stored_capacity = replay_read_u64(&mut reader)? as usize;
         let n_chunks = replay_read_u64(&mut reader)? as usize;
@@ -507,7 +494,7 @@ impl AzExperiencePool {
             }
             let mut entries = Vec::with_capacity(n_entries.min(capacity));
             for _ in 0..n_entries {
-                let entry = decode_replay_entry(&mut reader, version)?;
+                let entry = decode_replay_entry(&mut reader)?;
                 if capacity > 0 {
                     entries.push(entry);
                 }
@@ -581,7 +568,7 @@ impl AzExperiencePool {
             ));
         }
         let inner = Self::decompress_chunked_snapshot(&file_blob[12..])?;
-        Self::decode_replay_payload(&inner, capacity, ver)
+        Self::decode_replay_payload(&inner, capacity)
     }
 
     fn decompress_chunked_snapshot(data: &[u8]) -> io::Result<Vec<u8>> {

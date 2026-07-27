@@ -51,6 +51,10 @@ pub struct AzSearchLimits {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub value_scale: f32,
+    /// Enable the broad, policy-independent tactical exploration used by the
+    /// standalone verifier. Keep this disabled for the main self-play tree so
+    /// verifier effort cannot leak into the visit-count policy target.
+    pub tactical_verifier: bool,
 }
 
 impl Default for AzSearchLimits {
@@ -78,6 +82,7 @@ impl Default for AzSearchLimits {
             moves_left_scaled_factor: 0.15,
             moves_left_quadratic_factor: 0.85,
             value_scale: 1.0,
+            tactical_verifier: false,
         }
     }
 }
@@ -259,6 +264,7 @@ struct AzTree<'a> {
     moves_left_scaled_factor: f32,
     moves_left_quadratic_factor: f32,
     value_scale: f32,
+    tactical_verifier: bool,
     max_depth: usize,
     search_depth_sum: usize,
     search_depth_count: usize,
@@ -462,6 +468,7 @@ impl<'a> AzTree<'a> {
             moves_left_scaled_factor: limits.moves_left_scaled_factor,
             moves_left_quadratic_factor: limits.moves_left_quadratic_factor,
             value_scale: limits.value_scale.clamp(0.0, 1.0),
+            tactical_verifier: limits.tactical_verifier,
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
             } else {
@@ -670,12 +677,17 @@ impl<'a> AzTree<'a> {
             return eval;
         }
         if !self.nodes[node_index].expanded {
+            let was_in_check = self.nodes[node_index]
+                .position
+                .in_check(self.nodes[node_index].position.side_to_move());
             let eval = self.expand(node_index);
-            // 唯一合法着不是需要由策略分配预算的“选择”。尤其在被将军时，
-            // 若停在应将前直接使用网络值，会把一条强制战术人为截断；父节点
-            // 必须再次选中同一分支，才能看到应将后的真实局面。连续穿过唯一
-            // 合法着，让一次模拟落在下一个真正存在选择的节点上。
-            if self.nodes[node_index].children_len == 1 {
+            // 叶子正被将军时，网络在“尚未应将”的截断点上给值会把
+            // 将军错当成终局收益。像 quiescence 搜索一样，至少完整搜索一手
+            // 应将；若应将后仍被将军，会递归继续。唯一合法着同理不是
+            // 需要策略分配预算的选择。
+            if self.nodes[node_index].children_len > 0
+                && (was_in_check || self.nodes[node_index].children_len == 1)
+            {
                 return self.simulate_child(node_index, 0, depth + 1);
             }
             self.add_node_visit(node_index, eval);
@@ -982,16 +994,20 @@ impl<'a> AzTree<'a> {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        let tactical_exploration = if child.gives_check {
-            CHECK_EXPLORATION_MULTIPLIER
-        } else if child.is_capture {
-            CAPTURE_EXPLORATION_MULTIPLIER
+        let independent_u = if self.tactical_verifier {
+            let tactical_exploration = if child.gives_check {
+                CHECK_EXPLORATION_MULTIPLIER
+            } else if child.is_capture {
+                CAPTURE_EXPLORATION_MULTIPLIER
+            } else {
+                1.0
+            };
+            PRIOR_INDEPENDENT_EXPLORATION
+                * tactical_exploration
+                * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt()
         } else {
-            1.0
+            0.0
         };
-        let independent_u = PRIOR_INDEPENDENT_EXPLORATION
-            * tactical_exploration
-            * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt();
         q + u + independent_u + self.moves_left_utility(parent, child, q)
     }
 
@@ -1280,6 +1296,34 @@ mod tests {
             None,
             Some(vec![checking_move]),
             &AzNnue::random(4, 23),
+            AzSearchLimits {
+                simulations: 1,
+                max_depth: 8,
+                ..AzSearchLimits::default()
+            },
+        );
+
+        assert_eq!(result.search_depth_max, 2);
+        assert_eq!(result.search_depth_cutoffs, 0);
+    }
+
+    #[test]
+    fn search_extends_an_in_check_leaf_with_multiple_evasions() {
+        let position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
+        let checking_move = position.parse_uci_move("h2h0").unwrap();
+        let mut checked = position.clone();
+        checked.make_move(checking_move);
+        assert!(checked.in_check(checked.side_to_move()));
+        assert!(checked.legal_moves().len() > 1);
+
+        let result = alphazero_search_with_rules(
+            &position,
+            None,
+            Some(vec![checking_move]),
+            &AzNnue::random(4, 29),
             AzSearchLimits {
                 simulations: 1,
                 max_depth: 8,

@@ -49,6 +49,7 @@ pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const POLICY_TRUNK_SIZE: usize = 32;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
+const AZ_MODEL_FORMAT_VERSION: f32 = 2.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -179,22 +180,6 @@ fn load_candle_f32_tensor(
         .flatten_all()
         .and_then(|tensor| tensor.to_vec1::<f32>())
         .map_err(candle_io_error)
-}
-
-fn load_optional_candle_f32_tensor(
-    tensors: &candle_core::safetensors::MmapedSafetensors,
-    name: &str,
-    default: Vec<f32>,
-) -> io::Result<Vec<f32>> {
-    if tensors
-        .tensors()
-        .iter()
-        .any(|(tensor_name, _)| tensor_name == name)
-    {
-        load_candle_f32_tensor(tensors, name)
-    } else {
-        Ok(default)
-    }
 }
 
 macro_rules! az_weight_tensors {
@@ -631,6 +616,16 @@ pub struct AzLoopConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    /// Fraction of the main search budget used by each tactical scout/proof search.
+    pub tactical_verify_fraction: f32,
+    pub tactical_verify_min_simulations: usize,
+    pub tactical_verify_max_candidates: usize,
+    pub tactical_verify_min_visits: u32,
+    pub tactical_verify_q_margin: f32,
+    pub tactical_teacher_max_weight: f32,
+    pub tactical_deep_verify_rate: f32,
+    pub tactical_deep_verify_multiplier: f32,
+    pub tactical_deep_verify_q_window: f32,
     pub opening_positions: Vec<Position>,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -644,6 +639,14 @@ pub struct AzLoopReport {
     pub total_games_generated: usize,
     pub total_samples_generated: usize,
     pub avg_search_simulations: f32,
+    pub tactical_scout_searches: usize,
+    pub tactical_proposals: usize,
+    pub tactical_accepted: usize,
+    pub tactical_deep_audits: usize,
+    pub tactical_deep_accepted: usize,
+    pub tactical_extra_simulations_per_search: f32,
+    pub tactical_teacher_weight: f32,
+    pub tactical_q_gap: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -953,14 +956,16 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_repeat_weight = vec![0.0; 1];
         let policy_repeat_hidden = vec![0.0; hidden_size];
-        // 低秩残差策略干线：第一层随机、第二层零初始化，因此新模型初始时
-        // 严格等价于旧策略头，随后可学习棋子之间的二阶组合关系。
+        // 从零训练时直接激活低秩残差策略干线。第二层使用较小随机初始化，
+        // 既不淹没主干表示，又让两层从第一个优化步骤起都能收到梯度。
         let mut policy_trunk_rng = SplitMix64::new(seed ^ 0xA24B_AED4_963E_E407);
         let policy_trunk_hidden = (0..POLICY_TRUNK_SIZE * hidden_size)
             .map(|_| policy_trunk_rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
             .collect();
         let policy_trunk_bias = vec![0.0; POLICY_TRUNK_SIZE];
-        let policy_trunk_output = vec![0.0; hidden_size * POLICY_TRUNK_SIZE];
+        let policy_trunk_output = (0..hidden_size * POLICY_TRUNK_SIZE)
+            .map(|_| policy_trunk_rng.weight((2.0 / POLICY_TRUNK_SIZE as f32).sqrt() * 0.10))
+            .collect();
         let policy_trunk_output_bias = vec![0.0; hidden_size];
         let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
@@ -1023,6 +1028,12 @@ impl AzNnue {
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let h = self.hidden_size;
         let varmap = VarMap::new();
+        insert_candle_var(
+            &varmap,
+            "az_model_format_version",
+            &[AZ_MODEL_FORMAT_VERSION],
+            (1,),
+        )?;
         macro_rules! save_tensor {
             ($field:ident, [$($dim:expr),+]) => {
                 insert_candle_var(&varmap, stringify!($field), &self.$field, ($($dim),+))?;
@@ -1037,13 +1048,19 @@ impl AzNnue {
             candle_core::safetensors::MmapedSafetensors::new(path.as_ref())
                 .map_err(candle_io_error)?
         };
+        let format_version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
+        if format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported AZ model format {:?}; expected v{}",
+                    format_version, AZ_MODEL_FORMAT_VERSION
+                ),
+            ));
+        }
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
-        let mut policy_trunk_rng = SplitMix64::new(0xA24B_AED4_963E_E407 ^ hidden_size as u64);
-        let default_policy_trunk_hidden = (0..POLICY_TRUNK_SIZE * hidden_size)
-            .map(|_| policy_trunk_rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
         let model = Self {
             hidden_size,
             arch,
@@ -1066,26 +1083,10 @@ impl AzNnue {
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
             policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
-            policy_trunk_hidden: load_optional_candle_f32_tensor(
-                &tensors,
-                "policy_trunk_hidden",
-                default_policy_trunk_hidden,
-            )?,
-            policy_trunk_bias: load_optional_candle_f32_tensor(
-                &tensors,
-                "policy_trunk_bias",
-                vec![0.0; POLICY_TRUNK_SIZE],
-            )?,
-            policy_trunk_output: load_optional_candle_f32_tensor(
-                &tensors,
-                "policy_trunk_output",
-                vec![0.0; hidden_size * POLICY_TRUNK_SIZE],
-            )?,
-            policy_trunk_output_bias: load_optional_candle_f32_tensor(
-                &tensors,
-                "policy_trunk_output_bias",
-                vec![0.0; hidden_size],
-            )?,
+            policy_trunk_hidden: load_candle_f32_tensor(&tensors, "policy_trunk_hidden")?,
+            policy_trunk_bias: load_candle_f32_tensor(&tensors, "policy_trunk_bias")?,
+            policy_trunk_output: load_candle_f32_tensor(&tensors, "policy_trunk_output")?,
+            policy_trunk_output_bias: load_candle_f32_tensor(&tensors, "policy_trunk_output_bias")?,
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
             policy_pair_context_hidden: load_candle_f32_tensor(
@@ -2886,6 +2887,47 @@ mod tests {
             loaded.policy_move_context_hidden
         );
         assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
+    }
+
+    #[test]
+    fn current_model_format_requires_policy_trunk_tensors() {
+        let model = AzNnue::random(16, 43);
+        assert!(model.policy_trunk_output.iter().any(|value| *value != 0.0));
+        let path = std::env::temp_dir().join(format!(
+            "chineseai_test_missing_policy_trunk_{}.safetensors",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let varmap = VarMap::new();
+        insert_candle_var(
+            &varmap,
+            "az_model_format_version",
+            &[AZ_MODEL_FORMAT_VERSION],
+            (1,),
+        )
+        .unwrap();
+        macro_rules! save_without_policy_trunk {
+            ($field:ident, [$($dim:expr),+]) => {
+                if !stringify!($field).starts_with("policy_trunk_") {
+                    insert_candle_var(
+                        &varmap,
+                        stringify!($field),
+                        &model.$field,
+                        ($($dim),+),
+                    )
+                    .unwrap();
+                }
+            };
+        }
+        az_weight_tensors!(save_without_policy_trunk, model.hidden_size);
+        varmap.save(&path).unwrap();
+
+        let load_result = AzNnue::load(&path);
+        let _ = fs::remove_file(&path);
+        assert!(
+            load_result.is_err(),
+            "缺失当前策略干线的旧模型必须明确拒绝，不能静默补权重"
+        );
     }
 
     #[test]
