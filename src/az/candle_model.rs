@@ -2,9 +2,9 @@ use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradSto
 
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE,
-    POLICY_TRUNK_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
-    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
-    dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
+    RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE,
+    STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch,
+    policy_move_from_features, policy_move_to_features,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
@@ -33,10 +33,6 @@ pub(super) struct AzCandleModel {
     policy_move_bias: Var,
     pub(super) policy_repeat_weight: Var,
     policy_repeat_hidden: Var,
-    policy_trunk_hidden: Var,
-    policy_trunk_bias: Var,
-    policy_trunk_output: Var,
-    policy_trunk_output_bias: Var,
     policy_from_hidden: Var,
     policy_to_hidden: Var,
     policy_pair_context_hidden: Var,
@@ -96,21 +92,6 @@ impl AzCandleModel {
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
 
-        let policy_trunk = hidden
-            .matmul(&self.policy_trunk_hidden.t()?)?
-            .broadcast_add(&self.policy_trunk_bias)?
-            .relu()?;
-        let policy_residual = policy_trunk
-            .matmul(&self.policy_trunk_output.t()?)?
-            .broadcast_add(&self.policy_trunk_output_bias)?;
-        let policy_hidden = (hidden.clone() + policy_residual)?;
-        let policy_rms = policy_hidden
-            .sqr()?
-            .mean_keepdim(1)?
-            .affine(1.0, RMS_NORM_EPS)?
-            .sqrt()?;
-        let policy_hidden = policy_hidden.broadcast_div(&policy_rms)?;
-
         let value_head = hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
@@ -128,21 +109,21 @@ impl AzCandleModel {
             .matmul(&self.moves_left_output.reshape((VALUE_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
         let policy_bias = self.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
-        let policy_from_scores = policy_hidden.matmul(&self.policy_from_hidden.t()?)?;
-        let policy_to_scores = policy_hidden.matmul(&self.policy_to_hidden.t()?)?;
+        let policy_from_scores = hidden.matmul(&self.policy_from_hidden.t()?)?;
+        let policy_to_scores = hidden.matmul(&self.policy_to_hidden.t()?)?;
         let policy_from_logits = policy_from_scores.matmul(&self.policy_move_from_features.t()?)?;
         let policy_to_logits = policy_to_scores.matmul(&self.policy_move_to_features.t()?)?;
-        let policy_pair_context = policy_hidden
+        let policy_pair_context = hidden
             .matmul(&self.policy_pair_context_hidden.t()?)?
             .broadcast_add(&self.policy_pair_context_bias)?
             .relu()?;
         let policy_pair_logits = policy_pair_context.matmul(&self.policy_pair_embedding.t()?)?;
-        let policy_move_context = policy_hidden.matmul(&self.policy_move_context_hidden.t()?)?;
+        let policy_move_context = hidden.matmul(&self.policy_move_context_hidden.t()?)?;
         let policy_move_logits = policy_move_context.matmul(&self.policy_move_embedding.t()?)?;
         let policy_logits = (((policy_from_logits + policy_to_logits)? + policy_pair_logits)?
             + policy_move_logits)?
             .broadcast_add(&policy_bias)?;
-        let policy_repeat_logit = policy_hidden
+        let policy_repeat_logit = hidden
             .matmul(
                 &self
                     .policy_repeat_hidden
@@ -342,22 +323,6 @@ impl AzCandleModel {
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_repeat_weight: var_from_slice(&model.policy_repeat_weight, 1, device)?,
             policy_repeat_hidden: var_from_slice(&model.policy_repeat_hidden, hidden, device)?,
-            policy_trunk_hidden: var_from_slice(
-                &model.policy_trunk_hidden,
-                (POLICY_TRUNK_SIZE, hidden),
-                device,
-            )?,
-            policy_trunk_bias: var_from_slice(&model.policy_trunk_bias, POLICY_TRUNK_SIZE, device)?,
-            policy_trunk_output: var_from_slice(
-                &model.policy_trunk_output,
-                (hidden, POLICY_TRUNK_SIZE),
-                device,
-            )?,
-            policy_trunk_output_bias: var_from_slice(
-                &model.policy_trunk_output_bias,
-                hidden,
-                device,
-            )?,
             policy_from_hidden: var_from_slice(
                 &model.policy_from_hidden,
                 (BOARD_SIZE, hidden),
@@ -427,10 +392,6 @@ impl AzCandleModel {
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_repeat_weight.clone());
         vars.push(self.policy_repeat_hidden.clone());
-        vars.push(self.policy_trunk_hidden.clone());
-        vars.push(self.policy_trunk_bias.clone());
-        vars.push(self.policy_trunk_output.clone());
-        vars.push(self.policy_trunk_output_bias.clone());
         vars.push(self.policy_from_hidden.clone());
         vars.push(self.policy_to_hidden.clone());
         vars.push(self.policy_pair_context_hidden.clone());
@@ -467,13 +428,6 @@ impl AzCandleModel {
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(&self.policy_repeat_weight, &mut model.policy_repeat_weight)?;
         copy_var(&self.policy_repeat_hidden, &mut model.policy_repeat_hidden)?;
-        copy_var(&self.policy_trunk_hidden, &mut model.policy_trunk_hidden)?;
-        copy_var(&self.policy_trunk_bias, &mut model.policy_trunk_bias)?;
-        copy_var(&self.policy_trunk_output, &mut model.policy_trunk_output)?;
-        copy_var(
-            &self.policy_trunk_output_bias,
-            &mut model.policy_trunk_output_bias,
-        )?;
         copy_var(&self.policy_from_hidden, &mut model.policy_from_hidden)?;
         copy_var(&self.policy_to_hidden, &mut model.policy_to_hidden)?;
         copy_var(

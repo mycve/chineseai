@@ -137,9 +137,6 @@ struct AzSearchArgs {
     /// Draw value in Q = W - L + draw_score * D.
     #[arg(long, default_value_t = 0.0)]
     draw_score: f32,
-    /// Enable broad tactical exploration for diagnostic/verifier searches.
-    #[arg(long, default_value_t = false)]
-    tactical_verifier: bool,
     /// Enable moves-left utility.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     moves_left_utility: bool,
@@ -367,7 +364,7 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-const AZ_LOOP_PROGRESS_VERSION: u32 = 2;
+const AZ_LOOP_PROGRESS_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -775,15 +772,6 @@ fn build_az_loop_config(
         moves_left_scaled_factor: config.moves_left_scaled_factor,
         moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
-        tactical_verify_fraction: config.tactical_verify_fraction,
-        tactical_verify_min_simulations: config.tactical_verify_min_simulations,
-        tactical_verify_max_candidates: config.tactical_verify_max_candidates,
-        tactical_verify_min_visits: config.tactical_verify_min_visits,
-        tactical_verify_q_margin: config.tactical_verify_q_margin,
-        tactical_teacher_max_weight: config.tactical_teacher_max_weight,
-        tactical_deep_verify_rate: config.tactical_deep_verify_rate,
-        tactical_deep_verify_multiplier: config.tactical_deep_verify_multiplier,
-        tactical_deep_verify_q_window: config.tactical_deep_verify_q_window,
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
@@ -873,18 +861,6 @@ fn build_async_training_report(
         total_samples_generated,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
-        tactical_scout_searches: pending.selfplay.tactical_teacher.scout_searches,
-        tactical_proposals: pending.selfplay.tactical_teacher.proposals,
-        tactical_accepted: pending.selfplay.tactical_teacher.accepted,
-        tactical_deep_audits: pending.selfplay.tactical_teacher.deep_audits,
-        tactical_deep_accepted: pending.selfplay.tactical_teacher.deep_accepted,
-        tactical_extra_simulations_per_search: pending.selfplay.tactical_teacher.simulations_sum
-            as f32
-            / search_count,
-        tactical_teacher_weight: pending.selfplay.tactical_teacher.teacher_weight_sum
-            / pending.selfplay.tactical_teacher.accepted.max(1) as f32,
-        tactical_q_gap: pending.selfplay.tactical_teacher.q_gap_sum
-            / pending.selfplay.tactical_teacher.accepted.max(1) as f32,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -1180,7 +1156,6 @@ fn fixed_az_search_limits(
         moves_left_scaled_factor: 0.0,
         moves_left_quadratic_factor: 0.0,
         value_scale: 1.0,
-        tactical_verifier: false,
     }
 }
 
@@ -1247,7 +1222,6 @@ fn main() {
                 moves_left_scaled_factor: if cmd.moves_left_utility { 0.20 } else { 0.0 },
                 moves_left_quadratic_factor: if cmd.moves_left_utility { 0.75 } else { 0.0 },
                 value_scale: 1.0,
-                tactical_verifier: cmd.tactical_verifier,
             };
             let root_moves = if cmd.root_moves.is_empty() {
                 None
@@ -1280,7 +1254,6 @@ fn main() {
             println!("fpu_value_at_root: {}", cmd.fpu_value_at_root);
             println!("draw_score: {}", cmd.draw_score);
             println!("moves_left_utility: {}", cmd.moves_left_utility);
-            println!("tactical_verifier: {}", cmd.tactical_verifier);
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
@@ -2230,7 +2203,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} swa_n={} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s tactical(scout={} proposal={} accept={} deep={}/{} extra_sims={:.1} weight={:.3} qgap={:.3}){}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} swa_n={} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2306,14 +2279,6 @@ fn main() {
                     report.samples_per_second,
                     report.train_samples_per_second,
                     started.elapsed().as_secs_f32(),
-                    report.tactical_scout_searches,
-                    report.tactical_proposals,
-                    report.tactical_accepted,
-                    report.tactical_deep_accepted,
-                    report.tactical_deep_audits,
-                    report.tactical_extra_simulations_per_search,
-                    report.tactical_teacher_weight,
-                    report.tactical_q_gap,
                     checkpoint_saved
                         .as_ref()
                         .map_or_else(String::new, |path| format!(
@@ -2418,54 +2383,6 @@ fn main() {
                     "selfplay/avg_search_simulations",
                     update,
                     report.avg_search_simulations,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_scout_searches",
-                    update,
-                    report.tactical_scout_searches as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_proposals",
-                    update,
-                    report.tactical_proposals as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_accepted",
-                    update,
-                    report.tactical_accepted as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_deep_audits",
-                    update,
-                    report.tactical_deep_audits as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_deep_accepted",
-                    update,
-                    report.tactical_deep_accepted as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_extra_simulations_per_search",
-                    update,
-                    report.tactical_extra_simulations_per_search,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_teacher_weight",
-                    update,
-                    report.tactical_teacher_weight,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/tactical_q_gap",
-                    update,
-                    report.tactical_q_gap,
                 );
                 log_scalar(
                     &mut tb,

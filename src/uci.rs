@@ -504,7 +504,6 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             moves_left_scaled_factor: state.moves_left_scaled_factor,
             moves_left_quadratic_factor: state.moves_left_quadratic_factor,
             value_scale: 1.0,
-            tactical_verifier: false,
         },
         Some(&control),
         Some(&mut report_progress),

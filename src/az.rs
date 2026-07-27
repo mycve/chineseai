@@ -46,10 +46,9 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
-pub(super) const POLICY_TRUNK_SIZE: usize = 32;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 2.0;
+const AZ_MODEL_FORMAT_VERSION: f32 = 3.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -203,10 +202,6 @@ macro_rules! az_weight_tensors {
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_repeat_weight, [1]);
         $visit!(policy_repeat_hidden, [$h]);
-        $visit!(policy_trunk_hidden, [POLICY_TRUNK_SIZE, $h]);
-        $visit!(policy_trunk_bias, [POLICY_TRUNK_SIZE]);
-        $visit!(policy_trunk_output, [$h, POLICY_TRUNK_SIZE]);
-        $visit!(policy_trunk_output_bias, [$h]);
         $visit!(policy_from_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_to_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_pair_context_hidden, [POLICY_PAIR_CONTEXT_SIZE, $h]);
@@ -256,8 +251,6 @@ pub(super) struct AzEvalScratch {
     // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
     features: Vec<usize>,
     hidden: Vec<f32>,
-    policy_hidden: Vec<f32>,
-    policy_trunk: Vec<f32>,
     value_head: Vec<f32>,
     value_head2: Vec<f32>,
     policy_pair_context: Vec<f32>,
@@ -274,8 +267,6 @@ impl AzEvalScratch {
         Self {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
-            policy_hidden: vec![0.0; hidden_size],
-            policy_trunk: vec![0.0; POLICY_TRUNK_SIZE],
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             value_head2: vec![0.0; VALUE_HEAD_SIZE],
             policy_pair_context: vec![0.0; POLICY_PAIR_CONTEXT_SIZE],
@@ -509,10 +500,6 @@ pub struct AzNnue {
     pub policy_move_bias: Vec<f32>,
     pub policy_repeat_weight: Vec<f32>,
     pub policy_repeat_hidden: Vec<f32>,
-    pub policy_trunk_hidden: Vec<f32>,
-    pub policy_trunk_bias: Vec<f32>,
-    pub policy_trunk_output: Vec<f32>,
-    pub policy_trunk_output_bias: Vec<f32>,
     pub policy_from_hidden: Vec<f32>,
     pub policy_to_hidden: Vec<f32>,
     pub policy_pair_context_hidden: Vec<f32>,
@@ -548,10 +535,6 @@ impl Clone for AzNnue {
             policy_move_bias: self.policy_move_bias.clone(),
             policy_repeat_weight: self.policy_repeat_weight.clone(),
             policy_repeat_hidden: self.policy_repeat_hidden.clone(),
-            policy_trunk_hidden: self.policy_trunk_hidden.clone(),
-            policy_trunk_bias: self.policy_trunk_bias.clone(),
-            policy_trunk_output: self.policy_trunk_output.clone(),
-            policy_trunk_output_bias: self.policy_trunk_output_bias.clone(),
             policy_from_hidden: self.policy_from_hidden.clone(),
             policy_to_hidden: self.policy_to_hidden.clone(),
             policy_pair_context_hidden: self.policy_pair_context_hidden.clone(),
@@ -616,16 +599,6 @@ pub struct AzLoopConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
-    /// Fraction of the main search budget used by each tactical scout/proof search.
-    pub tactical_verify_fraction: f32,
-    pub tactical_verify_min_simulations: usize,
-    pub tactical_verify_max_candidates: usize,
-    pub tactical_verify_min_visits: u32,
-    pub tactical_verify_q_margin: f32,
-    pub tactical_teacher_max_weight: f32,
-    pub tactical_deep_verify_rate: f32,
-    pub tactical_deep_verify_multiplier: f32,
-    pub tactical_deep_verify_q_window: f32,
     pub opening_positions: Vec<Position>,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -639,14 +612,6 @@ pub struct AzLoopReport {
     pub total_games_generated: usize,
     pub total_samples_generated: usize,
     pub avg_search_simulations: f32,
-    pub tactical_scout_searches: usize,
-    pub tactical_proposals: usize,
-    pub tactical_accepted: usize,
-    pub tactical_deep_audits: usize,
-    pub tactical_deep_accepted: usize,
-    pub tactical_extra_simulations_per_search: f32,
-    pub tactical_teacher_weight: f32,
-    pub tactical_q_gap: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -956,17 +921,6 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_repeat_weight = vec![0.0; 1];
         let policy_repeat_hidden = vec![0.0; hidden_size];
-        // 从零训练时直接激活低秩残差策略干线。第二层使用较小随机初始化，
-        // 既不淹没主干表示，又让两层从第一个优化步骤起都能收到梯度。
-        let mut policy_trunk_rng = SplitMix64::new(seed ^ 0xA24B_AED4_963E_E407);
-        let policy_trunk_hidden = (0..POLICY_TRUNK_SIZE * hidden_size)
-            .map(|_| policy_trunk_rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        let policy_trunk_bias = vec![0.0; POLICY_TRUNK_SIZE];
-        let policy_trunk_output = (0..hidden_size * POLICY_TRUNK_SIZE)
-            .map(|_| policy_trunk_rng.weight((2.0 / POLICY_TRUNK_SIZE as f32).sqrt() * 0.10))
-            .collect();
-        let policy_trunk_output_bias = vec![0.0; hidden_size];
         let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
@@ -1006,10 +960,6 @@ impl AzNnue {
             policy_move_bias,
             policy_repeat_weight,
             policy_repeat_hidden,
-            policy_trunk_hidden,
-            policy_trunk_bias,
-            policy_trunk_output,
-            policy_trunk_output_bias,
             policy_from_hidden,
             policy_to_hidden,
             policy_pair_context_hidden,
@@ -1083,10 +1033,6 @@ impl AzNnue {
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
             policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
-            policy_trunk_hidden: load_candle_f32_tensor(&tensors, "policy_trunk_hidden")?,
-            policy_trunk_bias: load_candle_f32_tensor(&tensors, "policy_trunk_bias")?,
-            policy_trunk_output: load_candle_f32_tensor(&tensors, "policy_trunk_output")?,
-            policy_trunk_output_bias: load_candle_f32_tensor(&tensors, "policy_trunk_output_bias")?,
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
             policy_pair_context_hidden: load_candle_f32_tensor(
@@ -1254,13 +1200,8 @@ impl AzNnue {
     ) -> f32 {
         {
             crate::scope_profile!("az.eval.policy_embeddings");
-            self.policy_hidden_into(
-                &scratch.hidden,
-                &mut scratch.policy_trunk,
-                &mut scratch.policy_hidden,
-            );
-            self.policy_pair_context_into(&scratch.policy_hidden, &mut scratch.policy_pair_context);
-            self.policy_move_context_into(&scratch.policy_hidden, &mut scratch.policy_move_context);
+            self.policy_pair_context_into(&scratch.hidden, &mut scratch.policy_pair_context);
+            self.policy_move_context_into(&scratch.hidden, &mut scratch.policy_move_context);
         }
         scratch.logits.resize(moves.len(), 0.0);
         let move_map = move_map();
@@ -1289,7 +1230,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_square_scores");
             self.policy_square_scores_for_squares_into(
-                &scratch.policy_hidden,
+                &scratch.hidden,
                 &from_squares[..from_count],
                 &to_squares[..to_count],
                 &mut scratch.policy_from_scores,
@@ -1299,7 +1240,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_logits");
             let repeat_logit = self.policy_repeat_weight[0]
-                + dot_product(&scratch.policy_hidden, &self.policy_repeat_hidden);
+                + dot_product(&scratch.hidden, &self.policy_repeat_hidden);
             for (index, mv) in moves.iter().enumerate() {
                 let canonical = canonical_move(side, *mv);
                 let sparse = canonical.from as usize * BOARD_SIZE + canonical.to as usize;
@@ -1583,22 +1524,6 @@ impl AzNnue {
             let end = start + self.hidden_size;
             to_scores[square] = dot_product(hidden, &self.policy_to_hidden[start..end]);
         }
-    }
-
-    fn policy_hidden_into(&self, hidden: &[f32], trunk: &mut Vec<f32>, out: &mut Vec<f32>) {
-        trunk.resize(POLICY_TRUNK_SIZE, 0.0);
-        for (index, value) in trunk.iter_mut().enumerate() {
-            let row =
-                &self.policy_trunk_hidden[index * self.hidden_size..(index + 1) * self.hidden_size];
-            *value = (self.policy_trunk_bias[index] + dot_product(hidden, row)).max(0.0);
-        }
-        out.resize(self.hidden_size, 0.0);
-        for (index, value) in out.iter_mut().enumerate() {
-            let row = &self.policy_trunk_output
-                [index * POLICY_TRUNK_SIZE..(index + 1) * POLICY_TRUNK_SIZE];
-            *value = hidden[index] + self.policy_trunk_output_bias[index] + dot_product(trunk, row);
-        }
-        rms_norm_in_place(out);
     }
 
     fn policy_pair_context_into(&self, hidden: &[f32], out: &mut Vec<f32>) {
@@ -2864,13 +2789,6 @@ mod tests {
         assert_eq!(model.moves_left_output, loaded.moves_left_output);
         assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
-        assert_eq!(model.policy_trunk_hidden, loaded.policy_trunk_hidden);
-        assert_eq!(model.policy_trunk_bias, loaded.policy_trunk_bias);
-        assert_eq!(model.policy_trunk_output, loaded.policy_trunk_output);
-        assert_eq!(
-            model.policy_trunk_output_bias,
-            loaded.policy_trunk_output_bias
-        );
         assert_eq!(model.policy_from_hidden, loaded.policy_from_hidden);
         assert_eq!(model.policy_to_hidden, loaded.policy_to_hidden);
         assert_eq!(
@@ -2887,47 +2805,6 @@ mod tests {
             loaded.policy_move_context_hidden
         );
         assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
-    }
-
-    #[test]
-    fn current_model_format_requires_policy_trunk_tensors() {
-        let model = AzNnue::random(16, 43);
-        assert!(model.policy_trunk_output.iter().any(|value| *value != 0.0));
-        let path = std::env::temp_dir().join(format!(
-            "chineseai_test_missing_policy_trunk_{}.safetensors",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&path);
-        let varmap = VarMap::new();
-        insert_candle_var(
-            &varmap,
-            "az_model_format_version",
-            &[AZ_MODEL_FORMAT_VERSION],
-            (1,),
-        )
-        .unwrap();
-        macro_rules! save_without_policy_trunk {
-            ($field:ident, [$($dim:expr),+]) => {
-                if !stringify!($field).starts_with("policy_trunk_") {
-                    insert_candle_var(
-                        &varmap,
-                        stringify!($field),
-                        &model.$field,
-                        ($($dim),+),
-                    )
-                    .unwrap();
-                }
-            };
-        }
-        az_weight_tensors!(save_without_policy_trunk, model.hidden_size);
-        varmap.save(&path).unwrap();
-
-        let load_result = AzNnue::load(&path);
-        let _ = fs::remove_file(&path);
-        assert!(
-            load_result.is_err(),
-            "缺失当前策略干线的旧模型必须明确拒绝，不能静默补权重"
-        );
     }
 
     #[test]

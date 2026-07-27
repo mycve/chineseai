@@ -9,9 +9,9 @@ use crate::nnue::{
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzSearchResult,
-    AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
-    policy_repeat_features, rule_context_features, scalar_value_to_wdl_target,
+    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
+    alphazero_search_with_rules, dense_move_index, policy_repeat_features, rule_context_features,
+    scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,35 +35,6 @@ pub struct AzTerminalStats {
 pub struct AzSearchSimulationStats {
     pub searches: usize,
     pub simulations_sum: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AzTacticalTeacherStats {
-    pub scout_searches: usize,
-    pub proof_searches: usize,
-    pub simulations_sum: usize,
-    pub proposals: usize,
-    pub accepted: usize,
-    pub deep_audits: usize,
-    pub deep_accepted: usize,
-    pub changed_move: usize,
-    pub teacher_weight_sum: f32,
-    pub q_gap_sum: f32,
-}
-
-impl AzTacticalTeacherStats {
-    pub fn add_assign(&mut self, other: &Self) {
-        self.scout_searches += other.scout_searches;
-        self.proof_searches += other.proof_searches;
-        self.simulations_sum += other.simulations_sum;
-        self.proposals += other.proposals;
-        self.accepted += other.accepted;
-        self.deep_audits += other.deep_audits;
-        self.deep_accepted += other.deep_accepted;
-        self.changed_move += other.changed_move;
-        self.teacher_weight_sum += other.teacher_weight_sum;
-        self.q_gap_sum += other.q_gap_sum;
-    }
 }
 
 impl AzSearchSimulationStats {
@@ -202,7 +173,6 @@ pub struct AzSelfplayData {
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
     pub search_simulations: AzSearchSimulationStats,
-    pub tactical_teacher: AzTacticalTeacherStats,
 }
 
 impl AzSelfplayData {
@@ -244,7 +214,6 @@ impl AzSelfplayData {
         self.terminal.add_assign(&other.terminal);
         self.search_simulations
             .add_assign(&other.search_simulations);
-        self.tactical_teacher.add_assign(&other.tactical_teacher);
     }
 }
 
@@ -315,279 +284,8 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged
             .search_simulations
             .add_assign(&chunk.search_simulations);
-        merged.tactical_teacher.add_assign(&chunk.tactical_teacher);
     }
     merged
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TacticalTeacher {
-    mv: Move,
-    q: f32,
-    weight: f32,
-}
-
-fn selfplay_search_limits(
-    config: &AzLoopConfig,
-    simulations: usize,
-    seed: u64,
-    tactical_verifier: bool,
-    root_noise: bool,
-) -> AzSearchLimits {
-    AzSearchLimits {
-        simulations: simulations.max(1),
-        seed,
-        cpuct: config.cpuct,
-        cpuct_at_root: config.cpuct_at_root,
-        cpuct_base: config.cpuct_base,
-        cpuct_factor: config.cpuct_factor,
-        cpuct_base_at_root: config.cpuct_base_at_root,
-        cpuct_factor_at_root: config.cpuct_factor_at_root,
-        max_depth: 0,
-        root_dirichlet_alpha: if root_noise {
-            config.root_dirichlet_alpha
-        } else {
-            0.0
-        },
-        root_exploration_fraction: if root_noise {
-            config.root_exploration_fraction
-        } else {
-            0.0
-        },
-        fpu_value: config.fpu_value,
-        fpu_value_at_root: config.fpu_value_at_root,
-        policy_softmax_temp: config.policy_softmax_temp,
-        draw_score: config.draw_score,
-        moves_left_max_effect: config.moves_left_max_effect,
-        moves_left_slope: config.moves_left_slope,
-        moves_left_threshold: config.moves_left_threshold,
-        moves_left_constant_factor: config.moves_left_constant_factor,
-        moves_left_scaled_factor: config.moves_left_scaled_factor,
-        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-        value_scale: 1.0,
-        tactical_verifier,
-    }
-}
-
-fn tactical_root_moves(
-    position: &Position,
-    search: &AzSearchResult,
-    max_candidates: usize,
-) -> Vec<Move> {
-    let Some(incumbent) = search.best_move else {
-        return Vec::new();
-    };
-    let mut tactical = search
-        .candidates
-        .iter()
-        .filter_map(|candidate| {
-            if candidate.mv == incumbent {
-                return None;
-            }
-            let is_capture = position.piece_at(candidate.mv.to as usize).is_some();
-            let mut child = position.clone();
-            child.make_move(candidate.mv);
-            let gives_check = child.in_check(child.side_to_move());
-            (is_capture || gives_check).then_some((
-                candidate.mv,
-                gives_check,
-                is_capture,
-                candidate.raw_prior,
-            ))
-        })
-        .collect::<Vec<_>>();
-    tactical.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.2.cmp(&left.2))
-            .then_with(|| right.3.total_cmp(&left.3))
-    });
-    let mut moves = Vec::with_capacity(max_candidates.max(2));
-    moves.push(incumbent);
-    moves.extend(
-        tactical
-            .into_iter()
-            .map(|(mv, _, _, _)| mv)
-            .take(max_candidates.saturating_sub(1)),
-    );
-    moves
-}
-
-fn verified_root_move_q(
-    position: &Position,
-    rule_history: &[RuleHistoryEntry],
-    mv: Move,
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    simulations: usize,
-    seed: u64,
-) -> f32 {
-    let mover = position.side_to_move();
-    let mut child = position.clone();
-    child.make_move(mv);
-    let mut child_history = rule_history.to_vec();
-    child_history.push(child.rule_history_entry_after_moved(mover, mv.to as usize));
-    let legal = child.legal_moves_with_rules(&child_history);
-    let result = alphazero_search_with_rules(
-        &child,
-        Some(child_history),
-        Some(legal),
-        model,
-        selfplay_search_limits(config, simulations, seed, true, false),
-    );
-    let opponent_q = result
-        .best_move
-        .and_then(|best_move| {
-            result
-                .candidates
-                .iter()
-                .find(|candidate| candidate.mv == best_move)
-                .map(|candidate| candidate.q)
-        })
-        .unwrap_or(result.value_q);
-    -opponent_q
-}
-
-fn find_tactical_teacher(
-    position: &Position,
-    rule_history: &[RuleHistoryEntry],
-    main: &AzSearchResult,
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    main_simulations: usize,
-    seed: u64,
-    stats: &mut AzTacticalTeacherStats,
-) -> Option<TacticalTeacher> {
-    if config.tactical_verify_fraction <= 0.0 || config.tactical_teacher_max_weight <= 0.0 {
-        return None;
-    }
-    let incumbent = main.best_move?;
-    let root_moves = tactical_root_moves(position, main, config.tactical_verify_max_candidates);
-    if root_moves.len() < 2 {
-        return None;
-    }
-    let verify_simulations = ((main_simulations as f32 * config.tactical_verify_fraction).round()
-        as usize)
-        .max(config.tactical_verify_min_simulations)
-        .min(main_simulations.max(1));
-    let scout = alphazero_search_with_rules(
-        position,
-        Some(rule_history.to_vec()),
-        Some(root_moves),
-        model,
-        selfplay_search_limits(config, verify_simulations, seed, true, false),
-    );
-    stats.scout_searches += 1;
-    stats.simulations_sum += scout.simulations;
-    let q_challenger = scout
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.visits >= config.tactical_verify_min_visits)
-        .max_by(|left, right| {
-            left.q
-                .total_cmp(&right.q)
-                .then_with(|| left.visits.cmp(&right.visits))
-        })?;
-    let visit_challenger = scout
-        .best_move
-        .and_then(|mv| scout.candidates.iter().find(|candidate| candidate.mv == mv));
-    let (challenger_mv, proof_simulations, deep_audit) = if q_challenger.mv != incumbent {
-        (q_challenger.mv, verify_simulations, false)
-    } else {
-        let visit_challenger = visit_challenger.filter(|candidate| {
-            candidate.mv != incumbent
-                && candidate.visits >= config.tactical_verify_min_visits
-                && q_challenger.q - candidate.q <= config.tactical_deep_verify_q_window
-        })?;
-        let audit_ticket = ((seed >> 40) & 0xFF_FFFF) as f32 / 16_777_216.0;
-        if audit_ticket >= config.tactical_deep_verify_rate {
-            return None;
-        }
-        let deep_simulations = ((main_simulations as f32 * config.tactical_deep_verify_multiplier)
-            .round() as usize)
-            .max(verify_simulations);
-        (visit_challenger.mv, deep_simulations, true)
-    };
-    stats.proposals += 1;
-    stats.deep_audits += usize::from(deep_audit);
-
-    // The scout may allocate very different visit counts. Re-search challenger and
-    // incumbent as child roots with exactly the same budget before teaching either.
-    let challenger_q = verified_root_move_q(
-        position,
-        rule_history,
-        challenger_mv,
-        model,
-        config,
-        proof_simulations,
-        seed ^ 0xE703_7ED1_A0B4_28DB,
-    );
-    let incumbent_q = verified_root_move_q(
-        position,
-        rule_history,
-        incumbent,
-        model,
-        config,
-        proof_simulations,
-        seed ^ 0x8EBC_6AF0_9C88_C6E3,
-    );
-    stats.proof_searches += 2;
-    stats.simulations_sum += proof_simulations.saturating_mul(2);
-    let q_gap = challenger_q - incumbent_q;
-    if q_gap < config.tactical_verify_q_margin {
-        return None;
-    }
-
-    // A barely accepted proof receives only a small correction. Strong evidence
-    // ramps to the configured cap without ever replacing the clean visit target.
-    let confidence = (q_gap / 0.25).clamp(0.25, 1.0);
-    let weight = (config.tactical_teacher_max_weight * confidence).clamp(0.0, 1.0);
-    stats.accepted += 1;
-    stats.deep_accepted += usize::from(deep_audit);
-    stats.changed_move += 1;
-    stats.teacher_weight_sum += weight;
-    stats.q_gap_sum += q_gap;
-    Some(TacticalTeacher {
-        mv: challenger_mv,
-        q: challenger_q,
-        weight,
-    })
-}
-
-fn distilled_policy_candidates(
-    candidates: &[AzCandidate],
-    teacher: Option<TacticalTeacher>,
-) -> Vec<AzCandidate> {
-    let mut distilled = candidates.to_vec();
-    let Some(teacher) = teacher else {
-        return distilled;
-    };
-    let weight = teacher.weight.clamp(0.0, 1.0);
-    for candidate in &mut distilled {
-        candidate.policy = candidate.policy.max(0.0) * (1.0 - weight);
-        if candidate.mv == teacher.mv {
-            candidate.policy += weight;
-            candidate.q = teacher.q;
-        }
-    }
-    let total = distilled
-        .iter()
-        .map(|candidate| candidate.policy)
-        .sum::<f32>();
-    if total > 0.0 {
-        for candidate in &mut distilled {
-            candidate.policy /= total;
-        }
-    }
-    distilled.sort_by(|left, right| {
-        right
-            .policy
-            .total_cmp(&left.policy)
-            .then_with(|| right.visits.cmp(&left.visits))
-            .then_with(|| right.q.total_cmp(&left.q))
-    });
-    distilled
 }
 
 fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
@@ -629,7 +327,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
-    let mut tactical_teacher = AzTacticalTeacherStats::default();
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -663,7 +360,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let search_simulation_count = config.simulations.max(1);
             search_simulations.searches += 1;
             search_simulations.simulations_sum += search_simulation_count;
-            let search_seed = rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64;
             let search = {
                 crate::scope_profile!("az.selfplay.search");
                 alphazero_search_with_rules(
@@ -671,13 +367,30 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     Some(rule_history.clone()),
                     Some(legal),
                     model,
-                    selfplay_search_limits(
-                        config,
-                        search_simulation_count,
-                        search_seed,
-                        false,
-                        true,
-                    ),
+                    AzSearchLimits {
+                        simulations: search_simulation_count,
+                        seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
+                        cpuct: config.cpuct,
+                        cpuct_at_root: config.cpuct_at_root,
+                        cpuct_base: config.cpuct_base,
+                        cpuct_factor: config.cpuct_factor,
+                        cpuct_base_at_root: config.cpuct_base_at_root,
+                        cpuct_factor_at_root: config.cpuct_factor_at_root,
+                        max_depth: 0,
+                        root_dirichlet_alpha: config.root_dirichlet_alpha,
+                        root_exploration_fraction: config.root_exploration_fraction,
+                        fpu_value: config.fpu_value,
+                        fpu_value_at_root: config.fpu_value_at_root,
+                        policy_softmax_temp: config.policy_softmax_temp,
+                        draw_score: config.draw_score,
+                        moves_left_max_effect: config.moves_left_max_effect,
+                        moves_left_slope: config.moves_left_slope,
+                        moves_left_threshold: config.moves_left_threshold,
+                        moves_left_constant_factor: config.moves_left_constant_factor,
+                        moves_left_scaled_factor: config.moves_left_scaled_factor,
+                        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+                        value_scale: 1.0,
+                    },
                 )
             };
             crate::scope_profile!("az.selfplay.post_search");
@@ -708,24 +421,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 entropy_mid_sum += entropy;
                 entropy_mid_count += 1;
             }
-            let teacher = find_tactical_teacher(
-                &position,
-                &rule_history,
-                &search,
-                model,
-                config,
-                search_simulation_count,
-                search_seed ^ 0xA076_1D64_78BD_642F,
-                &mut tactical_teacher,
-            );
-            let target_candidates = distilled_policy_candidates(&search.candidates, teacher);
-            let effective_value_q = teacher
-                .map(|teacher| search.value_q.max(teacher.q))
-                .unwrap_or(search.value_q);
-            if allow_resign && should_resign(effective_value_q, config) {
+            if allow_resign && should_resign(search.value_q, config) {
                 let meta = root_search_meta(
-                    &target_candidates,
-                    effective_value_q,
+                    &search.candidates,
+                    search.value_q,
                     config.generation_update,
                     config.seed ^ game_index as u64,
                     ply,
@@ -733,8 +432,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 let sample = make_training_sample(
                     &position,
                     &rule_history,
-                    &target_candidates,
-                    effective_value_q,
+                    &search.candidates,
+                    search.value_q,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                     search_simulation_count,
@@ -752,15 +451,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
             let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
-                teacher
-                    .map(|teacher| teacher.mv)
-                    .or(search.best_move)
-                    .or_else(|| {
-                        choose_selfplay_move(&target_candidates, temperature, 0.0, 0.0, &mut rng)
-                    })
+                search.best_move.or_else(|| {
+                    choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
+                })
             } else {
                 choose_selfplay_move(
-                    &target_candidates,
+                    &search.candidates,
                     temperature,
                     config.temperature_value_cutoff,
                     config.temperature_visit_offset,
@@ -772,9 +468,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             };
             let move_meta = move_search_meta(
-                &target_candidates,
+                &search.candidates,
                 mv,
-                effective_value_q,
+                search.value_q,
                 config.generation_update,
                 config.seed ^ game_index as u64,
                 ply,
@@ -782,7 +478,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             sampled_moves += 1;
             sampled_best_moves += usize::from(move_meta.best_index == move_meta.played_index);
             best_played_q_gap_sum += (move_meta.best_q - move_meta.played_q).max(0.0);
-            let top_visits = target_candidates
+            let top_visits = search
+                .candidates
                 .iter()
                 .map(|candidate| candidate.visits)
                 .max()
@@ -799,8 +496,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 let sample = make_training_sample(
                     &position,
                     &rule_history,
-                    &target_candidates,
-                    effective_value_q,
+                    &search.candidates,
+                    search.value_q,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
                     search_simulation_count,
@@ -910,7 +607,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         played_q_sum,
         terminal,
         search_simulations,
-        tactical_teacher,
     }
 }
 
@@ -1348,7 +1044,6 @@ fn play_arena_game(
                 moves_left_scaled_factor: 0.0,
                 moves_left_quadratic_factor: 0.0,
                 value_scale: 1.0,
-                tactical_verifier: false,
             },
         );
         let Some(mv) = result.best_move else {
@@ -1433,34 +1128,6 @@ mod tests {
         assert!((report.score_rate() - 0.54).abs() < 1e-6);
         assert!(report.promotes_with_lower_bound(0.50, 1.0));
         assert!(!report.promotes_with_lower_bound(0.50, 1.64));
-    }
-
-    #[test]
-    fn tactical_teacher_blends_policy_without_copying_verifier_visits() {
-        let first = Move::from_uci("a0a1").unwrap();
-        let teacher_move = Move::from_uci("b0b1").unwrap();
-        let candidates = vec![candidate(first, 0.8), candidate(teacher_move, 0.2)];
-
-        let distilled = distilled_policy_candidates(
-            &candidates,
-            Some(TacticalTeacher {
-                mv: teacher_move,
-                q: 0.7,
-                weight: 0.25,
-            }),
-        );
-        let first_after = distilled.iter().find(|item| item.mv == first).unwrap();
-        let teacher_after = distilled
-            .iter()
-            .find(|item| item.mv == teacher_move)
-            .unwrap();
-
-        assert!((first_after.policy - 0.6).abs() < 1e-6);
-        assert!((teacher_after.policy - 0.4).abs() < 1e-6);
-        assert_eq!(first_after.visits, candidates[0].visits);
-        assert_eq!(teacher_after.visits, candidates[1].visits);
-        assert!((teacher_after.q - 0.7).abs() < 1e-6);
-        assert!((distilled.iter().map(|item| item.policy).sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
     #[test]

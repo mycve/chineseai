@@ -51,10 +51,6 @@ pub struct AzSearchLimits {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub value_scale: f32,
-    /// Enable the broad, policy-independent tactical exploration used by the
-    /// standalone verifier. Keep this disabled for the main self-play tree so
-    /// verifier effort cannot leak into the visit-count policy target.
-    pub tactical_verifier: bool,
 }
 
 impl Default for AzSearchLimits {
@@ -82,7 +78,6 @@ impl Default for AzSearchLimits {
             moves_left_scaled_factor: 0.15,
             moves_left_quadratic_factor: 0.85,
             value_scale: 1.0,
-            tactical_verifier: false,
         }
     }
 }
@@ -264,7 +259,6 @@ struct AzTree<'a> {
     moves_left_scaled_factor: f32,
     moves_left_quadratic_factor: f32,
     value_scale: f32,
-    tactical_verifier: bool,
     max_depth: usize,
     search_depth_sum: usize,
     search_depth_count: usize,
@@ -468,7 +462,6 @@ impl<'a> AzTree<'a> {
             moves_left_scaled_factor: limits.moves_left_scaled_factor,
             moves_left_quadratic_factor: limits.moves_left_quadratic_factor,
             value_scale: limits.value_scale.clamp(0.0, 1.0),
-            tactical_verifier: limits.tactical_verifier,
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
             } else {
@@ -994,20 +987,16 @@ impl<'a> AzTree<'a> {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        let independent_u = if self.tactical_verifier {
-            let tactical_exploration = if child.gives_check {
-                CHECK_EXPLORATION_MULTIPLIER
-            } else if child.is_capture {
-                CAPTURE_EXPLORATION_MULTIPLIER
-            } else {
-                1.0
-            };
-            PRIOR_INDEPENDENT_EXPLORATION
-                * tactical_exploration
-                * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt()
+        let tactical_exploration = if child.gives_check {
+            CHECK_EXPLORATION_MULTIPLIER
+        } else if child.is_capture {
+            CAPTURE_EXPLORATION_MULTIPLIER
         } else {
-            0.0
+            1.0
         };
+        let independent_u = PRIOR_INDEPENDENT_EXPLORATION
+            * tactical_exploration
+            * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt();
         q + u + independent_u + self.moves_left_utility(parent, child, q)
     }
 
@@ -1574,6 +1563,49 @@ mod tests {
                     prior: 0.90,
                     is_capture: false,
                     gives_check: false,
+                    visits: 1,
+                    value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
+                    child: NO_CHILD,
+                },
+            ],
+        );
+
+        assert_eq!(tree.select_child(tree.root), 1);
+    }
+
+    #[test]
+    fn main_search_gives_checking_moves_more_policy_independent_visits() {
+        let model = AzNnue::random(4, 17);
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.cpuct_at_root = 0.0;
+        tree.nodes[tree.root].visits = 64;
+        tree.set_node_children(
+            tree.root,
+            vec![
+                AzChild {
+                    mv: legal[0],
+                    prior: 0.5,
+                    is_capture: false,
+                    gives_check: false,
+                    visits: 1,
+                    value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
+                    child: NO_CHILD,
+                },
+                AzChild {
+                    mv: legal[1],
+                    prior: 0.5,
+                    is_capture: false,
+                    gives_check: true,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     moves_left_sum: 0.0,
