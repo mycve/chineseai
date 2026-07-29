@@ -6,11 +6,12 @@ use std::thread;
 use std::time::Instant;
 
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::xiangqi::BOARD_SIZE;
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
     canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    normalize_wdl_target, structural_king_piece_index,
+    dense_move_squares, normalize_wdl_target, structural_king_piece_index,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -111,6 +112,11 @@ pub(super) struct PackedBatch {
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
     pub policy_repeats_history: Vec<f32>,
+    pub policy_consequence_from: Vec<u32>,
+    pub policy_consequence_to: Vec<u32>,
+    pub policy_consequence_captured: Vec<u32>,
+    pub policy_consequence_move_mask: Vec<f32>,
+    pub policy_consequence_capture_mask: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
@@ -158,6 +164,11 @@ impl PackedBatch {
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
             policy_repeats_history: vec![0.0; batch_size * max_policy_moves],
+            policy_consequence_from: vec![0u32; batch_size * max_policy_moves],
+            policy_consequence_to: vec![0u32; batch_size * max_policy_moves],
+            policy_consequence_captured: vec![0u32; batch_size * max_policy_moves],
+            policy_consequence_move_mask: vec![0.0; batch_size * max_policy_moves],
+            policy_consequence_capture_mask: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
@@ -217,6 +228,13 @@ impl PackedBatch {
 
     fn pack_policy(&mut self, row: usize, sample: &AzTrainingSample) {
         let policy_base = row * self.max_policy_moves;
+        let mut board_features = [usize::MAX; BOARD_SIZE];
+        for &feature in &sample.features {
+            if let Some(structural) = decode_current_piece_square_feature(feature) {
+                let square = structural.rank * 9 + structural.file;
+                board_features[square] = feature;
+            }
+        }
         let mut policy_offset = 0usize;
         for (sample_offset, (&move_index, &target)) in sample
             .move_indices
@@ -233,6 +251,23 @@ impl PackedBatch {
                     .get(sample_offset)
                     .copied()
                     .unwrap_or(0.0);
+                if let Some((from, to)) = dense_move_squares(move_index) {
+                    let moved_feature = board_features[from];
+                    if moved_feature != usize::MAX {
+                        let piece_index = moved_feature / BOARD_SIZE;
+                        self.policy_consequence_from[policy_base + policy_offset] =
+                            moved_feature as u32;
+                        self.policy_consequence_to[policy_base + policy_offset] =
+                            (piece_index * BOARD_SIZE + to) as u32;
+                        self.policy_consequence_move_mask[policy_base + policy_offset] = 1.0;
+                        let captured_feature = board_features[to];
+                        if captured_feature != usize::MAX {
+                            self.policy_consequence_captured[policy_base + policy_offset] =
+                                captured_feature as u32;
+                            self.policy_consequence_capture_mask[policy_base + policy_offset] = 1.0;
+                        }
+                    }
+                }
                 policy_offset += 1;
             }
         }
@@ -378,7 +413,7 @@ fn splitmix_next(state: &mut u64) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use crate::az::AzSampleMeta;
+    use crate::{az::AzSampleMeta, xiangqi::Move};
 
     use super::*;
 
@@ -443,6 +478,31 @@ mod tests {
         assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
         assert_eq!(packed.values, vec![1.0, 1.0]);
         assert_eq!(packed.moves_left, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn packed_policy_consequence_encodes_move_and_capture() {
+        let moved_feature = 6 * BOARD_SIZE;
+        let captured_feature = 10 * BOARD_SIZE + 1;
+        let move_index = super::super::dense_move_index(Move::new(0, 1));
+        let mut training_sample = sample(0);
+        training_sample.features = vec![moved_feature, captured_feature];
+        training_sample.move_indices = vec![move_index];
+        training_sample.policy = vec![1.0];
+        training_sample.policy_repeats_history = vec![0.0];
+
+        let packed = PackedBatch::from_indices(&[training_sample], &[0]);
+        assert_eq!(packed.policy_consequence_from, vec![moved_feature as u32]);
+        assert_eq!(
+            packed.policy_consequence_to,
+            vec![(6 * BOARD_SIZE + 1) as u32]
+        );
+        assert_eq!(
+            packed.policy_consequence_captured,
+            vec![captured_feature as u32]
+        );
+        assert_eq!(packed.policy_consequence_move_mask, vec![1.0]);
+        assert_eq!(packed.policy_consequence_capture_mask, vec![1.0]);
     }
 
     #[test]

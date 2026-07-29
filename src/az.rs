@@ -7,8 +7,10 @@ use candle_nn::VarMap;
 mod alphazero;
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
-    all(target_os = "linux", not(target_env = "musl"))
+    all(target_os = "linux", not(target_env = "musl")),
+    all(test, target_os = "macos")
 ))]
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
 mod dataloader;
 mod play;
@@ -46,9 +48,11 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
+pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 3.0;
+const AZ_MODEL_FORMAT_VERSION: f32 = 4.0;
+const AZ_MODEL_LEGACY_FORMAT_VERSION: f32 = 3.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -164,6 +168,21 @@ fn insert_candle_var(
     Ok(())
 }
 
+fn legacy_policy_consequence_weights(
+    hidden_size: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut rng = SplitMix64::new(0xA17E_5A7E_C05E_0004);
+    let hidden = (0..POLICY_CONSEQUENCE_SIZE * hidden_size)
+        .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
+        .collect();
+    let bias = vec![0.0; POLICY_CONSEQUENCE_SIZE];
+    let embedding = (0..PIECE_SQUARE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE)
+        .map(|_| rng.weight((2.0 / POLICY_CONSEQUENCE_SIZE as f32).sqrt() * 0.1))
+        .collect();
+    let output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
+    (hidden, bias, embedding, output)
+}
+
 fn load_candle_f32_tensor(
     tensors: &candle_core::safetensors::MmapedSafetensors,
     name: &str,
@@ -215,6 +234,13 @@ macro_rules! az_weight_tensors {
             policy_move_embedding,
             [DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE]
         );
+        $visit!(policy_consequence_hidden, [POLICY_CONSEQUENCE_SIZE, $h]);
+        $visit!(policy_consequence_bias, [POLICY_CONSEQUENCE_SIZE]);
+        $visit!(
+            policy_consequence_embedding,
+            [PIECE_SQUARE_INPUT_SIZE, POLICY_CONSEQUENCE_SIZE]
+        );
+        $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
     };
 }
 
@@ -255,6 +281,7 @@ pub(super) struct AzEvalScratch {
     value_head2: Vec<f32>,
     policy_pair_context: Vec<f32>,
     policy_move_context: Vec<f32>,
+    policy_consequence_context: Vec<f32>,
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
     logits: Vec<f32>,
@@ -271,6 +298,7 @@ impl AzEvalScratch {
             value_head2: vec![0.0; VALUE_HEAD_SIZE],
             policy_pair_context: vec![0.0; POLICY_PAIR_CONTEXT_SIZE],
             policy_move_context: vec![0.0; POLICY_MOVE_EMBED_SIZE],
+            policy_consequence_context: vec![0.0; POLICY_CONSEQUENCE_SIZE],
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
             logits: Vec::with_capacity(192),
@@ -507,6 +535,10 @@ pub struct AzNnue {
     pub policy_pair_embedding: Vec<f32>,
     pub policy_move_context_hidden: Vec<f32>,
     pub policy_move_embedding: Vec<f32>,
+    pub policy_consequence_hidden: Vec<f32>,
+    pub policy_consequence_bias: Vec<f32>,
+    pub policy_consequence_embedding: Vec<f32>,
+    pub policy_consequence_output: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -542,6 +574,10 @@ impl Clone for AzNnue {
             policy_pair_embedding: self.policy_pair_embedding.clone(),
             policy_move_context_hidden: self.policy_move_context_hidden.clone(),
             policy_move_embedding: self.policy_move_embedding.clone(),
+            policy_consequence_hidden: self.policy_consequence_hidden.clone(),
+            policy_consequence_bias: self.policy_consequence_bias.clone(),
+            policy_consequence_embedding: self.policy_consequence_embedding.clone(),
+            policy_consequence_output: self.policy_consequence_output.clone(),
             gpu_trainer: None,
         }
     }
@@ -938,6 +974,15 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
         let policy_move_embedding = vec![0.0; DENSE_MOVE_SPACE * POLICY_MOVE_EMBED_SIZE];
+        let policy_consequence_hidden = (0..POLICY_CONSEQUENCE_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
+            .collect();
+        let policy_consequence_bias = vec![0.0; POLICY_CONSEQUENCE_SIZE];
+        let policy_consequence_embedding = (0..PIECE_SQUARE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE)
+            .map(|_| rng.weight((2.0 / POLICY_CONSEQUENCE_SIZE as f32).sqrt() * 0.1))
+            .collect();
+        // Zero output preserves the exact policy distribution until this branch is trained.
+        let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
         Self {
             hidden_size,
             arch,
@@ -967,6 +1012,10 @@ impl AzNnue {
             policy_pair_embedding,
             policy_move_context_hidden,
             policy_move_embedding,
+            policy_consequence_hidden,
+            policy_consequence_bias,
+            policy_consequence_embedding,
+            policy_consequence_output,
             gpu_trainer: None,
         }
     }
@@ -999,18 +1048,34 @@ impl AzNnue {
                 .map_err(candle_io_error)?
         };
         let format_version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
-        if format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
+        let legacy_v3 = format_version.as_slice() == [AZ_MODEL_LEGACY_FORMAT_VERSION];
+        if !legacy_v3 && format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported AZ model format {:?}; expected v{}",
-                    format_version, AZ_MODEL_FORMAT_VERSION
+                    "unsupported AZ model format {:?}; expected v{} or legacy v{}",
+                    format_version, AZ_MODEL_FORMAT_VERSION, AZ_MODEL_LEGACY_FORMAT_VERSION
                 ),
             ));
         }
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
+        let (
+            policy_consequence_hidden,
+            policy_consequence_bias,
+            policy_consequence_embedding,
+            policy_consequence_output,
+        ) = if legacy_v3 {
+            legacy_policy_consequence_weights(hidden_size)
+        } else {
+            (
+                load_candle_f32_tensor(&tensors, "policy_consequence_hidden")?,
+                load_candle_f32_tensor(&tensors, "policy_consequence_bias")?,
+                load_candle_f32_tensor(&tensors, "policy_consequence_embedding")?,
+                load_candle_f32_tensor(&tensors, "policy_consequence_output")?,
+            )
+        };
         let model = Self {
             hidden_size,
             arch,
@@ -1046,6 +1111,10 @@ impl AzNnue {
                 "policy_move_context_hidden",
             )?,
             policy_move_embedding: load_candle_f32_tensor(&tensors, "policy_move_embedding")?,
+            policy_consequence_hidden,
+            policy_consequence_bias,
+            policy_consequence_embedding,
+            policy_consequence_output,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -1198,10 +1267,17 @@ impl AzNnue {
         policy_repeats_history: &[f32],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
+        let consequence_active = self.policy_consequence_is_active();
         {
             crate::scope_profile!("az.eval.policy_embeddings");
             self.policy_pair_context_into(&scratch.hidden, &mut scratch.policy_pair_context);
             self.policy_move_context_into(&scratch.hidden, &mut scratch.policy_move_context);
+            if consequence_active {
+                self.policy_consequence_context_into(
+                    &scratch.hidden,
+                    &mut scratch.policy_consequence_context,
+                );
+            }
         }
         scratch.logits.resize(moves.len(), 0.0);
         let move_map = move_map();
@@ -1261,6 +1337,14 @@ impl AzNnue {
                     canonical.from as usize,
                     canonical.to as usize,
                 );
+                if consequence_active {
+                    scratch.logits[index] += self.policy_consequence_logit(
+                        position,
+                        side,
+                        *mv,
+                        &scratch.policy_consequence_context,
+                    );
+                }
                 scratch.logits[index] +=
                     repeat_logit * policy_repeats_history.get(index).copied().unwrap_or(0.0);
             }
@@ -1544,6 +1628,60 @@ impl AzNnue {
                 [feature * self.hidden_size..(feature + 1) * self.hidden_size];
             *value = dot_product(hidden, hidden_row);
         }
+    }
+
+    fn policy_consequence_context_into(&self, hidden: &[f32], out: &mut Vec<f32>) {
+        out.resize(POLICY_CONSEQUENCE_SIZE, 0.0);
+        out.copy_from_slice(&self.policy_consequence_bias);
+        for (feature, value) in out.iter_mut().enumerate() {
+            let row = &self.policy_consequence_hidden
+                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            *value += dot_product(hidden, row);
+        }
+    }
+
+    #[inline]
+    fn policy_consequence_is_active(&self) -> bool {
+        self.policy_consequence_output
+            .iter()
+            .any(|&weight| weight != 0.0)
+    }
+
+    fn policy_consequence_logit(
+        &self,
+        position: &Position,
+        side: Color,
+        mv: Move,
+        context: &[f32],
+    ) -> f32 {
+        let Some(moved) = position.piece_at(mv.from as usize) else {
+            return 0.0;
+        };
+        let canonical = canonical_move(side, mv);
+        let moved_piece_index =
+            if moved.color == side { 0 } else { 7 } + piece_kind_index(moved.kind);
+        let from_feature = moved_piece_index * BOARD_SIZE + canonical.from as usize;
+        let to_feature = moved_piece_index * BOARD_SIZE + canonical.to as usize;
+        let captured_feature = position.piece_at(mv.to as usize).map(|captured| {
+            let piece_index =
+                (if captured.color == side { 0 } else { 7 }) + piece_kind_index(captured.kind);
+            piece_index * BOARD_SIZE + canonical.to as usize
+        });
+        let from_embedding = &self.policy_consequence_embedding
+            [from_feature * POLICY_CONSEQUENCE_SIZE..(from_feature + 1) * POLICY_CONSEQUENCE_SIZE];
+        let to_embedding = &self.policy_consequence_embedding
+            [to_feature * POLICY_CONSEQUENCE_SIZE..(to_feature + 1) * POLICY_CONSEQUENCE_SIZE];
+        let captured_embedding = captured_feature.map(|feature| {
+            &self.policy_consequence_embedding
+                [feature * POLICY_CONSEQUENCE_SIZE..(feature + 1) * POLICY_CONSEQUENCE_SIZE]
+        });
+        let mut logit = 0.0;
+        for feature in 0..POLICY_CONSEQUENCE_SIZE {
+            let captured = captured_embedding.map_or(0.0, |embedding| embedding[feature]);
+            let pre = context[feature] + to_embedding[feature] - from_embedding[feature] - captured;
+            logit += pre.max(0.0) * self.policy_consequence_output[feature];
+        }
+        logit
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -2369,6 +2507,11 @@ fn move_map() -> &'static MoveMap {
     })
 }
 
+pub(super) fn dense_move_squares(move_index: usize) -> Option<(usize, usize)> {
+    let sparse = *move_map().dense_to_sparse.get(move_index)? as usize;
+    Some((sparse / BOARD_SIZE, sparse % BOARD_SIZE))
+}
+
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) fn policy_move_from_features() -> &'static [f32] {
     use std::sync::OnceLock;
@@ -2471,6 +2614,59 @@ mod tests {
         let moves = position.legal_moves();
         let value = model.evaluate_value(&position, &moves);
         assert!(value.abs() < 1e-6, "initial startpos value={value}");
+    }
+
+    #[test]
+    fn zero_initialized_consequence_branch_preserves_policy_logits() {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let model = AzNnue::random(32, 20260729);
+        assert!(
+            model
+                .policy_consequence_output
+                .iter()
+                .all(|&weight| weight == 0.0)
+        );
+
+        let mut baseline = AzEvalScratch::new(model.arch);
+        model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &[],
+            &mut baseline,
+        );
+
+        let mut perturbed_inactive = model.clone();
+        perturbed_inactive.policy_consequence_hidden.fill(100.0);
+        perturbed_inactive.policy_consequence_embedding.fill(-100.0);
+        let mut unchanged = AzEvalScratch::new(model.arch);
+        perturbed_inactive.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &[],
+            &mut unchanged,
+        );
+        assert_eq!(baseline.logits, unchanged.logits);
+
+        let mut active = model.clone();
+        active.policy_consequence_output.fill(0.1);
+        let mut changed = AzEvalScratch::new(model.arch);
+        active.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &[],
+            &mut changed,
+        );
+        assert!(
+            baseline
+                .logits
+                .iter()
+                .zip(&changed.logits)
+                .any(|(left, right)| left != right)
+        );
     }
 
     #[test]
@@ -2805,6 +3001,22 @@ mod tests {
             loaded.policy_move_context_hidden
         );
         assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
+        assert_eq!(
+            model.policy_consequence_hidden,
+            loaded.policy_consequence_hidden
+        );
+        assert_eq!(
+            model.policy_consequence_bias,
+            loaded.policy_consequence_bias
+        );
+        assert_eq!(
+            model.policy_consequence_embedding,
+            loaded.policy_consequence_embedding
+        );
+        assert_eq!(
+            model.policy_consequence_output,
+            loaded.policy_consequence_output
+        );
     }
 
     #[test]
