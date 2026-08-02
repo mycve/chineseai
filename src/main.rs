@@ -12,7 +12,7 @@ use chineseai::{
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
         SplitMix64, alphazero_search, alphazero_search_with_rules, benchmark_training,
         generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples_weighted_owned,
+        train_samples_weighted, train_samples_weighted_owned,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -66,6 +66,8 @@ enum CliCommand {
     AzBench(AzBenchArgs),
     /// Benchmark a synthetic training workload.
     AzTrainBench(AzTrainBenchArgs),
+    /// Fit a model on a fixed replay snapshot and report future-game validation loss.
+    AzReplayFit(AzReplayFitArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
@@ -200,6 +202,36 @@ struct AzTrainBenchArgs {
     lr: f32,
     /// Random seed.
     #[arg(default_value_t = 20260411)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct AzReplayFitArgs {
+    /// Replay snapshot produced by az-loop.
+    replay: String,
+    /// Output model path.
+    #[arg(long, default_value = "replay-fit.safetensors")]
+    output: String,
+    /// Hidden width of the model under test.
+    #[arg(long, default_value_t = 192)]
+    hidden: usize,
+    /// Latest replay samples retained for the experiment.
+    #[arg(long, default_value_t = 300_000)]
+    samples: usize,
+    /// Fraction of complete games reserved from the newest end of the snapshot.
+    #[arg(long, default_value_t = 0.10)]
+    validation_fraction: f32,
+    /// Training passes over the fixed training split.
+    #[arg(long, default_value_t = 2)]
+    epochs: usize,
+    /// Micro-batch size per visible GPU.
+    #[arg(long, default_value_t = 1024)]
+    batch_size_per_gpu: usize,
+    /// Learning rate.
+    #[arg(long, default_value_t = 0.0007)]
+    lr: f32,
+    /// Initialization and shuffle seed.
+    #[arg(long, default_value_t = 20260802)]
     seed: u64,
 }
 
@@ -1471,6 +1503,89 @@ fn main() {
             println!("loss         : {:.4}", stats.loss);
             println!("value_ce     : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
+        }
+        Some(CliCommand::AzReplayFit(cmd)) => {
+            let capacity = cmd.samples.max(2);
+            let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), capacity)
+                .unwrap_or_else(|err| panic!("failed to load replay `{}`: {err}", cmd.replay));
+            let window = pool.window_stats(5000);
+            let groups = pool.all_sample_groups();
+            drop(pool);
+            let validation_groups = ((groups.len() as f32)
+                * cmd.validation_fraction.clamp(0.01, 0.5))
+            .round()
+            .max(1.0) as usize;
+            let split = groups.len().saturating_sub(validation_groups).max(1);
+            let mut train = Vec::new();
+            let mut validation = Vec::new();
+            for (index, group) in groups.into_iter().enumerate() {
+                if index < split {
+                    train.extend(group);
+                } else {
+                    validation.extend(group);
+                }
+            }
+            let arch = chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
+            let mut model = AzNnue::random_with_arch(arch, cmd.seed);
+            let weights = AzTrainLossWeights::default();
+            let mut eval_rng = SplitMix64::new(cmd.seed ^ 0xD1B5_4A32_D192_ED03);
+            let baseline = train_samples_weighted(
+                &mut model.clone(),
+                &validation,
+                1,
+                1.0e-12,
+                cmd.batch_size_per_gpu.max(1),
+                &mut eval_rng,
+                weights,
+            );
+            let mut train_rng = SplitMix64::new(cmd.seed);
+            let started = Instant::now();
+            let trained = train_samples_weighted(
+                &mut model,
+                &train,
+                cmd.epochs.max(1),
+                cmd.lr.max(0.0),
+                cmd.batch_size_per_gpu.max(1),
+                &mut train_rng,
+                weights,
+            );
+            let train_seconds = started.elapsed().as_secs_f32();
+            let mut final_eval_model = model.clone();
+            let mut final_eval_rng = SplitMix64::new(cmd.seed ^ 0x94D0_49BB_1331_11EB);
+            let validation_stats = train_samples_weighted(
+                &mut final_eval_model,
+                &validation,
+                1,
+                1.0e-12,
+                cmd.batch_size_per_gpu.max(1),
+                &mut final_eval_rng,
+                weights,
+            );
+            model.save(&cmd.output).unwrap_or_else(|err| {
+                panic!("failed to save replay-fit model `{}`: {err}", cmd.output)
+            });
+            println!("replay-fit : {}", cmd.replay);
+            println!("window     : {:?}", window);
+            println!("arch       : hidden={}", arch.hidden_size);
+            println!(
+                "split      : train={} validation={} games={}",
+                train.len(),
+                validation.len(),
+                split + validation_groups
+            );
+            println!(
+                "baseline   : loss={:.5} value_ce={:.5} policy_ce={:.5}",
+                baseline.loss, baseline.value_loss, baseline.policy_ce
+            );
+            println!(
+                "train      : loss={:.5} value_ce={:.5} policy_ce={:.5} seconds={:.2}",
+                trained.loss, trained.value_loss, trained.policy_ce, train_seconds
+            );
+            println!(
+                "validation : loss={:.5} value_ce={:.5} policy_ce={:.5}",
+                validation_stats.loss, validation_stats.value_loss, validation_stats.policy_ce
+            );
+            println!("output     : {}", cmd.output);
         }
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;

@@ -52,7 +52,7 @@ pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 4.0;
+const AZ_MODEL_FORMAT_VERSION: f32 = 5.0;
 const AZ_MODEL_LEGACY_FORMAT_VERSION: f32 = 3.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -210,6 +210,10 @@ macro_rules! az_weight_tensors {
         $visit!(input_king_piece_hidden, [STRUCTURAL_KING_PIECE_SIZE, $h]);
         $visit!(rule_context_hidden, [RULE_CONTEXT_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
+        $visit!(trunk_residual_hidden, [VALUE_HEAD_SIZE, $h]);
+        $visit!(trunk_residual_bias, [VALUE_HEAD_SIZE]);
+        $visit!(trunk_residual_output, [$h, VALUE_HEAD_SIZE]);
+        $visit!(trunk_residual_output_bias, [$h]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_hidden2, [VALUE_HEAD_SIZE, VALUE_HEAD_SIZE]);
@@ -278,6 +282,8 @@ pub(super) struct AzEvalScratch {
     // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
     features: Vec<usize>,
     hidden: Vec<f32>,
+    trunk_residual: Vec<f32>,
+    trunk_output: Vec<f32>,
     value_head: Vec<f32>,
     value_head2: Vec<f32>,
     policy_pair_context: Vec<f32>,
@@ -295,6 +301,8 @@ impl AzEvalScratch {
         Self {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
+            trunk_residual: vec![0.0; VALUE_HEAD_SIZE],
+            trunk_output: vec![0.0; hidden_size],
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             value_head2: vec![0.0; VALUE_HEAD_SIZE],
             policy_pair_context: vec![0.0; POLICY_PAIR_CONTEXT_SIZE],
@@ -517,6 +525,10 @@ pub struct AzNnue {
     pub input_king_piece_hidden: Vec<f32>,
     pub rule_context_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
+    pub trunk_residual_hidden: Vec<f32>,
+    pub trunk_residual_bias: Vec<f32>,
+    pub trunk_residual_output: Vec<f32>,
+    pub trunk_residual_output_bias: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_hidden2: Vec<f32>,
@@ -556,6 +568,10 @@ impl Clone for AzNnue {
             input_king_piece_hidden: self.input_king_piece_hidden.clone(),
             rule_context_hidden: self.rule_context_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
+            trunk_residual_hidden: self.trunk_residual_hidden.clone(),
+            trunk_residual_bias: self.trunk_residual_bias.clone(),
+            trunk_residual_output: self.trunk_residual_output.clone(),
+            trunk_residual_output_bias: self.trunk_residual_output_bias.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_hidden2: self.value_head_hidden2.clone(),
@@ -939,6 +955,14 @@ impl AzNnue {
         // Start history-neutral; rule context is learned from self-play.
         let rule_context_hidden = vec![0.0; RULE_CONTEXT_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
+        let mut residual_rng = SplitMix64::new(seed ^ 0xE703_7ED1_A0B4_28DB);
+        let trunk_residual_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
+            .map(|_| residual_rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
+            .collect();
+        let trunk_residual_bias = vec![0.0; VALUE_HEAD_SIZE];
+        // Zero-output initialization makes the residual candidate start as the identity trunk.
+        let trunk_residual_output = vec![0.0; hidden_size * VALUE_HEAD_SIZE];
+        let trunk_residual_output_bias = vec![0.0; hidden_size];
         // 保持相同 seed 下其余权重与旧结构一致，便于公平比较删除注意力前后的速度和棋力。
         // 旧注意力初始化消耗 33 * hidden_size 个随机数，但这些权重不再存储。
         for _ in 0..33 * hidden_size {
@@ -1003,6 +1027,10 @@ impl AzNnue {
             input_king_piece_hidden,
             rule_context_hidden,
             hidden_bias,
+            trunk_residual_hidden,
+            trunk_residual_bias,
+            trunk_residual_output,
+            trunk_residual_output_bias,
             value_head_hidden,
             value_head_bias,
             value_head_hidden2,
@@ -1096,6 +1124,13 @@ impl AzNnue {
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             rule_context_hidden: load_candle_f32_tensor(&tensors, "rule_context_hidden")?,
             hidden_bias,
+            trunk_residual_hidden: load_candle_f32_tensor(&tensors, "trunk_residual_hidden")?,
+            trunk_residual_bias: load_candle_f32_tensor(&tensors, "trunk_residual_bias")?,
+            trunk_residual_output: load_candle_f32_tensor(&tensors, "trunk_residual_output")?,
+            trunk_residual_output_bias: load_candle_f32_tensor(
+                &tensors,
+                "trunk_residual_output_bias",
+            )?,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_hidden2: load_candle_f32_tensor(&tensors, "value_head_hidden2")?,
@@ -1186,6 +1221,11 @@ impl AzNnue {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
+            self.apply_trunk_residual(
+                &mut scratch.hidden,
+                &mut scratch.trunk_residual,
+                &mut scratch.trunk_output,
+            );
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
@@ -1239,6 +1279,11 @@ impl AzNnue {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
+            self.apply_trunk_residual(
+                &mut scratch.hidden,
+                &mut scratch.trunk_residual,
+                &mut scratch.trunk_output,
+            );
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
@@ -1379,6 +1424,37 @@ impl AzNnue {
                 *target += value * weight;
             }
         }
+    }
+
+    fn apply_trunk_residual(
+        &self,
+        hidden: &mut [f32],
+        bottleneck: &mut Vec<f32>,
+        output: &mut Vec<f32>,
+    ) {
+        bottleneck.resize(VALUE_HEAD_SIZE, 0.0);
+        bottleneck.copy_from_slice(&self.trunk_residual_bias);
+        for (index, value) in bottleneck.iter_mut().enumerate() {
+            let row = &self.trunk_residual_hidden
+                [index * self.hidden_size..(index + 1) * self.hidden_size];
+            *value = (*value + dot_product(hidden, row)).max(0.0);
+        }
+        output.resize(self.hidden_size, 0.0);
+        for (row, value) in self
+            .trunk_residual_output
+            .chunks_exact(VALUE_HEAD_SIZE)
+            .zip(output.iter_mut())
+        {
+            *value = dot_product(bottleneck, row);
+        }
+        for ((value, &residual), &bias) in hidden
+            .iter_mut()
+            .zip(output.iter())
+            .zip(self.trunk_residual_output_bias.iter())
+        {
+            *value += residual + bias;
+        }
+        rms_norm_in_place(hidden);
     }
 
     fn add_factorized_structure_into(&self, features: &[usize], hidden: &mut [f32]) {
