@@ -242,7 +242,7 @@ pub struct AzNnueArch {
 
 impl AzNnueArch {
     pub const fn default_const() -> Self {
-        Self { hidden_size: 192 }
+        Self { hidden_size: 128 }
     }
 
     pub const fn with_hidden_size(hidden_size: usize) -> Self {
