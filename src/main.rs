@@ -10,8 +10,9 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
-        SplitMix64, alphazero_search, alphazero_search_with_rules, benchmark_training,
-        evaluate_policy_groups, generate_selfplay_data, global_training_step_sample_count,
+        SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
+        alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
+        generate_selfplay_data, global_training_step_sample_count,
         play_arena_games_from_positions, train_samples_weighted, train_samples_weighted_owned,
     },
     opening_book::ObkBook,
@@ -151,6 +152,9 @@ struct AzSearchArgs {
     /// Restrict the root search to these legal moves (repeat for multiple moves).
     #[arg(long = "root-move")]
     root_moves: Vec<String>,
+    /// Print the most-visited continuation below this root move with network leaf values.
+    #[arg(long = "trace-move")]
+    trace_move: Option<String>,
     /// Simulations for every independent child verification; 0 uses the root simulation count.
     #[arg(long, default_value_t = 0)]
     verify_sims: usize,
@@ -1287,13 +1291,32 @@ fn main() {
                         .collect::<Vec<_>>(),
                 )
             };
-            let result = alphazero_search_with_rules(
-                &position,
-                Some(rule_history.clone()),
-                root_moves,
-                &model,
-                search_limits,
-            );
+            let trace_move = cmd.trace_move.as_deref().map(|text| {
+                position
+                    .parse_uci_move(text)
+                    .unwrap_or_else(|| panic!("invalid or illegal --trace-move `{text}`"))
+            });
+            let (result, trace) = if let Some(trace_move) = trace_move {
+                alphazero_search_trace_with_rules(
+                    &position,
+                    Some(rule_history.clone()),
+                    root_moves,
+                    &model,
+                    search_limits,
+                    trace_move,
+                )
+            } else {
+                (
+                    alphazero_search_with_rules(
+                        &position,
+                        Some(rule_history.clone()),
+                        root_moves,
+                        &model,
+                        search_limits,
+                    ),
+                    Vec::new(),
+                )
+            };
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
@@ -1311,6 +1334,28 @@ fn main() {
                 result.search_depth_limit,
                 result.search_depth_cutoffs
             );
+            if let Some(trace_move) = trace_move {
+                println!("trace    : root_move={trace_move} pv_plies={}", trace.len());
+                for step in &trace {
+                    println!(
+                        "trace[{ply:02}]: move={mv} visits={visits} q={q:.3} prior={prior:.5} check={check} forced_check={forced} child_net={value:.3} child_wdl={win:.3}/{draw:.3}/{loss:.3} child_ml={moves_left:.1} expanded={expanded} fen={fen}",
+                        ply = step.ply,
+                        mv = step.mv,
+                        visits = step.visits,
+                        q = step.q,
+                        prior = step.prior,
+                        check = step.gives_check,
+                        forced = step.forced_check_continuation,
+                        value = step.child_value,
+                        win = step.child_value_wdl[0],
+                        draw = step.child_value_wdl[1],
+                        loss = step.child_value_wdl[2],
+                        moves_left = step.child_moves_left,
+                        expanded = step.child_expanded,
+                        fen = step.child_fen,
+                    );
+                }
+            }
             println!("value_cp : {}", result.value_cp);
             println!(
                 "bestmove : {}",

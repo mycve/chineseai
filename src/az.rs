@@ -30,8 +30,9 @@ use crate::xiangqi::{
 };
 
 pub use alphazero::{
-    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, alphazero_search,
-    alphazero_search_with_rules, alphazero_search_with_rules_controlled,
+    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,
+    alphazero_search, alphazero_search_trace_with_rules, alphazero_search_with_rules,
+    alphazero_search_with_rules_controlled,
     alphazero_search_with_rules_controlled_with_progress, cp_from_q,
     gumbel_alphazero_search_with_rules,
 };

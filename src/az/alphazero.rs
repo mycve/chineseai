@@ -103,6 +103,22 @@ pub struct AzSearchResult {
 }
 
 #[derive(Clone, Debug)]
+pub struct AzSearchTraceStep {
+    pub ply: usize,
+    pub mv: Move,
+    pub visits: u32,
+    pub q: f32,
+    pub prior: f32,
+    pub gives_check: bool,
+    pub forced_check_continuation: bool,
+    pub child_expanded: bool,
+    pub child_value: f32,
+    pub child_value_wdl: [f32; 3],
+    pub child_moves_left: f32,
+    pub child_fen: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct AzSearchControl {
     stop: Arc<AtomicBool>,
     deadline: Option<Instant>,
@@ -129,6 +145,31 @@ pub fn alphazero_search_with_rules(
     limits: AzSearchLimits,
 ) -> AzSearchResult {
     alphazero_search_with_rules_controlled(position, rule_history, root_moves, model, limits, None)
+}
+
+pub fn alphazero_search_trace_with_rules(
+    position: &Position,
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    trace_move: Move,
+) -> (AzSearchResult, Vec<AzSearchTraceStep>) {
+    let mut tree = AzTree::new(
+        position.clone(),
+        rule_history.unwrap_or_else(|| position.initial_rule_history()),
+        root_moves,
+        model,
+        limits,
+    );
+    let root = tree.root;
+    tree.expand(root);
+    for _ in 0..limits.simulations {
+        tree.simulate(root, 0);
+    }
+    let result = tree.search_result(limits.simulations);
+    let trace = tree.trace_root_move(trace_move);
+    (result, trace)
 }
 
 pub fn gumbel_alphazero_search_with_rules(
@@ -533,6 +574,58 @@ impl<'a> AzTree<'a> {
             search_depth_cutoffs: self.search_depth_cutoffs,
             candidates,
         }
+    }
+
+    fn trace_root_move(&self, trace_move: Move) -> Vec<AzSearchTraceStep> {
+        let mut node_index = self.root;
+        let Some(mut child_index) = self
+            .node_children(node_index)
+            .iter()
+            .position(|child| child.mv == trace_move)
+        else {
+            return Vec::new();
+        };
+        let mut trace = Vec::new();
+        loop {
+            let forced_check_continuation = self.force_check_continuation(node_index);
+            let child = &self.node_children(node_index)[child_index];
+            let Some(next_node_index) = child.child_node() else {
+                break;
+            };
+            let next_node = &self.nodes[next_node_index];
+            trace.push(AzSearchTraceStep {
+                ply: trace.len() + 1,
+                mv: child.mv,
+                visits: child.visits,
+                q: child.q(self.node_draw_score(node_index)),
+                prior: child.prior,
+                gives_check: child.gives_check,
+                forced_check_continuation,
+                child_expanded: next_node.expanded,
+                child_value: next_node.value,
+                child_value_wdl: next_node.value_wdl,
+                child_moves_left: next_node.moves_left,
+                child_fen: next_node.position.to_fen(),
+            });
+            if !next_node.expanded || next_node.children_len == 0 {
+                break;
+            }
+            node_index = next_node_index;
+            child_index = self
+                .node_children(node_index)
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| {
+                    left.visits
+                        .cmp(&right.visits)
+                        .then_with(|| left.q(self.node_draw_score(node_index)).total_cmp(
+                            &right.q(self.node_draw_score(node_index)),
+                        ))
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+        }
+        trace
     }
 
     fn new(
