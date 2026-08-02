@@ -175,8 +175,7 @@ impl AzCandleModel {
             .broadcast_mul(&batch.policy_consequence_capture_mask)?;
         let consequence_delta = ((consequence_to - consequence_from)? - consequence_captured)?;
         let policy_consequence_logits = consequence_delta
-            .broadcast_add(&policy_consequence_context)?
-            .relu()?
+            .broadcast_mul(&policy_consequence_context)?
             .reshape((bsz * batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?
             .matmul(
                 &self

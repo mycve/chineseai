@@ -11,8 +11,8 @@ use chineseai::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
         SplitMix64, alphazero_search, alphazero_search_with_rules, benchmark_training,
-        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples_weighted, train_samples_weighted_owned,
+        evaluate_policy_groups, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions, train_samples_weighted, train_samples_weighted_owned,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -1561,6 +1561,10 @@ fn main() {
                 &mut final_eval_rng,
                 weights,
             );
+            let policy_groups = evaluate_policy_groups(&model, &validation);
+            let mut ablated_model = model.clone();
+            ablated_model.policy_consequence_output.fill(0.0);
+            let ablated_groups = evaluate_policy_groups(&ablated_model, &validation);
             model.save(&cmd.output).unwrap_or_else(|err| {
                 panic!("failed to save replay-fit model `{}`: {err}", cmd.output)
             });
@@ -1585,6 +1589,8 @@ fn main() {
                 "validation : loss={:.5} value_ce={:.5} policy_ce={:.5}",
                 validation_stats.loss, validation_stats.value_loss, validation_stats.policy_ce
             );
+            println!("groups     : {policy_groups:?}");
+            println!("no-delta   : {ablated_groups:?}");
             println!("output     : {}", cmd.output);
         }
         Some(CliCommand::AzLoop(cmd)) => {

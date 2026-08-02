@@ -49,10 +49,10 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
-pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 16;
+pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 6.0;
+const AZ_MODEL_FORMAT_VERSION: f32 = 7.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -774,6 +774,114 @@ pub struct AzTrainingSample {
     pub value_weight: f32,
     pub search_simulations: u32,
     pub meta: AzSampleMeta,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzPolicyGroupStats {
+    pub quiet_samples: usize,
+    pub tactical_samples: usize,
+    pub quiet_ce: f32,
+    pub tactical_ce: f32,
+    pub quiet_target_mass: f32,
+    pub quiet_predicted_mass: f32,
+    pub quiet_top1_rank: f32,
+}
+
+pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> AzPolicyGroupStats {
+    let mut stats = AzPolicyGroupStats::default();
+    let mut quiet_target_mass_sum = 0.0;
+    let mut quiet_predicted_mass_sum = 0.0;
+    let mut quiet_rank_sum = 0.0;
+    let mut scratch = AzEvalScratch::new(model.arch);
+    for sample in samples {
+        if sample.move_indices.is_empty() || sample.policy.len() != sample.move_indices.len() {
+            continue;
+        }
+        let pieces = sample
+            .features
+            .iter()
+            .filter_map(|&feature| decode_current_piece_square_feature(feature))
+            .map(|piece| (piece.piece_index, piece.rank * BOARD_FILES + piece.file))
+            .collect::<Vec<_>>();
+        let position = Position::from_canonical_piece_squares(&pieces);
+        if !position.has_general(Color::Red) || !position.has_general(Color::Black) {
+            continue;
+        }
+        let moves = sample
+            .move_indices
+            .iter()
+            .filter_map(|&index| dense_move_squares(index))
+            .map(|(from, to)| Move::new(from, to))
+            .collect::<Vec<_>>();
+        if moves.len() != sample.policy.len() {
+            continue;
+        }
+        model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &sample.rule_context,
+            &sample.policy_repeats_history,
+            &mut scratch,
+        );
+        let max_logit = scratch.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut predicted = scratch
+            .logits
+            .iter()
+            .map(|&logit| (logit - max_logit).exp())
+            .collect::<Vec<_>>();
+        let total = predicted.iter().sum::<f32>().max(1.0e-12);
+        for value in &mut predicted {
+            *value /= total;
+        }
+        let quiet = moves
+            .iter()
+            .zip(&scratch.policy_gives_check)
+            .map(|(&mv, &check)| position.piece_at(mv.to as usize).is_none() && check == 0.0)
+            .collect::<Vec<_>>();
+        let top1 = sample
+            .policy
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let ce = sample
+            .policy
+            .iter()
+            .zip(&predicted)
+            .map(|(&target, &probability)| -target.max(0.0) * probability.max(1.0e-12).ln())
+            .sum::<f32>();
+        if quiet[top1] {
+            stats.quiet_samples += 1;
+            stats.quiet_ce += ce;
+            quiet_rank_sum += 1.0
+                + predicted
+                    .iter()
+                    .filter(|&&probability| probability > predicted[top1])
+                    .count() as f32;
+        } else {
+            stats.tactical_samples += 1;
+            stats.tactical_ce += ce;
+        }
+        quiet_target_mass_sum += sample
+            .policy
+            .iter()
+            .zip(&quiet)
+            .filter_map(|(&probability, &is_quiet)| is_quiet.then_some(probability))
+            .sum::<f32>();
+        quiet_predicted_mass_sum += predicted
+            .iter()
+            .zip(&quiet)
+            .filter_map(|(&probability, &is_quiet)| is_quiet.then_some(probability))
+            .sum::<f32>();
+    }
+    stats.quiet_ce /= stats.quiet_samples.max(1) as f32;
+    stats.tactical_ce /= stats.tactical_samples.max(1) as f32;
+    let total_samples = (stats.quiet_samples + stats.tactical_samples).max(1) as f32;
+    stats.quiet_target_mass = quiet_target_mass_sum / total_samples;
+    stats.quiet_predicted_mass = quiet_predicted_mass_sum / total_samples;
+    stats.quiet_top1_rank = quiet_rank_sum / stats.quiet_samples.max(1) as f32;
+    stats
 }
 
 /// Compress exact rule history into bounded continuous inputs. Values are
@@ -1766,8 +1874,8 @@ impl AzNnue {
         let mut logit = 0.0;
         for feature in 0..POLICY_CONSEQUENCE_SIZE {
             let captured = captured_embedding.map_or(0.0, |embedding| embedding[feature]);
-            let pre = context[feature] + to_embedding[feature] - from_embedding[feature] - captured;
-            logit += pre.max(0.0) * self.policy_consequence_output[feature];
+            let delta = to_embedding[feature] - from_embedding[feature] - captured;
+            logit += context[feature] * delta * self.policy_consequence_output[feature];
         }
         logit
     }
