@@ -53,6 +53,7 @@ pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 const AZ_MODEL_FORMAT_VERSION: f32 = 6.0;
+const AZ_MODEL_PREVIOUS_FORMAT_VERSION: f32 = 5.0;
 const AZ_MODEL_LEGACY_FORMAT_VERSION: f32 = 3.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -1099,12 +1100,16 @@ impl AzNnue {
         };
         let format_version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
         let legacy_v3 = format_version.as_slice() == [AZ_MODEL_LEGACY_FORMAT_VERSION];
-        if !legacy_v3 && format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
+        let previous_v5 = format_version.as_slice() == [AZ_MODEL_PREVIOUS_FORMAT_VERSION];
+        if !legacy_v3 && !previous_v5 && format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported AZ model format {:?}; expected v{} or legacy v{}",
-                    format_version, AZ_MODEL_FORMAT_VERSION, AZ_MODEL_LEGACY_FORMAT_VERSION
+                    "unsupported AZ model format {:?}; expected v{}, v{}, or legacy v{}",
+                    format_version,
+                    AZ_MODEL_FORMAT_VERSION,
+                    AZ_MODEL_PREVIOUS_FORMAT_VERSION,
+                    AZ_MODEL_LEGACY_FORMAT_VERSION
                 ),
             ));
         }
@@ -1155,8 +1160,16 @@ impl AzNnue {
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
             policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
-            policy_check_weight: load_candle_f32_tensor(&tensors, "policy_check_weight")?,
-            policy_check_hidden: load_candle_f32_tensor(&tensors, "policy_check_hidden")?,
+            policy_check_weight: if legacy_v3 || previous_v5 {
+                vec![0.0; 1]
+            } else {
+                load_candle_f32_tensor(&tensors, "policy_check_weight")?
+            },
+            policy_check_hidden: if legacy_v3 || previous_v5 {
+                vec![0.0; hidden_size]
+            } else {
+                load_candle_f32_tensor(&tensors, "policy_check_hidden")?
+            },
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
             policy_pair_context_hidden: load_candle_f32_tensor(
