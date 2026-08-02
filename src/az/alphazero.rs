@@ -18,6 +18,9 @@ const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
+const PRIOR_INDEPENDENT_EXPLORATION: f32 = 0.10;
+const CHECK_EXPLORATION_MULTIPLIER: f32 = 5.0;
+const CAPTURE_EXPLORATION_MULTIPLIER: f32 = 3.0;
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
@@ -110,7 +113,6 @@ pub struct AzSearchTraceStep {
     pub q: f32,
     pub prior: f32,
     pub gives_check: bool,
-    pub forced_check_continuation: bool,
     pub child_expanded: bool,
     pub child_value: f32,
     pub child_value_wdl: [f32; 3],
@@ -386,6 +388,7 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     prior: f32,
+    is_capture: bool,
     gives_check: bool,
     visits: u32,
     value_wdl_sum: [f32; 3],
@@ -587,7 +590,6 @@ impl<'a> AzTree<'a> {
         };
         let mut trace = Vec::new();
         loop {
-            let forced_check_continuation = self.force_check_continuation(node_index);
             let child = &self.node_children(node_index)[child_index];
             let Some(next_node_index) = child.child_node() else {
                 break;
@@ -600,7 +602,6 @@ impl<'a> AzTree<'a> {
                 q: child.q(self.node_draw_score(node_index)),
                 prior: child.prior,
                 gives_check: child.gives_check,
-                forced_check_continuation,
                 child_expanded: next_node.expanded,
                 child_value: next_node.value,
                 child_value_wdl: next_node.value_wdl,
@@ -875,12 +876,22 @@ impl<'a> AzTree<'a> {
         {
             crate::scope_profile!("az.search.children_build");
             let gives_checks = self.eval_scratch.policy_gives_check.clone();
+            let captures = moves
+                .iter()
+                .map(|mv| {
+                    self.nodes[node_index]
+                        .position
+                        .piece_at(mv.to as usize)
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
             let offset = self.children.len();
             self.children
                 .extend(moves.into_iter().zip(priors.drain(..)).enumerate().map(
                     |(index, (mv, prior))| AzChild {
                         mv,
                         prior,
+                        is_capture: captures[index],
                         gives_check: gives_checks.get(index).copied().unwrap_or(0.0) != 0.0,
                         visits: 0,
                         value_wdl_sum: [0.0; 3],
@@ -1134,12 +1145,8 @@ impl<'a> AzTree<'a> {
             alphazero_fpu_value_reduction(node, children, self.fpu_value, draw_score)
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
-        let force_checks = self.force_check_continuation(node_index);
         let mut best: Option<(usize, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
-            if force_checks && !child.gives_check {
-                continue;
-            }
             let score = self.child_score(
                 node,
                 child,
@@ -1161,7 +1168,6 @@ impl<'a> AzTree<'a> {
 
     fn select_gumbel_interior_child(&self, node_index: usize) -> usize {
         let children = self.node_children(node_index);
-        let force_checks = self.force_check_continuation(node_index);
         let completed_q = self.gumbel_completed_qvalues(node_index);
         let logits = children
             .iter()
@@ -1175,7 +1181,6 @@ impl<'a> AzTree<'a> {
             .collect::<Vec<_>>();
         let visits_total = children.iter().map(|child| child.visits).sum::<u32>() as f32;
         (0..children.len())
-            .filter(|&index| !force_checks || children[index].gives_check)
             .max_by(|&left, &right| {
                 let score = |index: usize| {
                     probabilities[index] - children[index].visits as f32 / (visits_total + 1.0)
@@ -1183,19 +1188,6 @@ impl<'a> AzTree<'a> {
                 score(left).total_cmp(&score(right))
             })
             .unwrap_or(0)
-    }
-
-    fn force_check_continuation(&self, node_index: usize) -> bool {
-        let node = &self.nodes[node_index];
-        node.parent != NO_CHILD
-            && self.nodes[node.parent as usize]
-                .rule_entry
-                .as_ref()
-                .is_some_and(|entry| entry.gives_check)
-            && self
-                .node_children(node_index)
-                .iter()
-                .any(|child| child.gives_check)
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
@@ -1261,7 +1253,17 @@ impl<'a> AzTree<'a> {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        q + u + self.moves_left_utility(parent, child, q)
+        let tactical_exploration = if child.gives_check {
+            CHECK_EXPLORATION_MULTIPLIER
+        } else if child.is_capture {
+            CAPTURE_EXPLORATION_MULTIPLIER
+        } else {
+            1.0
+        };
+        let independent_u = PRIOR_INDEPENDENT_EXPLORATION
+            * tactical_exploration
+            * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt();
+        q + u + independent_u + self.moves_left_utility(parent, child, q)
     }
 
     fn moves_left_utility(&self, parent: &AzNode, child: &AzChild, q: f32) -> f32 {
@@ -1603,6 +1605,7 @@ mod tests {
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
+            is_capture: false,
             gives_check: false,
             visits: 0,
             value_wdl_sum: [0.0; 3],
@@ -1686,6 +1689,7 @@ mod tests {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
+            is_capture: false,
             gives_check: false,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
@@ -1869,6 +1873,7 @@ mod tests {
                 AzChild {
                     mv: legal[0],
                     prior: 0.10,
+                    is_capture: false,
                     gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
@@ -1878,6 +1883,7 @@ mod tests {
                 AzChild {
                     mv: legal[1],
                     prior: 0.90,
+                    is_capture: false,
                     gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
@@ -1888,6 +1894,49 @@ mod tests {
         );
 
         assert_eq!(tree.select_child(tree.root), 1);
+    }
+
+    #[test]
+    fn tactical_exploration_prefers_check_then_capture() {
+        let model = AzNnue::random(4, 17);
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits::default(),
+        );
+        let parent = AzNode {
+            position,
+            accumulator_offset: 0,
+            parent: NO_CHILD,
+            rule_entry: None,
+            children_offset: 0,
+            children_len: 0,
+            visits: 64,
+            value_wdl_sum: [0.0; 3],
+            value: 0.0,
+            value_wdl: [0.0, 1.0, 0.0],
+            moves_left: 0.0,
+            expanded: true,
+        };
+        let child = |is_capture, gives_check| AzChild {
+            mv: legal[0],
+            prior: 0.0,
+            is_capture,
+            gives_check,
+            visits: 1,
+            value_wdl_sum: [0.0, 1.0, 0.0],
+            moves_left_sum: 0.0,
+            child: NO_CHILD,
+        };
+        let score = |candidate: &AzChild| tree.child_score(&parent, candidate, 0.0, 0.0, 8.0, 0.0);
+        let quiet = score(&child(false, false));
+        let capture = score(&child(true, false));
+        let check = score(&child(false, true));
+        assert!(check > capture && capture > quiet);
     }
 
     #[test]

@@ -1338,14 +1338,13 @@ fn main() {
                 println!("trace    : root_move={trace_move} pv_plies={}", trace.len());
                 for step in &trace {
                     println!(
-                        "trace[{ply:02}]: move={mv} visits={visits} q={q:.3} prior={prior:.5} check={check} forced_check={forced} child_net={value:.3} child_wdl={win:.3}/{draw:.3}/{loss:.3} child_ml={moves_left:.1} expanded={expanded} fen={fen}",
+                        "trace[{ply:02}]: move={mv} visits={visits} q={q:.3} prior={prior:.5} check={check} child_net={value:.3} child_wdl={win:.3}/{draw:.3}/{loss:.3} child_ml={moves_left:.1} expanded={expanded} fen={fen}",
                         ply = step.ply,
                         mv = step.mv,
                         visits = step.visits,
                         q = step.q,
                         prior = step.prior,
                         check = step.gives_check,
-                        forced = step.forced_check_continuation,
                         value = step.child_value,
                         win = step.child_value_wdl[0],
                         draw = step.child_value_wdl[1],
