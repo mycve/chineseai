@@ -17,3 +17,4 @@ eval/*.csv
 eval/*.fens
 eval/*.sqlite
 eval/torch/
+POTENTIAL_IMPROVEMENT_PLAN.md

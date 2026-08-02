@@ -10,8 +10,8 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, Ru
 
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_rules, dense_move_index, policy_repeat_features, rule_context_features,
-    scalar_value_to_wdl_target,
+    alphazero_search_with_rules, dense_move_index, gumbel_alphazero_search_with_rules,
+    policy_repeat_features, rule_context_features, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -171,6 +171,10 @@ pub struct AzSelfplayData {
     pub played_top_visit_ratio_sum: f32,
     pub best_q_sum: f32,
     pub played_q_sum: f32,
+    pub gumbel_searches: usize,
+    pub gumbel_prior_flips: usize,
+    pub gumbel_selected_prior_rank_sum: usize,
+    pub gumbel_flip_q_gain_sum: f32,
     pub terminal: AzTerminalStats,
     pub search_simulations: AzSearchSimulationStats,
 }
@@ -211,6 +215,10 @@ impl AzSelfplayData {
         self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
+        self.gumbel_searches += other.gumbel_searches;
+        self.gumbel_prior_flips += other.gumbel_prior_flips;
+        self.gumbel_selected_prior_rank_sum += other.gumbel_selected_prior_rank_sum;
+        self.gumbel_flip_q_gain_sum += other.gumbel_flip_q_gain_sum;
         self.terminal.add_assign(&other.terminal);
         self.search_simulations
             .add_assign(&other.search_simulations);
@@ -325,10 +333,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_top_visit_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
     let mut played_q_sum = 0.0f32;
+    let mut gumbel_searches = 0usize;
+    let mut gumbel_prior_flips = 0usize;
+    let mut gumbel_selected_prior_rank_sum = 0usize;
+    let mut gumbel_flip_q_gain_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
 
     for game_index in 0..config.games {
+        let use_gumbel = rng.unit_f32() < config.gumbel_game_probability;
         let mut position = if config.opening_positions.is_empty() {
             Position::startpos()
         } else {
@@ -357,42 +370,92 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search_simulation_count = config.simulations.max(1);
+            let search_simulation_count = if use_gumbel {
+                config.gumbel_simulations
+            } else {
+                config.simulations
+            }
+            .max(1);
             search_simulations.searches += 1;
             search_simulations.simulations_sum += search_simulation_count;
+            let limits = AzSearchLimits {
+                simulations: search_simulation_count,
+                seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
+                cpuct: config.cpuct,
+                cpuct_at_root: config.cpuct_at_root,
+                cpuct_base: config.cpuct_base,
+                cpuct_factor: config.cpuct_factor,
+                cpuct_base_at_root: config.cpuct_base_at_root,
+                cpuct_factor_at_root: config.cpuct_factor_at_root,
+                max_depth: 0,
+                root_dirichlet_alpha: if use_gumbel {
+                    0.0
+                } else {
+                    config.root_dirichlet_alpha
+                },
+                root_exploration_fraction: if use_gumbel {
+                    0.0
+                } else {
+                    config.root_exploration_fraction
+                },
+                fpu_value: config.fpu_value,
+                fpu_value_at_root: config.fpu_value_at_root,
+                policy_softmax_temp: config.policy_softmax_temp,
+                draw_score: config.draw_score,
+                moves_left_max_effect: config.moves_left_max_effect,
+                moves_left_slope: config.moves_left_slope,
+                moves_left_threshold: config.moves_left_threshold,
+                moves_left_constant_factor: config.moves_left_constant_factor,
+                moves_left_scaled_factor: config.moves_left_scaled_factor,
+                moves_left_quadratic_factor: config.moves_left_quadratic_factor,
+                value_scale: 1.0,
+            };
             let search = {
                 crate::scope_profile!("az.selfplay.search");
-                alphazero_search_with_rules(
-                    &position,
-                    Some(rule_history.clone()),
-                    Some(legal),
-                    model,
-                    AzSearchLimits {
-                        simulations: search_simulation_count,
-                        seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                        cpuct: config.cpuct,
-                        cpuct_at_root: config.cpuct_at_root,
-                        cpuct_base: config.cpuct_base,
-                        cpuct_factor: config.cpuct_factor,
-                        cpuct_base_at_root: config.cpuct_base_at_root,
-                        cpuct_factor_at_root: config.cpuct_factor_at_root,
-                        max_depth: 0,
-                        root_dirichlet_alpha: config.root_dirichlet_alpha,
-                        root_exploration_fraction: config.root_exploration_fraction,
-                        fpu_value: config.fpu_value,
-                        fpu_value_at_root: config.fpu_value_at_root,
-                        policy_softmax_temp: config.policy_softmax_temp,
-                        draw_score: config.draw_score,
-                        moves_left_max_effect: config.moves_left_max_effect,
-                        moves_left_slope: config.moves_left_slope,
-                        moves_left_threshold: config.moves_left_threshold,
-                        moves_left_constant_factor: config.moves_left_constant_factor,
-                        moves_left_scaled_factor: config.moves_left_scaled_factor,
-                        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-                        value_scale: 1.0,
-                    },
-                )
+                if use_gumbel {
+                    gumbel_alphazero_search_with_rules(
+                        &position,
+                        Some(rule_history.clone()),
+                        Some(legal),
+                        model,
+                        limits,
+                        config.gumbel_max_considered_actions,
+                        config.gumbel_scale,
+                        config.gumbel_value_scale,
+                        config.gumbel_maxvisit_init,
+                    )
+                } else {
+                    alphazero_search_with_rules(
+                        &position,
+                        Some(rule_history.clone()),
+                        Some(legal),
+                        model,
+                        limits,
+                    )
+                }
             };
+            if use_gumbel {
+                gumbel_searches += 1;
+                if let Some(selected) = search.best_move.and_then(|mv| {
+                    search
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.mv == mv)
+                }) {
+                    let mut by_prior = search.candidates.iter().collect::<Vec<_>>();
+                    by_prior.sort_by(|left, right| right.raw_prior.total_cmp(&left.raw_prior));
+                    let prior_best = by_prior[0];
+                    let rank = by_prior
+                        .iter()
+                        .position(|candidate| candidate.mv == selected.mv)
+                        .unwrap_or(0);
+                    gumbel_selected_prior_rank_sum += rank + 1;
+                    if selected.mv != prior_best.mv {
+                        gumbel_prior_flips += 1;
+                        gumbel_flip_q_gain_sum += selected.q - prior_best.q;
+                    }
+                }
+            }
             crate::scope_profile!("az.selfplay.post_search");
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
@@ -605,6 +668,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         played_top_visit_ratio_sum,
         best_q_sum,
         played_q_sum,
+        gumbel_searches,
+        gumbel_prior_flips,
+        gumbel_selected_prior_rank_sum,
+        gumbel_flip_q_gain_sum,
         terminal,
         search_simulations,
     }

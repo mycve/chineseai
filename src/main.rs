@@ -481,7 +481,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_ggp{}_gsim{}_gma{}_gs{}_gvs{}_gmv{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -524,6 +524,12 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
+        f32_slug(config.gumbel_game_probability),
+        config.gumbel_simulations,
+        config.gumbel_max_considered_actions,
+        f32_slug(config.gumbel_scale),
+        f32_slug(config.gumbel_value_scale),
+        f32_slug(config.gumbel_maxvisit_init),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -762,6 +768,12 @@ fn build_az_loop_config(
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
+        gumbel_game_probability: config.gumbel_game_probability,
+        gumbel_simulations: config.gumbel_simulations,
+        gumbel_max_considered_actions: config.gumbel_max_considered_actions,
+        gumbel_scale: config.gumbel_scale,
+        gumbel_value_scale: config.gumbel_value_scale,
+        gumbel_maxvisit_init: config.gumbel_maxvisit_init,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         draw_score: config.draw_score,
@@ -913,6 +925,12 @@ fn build_async_training_report(
         avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
         avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
+        gumbel_prior_flip_rate: pending.selfplay.gumbel_prior_flips as f32
+            / pending.selfplay.gumbel_searches.max(1) as f32,
+        gumbel_selected_prior_rank_avg: pending.selfplay.gumbel_selected_prior_rank_sum as f32
+            / pending.selfplay.gumbel_searches.max(1) as f32,
+        gumbel_flip_q_gain_avg: pending.selfplay.gumbel_flip_q_gain_sum
+            / pending.selfplay.gumbel_prior_flips.max(1) as f32,
         selfplay_seconds: pending.selfplay_seconds,
         train_seconds,
         total_seconds,
@@ -1720,6 +1738,15 @@ fn main() {
                 config.pikafish_label_eval_cpuct,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
+            );
+            println!(
+                "gumbel  : game_probability={} simulations={} max_considered_actions={} scale={} value_scale={} maxvisit_init={}",
+                config.gumbel_game_probability,
+                config.gumbel_simulations,
+                config.gumbel_max_considered_actions,
+                config.gumbel_scale,
+                config.gumbel_value_scale,
+                config.gumbel_maxvisit_init
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -2588,6 +2615,24 @@ fn main() {
                 );
                 log_scalar(&mut tb, "stats/avg_max_child_q", update, report.avg_best_q);
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
+                log_scalar(
+                    &mut tb,
+                    "gumbel/prior_flip_rate",
+                    update,
+                    report.gumbel_prior_flip_rate,
+                );
+                log_scalar(
+                    &mut tb,
+                    "gumbel/selected_prior_rank_avg",
+                    update,
+                    report.gumbel_selected_prior_rank_avg,
+                );
+                log_scalar(
+                    &mut tb,
+                    "gumbel/flip_q_gain_avg",
+                    update,
+                    report.gumbel_flip_q_gain_avg,
+                );
                 log_scalar(
                     &mut tb,
                     "terminal/checkmate_no_legal_moves",
