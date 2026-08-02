@@ -53,8 +53,6 @@ pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 const AZ_MODEL_FORMAT_VERSION: f32 = 6.0;
-const AZ_MODEL_PREVIOUS_FORMAT_VERSION: f32 = 5.0;
-const AZ_MODEL_LEGACY_FORMAT_VERSION: f32 = 3.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -168,21 +166,6 @@ fn insert_candle_var(
         .unwrap_or_else(|_| panic!("candle varmap poisoned"))
         .insert(name.to_string(), var);
     Ok(())
-}
-
-fn legacy_policy_consequence_weights(
-    hidden_size: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let mut rng = SplitMix64::new(0xA17E_5A7E_C05E_0004);
-    let hidden = (0..POLICY_CONSEQUENCE_SIZE * hidden_size)
-        .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-        .collect();
-    let bias = vec![0.0; POLICY_CONSEQUENCE_SIZE];
-    let embedding = (0..PIECE_SQUARE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE)
-        .map(|_| rng.weight((2.0 / POLICY_CONSEQUENCE_SIZE as f32).sqrt() * 0.1))
-        .collect();
-    let output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
-    (hidden, bias, embedding, output)
 }
 
 fn load_candle_f32_tensor(
@@ -1099,38 +1082,18 @@ impl AzNnue {
                 .map_err(candle_io_error)?
         };
         let format_version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
-        let legacy_v3 = format_version.as_slice() == [AZ_MODEL_LEGACY_FORMAT_VERSION];
-        let previous_v5 = format_version.as_slice() == [AZ_MODEL_PREVIOUS_FORMAT_VERSION];
-        if !legacy_v3 && !previous_v5 && format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
+        if format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported AZ model format {:?}; expected v{}, v{}, or legacy v{}",
-                    format_version,
-                    AZ_MODEL_FORMAT_VERSION,
-                    AZ_MODEL_PREVIOUS_FORMAT_VERSION,
-                    AZ_MODEL_LEGACY_FORMAT_VERSION
+                    "unsupported AZ model format {:?}; expected v{}",
+                    format_version, AZ_MODEL_FORMAT_VERSION
                 ),
             ));
         }
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
-        let (
-            policy_consequence_hidden,
-            policy_consequence_bias,
-            policy_consequence_embedding,
-            policy_consequence_output,
-        ) = if legacy_v3 {
-            legacy_policy_consequence_weights(hidden_size)
-        } else {
-            (
-                load_candle_f32_tensor(&tensors, "policy_consequence_hidden")?,
-                load_candle_f32_tensor(&tensors, "policy_consequence_bias")?,
-                load_candle_f32_tensor(&tensors, "policy_consequence_embedding")?,
-                load_candle_f32_tensor(&tensors, "policy_consequence_output")?,
-            )
-        };
         let model = Self {
             hidden_size,
             arch,
@@ -1160,16 +1123,8 @@ impl AzNnue {
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
             policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
-            policy_check_weight: if legacy_v3 || previous_v5 {
-                vec![0.0; 1]
-            } else {
-                load_candle_f32_tensor(&tensors, "policy_check_weight")?
-            },
-            policy_check_hidden: if legacy_v3 || previous_v5 {
-                vec![0.0; hidden_size]
-            } else {
-                load_candle_f32_tensor(&tensors, "policy_check_hidden")?
-            },
+            policy_check_weight: load_candle_f32_tensor(&tensors, "policy_check_weight")?,
+            policy_check_hidden: load_candle_f32_tensor(&tensors, "policy_check_hidden")?,
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
             policy_pair_context_hidden: load_candle_f32_tensor(
@@ -1183,10 +1138,22 @@ impl AzNnue {
                 "policy_move_context_hidden",
             )?,
             policy_move_embedding: load_candle_f32_tensor(&tensors, "policy_move_embedding")?,
-            policy_consequence_hidden,
-            policy_consequence_bias,
-            policy_consequence_embedding,
-            policy_consequence_output,
+            policy_consequence_hidden: load_candle_f32_tensor(
+                &tensors,
+                "policy_consequence_hidden",
+            )?,
+            policy_consequence_bias: load_candle_f32_tensor(
+                &tensors,
+                "policy_consequence_bias",
+            )?,
+            policy_consequence_embedding: load_candle_f32_tensor(
+                &tensors,
+                "policy_consequence_embedding",
+            )?,
+            policy_consequence_output: load_candle_f32_tensor(
+                &tensors,
+                "policy_consequence_output",
+            )?,
             gpu_trainer: None,
         };
         model.validate()?;
