@@ -34,6 +34,48 @@ impl Default for Position {
 }
 
 impl Position {
+    pub(crate) fn from_canonical_piece_squares(pieces: &[(usize, usize)]) -> Self {
+        let kinds = [
+            PieceKind::General,
+            PieceKind::Advisor,
+            PieceKind::Elephant,
+            PieceKind::Horse,
+            PieceKind::Rook,
+            PieceKind::Cannon,
+            PieceKind::Soldier,
+        ];
+        let mut board = [None; BOARD_SIZE];
+        for &(piece_index, square) in pieces {
+            if piece_index < 14 && square < BOARD_SIZE {
+                board[square] = Some(Piece {
+                    color: if piece_index < 7 { Color::Red } else { Color::Black },
+                    kind: kinds[piece_index % 7],
+                });
+            }
+        }
+        let position = Self {
+            board,
+            side_to_move: Color::Red,
+            hash: 0,
+            base_eval: 0,
+            advisor_counts: [0; 2],
+            elephant_counts: [0; 2],
+            dynamic_material_counts: [0; 2],
+            general_squares: [None; 2],
+            halfmove_clock: 0,
+        };
+        let state = position.compute_state();
+        Self {
+            hash: state.hash,
+            base_eval: state.base_eval,
+            advisor_counts: state.advisor_counts,
+            elephant_counts: state.elephant_counts,
+            dynamic_material_counts: state.dynamic_material_counts,
+            general_squares: state.general_squares,
+            ..position
+        }
+    }
+
     pub fn startpos() -> Self {
         Self::from_fen(STARTPOS_FEN).expect("valid start position")
     }
@@ -392,6 +434,13 @@ impl Position {
         {
             self.general_squares[color_hash_index(captured.color)] = Some(to);
         }
+    }
+
+    pub(crate) fn gives_check_after_move(&mut self, mv: Move) -> bool {
+        let captured = self.make_move_board_only(mv);
+        let gives_check = self.in_check(self.side_to_move.opposite());
+        self.unmake_move_board_only(mv, captured);
+        gives_check
     }
 
     pub fn in_check(&self, color: Color) -> bool {

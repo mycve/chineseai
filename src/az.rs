@@ -52,7 +52,7 @@ pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 5.0;
+const AZ_MODEL_FORMAT_VERSION: f32 = 6.0;
 const AZ_MODEL_LEGACY_FORMAT_VERSION: f32 = 3.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -226,6 +226,8 @@ macro_rules! az_weight_tensors {
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_repeat_weight, [1]);
         $visit!(policy_repeat_hidden, [$h]);
+        $visit!(policy_check_weight, [1]);
+        $visit!(policy_check_hidden, [$h]);
         $visit!(policy_from_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_to_hidden, [BOARD_SIZE, $h]);
         $visit!(policy_pair_context_hidden, [POLICY_PAIR_CONTEXT_SIZE, $h]);
@@ -291,6 +293,7 @@ pub(super) struct AzEvalScratch {
     policy_consequence_context: Vec<f32>,
     policy_from_scores: Vec<f32>,
     policy_to_scores: Vec<f32>,
+    policy_gives_check: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
 }
@@ -310,6 +313,7 @@ impl AzEvalScratch {
             policy_consequence_context: vec![0.0; POLICY_CONSEQUENCE_SIZE],
             policy_from_scores: vec![0.0; BOARD_SIZE],
             policy_to_scores: vec![0.0; BOARD_SIZE],
+            policy_gives_check: Vec::with_capacity(192),
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -541,6 +545,8 @@ pub struct AzNnue {
     pub policy_move_bias: Vec<f32>,
     pub policy_repeat_weight: Vec<f32>,
     pub policy_repeat_hidden: Vec<f32>,
+    pub policy_check_weight: Vec<f32>,
+    pub policy_check_hidden: Vec<f32>,
     pub policy_from_hidden: Vec<f32>,
     pub policy_to_hidden: Vec<f32>,
     pub policy_pair_context_hidden: Vec<f32>,
@@ -584,6 +590,8 @@ impl Clone for AzNnue {
             policy_move_bias: self.policy_move_bias.clone(),
             policy_repeat_weight: self.policy_repeat_weight.clone(),
             policy_repeat_hidden: self.policy_repeat_hidden.clone(),
+            policy_check_weight: self.policy_check_weight.clone(),
+            policy_check_hidden: self.policy_check_hidden.clone(),
             policy_from_hidden: self.policy_from_hidden.clone(),
             policy_to_hidden: self.policy_to_hidden.clone(),
             policy_pair_context_hidden: self.policy_pair_context_hidden.clone(),
@@ -991,6 +999,8 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         let policy_repeat_weight = vec![0.0; 1];
         let policy_repeat_hidden = vec![0.0; hidden_size];
+        let policy_check_weight = vec![0.0; 1];
+        let policy_check_hidden = vec![0.0; hidden_size];
         let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
             .collect();
@@ -1043,6 +1053,8 @@ impl AzNnue {
             policy_move_bias,
             policy_repeat_weight,
             policy_repeat_hidden,
+            policy_check_weight,
+            policy_check_hidden,
             policy_from_hidden,
             policy_to_hidden,
             policy_pair_context_hidden,
@@ -1143,6 +1155,8 @@ impl AzNnue {
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
             policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
+            policy_check_weight: load_candle_f32_tensor(&tensors, "policy_check_weight")?,
+            policy_check_hidden: load_candle_f32_tensor(&tensors, "policy_check_hidden")?,
             policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
             policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
             policy_pair_context_hidden: load_candle_f32_tensor(
@@ -1372,6 +1386,13 @@ impl AzNnue {
             crate::scope_profile!("az.eval.policy_logits");
             let repeat_logit = self.policy_repeat_weight[0]
                 + dot_product(&scratch.hidden, &self.policy_repeat_hidden);
+            let check_logit = self.policy_check_weight[0]
+                + dot_product(&scratch.hidden, &self.policy_check_hidden);
+            scratch.policy_gives_check.resize(moves.len(), 0.0);
+            let mut work = position.clone();
+            for (flag, &mv) in scratch.policy_gives_check.iter_mut().zip(moves) {
+                *flag = f32::from(work.gives_check_after_move(mv));
+            }
             for (index, mv) in moves.iter().enumerate() {
                 let canonical = canonical_move(side, *mv);
                 let sparse = canonical.from as usize * BOARD_SIZE + canonical.to as usize;
@@ -1402,6 +1423,7 @@ impl AzNnue {
                 }
                 scratch.logits[index] +=
                     repeat_logit * policy_repeats_history.get(index).copied().unwrap_or(0.0);
+                scratch.logits[index] += check_logit * scratch.policy_gives_check[index];
             }
         }
         let _ = features;
@@ -2753,6 +2775,45 @@ mod tests {
                 .zip(&changed.logits)
                 .any(|(left, right)| left != right)
         );
+    }
+
+    #[test]
+    fn learned_check_branch_changes_only_checking_moves() {
+        let position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
+        let moves = position.legal_moves();
+        let checking = position.parse_uci_move("h2h0").unwrap();
+        let model = AzNnue::random(32, 19);
+        let mut baseline = AzEvalScratch::new(model.arch);
+        model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &[],
+            &mut baseline,
+        );
+
+        let mut active = model.clone();
+        active.policy_check_weight[0] = 1.0;
+        let mut changed = AzEvalScratch::new(model.arch);
+        active.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &[],
+            &mut changed,
+        );
+
+        for (index, mv) in moves.iter().enumerate() {
+            let delta = changed.logits[index] - baseline.logits[index];
+            if *mv == checking {
+                assert!((delta - 1.0).abs() < 1e-6);
+            } else if changed.policy_gives_check[index] == 0.0 {
+                assert!(delta.abs() < 1e-6);
+            }
+        }
     }
 
     #[test]

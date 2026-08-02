@@ -37,6 +37,8 @@ pub(super) struct AzCandleModel {
     policy_move_bias: Var,
     pub(super) policy_repeat_weight: Var,
     policy_repeat_hidden: Var,
+    policy_check_weight: Var,
+    policy_check_hidden: Var,
     policy_from_hidden: Var,
     policy_to_hidden: Var,
     policy_pair_context_hidden: Var,
@@ -151,6 +153,9 @@ impl AzCandleModel {
                     .reshape((self.arch.hidden_size, 1))?,
             )?
             .broadcast_add(&self.policy_repeat_weight)?;
+        let policy_check_logit = hidden
+            .matmul(&self.policy_check_hidden.reshape((self.arch.hidden_size, 1))?)?
+            .broadcast_add(&self.policy_check_weight)?;
         let policy_consequence_context = hidden
             .matmul(&self.policy_consequence_hidden.t()?)?
             .broadcast_add(&self.policy_consequence_bias)?
@@ -180,6 +185,8 @@ impl AzCandleModel {
             )?
             .reshape((bsz, batch.max_policy_moves))?
             .broadcast_mul(&batch.policy_consequence_move_mask)?;
+        let policy_consequence_logits = (policy_consequence_logits
+            + policy_check_logit.broadcast_mul(&batch.policy_gives_check)?)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -215,6 +222,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) policy_repeats_history: Tensor,
+    pub(super) policy_gives_check: Tensor,
     pub(super) policy_consequence_from: Tensor,
     pub(super) policy_consequence_to: Tensor,
     pub(super) policy_consequence_captured: Tensor,
@@ -295,6 +303,11 @@ impl BatchTensors {
             )?,
             policy_repeats_history: Tensor::from_vec(
                 packed.policy_repeats_history,
+                (batch_size, max_policy_moves),
+                device,
+            )?,
+            policy_gives_check: Tensor::from_vec(
+                packed.policy_gives_check,
                 (batch_size, max_policy_moves),
                 device,
             )?,
@@ -427,6 +440,8 @@ impl AzCandleModel {
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_repeat_weight: var_from_slice(&model.policy_repeat_weight, 1, device)?,
             policy_repeat_hidden: var_from_slice(&model.policy_repeat_hidden, hidden, device)?,
+            policy_check_weight: var_from_slice(&model.policy_check_weight, 1, device)?,
+            policy_check_hidden: var_from_slice(&model.policy_check_hidden, hidden, device)?,
             policy_from_hidden: var_from_slice(
                 &model.policy_from_hidden,
                 (BOARD_SIZE, hidden),
@@ -520,6 +535,8 @@ impl AzCandleModel {
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_repeat_weight.clone());
         vars.push(self.policy_repeat_hidden.clone());
+        vars.push(self.policy_check_weight.clone());
+        vars.push(self.policy_check_hidden.clone());
         vars.push(self.policy_from_hidden.clone());
         vars.push(self.policy_to_hidden.clone());
         vars.push(self.policy_pair_context_hidden.clone());
@@ -573,6 +590,8 @@ impl AzCandleModel {
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(&self.policy_repeat_weight, &mut model.policy_repeat_weight)?;
         copy_var(&self.policy_repeat_hidden, &mut model.policy_repeat_hidden)?;
+        copy_var(&self.policy_check_weight, &mut model.policy_check_weight)?;
+        copy_var(&self.policy_check_hidden, &mut model.policy_check_hidden)?;
         copy_var(&self.policy_from_hidden, &mut model.policy_from_hidden)?;
         copy_var(&self.policy_to_hidden, &mut model.policy_to_hidden)?;
         copy_var(
