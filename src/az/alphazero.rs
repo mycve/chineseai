@@ -345,6 +345,7 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     prior: f32,
+    gives_check: bool,
     visits: u32,
     value_wdl_sum: [f32; 3],
     moves_left_sum: f32,
@@ -780,21 +781,20 @@ impl<'a> AzTree<'a> {
         }
         {
             crate::scope_profile!("az.search.children_build");
+            let gives_checks = self.eval_scratch.policy_gives_check.clone();
             let offset = self.children.len();
             self.children
-                .extend(
-                    moves
-                        .into_iter()
-                        .zip(priors.drain(..))
-                        .map(|(mv, prior)| AzChild {
-                            mv,
-                            prior,
-                            visits: 0,
-                            value_wdl_sum: [0.0; 3],
-                            moves_left_sum: 0.0,
-                            child: NO_CHILD,
-                        }),
-                );
+                .extend(moves.into_iter().zip(priors.drain(..)).enumerate().map(
+                    |(index, (mv, prior))| AzChild {
+                        mv,
+                        prior,
+                        gives_check: gives_checks.get(index).copied().unwrap_or(0.0) != 0.0,
+                        visits: 0,
+                        value_wdl_sum: [0.0; 3],
+                        moves_left_sum: 0.0,
+                        child: NO_CHILD,
+                    },
+                ));
             let len = self.children.len() - offset;
             self.nodes[node_index].children_offset =
                 u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
@@ -1041,20 +1041,12 @@ impl<'a> AzTree<'a> {
             alphazero_fpu_value_reduction(node, children, self.fpu_value, draw_score)
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
-        let Some(first) = children.first() else {
-            return 0;
-        };
-        let mut best_index = 0;
-        let mut best_prior = first.prior;
-        let mut best_score = self.child_score(
-            node,
-            first,
-            draw_score,
-            fpu_value,
-            parent_visits_sqrt,
-            cpuct,
-        );
-        for (index, child) in children.iter().enumerate().skip(1) {
+        let force_checks = self.force_check_continuation(node_index);
+        let mut best: Option<(usize, f32, f32)> = None;
+        for (index, child) in children.iter().enumerate() {
+            if force_checks && !child.gives_check {
+                continue;
+            }
             let score = self.child_score(
                 node,
                 child,
@@ -1063,20 +1055,20 @@ impl<'a> AzTree<'a> {
                 parent_visits_sqrt,
                 cpuct,
             );
-            if score.total_cmp(&best_score).is_gt()
-                || (score.total_cmp(&best_score).is_eq()
-                    && child.prior.total_cmp(&best_prior).is_gt())
-            {
-                best_index = index;
-                best_prior = child.prior;
-                best_score = score;
+            if best.is_none_or(|(_, best_prior, best_score)| {
+                score.total_cmp(&best_score).is_gt()
+                    || (score.total_cmp(&best_score).is_eq()
+                        && child.prior.total_cmp(&best_prior).is_gt())
+            }) {
+                best = Some((index, child.prior, score));
             }
         }
-        best_index
+        best.map(|(index, _, _)| index).unwrap_or(0)
     }
 
     fn select_gumbel_interior_child(&self, node_index: usize) -> usize {
         let children = self.node_children(node_index);
+        let force_checks = self.force_check_continuation(node_index);
         let completed_q = self.gumbel_completed_qvalues(node_index);
         let logits = children
             .iter()
@@ -1090,6 +1082,7 @@ impl<'a> AzTree<'a> {
             .collect::<Vec<_>>();
         let visits_total = children.iter().map(|child| child.visits).sum::<u32>() as f32;
         (0..children.len())
+            .filter(|&index| !force_checks || children[index].gives_check)
             .max_by(|&left, &right| {
                 let score = |index: usize| {
                     probabilities[index] - children[index].visits as f32 / (visits_total + 1.0)
@@ -1097,6 +1090,19 @@ impl<'a> AzTree<'a> {
                 score(left).total_cmp(&score(right))
             })
             .unwrap_or(0)
+    }
+
+    fn force_check_continuation(&self, node_index: usize) -> bool {
+        let node = &self.nodes[node_index];
+        node.parent != NO_CHILD
+            && self.nodes[node.parent as usize]
+                .rule_entry
+                .as_ref()
+                .is_some_and(|entry| entry.gives_check)
+            && self
+                .node_children(node_index)
+                .iter()
+                .any(|child| child.gives_check)
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
@@ -1504,6 +1510,7 @@ mod tests {
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
+            gives_check: false,
             visits: 0,
             value_wdl_sum: [0.0; 3],
             moves_left_sum: 0.0,
@@ -1586,6 +1593,7 @@ mod tests {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
+            gives_check: false,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
             moves_left_sum: 0.0,
@@ -1768,6 +1776,7 @@ mod tests {
                 AzChild {
                     mv: legal[0],
                     prior: 0.10,
+                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     moves_left_sum: 0.0,
@@ -1776,6 +1785,7 @@ mod tests {
                 AzChild {
                     mv: legal[1],
                     prior: 0.90,
+                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     moves_left_sum: 0.0,
