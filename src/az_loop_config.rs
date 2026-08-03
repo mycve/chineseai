@@ -33,12 +33,6 @@ pub struct AzLoopFileConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
-    pub gumbel_game_probability: f32,
-    pub gumbel_simulations: usize,
-    pub gumbel_max_considered_actions: usize,
-    pub gumbel_scale: f32,
-    pub gumbel_value_scale: f32,
-    pub gumbel_maxvisit_init: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
@@ -112,12 +106,6 @@ impl Default for AzLoopFileConfig {
             cpuct_factor_at_root: 2.0,
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.10,
-            gumbel_game_probability: 0.20,
-            gumbel_simulations: 256,
-            gumbel_max_considered_actions: 16,
-            gumbel_scale: 1.0,
-            gumbel_value_scale: 0.1,
-            gumbel_maxvisit_init: 50.0,
             fpu_value: 0.0,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
@@ -194,12 +182,6 @@ struct AzLoopTomlConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
-    pub gumbel_game_probability: f32,
-    pub gumbel_simulations: usize,
-    pub gumbel_max_considered_actions: usize,
-    pub gumbel_scale: f32,
-    pub gumbel_value_scale: f32,
-    pub gumbel_maxvisit_init: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
@@ -280,12 +262,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             cpuct_factor_at_root: config.cpuct_factor_at_root,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
-            gumbel_game_probability: config.gumbel_game_probability,
-            gumbel_simulations: config.gumbel_simulations,
-            gumbel_max_considered_actions: config.gumbel_max_considered_actions,
-            gumbel_scale: config.gumbel_scale,
-            gumbel_value_scale: config.gumbel_value_scale,
-            gumbel_maxvisit_init: config.gumbel_maxvisit_init,
             fpu_value: config.fpu_value,
             fpu_value_at_root: config.fpu_value_at_root,
             draw_score: config.draw_score,
@@ -361,12 +337,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             cpuct_factor_at_root: config.cpuct_factor_at_root,
             root_dirichlet_alpha: config.root_dirichlet_alpha,
             root_exploration_fraction: config.root_exploration_fraction,
-            gumbel_game_probability: config.gumbel_game_probability,
-            gumbel_simulations: config.gumbel_simulations,
-            gumbel_max_considered_actions: config.gumbel_max_considered_actions,
-            gumbel_scale: config.gumbel_scale,
-            gumbel_value_scale: config.gumbel_value_scale,
-            gumbel_maxvisit_init: config.gumbel_maxvisit_init,
             fpu_value: config.fpu_value,
             fpu_value_at_root: config.fpu_value_at_root,
             draw_score: config.draw_score,
@@ -474,15 +444,6 @@ impl AzLoopFileConfig {
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
         );
-        line!("gumbel_game_probability", f(self.gumbel_game_probability));
-        line!("gumbel_simulations", self.gumbel_simulations);
-        line!(
-            "gumbel_max_considered_actions",
-            self.gumbel_max_considered_actions
-        );
-        line!("gumbel_scale", f(self.gumbel_scale));
-        line!("gumbel_value_scale", f(self.gumbel_value_scale));
-        line!("gumbel_maxvisit_init", f(self.gumbel_maxvisit_init));
         line!("fpu_value", f(self.fpu_value));
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
@@ -593,12 +554,6 @@ impl AzLoopFileConfig {
         self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
-        self.gumbel_game_probability = self.gumbel_game_probability.clamp(0.0, 1.0);
-        self.gumbel_simulations = self.gumbel_simulations.max(1);
-        self.gumbel_max_considered_actions = self.gumbel_max_considered_actions.max(1);
-        self.gumbel_scale = self.gumbel_scale.max(0.0);
-        self.gumbel_value_scale = self.gumbel_value_scale.max(0.0);
-        self.gumbel_maxvisit_init = self.gumbel_maxvisit_init.max(0.0);
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
@@ -661,12 +616,6 @@ mod tests {
         assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
-        assert!(text.contains("gumbel_game_probability = 0.2\n"));
-        assert!(text.contains("gumbel_simulations = 256\n"));
-        assert!(text.contains("gumbel_max_considered_actions = 16\n"));
-        assert!(text.contains("gumbel_scale = 1.0\n"));
-        assert!(text.contains("gumbel_value_scale = 0.1\n"));
-        assert!(text.contains("gumbel_maxvisit_init = 50.0\n"));
         assert!(text.contains("fpu_value = 0.0\n"));
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
