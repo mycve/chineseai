@@ -5,10 +5,15 @@ use std::{fmt::Write, fs, path::Path};
 pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
 const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 4;
 
-fn system_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
+fn system_physical_cores() -> usize {
+    let physical = num_cpus::get_physical();
+    if physical > 0 {
+        physical
+    } else {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct AzLoopFileConfig {
@@ -595,7 +600,7 @@ impl AzLoopFileConfig {
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
         if self.workers == 0 {
-            self.workers = system_parallelism();
+            self.workers = system_physical_cores();
         }
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_endgame = self.temperature_endgame.max(0.0);
@@ -632,7 +637,7 @@ impl AzLoopFileConfig {
         self.teacher_positions = self.teacher_positions.max(1);
         self.teacher_depth = self.teacher_depth.max(1);
         if self.teacher_processes == 0 {
-            self.teacher_processes = system_parallelism();
+            self.teacher_processes = system_physical_cores();
         }
         self.teacher_value_weight = self.teacher_value_weight.max(0.0);
         self.teacher_min_ply = self.teacher_min_ply.min(self.max_plies.saturating_sub(1));
