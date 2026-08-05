@@ -8,6 +8,7 @@ use crate::nnue::{
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
+use super::alphazero::{AzSearchWorkspace, alphazero_search_with_rules_reusing};
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
     alphazero_search_with_rules, dense_move_index, policy_repeat_features, rule_context_features,
@@ -139,6 +140,7 @@ impl AzArenaReport {
 pub struct AzSelfplayData {
     pub samples: Vec<AzTrainingSample>,
     pub games: Vec<Vec<AzTrainingSample>>,
+    pub position_fens: Vec<String>,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -179,6 +181,7 @@ impl AzSelfplayData {
     pub fn add_assign(&mut self, other: &Self) {
         self.samples.extend(other.samples.iter().cloned());
         self.games.extend(other.games.iter().cloned());
+        self.position_fens.extend(other.position_fens.iter().cloned());
         self.red_wins += other.red_wins;
         self.black_wins += other.black_wins;
         self.draws += other.draws;
@@ -248,6 +251,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     for chunk in chunks {
         merged.samples.extend(chunk.samples);
         merged.games.extend(chunk.games);
+        merged.position_fens.extend(chunk.position_fens);
         merged.red_wins += chunk.red_wins;
         merged.black_wins += chunk.black_wins;
         merged.draws += chunk.draws;
@@ -292,6 +296,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     crate::scope_profile!("az.selfplay.chunk");
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
+    let mut position_fens = Vec::new();
     let mut red_wins = 0usize;
     let mut black_wins = 0usize;
     let mut draws = 0usize;
@@ -327,6 +332,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
+    let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
         let mut position = if config.opening_positions.is_empty() {
@@ -343,9 +349,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            let legal = {
+            let (legal, policy_repeats) = {
                 crate::scope_profile!("az.selfplay.root_legal_moves");
-                position.legal_moves_with_rules(&rule_history)
+                position
+                    .legal_moves_with_rules_and_repetition(&rule_history)
+                    .into_iter()
+                    .map(|(mv, repeat)| (mv, f32::from(repeat)))
+                    .unzip::<_, _, Vec<_>, Vec<_>>()
             };
             if legal.is_empty() {
                 result = Some(if position.side_to_move() == Color::Red {
@@ -386,12 +396,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             };
             let search = {
                 crate::scope_profile!("az.selfplay.search");
-                alphazero_search_with_rules(
+                alphazero_search_with_rules_reusing(
                     &position,
-                    Some(rule_history.clone()),
-                    Some(legal),
+                    &rule_history,
+                    legal,
+                    policy_repeats,
                     model,
                     limits,
+                    &mut search_workspace,
                 )
             };
             crate::scope_profile!("az.selfplay.post_search");
@@ -494,6 +506,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             played_q_sum += move_meta.played_q;
             {
                 crate::scope_profile!("az.selfplay.make_sample");
+                if config.record_fens {
+                    position_fens.push(position.to_fen());
+                }
                 let sample = make_training_sample(
                     &position,
                     &rule_history,
@@ -574,6 +589,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     AzSelfplayData {
         samples,
         games,
+        position_fens,
         red_wins,
         black_wins,
         draws,

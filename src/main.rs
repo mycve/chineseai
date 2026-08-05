@@ -12,9 +12,11 @@ use chineseai::{
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
         SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
         alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
-        generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions, train_samples_weighted, train_samples_weighted_owned,
+        dense_move_index, generate_selfplay_data, global_training_step_sample_count,
+        play_arena_games_from_positions,
+        train_samples_weighted, train_samples_weighted_owned,
     },
+    nnue::{canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -75,6 +77,12 @@ enum CliCommand {
     VsPikafish(VsPikafishArgs),
     /// Generate random positions and label them with Pikafish best moves.
     PikafishLabelRandom(PikafishLabelRandomArgs),
+    /// Append WDL labels for FENs to a persistent teacher database.
+    PikafishLabelFens(PikafishLabelFensArgs),
+    /// Generate unique positions from self-play without training.
+    SelfplayFens(SelfplayFensArgs),
+    /// Incrementally train value from new teacher labels.
+    TeacherTrain(TeacherTrainArgs),
     /// Evaluate a model against Pikafish labels stored in SQLite.
     PikafishLabelEval(PikafishLabelEvalArgs),
 }
@@ -302,19 +310,16 @@ struct VsPikafishArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --count 5000 --depth 8
-  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --fens eval/random.fens --output eval/pikafish-labels.csv --sqlite eval/pikafish-labels.sqlite")]
+  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --count 5000 --depth 20 --threads 16
+  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --fens eval/random.fens --sqlite eval/pikafish-selfplay-5000-d20.sqlite")]
 struct PikafishLabelRandomArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
     /// Output FEN list. Existing file is reused unless --regenerate is set.
     #[arg(long, default_value = "eval/random.fens")]
     fens: String,
-    /// Output CSV labels.
-    #[arg(long, default_value = "eval/pikafish-labels.csv")]
-    output: String,
     /// Output SQLite labels.
-    #[arg(long, default_value = "eval/pikafish-labels.sqlite")]
+    #[arg(long, default_value = "eval/pikafish-selfplay-5000-d20.sqlite")]
     sqlite: String,
     /// Number of unique random positions.
     #[arg(long, default_value_t = 5000)]
@@ -329,17 +334,76 @@ struct PikafishLabelRandomArgs {
     #[arg(long, default_value_t = 80)]
     max_plies: usize,
     /// Pikafish search depth.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 20)]
     depth: u32,
+    /// Independent single-threaded Pikafish workers.
+    #[arg(long, default_value_t = 16)]
+    threads: usize,
     /// Regenerate the FEN file even when it already exists.
     #[arg(long)]
     regenerate: bool,
 }
 
 #[derive(Args, Debug)]
+struct PikafishLabelFensArgs {
+    /// Pikafish UCI executable path.
+    pikafish_exe: String,
+    /// UTF-8 file containing one FEN per line.
+    fens: String,
+    /// Persistent teacher SQLite database.
+    #[arg(long, default_value = "data/pikafish-teacher.sqlite")]
+    sqlite: String,
+    /// Pikafish search depth.
+    #[arg(long, default_value_t = 20)]
+    depth: u32,
+    /// Independent single-threaded Pikafish workers.
+    #[arg(long, default_value_t = 16)]
+    threads: usize,
+}
+
+#[derive(Args, Debug)]
+struct SelfplayFensArgs {
+    model: String,
+    #[arg(long, default_value = "data/selfplay.fens")]
+    output: String,
+    #[arg(long, default_value_t = 5000)]
+    samples: usize,
+    #[arg(long, default_value_t = 1600)]
+    simulations: usize,
+    #[arg(long, default_value_t = 32)]
+    workers: usize,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 20260805)]
+    seed: u64,
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Args, Debug)]
+struct TeacherTrainArgs {
+    model: String,
+    sqlite: String,
+    #[arg(long)]
+    output: Option<String>,
+    #[arg(long, default_value = "main")]
+    stream: String,
+    #[arg(long, default_value_t = 1)]
+    epochs: usize,
+    #[arg(long, default_value_t = 256)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 0.0001)]
+    lr: f32,
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+    #[arg(long, default_value_t = 20260805)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai pikafish-label-eval model.safetensors eval/pikafish-labels.sqlite --simulations 64")]
+  chineseai pikafish-label-eval model.safetensors eval/pikafish-selfplay-5000-d20.sqlite --simulations 64")]
 struct PikafishLabelEvalArgs {
     /// ChineseAI AZ-NNUE model path.
     model: String,
@@ -812,6 +876,7 @@ fn build_az_loop_config(
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
+        record_fens: false,
     }
 }
 
@@ -2120,6 +2185,7 @@ fn main() {
                         AzTrainLossWeights {
                             value: trainer_config.train_value_weight,
                             policy: trainer_config.train_policy_weight,
+                            ..AzTrainLossWeights::default()
                         },
                     );
                     let train_seconds = train_started.elapsed().as_secs_f32();
@@ -3014,9 +3080,9 @@ fn main() {
                                     100.0 * stats.top8_rate(),
                                     100.0 * stats.prior_top1_rate(),
                                     stats.raw_value_corr(),
-                                    stats.raw_value_mae_tanh_cp(),
+                                    stats.raw_value_mae_wdl_q(),
                                     stats.value_corr(),
-                                    stats.value_mae_tanh_cp(),
+                                    stats.value_mae_wdl_q(),
                                     started.elapsed().as_secs_f32()
                                 );
                                 log_scalar(
@@ -3069,9 +3135,9 @@ fn main() {
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/search_value_mae_tanh_cp",
+                                    "pikafish_label/search_value_mae_wdl_q",
                                     update,
-                                    stats.value_mae_tanh_cp(),
+                                    stats.value_mae_wdl_q(),
                                 );
                                 log_scalar(
                                     &mut tb,
@@ -3081,9 +3147,9 @@ fn main() {
                                 );
                                 log_scalar(
                                     &mut tb,
-                                    "pikafish_label/raw_value_mae_tanh_cp",
+                                    "pikafish_label/raw_value_mae_wdl_q",
                                     update,
-                                    stats.raw_value_mae_tanh_cp(),
+                                    stats.raw_value_mae_wdl_q(),
                                 );
                             }
                             Err(err) => {
@@ -3283,6 +3349,16 @@ fn main() {
             run_pikafish_label_random(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-random failed: {err}"));
         }
+        Some(CliCommand::PikafishLabelFens(cmd)) => {
+            run_pikafish_label_fens(cmd)
+                .unwrap_or_else(|err| panic!("pikafish-label-fens failed: {err}"));
+        }
+        Some(CliCommand::SelfplayFens(cmd)) => {
+            run_selfplay_fens(cmd).unwrap_or_else(|err| panic!("selfplay-fens failed: {err}"));
+        }
+        Some(CliCommand::TeacherTrain(cmd)) => {
+            run_teacher_train(cmd).unwrap_or_else(|err| panic!("teacher-train failed: {err}"));
+        }
         Some(CliCommand::PikafishLabelEval(cmd)) => {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
@@ -3296,7 +3372,7 @@ struct PikafishLabelRow {
     id: i64,
     fen: String,
     bestmove: String,
-    best_score_cp: Option<i32>,
+    best_wdl: [u16; 3],
 }
 
 #[derive(Default)]
@@ -3310,17 +3386,17 @@ struct LabelEvalStats {
     prior_top1_hits: usize,
     value_pairs: usize,
     value_q_sum: f64,
-    cp_tanh_sum: f64,
+    target_q_sum: f64,
     value_q_sq_sum: f64,
-    cp_tanh_sq_sum: f64,
-    value_cp_cross_sum: f64,
+    target_q_sq_sum: f64,
+    value_target_cross_sum: f64,
     abs_value_error_sum: f64,
     raw_value_pairs: usize,
     raw_value_q_sum: f64,
-    raw_cp_tanh_sum: f64,
+    raw_target_q_sum: f64,
     raw_value_q_sq_sum: f64,
-    raw_cp_tanh_sq_sum: f64,
-    raw_value_cp_cross_sum: f64,
+    raw_target_q_sq_sum: f64,
+    raw_value_target_cross_sum: f64,
     raw_abs_value_error_sum: f64,
 }
 
@@ -3335,17 +3411,17 @@ impl LabelEvalStats {
         self.prior_top1_hits += other.prior_top1_hits;
         self.value_pairs += other.value_pairs;
         self.value_q_sum += other.value_q_sum;
-        self.cp_tanh_sum += other.cp_tanh_sum;
+        self.target_q_sum += other.target_q_sum;
         self.value_q_sq_sum += other.value_q_sq_sum;
-        self.cp_tanh_sq_sum += other.cp_tanh_sq_sum;
-        self.value_cp_cross_sum += other.value_cp_cross_sum;
+        self.target_q_sq_sum += other.target_q_sq_sum;
+        self.value_target_cross_sum += other.value_target_cross_sum;
         self.abs_value_error_sum += other.abs_value_error_sum;
         self.raw_value_pairs += other.raw_value_pairs;
         self.raw_value_q_sum += other.raw_value_q_sum;
-        self.raw_cp_tanh_sum += other.raw_cp_tanh_sum;
+        self.raw_target_q_sum += other.raw_target_q_sum;
         self.raw_value_q_sq_sum += other.raw_value_q_sq_sum;
-        self.raw_cp_tanh_sq_sum += other.raw_cp_tanh_sq_sum;
-        self.raw_value_cp_cross_sum += other.raw_value_cp_cross_sum;
+        self.raw_target_q_sq_sum += other.raw_target_q_sq_sum;
+        self.raw_value_target_cross_sum += other.raw_value_target_cross_sum;
         self.raw_abs_value_error_sum += other.raw_abs_value_error_sum;
     }
 
@@ -3373,22 +3449,23 @@ impl LabelEvalStats {
         self.prior_top1_hits as f32 / self.denom()
     }
 
-    fn value_mae_tanh_cp(&self) -> f32 {
+    fn value_mae_wdl_q(&self) -> f32 {
         (self.abs_value_error_sum / self.value_count().max(1) as f64) as f32
     }
 
-    fn push_value_pair(&mut self, value_q: f32, score_cp: Option<i32>) {
-        let Some(score_cp) = score_cp else {
-            return;
-        };
-        let target = ((score_cp as f64) / 600.0).tanh();
+    fn target_q(wdl: [u16; 3]) -> f64 {
+        (f64::from(wdl[0]) - f64::from(wdl[2])) / 1000.0
+    }
+
+    fn push_value_pair(&mut self, value_q: f32, wdl: [u16; 3]) {
+        let target = Self::target_q(wdl);
         let value = value_q as f64;
         self.value_pairs += 1;
         self.value_q_sum += value;
-        self.cp_tanh_sum += target;
+        self.target_q_sum += target;
         self.value_q_sq_sum += value * value;
-        self.cp_tanh_sq_sum += target * target;
-        self.value_cp_cross_sum += value * target;
+        self.target_q_sq_sum += target * target;
+        self.value_target_cross_sum += value * target;
         self.abs_value_error_sum += (value - target).abs();
     }
 
@@ -3396,22 +3473,19 @@ impl LabelEvalStats {
         self.value_pairs
     }
 
-    fn push_raw_value_pair(&mut self, value_q: f32, score_cp: Option<i32>) {
-        let Some(score_cp) = score_cp else {
-            return;
-        };
-        let target = ((score_cp as f64) / 600.0).tanh();
+    fn push_raw_value_pair(&mut self, value_q: f32, wdl: [u16; 3]) {
+        let target = Self::target_q(wdl);
         let value = value_q as f64;
         self.raw_value_pairs += 1;
         self.raw_value_q_sum += value;
-        self.raw_cp_tanh_sum += target;
+        self.raw_target_q_sum += target;
         self.raw_value_q_sq_sum += value * value;
-        self.raw_cp_tanh_sq_sum += target * target;
-        self.raw_value_cp_cross_sum += value * target;
+        self.raw_target_q_sq_sum += target * target;
+        self.raw_value_target_cross_sum += value * target;
         self.raw_abs_value_error_sum += (value - target).abs();
     }
 
-    fn raw_value_mae_tanh_cp(&self) -> f32 {
+    fn raw_value_mae_wdl_q(&self) -> f32 {
         (self.raw_abs_value_error_sum / self.raw_value_pairs.max(1) as f64) as f32
     }
 
@@ -3420,9 +3494,11 @@ impl LabelEvalStats {
         if n <= 1.0 {
             return 0.0;
         }
-        let cov = self.raw_value_cp_cross_sum - self.raw_value_q_sum * self.raw_cp_tanh_sum / n;
+        let cov = self.raw_value_target_cross_sum
+            - self.raw_value_q_sum * self.raw_target_q_sum / n;
         let left = self.raw_value_q_sq_sum - self.raw_value_q_sum * self.raw_value_q_sum / n;
-        let right = self.raw_cp_tanh_sq_sum - self.raw_cp_tanh_sum * self.raw_cp_tanh_sum / n;
+        let right = self.raw_target_q_sq_sum
+            - self.raw_target_q_sum * self.raw_target_q_sum / n;
         if left <= 0.0 || right <= 0.0 {
             0.0
         } else {
@@ -3435,9 +3511,9 @@ impl LabelEvalStats {
         if n <= 1.0 {
             return 0.0;
         }
-        let cov = self.value_cp_cross_sum - self.value_q_sum * self.cp_tanh_sum / n;
+        let cov = self.value_target_cross_sum - self.value_q_sum * self.target_q_sum / n;
         let left = self.value_q_sq_sum - self.value_q_sum * self.value_q_sum / n;
-        let right = self.cp_tanh_sq_sum - self.cp_tanh_sum * self.cp_tanh_sum / n;
+        let right = self.target_q_sq_sum - self.target_q_sum * self.target_q_sum / n;
         if left <= 0.0 || right <= 0.0 {
             0.0
         } else {
@@ -3474,7 +3550,7 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
     )?;
 
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_tanh_cp={:.4} search_value_corr={:.4} search_value_mae_tanh_cp={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
@@ -3488,9 +3564,9 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         100.0 * stats.top8_rate(),
         100.0 * stats.prior_top1_rate(),
         stats.raw_value_corr(),
-        stats.raw_value_mae_tanh_cp(),
+        stats.raw_value_mae_wdl_q(),
         stats.value_corr(),
-        stats.value_mae_tanh_cp(),
+        stats.value_mae_wdl_q(),
         started.elapsed().as_secs_f32()
     );
     Ok(())
@@ -3520,7 +3596,7 @@ fn evaluate_pikafish_labels(
         let rule_history = position.initial_rule_history();
         let legal_moves = position.legal_moves_with_rules(&rule_history);
         let raw_value = model.evaluate_value_with_rules(&position, &rule_history, &legal_moves);
-        stats.push_raw_value_pair(raw_value, row.best_score_cp);
+        stats.push_raw_value_pair(raw_value, row.best_wdl);
         let result = alphazero_search(
             &position,
             model,
@@ -3566,7 +3642,7 @@ fn evaluate_pikafish_labels(
         {
             stats.prior_top1_hits += 1;
         }
-        stats.push_value_pair(result.value_q, row.best_score_cp);
+        stats.push_value_pair(result.value_q, row.best_wdl);
         progress(offset + 1, rows.len());
     }
     Ok(stats)
@@ -3624,7 +3700,7 @@ fn load_pikafish_label_rows(
     limit: usize,
 ) -> rusqlite::Result<Vec<PikafishLabelRow>> {
     let mut query =
-        "SELECT id, fen, bestmove, best_score_cp FROM pikafish_labels ORDER BY id".to_string();
+        "SELECT id, fen, bestmove, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id".to_string();
     if limit > 0 {
         query.push_str(" LIMIT ?1");
         let mut stmt = conn.prepare(&query)?;
@@ -3633,7 +3709,7 @@ fn load_pikafish_label_rows(
                 id: row.get(0)?,
                 fen: row.get(1)?,
                 bestmove: row.get(2)?,
-                best_score_cp: row.get(3)?,
+                best_wdl: [row.get(3)?, row.get(4)?, row.get(5)?],
             })
         })?
         .collect()
@@ -3644,7 +3720,7 @@ fn load_pikafish_label_rows(
                 id: row.get(0)?,
                 fen: row.get(1)?,
                 bestmove: row.get(2)?,
-                best_score_cp: row.get(3)?,
+                best_wdl: [row.get(3)?, row.get(4)?, row.get(5)?],
             })
         })?
         .collect()
@@ -3654,8 +3730,11 @@ fn load_pikafish_label_rows(
 #[derive(Clone, Debug, Default)]
 struct PikafishPv {
     multipv: usize,
+    depth: u32,
+    nodes: u64,
     score_cp: Option<i32>,
     mate: Option<i32>,
+    wdl: Option<[u16; 3]>,
     moves: Vec<String>,
 }
 
@@ -3706,6 +3785,8 @@ impl PikafishLabelUci {
     fn handshake(&mut self) -> io::Result<()> {
         self.write_line("uci")?;
         self.wait_for("uciok")?;
+        self.write_line("setoption name Threads value 1")?;
+        self.write_line("setoption name Repetition Rule value ChineseRule")?;
         self.write_line("isready")?;
         self.wait_for("readyok")
     }
@@ -3771,12 +3852,23 @@ fn parse_pikafish_info_pv(line: &str) -> Option<PikafishPv> {
     }
     let parts: Vec<&str> = line.split_whitespace().collect();
     let mut multipv = 1usize;
+    let mut depth = 0u32;
+    let mut nodes = 0u64;
     let mut score_cp = None;
     let mut mate = None;
+    let mut wdl = None;
     let mut moves = Vec::new();
     let mut i = 0usize;
     while i < parts.len() {
         match parts[i] {
+            "depth" if i + 1 < parts.len() => {
+                depth = parts[i + 1].parse().ok()?;
+                i += 2;
+            }
+            "nodes" if i + 1 < parts.len() => {
+                nodes = parts[i + 1].parse().unwrap_or(0);
+                i += 2;
+            }
             "multipv" if i + 1 < parts.len() => {
                 multipv = parts[i + 1].parse().ok()?;
                 i += 2;
@@ -3789,6 +3881,14 @@ fn parse_pikafish_info_pv(line: &str) -> Option<PikafishPv> {
                 }
                 i += 3;
             }
+            "wdl" if i + 3 < parts.len() => {
+                wdl = Some([
+                    parts[i + 1].parse().ok()?,
+                    parts[i + 2].parse().ok()?,
+                    parts[i + 3].parse().ok()?,
+                ]);
+                i += 4;
+            }
             "pv" => {
                 moves.extend(parts[i + 1..].iter().map(|item| (*item).to_string()));
                 break;
@@ -3798,15 +3898,342 @@ fn parse_pikafish_info_pv(line: &str) -> Option<PikafishPv> {
     }
     (!moves.is_empty()).then_some(PikafishPv {
         multipv,
+        depth,
+        nodes,
         score_cp,
         mate,
+        wdl,
         moves,
     })
 }
 
+fn label_fens_parallel(
+    exe: &Path,
+    fens: &[String],
+    depth: u32,
+    threads: usize,
+) -> io::Result<Vec<(usize, String, Vec<PikafishPv>)>> {
+    let worker_count = threads.max(1).min(fens.len());
+    let fens = Arc::new(fens.to_vec());
+    let exe = Arc::new(exe.to_path_buf());
+    let mut handles = Vec::with_capacity(worker_count);
+    for worker in 0..worker_count {
+        let fens = Arc::clone(&fens);
+        let exe = Arc::clone(&exe);
+        handles.push(thread::spawn(move || -> io::Result<Vec<_>> {
+            let mut engine = PikafishLabelUci::spawn(&exe)?;
+            let mut out = Vec::new();
+            for index in (worker..fens.len()).step_by(worker_count) {
+                let (bestmove, pvs) = engine.query(&fens[index], depth)?;
+                out.push((index, bestmove, pvs));
+            }
+            Ok(out)
+        }));
+    }
+    let mut out = Vec::with_capacity(fens.len());
+    for handle in handles {
+        out.extend(
+            handle
+                .join()
+                .map_err(|_| io::Error::other("Pikafish label worker panicked"))??,
+        );
+    }
+    out.sort_by_key(|row| row.0);
+    Ok(out)
+}
+
+fn run_pikafish_label_fens(cmd: PikafishLabelFensArgs) -> io::Result<()> {
+    let text = fs::read_to_string(&cmd.fens)?;
+    let mut seen = HashSet::new();
+    let mut fens = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let fen = line.trim();
+        if fen.is_empty() || fen.starts_with('#') || !seen.insert(fen.to_string()) {
+            continue;
+        }
+        Position::from_fen(fen).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid FEN at {} line {}: {err}", cmd.fens, line_index + 1),
+            )
+        })?;
+        fens.push(fen.to_string());
+    }
+    if fens.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no FENs to label"));
+    }
+
+    let sqlite_path = Path::new(&cmd.sqlite);
+    if let Some(parent) = sqlite_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS teacher_labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fen TEXT NOT NULL UNIQUE,
+            bestmove TEXT NOT NULL,
+            wdl_win INTEGER NOT NULL,
+            wdl_draw INTEGER NOT NULL,
+            wdl_loss INTEGER NOT NULL,
+            depth INTEGER NOT NULL,
+            CHECK (wdl_win >= 0 AND wdl_draw >= 0 AND wdl_loss >= 0),
+            CHECK (wdl_win + wdl_draw + wdl_loss = 1000)
+        );",
+    )
+    .map_err(sqlite_io_error)?;
+    let existing = {
+        let mut stmt = conn
+            .prepare("SELECT fen FROM teacher_labels")
+            .map_err(sqlite_io_error)?;
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_io_error)?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(sqlite_io_error)?
+    };
+    let input_count = fens.len();
+    fens.retain(|fen| !existing.contains(fen));
+    if fens.is_empty() {
+        println!(
+            "pikafish-label-fens: input={} new=0 skipped={} sqlite={}",
+            input_count,
+            input_count,
+            sqlite_path.display()
+        );
+        return Ok(());
+    }
+
+    let depth = cmd.depth.max(1);
+    println!(
+        "pikafish-label-fens: input={} new={} skipped={} depth={} workers={}",
+        input_count,
+        fens.len(),
+        input_count - fens.len(),
+        depth,
+        cmd.threads.max(1).min(fens.len())
+    );
+    let labeled = label_fens_parallel(
+        Path::new(&cmd.pikafish_exe),
+        &fens,
+        depth,
+        cmd.threads,
+    )?;
+    let tx = conn.transaction().map_err(sqlite_io_error)?;
+    for (done, (index, bestmove, pvs)) in labeled.into_iter().enumerate() {
+        let best = pvs.iter().find(|pv| pv.multipv == 1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Pikafish returned no principal variation")
+        })?;
+        let wdl = best.wdl.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Pikafish returned no WDL")
+        })?;
+        tx.execute(
+            "INSERT INTO teacher_labels
+                (fen, bestmove, wdl_win, wdl_draw, wdl_loss, depth)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &fens[index],
+                bestmove,
+                i64::from(wdl[0]),
+                i64::from(wdl[1]),
+                i64::from(wdl[2]),
+                i64::from(best.depth),
+            ],
+        )
+        .map_err(sqlite_io_error)?;
+        if (done + 1) % 100 == 0 || done + 1 == fens.len() {
+            println!("pikafish-label-fens: stored {}/{}", done + 1, fens.len());
+        }
+    }
+    tx.commit().map_err(sqlite_io_error)?;
+    println!("pikafish-label-fens: sqlite={}", sqlite_path.display());
+    Ok(())
+}
+
+fn run_selfplay_fens(cmd: SelfplayFensArgs) -> io::Result<()> {
+    let model = AzNnue::load(&cmd.model)?;
+    let target = cmd.samples.max(1);
+    let output = Path::new(&cmd.output);
+    let mut seen = HashSet::with_capacity(target * 2);
+    if !cmd.overwrite && output.exists() {
+        for line in fs::read_to_string(output)?.lines() {
+            let fen = line.trim();
+            if !fen.is_empty() && !fen.starts_with('#') {
+                seen.insert(fen.to_string());
+            }
+        }
+    }
+    let initial = seen.len();
+    if initial >= target {
+        println!(
+            "selfplay-fens: existing={} already reaches target={} output={}",
+            initial,
+            target,
+            output.display()
+        );
+        return Ok(());
+    }
+    let file_config = AzLoopFileConfig {
+        simulations: cmd.simulations.max(1),
+        max_plies: cmd.max_plies.max(1),
+        workers: cmd.workers.max(1),
+        mirror_probability: 0.0,
+        ..AzLoopFileConfig::default()
+    };
+    let mut round = 0u64;
+    while seen.len() < target {
+        let mut config = build_az_loop_config(
+            &file_config,
+            cmd.seed ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            cmd.workers.max(1),
+            1,
+            &[],
+        );
+        config.games = cmd.workers.max(1);
+        config.record_fens = true;
+        let data = generate_selfplay_data(&model, &config);
+        for fen in data.position_fens {
+            seen.insert(fen);
+            if seen.len() >= target {
+                break;
+            }
+        }
+        round = round.wrapping_add(1);
+        println!("selfplay-fens: collected {}/{}", seen.len(), target);
+    }
+    let mut fens = seen.into_iter().collect::<Vec<_>>();
+    fens.sort_unstable();
+    fens.truncate(target);
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, format!("{}\n", fens.join("\n")))?;
+    println!(
+        "selfplay-fens: initial={} generated={} total={} output={}",
+        initial,
+        fens.len().saturating_sub(initial.min(fens.len())),
+        fens.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn run_teacher_train(cmd: TeacherTrainArgs) -> io::Result<()> {
+    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS training_progress (
+            stream TEXT PRIMARY KEY,
+            last_trained_id INTEGER NOT NULL
+        );",
+    )
+    .map_err(sqlite_io_error)?;
+    let last_id = conn
+        .query_row(
+            "SELECT last_trained_id FROM training_progress WHERE stream=?1",
+            params![&cmd.stream],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let mut query = "SELECT id, fen, wdl_win, wdl_draw, wdl_loss
+                     FROM teacher_labels WHERE id > ?1 ORDER BY id"
+        .to_string();
+    if cmd.limit > 0 {
+        query.push_str(" LIMIT ?2");
+    }
+    let rows = {
+        let mut stmt = conn.prepare(&query).map_err(sqlite_io_error)?;
+        let mapper = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u16>(2)?,
+                row.get::<_, u16>(3)?,
+                row.get::<_, u16>(4)?,
+            ))
+        };
+        if cmd.limit > 0 {
+            stmt.query_map(params![last_id, cmd.limit as i64], mapper)
+                .map_err(sqlite_io_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_io_error)?
+        } else {
+            stmt.query_map(params![last_id], mapper)
+                .map_err(sqlite_io_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_io_error)?
+        }
+    };
+    if rows.is_empty() {
+        println!("teacher-train: stream={} no new labels after id={}", cmd.stream, last_id);
+        return Ok(());
+    }
+    let max_id = rows.last().unwrap().0;
+    let mut samples = Vec::with_capacity(rows.len());
+    for &(id, ref fen, win, draw, loss) in &rows {
+        let position = Position::from_fen(fen).map_err(|err| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid teacher FEN id={id}: {err}"))
+        })?;
+        let legal = position.legal_moves();
+        if legal.is_empty() {
+            continue;
+        }
+        let move_indices = legal
+            .iter()
+            .map(|&mv| dense_move_index(canonical_move(position.side_to_move(), mv)))
+            .collect::<Vec<_>>();
+        let uniform = 1.0 / move_indices.len() as f32;
+        samples.push(AzTrainingSample {
+            features: extract_sparse_features_az(&position),
+            rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
+            move_indices,
+            policy: vec![uniform; legal.len()],
+            policy_repeats_history: vec![0.0; legal.len()],
+            value_wdl: [win as f32 / 1000.0, draw as f32 / 1000.0, loss as f32 / 1000.0],
+            value: (win as f32 - loss as f32) / 1000.0,
+            side_sign: 1.0,
+            moves_left: 0.0,
+            policy_weight: 0.0,
+            value_weight: 1.0,
+            search_simulations: 0,
+            meta: chineseai::az::AzSampleMeta::default(),
+        });
+    }
+    if samples.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no trainable teacher positions"));
+    }
+    let mut model = AzNnue::load(&cmd.model)?;
+    let mut rng = SplitMix64::new(cmd.seed);
+    let stats = train_samples_weighted_owned(
+        &mut model,
+        samples,
+        cmd.epochs.max(1),
+        cmd.lr.max(0.0),
+        cmd.batch_size.max(1),
+        &mut rng,
+        AzTrainLossWeights { value: 1.0, policy: 0.0, moves_left: 0.0 },
+    );
+    let output = cmd.output.as_deref().unwrap_or(&cmd.model);
+    let output_path = Path::new(output);
+    let tmp = PathBuf::from(format!("{}.tmp", output_path.display()));
+    model.save(&tmp)?;
+    if output_path.exists() {
+        fs::remove_file(output_path)?;
+    }
+    fs::rename(&tmp, output_path)?;
+    conn.execute(
+        "INSERT INTO training_progress(stream,last_trained_id) VALUES(?1,?2)
+         ON CONFLICT(stream) DO UPDATE SET last_trained_id=excluded.last_trained_id",
+        params![&cmd.stream, max_id],
+    )
+    .map_err(sqlite_io_error)?;
+    println!(
+        "teacher-train: stream={} labels={} ids={}..{} epochs={} value_ce={:.5} output={}",
+        cmd.stream, rows.len(), last_id + 1, max_id, cmd.epochs.max(1), stats.value_loss, output
+    );
+    Ok(())
+}
+
 fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
     let fens_path = Path::new(&cmd.fens);
-    let output_path = Path::new(&cmd.output);
     let sqlite_path = Path::new(&cmd.sqlite);
     if cmd.regenerate || !fens_path.exists() {
         let fens = generate_random_eval_fens(
@@ -3843,12 +4270,6 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
         ));
     }
 
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
     if let Some(parent) = sqlite_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -3865,87 +4286,92 @@ fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
             bestmove TEXT NOT NULL,
             best_score_cp INTEGER,
             best_mate INTEGER,
+            wdl_win INTEGER NOT NULL,
+            wdl_draw INTEGER NOT NULL,
+            wdl_loss INTEGER NOT NULL,
+            nodes INTEGER NOT NULL DEFAULT 0,
             best_pv TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
     )
     .map_err(sqlite_io_error)?;
-    migrate_pikafish_label_schema(&conn).map_err(sqlite_io_error)?;
     let tx = conn.transaction().map_err(sqlite_io_error)?;
-    let mut writer = BufWriter::new(fs::File::create(output_path)?);
-    writeln!(
-        writer,
-        "index,fen,side_to_move,depth,bestmove,best_score_cp,best_mate,best_pv"
-    )?;
 
-    let mut engine = PikafishLabelUci::spawn(Path::new(&cmd.pikafish_exe))?;
-    for (index, fen) in fens.iter().enumerate() {
+    println!(
+        "pikafish-label-random: labeling {} positions depth={} workers={}",
+        fens.len(),
+        cmd.depth.max(1),
+        cmd.threads.max(1).min(fens.len())
+    );
+    let labeled = label_fens_parallel(
+        Path::new(&cmd.pikafish_exe),
+        &fens,
+        cmd.depth.max(1),
+        cmd.threads,
+    )?;
+    for (index, bestmove, pvs) in labeled {
+        let fen = &fens[index];
         let position = Position::from_fen(fen).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid FEN at {}: {err}", index + 1),
             )
         })?;
-        let (bestmove, pvs) = engine.query(fen, cmd.depth.max(1))?;
         let best = pvs.iter().find(|pv| pv.multipv == 1);
         let best_pv = best.map(|pv| pv.moves.join(" ")).unwrap_or_default();
         let side_to_move = match position.side_to_move() {
             chineseai::xiangqi::Color::Red => "w",
             chineseai::xiangqi::Color::Black => "b",
         };
-        write!(
-            writer,
-            "{},{},{},{},{},{},{},{}",
-            index,
-            csv_escape(fen),
-            side_to_move,
-            cmd.depth.max(1),
-            csv_escape(&bestmove),
-            best.and_then(|pv| pv.score_cp)
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            best.and_then(|pv| pv.mate)
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            csv_escape(&best_pv)
-        )?;
-        writeln!(writer)?;
+        let wdl = best.and_then(|pv| pv.wdl).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Pikafish returned no WDL at position {}", index + 1),
+            )
+        })?;
         tx.execute(
             "INSERT INTO pikafish_labels (
-                id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
+                id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate,
+                wdl_win, wdl_draw, wdl_loss, nodes, best_pv, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, CURRENT_TIMESTAMP)
             ON CONFLICT(fen) DO UPDATE SET
                 side_to_move=excluded.side_to_move,
                 depth=excluded.depth,
                 bestmove=excluded.bestmove,
                 best_score_cp=excluded.best_score_cp,
                 best_mate=excluded.best_mate,
+                wdl_win=excluded.wdl_win,
+                wdl_draw=excluded.wdl_draw,
+                wdl_loss=excluded.wdl_loss,
+                nodes=excluded.nodes,
                 best_pv=excluded.best_pv,
                 updated_at=CURRENT_TIMESTAMP",
             params![
                 index as i64,
                 fen,
                 side_to_move,
-                cmd.depth.max(1) as i64,
-                bestmove,
+                best.map(|pv| pv.depth).unwrap_or(cmd.depth.max(1)) as i64,
+                &bestmove,
                 best.and_then(|pv| pv.score_cp).map(i64::from),
                 best.and_then(|pv| pv.mate).map(i64::from),
-                best_pv,
+                i64::from(wdl[0]),
+                i64::from(wdl[1]),
+                i64::from(wdl[2]),
+                best.map(|pv| pv.nodes as i64).unwrap_or(0),
+                &best_pv,
             ],
         )
         .map_err(sqlite_io_error)?;
         if (index + 1) % 100 == 0 || index + 1 == fens.len() {
             println!(
-                "pikafish-label-random: labeled {}/{} -> {} {}",
+                "pikafish-label-random: labeled {}/{} -> {}",
                 index + 1,
                 fens.len(),
-                output_path.display(),
                 sqlite_path.display()
             );
         }
     }
-    writer.flush()?;
     tx.commit().map_err(sqlite_io_error)?;
     Ok(())
 }
@@ -4003,43 +4429,11 @@ mod reporting_tests {
             count: 2,
             ..LabelEvalStats::default()
         };
-        stats.push_value_pair(0.25, None);
-        stats.push_value_pair(0.25, Some(0));
+        stats.push_value_pair(0.25, [500, 500, 0]);
 
         assert_eq!(stats.value_count(), 1);
-        assert!((stats.value_mae_tanh_cp() - 0.25).abs() < 1e-6);
+        assert!((stats.value_mae_wdl_q() - 0.25).abs() < 1e-6);
     }
-}
-
-fn migrate_pikafish_label_schema(conn: &Connection) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(pikafish_labels)")?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|column| column == "multipv") {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "ALTER TABLE pikafish_labels RENAME TO pikafish_labels_old;
-        CREATE TABLE pikafish_labels (
-            id INTEGER PRIMARY KEY,
-            fen TEXT NOT NULL UNIQUE,
-            side_to_move TEXT NOT NULL,
-            depth INTEGER NOT NULL,
-            bestmove TEXT NOT NULL,
-            best_score_cp INTEGER,
-            best_mate INTEGER,
-            best_pv TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        INSERT OR REPLACE INTO pikafish_labels (
-            id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
-        )
-        SELECT id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate, best_pv, updated_at
-        FROM pikafish_labels_old;
-        DROP TABLE pikafish_labels_old;
-        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
-    )
 }
 
 fn generate_random_eval_fens(
@@ -4092,14 +4486,6 @@ fn random_position_fen(target_plies: usize, rng: &mut SplitMix64) -> Option<Stri
         Some(RuleOutcome::Draw(_) | RuleOutcome::Win(_)) => None,
         None if position.legal_moves_with_rules(&rule_history).is_empty() => None,
         None => Some(position.to_fen()),
-    }
-}
-
-fn csv_escape(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
     }
 }
 

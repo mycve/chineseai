@@ -302,6 +302,25 @@ impl AzEvalScratch {
             priors: Vec::with_capacity(192),
         }
     }
+
+    pub(super) fn empty() -> Self {
+        Self {
+            features: Vec::new(),
+            hidden: Vec::new(),
+            trunk_residual: Vec::new(),
+            trunk_output: Vec::new(),
+            value_head: Vec::new(),
+            value_head2: Vec::new(),
+            policy_pair_context: Vec::new(),
+            policy_move_context: Vec::new(),
+            policy_consequence_context: Vec::new(),
+            policy_from_scores: Vec::new(),
+            policy_to_scores: Vec::new(),
+            policy_gives_check: Vec::new(),
+            logits: Vec::new(),
+            priors: Vec::new(),
+        }
+    }
 }
 
 /// 搜索节点使用的双视角 NNUE 累加器，不包含随每步老化的历史特征。
@@ -648,6 +667,7 @@ pub struct AzLoopConfig {
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
+    pub record_fens: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -990,6 +1010,7 @@ pub struct AzValueMomentStats {
 pub struct AzTrainLossWeights {
     pub value: f32,
     pub policy: f32,
+    pub moves_left: f32,
 }
 
 impl Default for AzTrainLossWeights {
@@ -997,6 +1018,7 @@ impl Default for AzTrainLossWeights {
         Self {
             value: 1.0,
             policy: 1.0,
+            moves_left: MOVES_LEFT_AUX_WEIGHT,
         }
     }
 }
@@ -2727,7 +2749,7 @@ pub(super) fn policy_move_to_features() -> &'static [f32] {
     })
 }
 
-fn dense_move_index(mv: Move) -> usize {
+pub fn dense_move_index(mv: Move) -> usize {
     let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
     let dense = move_map().sparse_to_dense[sparse];
     debug_assert!(
@@ -3166,6 +3188,7 @@ mod tests {
         let weights = AzTrainLossWeights {
             value: 1.0,
             policy: 0.0,
+            moves_left: 0.0,
         };
         train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights);
 

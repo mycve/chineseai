@@ -264,6 +264,66 @@ pub fn alphazero_search(
     alphazero_search_with_rules(position, None, None, model, limits)
 }
 
+pub(super) struct AzSearchWorkspace {
+    nodes: Vec<AzNode>,
+    children: Vec<AzChild>,
+    accumulator_arena: Vec<f32>,
+    root_raw_priors: Vec<f32>,
+    eval_scratch: Option<AzEvalScratch>,
+    rule_history_scratch: Vec<RuleHistoryEntry>,
+}
+
+impl AzSearchWorkspace {
+    pub(super) fn new(model: &AzNnue) -> Self {
+        Self {
+            nodes: Vec::new(),
+            children: Vec::new(),
+            accumulator_arena: Vec::new(),
+            root_raw_priors: Vec::new(),
+            eval_scratch: Some(AzEvalScratch::new(model.arch)),
+            rule_history_scratch: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn alphazero_search_with_rules_reusing(
+    position: &Position,
+    rule_history: &[RuleHistoryEntry],
+    root_moves: Vec<Move>,
+    root_policy_repeats: Vec<f32>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    workspace: &mut AzSearchWorkspace,
+) -> AzSearchResult {
+    crate::scope_profile!("az.alphazero_search");
+    let mut tree = AzTree::new_reusing(
+        position.clone(),
+        rule_history,
+        Some(root_moves),
+        Some(root_policy_repeats),
+        model,
+        limits,
+        workspace,
+    );
+    let root = tree.root;
+    {
+        crate::scope_profile!("az.search.root_expand");
+        tree.expand(root);
+    }
+    let used = if tree.nodes[root].children_len == 0 {
+        0
+    } else {
+        crate::scope_profile!("az.search.simulations");
+        for _ in 0..limits.simulations {
+            tree.simulate(root, 0);
+        }
+        limits.simulations
+    };
+    let result = tree.search_result(used);
+    tree.recycle_into(workspace);
+    result
+}
+
 pub fn cp_from_q(q: f32) -> i32 {
     (q.clamp(-1.0, 1.0) * 1000.0).round() as i32
 }
@@ -274,6 +334,7 @@ struct AzTree<'a> {
     accumulator_arena: Vec<f32>,
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
+    root_policy_repeats: Option<Vec<f32>>,
     root_raw_priors: Vec<f32>,
     root: usize,
     cpuct: f32,
@@ -302,14 +363,12 @@ struct AzTree<'a> {
     search_depth_max: usize,
     search_depth_cutoffs: usize,
     eval_scratch: AzEvalScratch,
-    root_rule_history: Vec<RuleHistoryEntry>,
     rule_history_scratch: Vec<RuleHistoryEntry>,
 }
 
 struct AzNode {
     position: Position,
     accumulator_offset: u32,
-    parent: u32,
     rule_entry: Option<RuleHistoryEntry>,
     children_offset: u32,
     children_len: u16,
@@ -459,11 +518,10 @@ impl<'a> AzTree<'a> {
                 .iter()
                 .enumerate()
                 .max_by(|(_, left), (_, right)| {
-                    left.visits
-                        .cmp(&right.visits)
-                        .then_with(|| left.q(self.node_draw_score(node_index)).total_cmp(
-                            &right.q(self.node_draw_score(node_index)),
-                        ))
+                    left.visits.cmp(&right.visits).then_with(|| {
+                        left.q(self.node_draw_score(node_index))
+                            .total_cmp(&right.q(self.node_draw_score(node_index)))
+                    })
                 })
                 .map(|(index, _)| index)
                 .unwrap_or(0);
@@ -482,15 +540,76 @@ impl<'a> AzTree<'a> {
             .simulations
             .saturating_add(1)
             .min(INITIAL_TREE_NODE_CAPACITY);
-        let mut nodes = Vec::with_capacity(initial_nodes);
+        Self::new_with_buffers(
+            position,
+            &rule_history,
+            root_moves,
+            None,
+            model,
+            limits,
+            Vec::with_capacity(initial_nodes),
+            Vec::with_capacity(initial_nodes.saturating_mul(INITIAL_CHILDREN_PER_NODE_ESTIMATE)),
+            Vec::with_capacity(initial_nodes.saturating_mul(model.hidden_size.saturating_mul(2))),
+            Vec::new(),
+            AzEvalScratch::new(model.arch),
+            Vec::new(),
+        )
+    }
+
+    fn new_reusing(
+        position: Position,
+        rule_history: &[RuleHistoryEntry],
+        root_moves: Option<Vec<Move>>,
+        root_policy_repeats: Option<Vec<f32>>,
+        model: &'a AzNnue,
+        limits: AzSearchLimits,
+        workspace: &mut AzSearchWorkspace,
+    ) -> Self {
+        Self::new_with_buffers(
+            position,
+            rule_history,
+            root_moves,
+            root_policy_repeats,
+            model,
+            limits,
+            std::mem::take(&mut workspace.nodes),
+            std::mem::take(&mut workspace.children),
+            std::mem::take(&mut workspace.accumulator_arena),
+            std::mem::take(&mut workspace.root_raw_priors),
+            workspace
+                .eval_scratch
+                .take()
+                .unwrap_or_else(|| AzEvalScratch::new(model.arch)),
+            std::mem::take(&mut workspace.rule_history_scratch),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_buffers(
+        position: Position,
+        rule_history: &[RuleHistoryEntry],
+        root_moves: Option<Vec<Move>>,
+        root_policy_repeats: Option<Vec<f32>>,
+        model: &'a AzNnue,
+        limits: AzSearchLimits,
+        mut nodes: Vec<AzNode>,
+        mut children: Vec<AzChild>,
+        mut accumulator_arena: Vec<f32>,
+        mut root_raw_priors: Vec<f32>,
+        eval_scratch: AzEvalScratch,
+        mut rule_history_scratch: Vec<RuleHistoryEntry>,
+    ) -> Self {
+        nodes.clear();
+        children.clear();
+        accumulator_arena.clear();
+        root_raw_priors.clear();
+        rule_history_scratch.clear();
+        rule_history_scratch.extend_from_slice(rule_history);
         let accumulator = AzEvalAccumulator::new(model, &position);
-        let mut accumulator_arena =
-            Vec::with_capacity(initial_nodes.saturating_mul(model.hidden_size.saturating_mul(2)));
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         nodes.push(AzNode {
             position,
             accumulator_offset: 0,
-            parent: NO_CHILD,
             rule_entry: None,
             children_offset: 0,
             children_len: 0,
@@ -503,13 +622,12 @@ impl<'a> AzTree<'a> {
         });
         Self {
             nodes,
-            children: Vec::with_capacity(
-                initial_nodes.saturating_mul(INITIAL_CHILDREN_PER_NODE_ESTIMATE),
-            ),
+            children,
             accumulator_arena,
             model,
             root_moves,
-            root_raw_priors: Vec::new(),
+            root_policy_repeats,
+            root_raw_priors,
             root: 0,
             cpuct: if limits.cpuct > 0.0 {
                 limits.cpuct
@@ -558,10 +676,21 @@ impl<'a> AzTree<'a> {
             search_depth_count: 0,
             search_depth_max: 0,
             search_depth_cutoffs: 0,
-            eval_scratch: AzEvalScratch::new(model.arch),
-            rule_history_scratch: Vec::with_capacity(rule_history.len().saturating_add(64)),
-            root_rule_history: rule_history,
+            eval_scratch,
+            rule_history_scratch,
         }
+    }
+
+    fn recycle_into(mut self, workspace: &mut AzSearchWorkspace) {
+        workspace.nodes = std::mem::take(&mut self.nodes);
+        workspace.children = std::mem::take(&mut self.children);
+        workspace.accumulator_arena = std::mem::take(&mut self.accumulator_arena);
+        workspace.root_raw_priors = std::mem::take(&mut self.root_raw_priors);
+        workspace.eval_scratch = Some(std::mem::replace(
+            &mut self.eval_scratch,
+            AzEvalScratch::empty(),
+        ));
+        workspace.rule_history_scratch = std::mem::take(&mut self.rule_history_scratch);
     }
 
     fn node_children(&self, node_index: usize) -> &[AzChild] {
@@ -593,29 +722,11 @@ impl<'a> AzTree<'a> {
             u16::try_from(len).expect("MCTS node has too many legal moves");
     }
 
-    fn prepare_rule_history(&mut self, node_index: usize) {
-        self.rule_history_scratch.clear();
-        self.rule_history_scratch
-            .extend_from_slice(&self.root_rule_history);
-        let root_len = self.rule_history_scratch.len();
-        let mut current = node_index;
-        while current != self.root {
-            let node = &self.nodes[current];
-            if let Some(entry) = node.rule_entry {
-                self.rule_history_scratch.push(entry);
-            }
-            current = node.parent as usize;
-        }
-        self.rule_history_scratch[root_len..].reverse();
-    }
-
     fn expand(&mut self, node_index: usize) -> AzEvalOutput {
         crate::scope_profile!("az.search.expand");
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
-        self.prepare_rule_history(node_index);
-
         let terminal = {
             crate::scope_profile!("az.search.terminal_value");
             terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
@@ -636,12 +747,15 @@ impl<'a> AzTree<'a> {
         let (moves, policy_repeats_history) = {
             crate::scope_profile!("az.search.expand_legal_moves");
             if node_index == self.root {
-                if let Some(moves) = self.root_moves.clone() {
-                    let repeats = policy_repeat_features(
-                        &self.nodes[node_index].position,
-                        &self.rule_history_scratch,
-                        &moves,
-                    );
+                if let Some(moves) = self.root_moves.take() {
+                    let repeats = self.root_policy_repeats.take().unwrap_or_else(|| {
+                        policy_repeat_features(
+                            &self.nodes[node_index].position,
+                            &self.rule_history_scratch,
+                            &moves,
+                        )
+                    });
+                    debug_assert_eq!(moves.len(), repeats.len());
                     (moves, repeats)
                 } else {
                     self.nodes[node_index]
@@ -714,30 +828,26 @@ impl<'a> AzTree<'a> {
         }
         {
             crate::scope_profile!("az.search.children_build");
-            let gives_checks = self.eval_scratch.policy_gives_check.clone();
-            let captures = moves
-                .iter()
-                .map(|mv| {
-                    self.nodes[node_index]
-                        .position
-                        .piece_at(mv.to as usize)
-                        .is_some()
-                })
-                .collect::<Vec<_>>();
+            let position = &self.nodes[node_index].position;
+            let gives_checks = &self.eval_scratch.policy_gives_check;
+            let priors = &mut self.eval_scratch.priors;
             let offset = self.children.len();
-            self.children
-                .extend(moves.into_iter().zip(priors.drain(..)).enumerate().map(
-                    |(index, (mv, prior))| AzChild {
+            self.children.extend(
+                moves
+                    .into_iter()
+                    .zip(priors.drain(..))
+                    .zip(gives_checks.iter().copied())
+                    .map(|((mv, prior), gives_check)| AzChild {
                         mv,
                         prior,
-                        is_capture: captures[index],
-                        gives_check: gives_checks.get(index).copied().unwrap_or(0.0) != 0.0,
+                        is_capture: position.piece_at(mv.to as usize).is_some(),
+                        gives_check: gives_check != 0.0,
                         visits: 0,
                         value_wdl_sum: [0.0; 3],
                         moves_left_sum: 0.0,
                         child: NO_CHILD,
-                    },
-                ));
+                    }),
+            );
             let len = self.children.len() - offset;
             self.nodes[node_index].children_offset =
                 u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
@@ -833,7 +943,6 @@ impl<'a> AzTree<'a> {
                     position: child_position,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
-                    parent: node_index as u32,
                     rule_entry: Some(child_rule_entry),
                     children_offset: 0,
                     children_len: 0,
@@ -847,7 +956,12 @@ impl<'a> AzTree<'a> {
                 self.node_children_mut(node_index)[child_index].set_child_node(child_node);
                 child_node
             };
+        let history_len = self.rule_history_scratch.len();
+        if let Some(entry) = self.nodes[child_node].rule_entry {
+            self.rule_history_scratch.push(entry);
+        }
         let child_eval = self.simulate(child_node, child_depth);
+        self.rule_history_scratch.truncate(history_len);
         let eval = AzEvalOutput {
             value_wdl: flip_wdl(child_eval.value_wdl),
             value: -child_eval.value,
@@ -869,7 +983,6 @@ impl<'a> AzTree<'a> {
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
-        self.prepare_rule_history(node_index);
         let terminal = {
             crate::scope_profile!("az.search.terminal_value");
             terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
@@ -1501,6 +1614,55 @@ mod tests {
     }
 
     #[test]
+    fn reusable_workspace_preserves_search_result() {
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let legal = position.legal_moves_with_rules(&history);
+        let policy_repeats = policy_repeat_features(&position, &history, &legal);
+        let model = AzNnue::random(32, 71);
+        let limits = AzSearchLimits {
+            simulations: 128,
+            seed: 91,
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.1,
+            ..AzSearchLimits::default()
+        };
+        let expected = alphazero_search_with_rules(
+            &position,
+            Some(history.clone()),
+            Some(legal.clone()),
+            &model,
+            limits,
+        );
+        let mut workspace = AzSearchWorkspace::new(&model);
+        let actual = alphazero_search_with_rules_reusing(
+            &position,
+            &history,
+            legal,
+            policy_repeats,
+            &model,
+            limits,
+            &mut workspace,
+        );
+
+        assert_eq!(actual.best_move, expected.best_move);
+        assert_eq!(actual.simulations, expected.simulations);
+        assert_eq!(actual.value_q.to_bits(), expected.value_q.to_bits());
+        assert_eq!(
+            actual.value_wdl.map(f32::to_bits),
+            expected.value_wdl.map(f32::to_bits)
+        );
+        assert_eq!(actual.candidates.len(), expected.candidates.len());
+        for (actual, expected) in actual.candidates.iter().zip(&expected.candidates) {
+            assert_eq!(actual.mv, expected.mv);
+            assert_eq!(actual.visits, expected.visits);
+            assert_eq!(actual.q.to_bits(), expected.q.to_bits());
+            assert_eq!(actual.policy.to_bits(), expected.policy.to_bits());
+            assert_eq!(actual.prior.to_bits(), expected.prior.to_bits());
+        }
+    }
+
+    #[test]
     fn search_reports_leaf_depth_and_depth_cutoffs() {
         let model = AzNnue::random(4, 7);
         let result = alphazero_search(
@@ -1648,7 +1810,6 @@ mod tests {
         let parent = AzNode {
             position,
             accumulator_offset: 0,
-            parent: NO_CHILD,
             rule_entry: None,
             children_offset: 0,
             children_len: 0,

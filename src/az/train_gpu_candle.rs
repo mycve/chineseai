@@ -12,7 +12,7 @@ use candle_core::{
 
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, AzValueMomentStats,
-    MOVES_LEFT_AUX_WEIGHT, WDL_HEAD_SIZE,
+    WDL_HEAD_SIZE,
     candle_model::{AzCandleModel, BatchTensors},
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
@@ -585,6 +585,7 @@ impl GpuReplica {
             global_batch_len,
             loss_weights.value,
             loss_weights.policy,
+            loss_weights.moves_left,
         )?;
         profile_sync(&self.device)?;
         let loss_seconds = loss_started.elapsed().as_secs_f64();
@@ -626,6 +627,7 @@ impl GpuReplica {
         global_batch_len: usize,
         value_weight: f32,
         policy_weight: f32,
+        moves_left_weight: f32,
     ) -> CandleResult<BatchLossOutput> {
         let forward = self.model.forward(batch_tensors)?;
         let value_log_probs = log_softmax(&forward.value_logits, 1)?;
@@ -666,7 +668,7 @@ impl GpuReplica {
         let weighted_moves_left_loss = moves_left_sse_per_sample
             .broadcast_mul(&batch_tensors.value_weights)?
             .sum_all()?
-            .affine(MOVES_LEFT_AUX_WEIGHT as f64, 0.0)?;
+            .affine(moves_left_weight.max(0.0) as f64, 0.0)?;
         let loss_sum = ((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?;
         let optimized_loss_sum = loss_sum.to_scalar::<f32>()?;
         let loss_tensor = (loss_sum / global_batch_len as f64)?;

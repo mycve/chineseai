@@ -15,6 +15,6 @@ runs
 tools
 eval/*.csv
 eval/*.fens
-eval/*.sqlite
+data/*.sqlite
 eval/torch/
 POTENTIAL_IMPROVEMENT_PLAN.md

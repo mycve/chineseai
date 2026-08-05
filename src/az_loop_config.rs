@@ -141,7 +141,7 @@ impl Default for AzLoopFileConfig {
             arena_opening_positions: 300,
             arena_opening_plies_min: 6,
             arena_opening_plies_max: 10,
-            pikafish_label_eval_sqlite: "eval/pikafish-random-5000-d8.sqlite".into(),
+            pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
             pikafish_label_eval_simulations: 3000,
@@ -653,7 +653,9 @@ mod tests {
         assert!(text.contains("arena_interval = 20\n"));
         assert!(text.contains("arena_simulations = 4000\n"));
         assert!(
-            text.contains("pikafish_label_eval_sqlite = \"eval/pikafish-random-5000-d8.sqlite\"\n")
+            text.contains(
+                "pikafish_label_eval_sqlite = \"eval/pikafish-selfplay-5000-d20.sqlite\"\n"
+            )
         );
         assert!(text.contains("pikafish_label_eval_interval = 20\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
