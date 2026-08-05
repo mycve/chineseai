@@ -3,7 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
 
 pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
-const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 3;
+const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 4;
+
+fn system_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
 #[derive(Clone, Debug)]
 pub struct AzLoopFileConfig {
     pub model_path: String,
@@ -55,6 +61,14 @@ pub struct AzLoopFileConfig {
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
+    pub teacher_enabled: bool,
+    pub teacher_pikafish_exe: String,
+    pub teacher_interval: usize,
+    pub teacher_positions: usize,
+    pub teacher_depth: u32,
+    pub teacher_processes: usize,
+    pub teacher_value_weight: f32,
+    pub teacher_min_ply: usize,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -91,7 +105,7 @@ impl Default for AzLoopFileConfig {
             max_plies: 200,
             hidden_size: 128,
             seed: 20260420,
-            workers: 192,
+            workers: 0,
             temperature_start: 0.9,
             temperature_endgame: 0.35,
             temperature_decay_delay_plies: 30,
@@ -128,6 +142,14 @@ impl Default for AzLoopFileConfig {
             mirror_probability: 0.3,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
+            teacher_enabled: false,
+            teacher_pikafish_exe: "pikafish.exe".into(),
+            teacher_interval: 20,
+            teacher_positions: 2000,
+            teacher_depth: 12,
+            teacher_processes: 0,
+            teacher_value_weight: 0.3,
+            teacher_min_ply: 20,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
@@ -204,6 +226,14 @@ struct AzLoopTomlConfig {
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
+    pub teacher_enabled: bool,
+    pub teacher_pikafish_exe: String,
+    pub teacher_interval: usize,
+    pub teacher_positions: usize,
+    pub teacher_depth: u32,
+    pub teacher_processes: usize,
+    pub teacher_value_weight: f32,
+    pub teacher_min_ply: usize,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -284,6 +314,14 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             mirror_probability: config.mirror_probability,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
+            teacher_enabled: config.teacher_enabled,
+            teacher_pikafish_exe: config.teacher_pikafish_exe.clone(),
+            teacher_interval: config.teacher_interval,
+            teacher_positions: config.teacher_positions,
+            teacher_depth: config.teacher_depth,
+            teacher_processes: config.teacher_processes,
+            teacher_value_weight: config.teacher_value_weight,
+            teacher_min_ply: config.teacher_min_ply,
             checkpoint_interval: config.checkpoint_interval,
             checkpoint_dir: config.checkpoint_dir.clone(),
             max_checkpoints: config.max_checkpoints,
@@ -359,6 +397,14 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             mirror_probability: config.mirror_probability,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
+            teacher_enabled: config.teacher_enabled,
+            teacher_pikafish_exe: config.teacher_pikafish_exe,
+            teacher_interval: config.teacher_interval,
+            teacher_positions: config.teacher_positions,
+            teacher_depth: config.teacher_depth,
+            teacher_processes: config.teacher_processes,
+            teacher_value_weight: config.teacher_value_weight,
+            teacher_min_ply: config.teacher_min_ply,
             checkpoint_interval: config.checkpoint_interval,
             checkpoint_dir: config.checkpoint_dir,
             max_checkpoints: config.max_checkpoints,
@@ -475,6 +521,14 @@ impl AzLoopFileConfig {
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
+        line!("teacher_enabled", self.teacher_enabled);
+        line!("teacher_pikafish_exe", q(&self.teacher_pikafish_exe));
+        line!("teacher_interval", self.teacher_interval);
+        line!("teacher_positions", self.teacher_positions);
+        line!("teacher_depth", self.teacher_depth);
+        line!("teacher_processes", self.teacher_processes);
+        line!("teacher_value_weight", f(self.teacher_value_weight));
+        line!("teacher_min_ply", self.teacher_min_ply);
         line!("checkpoint_interval", self.checkpoint_interval);
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
@@ -540,7 +594,9 @@ impl AzLoopFileConfig {
         self.batch_size = self.batch_size.max(1);
         self.max_plies = self.max_plies.max(1);
         self.hidden_size = self.hidden_size.max(1);
-        self.workers = self.workers.max(1);
+        if self.workers == 0 {
+            self.workers = system_parallelism();
+        }
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_endgame = self.temperature_endgame.max(0.0);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
@@ -572,6 +628,14 @@ impl AzLoopFileConfig {
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
+        self.teacher_interval = self.teacher_interval.max(1);
+        self.teacher_positions = self.teacher_positions.max(1);
+        self.teacher_depth = self.teacher_depth.max(1);
+        if self.teacher_processes == 0 {
+            self.teacher_processes = system_parallelism();
+        }
+        self.teacher_value_weight = self.teacher_value_weight.max(0.0);
+        self.teacher_min_ply = self.teacher_min_ply.min(self.max_plies.saturating_sub(1));
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
@@ -598,7 +662,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 3\n"));
+        assert!(text.starts_with("format_version = 4\n"));
         assert!(text.contains("lr = 0.0007\n"));
         assert!(text.contains("lr_min = 0.00015\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -637,13 +701,15 @@ mod tests {
         assert!(!text.contains("high_simulation_probability"));
         assert!(!text.contains("high_simulation_start_plies"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
-        assert!(text.contains("workers = 192\n"));
+        assert!(text.contains("workers = 0\n"));
         assert!(text.contains("batch_size = 256\n"));
         assert!(text.contains("max_plies = 200\n"));
         assert!(text.contains("hidden_size = 128\n"));
         assert!(text.contains("replay_capacity = 1000000\n"));
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
+        assert!(text.contains("teacher_enabled = false\n"));
+        assert!(text.contains("teacher_processes = 0\n"));
         assert!(text.contains("replay_recent_games = 5000\n"));
         assert!(text.contains("arena_processes = 192\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));

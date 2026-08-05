@@ -77,12 +77,6 @@ enum CliCommand {
     VsPikafish(VsPikafishArgs),
     /// Generate random positions and label them with Pikafish best moves.
     PikafishLabelRandom(PikafishLabelRandomArgs),
-    /// Append WDL labels for FENs to a persistent teacher database.
-    PikafishLabelFens(PikafishLabelFensArgs),
-    /// Generate unique positions from self-play without training.
-    SelfplayFens(SelfplayFensArgs),
-    /// Incrementally train value from new teacher labels.
-    TeacherTrain(TeacherTrainArgs),
     /// Evaluate a model against Pikafish labels stored in SQLite.
     PikafishLabelEval(PikafishLabelEvalArgs),
 }
@@ -342,62 +336,6 @@ struct PikafishLabelRandomArgs {
     /// Regenerate the FEN file even when it already exists.
     #[arg(long)]
     regenerate: bool,
-}
-
-#[derive(Args, Debug)]
-struct PikafishLabelFensArgs {
-    /// Pikafish UCI executable path.
-    pikafish_exe: String,
-    /// UTF-8 file containing one FEN per line.
-    fens: String,
-    /// Persistent teacher SQLite database.
-    #[arg(long, default_value = "data/pikafish-teacher.sqlite")]
-    sqlite: String,
-    /// Pikafish search depth.
-    #[arg(long, default_value_t = 20)]
-    depth: u32,
-    /// Independent single-threaded Pikafish workers.
-    #[arg(long, default_value_t = 16)]
-    threads: usize,
-}
-
-#[derive(Args, Debug)]
-struct SelfplayFensArgs {
-    model: String,
-    #[arg(long, default_value = "data/selfplay.fens")]
-    output: String,
-    #[arg(long, default_value_t = 5000)]
-    samples: usize,
-    #[arg(long, default_value_t = 1600)]
-    simulations: usize,
-    #[arg(long, default_value_t = 32)]
-    workers: usize,
-    #[arg(long, default_value_t = 200)]
-    max_plies: usize,
-    #[arg(long, default_value_t = 20260805)]
-    seed: u64,
-    #[arg(long)]
-    overwrite: bool,
-}
-
-#[derive(Args, Debug)]
-struct TeacherTrainArgs {
-    model: String,
-    sqlite: String,
-    #[arg(long)]
-    output: Option<String>,
-    #[arg(long, default_value = "main")]
-    stream: String,
-    #[arg(long, default_value_t = 1)]
-    epochs: usize,
-    #[arg(long, default_value_t = 256)]
-    batch_size: usize,
-    #[arg(long, default_value_t = 0.0001)]
-    lr: f32,
-    #[arg(long, default_value_t = 0)]
-    limit: usize,
-    #[arg(long, default_value_t = 20260805)]
-    seed: u64,
 }
 
 #[derive(Args, Debug)]
@@ -797,11 +735,12 @@ fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> V
 struct SelfplayPauseState {
     arena_paused: bool,
     backlog_paused: bool,
+    teacher_paused: bool,
 }
 
 impl SelfplayPauseState {
     fn is_paused(&self) -> bool {
-        self.arena_paused || self.backlog_paused
+        self.arena_paused || self.backlog_paused || self.teacher_paused
     }
 }
 
@@ -877,6 +816,7 @@ fn build_az_loop_config(
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         record_fens: false,
+        record_fens_min_ply: 0,
     }
 }
 
@@ -2122,6 +2062,7 @@ fn main() {
             let trainer_config = config.clone();
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
+            let trainer_selfplay_pause = Arc::clone(&selfplay_pause);
             let trainer_handle = thread::spawn(move || {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
@@ -2188,6 +2129,59 @@ fn main() {
                             ..AzTrainLossWeights::default()
                         },
                     );
+                    if trainer_config.teacher_enabled
+                        && (train_update + 1) % trainer_config.teacher_interval == 0
+                    {
+                        {
+                            let (lock, _) = &*trainer_selfplay_pause;
+                            lock.lock().unwrap().teacher_paused = true;
+                        }
+                        println!(
+                            "teacher  : update={} collecting {} positions, depth={}, processes={}",
+                            train_update + 1,
+                            trainer_config.teacher_positions,
+                            trainer_config.teacher_depth,
+                            trainer_config.teacher_processes
+                        );
+                        let teacher_result = build_teacher_samples(
+                            &trainer_model,
+                            &trainer_config,
+                            train_update as u64,
+                        );
+                        {
+                            let (lock, condvar) = &*trainer_selfplay_pause;
+                            lock.lock().unwrap().teacher_paused = false;
+                            condvar.notify_all();
+                        }
+                        match teacher_result {
+                            Ok(samples) => {
+                                let count = samples.len();
+                                let teacher_stats = train_samples_weighted_owned(
+                                    &mut trainer_model,
+                                    samples,
+                                    1,
+                                    current_lr,
+                                    trainer_config.batch_size,
+                                    &mut rng,
+                                    AzTrainLossWeights {
+                                        value: trainer_config.teacher_value_weight,
+                                        policy: 0.0,
+                                        moves_left: 0.0,
+                                    },
+                                );
+                                println!(
+                                    "teacher  : update={} samples={} value_ce={:.5}",
+                                    train_update + 1,
+                                    count,
+                                    teacher_stats.value_loss
+                                );
+                            }
+                            Err(err) => eprintln!(
+                                "teacher  : update={} skipped: {err}",
+                                train_update + 1
+                            ),
+                        }
+                    }
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
                         pending,
@@ -3349,16 +3343,6 @@ fn main() {
             run_pikafish_label_random(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-random failed: {err}"));
         }
-        Some(CliCommand::PikafishLabelFens(cmd)) => {
-            run_pikafish_label_fens(cmd)
-                .unwrap_or_else(|err| panic!("pikafish-label-fens failed: {err}"));
-        }
-        Some(CliCommand::SelfplayFens(cmd)) => {
-            run_selfplay_fens(cmd).unwrap_or_else(|err| panic!("selfplay-fens failed: {err}"));
-        }
-        Some(CliCommand::TeacherTrain(cmd)) => {
-            run_teacher_train(cmd).unwrap_or_else(|err| panic!("teacher-train failed: {err}"));
-        }
         Some(CliCommand::PikafishLabelEval(cmd)) => {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
@@ -3942,235 +3926,51 @@ fn label_fens_parallel(
     Ok(out)
 }
 
-fn run_pikafish_label_fens(cmd: PikafishLabelFensArgs) -> io::Result<()> {
-    let text = fs::read_to_string(&cmd.fens)?;
-    let mut seen = HashSet::new();
-    let mut fens = Vec::new();
-    for (line_index, line) in text.lines().enumerate() {
-        let fen = line.trim();
-        if fen.is_empty() || fen.starts_with('#') || !seen.insert(fen.to_string()) {
-            continue;
-        }
-        Position::from_fen(fen).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid FEN at {} line {}: {err}", cmd.fens, line_index + 1),
-            )
-        })?;
-        fens.push(fen.to_string());
-    }
-    if fens.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no FENs to label"));
-    }
-
-    let sqlite_path = Path::new(&cmd.sqlite);
-    if let Some(parent) = sqlite_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let mut conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS teacher_labels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fen TEXT NOT NULL UNIQUE,
-            bestmove TEXT NOT NULL,
-            wdl_win INTEGER NOT NULL,
-            wdl_draw INTEGER NOT NULL,
-            wdl_loss INTEGER NOT NULL,
-            depth INTEGER NOT NULL,
-            CHECK (wdl_win >= 0 AND wdl_draw >= 0 AND wdl_loss >= 0),
-            CHECK (wdl_win + wdl_draw + wdl_loss = 1000)
-        );",
-    )
-    .map_err(sqlite_io_error)?;
-    let existing = {
-        let mut stmt = conn
-            .prepare("SELECT fen FROM teacher_labels")
-            .map_err(sqlite_io_error)?;
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .map_err(sqlite_io_error)?
-            .collect::<Result<HashSet<_>, _>>()
-            .map_err(sqlite_io_error)?
-    };
-    let input_count = fens.len();
-    fens.retain(|fen| !existing.contains(fen));
-    if fens.is_empty() {
-        println!(
-            "pikafish-label-fens: input={} new=0 skipped={} sqlite={}",
-            input_count,
-            input_count,
-            sqlite_path.display()
+fn build_teacher_samples(
+    model: &AzNnue,
+    config: &AzLoopFileConfig,
+    update: u64,
+) -> io::Result<Vec<AzTrainingSample>> {
+    let target = config.teacher_positions;
+    let mut unique = HashSet::with_capacity(target.saturating_mul(2));
+    let mut round = 0u64;
+    while unique.len() < target {
+        let mut loop_config = build_az_loop_config(
+            config,
+            config.seed ^ update.rotate_left(17) ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            config.workers,
+            update as u32,
+            &[],
         );
-        return Ok(());
+        loop_config.games = config.workers;
+        loop_config.record_fens = true;
+        loop_config.record_fens_min_ply = config.teacher_min_ply;
+        let data = generate_selfplay_data(model, &loop_config);
+        for fen in data.position_fens {
+            unique.insert(fen);
+            if unique.len() == target {
+                break;
+            }
+        }
+        round = round.wrapping_add(1);
     }
-
-    let depth = cmd.depth.max(1);
-    println!(
-        "pikafish-label-fens: input={} new={} skipped={} depth={} workers={}",
-        input_count,
-        fens.len(),
-        input_count - fens.len(),
-        depth,
-        cmd.threads.max(1).min(fens.len())
-    );
+    let fens = unique.into_iter().collect::<Vec<_>>();
     let labeled = label_fens_parallel(
-        Path::new(&cmd.pikafish_exe),
+        Path::new(&config.teacher_pikafish_exe),
         &fens,
-        depth,
-        cmd.threads,
+        config.teacher_depth,
+        config.teacher_processes,
     )?;
-    let tx = conn.transaction().map_err(sqlite_io_error)?;
-    for (done, (index, bestmove, pvs)) in labeled.into_iter().enumerate() {
+    let mut samples = Vec::with_capacity(labeled.len());
+    for (index, _bestmove, pvs) in labeled {
         let best = pvs.iter().find(|pv| pv.multipv == 1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Pikafish returned no principal variation")
         })?;
         let wdl = best.wdl.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Pikafish returned no WDL")
         })?;
-        tx.execute(
-            "INSERT INTO teacher_labels
-                (fen, bestmove, wdl_win, wdl_draw, wdl_loss, depth)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &fens[index],
-                bestmove,
-                i64::from(wdl[0]),
-                i64::from(wdl[1]),
-                i64::from(wdl[2]),
-                i64::from(best.depth),
-            ],
-        )
-        .map_err(sqlite_io_error)?;
-        if (done + 1) % 100 == 0 || done + 1 == fens.len() {
-            println!("pikafish-label-fens: stored {}/{}", done + 1, fens.len());
-        }
-    }
-    tx.commit().map_err(sqlite_io_error)?;
-    println!("pikafish-label-fens: sqlite={}", sqlite_path.display());
-    Ok(())
-}
-
-fn run_selfplay_fens(cmd: SelfplayFensArgs) -> io::Result<()> {
-    let model = AzNnue::load(&cmd.model)?;
-    let target = cmd.samples.max(1);
-    let output = Path::new(&cmd.output);
-    let mut seen = HashSet::with_capacity(target * 2);
-    if !cmd.overwrite && output.exists() {
-        for line in fs::read_to_string(output)?.lines() {
-            let fen = line.trim();
-            if !fen.is_empty() && !fen.starts_with('#') {
-                seen.insert(fen.to_string());
-            }
-        }
-    }
-    let initial = seen.len();
-    if initial >= target {
-        println!(
-            "selfplay-fens: existing={} already reaches target={} output={}",
-            initial,
-            target,
-            output.display()
-        );
-        return Ok(());
-    }
-    let file_config = AzLoopFileConfig {
-        simulations: cmd.simulations.max(1),
-        max_plies: cmd.max_plies.max(1),
-        workers: cmd.workers.max(1),
-        mirror_probability: 0.0,
-        ..AzLoopFileConfig::default()
-    };
-    let mut round = 0u64;
-    while seen.len() < target {
-        let mut config = build_az_loop_config(
-            &file_config,
-            cmd.seed ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            cmd.workers.max(1),
-            1,
-            &[],
-        );
-        config.games = cmd.workers.max(1);
-        config.record_fens = true;
-        let data = generate_selfplay_data(&model, &config);
-        for fen in data.position_fens {
-            seen.insert(fen);
-            if seen.len() >= target {
-                break;
-            }
-        }
-        round = round.wrapping_add(1);
-        println!("selfplay-fens: collected {}/{}", seen.len(), target);
-    }
-    let mut fens = seen.into_iter().collect::<Vec<_>>();
-    fens.sort_unstable();
-    fens.truncate(target);
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(output, format!("{}\n", fens.join("\n")))?;
-    println!(
-        "selfplay-fens: initial={} generated={} total={} output={}",
-        initial,
-        fens.len().saturating_sub(initial.min(fens.len())),
-        fens.len(),
-        output.display()
-    );
-    Ok(())
-}
-
-fn run_teacher_train(cmd: TeacherTrainArgs) -> io::Result<()> {
-    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS training_progress (
-            stream TEXT PRIMARY KEY,
-            last_trained_id INTEGER NOT NULL
-        );",
-    )
-    .map_err(sqlite_io_error)?;
-    let last_id = conn
-        .query_row(
-            "SELECT last_trained_id FROM training_progress WHERE stream=?1",
-            params![&cmd.stream],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0);
-    let mut query = "SELECT id, fen, wdl_win, wdl_draw, wdl_loss
-                     FROM teacher_labels WHERE id > ?1 ORDER BY id"
-        .to_string();
-    if cmd.limit > 0 {
-        query.push_str(" LIMIT ?2");
-    }
-    let rows = {
-        let mut stmt = conn.prepare(&query).map_err(sqlite_io_error)?;
-        let mapper = |row: &rusqlite::Row<'_>| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u16>(2)?,
-                row.get::<_, u16>(3)?,
-                row.get::<_, u16>(4)?,
-            ))
-        };
-        if cmd.limit > 0 {
-            stmt.query_map(params![last_id, cmd.limit as i64], mapper)
-                .map_err(sqlite_io_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sqlite_io_error)?
-        } else {
-            stmt.query_map(params![last_id], mapper)
-                .map_err(sqlite_io_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sqlite_io_error)?
-        }
-    };
-    if rows.is_empty() {
-        println!("teacher-train: stream={} no new labels after id={}", cmd.stream, last_id);
-        return Ok(());
-    }
-    let max_id = rows.last().unwrap().0;
-    let mut samples = Vec::with_capacity(rows.len());
-    for &(id, ref fen, win, draw, loss) in &rows {
-        let position = Position::from_fen(fen).map_err(|err| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("invalid teacher FEN id={id}: {err}"))
+        let position = Position::from_fen(&fens[index]).map_err(|err| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid teacher FEN: {err}"))
         })?;
         let legal = position.legal_moves();
         if legal.is_empty() {
@@ -4187,8 +3987,12 @@ fn run_teacher_train(cmd: TeacherTrainArgs) -> io::Result<()> {
             move_indices,
             policy: vec![uniform; legal.len()],
             policy_repeats_history: vec![0.0; legal.len()],
-            value_wdl: [win as f32 / 1000.0, draw as f32 / 1000.0, loss as f32 / 1000.0],
-            value: (win as f32 - loss as f32) / 1000.0,
+            value_wdl: [
+                wdl[0] as f32 / 1000.0,
+                wdl[1] as f32 / 1000.0,
+                wdl[2] as f32 / 1000.0,
+            ],
+            value: (wdl[0] as f32 - wdl[2] as f32) / 1000.0,
             side_sign: 1.0,
             moves_left: 0.0,
             policy_weight: 0.0,
@@ -4197,39 +4001,7 @@ fn run_teacher_train(cmd: TeacherTrainArgs) -> io::Result<()> {
             meta: chineseai::az::AzSampleMeta::default(),
         });
     }
-    if samples.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "no trainable teacher positions"));
-    }
-    let mut model = AzNnue::load(&cmd.model)?;
-    let mut rng = SplitMix64::new(cmd.seed);
-    let stats = train_samples_weighted_owned(
-        &mut model,
-        samples,
-        cmd.epochs.max(1),
-        cmd.lr.max(0.0),
-        cmd.batch_size.max(1),
-        &mut rng,
-        AzTrainLossWeights { value: 1.0, policy: 0.0, moves_left: 0.0 },
-    );
-    let output = cmd.output.as_deref().unwrap_or(&cmd.model);
-    let output_path = Path::new(output);
-    let tmp = PathBuf::from(format!("{}.tmp", output_path.display()));
-    model.save(&tmp)?;
-    if output_path.exists() {
-        fs::remove_file(output_path)?;
-    }
-    fs::rename(&tmp, output_path)?;
-    conn.execute(
-        "INSERT INTO training_progress(stream,last_trained_id) VALUES(?1,?2)
-         ON CONFLICT(stream) DO UPDATE SET last_trained_id=excluded.last_trained_id",
-        params![&cmd.stream, max_id],
-    )
-    .map_err(sqlite_io_error)?;
-    println!(
-        "teacher-train: stream={} labels={} ids={}..{} epochs={} value_ce={:.5} output={}",
-        cmd.stream, rows.len(), last_id + 1, max_id, cmd.epochs.max(1), stats.value_loss, output
-    );
-    Ok(())
+    Ok(samples)
 }
 
 fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
