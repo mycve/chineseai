@@ -143,7 +143,7 @@ impl Default for AzLoopFileConfig {
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             teacher_enabled: false,
-            teacher_pikafish_exe: "pikafish.exe".into(),
+            teacher_pikafish_exe: "./tools/pikafish".into(),
             teacher_interval: 20,
             teacher_positions: 2000,
             teacher_depth: 12,
@@ -709,6 +709,7 @@ mod tests {
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("teacher_enabled = false\n"));
+        assert!(text.contains("teacher_pikafish_exe = \"./tools/pikafish\"\n"));
         assert!(text.contains("teacher_processes = 0\n"));
         assert!(text.contains("replay_recent_games = 5000\n"));
         assert!(text.contains("arena_processes = 192\n"));
