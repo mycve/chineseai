@@ -116,9 +116,13 @@ impl AzCandleModel {
         let policy_logits = self
             .policy_move_bias
             .reshape((1, DENSE_MOVE_SPACE))?
-            .broadcast_as((bsz, DENSE_MOVE_SPACE))?;
+            .broadcast_as((bsz, DENSE_MOVE_SPACE))?
+            .contiguous()?;
         let policy_repeat_logit = Tensor::zeros((bsz, 1), hidden.dtype(), hidden.device())?;
-        let piece_square_policy = self.input_hidden.narrow(1, 0, POLICY_CONSEQUENCE_SIZE)?;
+        let piece_square_policy = self
+            .input_hidden
+            .narrow(1, 0, POLICY_CONSEQUENCE_SIZE)?
+            .contiguous()?;
         let consequence_from = piece_square_policy
             .index_select(&batch.policy_consequence_from.flatten_all()?, 0)?
             .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?;
