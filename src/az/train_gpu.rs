@@ -10,7 +10,26 @@ use super::train_gpu_candle as candle;
     all(target_os = "linux", not(target_env = "musl")),
     target_os = "windows",
 ))]
-pub(super) use candle::{GpuTrainer, train_samples_gpu};
+pub(super) use candle::GpuTrainer;
+
+/// ??? GPU ???????????? `String` ??????????
+#[cfg(any(
+    all(feature = "gpu-train", not(target_os = "macos")),
+    all(target_os = "linux", not(target_env = "musl")),
+    target_os = "windows",
+))]
+pub(super) fn train_samples_gpu(
+    model: &mut super::AzNnue,
+    samples: std::sync::Arc<Vec<super::AzTrainingSample>>,
+    epochs: usize,
+    lr: f32,
+    batch_size: usize,
+    rng: &mut super::SplitMix64,
+    loss_weights: super::AzTrainLossWeights,
+) -> Result<super::AzTrainStats, String> {
+    candle::train_samples_gpu(model, samples, epochs, lr, batch_size, rng, loss_weights)
+        .map_err(|err| err.to_string())
+}
 
 #[cfg(not(any(
     all(feature = "gpu-train", not(target_os = "macos")),

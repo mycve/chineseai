@@ -172,7 +172,6 @@ pub struct Position {
     pub(super) board: [Option<Piece>; BOARD_SIZE],
     pub(super) side_to_move: Color,
     pub(super) hash: u64,
-    pub(super) base_eval: i32,
     pub(super) advisor_counts: [u8; 2],
     pub(super) elephant_counts: [u8; 2],
     pub(super) dynamic_material_counts: [u8; 2],
@@ -183,9 +182,29 @@ pub struct Position {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PositionState {
     pub(super) hash: u64,
-    pub(super) base_eval: i32,
     pub(super) advisor_counts: [u8; 2],
     pub(super) elephant_counts: [u8; 2],
     pub(super) dynamic_material_counts: [u8; 2],
     pub(super) general_squares: [Option<usize>; 2],
+}
+
+#[inline(always)]
+pub(crate) const fn color_index(color: Color) -> usize {
+    match color {
+        Color::Red => 0,
+        Color::Black => 1,
+    }
+}
+
+#[inline(always)]
+pub(crate) const fn piece_kind_index(kind: PieceKind) -> usize {
+    match kind {
+        PieceKind::General => 0,
+        PieceKind::Advisor => 1,
+        PieceKind::Elephant => 2,
+        PieceKind::Horse => 3,
+        PieceKind::Rook => 4,
+        PieceKind::Cannon => 5,
+        PieceKind::Soldier => 6,
+    }
 }

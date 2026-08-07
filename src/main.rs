@@ -6,6 +6,8 @@ mod az_loop_config;
 
 use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az_loop_config};
 
+use chineseai::version::AZ_LOOP_PROGRESS_VERSION;
+
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
@@ -401,7 +403,6 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-const AZ_LOOP_PROGRESS_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -809,6 +810,7 @@ fn build_az_loop_config(
         moves_left_scaled_factor: config.moves_left_scaled_factor,
         moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
+        value_target_search_q_mix: config.value_target_search_q_mix,
         opening_positions: opening_positions.to_vec(),
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
@@ -1565,7 +1567,8 @@ fn main() {
                 cmd.batch_size_per_gpu.max(1),
                 &mut eval_rng,
                 weights,
-            );
+            )
+            .expect("replay-fit baseline training failed");
             let mut train_rng = SplitMix64::new(cmd.seed);
             let started = Instant::now();
             let trained = train_samples_weighted(
@@ -1576,7 +1579,8 @@ fn main() {
                 cmd.batch_size_per_gpu.max(1),
                 &mut train_rng,
                 weights,
-            );
+            )
+            .expect("replay-fit training failed");
             let train_seconds = started.elapsed().as_secs_f32();
             let mut final_eval_model = model.clone();
             let mut final_eval_rng = SplitMix64::new(cmd.seed ^ 0x94D0_49BB_1331_11EB);
@@ -1588,7 +1592,8 @@ fn main() {
                 cmd.batch_size_per_gpu.max(1),
                 &mut final_eval_rng,
                 weights,
-            );
+            )
+            .expect("replay-fit validation training failed");
             let policy_groups = evaluate_policy_groups(&model, &validation);
             let mut ablated_model = model.clone();
             ablated_model.policy_consequence_output.fill(0.0);
@@ -2124,7 +2129,8 @@ fn main() {
                             policy: trainer_config.train_policy_weight,
                             ..AzTrainLossWeights::default()
                         },
-                    );
+                    )
+                    .unwrap_or_else(|err| panic!("training update {} failed: {err}", train_update));
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
                         pending,

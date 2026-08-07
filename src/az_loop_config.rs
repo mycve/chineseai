@@ -1,9 +1,9 @@
 use chineseai::az::AzNnueArch;
+use chineseai::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
 
 pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.azloop.toml";
-const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 4;
 
 fn system_physical_cores() -> usize {
     let physical = num_cpus::get_physical();
@@ -15,156 +15,9 @@ fn system_physical_cores() -> usize {
             .unwrap_or(1)
     }
 }
-#[derive(Clone, Debug)]
-pub struct AzLoopFileConfig {
-    pub model_path: String,
-    pub simulations: usize,
-    pub selfplay_samples_per_update: usize,
-    pub lr: f32,
-    pub lr_min: f32,
-    pub lr_decay_start_update: usize,
-    pub lr_decay_interval: usize,
-    pub lr_decay_factor: f32,
-    pub batch_size: usize,
-    pub max_plies: usize,
-    pub hidden_size: usize,
-    pub seed: u64,
-    pub workers: usize,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
-    pub opening_fens_path: String,
-    pub resign_percentage: f32,
-    pub resign_playthrough: f32,
-    pub replay_capacity: usize,
-    pub replay_recent_sample_fraction: f32,
-    pub replay_recent_games: u32,
-    pub train_warmup_samples: usize,
-    pub train_samples_per_update: usize,
-    pub train_epochs_per_update: usize,
-    pub mirror_probability: f32,
-    pub train_value_weight: f32,
-    pub train_policy_weight: f32,
-    pub checkpoint_interval: usize,
-    pub checkpoint_dir: String,
-    pub max_checkpoints: usize,
-    pub arena_interval: usize,
-    pub arena_simulations: usize,
-    pub arena_cpuct: f32,
-    pub arena_promotion_rate: f32,
-    pub arena_promotion_confidence_z: f32,
-    pub arena_processes: usize,
-    pub arena_opening_book: String,
-    pub arena_opening_positions: usize,
-    pub arena_opening_plies_min: usize,
-    pub arena_opening_plies_max: usize,
-    pub pikafish_label_eval_sqlite: String,
-    pub pikafish_label_eval_interval: usize,
-    pub pikafish_label_eval_limit: usize,
-    pub pikafish_label_eval_simulations: usize,
-    pub pikafish_label_eval_cpuct: f32,
-    pub tensorboard_logdir: String,
-}
-
-impl Default for AzLoopFileConfig {
-    fn default() -> Self {
-        Self {
-            model_path: "model.safetensors".into(),
-            simulations: 1600,
-            selfplay_samples_per_update: 120000,
-            lr: 0.0007,
-            lr_min: 0.00015,
-            lr_decay_start_update: 100,
-            lr_decay_interval: 200,
-            lr_decay_factor: 0.9,
-            batch_size: 256,
-            max_plies: 200,
-            hidden_size: 128,
-            seed: 20260420,
-            workers: 0,
-            temperature_start: 0.9,
-            temperature_endgame: 0.35,
-            temperature_decay_delay_plies: 30,
-            temperature_decay_plies: 60,
-            temperature_value_cutoff: 0.12,
-            temperature_visit_offset: -0.8,
-            cpuct: 1.20,
-            cpuct_at_root: 2.0,
-            cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
-            root_dirichlet_alpha: 0.12,
-            root_exploration_fraction: 0.10,
-            fpu_value: 0.0,
-            fpu_value_at_root: 1.0,
-            draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.004,
-            moves_left_threshold: 0.7,
-            moves_left_constant_factor: 0.05,
-            moves_left_scaled_factor: 0.20,
-            moves_left_quadratic_factor: 0.75,
-            policy_softmax_temp: 1.45,
-            opening_fens_path: String::new(),
-            resign_percentage: 0.8,
-            resign_playthrough: 20.0,
-            replay_capacity: 1000000,
-            replay_recent_sample_fraction: 0.4,
-            replay_recent_games: 5000,
-            train_warmup_samples: 240000,
-            train_samples_per_update: 240000,
-            train_epochs_per_update: 1,
-            mirror_probability: 0.3,
-            train_value_weight: 1.0,
-            train_policy_weight: 1.0,
-            checkpoint_interval: 20,
-            checkpoint_dir: "checkpoints".into(),
-            max_checkpoints: 50,
-            arena_interval: 20,
-            arena_simulations: 4000,
-            arena_cpuct: 1.5,
-            arena_promotion_rate: 0.50,
-            arena_promotion_confidence_z: 1.28,
-            arena_processes: 192,
-            arena_opening_book: "opening.obk".into(),
-            arena_opening_positions: 300,
-            arena_opening_plies_min: 6,
-            arena_opening_plies_max: 10,
-            pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
-            pikafish_label_eval_interval: 20,
-            pikafish_label_eval_limit: 1000,
-            pikafish_label_eval_simulations: 3000,
-            pikafish_label_eval_cpuct: 1.5,
-            tensorboard_logdir: "runs/chineseai".into(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct AzLoopTomlConfig {
+pub struct AzLoopFileConfig {
     pub format_version: u32,
     pub model_path: String,
     pub simulations: usize,
@@ -203,6 +56,7 @@ struct AzLoopTomlConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub value_target_search_q_mix: f32,
     pub opening_fens_path: String,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -236,159 +90,79 @@ struct AzLoopTomlConfig {
     pub tensorboard_logdir: String,
 }
 
-impl Default for AzLoopTomlConfig {
+impl Default for AzLoopFileConfig {
     fn default() -> Self {
-        Self::from(&AzLoopFileConfig::default())
-    }
-}
-
-impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
-    fn from(config: &AzLoopFileConfig) -> Self {
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
-            model_path: config.model_path.clone(),
-            simulations: config.simulations,
-            selfplay_samples_per_update: config.selfplay_samples_per_update,
-            lr: config.lr,
-            lr_min: config.lr_min,
-            lr_decay_start_update: config.lr_decay_start_update,
-            lr_decay_interval: config.lr_decay_interval,
-            lr_decay_factor: config.lr_decay_factor,
-            batch_size: config.batch_size,
-            max_plies: config.max_plies,
-            hidden_size: config.hidden_size,
-            seed: config.seed,
-            workers: config.workers,
-            temperature_start: config.temperature_start,
-            temperature_endgame: config.temperature_endgame,
-            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-            temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
-            root_exploration_fraction: config.root_exploration_fraction,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
-            draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            policy_softmax_temp: config.policy_softmax_temp,
-            opening_fens_path: config.opening_fens_path.clone(),
-            resign_percentage: config.resign_percentage,
-            resign_playthrough: config.resign_playthrough,
-            replay_capacity: config.replay_capacity,
-            replay_recent_sample_fraction: config.replay_recent_sample_fraction,
-            replay_recent_games: config.replay_recent_games,
-            train_warmup_samples: config.train_warmup_samples,
-            train_samples_per_update: config.train_samples_per_update,
-            train_epochs_per_update: config.train_epochs_per_update,
-            mirror_probability: config.mirror_probability,
-            train_value_weight: config.train_value_weight,
-            train_policy_weight: config.train_policy_weight,
-            checkpoint_interval: config.checkpoint_interval,
-            checkpoint_dir: config.checkpoint_dir.clone(),
-            max_checkpoints: config.max_checkpoints,
-            arena_interval: config.arena_interval,
-            arena_simulations: config.arena_simulations,
-            arena_cpuct: config.arena_cpuct,
-            arena_promotion_rate: config.arena_promotion_rate,
-            arena_promotion_confidence_z: config.arena_promotion_confidence_z,
-            arena_processes: config.arena_processes,
-            arena_opening_book: config.arena_opening_book.clone(),
-            arena_opening_positions: config.arena_opening_positions,
-            arena_opening_plies_min: config.arena_opening_plies_min,
-            arena_opening_plies_max: config.arena_opening_plies_max,
-            pikafish_label_eval_sqlite: config.pikafish_label_eval_sqlite.clone(),
-            pikafish_label_eval_interval: config.pikafish_label_eval_interval,
-            pikafish_label_eval_limit: config.pikafish_label_eval_limit,
-            pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
-            pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
-            tensorboard_logdir: config.tensorboard_logdir.clone(),
-        }
-    }
-}
-
-impl From<AzLoopTomlConfig> for AzLoopFileConfig {
-    fn from(config: AzLoopTomlConfig) -> Self {
-        Self {
-            model_path: config.model_path,
-            simulations: config.simulations,
-            selfplay_samples_per_update: config.selfplay_samples_per_update,
-            lr: config.lr,
-            lr_min: config.lr_min,
-            lr_decay_start_update: config.lr_decay_start_update,
-            lr_decay_interval: config.lr_decay_interval,
-            lr_decay_factor: config.lr_decay_factor,
-            batch_size: config.batch_size,
-            max_plies: config.max_plies,
-            hidden_size: config.hidden_size,
-            seed: config.seed,
-            workers: config.workers,
-            temperature_start: config.temperature_start,
-            temperature_endgame: config.temperature_endgame,
-            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-            temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
-            cpuct: config.cpuct,
-            cpuct_at_root: config.cpuct_at_root,
-            cpuct_base: config.cpuct_base,
-            cpuct_factor: config.cpuct_factor,
-            cpuct_base_at_root: config.cpuct_base_at_root,
-            cpuct_factor_at_root: config.cpuct_factor_at_root,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
-            root_exploration_fraction: config.root_exploration_fraction,
-            fpu_value: config.fpu_value,
-            fpu_value_at_root: config.fpu_value_at_root,
-            draw_score: config.draw_score,
-            moves_left_max_effect: config.moves_left_max_effect,
-            moves_left_slope: config.moves_left_slope,
-            moves_left_threshold: config.moves_left_threshold,
-            moves_left_constant_factor: config.moves_left_constant_factor,
-            moves_left_scaled_factor: config.moves_left_scaled_factor,
-            moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-            policy_softmax_temp: config.policy_softmax_temp,
-            opening_fens_path: config.opening_fens_path,
-            resign_percentage: config.resign_percentage,
-            resign_playthrough: config.resign_playthrough,
-            replay_capacity: config.replay_capacity,
-            replay_recent_sample_fraction: config.replay_recent_sample_fraction,
-            replay_recent_games: config.replay_recent_games,
-            train_warmup_samples: config.train_warmup_samples,
-            train_samples_per_update: config.train_samples_per_update,
-            train_epochs_per_update: config.train_epochs_per_update,
-            mirror_probability: config.mirror_probability,
-            train_value_weight: config.train_value_weight,
-            train_policy_weight: config.train_policy_weight,
-            checkpoint_interval: config.checkpoint_interval,
-            checkpoint_dir: config.checkpoint_dir,
-            max_checkpoints: config.max_checkpoints,
-            arena_interval: config.arena_interval,
-            arena_simulations: config.arena_simulations,
-            arena_cpuct: config.arena_cpuct,
-            arena_promotion_rate: config.arena_promotion_rate,
-            arena_promotion_confidence_z: config.arena_promotion_confidence_z,
-            arena_processes: config.arena_processes,
-            arena_opening_book: config.arena_opening_book,
-            arena_opening_positions: config.arena_opening_positions,
-            arena_opening_plies_min: config.arena_opening_plies_min,
-            arena_opening_plies_max: config.arena_opening_plies_max,
-            pikafish_label_eval_sqlite: config.pikafish_label_eval_sqlite,
-            pikafish_label_eval_interval: config.pikafish_label_eval_interval,
-            pikafish_label_eval_limit: config.pikafish_label_eval_limit,
-            pikafish_label_eval_simulations: config.pikafish_label_eval_simulations,
-            pikafish_label_eval_cpuct: config.pikafish_label_eval_cpuct,
-            tensorboard_logdir: config.tensorboard_logdir,
+            model_path: "model.safetensors".into(),
+            simulations: 1600,
+            selfplay_samples_per_update: 120000,
+            lr: 0.0007,
+            lr_min: 0.00015,
+            lr_decay_start_update: 100,
+            lr_decay_interval: 200,
+            lr_decay_factor: 0.9,
+            batch_size: 256,
+            max_plies: 200,
+            hidden_size: 128,
+            seed: 20260420,
+            workers: 0,
+            temperature_start: 0.9,
+            temperature_endgame: 0.35,
+            temperature_decay_delay_plies: 30,
+            temperature_decay_plies: 60,
+            temperature_value_cutoff: 0.12,
+            temperature_visit_offset: -0.8,
+            cpuct: 1.20,
+            cpuct_at_root: 2.0,
+            cpuct_base: 19652.0,
+            cpuct_factor: 2.0,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 2.0,
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.10,
+            fpu_value: 0.0,
+            fpu_value_at_root: 1.0,
+            draw_score: 0.0,
+            moves_left_max_effect: 0.25,
+            moves_left_slope: 0.004,
+            moves_left_threshold: 0.7,
+            moves_left_constant_factor: 0.05,
+            moves_left_scaled_factor: 0.20,
+            moves_left_quadratic_factor: 0.75,
+            policy_softmax_temp: 1.45,
+            value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
+            opening_fens_path: String::new(),
+            resign_percentage: 0.8,
+            resign_playthrough: 20.0,
+            replay_capacity: 1000000,
+            replay_recent_sample_fraction: 0.4,
+            replay_recent_games: 5000,
+            train_warmup_samples: 240000,
+            train_samples_per_update: 240000,
+            train_epochs_per_update: 1,
+            mirror_probability: 0.3,
+            train_value_weight: 1.0,
+            train_policy_weight: 1.0,
+            checkpoint_interval: 20,
+            checkpoint_dir: "checkpoints".into(),
+            max_checkpoints: 50,
+            arena_interval: 20,
+            arena_simulations: 4000,
+            arena_cpuct: 1.5,
+            arena_promotion_rate: 0.50,
+            arena_promotion_confidence_z: 1.28,
+            arena_processes: 192,
+            arena_opening_book: "opening.obk".into(),
+            arena_opening_positions: 300,
+            arena_opening_plies_min: 6,
+            arena_opening_plies_max: 10,
+            pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
+            pikafish_label_eval_interval: 20,
+            pikafish_label_eval_limit: 1000,
+            pikafish_label_eval_simulations: 3000,
+            pikafish_label_eval_cpuct: 1.5,
+            tensorboard_logdir: "runs/chineseai".into(),
         }
     }
 }
@@ -471,6 +245,10 @@ impl AzLoopFileConfig {
             f(self.moves_left_quadratic_factor)
         );
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
+        line!(
+            "value_target_search_q_mix",
+            f(self.value_target_search_q_mix)
+        );
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -524,7 +302,7 @@ impl AzLoopFileConfig {
     }
 
     fn parse(text: &str) -> Self {
-        let config = toml::from_str::<AzLoopTomlConfig>(text)
+        let config = toml::from_str::<AzLoopFileConfig>(text)
             .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
         if config.format_version != AZ_LOOP_CONFIG_FORMAT_VERSION {
             panic!(
@@ -532,7 +310,7 @@ impl AzLoopFileConfig {
                 config.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
             );
         }
-        AzLoopFileConfig::from(config).normalize()
+        config.normalize()
     }
 
     pub fn arch(&self) -> AzNnueArch {
@@ -574,6 +352,7 @@ impl AzLoopFileConfig {
         self.moves_left_slope = self.moves_left_slope.max(0.0);
         self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
+        self.value_target_search_q_mix = self.value_target_search_q_mix.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -639,6 +418,7 @@ mod tests {
         assert!(text.contains("moves_left_scaled_factor = 0.2\n"));
         assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("value_target_search_q_mix = 0.25\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 0.8\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
@@ -703,7 +483,7 @@ mod tests {
             "arena_pikafish_depth = 10\n",
             "arena_pikafish_games = 20\n",
         ] {
-            let error = toml::from_str::<AzLoopTomlConfig>(removed)
+            let error = toml::from_str::<AzLoopFileConfig>(removed)
                 .expect_err("removed config keys must not be accepted");
             let key = removed.split_once(' ').unwrap().0;
             assert!(error.to_string().contains(key));

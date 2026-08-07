@@ -1,6 +1,8 @@
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_SIZE, Color, Move, PieceKind, Position,
+    BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piece_kind_index,
 };
+#[cfg(test)]
+use crate::xiangqi::PieceKind;
 
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
@@ -19,6 +21,14 @@ pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {
 ///
 /// 推理只对特征行求和，不依赖特征顺序，因此热路径不做排序，也不产生堆分配。
 /// 需要稳定顺序（例如序列化或测试）时使用 `extract_sparse_features_az`。
+/// ?? `perspective` ??????????????? [0,6]???? [7,13]?
+/// ????????????????????????????
+#[inline]
+pub fn piece_absolute_feature_index(perspective: Color, piece: Piece) -> usize {
+    let base = if piece.color == perspective { 0 } else { 7 };
+    base + piece_kind_index(piece.kind)
+}
+
 #[inline]
 pub fn fill_sparse_features_az(position: &Position, features: &mut Vec<usize>) {
     features.clear();
@@ -28,14 +38,9 @@ pub fn fill_sparse_features_az(position: &Position, features: &mut Vec<usize>) {
         let Some(piece) = position.piece_at(sq) else {
             continue;
         };
-        let relative_color = if piece.color == side {
-            Color::Red
-        } else {
-            Color::Black
-        };
-        let relative_square = orient_square(side, sq);
-        let piece_index = absolute_piece_index(relative_color, piece.kind);
-        features.push(piece_index * BOARD_SIZE + relative_square);
+        features.push(
+            piece_absolute_feature_index(side, piece) * BOARD_SIZE + canonical_square(side, sq),
+        );
     }
 }
 
@@ -74,19 +79,6 @@ pub fn mirror_sparse_features_az_canonical_file(features: &mut [usize]) {
     features.sort_unstable();
 }
 
-fn absolute_piece_index(color: Color, kind: PieceKind) -> usize {
-    let base = if color == Color::Red { 0 } else { 7 };
-    base + match kind {
-        PieceKind::General => 0,
-        PieceKind::Advisor => 1,
-        PieceKind::Elephant => 2,
-        PieceKind::Horse => 3,
-        PieceKind::Rook => 4,
-        PieceKind::Cannon => 5,
-        PieceKind::Soldier => 6,
-    }
-}
-
 fn orient_square(side: Color, sq: usize) -> usize {
     match side {
         Color::Red => sq,
@@ -107,8 +99,20 @@ mod tests {
     fn az_features_use_side_to_move_canonical_coordinates() {
         let position = Position::from_fen("4k4/9/9/9/4p4/9/9/9/9/4K4 b - - 0 1").unwrap();
         let features = extract_sparse_features_az(&position);
-        let us_general = absolute_piece_index(Color::Red, PieceKind::General) * BOARD_SIZE + 85;
-        let them_general = absolute_piece_index(Color::Black, PieceKind::General) * BOARD_SIZE + 4;
+        let side = position.side_to_move();
+        let us_general = piece_absolute_feature_index(
+            side,
+            Piece { color: side, kind: PieceKind::General },
+        ) * BOARD_SIZE
+            + canonical_square(side, 4);
+        let them_general = piece_absolute_feature_index(
+            side,
+            Piece {
+                color: side.opposite(),
+                kind: PieceKind::General,
+            },
+        ) * BOARD_SIZE
+            + canonical_square(side, 85);
 
         assert!(features.contains(&us_general));
         assert!(features.contains(&them_general));

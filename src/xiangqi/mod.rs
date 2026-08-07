@@ -4,7 +4,6 @@ pub const BOARD_SIZE: usize = BOARD_FILES * BOARD_RANKS;
 pub const STARTPOS_FEN: &str = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w";
 
 mod env;
-mod eval;
 mod geom;
 mod hash;
 mod rules;
@@ -15,8 +14,8 @@ pub use geom::{parse_square, square_name};
 pub use types::{
     Color, Move, Piece, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome, Undo,
 };
+pub(crate) use types::{color_index, piece_kind_index};
 
-use eval::signed_piece_contrib;
 #[cfg(test)]
 use geom::same_rank_or_file;
 use geom::{
@@ -56,7 +55,6 @@ impl Position {
             board,
             side_to_move: Color::Red,
             hash: 0,
-            base_eval: 0,
             advisor_counts: [0; 2],
             elephant_counts: [0; 2],
             dynamic_material_counts: [0; 2],
@@ -66,7 +64,6 @@ impl Position {
         let state = position.compute_state();
         Self {
             hash: state.hash,
-            base_eval: state.base_eval,
             advisor_counts: state.advisor_counts,
             elephant_counts: state.elephant_counts,
             dynamic_material_counts: state.dynamic_material_counts,
@@ -125,7 +122,6 @@ impl Position {
             board,
             side_to_move,
             hash: 0,
-            base_eval: 0,
             advisor_counts: [0; 2],
             elephant_counts: [0; 2],
             dynamic_material_counts: [0; 2],
@@ -135,7 +131,6 @@ impl Position {
         let state = position.compute_state();
         let position = Self {
             hash: state.hash,
-            base_eval: state.base_eval,
             advisor_counts: state.advisor_counts,
             elephant_counts: state.elephant_counts,
             dynamic_material_counts: state.dynamic_material_counts,
@@ -244,7 +239,6 @@ impl Position {
             board,
             side_to_move: self.side_to_move,
             hash: 0,
-            base_eval: 0,
             advisor_counts: [0; 2],
             elephant_counts: [0; 2],
             dynamic_material_counts: [0; 2],
@@ -254,7 +248,6 @@ impl Position {
         let state = position.compute_state();
         Self {
             hash: state.hash,
-            base_eval: state.base_eval,
             advisor_counts: state.advisor_counts,
             elephant_counts: state.elephant_counts,
             dynamic_material_counts: state.dynamic_material_counts,
@@ -353,22 +346,19 @@ impl Position {
         self.hash ^= zobrist_piece_key(from, moving);
         if let Some(captured) = undo.captured {
             self.hash ^= zobrist_piece_key(to, captured);
-            self.base_eval -= signed_piece_contrib(captured, to);
-            self.adjust_minor_counts(captured, -1);
+                self.adjust_minor_counts(captured, -1);
             self.adjust_dynamic_material_counts(captured, -1);
             if captured.kind == PieceKind::General {
                 self.general_squares[color_hash_index(captured.color)] = None;
             }
         }
 
-        self.base_eval -= signed_piece_contrib(moving, from);
         self.board[to] = Some(moving);
         self.board[from] = None;
         if moving.kind == PieceKind::General {
             self.general_squares[color_hash_index(moving.color)] = Some(to);
         }
         self.hash ^= zobrist_piece_key(to, moving);
-        self.base_eval += signed_piece_contrib(moving, to);
         self.side_to_move = self.side_to_move.opposite();
         self.hash ^= SIDE_TO_MOVE_KEY;
         self.halfmove_clock = if undo.captured.is_some() || moving.kind == PieceKind::Soldier {
@@ -385,17 +375,14 @@ impl Position {
         let moving = self.board[to].expect("move to occupied square");
         self.hash ^= SIDE_TO_MOVE_KEY;
         self.hash ^= zobrist_piece_key(to, moving);
-        self.base_eval -= signed_piece_contrib(moving, to);
         self.board[from] = Some(moving);
         self.board[to] = undo.captured;
         if moving.kind == PieceKind::General {
             self.general_squares[color_hash_index(moving.color)] = Some(from);
         }
         self.hash ^= zobrist_piece_key(from, moving);
-        self.base_eval += signed_piece_contrib(moving, from);
         if let Some(captured) = undo.captured {
             self.hash ^= zobrist_piece_key(to, captured);
-            self.base_eval += signed_piece_contrib(captured, to);
             self.adjust_minor_counts(captured, 1);
             self.adjust_dynamic_material_counts(captured, 1);
             if captured.kind == PieceKind::General {
@@ -466,7 +453,6 @@ impl Position {
 
     fn compute_state(&self) -> PositionState {
         let mut hash = 0u64;
-        let mut base_eval = 0;
         let mut advisor_counts = [0u8; 2];
         let mut elephant_counts = [0u8; 2];
         let mut dynamic_material_counts = [0u8; 2];
@@ -476,7 +462,6 @@ impl Position {
                 continue;
             };
             hash ^= zobrist_piece_key(sq, piece);
-            base_eval += signed_piece_contrib(piece, sq);
             match piece.kind {
                 PieceKind::Advisor => advisor_counts[color_hash_index(piece.color)] += 1,
                 PieceKind::Elephant => elephant_counts[color_hash_index(piece.color)] += 1,
@@ -493,7 +478,6 @@ impl Position {
 
         PositionState {
             hash,
-            base_eval,
             advisor_counts,
             elephant_counts,
             dynamic_material_counts,

@@ -515,4 +515,46 @@ mod tests {
                 .any(|gradient| gradient.abs() > 1.0e-8)
         );
     }
+
+    /// CPU ???`AzNnue`?? Candle GPU ???????????
+    /// `from_model` + `copy_to_model` ??????????????
+    /// ?? CPU/GPU ???????????
+    #[test]
+    fn gpu_and_cpu_weight_tensors_roundtrip() {
+        let model = AzNnue::random(16, 12345);
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let mut back = AzNnue::random(16, 54321);
+        candle.copy_to_model(&mut back).unwrap();
+
+        macro_rules! assert_weight_parity {
+            ($($field:ident),* $(,)?) => {
+                $(
+                    assert_eq!(
+                        model.$field, back.$field,
+                        "weight tensor `{}` drifted between CPU and GPU paths",
+                        stringify!($field)
+                    );
+                )*
+            };
+        }
+        assert_weight_parity!(
+            input_hidden,
+            input_piece_hidden,
+            input_rank_hidden,
+            input_file_hidden,
+            input_king_piece_hidden,
+            rule_context_hidden,
+            hidden_bias,
+            value_head_hidden,
+            value_head_bias,
+            value_head_output,
+            moves_left_hidden,
+            moves_left_bias_hidden,
+            moves_left_output,
+            moves_left_bias,
+            policy_move_bias,
+            policy_consequence_output,
+        );
+    }
 }
+

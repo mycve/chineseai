@@ -785,11 +785,11 @@ fn move_search_meta(
 fn assign_value_targets(
     samples: &mut [AzTrainingSample],
     game_result_red: f32,
-    _config: &AzLoopConfig,
+    config: &AzLoopConfig,
 ) {
     // 价值目标 = MCTS 根搜索 Q 与终局结果的混合：0.25 * root_q + 0.75 * 终局结果。
     // 两者都已换算到行棋方视角（root_q 来自行棋方正对的搜索，终局结果乘以 side_sign）。
-    let mix = super::VALUE_TARGET_SEARCH_Q_MIX.clamp(0.0, 1.0);
+    let mix = config.value_target_search_q_mix.clamp(0.0, 1.0);
     for sample in samples {
         let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
         let blended = (mix * sample.meta.root_q + (1.0 - mix) * side_result).clamp(-1.0, 1.0);

@@ -1,8 +1,8 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 
 use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
 
-/// 一次全局优化步消耗的样本数，等于配置的全局 batch size（不按卡数放大）。
+/// ????????????????????? batch size?????????
 pub fn global_training_step_sample_count(global_batch_size: usize) -> usize {
     global_batch_size.max(1)
 }
@@ -14,7 +14,7 @@ pub fn train_samples(
     lr: f32,
     batch_size: usize,
     rng: &mut SplitMix64,
-) -> AzTrainStats {
+) -> Result<AzTrainStats, String> {
     train_samples_weighted(
         model,
         samples,
@@ -34,7 +34,7 @@ pub fn train_samples_weighted(
     batch_size: usize,
     rng: &mut SplitMix64,
     loss_weights: AzTrainLossWeights,
-) -> AzTrainStats {
+) -> Result<AzTrainStats, String> {
     train_samples_weighted_shared(
         model,
         Arc::new(samples.to_vec()),
@@ -54,7 +54,7 @@ pub fn train_samples_weighted_owned(
     batch_size: usize,
     rng: &mut SplitMix64,
     loss_weights: AzTrainLossWeights,
-) -> AzTrainStats {
+) -> Result<AzTrainStats, String> {
     train_samples_weighted_shared(
         model,
         Arc::new(samples),
@@ -74,8 +74,8 @@ fn train_samples_weighted_shared(
     batch_size: usize,
     rng: &mut SplitMix64,
     loss_weights: AzTrainLossWeights,
-) -> AzTrainStats {
-    match super::train_gpu::train_samples_gpu(
+) -> Result<AzTrainStats, String> {
+    super::train_gpu::train_samples_gpu(
         model,
         samples,
         epochs,
@@ -83,8 +83,5 @@ fn train_samples_weighted_shared(
         batch_size,
         rng,
         loss_weights,
-    ) {
-        Ok(stats) => stats,
-        Err(err) => panic!("Candle CUDA training failed: {err}"),
-    }
+    )
 }

@@ -26,9 +26,11 @@ mod train_gpu;
 #[path = "az/train_gpu_candle.rs"]
 mod train_gpu_candle;
 
-use crate::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, fill_sparse_features_az};
+use crate::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, canonical_square, fill_sparse_features_az, piece_absolute_feature_index};
+use crate::version::MODEL_FORMAT_VERSION;
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position,
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position, color_index,
+    piece_kind_index,
 };
 
 pub use alphazero::{
@@ -55,7 +57,6 @@ pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub const VALUE_TARGET_SEARCH_Q_MIX: f32 = 0.25;
 pub(super) const MOVES_LEFT_HEAD_SIZE: usize = 32;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 8.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -294,9 +295,8 @@ impl AzEvalAccumulator {
             let mut features = Vec::with_capacity(32);
             for sq in 0..BOARD_SIZE {
                 if let Some(piece) = position.piece_at(sq) {
-                    let relative_color = if piece.color == perspective { 0 } else { 7 };
-                    let piece_index = relative_color + piece_kind_index(piece.kind);
-                    features.push(piece_index * BOARD_SIZE + canonical_square_for(perspective, sq));
+                    let piece_index = piece_absolute_feature_index(perspective, piece);
+                    features.push(piece_index * BOARD_SIZE + canonical_square(perspective, sq));
                 }
             }
             let start = index * model.hidden_size;
@@ -450,27 +450,6 @@ fn canonical_square_for(perspective: Color, sq: usize) -> usize {
     }
 }
 
-#[inline(always)]
-const fn color_index(color: Color) -> usize {
-    match color {
-        Color::Red => 0,
-        Color::Black => 1,
-    }
-}
-
-#[inline(always)]
-const fn piece_kind_index(kind: PieceKind) -> usize {
-    match kind {
-        PieceKind::General => 0,
-        PieceKind::Advisor => 1,
-        PieceKind::Elephant => 2,
-        PieceKind::Horse => 3,
-        PieceKind::Rook => 4,
-        PieceKind::Cannon => 5,
-        PieceKind::Soldier => 6,
-    }
-}
-
 #[derive(Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
@@ -573,6 +552,7 @@ pub struct AzLoopConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub value_target_search_q_mix: f32,
     pub opening_positions: Vec<Position>,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -1013,7 +993,7 @@ impl AzNnue {
         insert_candle_var(
             &varmap,
             "az_model_format_version",
-            &[AZ_MODEL_FORMAT_VERSION],
+            &[MODEL_FORMAT_VERSION],
             (1,),
         )?;
         macro_rules! save_tensor {
@@ -1031,12 +1011,12 @@ impl AzNnue {
                 .map_err(candle_io_error)?
         };
         let format_version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
-        if format_version.as_slice() != [AZ_MODEL_FORMAT_VERSION] {
+        if format_version.as_slice() != [MODEL_FORMAT_VERSION] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "unsupported AZ model format {:?}; expected v{}",
-                    format_version, AZ_MODEL_FORMAT_VERSION
+                    format_version, MODEL_FORMAT_VERSION
                 ),
             ));
         }
@@ -1583,7 +1563,8 @@ pub fn benchmark_training(
             break;
         }
     }
-    let stats = train_samples(model, &samples, epochs, lr, batch_size, &mut rng);
+    let stats = train_samples(model, &samples, epochs, lr, batch_size, &mut rng)
+        .unwrap_or_else(|err| panic!("training failed: {err}"));
     AzTrainBenchmark {
         loss: stats.loss,
         value_loss: stats.value_loss,
@@ -1831,34 +1812,12 @@ unsafe fn dot_product_avx2_fma(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
-    let chunks = left.len() / 8;
-    let mut acc = _mm256_setzero_ps();
-    for chunk in 0..chunks {
-        let index = chunk * 8;
-        unsafe {
-            let l = _mm256_loadu_ps(left.as_ptr().add(index));
-            let r = _mm256_loadu_ps(right.as_ptr().add(index));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(l, r));
-        }
-    }
-    let mut lanes = [0.0f32; 8];
-    unsafe {
-        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    }
-    let mut sum = lanes.iter().sum::<f32>();
-    for index in (chunks * 8)..left.len() {
-        sum += left[index] * right[index];
-    }
-    sum
-}
-
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "avx2")]
-unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     let chunks = left.len() / 8;
     let mut acc = _mm256_setzero_ps();
@@ -1881,27 +1840,12 @@ unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
-    let chunks = hidden.len() / 8;
-    for chunk in 0..chunks {
-        let index = chunk * 8;
-        unsafe {
-            let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
-            let right = _mm256_loadu_ps(row.as_ptr().add(index));
-            _mm256_storeu_ps(hidden.as_mut_ptr().add(index), _mm256_add_ps(left, right));
-        }
-    }
-    for index in (chunks * 8)..hidden.len() {
-        hidden[index] += row[index];
-    }
-}
-
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "avx2")]
-unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
+    #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     let chunks = hidden.len() / 8;
     for chunk in 0..chunks {
@@ -1940,32 +1884,12 @@ unsafe fn add_scaled_feature_row_avx2_fma(hidden: &mut [f32], row: &[f32], scale
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn add_scaled_feature_row_avx2(hidden: &mut [f32], row: &[f32], scale: f32) {
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
-    let scale_scalar = scale;
-    let scale = _mm256_set1_ps(scale_scalar);
-    let chunks = hidden.len() / 8;
-    for chunk in 0..chunks {
-        let index = chunk * 8;
-        unsafe {
-            let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
-            let right = _mm256_loadu_ps(row.as_ptr().add(index));
-            _mm256_storeu_ps(
-                hidden.as_mut_ptr().add(index),
-                _mm256_add_ps(left, _mm256_mul_ps(scale, right)),
-            );
-        }
-    }
-    for index in (chunks * 8)..hidden.len() {
-        hidden[index] += row[index] * scale_scalar;
-    }
-}
-
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "avx2")]
-unsafe fn add_scaled_feature_row_avx2(hidden: &mut [f32], row: &[f32], scale: f32) {
+    #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     let scale_scalar = scale;
     let scale = _mm256_set1_ps(scale_scalar);
@@ -2026,7 +1950,7 @@ unsafe fn relu_in_place_neon(values: &mut [f32]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn input_embedding_add_features_avx2(
     input_hidden: &[f32],
@@ -2034,32 +1958,9 @@ unsafe fn input_embedding_add_features_avx2(
     features: &[usize],
     hidden: &mut [f32],
 ) {
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
-    let chunks = hidden_size / 8;
-    for &feature in features {
-        let row = &input_hidden[feature * hidden_size..(feature + 1) * hidden_size];
-        for chunk in 0..chunks {
-            let index = chunk * 8;
-            unsafe {
-                let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
-                let right = _mm256_loadu_ps(row.as_ptr().add(index));
-                _mm256_storeu_ps(hidden.as_mut_ptr().add(index), _mm256_add_ps(left, right));
-            }
-        }
-        for index in (chunks * 8)..hidden_size {
-            hidden[index] += row[index];
-        }
-    }
-}
-
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "avx2")]
-unsafe fn input_embedding_add_features_avx2(
-    input_hidden: &[f32],
-    hidden_size: usize,
-    features: &[usize],
-    hidden: &mut [f32],
-) {
+    #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     let chunks = hidden_size / 8;
     for &feature in features {
@@ -2078,27 +1979,12 @@ unsafe fn input_embedding_add_features_avx2(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn relu_in_place_avx2(values: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
-    let zero = _mm256_setzero_ps();
-    let chunks = values.len() / 8;
-    for chunk in 0..chunks {
-        let index = chunk * 8;
-        unsafe {
-            let value = _mm256_loadu_ps(values.as_ptr().add(index));
-            _mm256_storeu_ps(values.as_mut_ptr().add(index), _mm256_max_ps(value, zero));
-        }
-    }
-    for value in &mut values[(chunks * 8)..] {
-        *value = value.max(0.0);
-    }
-}
-
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "avx2")]
-unsafe fn relu_in_place_avx2(values: &mut [f32]) {
+    #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     let zero = _mm256_setzero_ps();
     let chunks = values.len() / 8;
@@ -2535,8 +2421,12 @@ mod tests {
         ];
 
         let mut rng = SplitMix64::new(17);
-        let before = train_samples(&mut model, &samples, 1, 0.003, 4, &mut rng).value_loss;
-        let after = train_samples(&mut model, &samples, 300, 0.003, 4, &mut rng).value_loss;
+        let before = train_samples(&mut model, &samples, 1, 0.003, 4, &mut rng)
+            .unwrap()
+            .value_loss;
+        let after = train_samples(&mut model, &samples, 300, 0.003, 4, &mut rng)
+            .unwrap()
+            .value_loss;
 
         assert!(after < before * 0.5, "before={before} after={after}");
         assert!(after < 0.35, "after={after}");
@@ -2610,8 +2500,10 @@ mod tests {
 
         let mut rng_single = SplitMix64::new(99);
         let mut rng_repeated = SplitMix64::new(99);
-        let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single);
-        let repeated_stats = train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated);
+        let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single)
+            .unwrap();
+        let repeated_stats = train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated)
+            .unwrap();
 
         assert!((single_stats.loss - repeated_stats.loss).abs() < 1e-5);
         assert!((single_stats.value_loss - repeated_stats.value_loss).abs() < 1e-5);
@@ -2698,7 +2590,8 @@ mod tests {
             policy: 0.0,
             moves_left: 0.0,
         };
-        train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights);
+        train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights)
+            .unwrap();
 
         let input_changed = before_input
             .iter()
