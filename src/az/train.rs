@@ -2,8 +2,9 @@
 
 use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
 
-pub fn global_training_step_sample_count(batch_size_per_gpu: usize) -> usize {
-    batch_size_per_gpu.max(1) * super::train_gpu::training_cuda_device_count()
+/// 一次全局优化步消耗的样本数，等于配置的全局 batch size（不按卡数放大）。
+pub fn global_training_step_sample_count(global_batch_size: usize) -> usize {
+    global_batch_size.max(1)
 }
 
 pub fn train_samples(

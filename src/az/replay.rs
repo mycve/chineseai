@@ -15,7 +15,7 @@ use super::{
 const REPLAY_MAGIC: &[u8] = b"AZRP";
 /// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
 // v32 开始使用干净主搜索与独立战术教师；旧访问目标语义不同，禁止混入。
-const REPLAY_FILE_VERSION: u32 = 33;
+const REPLAY_FILE_VERSION: u32 = 34;
 /// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
 const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";
@@ -65,7 +65,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
         || sample.policy.len() != sample.move_indices.len()
-        || sample.policy_repeats_history.len() != sample.move_indices.len()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -85,9 +84,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     for &p in &sample.policy {
         replay_push_f32(out, p);
-    }
-    for &repeat in &sample.policy_repeats_history {
-        replay_push_f32(out, repeat);
     }
     for &value in &normalize_wdl_target(sample.value_wdl) {
         replay_push_f32(out, value);
@@ -196,10 +192,6 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     for _ in 0..nm {
         policy.push(replay_read_f32(reader)?);
     }
-    let mut policy_repeats_history = Vec::with_capacity(nm as usize);
-    for _ in 0..nm {
-        policy_repeats_history.push(replay_read_f32(reader)?);
-    }
     let mut value_wdl = [0.0f32; WDL_HEAD_SIZE];
     for value in &mut value_wdl {
         *value = replay_read_f32(reader)?;
@@ -228,7 +220,6 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         rule_context,
         move_indices,
         policy,
-        policy_repeats_history,
         value_wdl,
         value,
         side_sign,

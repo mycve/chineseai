@@ -55,16 +55,12 @@ unsafe impl Send for NcclAllReduce {}
 #[cfg(feature = "nccl-train")]
 unsafe impl Sync for NcclAllReduce {}
 
-pub(crate) fn training_cuda_device_count() -> usize {
-    cuda_device_indices().len().max(1)
-}
-
 pub(super) fn train_samples_gpu(
     model: &mut AzNnue,
     samples: Arc<Vec<AzTrainingSample>>,
     epochs: usize,
     lr: f32,
-    per_gpu_batch_size: usize,
+    global_batch_size: usize,
     rng: &mut super::SplitMix64,
     loss_weights: AzTrainLossWeights,
 ) -> CandleResult<AzTrainStats> {
@@ -87,8 +83,8 @@ pub(super) fn train_samples_gpu(
             .gpu_trainer
             .as_mut()
             .expect("gpu trainer was initialized");
-        let per_gpu = per_gpu_batch_size.max(1);
-        let step_chunk = (per_gpu * trainer.replicas.len().max(1)).max(1);
+        // batch_size 为全局语义：一次优化步的样本总数，由 dataloader 按 GPU 数切分。
+        let step_chunk = global_batch_size.max(1);
         trainer.set_learning_rate(lr);
         for _ in 0..epochs {
             let config = DataLoaderConfig {
@@ -140,10 +136,21 @@ pub(super) fn train_samples_gpu(
 
 impl GpuTrainer {
     fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
-        let device_indices = cuda_device_indices();
-        let mut replicas = Vec::with_capacity(device_indices.len());
-        for &device_index in &device_indices {
-            replicas.push(GpuReplica::new(model, device_index)?);
+        // 逐个尝试可用的 CUDA 设备；若全部不可用则回退为 CPU 训练（单副本）。
+        let mut replicas = Vec::new();
+        let mut device_indices = Vec::new();
+        for &device_index in &cuda_device_indices() {
+            match GpuReplica::new(model, device_index) {
+                Ok(replica) => {
+                    device_indices.push(device_index);
+                    replicas.push(replica);
+                }
+                Err(_) => {}
+            }
+        }
+        if replicas.is_empty() {
+            eprintln!("[chineseai] no usable CUDA device; falling back to CPU training");
+            replicas.push(GpuReplica::new_cpu(model)?);
         }
         let mut optimizers = Vec::with_capacity(replicas.len());
         for replica in &replicas {
@@ -158,7 +165,7 @@ impl GpuTrainer {
                 },
             )?);
         }
-        if device_indices.len() > 1 {
+        if replicas.len() > 1 {
             eprintln!(
                 "[chineseai] multi-gpu CUDA training: devices={:?}; synchronize shards each step.",
                 device_indices
@@ -566,6 +573,13 @@ impl GpuReplica {
         Ok(Self { device, model })
     }
 
+    /// 无可用 CUDA 设备时的 CPU 训练副本。
+    fn new_cpu(model: &AzNnue) -> CandleResult<Self> {
+        let device = Device::Cpu;
+        let model = AzCandleModel::from_model(model, &device)?;
+        Ok(Self { device, model })
+    }
+
     fn compute_batch_grads(
         &self,
         batch: PackedBatch,
@@ -647,11 +661,7 @@ impl GpuReplica {
         let legal_policy_logits = forward
             .policy_logits
             .gather(&batch_tensors.policy_indices, 1)?;
-        let repeat_logits = batch_tensors
-            .policy_repeats_history
-            .broadcast_mul(&forward.policy_repeat_logit)?;
-        let legal_policy_logits =
-            ((legal_policy_logits + repeat_logits)? + &forward.policy_consequence_logits)?;
+        let legal_policy_logits = (&legal_policy_logits + &forward.policy_consequence_logits)?;
         let masked_policy_logits = (&legal_policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -863,14 +873,10 @@ fn cuda_device_indices() -> Vec<usize> {
     } else {
         probe_cuda_device_indices(64)
     };
-    let probed = candidates
+    candidates
         .into_iter()
         .filter(|&index| cuda_device_supports_training(index))
-        .collect::<Vec<_>>();
-    if !probed.is_empty() {
-        return probed;
-    }
-    vec![0]
+        .collect()
 }
 
 fn cuda_visible_device_count() -> Option<usize> {

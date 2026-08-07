@@ -111,7 +111,6 @@ pub(super) struct PackedBatch {
     pub policy_indices: Vec<u32>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
-    pub policy_repeats_history: Vec<f32>,
     pub policy_consequence_from: Vec<u32>,
     pub policy_consequence_to: Vec<u32>,
     pub policy_consequence_captured: Vec<u32>,
@@ -163,7 +162,6 @@ impl PackedBatch {
             policy_indices: vec![0u32; batch_size * max_policy_moves],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
-            policy_repeats_history: vec![0.0; batch_size * max_policy_moves],
             policy_consequence_from: vec![0u32; batch_size * max_policy_moves],
             policy_consequence_to: vec![0u32; batch_size * max_policy_moves],
             policy_consequence_captured: vec![0u32; batch_size * max_policy_moves],
@@ -236,21 +234,15 @@ impl PackedBatch {
             }
         }
         let mut policy_offset = 0usize;
-        for (sample_offset, (&move_index, &target)) in sample
+        for (&move_index, &target) in sample
             .move_indices
             .iter()
             .zip(sample.policy.iter())
-            .enumerate()
         {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_indices[policy_base + policy_offset] = move_index as u32;
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
-                self.policy_repeats_history[policy_base + policy_offset] = sample
-                    .policy_repeats_history
-                    .get(sample_offset)
-                    .copied()
-                    .unwrap_or(0.0);
                 if let Some((from, to)) = dense_move_squares(move_index) {
                     let moved_feature = board_features[from];
                     if moved_feature != usize::MAX {
@@ -423,7 +415,6 @@ mod tests {
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: vec![0, 1],
             policy: vec![1.0 + index as f32, 1.0],
-            policy_repeats_history: vec![0.0, 0.0],
             value_wdl: [1.0, 0.0, 0.0],
             value: 2.0,
             side_sign: 1.0,
@@ -489,7 +480,6 @@ mod tests {
         training_sample.features = vec![moved_feature, captured_feature];
         training_sample.move_indices = vec![move_index];
         training_sample.policy = vec![1.0];
-        training_sample.policy_repeats_history = vec![0.0];
 
         let packed = PackedBatch::from_indices(&[training_sample], &[0]);
         assert_eq!(packed.policy_consequence_from, vec![moved_feature as u32]);

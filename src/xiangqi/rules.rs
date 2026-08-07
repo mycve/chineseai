@@ -98,6 +98,8 @@ impl Position {
         if repeated_indices.len() < 2 {
             return None;
         }
+        // 长将与长捉都在各自第二次闭合成环（同局面第 3 次出现, 即 repeated==2）时
+        // 立即裁决并据此在走法生成时过滤该着法。优先级：将 > 捉。
         if repeated_indices.len() == 2 {
             return match (red_violation, black_violation) {
                 (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
@@ -105,6 +107,11 @@ impl Position {
                 }
                 (Some(RuleViolation::LongCheck), _) => Some(RuleOutcome::Win(Color::Black)),
                 (_, Some(RuleViolation::LongCheck)) => Some(RuleOutcome::Win(Color::Red)),
+                (Some(RuleViolation::LongChase), Some(RuleViolation::LongChase)) => {
+                    Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase))
+                }
+                (Some(RuleViolation::LongChase), _) => Some(RuleOutcome::Win(Color::Black)),
+                (_, Some(RuleViolation::LongChase)) => Some(RuleOutcome::Win(Color::Red)),
                 _ => None,
             };
         }

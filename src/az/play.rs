@@ -11,7 +11,7 @@ use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, Ru
 use super::alphazero::{AzSearchWorkspace, alphazero_search_with_rules_reusing};
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_rules, dense_move_index, policy_repeat_features, rule_context_features,
+    alphazero_search_with_rules, dense_move_index, rule_context_features,
     scalar_value_to_wdl_target,
 };
 
@@ -349,13 +349,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         for ply in 0..config.max_plies {
             plies = ply + 1;
-            let (legal, policy_repeats) = {
+            let legal = {
                 crate::scope_profile!("az.selfplay.root_legal_moves");
                 position
                     .legal_moves_with_rules_and_repetition(&rule_history)
                     .into_iter()
-                    .map(|(mv, repeat)| (mv, f32::from(repeat)))
-                    .unzip::<_, _, Vec<_>, Vec<_>>()
+                    .map(|(mv, _)| mv)
+                    .collect::<Vec<_>>()
             };
             if legal.is_empty() {
                 result = Some(if position.side_to_move() == Color::Red {
@@ -400,7 +400,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &position,
                     &rule_history,
                     legal,
-                    policy_repeats,
                     model,
                     limits,
                     &mut search_workspace,
@@ -698,7 +697,6 @@ fn make_training_sample(
         .iter()
         .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
-    let policy_repeats_history = policy_repeat_features(position, rule_history, &moves);
     if mirror_file {
         mirror_sparse_features_az_canonical_file(&mut features);
         for mv in &mut moves {
@@ -724,7 +722,6 @@ fn make_training_sample(
         rule_context: rule_context_features(position, rule_history),
         move_indices,
         policy,
-        policy_repeats_history,
         value_wdl: scalar_value_to_wdl_target(value),
         value: value.clamp(-1.0, 1.0),
         side_sign,
@@ -790,10 +787,14 @@ fn assign_value_targets(
     game_result_red: f32,
     _config: &AzLoopConfig,
 ) {
+    // 价值目标 = MCTS 根搜索 Q 与终局结果的混合：0.25 * root_q + 0.75 * 终局结果。
+    // 两者都已换算到行棋方视角（root_q 来自行棋方正对的搜索，终局结果乘以 side_sign）。
+    let mix = super::VALUE_TARGET_SEARCH_Q_MIX.clamp(0.0, 1.0);
     for sample in samples {
         let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
-        sample.value_wdl = scalar_value_to_wdl_target(side_result);
-        sample.value = side_result;
+        let blended = (mix * sample.meta.root_q + (1.0 - mix) * side_result).clamp(-1.0, 1.0);
+        sample.value_wdl = scalar_value_to_wdl_target(blended);
+        sample.value = blended;
     }
 }
 
@@ -1121,7 +1122,6 @@ mod tests {
             rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
             move_indices: Vec::new(),
             policy: Vec::new(),
-            policy_repeats_history: Vec::new(),
             value_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign,

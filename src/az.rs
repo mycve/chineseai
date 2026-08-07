@@ -8,7 +8,8 @@ mod alphazero;
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl")),
-    all(test, target_os = "macos")
+    all(test, target_os = "macos"),
+    target_os = "windows",
 ))]
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
@@ -19,7 +20,8 @@ mod train;
 mod train_gpu;
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
-    all(target_os = "linux", not(target_env = "musl"))
+    all(target_os = "linux", not(target_env = "musl")),
+    target_os = "windows",
 ))]
 #[path = "az/train_gpu_candle.rs"]
 mod train_gpu_candle;
@@ -49,6 +51,8 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
+/// 自对弈价值目标：终局结果 与 MCTS 根搜索 Q 的混合权重（root_q 占比）。
+pub const VALUE_TARGET_SEARCH_Q_MIX: f32 = 0.25;
 pub(super) const MOVES_LEFT_HEAD_SIZE: usize = 32;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 const AZ_MODEL_FORMAT_VERSION: f32 = 8.0;
@@ -682,7 +686,6 @@ pub struct AzTrainingSample {
     pub rule_context: [f32; RULE_CONTEXT_SIZE],
     pub move_indices: Vec<usize>,
     pub policy: Vec<f32>,
-    pub policy_repeats_history: Vec<f32>,
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
     pub side_sign: f32,
@@ -737,7 +740,6 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
             &position,
             &moves,
             &sample.rule_context,
-            &sample.policy_repeats_history,
             &mut scratch,
         );
         let max_logit = scratch
@@ -846,25 +848,6 @@ pub fn rule_context_features(
         (cycle_count(side, is_chase) as f32 / 4.0).min(1.0),
         (cycle_count(side.opposite(), is_chase) as f32 / 4.0).min(1.0),
     ]
-}
-
-pub fn policy_repeat_features(
-    position: &Position,
-    history: &[crate::xiangqi::RuleHistoryEntry],
-    moves: &[Move],
-) -> Vec<f32> {
-    let next_side = position.side_to_move().opposite();
-    moves
-        .iter()
-        .map(|&mv| {
-            let next_hash = position.hash_after_move(mv);
-            f32::from(
-                history
-                    .iter()
-                    .any(|entry| entry.hash == next_hash && entry.side_to_move == next_side),
-            )
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1104,7 +1087,6 @@ impl AzNnue {
             position,
             moves,
             &rule_context_features(position, history),
-            &policy_repeat_features(position, history, moves),
             &mut scratch,
         )
         .value
@@ -1116,7 +1098,7 @@ impl AzNnue {
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
-        self.evaluate_with_scratch_output(position, moves, &[0.0; RULE_CONTEXT_SIZE], &[], scratch)
+        self.evaluate_with_scratch_output(position, moves, &[0.0; RULE_CONTEXT_SIZE], scratch)
             .value
     }
 
@@ -1125,7 +1107,6 @@ impl AzNnue {
         position: &Position,
         moves: &[Move],
         rule_context: &[f32; RULE_CONTEXT_SIZE],
-        policy_repeats_history: &[f32],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_with_scratch");
@@ -1161,7 +1142,6 @@ impl AzNnue {
             &features,
             value,
             moves,
-            policy_repeats_history,
             scratch,
         );
         scratch.features = features;
@@ -1178,7 +1158,6 @@ impl AzNnue {
         accumulator_hidden: &[f32],
         moves: &[Move],
         rule_context: &[f32; RULE_CONTEXT_SIZE],
-        policy_repeats_history: &[f32],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_incremental_with_scratch");
@@ -1213,7 +1192,6 @@ impl AzNnue {
             &[],
             value,
             moves,
-            policy_repeats_history,
             scratch,
         );
         AzEvalOutput {
@@ -1229,7 +1207,6 @@ impl AzNnue {
         features: &[usize],
         value: f32,
         moves: &[Move],
-        policy_repeats_history: &[f32],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         scratch.logits.resize(moves.len(), 0.0);
@@ -1257,7 +1234,7 @@ impl AzNnue {
                     + self.policy_piece_square_logit(position, side, *mv);
             }
         }
-        let _ = (features, policy_repeats_history);
+        let _ = features;
         value
     }
 
@@ -1588,13 +1565,11 @@ pub fn benchmark_training(
         for value in &mut policy {
             *value /= policy_sum;
         }
-        let policy_repeats_history = vec![0.0; move_indices.len()];
         samples.push(AzTrainingSample {
             features,
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices,
             policy,
-            policy_repeats_history,
             value_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign: 1.0,
@@ -2341,7 +2316,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: vec![0, 1],
             policy: vec![0.6, 0.4],
-            policy_repeats_history: vec![0.0, 1.0],
             value_wdl: scalar_value_to_wdl_target(0.1),
             value: 0.1,
             side_sign: 1.0,
@@ -2414,7 +2388,6 @@ mod tests {
             &position,
             &moves,
             &[0.0; RULE_CONTEXT_SIZE],
-            &[],
             &mut baseline,
         );
 
@@ -2426,7 +2399,6 @@ mod tests {
             &position,
             &moves,
             &[0.0; RULE_CONTEXT_SIZE],
-            &[],
             &mut changed,
         );
         assert!(
@@ -2509,7 +2481,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
@@ -2524,7 +2495,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
@@ -2539,7 +2509,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(0.75),
                 value: 0.75,
                 side_sign: 1.0,
@@ -2554,7 +2523,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-0.75),
                 value: -0.75,
                 side_sign: 1.0,
@@ -2583,7 +2551,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
@@ -2598,7 +2565,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
@@ -2613,7 +2579,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(0.5),
                 value: 0.5,
                 side_sign: 1.0,
@@ -2628,7 +2593,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-0.5),
                 value: -0.5,
                 side_sign: 1.0,
@@ -2671,7 +2635,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
@@ -2686,7 +2649,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
@@ -2701,7 +2663,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(0.75),
                 value: 0.75,
                 side_sign: 1.0,
@@ -2716,7 +2677,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
-                policy_repeats_history: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-0.75),
                 value: -0.75,
                 side_sign: 1.0,
@@ -2827,7 +2787,6 @@ mod tests {
         assert_eq!(loaded_samples[0].meta.ply, 9);
         assert!((loaded_samples[0].meta.best_q - 0.33).abs() < 1e-6);
         assert_eq!(loaded_samples[0].meta.played_visits, 13);
-        assert_eq!(loaded_samples[0].policy_repeats_history, vec![0.0, 1.0]);
     }
 
     #[test]
@@ -2838,7 +2797,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: vec![0],
                 policy: vec![1.0],
-                policy_repeats_history: vec![0.0],
                 value_wdl: scalar_value_to_wdl_target(0.0),
                 value: 0.0,
                 side_sign: 1.0,
@@ -2880,7 +2838,6 @@ mod tests {
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: vec![0],
                 policy: vec![1.0],
-                policy_repeats_history: vec![0.0],
                 value_wdl: scalar_value_to_wdl_target(0.0),
                 value: 0.0,
                 side_sign: 1.0,
@@ -2924,19 +2881,4 @@ mod tests {
         assert_eq!(context[3..], [0.0; 4]);
     }
 
-    #[test]
-    fn policy_repeat_feature_marks_move_returning_to_history() {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let mv = moves[0];
-        let mover = position.side_to_move();
-        let mut next = position.clone();
-        next.make_move(mv);
-        let repeated = next.rule_history_entry_after_moved(mover, mv.to as usize);
-
-        assert_eq!(
-            policy_repeat_features(&position, &[repeated], &[mv]),
-            vec![1.0]
-        );
-    }
 }

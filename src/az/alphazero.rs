@@ -6,7 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64, policy_repeat_features,
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64,
     rule_context_features,
 };
 
@@ -290,7 +290,6 @@ pub(super) fn alphazero_search_with_rules_reusing(
     position: &Position,
     rule_history: &[RuleHistoryEntry],
     root_moves: Vec<Move>,
-    root_policy_repeats: Vec<f32>,
     model: &AzNnue,
     limits: AzSearchLimits,
     workspace: &mut AzSearchWorkspace,
@@ -300,7 +299,6 @@ pub(super) fn alphazero_search_with_rules_reusing(
         position.clone(),
         rule_history,
         Some(root_moves),
-        Some(root_policy_repeats),
         model,
         limits,
         workspace,
@@ -334,7 +332,6 @@ struct AzTree<'a> {
     accumulator_arena: Vec<f32>,
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
-    root_policy_repeats: Option<Vec<f32>>,
     root_raw_priors: Vec<f32>,
     root: usize,
     cpuct: f32,
@@ -544,7 +541,6 @@ impl<'a> AzTree<'a> {
             position,
             &rule_history,
             root_moves,
-            None,
             model,
             limits,
             Vec::with_capacity(initial_nodes),
@@ -560,7 +556,6 @@ impl<'a> AzTree<'a> {
         position: Position,
         rule_history: &[RuleHistoryEntry],
         root_moves: Option<Vec<Move>>,
-        root_policy_repeats: Option<Vec<f32>>,
         model: &'a AzNnue,
         limits: AzSearchLimits,
         workspace: &mut AzSearchWorkspace,
@@ -569,7 +564,6 @@ impl<'a> AzTree<'a> {
             position,
             rule_history,
             root_moves,
-            root_policy_repeats,
             model,
             limits,
             std::mem::take(&mut workspace.nodes),
@@ -589,7 +583,6 @@ impl<'a> AzTree<'a> {
         position: Position,
         rule_history: &[RuleHistoryEntry],
         root_moves: Option<Vec<Move>>,
-        root_policy_repeats: Option<Vec<f32>>,
         model: &'a AzNnue,
         limits: AzSearchLimits,
         mut nodes: Vec<AzNode>,
@@ -626,7 +619,6 @@ impl<'a> AzTree<'a> {
             accumulator_arena,
             model,
             root_moves,
-            root_policy_repeats,
             root_raw_priors,
             root: 0,
             cpuct: if limits.cpuct > 0.0 {
@@ -744,34 +736,26 @@ impl<'a> AzTree<'a> {
             };
         }
 
-        let (moves, policy_repeats_history) = {
+        let moves = {
             crate::scope_profile!("az.search.expand_legal_moves");
             if node_index == self.root {
                 if let Some(moves) = self.root_moves.take() {
-                    let repeats = self.root_policy_repeats.take().unwrap_or_else(|| {
-                        policy_repeat_features(
-                            &self.nodes[node_index].position,
-                            &self.rule_history_scratch,
-                            &moves,
-                        )
-                    });
-                    debug_assert_eq!(moves.len(), repeats.len());
-                    (moves, repeats)
+                    moves
                 } else {
                     self.nodes[node_index]
                         .position
                         .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
                         .into_iter()
-                        .map(|(mv, repeat)| (mv, f32::from(repeat)))
-                        .unzip()
+                        .map(|(mv, _)| mv)
+                        .collect()
                 }
             } else {
                 self.nodes[node_index]
                     .position
                     .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
                     .into_iter()
-                    .map(|(mv, repeat)| (mv, f32::from(repeat)))
-                    .unzip()
+                    .map(|(mv, _)| mv)
+                    .collect()
             }
         };
         if moves.is_empty() {
@@ -798,7 +782,6 @@ impl<'a> AzTree<'a> {
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
                 ),
-                &policy_repeats_history,
                 &mut self.eval_scratch,
             )
         };
@@ -998,14 +981,14 @@ impl<'a> AzTree<'a> {
                 moves_left: 0.0,
             };
         }
-        let (moves, policy_repeats_history): (Vec<_>, Vec<_>) = {
+        let moves: Vec<_> = {
             crate::scope_profile!("az.search.expand_legal_moves");
             self.nodes[node_index]
                 .position
                 .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
                 .into_iter()
-                .map(|(mv, repeat)| (mv, f32::from(repeat)))
-                .unzip()
+                .map(|(mv, _)| mv)
+                .collect()
         };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
@@ -1029,7 +1012,6 @@ impl<'a> AzTree<'a> {
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
                 ),
-                &policy_repeats_history,
                 &mut self.eval_scratch,
             )
         };
@@ -1618,7 +1600,6 @@ mod tests {
         let position = Position::startpos();
         let history = position.initial_rule_history();
         let legal = position.legal_moves_with_rules(&history);
-        let policy_repeats = policy_repeat_features(&position, &history, &legal);
         let model = AzNnue::random(32, 71);
         let limits = AzSearchLimits {
             simulations: 128,
@@ -1639,7 +1620,6 @@ mod tests {
             &position,
             &history,
             legal,
-            policy_repeats,
             &model,
             limits,
             &mut workspace,

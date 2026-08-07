@@ -94,7 +94,6 @@ impl AzCandleModel {
             .reshape((1, DENSE_MOVE_SPACE))?
             .broadcast_as((bsz, DENSE_MOVE_SPACE))?
             .contiguous()?;
-        let policy_repeat_logit = Tensor::zeros((bsz, 1), hidden.dtype(), hidden.device())?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, POLICY_CONSEQUENCE_SIZE)?
@@ -123,7 +122,6 @@ impl AzCandleModel {
         Ok(ForwardOutput {
             value_logits,
             policy_logits,
-            policy_repeat_logit,
             policy_consequence_logits,
             moves_left_logits,
         })
@@ -133,7 +131,6 @@ impl AzCandleModel {
 pub(super) struct ForwardOutput {
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
-    pub(super) policy_repeat_logit: Tensor,
     pub(super) policy_consequence_logits: Tensor,
     pub(super) moves_left_logits: Tensor,
 }
@@ -153,7 +150,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
-    pub(super) policy_repeats_history: Tensor,
     pub(super) policy_consequence_from: Tensor,
     pub(super) policy_consequence_to: Tensor,
     pub(super) policy_consequence_captured: Tensor,
@@ -229,11 +225,6 @@ impl BatchTensors {
             )?,
             policy_mask: Tensor::from_vec(
                 packed.policy_mask,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_repeats_history: Tensor::from_vec(
-                packed.policy_repeats_history,
                 (batch_size, max_policy_moves),
                 device,
             )?,
@@ -454,7 +445,7 @@ mod tests {
             Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
                 .unwrap();
         let moves = position.legal_moves();
-        let mut model = AzNnue::random(24, 20260730);
+        let mut model = AzNnue::random(32, 20260730);
         for (index, weight) in model.policy_consequence_output.iter_mut().enumerate() {
             *weight = (index as f32 + 1.0) * 0.003;
         }
@@ -464,7 +455,6 @@ mod tests {
             &position,
             &moves,
             &[0.0; RULE_CONTEXT_SIZE],
-            &vec![0.0; moves.len()],
             &mut cpu,
         );
 
@@ -473,7 +463,6 @@ mod tests {
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
             policy: vec![1.0; moves.len()],
-            policy_repeats_history: vec![0.0; moves.len()],
             value_wdl: [0.0, 1.0, 0.0],
             value: 0.0,
             side_sign: 1.0,
@@ -504,7 +493,7 @@ mod tests {
             );
         }
 
-        let gradient_model = AzNnue::random(24, 20260731);
+        let gradient_model = AzNnue::random(32, 20260731);
         let gradient_candle = AzCandleModel::from_model(&gradient_model, &Device::Cpu).unwrap();
         let gradient_forward = gradient_candle.forward(&batch).unwrap();
         let gradients = gradient_forward
