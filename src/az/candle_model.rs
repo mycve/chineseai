@@ -21,10 +21,6 @@ pub(super) struct AzCandleModel {
     input_king_piece_hidden: Var,
     rule_context_hidden: Var,
     hidden_bias: Var,
-    trunk_residual_hidden: Var,
-    trunk_residual_bias: Var,
-    trunk_residual_output: Var,
-    trunk_residual_output_bias: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
@@ -101,20 +97,6 @@ impl AzCandleModel {
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
-        let trunk_residual = hidden
-            .matmul(&self.trunk_residual_hidden.t()?)?
-            .broadcast_add(&self.trunk_residual_bias)?
-            .relu()?
-            .matmul(&self.trunk_residual_output.t()?)?
-            .broadcast_add(&self.trunk_residual_output_bias)?;
-        let hidden = (hidden + trunk_residual)?;
-        let rms = hidden
-            .sqr()?
-            .mean_keepdim(1)?
-            .affine(1.0, RMS_NORM_EPS)?
-            .sqrt()?;
-        let hidden = hidden.broadcast_div(&rms)?;
-
         let value_head = hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
@@ -131,51 +113,24 @@ impl AzCandleModel {
         let moves_left_logits = moves_left_head
             .matmul(&self.moves_left_output.reshape((VALUE_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
-        let policy_bias = self.policy_move_bias.reshape((1, DENSE_MOVE_SPACE))?;
-        let policy_from_scores = hidden.matmul(&self.policy_from_hidden.t()?)?;
-        let policy_to_scores = hidden.matmul(&self.policy_to_hidden.t()?)?;
-        let policy_from_logits = policy_from_scores.matmul(&self.policy_move_from_features.t()?)?;
-        let policy_to_logits = policy_to_scores.matmul(&self.policy_move_to_features.t()?)?;
-        let policy_pair_context = hidden
-            .matmul(&self.policy_pair_context_hidden.t()?)?
-            .broadcast_add(&self.policy_pair_context_bias)?
-            .relu()?;
-        let policy_pair_logits = policy_pair_context.matmul(&self.policy_pair_embedding.t()?)?;
-        let policy_move_context = hidden.matmul(&self.policy_move_context_hidden.t()?)?;
-        let policy_move_logits = policy_move_context.matmul(&self.policy_move_embedding.t()?)?;
-        let policy_logits = (((policy_from_logits + policy_to_logits)? + policy_pair_logits)?
-            + policy_move_logits)?
-            .broadcast_add(&policy_bias)?;
-        let policy_repeat_logit = hidden
-            .matmul(
-                &self
-                    .policy_repeat_hidden
-                    .reshape((self.arch.hidden_size, 1))?,
-            )?
-            .broadcast_add(&self.policy_repeat_weight)?;
-        let policy_check_logit = hidden
-            .matmul(&self.policy_check_hidden.reshape((self.arch.hidden_size, 1))?)?
-            .broadcast_add(&self.policy_check_weight)?;
-        let policy_consequence_context = hidden
-            .matmul(&self.policy_consequence_hidden.t()?)?
-            .broadcast_add(&self.policy_consequence_bias)?
-            .unsqueeze(1)?;
-        let consequence_from = self
-            .policy_consequence_embedding
+        let policy_logits = self
+            .policy_move_bias
+            .reshape((1, DENSE_MOVE_SPACE))?
+            .broadcast_as((bsz, DENSE_MOVE_SPACE))?;
+        let policy_repeat_logit = Tensor::zeros((bsz, 1), hidden.dtype(), hidden.device())?;
+        let piece_square_policy = self.input_hidden.narrow(1, 0, POLICY_CONSEQUENCE_SIZE)?;
+        let consequence_from = piece_square_policy
             .index_select(&batch.policy_consequence_from.flatten_all()?, 0)?
             .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?;
-        let consequence_to = self
-            .policy_consequence_embedding
+        let consequence_to = piece_square_policy
             .index_select(&batch.policy_consequence_to.flatten_all()?, 0)?
             .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?;
-        let consequence_captured = self
-            .policy_consequence_embedding
+        let consequence_captured = piece_square_policy
             .index_select(&batch.policy_consequence_captured.flatten_all()?, 0)?
             .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?
             .broadcast_mul(&batch.policy_consequence_capture_mask)?;
         let consequence_delta = ((consequence_to - consequence_from)? - consequence_captured)?;
         let policy_consequence_logits = consequence_delta
-            .broadcast_mul(&policy_consequence_context)?
             .reshape((bsz * batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?
             .matmul(
                 &self
@@ -184,8 +139,6 @@ impl AzCandleModel {
             )?
             .reshape((bsz, batch.max_policy_moves))?
             .broadcast_mul(&batch.policy_consequence_move_mask)?;
-        let policy_consequence_logits = (policy_consequence_logits
-            + policy_check_logit.broadcast_mul(&batch.policy_gives_check)?)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -387,26 +340,6 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            trunk_residual_hidden: var_from_slice(
-                &model.trunk_residual_hidden,
-                (VALUE_HEAD_SIZE, hidden),
-                device,
-            )?,
-            trunk_residual_bias: var_from_slice(
-                &model.trunk_residual_bias,
-                VALUE_HEAD_SIZE,
-                device,
-            )?,
-            trunk_residual_output: var_from_slice(
-                &model.trunk_residual_output,
-                (hidden, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            trunk_residual_output_bias: var_from_slice(
-                &model.trunk_residual_output_bias,
-                hidden,
-                device,
-            )?,
             value_head_hidden: var_from_slice(
                 &model.value_head_hidden,
                 (VALUE_HEAD_SIZE, hidden),
@@ -518,10 +451,6 @@ impl AzCandleModel {
         vars.push(self.input_king_piece_hidden.clone());
         vars.push(self.rule_context_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.trunk_residual_hidden.clone());
-        vars.push(self.trunk_residual_bias.clone());
-        vars.push(self.trunk_residual_output.clone());
-        vars.push(self.trunk_residual_output_bias.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_hidden2.clone());
@@ -561,19 +490,6 @@ impl AzCandleModel {
         )?;
         copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
-        copy_var(
-            &self.trunk_residual_hidden,
-            &mut model.trunk_residual_hidden,
-        )?;
-        copy_var(&self.trunk_residual_bias, &mut model.trunk_residual_bias)?;
-        copy_var(
-            &self.trunk_residual_output,
-            &mut model.trunk_residual_output,
-        )?;
-        copy_var(
-            &self.trunk_residual_output_bias,
-            &mut model.trunk_residual_output_bias,
-        )?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_hidden2, &mut model.value_head_hidden2)?;
@@ -691,12 +607,6 @@ mod tests {
                 .unwrap();
         let moves = position.legal_moves();
         let mut model = AzNnue::random(24, 20260730);
-        for (index, weight) in model.trunk_residual_output.iter_mut().enumerate() {
-            *weight = ((index % 17) as f32 - 8.0) * 0.0002;
-        }
-        for (index, bias) in model.trunk_residual_output_bias.iter_mut().enumerate() {
-            *bias = ((index % 5) as f32 - 2.0) * 0.0001;
-        }
         for (index, weight) in model.policy_consequence_output.iter_mut().enumerate() {
             *weight = (index as f32 + 1.0) * 0.003;
         }
