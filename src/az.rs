@@ -668,7 +668,6 @@ pub struct AzLoopConfig {
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub record_fens: bool,
-    pub record_fens_min_ply: usize,
 }
 
 #[derive(Clone, Debug, Default)]

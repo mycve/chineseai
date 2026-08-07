@@ -66,14 +66,6 @@ pub struct AzLoopFileConfig {
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
-    pub teacher_enabled: bool,
-    pub teacher_pikafish_exe: String,
-    pub teacher_interval: usize,
-    pub teacher_positions: usize,
-    pub teacher_depth: u32,
-    pub teacher_processes: usize,
-    pub teacher_value_weight: f32,
-    pub teacher_min_ply: usize,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -147,14 +139,6 @@ impl Default for AzLoopFileConfig {
             mirror_probability: 0.3,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
-            teacher_enabled: false,
-            teacher_pikafish_exe: "./tools/pikafish".into(),
-            teacher_interval: 20,
-            teacher_positions: 2000,
-            teacher_depth: 12,
-            teacher_processes: 0,
-            teacher_value_weight: 0.3,
-            teacher_min_ply: 20,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
@@ -231,14 +215,6 @@ struct AzLoopTomlConfig {
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
-    pub teacher_enabled: bool,
-    pub teacher_pikafish_exe: String,
-    pub teacher_interval: usize,
-    pub teacher_positions: usize,
-    pub teacher_depth: u32,
-    pub teacher_processes: usize,
-    pub teacher_value_weight: f32,
-    pub teacher_min_ply: usize,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -319,14 +295,6 @@ impl From<&AzLoopFileConfig> for AzLoopTomlConfig {
             mirror_probability: config.mirror_probability,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
-            teacher_enabled: config.teacher_enabled,
-            teacher_pikafish_exe: config.teacher_pikafish_exe.clone(),
-            teacher_interval: config.teacher_interval,
-            teacher_positions: config.teacher_positions,
-            teacher_depth: config.teacher_depth,
-            teacher_processes: config.teacher_processes,
-            teacher_value_weight: config.teacher_value_weight,
-            teacher_min_ply: config.teacher_min_ply,
             checkpoint_interval: config.checkpoint_interval,
             checkpoint_dir: config.checkpoint_dir.clone(),
             max_checkpoints: config.max_checkpoints,
@@ -402,14 +370,6 @@ impl From<AzLoopTomlConfig> for AzLoopFileConfig {
             mirror_probability: config.mirror_probability,
             train_value_weight: config.train_value_weight,
             train_policy_weight: config.train_policy_weight,
-            teacher_enabled: config.teacher_enabled,
-            teacher_pikafish_exe: config.teacher_pikafish_exe,
-            teacher_interval: config.teacher_interval,
-            teacher_positions: config.teacher_positions,
-            teacher_depth: config.teacher_depth,
-            teacher_processes: config.teacher_processes,
-            teacher_value_weight: config.teacher_value_weight,
-            teacher_min_ply: config.teacher_min_ply,
             checkpoint_interval: config.checkpoint_interval,
             checkpoint_dir: config.checkpoint_dir,
             max_checkpoints: config.max_checkpoints,
@@ -526,14 +486,6 @@ impl AzLoopFileConfig {
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
-        line!("teacher_enabled", self.teacher_enabled);
-        line!("teacher_pikafish_exe", q(&self.teacher_pikafish_exe));
-        line!("teacher_interval", self.teacher_interval);
-        line!("teacher_positions", self.teacher_positions);
-        line!("teacher_depth", self.teacher_depth);
-        line!("teacher_processes", self.teacher_processes);
-        line!("teacher_value_weight", f(self.teacher_value_weight));
-        line!("teacher_min_ply", self.teacher_min_ply);
         line!("checkpoint_interval", self.checkpoint_interval);
         line!("checkpoint_dir", q(&self.checkpoint_dir));
         line!("max_checkpoints", self.max_checkpoints);
@@ -633,14 +585,6 @@ impl AzLoopFileConfig {
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
-        self.teacher_interval = self.teacher_interval.max(1);
-        self.teacher_positions = self.teacher_positions.max(1);
-        self.teacher_depth = self.teacher_depth.max(1);
-        if self.teacher_processes == 0 {
-            self.teacher_processes = system_physical_cores();
-        }
-        self.teacher_value_weight = self.teacher_value_weight.max(0.0);
-        self.teacher_min_ply = self.teacher_min_ply.min(self.max_plies.saturating_sub(1));
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
@@ -713,9 +657,6 @@ mod tests {
         assert!(text.contains("replay_capacity = 1000000\n"));
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
-        assert!(text.contains("teacher_enabled = false\n"));
-        assert!(text.contains("teacher_pikafish_exe = \"./tools/pikafish\"\n"));
-        assert!(text.contains("teacher_processes = 0\n"));
         assert!(text.contains("replay_recent_games = 5000\n"));
         assert!(text.contains("arena_processes = 192\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));

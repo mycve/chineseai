@@ -12,11 +12,10 @@ use chineseai::{
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
         SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
         alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
-        dense_move_index, generate_selfplay_data, global_training_step_sample_count,
+        generate_selfplay_data, global_training_step_sample_count,
         play_arena_games_from_positions,
         train_samples_weighted, train_samples_weighted_owned,
     },
-    nnue::{canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     uci::run_uci,
@@ -735,12 +734,11 @@ fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> V
 struct SelfplayPauseState {
     arena_paused: bool,
     backlog_paused: bool,
-    teacher_paused: bool,
 }
 
 impl SelfplayPauseState {
     fn is_paused(&self) -> bool {
-        self.arena_paused || self.backlog_paused || self.teacher_paused
+        self.arena_paused || self.backlog_paused
     }
 }
 
@@ -816,7 +814,6 @@ fn build_az_loop_config(
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         record_fens: false,
-        record_fens_min_ply: 0,
     }
 }
 
@@ -2062,7 +2059,6 @@ fn main() {
             let trainer_config = config.clone();
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
-            let trainer_selfplay_pause = Arc::clone(&selfplay_pause);
             let trainer_handle = thread::spawn(move || {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
@@ -2129,59 +2125,6 @@ fn main() {
                             ..AzTrainLossWeights::default()
                         },
                     );
-                    if trainer_config.teacher_enabled
-                        && (train_update + 1) % trainer_config.teacher_interval == 0
-                    {
-                        {
-                            let (lock, _) = &*trainer_selfplay_pause;
-                            lock.lock().unwrap().teacher_paused = true;
-                        }
-                        println!(
-                            "teacher  : update={} collecting {} positions, depth={}, processes={}",
-                            train_update + 1,
-                            trainer_config.teacher_positions,
-                            trainer_config.teacher_depth,
-                            trainer_config.teacher_processes
-                        );
-                        let teacher_result = build_teacher_samples(
-                            &trainer_model,
-                            &trainer_config,
-                            train_update as u64,
-                        );
-                        {
-                            let (lock, condvar) = &*trainer_selfplay_pause;
-                            lock.lock().unwrap().teacher_paused = false;
-                            condvar.notify_all();
-                        }
-                        match teacher_result {
-                            Ok(samples) => {
-                                let count = samples.len();
-                                let teacher_stats = train_samples_weighted_owned(
-                                    &mut trainer_model,
-                                    samples,
-                                    1,
-                                    current_lr,
-                                    trainer_config.batch_size,
-                                    &mut rng,
-                                    AzTrainLossWeights {
-                                        value: trainer_config.teacher_value_weight,
-                                        policy: 0.0,
-                                        moves_left: 0.0,
-                                    },
-                                );
-                                println!(
-                                    "teacher  : update={} samples={} value_ce={:.5}",
-                                    train_update + 1,
-                                    count,
-                                    teacher_stats.value_loss
-                                );
-                            }
-                            Err(err) => eprintln!(
-                                "teacher  : update={} skipped: {err}",
-                                train_update + 1
-                            ),
-                        }
-                    }
                     let train_seconds = train_started.elapsed().as_secs_f32();
                     let report = build_async_training_report(
                         pending,
@@ -3924,84 +3867,6 @@ fn label_fens_parallel(
     }
     out.sort_by_key(|row| row.0);
     Ok(out)
-}
-
-fn build_teacher_samples(
-    model: &AzNnue,
-    config: &AzLoopFileConfig,
-    update: u64,
-) -> io::Result<Vec<AzTrainingSample>> {
-    let target = config.teacher_positions;
-    let mut unique = HashSet::with_capacity(target.saturating_mul(2));
-    let mut round = 0u64;
-    while unique.len() < target {
-        let mut loop_config = build_az_loop_config(
-            config,
-            config.seed ^ update.rotate_left(17) ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            config.workers,
-            update as u32,
-            &[],
-        );
-        loop_config.games = config.workers;
-        loop_config.record_fens = true;
-        loop_config.record_fens_min_ply = config.teacher_min_ply;
-        let data = generate_selfplay_data(model, &loop_config);
-        for fen in data.position_fens {
-            unique.insert(fen);
-            if unique.len() == target {
-                break;
-            }
-        }
-        round = round.wrapping_add(1);
-    }
-    let fens = unique.into_iter().collect::<Vec<_>>();
-    let labeled = label_fens_parallel(
-        Path::new(&config.teacher_pikafish_exe),
-        &fens,
-        config.teacher_depth,
-        config.teacher_processes,
-    )?;
-    let mut samples = Vec::with_capacity(labeled.len());
-    for (index, _bestmove, pvs) in labeled {
-        let best = pvs.iter().find(|pv| pv.multipv == 1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Pikafish returned no principal variation")
-        })?;
-        let wdl = best.wdl.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Pikafish returned no WDL")
-        })?;
-        let position = Position::from_fen(&fens[index]).map_err(|err| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("invalid teacher FEN: {err}"))
-        })?;
-        let legal = position.legal_moves();
-        if legal.is_empty() {
-            continue;
-        }
-        let move_indices = legal
-            .iter()
-            .map(|&mv| dense_move_index(canonical_move(position.side_to_move(), mv)))
-            .collect::<Vec<_>>();
-        let uniform = 1.0 / move_indices.len() as f32;
-        samples.push(AzTrainingSample {
-            features: extract_sparse_features_az(&position),
-            rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
-            move_indices,
-            policy: vec![uniform; legal.len()],
-            policy_repeats_history: vec![0.0; legal.len()],
-            value_wdl: [
-                wdl[0] as f32 / 1000.0,
-                wdl[1] as f32 / 1000.0,
-                wdl[2] as f32 / 1000.0,
-            ],
-            value: (wdl[0] as f32 - wdl[2] as f32) / 1000.0,
-            side_sign: 1.0,
-            moves_left: 0.0,
-            policy_weight: 0.0,
-            value_weight: 1.0,
-            search_simulations: 0,
-            meta: chineseai::az::AzSampleMeta::default(),
-        });
-    }
-    Ok(samples)
 }
 
 fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {

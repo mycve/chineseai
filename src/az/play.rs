@@ -506,7 +506,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             played_q_sum += move_meta.played_q;
             {
                 crate::scope_profile!("az.selfplay.make_sample");
-                if config.record_fens && ply >= config.record_fens_min_ply {
+                if config.record_fens {
                     position_fens.push(position.to_fen());
                 }
                 let sample = make_training_sample(
