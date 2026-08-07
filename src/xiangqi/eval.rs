@@ -5,11 +5,6 @@ pub(super) fn signed_piece_contrib(piece: Piece, sq: usize) -> i32 {
     SIGNED_PIECE_CONTRIB_TABLE[color_index(piece.color)][piece_kind_index(piece.kind)][sq]
 }
 
-#[inline(always)]
-pub(crate) fn piece_base_value(kind: PieceKind) -> i32 {
-    PIECE_BASE_VALUES[piece_kind_index(kind)]
-}
-
 const PIECE_BASE_VALUES: [i32; 7] = [0, 110, 110, 420, 900, 460, 110];
 const PIECE_SQUARE_TABLE: [[[i32; BOARD_SIZE]; 7]; 2] = build_piece_square_table();
 const SIGNED_PIECE_CONTRIB_TABLE: [[[i32; BOARD_SIZE]; 7]; 2] = build_signed_piece_contrib_table();

@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::{BOARD_SIZE, Color, Move, Position};
+use crate::xiangqi::BOARD_SIZE;
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
@@ -112,7 +112,6 @@ pub(super) struct PackedBatch {
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
     pub policy_repeats_history: Vec<f32>,
-    pub policy_gives_check: Vec<f32>,
     pub policy_consequence_from: Vec<u32>,
     pub policy_consequence_to: Vec<u32>,
     pub policy_consequence_captured: Vec<u32>,
@@ -165,7 +164,6 @@ impl PackedBatch {
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
             policy_repeats_history: vec![0.0; batch_size * max_policy_moves],
-            policy_gives_check: vec![0.0; batch_size * max_policy_moves],
             policy_consequence_from: vec![0u32; batch_size * max_policy_moves],
             policy_consequence_to: vec![0u32; batch_size * max_policy_moves],
             policy_consequence_captured: vec![0u32; batch_size * max_policy_moves],
@@ -237,14 +235,6 @@ impl PackedBatch {
                 board_features[square] = feature;
             }
         }
-        let pieces = board_features
-            .iter()
-            .enumerate()
-            .filter_map(|(square, &feature)| {
-                (feature != usize::MAX).then_some((feature / BOARD_SIZE, square))
-            })
-            .collect::<Vec<_>>();
-        let mut position = Position::from_canonical_piece_squares(&pieces);
         let mut policy_offset = 0usize;
         for (sample_offset, (&move_index, &target)) in sample
             .move_indices
@@ -262,14 +252,6 @@ impl PackedBatch {
                     .copied()
                     .unwrap_or(0.0);
                 if let Some((from, to)) = dense_move_squares(move_index) {
-                    if position.has_general(Color::Red)
-                        && position.has_general(Color::Black)
-                        && position.piece_at(from).is_some()
-                    {
-                        let mv = Move::new(from, to);
-                        self.policy_gives_check[policy_base + policy_offset] =
-                            f32::from(position.gives_check_after_move(mv));
-                    }
                     let moved_feature = board_features[from];
                     if moved_feature != usize::MAX {
                         let piece_index = moved_feature / BOARD_SIZE;

@@ -1,13 +1,11 @@
 use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIECE_SQUARE_INPUT_SIZE, POLICY_CONSEQUENCE_SIZE,
-    POLICY_MOVE_EMBED_SIZE, POLICY_PAIR_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
-    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
-    WDL_HEAD_SIZE, dataloader::PackedBatch, policy_move_from_features, policy_move_to_features,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_CONSEQUENCE_SIZE, RULE_CONTEXT_SIZE,
+    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
+    MOVES_LEFT_HEAD_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::BOARD_SIZE;
 
 const RMS_NORM_EPS: f64 = 1.0e-6;
 
@@ -23,31 +21,13 @@ pub(super) struct AzCandleModel {
     hidden_bias: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
-    value_head_hidden2: Var,
-    value_head_bias2: Var,
     value_head_output: Var,
     moves_left_hidden: Var,
     moves_left_bias_hidden: Var,
     moves_left_output: Var,
     moves_left_bias: Var,
     policy_move_bias: Var,
-    pub(super) policy_repeat_weight: Var,
-    policy_repeat_hidden: Var,
-    policy_check_weight: Var,
-    policy_check_hidden: Var,
-    policy_from_hidden: Var,
-    policy_to_hidden: Var,
-    policy_pair_context_hidden: Var,
-    policy_pair_context_bias: Var,
-    policy_pair_embedding: Var,
-    policy_move_context_hidden: Var,
-    policy_move_embedding: Var,
-    policy_consequence_hidden: Var,
-    policy_consequence_bias: Var,
-    policy_consequence_embedding: Var,
     policy_consequence_output: Var,
-    policy_move_from_features: Tensor,
-    policy_move_to_features: Tensor,
 }
 
 impl AzCandleModel {
@@ -101,17 +81,13 @@ impl AzCandleModel {
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
-        let value_head = value_head
-            .matmul(&self.value_head_hidden2.t()?)?
-            .broadcast_add(&self.value_head_bias2)?
-            .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
         let moves_left_head = hidden
             .matmul(&self.moves_left_hidden.t()?)?
             .broadcast_add(&self.moves_left_bias_hidden)?
             .relu()?;
         let moves_left_logits = moves_left_head
-            .matmul(&self.moves_left_output.reshape((VALUE_HEAD_SIZE, 1))?)?
+            .matmul(&self.moves_left_output.reshape((MOVES_LEFT_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
         let policy_logits = self
             .policy_move_bias
@@ -178,7 +154,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) policy_repeats_history: Tensor,
-    pub(super) policy_gives_check: Tensor,
     pub(super) policy_consequence_from: Tensor,
     pub(super) policy_consequence_to: Tensor,
     pub(super) policy_consequence_captured: Tensor,
@@ -259,11 +234,6 @@ impl BatchTensors {
             )?,
             policy_repeats_history: Tensor::from_vec(
                 packed.policy_repeats_history,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_gives_check: Tensor::from_vec(
-                packed.policy_gives_check,
                 (batch_size, max_policy_moves),
                 device,
             )?,
@@ -350,12 +320,6 @@ impl AzCandleModel {
                 device,
             )?,
             value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
-            value_head_hidden2: var_from_slice(
-                &model.value_head_hidden2,
-                (VALUE_HEAD_SIZE, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            value_head_bias2: var_from_slice(&model.value_head_bias2, VALUE_HEAD_SIZE, device)?,
             value_head_output: var_from_slice(
                 &model.value_head_output,
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
@@ -363,84 +327,20 @@ impl AzCandleModel {
             )?,
             moves_left_hidden: var_from_slice(
                 &model.moves_left_hidden,
-                (VALUE_HEAD_SIZE, hidden),
+                (MOVES_LEFT_HEAD_SIZE, hidden),
                 device,
             )?,
             moves_left_bias_hidden: var_from_slice(
                 &model.moves_left_bias_hidden,
-                VALUE_HEAD_SIZE,
+                MOVES_LEFT_HEAD_SIZE,
                 device,
             )?,
-            moves_left_output: var_from_slice(&model.moves_left_output, VALUE_HEAD_SIZE, device)?,
+            moves_left_output: var_from_slice(&model.moves_left_output, MOVES_LEFT_HEAD_SIZE, device)?,
             moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
-            policy_repeat_weight: var_from_slice(&model.policy_repeat_weight, 1, device)?,
-            policy_repeat_hidden: var_from_slice(&model.policy_repeat_hidden, hidden, device)?,
-            policy_check_weight: var_from_slice(&model.policy_check_weight, 1, device)?,
-            policy_check_hidden: var_from_slice(&model.policy_check_hidden, hidden, device)?,
-            policy_from_hidden: var_from_slice(
-                &model.policy_from_hidden,
-                (BOARD_SIZE, hidden),
-                device,
-            )?,
-            policy_to_hidden: var_from_slice(
-                &model.policy_to_hidden,
-                (BOARD_SIZE, hidden),
-                device,
-            )?,
-            policy_pair_context_hidden: var_from_slice(
-                &model.policy_pair_context_hidden,
-                (POLICY_PAIR_CONTEXT_SIZE, hidden),
-                device,
-            )?,
-            policy_pair_context_bias: var_from_slice(
-                &model.policy_pair_context_bias,
-                POLICY_PAIR_CONTEXT_SIZE,
-                device,
-            )?,
-            policy_pair_embedding: var_from_slice(
-                &model.policy_pair_embedding,
-                (DENSE_MOVE_SPACE, POLICY_PAIR_CONTEXT_SIZE),
-                device,
-            )?,
-            policy_move_context_hidden: var_from_slice(
-                &model.policy_move_context_hidden,
-                (POLICY_MOVE_EMBED_SIZE, hidden),
-                device,
-            )?,
-            policy_move_embedding: var_from_slice(
-                &model.policy_move_embedding,
-                (DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE),
-                device,
-            )?,
-            policy_consequence_hidden: var_from_slice(
-                &model.policy_consequence_hidden,
-                (POLICY_CONSEQUENCE_SIZE, hidden),
-                device,
-            )?,
-            policy_consequence_bias: var_from_slice(
-                &model.policy_consequence_bias,
-                POLICY_CONSEQUENCE_SIZE,
-                device,
-            )?,
-            policy_consequence_embedding: var_from_slice(
-                &model.policy_consequence_embedding,
-                (PIECE_SQUARE_INPUT_SIZE, POLICY_CONSEQUENCE_SIZE),
-                device,
-            )?,
             policy_consequence_output: var_from_slice(
                 &model.policy_consequence_output,
                 POLICY_CONSEQUENCE_SIZE,
-                device,
-            )?,
-            policy_move_from_features: Tensor::from_vec(
-                policy_move_from_features().to_vec(),
-                (DENSE_MOVE_SPACE, BOARD_SIZE),
-                device,
-            )?,
-            policy_move_to_features: Tensor::from_vec(
-                policy_move_to_features().to_vec(),
-                (DENSE_MOVE_SPACE, BOARD_SIZE),
                 device,
             )?,
         })
@@ -457,28 +357,12 @@ impl AzCandleModel {
         vars.push(self.hidden_bias.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
-        vars.push(self.value_head_hidden2.clone());
-        vars.push(self.value_head_bias2.clone());
         vars.push(self.value_head_output.clone());
         vars.push(self.moves_left_hidden.clone());
         vars.push(self.moves_left_bias_hidden.clone());
         vars.push(self.moves_left_output.clone());
         vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
-        vars.push(self.policy_repeat_weight.clone());
-        vars.push(self.policy_repeat_hidden.clone());
-        vars.push(self.policy_check_weight.clone());
-        vars.push(self.policy_check_hidden.clone());
-        vars.push(self.policy_from_hidden.clone());
-        vars.push(self.policy_to_hidden.clone());
-        vars.push(self.policy_pair_context_hidden.clone());
-        vars.push(self.policy_pair_context_bias.clone());
-        vars.push(self.policy_pair_embedding.clone());
-        vars.push(self.policy_move_context_hidden.clone());
-        vars.push(self.policy_move_embedding.clone());
-        vars.push(self.policy_consequence_hidden.clone());
-        vars.push(self.policy_consequence_bias.clone());
-        vars.push(self.policy_consequence_embedding.clone());
         vars.push(self.policy_consequence_output.clone());
         vars
     }
@@ -496,8 +380,6 @@ impl AzCandleModel {
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
-        copy_var(&self.value_head_hidden2, &mut model.value_head_hidden2)?;
-        copy_var(&self.value_head_bias2, &mut model.value_head_bias2)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
         copy_var(&self.moves_left_hidden, &mut model.moves_left_hidden)?;
         copy_var(
@@ -507,44 +389,6 @@ impl AzCandleModel {
         copy_var(&self.moves_left_output, &mut model.moves_left_output)?;
         copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
-        copy_var(&self.policy_repeat_weight, &mut model.policy_repeat_weight)?;
-        copy_var(&self.policy_repeat_hidden, &mut model.policy_repeat_hidden)?;
-        copy_var(&self.policy_check_weight, &mut model.policy_check_weight)?;
-        copy_var(&self.policy_check_hidden, &mut model.policy_check_hidden)?;
-        copy_var(&self.policy_from_hidden, &mut model.policy_from_hidden)?;
-        copy_var(&self.policy_to_hidden, &mut model.policy_to_hidden)?;
-        copy_var(
-            &self.policy_pair_context_hidden,
-            &mut model.policy_pair_context_hidden,
-        )?;
-        copy_var(
-            &self.policy_pair_context_bias,
-            &mut model.policy_pair_context_bias,
-        )?;
-        copy_var(
-            &self.policy_pair_embedding,
-            &mut model.policy_pair_embedding,
-        )?;
-        copy_var(
-            &self.policy_move_context_hidden,
-            &mut model.policy_move_context_hidden,
-        )?;
-        copy_var(
-            &self.policy_move_embedding,
-            &mut model.policy_move_embedding,
-        )?;
-        copy_var(
-            &self.policy_consequence_hidden,
-            &mut model.policy_consequence_hidden,
-        )?;
-        copy_var(
-            &self.policy_consequence_bias,
-            &mut model.policy_consequence_bias,
-        )?;
-        copy_var(
-            &self.policy_consequence_embedding,
-            &mut model.policy_consequence_embedding,
-        )?;
         copy_var(
             &self.policy_consequence_output,
             &mut model.policy_consequence_output,

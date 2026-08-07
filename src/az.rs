@@ -47,12 +47,11 @@ pub use train::{
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
-pub(super) const POLICY_PAIR_CONTEXT_SIZE: usize = 32;
-pub(super) const POLICY_MOVE_EMBED_SIZE: usize = 16;
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
+pub(super) const MOVES_LEFT_HEAD_SIZE: usize = 32;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
-const AZ_MODEL_FORMAT_VERSION: f32 = 7.0;
+const AZ_MODEL_FORMAT_VERSION: f32 = 8.0;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -196,37 +195,12 @@ macro_rules! az_weight_tensors {
         $visit!(hidden_bias, [$h]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
-        $visit!(value_head_hidden2, [VALUE_HEAD_SIZE, VALUE_HEAD_SIZE]);
-        $visit!(value_head_bias2, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
-        $visit!(moves_left_hidden, [VALUE_HEAD_SIZE, $h]);
-        $visit!(moves_left_bias_hidden, [VALUE_HEAD_SIZE]);
-        $visit!(moves_left_output, [VALUE_HEAD_SIZE]);
+        $visit!(moves_left_hidden, [MOVES_LEFT_HEAD_SIZE, $h]);
+        $visit!(moves_left_bias_hidden, [MOVES_LEFT_HEAD_SIZE]);
+        $visit!(moves_left_output, [MOVES_LEFT_HEAD_SIZE]);
         $visit!(moves_left_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
-        $visit!(policy_repeat_weight, [1]);
-        $visit!(policy_repeat_hidden, [$h]);
-        $visit!(policy_check_weight, [1]);
-        $visit!(policy_check_hidden, [$h]);
-        $visit!(policy_from_hidden, [BOARD_SIZE, $h]);
-        $visit!(policy_to_hidden, [BOARD_SIZE, $h]);
-        $visit!(policy_pair_context_hidden, [POLICY_PAIR_CONTEXT_SIZE, $h]);
-        $visit!(policy_pair_context_bias, [POLICY_PAIR_CONTEXT_SIZE]);
-        $visit!(
-            policy_pair_embedding,
-            [DENSE_MOVE_SPACE, POLICY_PAIR_CONTEXT_SIZE]
-        );
-        $visit!(policy_move_context_hidden, [POLICY_MOVE_EMBED_SIZE, $h]);
-        $visit!(
-            policy_move_embedding,
-            [DENSE_MOVE_SPACE, POLICY_MOVE_EMBED_SIZE]
-        );
-        $visit!(policy_consequence_hidden, [POLICY_CONSEQUENCE_SIZE, $h]);
-        $visit!(policy_consequence_bias, [POLICY_CONSEQUENCE_SIZE]);
-        $visit!(
-            policy_consequence_embedding,
-            [PIECE_SQUARE_INPUT_SIZE, POLICY_CONSEQUENCE_SIZE]
-        );
         $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
     };
 }
@@ -265,7 +239,6 @@ pub(super) struct AzEvalScratch {
     features: Vec<usize>,
     hidden: Vec<f32>,
     value_head: Vec<f32>,
-    value_head2: Vec<f32>,
     policy_gives_check: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
@@ -278,7 +251,6 @@ impl AzEvalScratch {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
             value_head: vec![0.0; VALUE_HEAD_SIZE],
-            value_head2: vec![0.0; VALUE_HEAD_SIZE],
             policy_gives_check: Vec::with_capacity(192),
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
@@ -290,7 +262,6 @@ impl AzEvalScratch {
             features: Vec::new(),
             hidden: Vec::new(),
             value_head: Vec::new(),
-            value_head2: Vec::new(),
             policy_gives_check: Vec::new(),
             logits: Vec::new(),
             priors: Vec::new(),
@@ -509,28 +480,12 @@ pub struct AzNnue {
     pub hidden_bias: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
-    pub value_head_hidden2: Vec<f32>,
-    pub value_head_bias2: Vec<f32>,
     pub value_head_output: Vec<f32>,
     pub moves_left_hidden: Vec<f32>,
     pub moves_left_bias_hidden: Vec<f32>,
     pub moves_left_output: Vec<f32>,
     pub moves_left_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
-    pub policy_repeat_weight: Vec<f32>,
-    pub policy_repeat_hidden: Vec<f32>,
-    pub policy_check_weight: Vec<f32>,
-    pub policy_check_hidden: Vec<f32>,
-    pub policy_from_hidden: Vec<f32>,
-    pub policy_to_hidden: Vec<f32>,
-    pub policy_pair_context_hidden: Vec<f32>,
-    pub policy_pair_context_bias: Vec<f32>,
-    pub policy_pair_embedding: Vec<f32>,
-    pub policy_move_context_hidden: Vec<f32>,
-    pub policy_move_embedding: Vec<f32>,
-    pub policy_consequence_hidden: Vec<f32>,
-    pub policy_consequence_bias: Vec<f32>,
-    pub policy_consequence_embedding: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
@@ -550,28 +505,12 @@ impl Clone for AzNnue {
             hidden_bias: self.hidden_bias.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
-            value_head_hidden2: self.value_head_hidden2.clone(),
-            value_head_bias2: self.value_head_bias2.clone(),
             value_head_output: self.value_head_output.clone(),
             moves_left_hidden: self.moves_left_hidden.clone(),
             moves_left_bias_hidden: self.moves_left_bias_hidden.clone(),
             moves_left_output: self.moves_left_output.clone(),
             moves_left_bias: self.moves_left_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
-            policy_repeat_weight: self.policy_repeat_weight.clone(),
-            policy_repeat_hidden: self.policy_repeat_hidden.clone(),
-            policy_check_weight: self.policy_check_weight.clone(),
-            policy_check_hidden: self.policy_check_hidden.clone(),
-            policy_from_hidden: self.policy_from_hidden.clone(),
-            policy_to_hidden: self.policy_to_hidden.clone(),
-            policy_pair_context_hidden: self.policy_pair_context_hidden.clone(),
-            policy_pair_context_bias: self.policy_pair_context_bias.clone(),
-            policy_pair_embedding: self.policy_pair_embedding.clone(),
-            policy_move_context_hidden: self.policy_move_context_hidden.clone(),
-            policy_move_embedding: self.policy_move_embedding.clone(),
-            policy_consequence_hidden: self.policy_consequence_hidden.clone(),
-            policy_consequence_bias: self.policy_consequence_bias.clone(),
-            policy_consequence_embedding: self.policy_consequence_embedding.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
             gpu_trainer: None,
         }
@@ -1039,11 +978,6 @@ impl AzNnue {
         // Start history-neutral; rule context is learned from self-play.
         let rule_context_hidden = vec![0.0; RULE_CONTEXT_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
-        // 保持相同 seed 下其余权重与旧结构一致，便于公平比较删除注意力前后的速度和棋力。
-        // 旧注意力初始化消耗 33 * hidden_size 个随机数，但这些权重不再存储。
-        for _ in 0..33 * hidden_size {
-            let _ = rng.next_u64();
-        }
         // Start value-neutral. A random value head can evaluate startpos as a
         // large red/black advantage before any training, and MCTS amplifies
         // that noise into the first self-play dataset.
@@ -1051,48 +985,16 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let value_head_bias = vec![0.0; VALUE_HEAD_SIZE];
-        let value_head_hidden2 = (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
-            .map(|_| rng.weight((2.0 / VALUE_HEAD_SIZE as f32).sqrt() * 0.5))
-            .collect();
-        let value_head_bias2 = vec![0.0; VALUE_HEAD_SIZE];
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
-        let moves_left_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
+        let moves_left_hidden = (0..MOVES_LEFT_HEAD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
-        let moves_left_bias_hidden = vec![0.0; VALUE_HEAD_SIZE];
-        let moves_left_output = vec![0.0; VALUE_HEAD_SIZE];
+        let moves_left_bias_hidden = vec![0.0; MOVES_LEFT_HEAD_SIZE];
+        let moves_left_output = vec![0.0; MOVES_LEFT_HEAD_SIZE];
         let moves_left_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
-        let policy_repeat_weight = vec![0.0; 1];
-        let policy_repeat_hidden = vec![0.0; hidden_size];
-        let policy_check_weight = vec![0.0; 1];
-        let policy_check_hidden = vec![0.0; hidden_size];
-        let policy_from_hidden = (0..BOARD_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let policy_to_hidden = (0..BOARD_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let policy_pair_context_hidden = (0..POLICY_PAIR_CONTEXT_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let policy_pair_context_bias = vec![0.0; POLICY_PAIR_CONTEXT_SIZE];
-        let policy_pair_embedding = (0..DENSE_MOVE_SPACE * POLICY_PAIR_CONTEXT_SIZE)
-            .map(|_| rng.weight((2.0 / POLICY_PAIR_CONTEXT_SIZE as f32).sqrt() * 0.1))
-            .collect();
-        let policy_move_context_hidden = (0..POLICY_MOVE_EMBED_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let policy_move_embedding = vec![0.0; DENSE_MOVE_SPACE * POLICY_MOVE_EMBED_SIZE];
-        let policy_consequence_hidden = (0..POLICY_CONSEQUENCE_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.25))
-            .collect();
-        let policy_consequence_bias = vec![0.0; POLICY_CONSEQUENCE_SIZE];
-        let policy_consequence_embedding = (0..PIECE_SQUARE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE)
-            .map(|_| rng.weight((2.0 / POLICY_CONSEQUENCE_SIZE as f32).sqrt() * 0.1))
-            .collect();
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
         Self {
@@ -1107,28 +1009,12 @@ impl AzNnue {
             hidden_bias,
             value_head_hidden,
             value_head_bias,
-            value_head_hidden2,
-            value_head_bias2,
             value_head_output,
             moves_left_hidden,
             moves_left_bias_hidden,
             moves_left_output,
             moves_left_bias,
             policy_move_bias,
-            policy_repeat_weight,
-            policy_repeat_hidden,
-            policy_check_weight,
-            policy_check_hidden,
-            policy_from_hidden,
-            policy_to_hidden,
-            policy_pair_context_hidden,
-            policy_pair_context_bias,
-            policy_pair_embedding,
-            policy_move_context_hidden,
-            policy_move_embedding,
-            policy_consequence_hidden,
-            policy_consequence_bias,
-            policy_consequence_embedding,
             policy_consequence_output,
             gpu_trainer: None,
         }
@@ -1186,40 +1072,12 @@ impl AzNnue {
             hidden_bias,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
-            value_head_hidden2: load_candle_f32_tensor(&tensors, "value_head_hidden2")?,
-            value_head_bias2: load_candle_f32_tensor(&tensors, "value_head_bias2")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
             moves_left_hidden: load_candle_f32_tensor(&tensors, "moves_left_hidden")?,
             moves_left_bias_hidden: load_candle_f32_tensor(&tensors, "moves_left_bias_hidden")?,
             moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
             moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
-            policy_repeat_weight: load_candle_f32_tensor(&tensors, "policy_repeat_weight")?,
-            policy_repeat_hidden: load_candle_f32_tensor(&tensors, "policy_repeat_hidden")?,
-            policy_check_weight: load_candle_f32_tensor(&tensors, "policy_check_weight")?,
-            policy_check_hidden: load_candle_f32_tensor(&tensors, "policy_check_hidden")?,
-            policy_from_hidden: load_candle_f32_tensor(&tensors, "policy_from_hidden")?,
-            policy_to_hidden: load_candle_f32_tensor(&tensors, "policy_to_hidden")?,
-            policy_pair_context_hidden: load_candle_f32_tensor(
-                &tensors,
-                "policy_pair_context_hidden",
-            )?,
-            policy_pair_context_bias: load_candle_f32_tensor(&tensors, "policy_pair_context_bias")?,
-            policy_pair_embedding: load_candle_f32_tensor(&tensors, "policy_pair_embedding")?,
-            policy_move_context_hidden: load_candle_f32_tensor(
-                &tensors,
-                "policy_move_context_hidden",
-            )?,
-            policy_move_embedding: load_candle_f32_tensor(&tensors, "policy_move_embedding")?,
-            policy_consequence_hidden: load_candle_f32_tensor(
-                &tensors,
-                "policy_consequence_hidden",
-            )?,
-            policy_consequence_bias: load_candle_f32_tensor(&tensors, "policy_consequence_bias")?,
-            policy_consequence_embedding: load_candle_f32_tensor(
-                &tensors,
-                "policy_consequence_embedding",
-            )?,
             policy_consequence_output: load_candle_f32_tensor(
                 &tensors,
                 "policy_consequence_output",
@@ -1292,7 +1150,6 @@ impl AzNnue {
                 &scratch.hidden,
                 &features,
                 &mut scratch.value_head,
-                &mut scratch.value_head2,
             )
         };
         let moves_left = {
@@ -1345,7 +1202,6 @@ impl AzNnue {
                 &scratch.hidden,
                 &[],
                 &mut scratch.value_head,
-                &mut scratch.value_head2,
             )
         };
         let moves_left = {
@@ -1588,8 +1444,7 @@ impl AzNnue {
         features: &[usize],
         value_head: &mut Vec<f32>,
     ) -> f32 {
-        let mut value_head2 = Vec::new();
-        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head, &mut value_head2);
+        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head);
         probs.1
     }
 
@@ -1598,7 +1453,6 @@ impl AzNnue {
         hidden: &[f32],
         features: &[usize],
         value_head: &mut Vec<f32>,
-        value_head2: &mut Vec<f32>,
     ) -> ([f32; WDL_HEAD_SIZE], f32) {
         value_head.resize(VALUE_HEAD_SIZE, 0.0);
         value_head.copy_from_slice(&self.value_head_bias);
@@ -1608,19 +1462,11 @@ impl AzNnue {
             *value += dot_product(hidden, hidden_row);
             *value = (*value).max(0.0);
         }
-        value_head2.resize(VALUE_HEAD_SIZE, 0.0);
-        value_head2.copy_from_slice(&self.value_head_bias2);
-        for (feature, value) in value_head2.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
-            let row = &self.value_head_hidden2
-                [feature * VALUE_HEAD_SIZE..(feature + 1) * VALUE_HEAD_SIZE];
-            *value += dot_product(value_head, row);
-            *value = (*value).max(0.0);
-        }
         let _ = features;
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
             let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-            *logit = dot_product(value_head2, row);
+            *logit = dot_product(value_head, row);
         }
         let wdl = softmax_fixed3(logits);
         let q = wdl[0] - wdl[2];
@@ -1628,9 +1474,9 @@ impl AzNnue {
     }
 
     fn moves_left_from_hidden_into(&self, hidden: &[f32], moves_left_head: &mut Vec<f32>) -> f32 {
-        moves_left_head.resize(VALUE_HEAD_SIZE, 0.0);
+        moves_left_head.resize(MOVES_LEFT_HEAD_SIZE, 0.0);
         moves_left_head.copy_from_slice(&self.moves_left_bias_hidden);
-        for (feature, value) in moves_left_head.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
+        for (feature, value) in moves_left_head.iter_mut().enumerate().take(MOVES_LEFT_HEAD_SIZE) {
             let hidden_row = &self.moves_left_hidden
                 [feature * self.hidden_size..(feature + 1) * self.hidden_size];
             *value += dot_product(hidden, hidden_row);
@@ -2474,33 +2320,6 @@ pub(super) fn dense_move_squares(move_index: usize) -> Option<(usize, usize)> {
     Some((sparse / BOARD_SIZE, sparse % BOARD_SIZE))
 }
 
-#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-pub(super) fn policy_move_from_features() -> &'static [f32] {
-    use std::sync::OnceLock;
-    static FEATURES: OnceLock<Vec<f32>> = OnceLock::new();
-    FEATURES.get_or_init(|| {
-        let mut features = vec![0.0; DENSE_MOVE_SPACE * BOARD_SIZE];
-        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
-            let from = sparse as usize / BOARD_SIZE;
-            features[move_index * BOARD_SIZE + from] = 1.0;
-        }
-        features
-    })
-}
-
-#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-pub(super) fn policy_move_to_features() -> &'static [f32] {
-    use std::sync::OnceLock;
-    static FEATURES: OnceLock<Vec<f32>> = OnceLock::new();
-    FEATURES.get_or_init(|| {
-        let mut features = vec![0.0; DENSE_MOVE_SPACE * BOARD_SIZE];
-        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
-            let to = sparse as usize % BOARD_SIZE;
-            features[move_index * BOARD_SIZE + to] = 1.0;
-        }
-        features
-    })
-}
 
 pub fn dense_move_index(mv: Move) -> usize {
     let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
@@ -2599,18 +2418,6 @@ mod tests {
             &mut baseline,
         );
 
-        let mut perturbed_inactive = model.clone();
-        perturbed_inactive.policy_consequence_hidden.fill(100.0);
-        perturbed_inactive.policy_consequence_embedding.fill(-100.0);
-        let mut unchanged = AzEvalScratch::new(model.arch);
-        perturbed_inactive.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &[],
-            &mut unchanged,
-        );
-        assert_eq!(baseline.logits, unchanged.logits);
 
         let mut active = model.clone();
         active.policy_consequence_output.fill(0.1);
@@ -2967,42 +2774,12 @@ mod tests {
         assert_eq!(model.hidden_bias, loaded.hidden_bias);
         assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
         assert_eq!(model.value_head_bias, loaded.value_head_bias);
-        assert_eq!(model.value_head_hidden2, loaded.value_head_hidden2);
-        assert_eq!(model.value_head_bias2, loaded.value_head_bias2);
         assert_eq!(model.value_head_output, loaded.value_head_output);
         assert_eq!(model.moves_left_hidden, loaded.moves_left_hidden);
         assert_eq!(model.moves_left_bias_hidden, loaded.moves_left_bias_hidden);
         assert_eq!(model.moves_left_output, loaded.moves_left_output);
         assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
-        assert_eq!(model.policy_from_hidden, loaded.policy_from_hidden);
-        assert_eq!(model.policy_to_hidden, loaded.policy_to_hidden);
-        assert_eq!(
-            model.policy_pair_context_hidden,
-            loaded.policy_pair_context_hidden
-        );
-        assert_eq!(
-            model.policy_pair_context_bias,
-            loaded.policy_pair_context_bias
-        );
-        assert_eq!(model.policy_pair_embedding, loaded.policy_pair_embedding);
-        assert_eq!(
-            model.policy_move_context_hidden,
-            loaded.policy_move_context_hidden
-        );
-        assert_eq!(model.policy_move_embedding, loaded.policy_move_embedding);
-        assert_eq!(
-            model.policy_consequence_hidden,
-            loaded.policy_consequence_hidden
-        );
-        assert_eq!(
-            model.policy_consequence_bias,
-            loaded.policy_consequence_bias
-        );
-        assert_eq!(
-            model.policy_consequence_embedding,
-            loaded.policy_consequence_embedding
-        );
         assert_eq!(
             model.policy_consequence_output,
             loaded.policy_consequence_output
@@ -3014,15 +2791,15 @@ mod tests {
         let mut average = AzNnue::random(4, 101);
         let current = AzNnue::random(4, 202);
         let first_before = average.input_hidden[17];
-        let last_before = average.policy_move_embedding[31];
+        let last_before = average.policy_consequence_output[31];
         let first_current = current.input_hidden[17];
-        let last_current = current.policy_move_embedding[31];
+        let last_current = current.policy_consequence_output[31];
 
         let mut count = average.update_capped_swa(&current, 1, 10);
         assert_eq!(count, 2);
         assert!((average.input_hidden[17] - (first_before + first_current) * 0.5).abs() < 1e-7);
         assert!(
-            (average.policy_move_embedding[31] - (last_before + last_current) * 0.5).abs() < 1e-7
+            (average.policy_consequence_output[31] - (last_before + last_current) * 0.5).abs() < 1e-7
         );
 
         for _ in 0..20 {

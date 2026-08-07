@@ -11,7 +11,6 @@ mod rules;
 mod types;
 
 pub use env::{AppliedMove, IllegalMove, StepOutcome, XiangqiEnv};
-pub(crate) use eval::piece_base_value;
 pub use geom::{parse_square, square_name};
 pub use types::{
     Color, Move, Piece, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome, Undo,
