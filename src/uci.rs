@@ -50,21 +50,21 @@ impl Default for UciState {
             model: None,
             simulations: 10_000,
             threads: 1,
-            cpuct: 1.5,
-            cpuct_at_root: 3.0,
+            cpuct: 0.65,
+            cpuct_at_root: 1.5,
             cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
+            cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
-            fpu_value: 0.23,
+            cpuct_factor_at_root: 1.5,
+            fpu_value: 0.0,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
             moves_left_max_effect: 0.25,
-            moves_left_slope: 0.002,
-            moves_left_threshold: 0.6,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.15,
-            moves_left_quadratic_factor: 0.85,
+            moves_left_slope: 0.004,
+            moves_left_threshold: 0.7,
+            moves_left_constant_factor: 0.05,
+            moves_left_scaled_factor: 0.2,
+            moves_left_quadratic_factor: 0.75,
             seed: 20260409,
         }
     }
@@ -148,21 +148,21 @@ fn print_uci_id() {
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name Cpuct type string default 1.5");
-    println!("option name CpuctAtRoot type string default 3.0");
+    println!("option name Cpuct type string default 0.65");
+    println!("option name CpuctAtRoot type string default 1.5");
     println!("option name CpuctBase type string default 19652.0");
-    println!("option name CpuctFactor type string default 2.0");
+    println!("option name CpuctFactor type string default 1.5");
     println!("option name CpuctBaseAtRoot type string default 19652.0");
-    println!("option name CpuctFactorAtRoot type string default 2.0");
-    println!("option name FpuValue type string default 0.23");
+    println!("option name CpuctFactorAtRoot type string default 1.5");
+    println!("option name FpuValue type string default 0.0");
     println!("option name FpuValueAtRoot type string default 1.0");
     println!("option name DrawScore type string default 0.0");
     println!("option name MovesLeftMaxEffect type string default 0.25");
-    println!("option name MovesLeftSlope type string default 0.002");
-    println!("option name MovesLeftThreshold type string default 0.6");
-    println!("option name MovesLeftConstantFactor type string default 0.0");
-    println!("option name MovesLeftScaledFactor type string default 0.15");
-    println!("option name MovesLeftQuadraticFactor type string default 0.85");
+    println!("option name MovesLeftSlope type string default 0.004");
+    println!("option name MovesLeftThreshold type string default 0.7");
+    println!("option name MovesLeftConstantFactor type string default 0.05");
+    println!("option name MovesLeftScaledFactor type string default 0.2");
+    println!("option name MovesLeftQuadraticFactor type string default 0.75");
     println!("uciok");
     flush();
 }

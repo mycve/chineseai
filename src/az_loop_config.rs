@@ -97,12 +97,12 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 1600,
             selfplay_samples_per_update: 120000,
-            lr: 0.0007,
-            lr_min: 0.00015,
+            lr: 0.001,
+            lr_min: 0.0003,
             lr_decay_start_update: 100,
             lr_decay_interval: 200,
-            lr_decay_factor: 0.9,
-            batch_size: 256,
+            lr_decay_factor: 0.97,
+            batch_size: 1024,
             max_plies: 200,
             hidden_size: 128,
             seed: 20260420,
@@ -113,12 +113,12 @@ impl Default for AzLoopFileConfig {
             temperature_decay_plies: 60,
             temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
-            cpuct: 1.20,
-            cpuct_at_root: 2.0,
+            cpuct: 0.65,
+            cpuct_at_root: 1.5,
             cpuct_base: 19652.0,
-            cpuct_factor: 2.0,
+            cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 2.0,
+            cpuct_factor_at_root: 1.5,
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.10,
             fpu_value: 0.0,
@@ -133,7 +133,7 @@ impl Default for AzLoopFileConfig {
             policy_softmax_temp: 1.45,
             value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
             opening_fens_path: String::new(),
-            resign_percentage: 0.8,
+            resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
             replay_recent_sample_fraction: 0.4,
@@ -152,7 +152,7 @@ impl Default for AzLoopFileConfig {
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
-            arena_processes: 192,
+            arena_processes: 128,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 300,
             arena_opening_plies_min: 6,
@@ -391,8 +391,8 @@ mod tests {
         let text = AzLoopFileConfig::default().to_file_text();
 
         assert!(text.starts_with("format_version = 4\n"));
-        assert!(text.contains("lr = 0.0007\n"));
-        assert!(text.contains("lr_min = 0.00015\n"));
+        assert!(text.contains("lr = 0.001\n"));
+        assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("temperature_endgame = 0.35\n"));
         assert!(text.contains("temperature_decay_delay_plies = 30\n"));
@@ -400,12 +400,12 @@ mod tests {
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
-        assert!(text.contains("cpuct = 1.2\n"));
-        assert!(text.contains("cpuct_at_root = 2.0\n"));
+        assert!(text.contains("cpuct = 0.65\n"));
+        assert!(text.contains("cpuct_at_root = 1.5\n"));
         assert!(text.contains("cpuct_base = 19652.0\n"));
-        assert!(text.contains("cpuct_factor = 2.0\n"));
+        assert!(text.contains("cpuct_factor = 1.5\n"));
         assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
-        assert!(text.contains("cpuct_factor_at_root = 2.0\n"));
+        assert!(text.contains("cpuct_factor_at_root = 1.5\n"));
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
         assert!(text.contains("fpu_value = 0.0\n"));
@@ -420,7 +420,7 @@ mod tests {
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(text.contains("value_target_search_q_mix = 0.25\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
-        assert!(text.contains("resign_percentage = 0.8\n"));
+        assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("simulations = 1600\n"));
         assert!(!text.contains("low_simulations"));
@@ -431,14 +431,14 @@ mod tests {
         assert!(!text.contains("high_simulation_start_plies"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 0\n"));
-        assert!(text.contains("batch_size = 256\n"));
+        assert!(text.contains("batch_size = 1024\n"));
         assert!(text.contains("max_plies = 200\n"));
         assert!(text.contains("hidden_size = 128\n"));
         assert!(text.contains("replay_capacity = 1000000\n"));
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("replay_recent_games = 5000\n"));
-        assert!(text.contains("arena_processes = 192\n"));
+        assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
@@ -463,7 +463,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.0007).abs() < 1e-9);
+        assert!((parsed.lr - 0.001).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
     }
