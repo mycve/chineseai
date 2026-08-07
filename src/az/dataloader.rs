@@ -116,6 +116,8 @@ pub(super) struct PackedBatch {
     pub policy_consequence_captured: Vec<u32>,
     pub policy_consequence_move_mask: Vec<f32>,
     pub policy_consequence_capture_mask: Vec<f32>,
+    #[cfg(feature = "policy-context")]
+    pub policy_group_indices: Vec<u32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
@@ -167,6 +169,8 @@ impl PackedBatch {
             policy_consequence_captured: vec![0u32; batch_size * max_policy_moves],
             policy_consequence_move_mask: vec![0.0; batch_size * max_policy_moves],
             policy_consequence_capture_mask: vec![0.0; batch_size * max_policy_moves],
+            #[cfg(feature = "policy-context")]
+            policy_group_indices: vec![0u32; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
@@ -257,6 +261,15 @@ impl PackedBatch {
                             self.policy_consequence_captured[policy_base + policy_offset] =
                                 captured_feature as u32;
                             self.policy_consequence_capture_mask[policy_base + policy_offset] = 1.0;
+                        }
+                        #[cfg(feature = "policy-context")]
+                        {
+                            // L0 ??????? x ?????piece_index = moved_feature/BOARD_SIZE?
+                            // kind = piece_index % 7???/???????capture ???????????
+                            let kind = (moved_feature / BOARD_SIZE) % 7;
+                            let capture = usize::from(captured_feature != usize::MAX);
+                            self.policy_group_indices[policy_base + policy_offset] =
+                                (kind * 2 + capture) as u32;
                         }
                     }
                 }

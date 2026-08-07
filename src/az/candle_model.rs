@@ -5,6 +5,8 @@ use super::{
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
     MOVES_LEFT_HEAD_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch,
 };
+#[cfg(feature = "policy-context")]
+use super::POLICY_GROUP_COUNT;
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
 const RMS_NORM_EPS: f64 = 1.0e-6;
@@ -28,6 +30,8 @@ pub(super) struct AzCandleModel {
     moves_left_bias: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
+    #[cfg(feature = "policy-context")]
+    policy_group_hidden: Var,
 }
 
 impl AzCandleModel {
@@ -118,6 +122,21 @@ impl AzCandleModel {
             )?
             .reshape((bsz, batch.max_policy_moves))?
             .broadcast_mul(&batch.policy_consequence_move_mask)?;
+        #[cfg(feature = "policy-context")]
+        let policy_consequence_logits = {
+            let group_emb = self
+                .policy_group_hidden
+                .index_select(&batch.policy_group_indices.flatten_all()?, 0)?
+                .reshape((bsz, batch.max_policy_moves, hidden_size))?;
+            let hidden_expand = hidden
+                .unsqueeze(1)?
+                .broadcast_as((bsz, batch.max_policy_moves, hidden_size))?;
+            let group_logits = group_emb
+                .mul(&hidden_expand)?
+                .sum(2)?
+                .broadcast_mul(&batch.policy_consequence_move_mask)?;
+            (policy_consequence_logits + group_logits)?
+        };
 
         Ok(ForwardOutput {
             value_logits,
@@ -155,6 +174,8 @@ pub(super) struct BatchTensors {
     pub(super) policy_consequence_captured: Tensor,
     pub(super) policy_consequence_move_mask: Tensor,
     pub(super) policy_consequence_capture_mask: Tensor,
+    #[cfg(feature = "policy-context")]
+    pub(super) policy_group_indices: Tensor,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) moves_left: Tensor,
@@ -253,6 +274,12 @@ impl BatchTensors {
                 (batch_size, max_policy_moves, 1),
                 device,
             )?,
+            #[cfg(feature = "policy-context")]
+            policy_group_indices: Tensor::from_vec(
+                packed.policy_group_indices,
+                (batch_size, max_policy_moves),
+                device,
+            )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             moves_left: Tensor::from_vec(packed.moves_left, batch_size, device)?,
@@ -334,6 +361,12 @@ impl AzCandleModel {
                 POLICY_CONSEQUENCE_SIZE,
                 device,
             )?,
+            #[cfg(feature = "policy-context")]
+            policy_group_hidden: var_from_slice(
+                &model.policy_group_hidden,
+                (POLICY_GROUP_COUNT, hidden),
+                device,
+            )?,
         })
     }
 
@@ -355,6 +388,8 @@ impl AzCandleModel {
         vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
+        #[cfg(feature = "policy-context")]
+        vars.push(self.policy_group_hidden.clone());
         vars
     }
 
@@ -384,6 +419,8 @@ impl AzCandleModel {
             &self.policy_consequence_output,
             &mut model.policy_consequence_output,
         )?;
+        #[cfg(feature = "policy-context")]
+        copy_var(&self.policy_group_hidden, &mut model.policy_group_hidden)?;
         Ok(())
     }
 
@@ -448,6 +485,11 @@ mod tests {
         let mut model = AzNnue::random(32, 20260730);
         for (index, weight) in model.policy_consequence_output.iter_mut().enumerate() {
             *weight = (index as f32 + 1.0) * 0.003;
+        }
+        #[cfg(feature = "policy-context")]
+        for (index, weight) in model.policy_group_hidden.iter_mut().enumerate() {
+            // distinct rows so the L0 group projection contributes non-trivially
+            *weight = ((index % 7) as f32 + 1.0) * 0.01;
         }
 
         let mut cpu = AzEvalScratch::new(model.arch);

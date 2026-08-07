@@ -61,6 +61,8 @@ pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
 pub const RULE_CONTEXT_SIZE: usize = 7;
+#[cfg(feature = "policy-context")]
+pub(super) const POLICY_GROUP_COUNT: usize = 14; // 7 piece kinds x (capture / no-capture)
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
@@ -470,6 +472,8 @@ pub struct AzNnue {
     pub moves_left_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
+    #[cfg(feature = "policy-context")]
+    pub policy_group_hidden: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -495,6 +499,8 @@ impl Clone for AzNnue {
             moves_left_bias: self.moves_left_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
+            #[cfg(feature = "policy-context")]
+            policy_group_hidden: self.policy_group_hidden.clone(),
             gpu_trainer: None,
         }
     }
@@ -516,6 +522,17 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(blend_weight, self.hidden_size);
+        #[cfg(feature = "policy-context")]
+        {
+            debug_assert_eq!(self.policy_group_hidden.len(), current.policy_group_hidden.len());
+            for (average, &value) in self
+                .policy_group_hidden
+                .iter_mut()
+                .zip(&current.policy_group_hidden)
+            {
+                *average = *average * old_weight + value * new_weight;
+            }
+        }
         (count + 1).min(max_models)
     }
 }
@@ -960,6 +977,9 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
+        #[cfg(feature = "policy-context")]
+        // ??????hidden, 0?=0???????? baseline ??????????????
+        let policy_group_hidden = vec![0.0; POLICY_GROUP_COUNT * hidden_size];
         Self {
             hidden_size,
             arch,
@@ -979,6 +999,8 @@ impl AzNnue {
             moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
+            #[cfg(feature = "policy-context")]
+            policy_group_hidden,
             gpu_trainer: None,
         }
     }
@@ -1002,6 +1024,13 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(save_tensor, h);
+        #[cfg(feature = "policy-context")]
+        insert_candle_var(
+            &varmap,
+            "policy_group_hidden",
+            &self.policy_group_hidden,
+            (POLICY_GROUP_COUNT, h),
+        )?;
         varmap.save(path).map_err(candle_io_error)
     }
 
@@ -1045,6 +1074,8 @@ impl AzNnue {
                 &tensors,
                 "policy_consequence_output",
             )?,
+            #[cfg(feature = "policy-context")]
+            policy_group_hidden: load_candle_f32_tensor(&tensors, "policy_group_hidden")?,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -1212,6 +1243,17 @@ impl AzNnue {
                 let move_index = dense as usize;
                 scratch.logits[index] = self.policy_move_bias[move_index]
                     + self.policy_piece_square_logit(position, side, *mv);
+                #[cfg(feature = "policy-context")]
+                {
+                    // L0???????? hidden ??"???? x ????"????????????
+                    if let Some(moved) = position.piece_at(mv.from as usize) {
+                        let group =
+                            piece_kind_index(moved.kind) * 2 + usize::from(position.piece_at(mv.to as usize).is_some());
+                        let start = group * self.hidden_size;
+                        let row = &self.policy_group_hidden[start..start + self.hidden_size];
+                        scratch.logits[index] += dot_product(&scratch.hidden, row);
+                    }
+                }
             }
         }
         let _ = features;
@@ -1506,6 +1548,20 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(validate_tensor, hidden);
+        #[cfg(feature = "policy-context")]
+        {
+            let expected_pg = POLICY_GROUP_COUNT * hidden;
+            if self.policy_group_hidden.len() != expected_pg {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "az model tensor `policy_group_hidden` length mismatch: got {}, expected {}",
+                        self.policy_group_hidden.len(),
+                        expected_pg
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 }
