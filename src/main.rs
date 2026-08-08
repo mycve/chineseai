@@ -1215,7 +1215,10 @@ fn main() {
             model.save(&output).unwrap_or_else(|err| {
                 panic!("failed to write `{output}`: {err}");
             });
-            println!("aznnue   : initialized (safetensors, format v2)");
+            println!(
+                "aznnue   : initialized (safetensors, format v{})",
+                chineseai::version::MODEL_FORMAT_VERSION
+            );
             println!("arch     : hidden={}", arch.hidden_size,);
             println!("seed     : {seed}");
             println!("output   : {output}");
@@ -1759,6 +1762,12 @@ fn main() {
                 }
                 reference
             };
+            let initial_selfplay_model = if config.arena_interval == 0 {
+                selfplay_model.clone()
+            } else {
+                println!("selfplay : champion gate active; start from arena best");
+                initial_arena_reference_model.clone()
+            };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -1929,7 +1938,8 @@ fn main() {
                 },
                 numa_nodes.len(),
             );
-            let initial_numa_models = build_numa_model_replicas(&selfplay_model, &numa_nodes);
+            let initial_numa_models =
+                build_numa_model_replicas(&initial_selfplay_model, &numa_nodes);
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: start_update.saturating_sub(1) as u64,
                 models_by_numa_node: initial_numa_models,
@@ -2839,8 +2849,9 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                let updated_numa_models = build_numa_model_replicas(&deployed_model, &numa_nodes);
-                {
+                if config.arena_interval == 0 {
+                    let updated_numa_models =
+                        build_numa_model_replicas(&deployed_model, &numa_nodes);
                     let mut shared = shared_model
                         .write()
                         .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
@@ -2884,6 +2895,15 @@ fn main() {
                         );
                         if promoted {
                             arena_reference_model = deployed_model.clone();
+                            let updated_numa_models =
+                                build_numa_model_replicas(&deployed_model, &numa_nodes);
+                            {
+                                let mut shared = shared_model
+                                    .write()
+                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                                shared.models_by_numa_node = updated_numa_models;
+                                shared.version = shared.version.wrapping_add(1);
+                            }
                             let best_checkpoint = save_best_checkpoint_model(
                                 &deployed_model,
                                 &config.model_path,

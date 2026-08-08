@@ -52,6 +52,7 @@ pub use train::{
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
+pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 /// 自对弈价值目标：终局结果 与 MCTS 根搜索 Q 的混合权重（root_q 占比）。
 pub const VALUE_TARGET_SEARCH_Q_MIX: f32 = 0.40;
@@ -61,8 +62,6 @@ pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
 pub const RULE_CONTEXT_SIZE: usize = 7;
-#[cfg(feature = "policy-context")]
-pub(super) const POLICY_GROUP_COUNT: usize = 14; // 7 piece kinds x (capture / no-capture)
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
@@ -209,6 +208,11 @@ macro_rules! az_weight_tensors {
         $visit!(moves_left_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
+        $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h]);
+        $visit!(
+            policy_move_context,
+            [DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE]
+        );
     };
 }
 
@@ -245,6 +249,7 @@ pub(super) struct AzEvalScratch {
     // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
     features: Vec<usize>,
     hidden: Vec<f32>,
+    policy_context: Vec<f32>,
     value_head: Vec<f32>,
     policy_gives_check: Vec<f32>,
     logits: Vec<f32>,
@@ -257,6 +262,7 @@ impl AzEvalScratch {
         Self {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
+            policy_context: vec![0.0; POLICY_MOVE_CONTEXT_SIZE],
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             policy_gives_check: Vec::with_capacity(192),
             logits: Vec::with_capacity(192),
@@ -268,6 +274,7 @@ impl AzEvalScratch {
         Self {
             features: Vec::new(),
             hidden: Vec::new(),
+            policy_context: Vec::new(),
             value_head: Vec::new(),
             policy_gives_check: Vec::new(),
             logits: Vec::new(),
@@ -472,8 +479,8 @@ pub struct AzNnue {
     pub moves_left_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
-    #[cfg(feature = "policy-context")]
-    pub policy_group_hidden: Vec<f32>,
+    pub policy_context_hidden: Vec<f32>,
+    pub policy_move_context: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -499,8 +506,8 @@ impl Clone for AzNnue {
             moves_left_bias: self.moves_left_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
-            #[cfg(feature = "policy-context")]
-            policy_group_hidden: self.policy_group_hidden.clone(),
+            policy_context_hidden: self.policy_context_hidden.clone(),
+            policy_move_context: self.policy_move_context.clone(),
             gpu_trainer: None,
         }
     }
@@ -522,17 +529,6 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(blend_weight, self.hidden_size);
-        #[cfg(feature = "policy-context")]
-        {
-            debug_assert_eq!(self.policy_group_hidden.len(), current.policy_group_hidden.len());
-            for (average, &value) in self
-                .policy_group_hidden
-                .iter_mut()
-                .zip(&current.policy_group_hidden)
-            {
-                *average = *average * old_weight + value * new_weight;
-            }
-        }
         (count + 1).min(max_models)
     }
 }
@@ -977,9 +973,13 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
-        #[cfg(feature = "policy-context")]
-        // ??????hidden, 0?=0???????? baseline ??????????????
-        let policy_group_hidden = vec![0.0; POLICY_GROUP_COUNT * hidden_size];
+        // One factor starts random and the other at zero: the new branch is
+        // exactly policy-neutral at initialization, while gradients can update
+        // move embeddings on the first optimization step.
+        let policy_context_hidden = (0..POLICY_MOVE_CONTEXT_SIZE * hidden_size)
+            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
+            .collect();
+        let policy_move_context = vec![0.0; DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE];
         Self {
             hidden_size,
             arch,
@@ -999,8 +999,8 @@ impl AzNnue {
             moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
-            #[cfg(feature = "policy-context")]
-            policy_group_hidden,
+            policy_context_hidden,
+            policy_move_context,
             gpu_trainer: None,
         }
     }
@@ -1024,13 +1024,6 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(save_tensor, h);
-        #[cfg(feature = "policy-context")]
-        insert_candle_var(
-            &varmap,
-            "policy_group_hidden",
-            &self.policy_group_hidden,
-            (POLICY_GROUP_COUNT, h),
-        )?;
         varmap.save(path).map_err(candle_io_error)
     }
 
@@ -1074,8 +1067,8 @@ impl AzNnue {
                 &tensors,
                 "policy_consequence_output",
             )?,
-            #[cfg(feature = "policy-context")]
-            policy_group_hidden: load_candle_f32_tensor(&tensors, "policy_group_hidden")?,
+            policy_context_hidden: load_candle_f32_tensor(&tensors, "policy_context_hidden")?,
+            policy_move_context: load_candle_f32_tensor(&tensors, "policy_move_context")?,
             gpu_trainer: None,
         };
         model.validate()?;
@@ -1226,6 +1219,14 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_logits");
             scratch.policy_gives_check.resize(moves.len(), 0.0);
+            scratch.policy_context.resize(POLICY_MOVE_CONTEXT_SIZE, 0.0);
+            for (context_index, context) in scratch.policy_context.iter_mut().enumerate() {
+                let start = context_index * self.hidden_size;
+                *context = dot_product(
+                    &scratch.hidden,
+                    &self.policy_context_hidden[start..start + self.hidden_size],
+                );
+            }
             let work = position.clone();
             {
                 crate::scope_profile!("az.eval.policy.gives_check");
@@ -1233,18 +1234,6 @@ impl AzNnue {
                     *flag = f32::from(work.gives_check_after_move_fast(mv));
                 }
             }
-            #[cfg(feature = "policy-context")]
-            // hidden is identical for every move in this node, so the 14 group
-            // dot-products are computed once and looked up per move.
-            let policy_group_lut: [f32; POLICY_GROUP_COUNT] = {
-                let mut lut = [0.0f32; POLICY_GROUP_COUNT];
-                for (group, slot) in lut.iter_mut().enumerate() {
-                    let start = group * self.hidden_size;
-                    let row = &self.policy_group_hidden[start..start + self.hidden_size];
-                    *slot = dot_product(&scratch.hidden, row);
-                }
-                lut
-            };
             {
                 crate::scope_profile!("az.eval.policy.logit_arith");
             for (index, mv) in moves.iter().enumerate() {
@@ -1258,16 +1247,14 @@ impl AzNnue {
                     mv.to
                 );
                 let move_index = dense as usize;
+                let context_start = move_index * POLICY_MOVE_CONTEXT_SIZE;
                 scratch.logits[index] = self.policy_move_bias[move_index]
-                    + self.policy_piece_square_logit(position, side, *mv);
-                #[cfg(feature = "policy-context")]
-                {
-                    if let Some(moved) = position.piece_at(mv.from as usize) {
-                        let group =
-                            piece_kind_index(moved.kind) * 2 + usize::from(position.piece_at(mv.to as usize).is_some());
-                        scratch.logits[index] += policy_group_lut[group];
-                    }
-                }
+                    + self.policy_piece_square_logit(position, side, *mv)
+                    + dot_product(
+                        &scratch.policy_context,
+                        &self.policy_move_context
+                            [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
+                    );
             }
             }
         }
@@ -1514,16 +1501,17 @@ impl AzNnue {
                 (if captured.color == side { 0 } else { 7 }) + piece_kind_index(captured.kind);
             piece_index * BOARD_SIZE + canonical.to as usize
         });
+        let consequence_size = POLICY_CONSEQUENCE_SIZE.min(self.hidden_size);
         let from_embedding = &self.input_hidden[from_feature * self.hidden_size
-            ..from_feature * self.hidden_size + POLICY_CONSEQUENCE_SIZE];
+            ..from_feature * self.hidden_size + consequence_size];
         let to_embedding = &self.input_hidden[to_feature * self.hidden_size
-            ..to_feature * self.hidden_size + POLICY_CONSEQUENCE_SIZE];
+            ..to_feature * self.hidden_size + consequence_size];
         let captured_embedding = captured_feature.map(|feature| {
             &self.input_hidden
-                [feature * self.hidden_size..feature * self.hidden_size + POLICY_CONSEQUENCE_SIZE]
+                [feature * self.hidden_size..feature * self.hidden_size + consequence_size]
         });
         let mut logit = 0.0;
-        for feature in 0..POLICY_CONSEQUENCE_SIZE {
+        for feature in 0..consequence_size {
             let captured = captured_embedding.map_or(0.0, |embedding| embedding[feature]);
             let delta = to_embedding[feature] - from_embedding[feature] - captured;
             logit += delta * self.policy_consequence_output[feature];
@@ -1563,20 +1551,6 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(validate_tensor, hidden);
-        #[cfg(feature = "policy-context")]
-        {
-            let expected_pg = POLICY_GROUP_COUNT * hidden;
-            if self.policy_group_hidden.len() != expected_pg {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "az model tensor `policy_group_hidden` length mismatch: got {}, expected {}",
-                        self.policy_group_hidden.len(),
-                        expected_pg
-                    ),
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -2727,6 +2701,8 @@ mod tests {
             model.policy_consequence_output,
             loaded.policy_consequence_output
         );
+        assert_eq!(model.policy_context_hidden, loaded.policy_context_hidden);
+        assert_eq!(model.policy_move_context, loaded.policy_move_context);
     }
 
     #[test]

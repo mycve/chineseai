@@ -53,5 +53,5 @@ pub(super) fn train_samples_gpu(
     _rng: &mut super::SplitMix64,
     _loss_weights: super::AzTrainLossWeights,
 ) -> Result<super::AzTrainStats, String> {
-    Err("GPU training is disabled; rebuild with `--features gpu-train`".to_string())
+    Err("GPU training is disabled by `--no-default-features`".to_string())
 }

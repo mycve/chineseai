@@ -1,12 +1,11 @@
 use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_CONSEQUENCE_SIZE, RULE_CONTEXT_SIZE,
-    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    MOVES_LEFT_HEAD_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_CONSEQUENCE_SIZE,
+    POLICY_MOVE_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
+    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
+    dataloader::PackedBatch,
 };
-#[cfg(feature = "policy-context")]
-use super::POLICY_GROUP_COUNT;
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
 const RMS_NORM_EPS: f64 = 1.0e-6;
@@ -30,14 +29,15 @@ pub(super) struct AzCandleModel {
     moves_left_bias: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
-    #[cfg(feature = "policy-context")]
-    policy_group_hidden: Var,
+    policy_context_hidden: Var,
+    policy_move_context: Var,
 }
 
 impl AzCandleModel {
     pub(super) fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
         let bsz = batch.batch_size;
         let hidden_size = self.arch.hidden_size;
+        let policy_consequence_size = POLICY_CONSEQUENCE_SIZE.min(hidden_size);
         let feature_embeddings = self
             .input_hidden
             .index_select(&batch.feature_indices.flatten_all()?, 0)?
@@ -100,43 +100,39 @@ impl AzCandleModel {
             .contiguous()?;
         let piece_square_policy = self
             .input_hidden
-            .narrow(1, 0, POLICY_CONSEQUENCE_SIZE)?
+            .narrow(1, 0, policy_consequence_size)?
             .contiguous()?;
         let consequence_from = piece_square_policy
             .index_select(&batch.policy_consequence_from.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?;
+            .reshape((bsz, batch.max_policy_moves, policy_consequence_size))?;
         let consequence_to = piece_square_policy
             .index_select(&batch.policy_consequence_to.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?;
+            .reshape((bsz, batch.max_policy_moves, policy_consequence_size))?;
         let consequence_captured = piece_square_policy
             .index_select(&batch.policy_consequence_captured.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?
+            .reshape((bsz, batch.max_policy_moves, policy_consequence_size))?
             .broadcast_mul(&batch.policy_consequence_capture_mask)?;
         let consequence_delta = ((consequence_to - consequence_from)? - consequence_captured)?;
         let policy_consequence_logits = consequence_delta
-            .reshape((bsz * batch.max_policy_moves, POLICY_CONSEQUENCE_SIZE))?
+            .reshape((bsz * batch.max_policy_moves, policy_consequence_size))?
             .matmul(
                 &self
                     .policy_consequence_output
-                    .reshape((POLICY_CONSEQUENCE_SIZE, 1))?,
+                    .narrow(0, 0, policy_consequence_size)?
+                    .reshape((policy_consequence_size, 1))?,
             )?
             .reshape((bsz, batch.max_policy_moves))?
             .broadcast_mul(&batch.policy_consequence_move_mask)?;
-        #[cfg(feature = "policy-context")]
-        let policy_consequence_logits = {
-            let group_emb = self
-                .policy_group_hidden
-                .index_select(&batch.policy_group_indices.flatten_all()?, 0)?
-                .reshape((bsz, batch.max_policy_moves, hidden_size))?;
-            let hidden_expand = hidden
-                .unsqueeze(1)?
-                .broadcast_as((bsz, batch.max_policy_moves, hidden_size))?;
-            let group_logits = group_emb
-                .mul(&hidden_expand)?
-                .sum(2)?
-                .broadcast_mul(&batch.policy_consequence_move_mask)?;
-            (policy_consequence_logits + group_logits)?
-        };
+        let policy_context = hidden.matmul(&self.policy_context_hidden.t()?)?;
+        let move_context = self
+            .policy_move_context
+            .index_select(&batch.policy_indices.flatten_all()?, 0)?
+            .reshape((bsz, batch.max_policy_moves, POLICY_MOVE_CONTEXT_SIZE))?;
+        let policy_context_logits = move_context
+            .broadcast_mul(&policy_context.unsqueeze(1)?)?
+            .sum(2)?
+            .broadcast_mul(&batch.policy_consequence_move_mask)?;
+        let policy_consequence_logits = (policy_consequence_logits + policy_context_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -174,8 +170,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_consequence_captured: Tensor,
     pub(super) policy_consequence_move_mask: Tensor,
     pub(super) policy_consequence_capture_mask: Tensor,
-    #[cfg(feature = "policy-context")]
-    pub(super) policy_group_indices: Tensor,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) moves_left: Tensor,
@@ -274,12 +268,6 @@ impl BatchTensors {
                 (batch_size, max_policy_moves, 1),
                 device,
             )?,
-            #[cfg(feature = "policy-context")]
-            policy_group_indices: Tensor::from_vec(
-                packed.policy_group_indices,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             moves_left: Tensor::from_vec(packed.moves_left, batch_size, device)?,
@@ -361,10 +349,14 @@ impl AzCandleModel {
                 POLICY_CONSEQUENCE_SIZE,
                 device,
             )?,
-            #[cfg(feature = "policy-context")]
-            policy_group_hidden: var_from_slice(
-                &model.policy_group_hidden,
-                (POLICY_GROUP_COUNT, hidden),
+            policy_context_hidden: var_from_slice(
+                &model.policy_context_hidden,
+                (POLICY_MOVE_CONTEXT_SIZE, hidden),
+                device,
+            )?,
+            policy_move_context: var_from_slice(
+                &model.policy_move_context,
+                (DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE),
                 device,
             )?,
         })
@@ -388,8 +380,8 @@ impl AzCandleModel {
         vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
-        #[cfg(feature = "policy-context")]
-        vars.push(self.policy_group_hidden.clone());
+        vars.push(self.policy_context_hidden.clone());
+        vars.push(self.policy_move_context.clone());
         vars
     }
 
@@ -419,8 +411,11 @@ impl AzCandleModel {
             &self.policy_consequence_output,
             &mut model.policy_consequence_output,
         )?;
-        #[cfg(feature = "policy-context")]
-        copy_var(&self.policy_group_hidden, &mut model.policy_group_hidden)?;
+        copy_var(
+            &self.policy_context_hidden,
+            &mut model.policy_context_hidden,
+        )?;
+        copy_var(&self.policy_move_context, &mut model.policy_move_context)?;
         Ok(())
     }
 
@@ -486,10 +481,8 @@ mod tests {
         for (index, weight) in model.policy_consequence_output.iter_mut().enumerate() {
             *weight = (index as f32 + 1.0) * 0.003;
         }
-        #[cfg(feature = "policy-context")]
-        for (index, weight) in model.policy_group_hidden.iter_mut().enumerate() {
-            // distinct rows so the L0 group projection contributes non-trivially
-            *weight = ((index % 7) as f32 + 1.0) * 0.01;
+        for (index, weight) in model.policy_move_context.iter_mut().enumerate() {
+            *weight = ((index % POLICY_MOVE_CONTEXT_SIZE) as f32 + 1.0) * 0.002;
         }
 
         let mut cpu = AzEvalScratch::new(model.arch);
@@ -556,6 +549,18 @@ mod tests {
                 .iter()
                 .any(|gradient| gradient.abs() > 1.0e-8)
         );
+        let move_context_gradient = gradients
+            .get(&gradient_candle.policy_move_context)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            move_context_gradient
+                .iter()
+                .any(|gradient| gradient.abs() > 1.0e-8)
+        );
     }
 
     /// CPU ???`AzNnue`?? Candle GPU ???????????
@@ -596,6 +601,8 @@ mod tests {
             moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
+            policy_context_hidden,
+            policy_move_context,
         );
     }
 }
