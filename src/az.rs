@@ -1226,7 +1226,7 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.policy_logits");
             scratch.policy_gives_check.resize(moves.len(), 0.0);
-            let mut work = position.clone();
+            let work = position.clone();
             {
                 crate::scope_profile!("az.eval.policy.gives_check");
                 for (flag, &mv) in scratch.policy_gives_check.iter_mut().zip(moves) {

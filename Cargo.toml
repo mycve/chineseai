@@ -47,3 +47,7 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 incremental = true
+
+[[bin]]
+name = "chineseai-uci"
+path = "src/bin/uci.rs"

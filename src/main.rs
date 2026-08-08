@@ -20,10 +20,9 @@ use chineseai::{
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
-    uci::run_uci,
     xiangqi::{Move, Position, RuleOutcome},
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -51,7 +50,7 @@ const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 5;
     name = "chineseai",
     version,
     about = "ChineseAI AZ-NNUE search and training tools",
-    long_about = "ChineseAI AZ-NNUE search and training tools.\n\nIf no command is given, the program starts in UCI mode."
+    long_about = "ChineseAI AZ-NNUE search and training tools."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,8 +59,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    /// Run the UCI engine loop.
-    Uci,
     /// Create a random AZ-NNUE model.
     AzInit(AzInitArgs),
     /// Search one position and print policy/debug details.
@@ -1206,8 +1203,10 @@ fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        None => run_uci(),
-        Some(CliCommand::Uci) => run_uci(),
+        None => {
+            let _ = Cli::command().print_help();
+            std::process::exit(0);
+        }
         Some(CliCommand::AzInit(cmd)) => {
             let arch = cmd.arch();
             let output = cmd.output;
