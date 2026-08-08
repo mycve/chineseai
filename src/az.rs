@@ -1227,9 +1227,26 @@ impl AzNnue {
             crate::scope_profile!("az.eval.policy_logits");
             scratch.policy_gives_check.resize(moves.len(), 0.0);
             let mut work = position.clone();
-            for (flag, &mv) in scratch.policy_gives_check.iter_mut().zip(moves) {
-                *flag = f32::from(work.gives_check_after_move(mv));
+            {
+                crate::scope_profile!("az.eval.policy.gives_check");
+                for (flag, &mv) in scratch.policy_gives_check.iter_mut().zip(moves) {
+                    *flag = f32::from(work.gives_check_after_move_fast(mv));
+                }
             }
+            #[cfg(feature = "policy-context")]
+            // hidden is identical for every move in this node, so the 14 group
+            // dot-products are computed once and looked up per move.
+            let policy_group_lut: [f32; POLICY_GROUP_COUNT] = {
+                let mut lut = [0.0f32; POLICY_GROUP_COUNT];
+                for (group, slot) in lut.iter_mut().enumerate() {
+                    let start = group * self.hidden_size;
+                    let row = &self.policy_group_hidden[start..start + self.hidden_size];
+                    *slot = dot_product(&scratch.hidden, row);
+                }
+                lut
+            };
+            {
+                crate::scope_profile!("az.eval.policy.logit_arith");
             for (index, mv) in moves.iter().enumerate() {
                 let canonical = canonical_move(side, *mv);
                 let sparse = canonical.from as usize * BOARD_SIZE + canonical.to as usize;
@@ -1245,15 +1262,13 @@ impl AzNnue {
                     + self.policy_piece_square_logit(position, side, *mv);
                 #[cfg(feature = "policy-context")]
                 {
-                    // L0???????? hidden ??"???? x ????"????????????
                     if let Some(moved) = position.piece_at(mv.from as usize) {
                         let group =
                             piece_kind_index(moved.kind) * 2 + usize::from(position.piece_at(mv.to as usize).is_some());
-                        let start = group * self.hidden_size;
-                        let row = &self.policy_group_hidden[start..start + self.hidden_size];
-                        scratch.logits[index] += dot_product(&scratch.hidden, row);
+                        scratch.logits[index] += policy_group_lut[group];
                     }
                 }
+            }
             }
         }
         let _ = features;
@@ -2311,6 +2326,25 @@ mod tests {
         let moves = position.legal_moves();
         let value = model.evaluate_value(&position, &moves);
         assert!(value.abs() < 1e-6, "initial startpos value={value}");
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    #[ignore = "manual profile harness"]
+    fn manual_profile_policy_head() {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let model = AzNnue::random(128, 999);
+        let mut scratch = AzEvalScratch::new(model.arch);
+        for _ in 0..50_000 {
+            model.evaluate_with_scratch_output(
+                &position,
+                &moves,
+                &[0.0; RULE_CONTEXT_SIZE],
+                &mut scratch,
+            );
+        }
+        crate::profile::print_report();
     }
 
     #[test]

@@ -701,3 +701,35 @@ fn fast_legal_moves_match_slow_on_vs_pikafish_repetition_game() {
         position.make_move(mv);
     }
 }
+
+#[test]
+fn gives_check_fast_matches_bruteforce() {
+    let mut rng: u64 = 0x9E3779B97F4A7C15;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for game in 0..30u64 {
+        let mut position = Position::startpos();
+        for ply in 0..200usize {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            let mv = moves[(next() as usize) % moves.len()];
+            let mut clone = position.clone();
+            let old = clone.gives_check_after_move(mv);
+            let fast = position.gives_check_after_move_fast(mv);
+            assert_eq!(old, fast, "fast mismatch game {game} ply {ply} mv {:?}\n{}", mv, position.to_fen());
+            let mut c2 = position.clone();
+            let captured = c2.make_move_board_only(mv);
+            let real = c2.in_check(position.side_to_move().opposite());
+            c2.unmake_move_board_only(mv, captured);
+            assert_eq!(fast, real, "real mismatch game {game} ply {ply} mv {:?}\n{}", mv, position.to_fen());
+            position.rule_history_entry_after_move(mv);
+            position.make_move(mv);
+        }
+    }
+}
