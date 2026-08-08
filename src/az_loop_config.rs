@@ -95,7 +95,7 @@ impl Default for AzLoopFileConfig {
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
-            simulations: 1600,
+            simulations: 2400,
             selfplay_samples_per_update: 120000,
             lr: 0.001,
             lr_min: 0.0003,
@@ -108,7 +108,7 @@ impl Default for AzLoopFileConfig {
             seed: 20260420,
             workers: 0,
             temperature_start: 0.9,
-            temperature_endgame: 0.35,
+            temperature_endgame: 0.30,
             temperature_decay_delay_plies: 30,
             temperature_decay_plies: 60,
             temperature_value_cutoff: 0.12,
@@ -136,7 +136,7 @@ impl Default for AzLoopFileConfig {
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
-            replay_recent_sample_fraction: 0.4,
+            replay_recent_sample_fraction: 0.35,
             replay_recent_games: 5000,
             train_warmup_samples: 240000,
             train_samples_per_update: 240000,
@@ -394,7 +394,7 @@ mod tests {
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
-        assert!(text.contains("temperature_endgame = 0.35\n"));
+        assert!(text.contains("temperature_endgame = 0.3\n"));
         assert!(text.contains("temperature_decay_delay_plies = 30\n"));
         assert!(text.contains("temperature_decay_plies = 60\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
@@ -418,11 +418,11 @@ mod tests {
         assert!(text.contains("moves_left_scaled_factor = 0.2\n"));
         assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
-        assert!(text.contains("value_target_search_q_mix = 0.25\n"));
+        assert!(text.contains("value_target_search_q_mix = 0.4\n"));
         assert!(text.contains("opening_fens_path = \"\"\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("simulations = 1600\n"));
+        assert!(text.contains("simulations = 2400\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));
