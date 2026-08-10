@@ -92,42 +92,24 @@ impl Position {
         let black_violation =
             repeated_rule_violation(&history[cycle_start..=current_index], Color::Black);
 
-        // One matching position only establishes the first complete cycle.
-        // Stop long check as soon as the next cycle closes; ordinary
-        // repetition and long chase keep their existing limit.
-        if repeated_indices.len() < 2 {
-            return None;
-        }
-        // 长将与长捉都在各自第二次闭合成环（同局面第 3 次出现, 即 repeated==2）时
-        // 立即裁决并据此在走法生成时过滤该着法。优先级：将 > 捉。
-        if repeated_indices.len() == 2 {
-            return match (red_violation, black_violation) {
-                (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
-                    Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck))
-                }
-                (Some(RuleViolation::LongCheck), _) => Some(RuleOutcome::Win(Color::Black)),
-                (_, Some(RuleViolation::LongCheck)) => Some(RuleOutcome::Win(Color::Red)),
-                (Some(RuleViolation::LongChase), Some(RuleViolation::LongChase)) => {
-                    Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase))
-                }
-                (Some(RuleViolation::LongChase), _) => Some(RuleOutcome::Win(Color::Black)),
-                (_, Some(RuleViolation::LongChase)) => Some(RuleOutcome::Win(Color::Red)),
-                _ => None,
-            };
-        }
-
+        // 长将和长捉都只允许一轮：同局面第 2 次出现时立即裁决，
+        // 并据此在走法生成时过滤第二轮的重复将军或捉子。优先级：将 > 捉。
         match (red_violation, black_violation) {
             (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
                 return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck));
             }
+            (Some(RuleViolation::LongCheck), _) => return Some(RuleOutcome::Win(Color::Black)),
+            (_, Some(RuleViolation::LongCheck)) => return Some(RuleOutcome::Win(Color::Red)),
+            _ => {}
+        }
+
+        match (red_violation, black_violation) {
             (Some(RuleViolation::LongChase), Some(RuleViolation::LongChase)) => {
                 return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase));
             }
-            (Some(RuleViolation::LongCheck), _) => return Some(RuleOutcome::Win(Color::Black)),
-            (_, Some(RuleViolation::LongCheck)) => return Some(RuleOutcome::Win(Color::Red)),
             (Some(RuleViolation::LongChase), _) => return Some(RuleOutcome::Win(Color::Black)),
             (_, Some(RuleViolation::LongChase)) => return Some(RuleOutcome::Win(Color::Red)),
-            (None, None) => {}
+            _ => {}
         }
 
         Some(RuleOutcome::Draw(RuleDrawReason::Repetition))

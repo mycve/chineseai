@@ -296,6 +296,21 @@ fn five_long_check_cycles_lose() {
 }
 
 #[test]
+fn one_long_check_cycle_loses() {
+    let history = vec![
+        test_rule_entry(1, Color::Red, None, false, 0),
+        test_rule_entry(2, Color::Black, Some(Color::Red), true, 0),
+        test_rule_entry(3, Color::Red, Some(Color::Black), false, 0),
+        test_rule_entry(4, Color::Black, Some(Color::Red), true, 0),
+        test_rule_entry(1, Color::Red, Some(Color::Black), false, 0),
+    ];
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
 fn three_long_check_cycles_lose() {
     let mut history = vec![test_rule_entry(1, Color::Red, None, false, 0)];
     for _ in 0..3 {
@@ -358,6 +373,21 @@ fn five_long_chase_cycles_lose() {
             0,
         ));
     }
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
+fn one_long_chase_cycle_loses() {
+    let history = vec![
+        test_rule_entry(10, Color::Red, None, false, 0),
+        test_rule_entry(11, Color::Black, Some(Color::Red), false, 1 << 20),
+        test_rule_entry(12, Color::Red, Some(Color::Black), false, 0),
+        test_rule_entry(13, Color::Black, Some(Color::Red), false, 1 << 20),
+        test_rule_entry(10, Color::Red, Some(Color::Black), false, 0),
+    ];
     assert_eq!(
         Position::rule_outcome(&history),
         Some(RuleOutcome::Win(Color::Black))
@@ -429,7 +459,7 @@ fn chased_piece_escape_does_not_make_mutual_long_chase() {
     }
 
     // 黑方被捉的车在逃，因此不是"互相长捉"和棋；红方是唯一长捉方所以判红负（黑胜）。
-    // 收紧为 2 次重复后，红方长捉在第二次闭合成环时即被判负。
+    // 长捉完成一轮后即被判负。
     assert_eq!(outcome, Some(RuleOutcome::Win(Color::Black)));
 }
 
@@ -473,7 +503,7 @@ fn mutual_long_chase_cycles_draw() {
 }
 
 #[test]
-fn one_cycle_repetition_does_not_end_by_force_rule() {
+fn one_long_check_cycle_filters_the_next_repeated_check() {
     let mut position =
         Position::from_fen("2Rakab2/8r/4c1n2/p3p1p1p/2p6/9/P3P3P/1CN1NC3/9/1RBAKArc1 b - - 0 1")
             .unwrap();
@@ -487,9 +517,18 @@ fn one_cycle_repetition_does_not_end_by_force_rule() {
         position.to_fen(),
         "2Rakab2/8r/4c1n2/p3p1p1p/2p6/9/P3P3P/1CN1NC3/9/1RBAKArc1 b"
     );
-    assert_eq!(position.rule_outcome_with_history(&history), None);
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Win(Color::Red))
+    );
     assert_eq!(position.legal_moves().len(), 44);
-    assert_eq!(position.legal_moves_with_rules(&history).len(), 44);
+    let repeated_check = position.parse_uci_move("g0g1").unwrap();
+    assert!(position.legal_moves().contains(&repeated_check));
+    assert!(
+        !position
+            .legal_moves_with_rules(&history)
+            .contains(&repeated_check)
+    );
 }
 
 #[test]
