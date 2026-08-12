@@ -321,12 +321,35 @@ fn apply_uci_moves(
         let Some(mv) = position.parse_uci_move(text) else {
             break;
         };
-        if !position.legal_moves_with_rules(rule_history).contains(&mv) {
+        // 外部引擎的重复、长将和长捉判罚可能与训练规则不同。UCI 导入只校验
+        // 棋盘着法合法性，避免规则分歧导致后续着法被静默截断。
+        if !position.legal_moves().contains(&mv) {
             break;
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
+}
+
+fn relaxed_uci_rule_history(rule_history: &[RuleHistoryEntry]) -> Vec<RuleHistoryEntry> {
+    let Some(current) = rule_history.last() else {
+        return Vec::new();
+    };
+    let prior_matches = rule_history[..rule_history.len() - 1]
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.hash == current.hash && entry.side_to_move == current.side_to_move
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    // 内部规则在同局面第二次出现时即裁决；UCI 对外兼容采用常见的三次出现
+    // 阈值。第二次出现时丢弃前一次匹配，仅把最近一轮作为后续搜索的规则历史。
+    if prior_matches.len() == 1 {
+        return rule_history[prior_matches[0] + 1..].to_vec();
+    }
+    rule_history.to_vec()
 }
 
 fn position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry]) -> bool {
@@ -441,15 +464,16 @@ fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
 
 fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let model = state.model.as_ref().expect("model was loaded");
+    let rule_history = relaxed_uci_rule_history(&state.rule_history);
 
-    if position_is_rule_draw(&state.position, &state.rule_history) {
+    if position_is_rule_draw(&state.position, &rule_history) {
         println!("info depth 0 nodes 0 time 0 score cp 0");
         println!("bestmove 0000");
         flush();
         return;
     }
 
-    let mut legal = state.position.legal_moves_with_rules(&state.rule_history);
+    let mut legal = state.position.legal_moves_with_rules(&rule_history);
     if !params.searchmoves.is_empty() {
         legal.retain(|mv| {
             params
@@ -478,7 +502,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     };
     let result = alphazero_search_with_rules_controlled_with_progress(
         &state.position,
-        Some(state.rule_history.clone()),
+        Some(rule_history),
         Some(legal),
         model,
         AzSearchLimits {
@@ -638,5 +662,64 @@ mod tests {
             uci_simulation_limit(&timed, 10_000, true),
             MAX_UCI_SIMULATIONS
         );
+    }
+
+    #[test]
+    fn uci_relaxes_second_occurrence_but_keeps_threefold_draw() {
+        let entry = |hash, side_to_move, mover| RuleHistoryEntry {
+            hash,
+            side_to_move,
+            mover,
+            gives_check: false,
+            chased_mask: 0,
+            chased_piece_mask: 0,
+        };
+        let second_occurrence = vec![
+            entry(1, Color::Red, None),
+            entry(2, Color::Black, Some(Color::Red)),
+            entry(1, Color::Red, Some(Color::Black)),
+        ];
+        let relaxed = relaxed_uci_rule_history(&second_occurrence);
+        assert_eq!(Position::rule_outcome(&relaxed), None);
+
+        let third_occurrence = vec![
+            entry(1, Color::Red, None),
+            entry(2, Color::Black, Some(Color::Red)),
+            entry(1, Color::Red, Some(Color::Black)),
+            entry(2, Color::Black, Some(Color::Red)),
+            entry(1, Color::Red, Some(Color::Black)),
+        ];
+        let relaxed = relaxed_uci_rule_history(&third_occurrence);
+        assert_eq!(
+            Position::rule_outcome(&relaxed),
+            Some(RuleOutcome::Draw(
+                crate::xiangqi::RuleDrawReason::Repetition
+            ))
+        );
+    }
+
+    #[test]
+    fn uci_accepts_external_single_cycle_and_can_search_it() {
+        let mut position = Position::startpos();
+        let mut history = position.initial_rule_history();
+        let moves = "g3g4 c9e7 c3c4 h9i7 h0i2 i9i8 f0e1 c6c5 c4c5 i8c8 \
+                     c0e2 c8c5 b0a2 c5e5 h2f2 i6i5 b2d2 e5e3 a0c0 e3a3 \
+                     a2c3 b9a7 c3d5 a9c9 c0c9 e7c9 d5b6 d9e8 i0h0 h7f7 \
+                     d2c2 c9e7 h0h8 f7f6 b6d5 f6f5 e2c0 f5e5 c2e2 a3d3 \
+                     d5b6 d3c3 b6d5 c3d3"
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        apply_uci_moves(&mut position, &mut history, &moves);
+
+        assert_eq!(history.len(), moves.len() + 1);
+        assert_eq!(
+            position.rule_outcome_with_history(&history),
+            Some(RuleOutcome::Draw(
+                crate::xiangqi::RuleDrawReason::Repetition
+            ))
+        );
+        let relaxed = relaxed_uci_rule_history(&history);
+        assert_eq!(position.rule_outcome_with_history(&relaxed), None);
+        assert!(!position.legal_moves_with_rules(&relaxed).is_empty());
     }
 }
