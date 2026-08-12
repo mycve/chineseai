@@ -1,12 +1,12 @@
 use crate::az::{
-    AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult,
-    alphazero_search_with_rules_controlled_with_progress,
+    alphazero_search_with_rules_controlled_with_progress, AzNnue, AzSearchControl, AzSearchLimits,
+    AzSearchResult,
 };
 use crate::xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome};
 use std::io::{self, BufRead, Write};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -331,25 +331,11 @@ fn apply_uci_moves(
     }
 }
 
-fn relaxed_uci_rule_history(rule_history: &[RuleHistoryEntry]) -> Vec<RuleHistoryEntry> {
-    let Some(current) = rule_history.last() else {
-        return Vec::new();
-    };
-    let prior_matches = rule_history[..rule_history.len() - 1]
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            entry.hash == current.hash && entry.side_to_move == current.side_to_move
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-
-    // 内部规则在同局面第二次出现时即裁决；UCI 对外兼容采用常见的三次出现
-    // 阈值。第二次出现时丢弃前一次匹配，仅把最近一轮作为后续搜索的规则历史。
-    if prior_matches.len() == 1 {
-        return rule_history[prior_matches[0] + 1..].to_vec();
-    }
-    rule_history.to_vec()
+fn uci_search_rule_history(position: &Position) -> Vec<RuleHistoryEntry> {
+    // 外部着法历史只用于还原棋盘，不作为我方胜负评分依据。否则对方采用不同的
+    // 长将、长捉或重复规则时，会被内部规则误判为我方 ±1000 分。搜索规则从当前
+    // 根局面重新计数，之后由我方搜索产生的循环仍按内部规则约束。
+    position.initial_rule_history()
 }
 
 fn position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry]) -> bool {
@@ -464,7 +450,7 @@ fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
 
 fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let model = state.model.as_ref().expect("model was loaded");
-    let rule_history = relaxed_uci_rule_history(&state.rule_history);
+    let rule_history = uci_search_rule_history(&state.position);
 
     if position_is_rule_draw(&state.position, &rule_history) {
         println!("info depth 0 nodes 0 time 0 score cp 0");
@@ -665,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn uci_relaxes_second_occurrence_but_keeps_threefold_draw() {
+    fn uci_search_does_not_score_external_long_check_as_a_win() {
         let entry = |hash, side_to_move, mover| RuleHistoryEntry {
             hash,
             side_to_move,
@@ -674,28 +660,27 @@ mod tests {
             chased_mask: 0,
             chased_piece_mask: 0,
         };
-        let second_occurrence = vec![
+        let external_history = vec![
             entry(1, Color::Red, None),
-            entry(2, Color::Black, Some(Color::Red)),
+            RuleHistoryEntry {
+                gives_check: true,
+                ..entry(2, Color::Black, Some(Color::Red))
+            },
+            entry(3, Color::Red, Some(Color::Black)),
+            RuleHistoryEntry {
+                gives_check: true,
+                ..entry(4, Color::Black, Some(Color::Red))
+            },
             entry(1, Color::Red, Some(Color::Black)),
         ];
-        let relaxed = relaxed_uci_rule_history(&second_occurrence);
-        assert_eq!(Position::rule_outcome(&relaxed), None);
-
-        let third_occurrence = vec![
-            entry(1, Color::Red, None),
-            entry(2, Color::Black, Some(Color::Red)),
-            entry(1, Color::Red, Some(Color::Black)),
-            entry(2, Color::Black, Some(Color::Red)),
-            entry(1, Color::Red, Some(Color::Black)),
-        ];
-        let relaxed = relaxed_uci_rule_history(&third_occurrence);
         assert_eq!(
-            Position::rule_outcome(&relaxed),
-            Some(RuleOutcome::Draw(
-                crate::xiangqi::RuleDrawReason::Repetition
-            ))
+            Position::rule_outcome(&external_history),
+            Some(RuleOutcome::Win(Color::Black))
         );
+
+        let position = Position::startpos();
+        let search_history = uci_search_rule_history(&position);
+        assert_eq!(position.rule_outcome_with_history(&search_history), None);
     }
 
     #[test]
@@ -718,8 +703,8 @@ mod tests {
                 crate::xiangqi::RuleDrawReason::Repetition
             ))
         );
-        let relaxed = relaxed_uci_rule_history(&history);
-        assert_eq!(position.rule_outcome_with_history(&relaxed), None);
-        assert!(!position.legal_moves_with_rules(&relaxed).is_empty());
+        let search_history = uci_search_rule_history(&position);
+        assert_eq!(position.rule_outcome_with_history(&search_history), None);
+        assert!(!position.legal_moves_with_rules(&search_history).is_empty());
     }
 }
