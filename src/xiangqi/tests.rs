@@ -761,24 +761,12 @@ fn gives_check_fast_matches_bruteforce() {
             let mut clone = position.clone();
             let old = clone.gives_check_after_move(mv);
             let fast = position.gives_check_after_move_fast(mv);
-            assert_eq!(
-                old,
-                fast,
-                "fast mismatch game {game} ply {ply} mv {:?}\n{}",
-                mv,
-                position.to_fen()
-            );
+            assert_eq!(old, fast, "fast mismatch game {game} ply {ply} mv {:?}\n{}", mv, position.to_fen());
             let mut c2 = position.clone();
             let captured = c2.make_move_board_only(mv);
             let real = c2.in_check(position.side_to_move().opposite());
             c2.unmake_move_board_only(mv, captured);
-            assert_eq!(
-                fast,
-                real,
-                "real mismatch game {game} ply {ply} mv {:?}\n{}",
-                mv,
-                position.to_fen()
-            );
+            assert_eq!(fast, real, "real mismatch game {game} ply {ply} mv {:?}\n{}", mv, position.to_fen());
             position.rule_history_entry_after_move(mv);
             position.make_move(mv);
         }

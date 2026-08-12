@@ -46,11 +46,7 @@ impl Position {
         for &(piece_index, square) in pieces {
             if piece_index < 14 && square < BOARD_SIZE {
                 board[square] = Some(Piece {
-                    color: if piece_index < 7 {
-                        Color::Red
-                    } else {
-                        Color::Black
-                    },
+                    color: if piece_index < 7 { Color::Red } else { Color::Black },
                     kind: kinds[piece_index % 7],
                 });
             }
@@ -350,7 +346,7 @@ impl Position {
         self.hash ^= zobrist_piece_key(from, moving);
         if let Some(captured) = undo.captured {
             self.hash ^= zobrist_piece_key(to, captured);
-            self.adjust_minor_counts(captured, -1);
+                self.adjust_minor_counts(captured, -1);
             self.adjust_dynamic_material_counts(captured, -1);
             if captured.kind == PieceKind::General {
                 self.general_squares[color_hash_index(captured.color)] = None;
@@ -613,20 +609,18 @@ impl Position {
         let dr = tr - pr;
         match piece.kind {
             PieceKind::General => {
-                if (df.abs() + dr.abs()) == 1
-                    && inside_palace(piece.color, tf as usize, tr as usize)
+                if (df.abs() + dr.abs()) == 1 && inside_palace(piece.color, tf as usize, tr as usize)
                 {
                     return true;
                 }
                 pf == tf
-                    && occ(target)
-                        .is_some_and(|p| p.kind == PieceKind::General && p.color != piece.color)
+                    && occ(target).is_some_and(|p| {
+                        p.kind == PieceKind::General && p.color != piece.color
+                    })
                     && self.clear_line_between_virtual(sq, target, occ)
             }
             PieceKind::Advisor => {
-                df.abs() == 1
-                    && dr.abs() == 1
-                    && inside_palace(piece.color, tf as usize, tr as usize)
+                df.abs() == 1 && dr.abs() == 1 && inside_palace(piece.color, tf as usize, tr as usize)
             }
             PieceKind::Elephant => {
                 df.abs() == 2

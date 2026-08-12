@@ -1,6 +1,8 @@
+use crate::xiangqi::{
+    BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piece_kind_index,
+};
 #[cfg(test)]
 use crate::xiangqi::PieceKind;
-use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piece_kind_index};
 
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
@@ -100,10 +102,7 @@ mod tests {
         let side = position.side_to_move();
         let us_general = piece_absolute_feature_index(
             side,
-            Piece {
-                color: side,
-                kind: PieceKind::General,
-            },
+            Piece { color: side, kind: PieceKind::General },
         ) * BOARD_SIZE
             + canonical_square(side, 4);
         let them_general = piece_absolute_feature_index(
