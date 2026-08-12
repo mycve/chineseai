@@ -32,6 +32,8 @@ pub struct AzLoopFileConfig {
     pub hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
+    pub opening_exploration_plies: usize,
+    pub opening_temperature: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
@@ -46,6 +48,7 @@ pub struct AzLoopFileConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub opening_root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
@@ -56,8 +59,10 @@ pub struct AzLoopFileConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
+    pub opening_policy_softmax_temp: f32,
     pub value_target_search_q_mix: f32,
     pub opening_fens_path: String,
+    pub opening_fen_game_fraction: f32,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
@@ -95,7 +100,7 @@ impl Default for AzLoopFileConfig {
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
-            simulations: 2400,
+            simulations: 1600,
             selfplay_samples_per_update: 120000,
             lr: 0.001,
             lr_min: 0.0003,
@@ -107,6 +112,8 @@ impl Default for AzLoopFileConfig {
             hidden_size: 128,
             seed: 20260420,
             workers: 0,
+            opening_exploration_plies: 20,
+            opening_temperature: 1.25,
             temperature_start: 0.9,
             temperature_endgame: 0.30,
             temperature_decay_delay_plies: 30,
@@ -121,6 +128,7 @@ impl Default for AzLoopFileConfig {
             cpuct_factor_at_root: 1.5,
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.10,
+            opening_root_exploration_fraction: 0.30,
             fpu_value: 0.0,
             fpu_value_at_root: 1.0,
             draw_score: 0.0,
@@ -131,8 +139,10 @@ impl Default for AzLoopFileConfig {
             moves_left_scaled_factor: 0.20,
             moves_left_quadratic_factor: 0.75,
             policy_softmax_temp: 1.45,
+            opening_policy_softmax_temp: 3.0,
             value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
-            opening_fens_path: String::new(),
+            opening_fens_path: "opening_fens.txt".into(),
+            opening_fen_game_fraction: 0.75,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
@@ -141,7 +151,7 @@ impl Default for AzLoopFileConfig {
             train_warmup_samples: 240000,
             train_samples_per_update: 240000,
             train_epochs_per_update: 1,
-            mirror_probability: 0.3,
+            mirror_probability: 0.5,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
@@ -209,6 +219,8 @@ impl AzLoopFileConfig {
         line!("hidden_size", self.hidden_size);
         line!("seed", self.seed);
         line!("workers", self.workers);
+        line!("opening_exploration_plies", self.opening_exploration_plies);
+        line!("opening_temperature", f(self.opening_temperature));
         line!("temperature_start", f(self.temperature_start));
         line!("temperature_endgame", f(self.temperature_endgame));
         line!(
@@ -229,6 +241,10 @@ impl AzLoopFileConfig {
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
         );
+        line!(
+            "opening_root_exploration_fraction",
+            f(self.opening_root_exploration_fraction)
+        );
         line!("fpu_value", f(self.fpu_value));
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
@@ -246,10 +262,18 @@ impl AzLoopFileConfig {
         );
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!(
+            "opening_policy_softmax_temp",
+            f(self.opening_policy_softmax_temp)
+        );
+        line!(
             "value_target_search_q_mix",
             f(self.value_target_search_q_mix)
         );
         line!("opening_fens_path", q(&self.opening_fens_path));
+        line!(
+            "opening_fen_game_fraction",
+            f(self.opening_fen_game_fraction)
+        );
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
         line!("replay_capacity", self.replay_capacity);
@@ -332,6 +356,8 @@ impl AzLoopFileConfig {
         if self.workers == 0 {
             self.workers = system_physical_cores();
         }
+        self.opening_exploration_plies = self.opening_exploration_plies.min(self.max_plies);
+        self.opening_temperature = self.opening_temperature.max(0.0);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_endgame = self.temperature_endgame.max(0.0);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
@@ -345,6 +371,8 @@ impl AzLoopFileConfig {
         self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.opening_root_exploration_fraction =
+            self.opening_root_exploration_fraction.clamp(0.0, 1.0);
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
@@ -352,6 +380,8 @@ impl AzLoopFileConfig {
         self.moves_left_slope = self.moves_left_slope.max(0.0);
         self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
+        self.opening_policy_softmax_temp = self.opening_policy_softmax_temp.max(1e-3);
+        self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
         self.value_target_search_q_mix = self.value_target_search_q_mix.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
@@ -390,13 +420,15 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 4\n"));
+        assert!(text.starts_with("format_version = 5\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("temperature_endgame = 0.3\n"));
         assert!(text.contains("temperature_decay_delay_plies = 30\n"));
         assert!(text.contains("temperature_decay_plies = 60\n"));
+        assert!(text.contains("opening_exploration_plies = 20\n"));
+        assert!(text.contains("opening_temperature = 1.25\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
@@ -408,6 +440,7 @@ mod tests {
         assert!(text.contains("cpuct_factor_at_root = 1.5\n"));
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
+        assert!(text.contains("opening_root_exploration_fraction = 0.3\n"));
         assert!(text.contains("fpu_value = 0.0\n"));
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
@@ -418,11 +451,13 @@ mod tests {
         assert!(text.contains("moves_left_scaled_factor = 0.2\n"));
         assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("opening_policy_softmax_temp = 3.0\n"));
         assert!(text.contains("value_target_search_q_mix = 0.4\n"));
-        assert!(text.contains("opening_fens_path = \"\"\n"));
+        assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
+        assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("simulations = 2400\n"));
+        assert!(text.contains("simulations = 1600\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));
@@ -438,6 +473,7 @@ mod tests {
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("replay_recent_games = 5000\n"));
+        assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
         assert!(text.contains("arena_opening_positions = 300\n"));

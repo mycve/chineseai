@@ -783,6 +783,8 @@ fn build_az_loop_config(
         seed,
         workers,
         generation_update,
+        opening_exploration_plies: config.opening_exploration_plies,
+        opening_temperature: config.opening_temperature,
         temperature_start: config.temperature_start,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
@@ -797,6 +799,7 @@ fn build_az_loop_config(
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
+        opening_root_exploration_fraction: config.opening_root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         draw_score: config.draw_score,
@@ -807,8 +810,10 @@ fn build_az_loop_config(
         moves_left_scaled_factor: config.moves_left_scaled_factor,
         moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
+        opening_policy_softmax_temp: config.opening_policy_softmax_temp,
         value_target_search_q_mix: config.value_target_search_q_mix,
         opening_positions: opening_positions.to_vec(),
+        opening_fen_game_fraction: config.opening_fen_game_fraction,
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
@@ -823,7 +828,8 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
     }
     let text = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read opening_fens_path `{path}`: {err}"));
-    text.lines()
+    let positions = text
+        .lines()
         .enumerate()
         .filter_map(|(index, line)| {
             let line = line.trim();
@@ -834,7 +840,35 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
                 panic!("invalid opening FEN at `{path}` line {}: {err}", index + 1)
             }))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let source_count = positions.len();
+    let mut mirror_keys = HashSet::with_capacity(source_count);
+    let positions = positions
+        .into_iter()
+        .filter(|position| {
+            assert!(
+                position.has_general(chineseai::xiangqi::Color::Red)
+                    && position.has_general(chineseai::xiangqi::Color::Black),
+                "opening FEN must contain both generals: {}",
+                position.to_fen()
+            );
+            assert!(
+                !position.legal_moves().is_empty(),
+                "opening FEN has no legal moves: {}",
+                position.to_fen()
+            );
+            let fen = position.to_fen();
+            let mirrored = position.mirror_files().to_fen();
+            mirror_keys.insert(if fen <= mirrored { fen } else { mirrored })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "openings : loaded={} mirror_deduplicated={} usable={}",
+        source_count,
+        source_count.saturating_sub(positions.len()),
+        positions.len()
+    );
+    positions
 }
 
 fn build_async_training_report(
@@ -1900,6 +1934,19 @@ fn main() {
                 config.pikafish_label_eval_cpuct,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
+            );
+            println!(
+                "explore  : opening={}ply move_temp={} policy_temp={} root_noise(alpha={},fraction={}) normal(move_temp={}..{},policy_temp={},noise_fraction={}) opening_fen_games={:.1}%",
+                config.opening_exploration_plies,
+                config.opening_temperature,
+                config.opening_policy_softmax_temp,
+                config.root_dirichlet_alpha,
+                config.opening_root_exploration_fraction,
+                config.temperature_start,
+                config.temperature_endgame,
+                config.policy_softmax_temp,
+                config.root_exploration_fraction,
+                config.opening_fen_game_fraction * 100.0
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);

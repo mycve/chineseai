@@ -335,11 +335,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
-        let mut position = if config.opening_positions.is_empty() {
-            Position::startpos()
-        } else {
+        let mut position = if use_opening_fen(
+            !config.opening_positions.is_empty(),
+            config.opening_fen_game_fraction,
+            rng.unit_f32(),
+        ) {
             let index = (rng.next_u64() as usize) % config.opening_positions.len();
             config.opening_positions[index].clone()
+        } else {
+            Position::startpos()
         };
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
@@ -370,6 +374,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let search_simulation_count = config.simulations.max(1);
             search_simulations.searches += 1;
             search_simulations.simulations_sum += search_simulation_count;
+            let opening_exploration = ply < config.opening_exploration_plies;
             let limits = AzSearchLimits {
                 simulations: search_simulation_count,
                 seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
@@ -381,10 +386,18 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 cpuct_factor_at_root: config.cpuct_factor_at_root,
                 max_depth: 0,
                 root_dirichlet_alpha: config.root_dirichlet_alpha,
-                root_exploration_fraction: config.root_exploration_fraction,
+                root_exploration_fraction: if opening_exploration {
+                    config.opening_root_exploration_fraction
+                } else {
+                    config.root_exploration_fraction
+                },
                 fpu_value: config.fpu_value,
                 fpu_value_at_root: config.fpu_value_at_root,
-                policy_softmax_temp: config.policy_softmax_temp,
+                policy_softmax_temp: if opening_exploration {
+                    config.opening_policy_softmax_temp
+                } else {
+                    config.policy_softmax_temp
+                },
                 draw_score: config.draw_score,
                 moves_left_max_effect: config.moves_left_max_effect,
                 moves_left_slope: config.moves_left_slope,
@@ -815,6 +828,9 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
 }
 
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
+    if ply < config.opening_exploration_plies {
+        return config.opening_temperature;
+    }
     if ply < config.temperature_decay_delay_plies {
         return config.temperature_start;
     }
@@ -827,6 +843,10 @@ fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
     }
     let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
     config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
+}
+
+fn use_opening_fen(openings_available: bool, fraction: f32, random_unit: f32) -> bool {
+    openings_available && random_unit < fraction.clamp(0.0, 1.0)
 }
 
 fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
@@ -1091,6 +1111,15 @@ fn play_arena_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_fen_sampling_respects_configured_fraction() {
+        assert!(use_opening_fen(true, 0.75, 0.0));
+        assert!(use_opening_fen(true, 0.75, 0.749_999));
+        assert!(!use_opening_fen(true, 0.75, 0.75));
+        assert!(!use_opening_fen(true, 0.75, 0.999_999));
+        assert!(!use_opening_fen(false, 0.75, 0.0));
+    }
 
     fn candidate(mv: Move, policy: f32) -> AzCandidate {
         AzCandidate {
