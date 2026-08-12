@@ -6,8 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64,
-    rule_context_features,
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;

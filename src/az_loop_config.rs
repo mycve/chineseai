@@ -33,7 +33,6 @@ pub struct AzLoopFileConfig {
     pub seed: u64,
     pub workers: usize,
     pub opening_exploration_plies: usize,
-    pub opening_temperature: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
@@ -114,7 +113,6 @@ impl Default for AzLoopFileConfig {
             seed: 20260420,
             workers: 0,
             opening_exploration_plies: 20,
-            opening_temperature: 1.25,
             temperature_start: 0.9,
             temperature_endgame: 0.30,
             temperature_decay_delay_plies: 30,
@@ -222,7 +220,6 @@ impl AzLoopFileConfig {
         line!("seed", self.seed);
         line!("workers", self.workers);
         line!("opening_exploration_plies", self.opening_exploration_plies);
-        line!("opening_temperature", f(self.opening_temperature));
         line!("temperature_start", f(self.temperature_start));
         line!("temperature_endgame", f(self.temperature_endgame));
         line!(
@@ -363,7 +360,6 @@ impl AzLoopFileConfig {
             self.workers = system_physical_cores();
         }
         self.opening_exploration_plies = self.opening_exploration_plies.min(self.max_plies);
-        self.opening_temperature = self.opening_temperature.max(0.0);
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_endgame = self.temperature_endgame.max(0.0);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
@@ -426,7 +422,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 6\n"));
+        assert!(text.starts_with("format_version = 7\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -434,7 +430,6 @@ mod tests {
         assert!(text.contains("temperature_decay_delay_plies = 30\n"));
         assert!(text.contains("temperature_decay_plies = 60\n"));
         assert!(text.contains("opening_exploration_plies = 20\n"));
-        assert!(text.contains("opening_temperature = 1.25\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));

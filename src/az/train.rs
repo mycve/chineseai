@@ -75,13 +75,5 @@ fn train_samples_weighted_shared(
     rng: &mut SplitMix64,
     loss_weights: AzTrainLossWeights,
 ) -> Result<AzTrainStats, String> {
-    super::train_gpu::train_samples_gpu(
-        model,
-        samples,
-        epochs,
-        lr,
-        batch_size,
-        rng,
-        loss_weights,
-    )
+    super::train_gpu::train_samples_gpu(model, samples, epochs, lr, batch_size, rng, loss_weights)
 }

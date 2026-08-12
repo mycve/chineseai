@@ -26,7 +26,10 @@ mod train_gpu;
 #[path = "az/train_gpu_candle.rs"]
 mod train_gpu_candle;
 
-use crate::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, canonical_square, fill_sparse_features_az, piece_absolute_feature_index};
+use crate::nnue::{
+    AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, canonical_square, fill_sparse_features_az,
+    piece_absolute_feature_index,
+};
 use crate::version::MODEL_FORMAT_VERSION;
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position, color_index,
@@ -522,7 +525,6 @@ pub struct AzLoopConfig {
     pub workers: usize,
     pub generation_update: u32,
     pub opening_exploration_plies: usize,
-    pub opening_temperature: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
@@ -714,12 +716,7 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
         if moves.len() != sample.policy.len() {
             continue;
         }
-        model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &sample.rule_context,
-            &mut scratch,
-        );
+        model.evaluate_with_scratch_output(&position, &moves, &sample.rule_context, &mut scratch);
         let max_logit = scratch
             .logits
             .iter()
@@ -1116,23 +1113,13 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(
-                &scratch.hidden,
-                &features,
-                &mut scratch.value_head,
-            )
+            self.value_wdl_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
         let moves_left = {
             crate::scope_profile!("az.eval.moves_left_head");
             self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
         };
-        self.evaluate_prepared_hidden_with_scratch(
-            position,
-            &features,
-            value,
-            moves,
-            scratch,
-        );
+        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
         scratch.features = features;
         AzEvalOutput {
             value_wdl,
@@ -1166,23 +1153,13 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(
-                &scratch.hidden,
-                &[],
-                &mut scratch.value_head,
-            )
+            self.value_wdl_from_hidden_into(&scratch.hidden, &[], &mut scratch.value_head)
         };
         let moves_left = {
             crate::scope_profile!("az.eval.moves_left_head");
             self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
         };
-        self.evaluate_prepared_hidden_with_scratch(
-            position,
-            &[],
-            value,
-            moves,
-            scratch,
-        );
+        self.evaluate_prepared_hidden_with_scratch(position, &[], value, moves, scratch);
         AzEvalOutput {
             value_wdl,
             value,
@@ -1221,26 +1198,26 @@ impl AzNnue {
             }
             {
                 crate::scope_profile!("az.eval.policy.logit_arith");
-            for (index, mv) in moves.iter().enumerate() {
-                let canonical = canonical_move(side, *mv);
-                let sparse = canonical.from as usize * BOARD_SIZE + canonical.to as usize;
-                let dense = move_map.sparse_to_dense[sparse];
-                debug_assert!(
-                    dense != u16::MAX,
-                    "invalid policy move {}->{}",
-                    mv.from,
-                    mv.to
-                );
-                let move_index = dense as usize;
-                let context_start = move_index * POLICY_MOVE_CONTEXT_SIZE;
-                scratch.logits[index] = self.policy_move_bias[move_index]
-                    + self.policy_piece_square_logit(position, side, *mv)
-                    + dot_product(
-                        &scratch.policy_context,
-                        &self.policy_move_context
-                            [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
+                for (index, mv) in moves.iter().enumerate() {
+                    let canonical = canonical_move(side, *mv);
+                    let sparse = canonical.from as usize * BOARD_SIZE + canonical.to as usize;
+                    let dense = move_map.sparse_to_dense[sparse];
+                    debug_assert!(
+                        dense != u16::MAX,
+                        "invalid policy move {}->{}",
+                        mv.from,
+                        mv.to
                     );
-            }
+                    let move_index = dense as usize;
+                    let context_start = move_index * POLICY_MOVE_CONTEXT_SIZE;
+                    scratch.logits[index] = self.policy_move_bias[move_index]
+                        + self.policy_piece_square_logit(position, side, *mv)
+                        + dot_product(
+                            &scratch.policy_context,
+                            &self.policy_move_context
+                                [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
+                        );
+                }
             }
         }
         let _ = features;
@@ -1462,7 +1439,11 @@ impl AzNnue {
     fn moves_left_from_hidden_into(&self, hidden: &[f32], moves_left_head: &mut Vec<f32>) -> f32 {
         moves_left_head.resize(MOVES_LEFT_HEAD_SIZE, 0.0);
         moves_left_head.copy_from_slice(&self.moves_left_bias_hidden);
-        for (feature, value) in moves_left_head.iter_mut().enumerate().take(MOVES_LEFT_HEAD_SIZE) {
+        for (feature, value) in moves_left_head
+            .iter_mut()
+            .enumerate()
+            .take(MOVES_LEFT_HEAD_SIZE)
+        {
             let hidden_row = &self.moves_left_hidden
                 [feature * self.hidden_size..(feature + 1) * self.hidden_size];
             *value += dot_product(hidden, hidden_row);
@@ -1487,10 +1468,10 @@ impl AzNnue {
             piece_index * BOARD_SIZE + canonical.to as usize
         });
         let consequence_size = POLICY_CONSEQUENCE_SIZE.min(self.hidden_size);
-        let from_embedding = &self.input_hidden[from_feature * self.hidden_size
-            ..from_feature * self.hidden_size + consequence_size];
-        let to_embedding = &self.input_hidden[to_feature * self.hidden_size
-            ..to_feature * self.hidden_size + consequence_size];
+        let from_embedding = &self.input_hidden
+            [from_feature * self.hidden_size..from_feature * self.hidden_size + consequence_size];
+        let to_embedding = &self.input_hidden
+            [to_feature * self.hidden_size..to_feature * self.hidden_size + consequence_size];
         let captured_embedding = captured_feature.map(|feature| {
             &self.input_hidden
                 [feature * self.hidden_size..feature * self.hidden_size + consequence_size]
@@ -1845,10 +1826,10 @@ unsafe fn dot_product_avx2_fma(left: &[f32], right: &[f32]) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
     let chunks = left.len() / 8;
     let mut acc = _mm256_setzero_ps();
     for chunk in 0..chunks {
@@ -1873,10 +1854,10 @@ unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
     let chunks = hidden.len() / 8;
     for chunk in 0..chunks {
         let index = chunk * 8;
@@ -1917,10 +1898,10 @@ unsafe fn add_scaled_feature_row_avx2_fma(hidden: &mut [f32], row: &[f32], scale
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn add_scaled_feature_row_avx2(hidden: &mut [f32], row: &[f32], scale: f32) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
     let scale_scalar = scale;
     let scale = _mm256_set1_ps(scale_scalar);
     let chunks = hidden.len() / 8;
@@ -1988,10 +1969,10 @@ unsafe fn input_embedding_add_features_avx2(
     features: &[usize],
     hidden: &mut [f32],
 ) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
     let chunks = hidden_size / 8;
     for &feature in features {
         let row = &input_hidden[feature * hidden_size..(feature + 1) * hidden_size];
@@ -2012,10 +1993,10 @@ unsafe fn input_embedding_add_features_avx2(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn relu_in_place_avx2(values: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
     let zero = _mm256_setzero_ps();
     let chunks = values.len() / 8;
     for chunk in 0..chunks {
@@ -2211,7 +2192,6 @@ pub(super) fn dense_move_squares(move_index: usize) -> Option<(usize, usize)> {
     Some((sparse / BOARD_SIZE, sparse % BOARD_SIZE))
 }
 
-
 pub fn dense_move_index(mv: Move) -> usize {
     let sparse = mv.from as usize * BOARD_SIZE + mv.to as usize;
     let dense = move_map().sparse_to_dense[sparse];
@@ -2325,7 +2305,6 @@ mod tests {
             &[0.0; RULE_CONTEXT_SIZE],
             &mut baseline,
         );
-
 
         let mut active = model.clone();
         active.policy_consequence_output.fill(0.1);
@@ -2549,10 +2528,10 @@ mod tests {
 
         let mut rng_single = SplitMix64::new(99);
         let mut rng_repeated = SplitMix64::new(99);
-        let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single)
-            .unwrap();
-        let repeated_stats = train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated)
-            .unwrap();
+        let single_stats =
+            train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single).unwrap();
+        let repeated_stats =
+            train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated).unwrap();
 
         assert!((single_stats.loss - repeated_stats.loss).abs() < 1e-5);
         assert!((single_stats.value_loss - repeated_stats.value_loss).abs() < 1e-5);
@@ -2639,8 +2618,7 @@ mod tests {
             policy: 0.0,
             moves_left: 0.0,
         };
-        train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights)
-            .unwrap();
+        train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights).unwrap();
 
         let input_changed = before_input
             .iter()
@@ -2802,5 +2780,4 @@ mod tests {
         assert!(context[2] > 0.0);
         assert_eq!(context[3..], [0.0; 4]);
     }
-
 }

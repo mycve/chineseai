@@ -234,11 +234,7 @@ impl PackedBatch {
             }
         }
         let mut policy_offset = 0usize;
-        for (&move_index, &target) in sample
-            .move_indices
-            .iter()
-            .zip(sample.policy.iter())
-        {
+        for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_indices[policy_base + policy_offset] = move_index as u32;
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
