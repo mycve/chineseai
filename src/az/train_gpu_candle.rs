@@ -688,8 +688,7 @@ impl GpuReplica {
         let moves_left_sse_per_sample = moves_left_error.sqr()?;
         let moves_left_sse = moves_left_sse_per_sample.sum_all()?;
 
-        let legal_policy_logits = (&forward.policy_logits + &forward.policy_consequence_logits)?;
-        let masked_policy_logits = (&legal_policy_logits + &batch_tensors.policy_mask)?;
+        let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce_per_sample = policy_ce_per_sample.sum(1)?;

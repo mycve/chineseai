@@ -11,7 +11,10 @@ use crate::xiangqi::BOARD_SIZE;
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
     canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    dense_move_squares, normalize_wdl_target, structural_king_piece_index,
+    dense_move_squares,
+    fused_feature_pool::{PADDING_ITEM, pack_feature},
+    fused_policy::{pack_policy_item, padding_item as policy_padding_item},
+    normalize_wdl_target,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -100,22 +103,10 @@ pub(super) struct PackedBatch {
     pub batch_size: usize,
     pub max_features: usize,
     pub max_policy_moves: usize,
-    pub feature_indices: Vec<u32>,
-    pub feature_mask: Vec<f32>,
-    pub structural_piece_indices: Vec<u32>,
-    pub structural_rank_indices: Vec<u32>,
-    pub structural_file_indices: Vec<u32>,
-    pub structural_us_king_piece_indices: Vec<u32>,
-    pub structural_them_king_piece_indices: Vec<u32>,
-    pub structural_mask: Vec<f32>,
-    pub policy_indices: Vec<u32>,
+    pub feature_items: Vec<u32>,
+    pub policy_items: Vec<i64>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
-    pub policy_consequence_from: Vec<u32>,
-    pub policy_consequence_to: Vec<u32>,
-    pub policy_consequence_captured: Vec<u32>,
-    pub policy_consequence_move_mask: Vec<f32>,
-    pub policy_consequence_capture_mask: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub moves_left: Vec<f32>,
@@ -151,22 +142,10 @@ impl PackedBatch {
             batch_size,
             max_features,
             max_policy_moves,
-            feature_indices: vec![0u32; batch_size * max_features],
-            feature_mask: vec![0.0f32; batch_size * max_features],
-            structural_piece_indices: vec![0u32; batch_size * max_features],
-            structural_rank_indices: vec![0u32; batch_size * max_features],
-            structural_file_indices: vec![0u32; batch_size * max_features],
-            structural_us_king_piece_indices: vec![0u32; batch_size * max_features],
-            structural_them_king_piece_indices: vec![0u32; batch_size * max_features],
-            structural_mask: vec![0.0f32; batch_size * max_features],
-            policy_indices: vec![0u32; batch_size * max_policy_moves],
+            feature_items: vec![PADDING_ITEM; batch_size * max_features],
+            policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
-            policy_consequence_from: vec![0u32; batch_size * max_policy_moves],
-            policy_consequence_to: vec![0u32; batch_size * max_policy_moves],
-            policy_consequence_captured: vec![0u32; batch_size * max_policy_moves],
-            policy_consequence_move_mask: vec![0.0; batch_size * max_policy_moves],
-            policy_consequence_capture_mask: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             moves_left: vec![0.0f32; batch_size],
@@ -209,18 +188,8 @@ impl PackedBatch {
                 continue;
             }
             let batch_feature_index = feature_base + feature_offset;
-            self.feature_indices[batch_feature_index] = feature as u32;
-            self.feature_mask[batch_feature_index] = 1.0;
-            if let Some(structural) = decode_current_piece_square_feature(feature) {
-                self.structural_piece_indices[batch_feature_index] = structural.piece_index as u32;
-                self.structural_rank_indices[batch_feature_index] = structural.rank as u32;
-                self.structural_file_indices[batch_feature_index] = structural.file as u32;
-                self.structural_us_king_piece_indices[batch_feature_index] =
-                    structural_king_piece_index(0, us_king_bucket, structural.piece_index) as u32;
-                self.structural_them_king_piece_indices[batch_feature_index] =
-                    structural_king_piece_index(1, them_king_bucket, structural.piece_index) as u32;
-                self.structural_mask[batch_feature_index] = 1.0;
-            }
+            self.feature_items[batch_feature_index] =
+                pack_feature(feature, us_king_bucket, them_king_bucket);
         }
     }
 
@@ -240,26 +209,36 @@ impl PackedBatch {
             .zip(sample.policy.iter())
         {
             if move_index < DENSE_MOVE_SPACE {
-                self.policy_indices[policy_base + policy_offset] = move_index as u32;
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
+                let mut consequence_from = 0usize;
+                let mut consequence_to = 0usize;
+                let mut consequence_captured = 0usize;
+                let mut move_valid = false;
+                let mut capture_valid = false;
                 if let Some((from, to)) = dense_move_squares(move_index) {
                     let moved_feature = board_features[from];
                     if moved_feature != usize::MAX {
                         let piece_index = moved_feature / BOARD_SIZE;
-                        self.policy_consequence_from[policy_base + policy_offset] =
-                            moved_feature as u32;
-                        self.policy_consequence_to[policy_base + policy_offset] =
-                            (piece_index * BOARD_SIZE + to) as u32;
-                        self.policy_consequence_move_mask[policy_base + policy_offset] = 1.0;
+                        consequence_from = moved_feature;
+                        consequence_to = piece_index * BOARD_SIZE + to;
+                        move_valid = true;
                         let captured_feature = board_features[to];
                         if captured_feature != usize::MAX {
-                            self.policy_consequence_captured[policy_base + policy_offset] =
-                                captured_feature as u32;
-                            self.policy_consequence_capture_mask[policy_base + policy_offset] = 1.0;
+                            consequence_captured = captured_feature;
+                            capture_valid = true;
                         }
                     }
                 }
+                let item_index = policy_base + policy_offset;
+                self.policy_items[item_index] = pack_policy_item(
+                    move_index,
+                    consequence_from,
+                    consequence_to,
+                    consequence_captured,
+                    move_valid,
+                    capture_valid,
+                );
                 policy_offset += 1;
             }
         }
@@ -482,17 +461,17 @@ mod tests {
         training_sample.policy = vec![1.0];
 
         let packed = PackedBatch::from_indices(&[training_sample], &[0]);
-        assert_eq!(packed.policy_consequence_from, vec![moved_feature as u32]);
         assert_eq!(
-            packed.policy_consequence_to,
-            vec![(6 * BOARD_SIZE + 1) as u32]
+            packed.policy_items,
+            vec![pack_policy_item(
+                move_index,
+                moved_feature,
+                6 * BOARD_SIZE + 1,
+                captured_feature,
+                true,
+                true,
+            )]
         );
-        assert_eq!(
-            packed.policy_consequence_captured,
-            vec![captured_feature as u32]
-        );
-        assert_eq!(packed.policy_consequence_move_mask, vec![1.0]);
-        assert_eq!(packed.policy_consequence_capture_mask, vec![1.0]);
     }
 
     #[test]

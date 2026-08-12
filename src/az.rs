@@ -14,6 +14,8 @@ mod alphazero;
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
 mod dataloader;
+mod fused_feature_pool;
+mod fused_policy;
 mod play;
 mod replay;
 mod train;

@@ -1,10 +1,10 @@
-use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
+use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
     STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
-    dataloader::PackedBatch,
+    dataloader::PackedBatch, fused_feature_pool::feature_pool, fused_policy::fused_policy,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -35,42 +35,19 @@ pub(super) struct AzCandleModel {
 
 impl AzCandleModel {
     pub(super) fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
-        let bsz = batch.batch_size;
         let hidden_size = self.arch.hidden_size;
         let policy_consequence_size = POLICY_CONSEQUENCE_SIZE.min(hidden_size);
-        let feature_embeddings = self
-            .input_hidden
-            .index_select(&batch.feature_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, hidden_size))?;
-        let structural_piece = self
-            .input_piece_hidden
-            .index_select(&batch.structural_piece_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, hidden_size))?;
-        let structural_rank = self
-            .input_rank_hidden
-            .index_select(&batch.structural_rank_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, hidden_size))?;
-        let structural_file = self
-            .input_file_hidden
-            .index_select(&batch.structural_file_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, hidden_size))?;
-        let structural_us_king_piece = self
-            .input_king_piece_hidden
-            .index_select(&batch.structural_us_king_piece_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, hidden_size))?;
-        let structural_them_king_piece = self
-            .input_king_piece_hidden
-            .index_select(&batch.structural_them_king_piece_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_features, hidden_size))?;
-        let structural_embeddings = (structural_piece + structural_rank)?;
-        let structural_embeddings = (structural_embeddings + structural_file)?;
-        let structural_embeddings = (structural_embeddings + structural_us_king_piece)?;
-        let structural_embeddings = (structural_embeddings + structural_them_king_piece)?;
-        let structural_embeddings = structural_embeddings.broadcast_mul(&batch.structural_mask)?;
-        let feature_embeddings = (feature_embeddings + structural_embeddings)?;
-        let sparse_pre = feature_embeddings
-            .broadcast_mul(&batch.feature_mask)?
-            .sum(1)?
+        let feature_tables = Tensor::cat(
+            &[
+                self.input_hidden.as_tensor(),
+                self.input_piece_hidden.as_tensor(),
+                self.input_rank_hidden.as_tensor(),
+                self.input_file_hidden.as_tensor(),
+                self.input_king_piece_hidden.as_tensor(),
+            ],
+            0,
+        )?;
+        let sparse_pre = feature_pool(&feature_tables, &batch.feature_items)?
             .broadcast_add(&self.hidden_bias)?;
         let rule_pre = batch.rule_context.matmul(&self.rule_context_hidden)?;
         let sparse_pre = (sparse_pre + rule_pre)?;
@@ -93,50 +70,44 @@ impl AzCandleModel {
         let moves_left_logits = moves_left_head
             .matmul(&self.moves_left_output.reshape((MOVES_LEFT_HEAD_SIZE, 1))?)?
             .broadcast_add(&self.moves_left_bias)?;
-        let policy_logits = self
-            .policy_move_bias
-            .index_select(&batch.policy_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves))?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
             .contiguous()?;
-        let consequence_from = piece_square_policy
-            .index_select(&batch.policy_consequence_from.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, policy_consequence_size))?;
-        let consequence_to = piece_square_policy
-            .index_select(&batch.policy_consequence_to.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, policy_consequence_size))?;
-        let consequence_captured = piece_square_policy
-            .index_select(&batch.policy_consequence_captured.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, policy_consequence_size))?
-            .broadcast_mul(&batch.policy_consequence_capture_mask)?;
-        let consequence_delta = ((consequence_to - consequence_from)? - consequence_captured)?;
-        let policy_consequence_logits = consequence_delta
-            .reshape((bsz * batch.max_policy_moves, policy_consequence_size))?
-            .matmul(
-                &self
-                    .policy_consequence_output
-                    .narrow(0, 0, policy_consequence_size)?
-                    .reshape((policy_consequence_size, 1))?,
+        let piece_square_policy = if policy_consequence_size < POLICY_CONSEQUENCE_SIZE {
+            Tensor::cat(
+                &[
+                    &piece_square_policy,
+                    &Tensor::zeros(
+                        (
+                            AZ_NNUE_INPUT_SIZE,
+                            POLICY_CONSEQUENCE_SIZE - policy_consequence_size,
+                        ),
+                        DType::F32,
+                        self.input_hidden.device(),
+                    )?,
+                ],
+                1,
             )?
-            .reshape((bsz, batch.max_policy_moves))?
-            .broadcast_mul(&batch.policy_consequence_move_mask)?;
+        } else {
+            piece_square_policy
+        };
+        let piece_square_policy = piece_square_policy.flatten_all()?;
         let policy_context = hidden.matmul(&self.policy_context_hidden.t()?)?;
-        let move_context = self
-            .policy_move_context
-            .index_select(&batch.policy_indices.flatten_all()?, 0)?
-            .reshape((bsz, batch.max_policy_moves, POLICY_MOVE_CONTEXT_SIZE))?;
-        let policy_context_logits = move_context
-            .broadcast_mul(&policy_context.unsqueeze(1)?)?
-            .sum(2)?
-            .broadcast_mul(&batch.policy_consequence_move_mask)?;
-        let policy_consequence_logits = (policy_consequence_logits + policy_context_logits)?;
+        let policy_tables = Tensor::cat(
+            &[
+                &piece_square_policy,
+                &self.policy_consequence_output.flatten_all()?,
+                &self.policy_move_bias.flatten_all()?,
+                &self.policy_move_context.flatten_all()?,
+            ],
+            0,
+        )?;
+        let policy_logits = fused_policy(&policy_tables, &policy_context, &batch.policy_items)?;
 
         Ok(ForwardOutput {
             value_logits,
             policy_logits,
-            policy_consequence_logits,
             moves_left_logits,
         })
     }
@@ -145,30 +116,15 @@ impl AzCandleModel {
 pub(super) struct ForwardOutput {
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
-    pub(super) policy_consequence_logits: Tensor,
     pub(super) moves_left_logits: Tensor,
 }
 
 pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
-    pub(super) max_features: usize,
-    pub(super) max_policy_moves: usize,
-    pub(super) feature_indices: Tensor,
-    pub(super) feature_mask: Tensor,
-    pub(super) structural_piece_indices: Tensor,
-    pub(super) structural_rank_indices: Tensor,
-    pub(super) structural_file_indices: Tensor,
-    pub(super) structural_us_king_piece_indices: Tensor,
-    pub(super) structural_them_king_piece_indices: Tensor,
-    pub(super) structural_mask: Tensor,
-    pub(super) policy_indices: Tensor,
+    pub(super) feature_items: Tensor,
+    pub(super) policy_items: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
-    pub(super) policy_consequence_from: Tensor,
-    pub(super) policy_consequence_to: Tensor,
-    pub(super) policy_consequence_captured: Tensor,
-    pub(super) policy_consequence_move_mask: Tensor,
-    pub(super) policy_consequence_capture_mask: Tensor,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) moves_left: Tensor,
@@ -185,50 +141,13 @@ impl BatchTensors {
         let max_policy_moves = packed.max_policy_moves;
         Ok(Self {
             batch_size,
-            max_features,
-            max_policy_moves,
-            feature_indices: Tensor::from_vec(
-                packed.feature_indices,
+            feature_items: Tensor::from_vec(
+                packed.feature_items,
                 (batch_size, max_features),
                 device,
             )?,
-            feature_mask: Tensor::from_vec(
-                packed.feature_mask,
-                (batch_size, max_features, 1),
-                device,
-            )?,
-            structural_piece_indices: Tensor::from_vec(
-                packed.structural_piece_indices,
-                (batch_size, max_features),
-                device,
-            )?,
-            structural_rank_indices: Tensor::from_vec(
-                packed.structural_rank_indices,
-                (batch_size, max_features),
-                device,
-            )?,
-            structural_file_indices: Tensor::from_vec(
-                packed.structural_file_indices,
-                (batch_size, max_features),
-                device,
-            )?,
-            structural_us_king_piece_indices: Tensor::from_vec(
-                packed.structural_us_king_piece_indices,
-                (batch_size, max_features),
-                device,
-            )?,
-            structural_them_king_piece_indices: Tensor::from_vec(
-                packed.structural_them_king_piece_indices,
-                (batch_size, max_features),
-                device,
-            )?,
-            structural_mask: Tensor::from_vec(
-                packed.structural_mask,
-                (batch_size, max_features, 1),
-                device,
-            )?,
-            policy_indices: Tensor::from_vec(
-                packed.policy_indices,
+            policy_items: Tensor::from_vec(
+                packed.policy_items,
                 (batch_size, max_policy_moves),
                 device,
             )?,
@@ -240,31 +159,6 @@ impl BatchTensors {
             policy_mask: Tensor::from_vec(
                 packed.policy_mask,
                 (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_consequence_from: Tensor::from_vec(
-                packed.policy_consequence_from,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_consequence_to: Tensor::from_vec(
-                packed.policy_consequence_to,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_consequence_captured: Tensor::from_vec(
-                packed.policy_consequence_captured,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_consequence_move_mask: Tensor::from_vec(
-                packed.policy_consequence_move_mask,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
-            policy_consequence_capture_mask: Tensor::from_vec(
-                packed.policy_consequence_capture_mask,
-                (batch_size, max_policy_moves, 1),
                 device,
             )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
@@ -510,10 +404,7 @@ mod tests {
         let batch = BatchTensors::from_packed(packed, &Device::Cpu).unwrap();
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
         let forward = candle.forward(&batch).unwrap();
-        let legal = (forward.policy_logits + forward.policy_consequence_logits)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
+        let legal = forward.policy_logits.to_vec2::<f32>().unwrap();
 
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
@@ -527,7 +418,7 @@ mod tests {
         let gradient_candle = AzCandleModel::from_model(&gradient_model, &Device::Cpu).unwrap();
         let gradient_forward = gradient_candle.forward(&batch).unwrap();
         let gradients = gradient_forward
-            .policy_consequence_logits
+            .policy_logits
             .sum_all()
             .unwrap()
             .backward()
