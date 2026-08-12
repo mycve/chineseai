@@ -522,7 +522,6 @@ pub struct AzLoopConfig {
     pub workers: usize,
     pub generation_update: u32,
     pub opening_exploration_plies: usize,
-    pub opening_temperature: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,

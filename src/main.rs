@@ -760,7 +760,6 @@ fn build_az_loop_config(
         workers,
         generation_update,
         opening_exploration_plies: config.opening_exploration_plies,
-        opening_temperature: config.opening_temperature,
         temperature_start: config.temperature_start,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
@@ -1870,9 +1869,8 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : opening={}ply move_temp={} policy_temp={} root_noise(alpha={},fraction={}) normal(move_temp={}..{},policy_temp={},noise_fraction={}) opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
+                "explore  : opening={}ply policy_temp={} root_noise(alpha={},fraction={}) move_temp={}..{} normal_policy_temp={} normal_noise_fraction={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
                 config.opening_exploration_plies,
-                config.opening_temperature,
                 config.opening_policy_softmax_temp,
                 config.root_dirichlet_alpha,
                 config.opening_root_exploration_fraction,

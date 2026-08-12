@@ -95,9 +95,8 @@ impl AzCandleModel {
             .broadcast_add(&self.moves_left_bias)?;
         let policy_logits = self
             .policy_move_bias
-            .reshape((1, DENSE_MOVE_SPACE))?
-            .broadcast_as((bsz, DENSE_MOVE_SPACE))?
-            .contiguous()?;
+            .index_select(&batch.policy_indices.flatten_all()?, 0)?
+            .reshape((bsz, batch.max_policy_moves))?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
@@ -511,11 +510,7 @@ mod tests {
         let batch = BatchTensors::from_packed(packed, &Device::Cpu).unwrap();
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
         let forward = candle.forward(&batch).unwrap();
-        let legal = forward
-            .policy_logits
-            .gather(&batch.policy_indices, 1)
-            .unwrap();
-        let legal = (legal + forward.policy_consequence_logits)
+        let legal = (forward.policy_logits + forward.policy_consequence_logits)
             .unwrap()
             .to_vec2::<f32>()
             .unwrap();

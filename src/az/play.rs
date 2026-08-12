@@ -828,9 +828,6 @@ pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_p
 }
 
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
-    if ply < config.opening_exploration_plies {
-        return config.opening_temperature;
-    }
     if ply < config.temperature_decay_delay_plies {
         return config.temperature_start;
     }

@@ -136,6 +136,15 @@ pub(super) fn train_samples_gpu(
 
 impl GpuTrainer {
     fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
+        #[cfg(not(feature = "nccl-train"))]
+        if cuda_visible_device_count()
+            .or_else(nvidia_smi_device_count)
+            .is_some_and(|count| count > 1)
+        {
+            eprintln!(
+                "[chineseai] multiple CUDA devices detected, but nccl-train is disabled; using GPU 0 only to avoid slow CPU gradient synchronization. Build with --features nccl-train for multi-GPU training."
+            );
+        }
         // 逐个尝试可用的 CUDA 设备；若全部不可用则回退为 CPU 训练（单副本）。
         let mut replicas = Vec::new();
         let mut device_indices = Vec::new();
@@ -308,6 +317,9 @@ impl GpuTrainer {
         }
         let all_reduce_started = Instant::now();
         self.nccl_all_reduce_grads(&mut outputs)?;
+        for replica in &self.replicas {
+            profile_sync(&replica.device)?;
+        }
         profile.grad_sync_seconds += all_reduce_started.elapsed().as_secs_f64();
 
         let optimizer_started = Instant::now();
@@ -336,8 +348,127 @@ impl GpuTrainer {
             .iter()
             .map(|replica| replica.model.all_vars())
             .collect::<Vec<_>>();
+        let nccl = self
+            .nccl
+            .as_ref()
+            .expect("NCCL reducer should be initialized");
+        let mut active_vars = Vec::new();
         for var_index in 0..vars_by_rank[0].len() {
-            self.nccl_all_reduce_var(outputs, &vars_by_rank, var_index)?;
+            let has_grad = outputs
+                .iter()
+                .zip(vars_by_rank.iter())
+                .map(|(output, vars)| {
+                    output
+                        .grads
+                        .as_ref()
+                        .is_some_and(|grads| grads.get(&vars[var_index]).is_some())
+                })
+                .collect::<Vec<_>>();
+            if has_grad.iter().all(|has_grad| !has_grad) {
+                continue;
+            }
+            if has_grad.iter().any(|has_grad| !has_grad) {
+                return Err(candle_core::Error::Msg(format!(
+                    "partial gradient set for NCCL var index {var_index}: {has_grad:?}"
+                )));
+            }
+            active_vars.push(var_index);
+        }
+        if active_vars.is_empty() {
+            return Ok(());
+        }
+
+        let mut send_tensors = Vec::with_capacity(outputs.len());
+        for (rank, output) in outputs.iter().enumerate() {
+            let grads = output
+                .grads
+                .as_ref()
+                .expect("NCCL all-reduce keeps gradients on every GPU");
+            let flattened = active_vars
+                .iter()
+                .map(|&var_index| {
+                    grads
+                        .get(&vars_by_rank[rank][var_index])
+                        .expect("active NCCL variable should have a gradient")
+                        .flatten_all()
+                })
+                .collect::<CandleResult<Vec<_>>>()?;
+            let flattened_refs = flattened.iter().collect::<Vec<_>>();
+            send_tensors.push(Tensor::cat(&flattened_refs, 0)?.contiguous()?);
+        }
+        let total_elements = send_tensors[0].elem_count();
+        if send_tensors
+            .iter()
+            .any(|tensor| tensor.elem_count() != total_elements)
+        {
+            return Err(candle_core::Error::Msg(
+                "NCCL flattened gradient sizes differ across ranks".into(),
+            ));
+        }
+
+        let mut recv_slices = Vec::with_capacity(outputs.len());
+        for tensor in &send_tensors {
+            let device = tensor.device().as_cuda_device()?.clone();
+            let recv = device
+                .cuda_stream()
+                .alloc_zeros::<f32>(total_elements)
+                .map_err(nccl_cuda_error)?;
+            recv_slices.push(recv);
+        }
+
+        let send_storages = send_tensors
+            .iter()
+            .map(|tensor| {
+                let (storage, layout) = tensor.storage_and_layout();
+                if !layout.is_contiguous() || layout.start_offset() != 0 {
+                    return Err(candle_core::Error::Msg(
+                        "NCCL gradient tensor must be contiguous with zero offset".into(),
+                    ));
+                }
+                Ok(storage)
+            })
+            .collect::<CandleResult<Vec<_>>>()?;
+
+        nccl::group_start().map_err(nccl_error)?;
+        let all_reduce = (|| -> CandleResult<()> {
+            for rank in 0..outputs.len() {
+                let send = match &*send_storages[rank] {
+                    Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+                    _ => {
+                        return Err(candle_core::Error::Msg(
+                            "NCCL gradient tensor must live on CUDA".into(),
+                        ));
+                    }
+                };
+                nccl.comms[rank]
+                    .all_reduce(send, &mut recv_slices[rank], &nccl::ReduceOp::Sum)
+                    .map_err(nccl_error)?;
+            }
+            Ok(())
+        })();
+        let group_end = nccl::group_end().map_err(nccl_error);
+        all_reduce?;
+        group_end?;
+
+        for (rank, recv) in recv_slices.into_iter().enumerate() {
+            let device = self.replicas[rank].device.as_cuda_device()?.clone();
+            let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
+            let reduced = Tensor::from_storage(storage, total_elements, BackpropOp::none(), false);
+            let grads = outputs[rank]
+                .grads
+                .as_mut()
+                .expect("NCCL all-reduce keeps gradients on every GPU");
+            let mut offset = 0usize;
+            for &var_index in &active_vars {
+                let var = &vars_by_rank[rank][var_index];
+                let elements = var.elem_count();
+                let grad = reduced
+                    .narrow(0, offset, elements)?
+                    .reshape(var.shape().clone())?;
+                grads.insert(var, grad);
+                offset += elements;
+            }
+            debug_assert_eq!(offset, total_elements);
         }
         Ok(())
     }
@@ -413,106 +544,6 @@ impl GpuTrainer {
             let tensor =
                 Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
             var.set(&tensor)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "nccl-train")]
-    fn nccl_all_reduce_var(
-        &self,
-        outputs: &mut [ShardOutput],
-        vars_by_rank: &[Vec<candle_core::Var>],
-        var_index: usize,
-    ) -> CandleResult<()> {
-        let nccl = self
-            .nccl
-            .as_ref()
-            .expect("NCCL reducer should be initialized");
-        let has_grad = outputs
-            .iter()
-            .zip(vars_by_rank.iter())
-            .map(|(output, vars)| {
-                output
-                    .grads
-                    .as_ref()
-                    .is_some_and(|grads| grads.get(&vars[var_index]).is_some())
-            })
-            .collect::<Vec<_>>();
-        if has_grad.iter().all(|has_grad| !has_grad) {
-            return Ok(());
-        }
-        if has_grad.iter().any(|has_grad| !has_grad) {
-            return Err(candle_core::Error::Msg(format!(
-                "partial gradient set for NCCL var index {var_index}: {has_grad:?}"
-            )));
-        }
-
-        let mut send_tensors = Vec::with_capacity(outputs.len());
-        let mut recv_slices = Vec::with_capacity(outputs.len());
-        for (rank, output) in outputs.iter_mut().enumerate() {
-            let var = &vars_by_rank[rank][var_index];
-            let grad = output
-                .grads
-                .as_ref()
-                .and_then(|grads| grads.get(var))
-                .ok_or_else(|| {
-                    candle_core::Error::Msg(format!("missing gradient for NCCL rank {rank}"))
-                })?
-                .contiguous()?;
-            let device = grad.device().as_cuda_device()?.clone();
-            let recv = device
-                .cuda_stream()
-                .alloc_zeros::<f32>(grad.elem_count())
-                .map_err(nccl_cuda_error)?;
-            send_tensors.push(grad);
-            recv_slices.push(recv);
-        }
-
-        let send_storages = send_tensors
-            .iter()
-            .map(|tensor| {
-                let (storage, layout) = tensor.storage_and_layout();
-                if !layout.is_contiguous() || layout.start_offset() != 0 {
-                    return Err(candle_core::Error::Msg(
-                        "NCCL gradient tensor must be contiguous with zero offset".into(),
-                    ));
-                }
-                Ok(storage)
-            })
-            .collect::<CandleResult<Vec<_>>>()?;
-
-        nccl::group_start().map_err(nccl_error)?;
-        let all_reduce = (|| -> CandleResult<()> {
-            for rank in 0..outputs.len() {
-                let send = match &*send_storages[rank] {
-                    Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
-                    _ => {
-                        return Err(candle_core::Error::Msg(
-                            "NCCL gradient tensor must live on CUDA".into(),
-                        ));
-                    }
-                };
-                nccl.comms[rank]
-                    .all_reduce(send, &mut recv_slices[rank], &nccl::ReduceOp::Sum)
-                    .map_err(nccl_error)?;
-            }
-            Ok(())
-        })();
-        let group_end = nccl::group_end().map_err(nccl_error);
-        all_reduce?;
-        group_end?;
-
-        for (rank, recv) in recv_slices.into_iter().enumerate() {
-            let var = &vars_by_rank[rank][var_index];
-            let device = self.replicas[rank].device.as_cuda_device()?.clone();
-            let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
-            let reduced =
-                Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
-            outputs[rank]
-                .grads
-                .as_mut()
-                .expect("NCCL all-reduce keeps gradients on every GPU")
-                .insert(var, reduced);
         }
         Ok(())
     }
@@ -648,7 +679,6 @@ impl GpuReplica {
         let value_probs = value_log_probs.exp()?;
         let value = wdl_probs_to_q(&value_probs)?.squeeze(1)?;
         let value_error = (&value - &batch_tensors.values)?;
-        let value_sse = value_error.sqr()?.sum_all()?;
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
         let value_ce = value_ce_per_sample.sum_all()?;
@@ -658,10 +688,7 @@ impl GpuReplica {
         let moves_left_sse_per_sample = moves_left_error.sqr()?;
         let moves_left_sse = moves_left_sse_per_sample.sum_all()?;
 
-        let legal_policy_logits = forward
-            .policy_logits
-            .gather(&batch_tensors.policy_indices, 1)?;
-        let legal_policy_logits = (&legal_policy_logits + &forward.policy_consequence_logits)?;
+        let legal_policy_logits = (&forward.policy_logits + &forward.policy_consequence_logits)?;
         let masked_policy_logits = (&legal_policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -680,30 +707,39 @@ impl GpuReplica {
             .sum_all()?
             .affine(moves_left_weight.max(0.0) as f64, 0.0)?;
         let loss_sum = ((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?;
-        let optimized_loss_sum = loss_sum.to_scalar::<f32>()?;
-        let loss_tensor = (loss_sum / global_batch_len as f64)?;
+        let loss_tensor = (&loss_sum / global_batch_len as f64)?;
 
-        let mut phase_value = [AzValueMomentStats::default(); 3];
         let value_sq = value.sqr()?;
         let target_sq = batch_tensors.values.sqr()?;
         let pred_target = value.broadcast_mul(&batch_tensors.values)?;
-        let error_sq = (&value - &batch_tensors.values)?.sqr()?;
-        let mut phase_moment_tensors = Vec::with_capacity(3 * 7);
+        let error_sq = value_error.sqr()?;
+        let mut metrics = Vec::with_capacity(10 + 3 * 7);
+        metrics.push(loss_sum);
+        metrics.push(value_ce);
+        metrics.push(policy_ce);
+        metrics.push(moves_left_sse);
+        metrics.push(value.sum_all()?);
+        metrics.push(value_sq.sum_all()?);
+        metrics.push(batch_tensors.values.sum_all()?);
+        metrics.push(target_sq.sum_all()?);
+        metrics.push(pred_target.sum_all()?);
+        metrics.push(error_sq.sum_all()?);
         for phase in 0..3 {
             let mask = batch_tensors
                 .value_phase_masks
                 .narrow(1, phase, 1)?
                 .squeeze(1)?;
-            phase_moment_tensors.push(mask.sum_all()?);
-            phase_moment_tensors.push((&value * &mask)?.sum_all()?);
-            phase_moment_tensors.push((&value_sq * &mask)?.sum_all()?);
-            phase_moment_tensors.push((&batch_tensors.values * &mask)?.sum_all()?);
-            phase_moment_tensors.push((&target_sq * &mask)?.sum_all()?);
-            phase_moment_tensors.push((&pred_target * &mask)?.sum_all()?);
-            phase_moment_tensors.push((&error_sq * &mask)?.sum_all()?);
+            metrics.push(mask.sum_all()?);
+            metrics.push((&value * &mask)?.sum_all()?);
+            metrics.push((&value_sq * &mask)?.sum_all()?);
+            metrics.push((&batch_tensors.values * &mask)?.sum_all()?);
+            metrics.push((&target_sq * &mask)?.sum_all()?);
+            metrics.push((&pred_target * &mask)?.sum_all()?);
+            metrics.push((&error_sq * &mask)?.sum_all()?);
         }
-        let phase_moments = Tensor::stack(&phase_moment_tensors, 0)?.to_vec1::<f32>()?;
-        for (phase_stats, values) in phase_value.iter_mut().zip(phase_moments.chunks_exact(7)) {
+        let metrics = Tensor::stack(&metrics, 0)?.to_vec1::<f32>()?;
+        let mut phase_value = [AzValueMomentStats::default(); 3];
+        for (phase_stats, values) in phase_value.iter_mut().zip(metrics[10..].chunks_exact(7)) {
             phase_stats.samples = values[0].round().max(0.0) as usize;
             phase_stats.pred_sum = values[1];
             phase_stats.pred_sq_sum = values[2];
@@ -712,23 +748,17 @@ impl GpuReplica {
             phase_stats.pred_target_sum = values[5];
             phase_stats.error_sq_sum = values[6];
         }
-        let value_sse = value_sse.to_scalar::<f32>()?;
-        let value_ce = value_ce.to_scalar::<f32>()?;
-        let policy_ce = policy_ce.to_scalar::<f32>()?;
         let stats = AzTrainStats {
-            loss: optimized_loss_sum,
-            value_loss: value_ce,
-            policy_ce,
-            moves_left_loss: moves_left_sse.to_scalar::<f32>()?,
-            value_pred_sum: value.sum_all()?.to_scalar::<f32>()?,
-            value_pred_sq_sum: value.sqr()?.sum_all()?.to_scalar::<f32>()?,
-            value_target_sum: batch_tensors.values.sum_all()?.to_scalar::<f32>()?,
-            value_target_sq_sum: batch_tensors.values.sqr()?.sum_all()?.to_scalar::<f32>()?,
-            value_pred_target_sum: value
-                .broadcast_mul(&batch_tensors.values)?
-                .sum_all()?
-                .to_scalar::<f32>()?,
-            value_error_sq_sum: value_sse,
+            loss: metrics[0],
+            value_loss: metrics[1],
+            policy_ce: metrics[2],
+            moves_left_loss: metrics[3],
+            value_pred_sum: metrics[4],
+            value_pred_sq_sum: metrics[5],
+            value_target_sum: metrics[6],
+            value_target_sq_sum: metrics[7],
+            value_pred_target_sum: metrics[8],
+            value_error_sq_sum: metrics[9],
             samples: batch_tensors.batch_size,
             phase_value,
         };
@@ -873,10 +903,18 @@ fn cuda_device_indices() -> Vec<usize> {
     } else {
         probe_cuda_device_indices(64)
     };
-    candidates
+    let devices = candidates
         .into_iter()
         .filter(|&index| cuda_device_supports_training(index))
-        .collect()
+        .collect::<Vec<_>>();
+    #[cfg(not(feature = "nccl-train"))]
+    {
+        devices.into_iter().take(1).collect()
+    }
+    #[cfg(feature = "nccl-train")]
+    {
+        devices
+    }
 }
 
 fn cuda_visible_device_count() -> Option<usize> {
