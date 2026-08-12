@@ -63,6 +63,7 @@ pub struct AzLoopFileConfig {
     pub value_target_search_q_mix: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
+    pub selfplay_update_warmup_updates: usize,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
@@ -143,6 +144,7 @@ impl Default for AzLoopFileConfig {
             value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
+            selfplay_update_warmup_updates: 5,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
@@ -157,7 +159,7 @@ impl Default for AzLoopFileConfig {
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
-            arena_interval: 20,
+            arena_interval: 10,
             arena_simulations: 4000,
             arena_cpuct: 1.5,
             arena_promotion_rate: 0.50,
@@ -168,7 +170,7 @@ impl Default for AzLoopFileConfig {
             arena_opening_plies_min: 6,
             arena_opening_plies_max: 10,
             pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
-            pikafish_label_eval_interval: 20,
+            pikafish_label_eval_interval: 10,
             pikafish_label_eval_limit: 1000,
             pikafish_label_eval_simulations: 3000,
             pikafish_label_eval_cpuct: 1.5,
@@ -273,6 +275,10 @@ impl AzLoopFileConfig {
         line!(
             "opening_fen_game_fraction",
             f(self.opening_fen_game_fraction)
+        );
+        line!(
+            "selfplay_update_warmup_updates",
+            self.selfplay_update_warmup_updates
         );
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -420,7 +426,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 5\n"));
+        assert!(text.starts_with("format_version = 6\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -455,6 +461,7 @@ mod tests {
         assert!(text.contains("value_target_search_q_mix = 0.4\n"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
+        assert!(text.contains("selfplay_update_warmup_updates = 5\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("simulations = 1600\n"));
@@ -479,14 +486,14 @@ mod tests {
         assert!(text.contains("arena_opening_positions = 300\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
-        assert!(text.contains("arena_interval = 20\n"));
+        assert!(text.contains("arena_interval = 10\n"));
         assert!(text.contains("arena_simulations = 4000\n"));
         assert!(
             text.contains(
                 "pikafish_label_eval_sqlite = \"eval/pikafish-selfplay-5000-d20.sqlite\"\n"
             )
         );
-        assert!(text.contains("pikafish_label_eval_interval = 20\n"));
+        assert!(text.contains("pikafish_label_eval_interval = 10\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
         assert!(text.contains("pikafish_label_eval_simulations = 3000\n"));
         assert!(text.contains("pikafish_label_eval_cpuct = 1.5\n"));
@@ -500,8 +507,8 @@ mod tests {
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
         assert!((parsed.lr - 0.001).abs() < 1e-9);
-        assert_eq!(parsed.arena_interval, 20);
-        assert_eq!(parsed.pikafish_label_eval_interval, 20);
+        assert_eq!(parsed.arena_interval, 10);
+        assert_eq!(parsed.pikafish_label_eval_interval, 10);
     }
 
     #[test]
