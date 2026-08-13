@@ -59,8 +59,8 @@ pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
-/// 自对弈价值目标：终局结果 与 MCTS 根搜索 Q 的混合权重（root_q 占比）。
-pub const VALUE_TARGET_SEARCH_Q_MIX: f32 = 0.40;
+/// 自对弈 WDL TD(λ) 的默认迹衰减系数。
+pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.95;
 pub(super) const MOVES_LEFT_HEAD_SIZE: usize = 32;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
@@ -611,7 +611,7 @@ pub struct AzLoopConfig {
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
     pub opening_policy_softmax_temp: f32,
-    pub value_target_search_q_mix: f32,
+    pub value_td_lambda: f32,
     pub opening_positions: Vec<Position>,
     pub opening_fen_game_fraction: f32,
     pub resign_percentage: f32,

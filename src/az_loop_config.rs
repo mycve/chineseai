@@ -59,7 +59,7 @@ pub struct AzLoopFileConfig {
     pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
     pub opening_policy_softmax_temp: f32,
-    pub value_target_search_q_mix: f32,
+    pub value_td_lambda: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
     pub selfplay_update_warmup_updates: usize,
@@ -139,7 +139,7 @@ impl Default for AzLoopFileConfig {
             moves_left_quadratic_factor: 0.75,
             policy_softmax_temp: 1.45,
             opening_policy_softmax_temp: 3.0,
-            value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
+            value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
             selfplay_update_warmup_updates: 5,
@@ -264,10 +264,7 @@ impl AzLoopFileConfig {
             "opening_policy_softmax_temp",
             f(self.opening_policy_softmax_temp)
         );
-        line!(
-            "value_target_search_q_mix",
-            f(self.value_target_search_q_mix)
-        );
+        line!("value_td_lambda", f(self.value_td_lambda));
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!(
             "opening_fen_game_fraction",
@@ -384,7 +381,7 @@ impl AzLoopFileConfig {
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.opening_policy_softmax_temp = self.opening_policy_softmax_temp.max(1e-3);
         self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
-        self.value_target_search_q_mix = self.value_target_search_q_mix.clamp(0.0, 1.0);
+        self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -422,7 +419,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 7\n"));
+        assert!(text.starts_with("format_version = 8\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -453,7 +450,8 @@ mod tests {
         assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(text.contains("opening_policy_softmax_temp = 3.0\n"));
-        assert!(text.contains("value_target_search_q_mix = 0.4\n"));
+        assert!(text.contains("value_td_lambda = 0.95\n"));
+        assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
         assert!(text.contains("selfplay_update_warmup_updates = 5\n"));
@@ -518,6 +516,7 @@ mod tests {
             "high_simulations = 20000\n",
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
+            "value_target_search_q_mix = 0.4\n",
             "arena_pikafish_exe = \"./pikafish\"\n",
             "arena_pikafish_depth = 10\n",
             "arena_pikafish_games = 20\n",
