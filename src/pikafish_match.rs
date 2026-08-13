@@ -45,6 +45,7 @@ pub struct VsPikafishConfig {
     pub parallel_games: usize,
     pub gumbel_scale: f32,
     pub max_considered_actions: usize,
+    pub q_value_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +76,7 @@ struct GameConfig {
     seed: u64,
     gumbel_scale: f32,
     max_considered_actions: usize,
+    q_value_scale: f32,
 }
 
 struct ExternalUci {
@@ -285,6 +287,7 @@ fn play_one_game(
                     seed,
                     gumbel_scale: config.gumbel_scale,
                     max_considered_actions: config.max_considered_actions,
+                    q_value_scale: config.q_value_scale,
                     max_depth: 0,
                     draw_score: 0.0,
                     value_scale: 1.0,
@@ -399,6 +402,7 @@ pub fn run_vs_pikafish(
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                             gumbel_scale: config.gumbel_scale,
                             max_considered_actions: config.max_considered_actions,
+                            q_value_scale: config.q_value_scale,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));

@@ -25,6 +25,7 @@ struct UciState {
     threads: usize,
     gumbel_scale: f32,
     max_considered_actions: usize,
+    q_value_scale: f32,
     draw_score: f32,
     seed: u64,
 }
@@ -40,6 +41,7 @@ impl Default for UciState {
             threads: 1,
             gumbel_scale: 0.0,
             max_considered_actions: 16,
+            q_value_scale: 0.02,
             draw_score: 0.0,
             seed: 20260409,
         }
@@ -126,6 +128,7 @@ fn print_uci_id() {
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name GumbelScale type string default 0.0");
     println!("option name MaxConsideredActions type spin default 16 min 1 max 256");
+    println!("option name QValueScale type string default 0.02");
     println!("option name DrawScore type string default 0.0");
     println!("uciok");
     flush();
@@ -181,6 +184,9 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .parse::<usize>()
                 .unwrap_or(state.max_considered_actions)
                 .clamp(1, 256);
+        }
+        "qvaluescale" => {
+            state.q_value_scale = value.parse::<f32>().unwrap_or(state.q_value_scale).max(0.0);
         }
         "drawscore" => {
             state.draw_score = value
@@ -403,6 +409,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             seed: state.seed,
             gumbel_scale: state.gumbel_scale,
             max_considered_actions: state.max_considered_actions,
+            q_value_scale: state.q_value_scale,
             max_depth: params.depth.unwrap_or(0),
             draw_score: state.draw_score,
             value_scale: 1.0,
@@ -547,9 +554,11 @@ mod tests {
         let mut state = UciState::default();
         handle_setoption("setoption name GumbelScale value 1.25", &mut state);
         handle_setoption("setoption name MaxConsideredActions value 32", &mut state);
+        handle_setoption("setoption name QValueScale value 0.015", &mut state);
 
         assert_eq!(state.gumbel_scale, 1.25);
         assert_eq!(state.max_considered_actions, 32);
+        assert_eq!(state.q_value_scale, 0.015);
     }
 
     #[test]

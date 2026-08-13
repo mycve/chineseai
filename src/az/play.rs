@@ -379,6 +379,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
                 gumbel_scale: config.gumbel_scale,
                 max_considered_actions: config.max_considered_actions,
+                q_value_scale: config.q_value_scale,
                 max_depth: 0,
                 draw_score: config.draw_score,
                 value_scale: 1.0,
@@ -822,6 +823,7 @@ pub struct AzArenaConfig {
     pub seed: u64,
     pub gumbel_scale: f32,
     pub max_considered_actions: usize,
+    pub q_value_scale: f32,
 }
 
 pub fn play_arena_games_from_positions(
@@ -843,6 +845,7 @@ pub fn play_arena_games_from_positions(
             game_seed,
             config.gumbel_scale,
             config.max_considered_actions,
+            config.q_value_scale,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -868,6 +871,7 @@ pub fn play_arena_games_from_positions(
             game_seed,
             config.gumbel_scale,
             config.max_considered_actions,
+            config.q_value_scale,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -903,6 +907,7 @@ fn play_arena_game(
     seed: u64,
     gumbel_scale: f32,
     max_considered_actions: usize,
+    q_value_scale: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut rule_history = position.initial_rule_history();
@@ -930,6 +935,7 @@ fn play_arena_game(
                 seed: seed ^ ((ply as u64) << 32),
                 gumbel_scale,
                 max_considered_actions,
+                q_value_scale,
                 max_depth: 0,
                 draw_score: 0.0,
                 value_scale: 1.0,

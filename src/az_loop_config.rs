@@ -34,6 +34,7 @@ pub struct AzLoopFileConfig {
     pub workers: usize,
     pub gumbel_scale: f32,
     pub max_considered_actions: usize,
+    pub q_value_scale: f32,
     pub draw_score: f32,
     pub value_target_search_q_mix: f32,
     pub opening_fens_path: String,
@@ -88,6 +89,7 @@ impl Default for AzLoopFileConfig {
             workers: 0,
             gumbel_scale: 1.0,
             max_considered_actions: 16,
+            q_value_scale: 0.02,
             draw_score: 0.0,
             value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
             opening_fens_path: "opening_fens.txt".into(),
@@ -169,6 +171,7 @@ impl AzLoopFileConfig {
         line!("workers", self.workers);
         line!("gumbel_scale", f(self.gumbel_scale));
         line!("max_considered_actions", self.max_considered_actions);
+        line!("q_value_scale", f(self.q_value_scale));
         line!("draw_score", f(self.draw_score));
         line!(
             "value_target_search_q_mix",
@@ -262,6 +265,7 @@ impl AzLoopFileConfig {
         }
         self.gumbel_scale = self.gumbel_scale.max(0.0);
         self.max_considered_actions = self.max_considered_actions.clamp(1, 256);
+        self.q_value_scale = self.q_value_scale.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
         self.value_target_search_q_mix = self.value_target_search_q_mix.clamp(0.0, 1.0);
@@ -300,11 +304,12 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 8\n"));
+        assert!(text.starts_with("format_version = 9\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
         assert!(text.contains("max_considered_actions = 16\n"));
+        assert!(text.contains("q_value_scale = 0.02\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("value_target_search_q_mix = 0.4\n"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));

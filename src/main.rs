@@ -114,6 +114,9 @@ struct AzSearchArgs {
     /// Maximum root actions retained by Sequential Halving.
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
+    /// Scale applied to normalized completed Q-values.
+    #[arg(long, default_value_t = 0.02)]
+    q_value_scale: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
@@ -159,6 +162,9 @@ struct AzBenchArgs {
     /// Maximum root actions retained by Sequential Halving.
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
+    /// Scale applied to normalized completed Q-values.
+    #[arg(long, default_value_t = 0.02)]
+    q_value_scale: f32,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -243,6 +249,9 @@ struct VsPikafishArgs {
     /// Maximum root actions retained by Sequential Halving.
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
+    /// Scale applied to normalized completed Q-values.
+    #[arg(long, default_value_t = 0.02)]
+    q_value_scale: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
@@ -324,6 +333,9 @@ struct PikafishLabelEvalArgs {
     /// Maximum root actions retained by Sequential Halving.
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
+    /// Scale applied to normalized completed Q-values.
+    #[arg(long, default_value_t = 0.02)]
+    q_value_scale: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
@@ -459,7 +471,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_op{}_rs{}_rp{}_rc{}_",
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_qvs{}_op{}_rs{}_rp{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_sd{}"
         ),
         config.simulations,
@@ -477,6 +489,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.lr_decay_factor),
         f32_slug(config.gumbel_scale),
         config.max_considered_actions,
+        f32_slug(config.q_value_scale),
         if config.opening_fens_path.trim().is_empty() {
             "none".to_string()
         } else {
@@ -717,6 +730,7 @@ fn build_az_loop_config(
         generation_update,
         gumbel_scale: config.gumbel_scale,
         max_considered_actions: config.max_considered_actions,
+        q_value_scale: config.q_value_scale,
         draw_score: config.draw_score,
         value_target_search_q_mix: config.value_target_search_q_mix,
         opening_positions: opening_positions.to_vec(),
@@ -1013,6 +1027,7 @@ struct ArenaThreadConfig {
     simulations: usize,
     max_plies: usize,
     max_considered_actions: usize,
+    q_value_scale: f32,
     thread_count: usize,
     seed: u64,
 }
@@ -1039,6 +1054,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let simulations = config.simulations;
         let max_plies = config.max_plies;
         let max_considered_actions = config.max_considered_actions;
+        let q_value_scale = config.q_value_scale;
         let seed = config.seed ^ index as u64;
         let thread_start_index = start_index;
         start_index += red_games;
@@ -1056,6 +1072,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                     seed,
                     gumbel_scale: 0.0,
                     max_considered_actions,
+                    q_value_scale,
                 },
             )
         }));
@@ -1111,6 +1128,7 @@ fn fixed_az_search_limits(
     seed: u64,
     gumbel_scale: f32,
     max_considered_actions: usize,
+    q_value_scale: f32,
     max_depth: usize,
 ) -> AzSearchLimits {
     AzSearchLimits {
@@ -1118,6 +1136,7 @@ fn fixed_az_search_limits(
         seed,
         gumbel_scale,
         max_considered_actions: max_considered_actions.max(1),
+        q_value_scale: q_value_scale.max(0.0),
         max_depth,
         draw_score: 0.0,
         value_scale: 1.0,
@@ -1172,6 +1191,7 @@ fn main() {
                 seed: 0,
                 gumbel_scale: cmd.gumbel_scale.max(0.0),
                 max_considered_actions: cmd.max_considered_actions.max(1),
+                q_value_scale: cmd.q_value_scale.max(0.0),
                 max_depth: cmd.max_depth,
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
                 value_scale: 1.0,
@@ -1222,6 +1242,7 @@ fn main() {
             println!("search   : gumbel-alphazero");
             println!("gumbel_scale: {}", cmd.gumbel_scale);
             println!("max_considered_actions: {}", cmd.max_considered_actions);
+            println!("q_value_scale: {}", cmd.q_value_scale);
             println!("draw_score: {}", cmd.draw_score);
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
@@ -1375,7 +1396,14 @@ fn main() {
             let _ = gumbel_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, 0.0, max_considered_actions, 0),
+                fixed_az_search_limits(
+                    simulations,
+                    0,
+                    0.0,
+                    max_considered_actions,
+                    cmd.q_value_scale,
+                    0,
+                ),
             );
 
             let started = std::time::Instant::now();
@@ -1390,6 +1418,7 @@ fn main() {
                         iteration as u64,
                         0.0,
                         max_considered_actions,
+                        cmd.q_value_scale,
                         0,
                     ),
                 );
@@ -1701,11 +1730,12 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=gumbel-alphazero sims={} gumbel_scale={} max_considered_actions={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} batch_size(global)={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} arena_interval={} arena_sims={} pikafish_label_eval(sqlite={},interval={},limit={},sims={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=gumbel-alphazero sims={} gumbel_scale={} max_considered_actions={} q_value_scale={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} batch_size(global)={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} arena_interval={} arena_sims={} pikafish_label_eval(sqlite={},interval={},limit={},sims={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.gumbel_scale,
                 config.max_considered_actions,
+                config.q_value_scale,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
                 config.selfplay_samples_per_update,
@@ -1734,9 +1764,10 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : gumbel_scale={} max_considered_actions={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
+                "explore  : gumbel_scale={} max_considered_actions={} q_value_scale={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
                 config.gumbel_scale,
                 config.max_considered_actions,
+                config.q_value_scale,
                 config.opening_fen_game_fraction * 100.0,
                 config.selfplay_update_warmup_updates
             );
@@ -2719,6 +2750,7 @@ fn main() {
                             simulations: config.arena_simulations,
                             max_plies: config.max_plies,
                             max_considered_actions: config.max_considered_actions,
+                            q_value_scale: config.q_value_scale,
                             thread_count: config.arena_processes,
                             seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                         });
@@ -2861,6 +2893,7 @@ fn main() {
                                 config.pikafish_label_eval_simulations,
                                 config.seed ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
                                 config.max_considered_actions,
+                                config.q_value_scale,
                                 config.max_plies,
                                 config.arena_processes,
                             )
@@ -3103,6 +3136,7 @@ fn main() {
                     parallel_games,
                     gumbel_scale: 0.0,
                     max_considered_actions: cmd.max_considered_actions.max(1),
+                    q_value_scale: cmd.q_value_scale.max(0.0),
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
@@ -3333,6 +3367,7 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         cmd.simulations.max(1),
         cmd.seed,
         cmd.max_considered_actions.max(1),
+        cmd.q_value_scale.max(0.0),
         cmd.max_depth,
         cmd.threads,
     )?;
@@ -3366,6 +3401,7 @@ fn evaluate_pikafish_labels(
     simulations: usize,
     seed: u64,
     max_considered_actions: usize,
+    q_value_scale: f32,
     max_depth: usize,
     mut progress: impl FnMut(usize, usize),
 ) -> io::Result<LabelEvalStats> {
@@ -3393,6 +3429,7 @@ fn evaluate_pikafish_labels(
                 seed ^ row.id as u64,
                 0.0,
                 max_considered_actions,
+                q_value_scale,
                 max_depth,
             ),
         );
@@ -3448,6 +3485,7 @@ fn evaluate_pikafish_labels_parallel(
     simulations: usize,
     seed: u64,
     max_considered_actions: usize,
+    q_value_scale: f32,
     max_depth: usize,
     thread_count: usize,
 ) -> io::Result<LabelEvalStats> {
@@ -3473,6 +3511,7 @@ fn evaluate_pikafish_labels_parallel(
                 simulations,
                 seed ^ (thread_id as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
                 max_considered_actions,
+                q_value_scale,
                 max_depth,
                 |_, _| {},
             )

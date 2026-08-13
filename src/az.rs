@@ -604,6 +604,7 @@ pub struct AzLoopConfig {
     pub generation_update: u32,
     pub gumbel_scale: f32,
     pub max_considered_actions: usize,
+    pub q_value_scale: f32,
     pub draw_score: f32,
     pub value_target_search_q_mix: f32,
     pub opening_positions: Vec<Position>,

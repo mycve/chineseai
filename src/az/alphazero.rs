@@ -16,12 +16,14 @@ const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
 const DEFAULT_GUMBEL_SCALE: f32 = 1.0;
 const DEFAULT_MAX_CONSIDERED_ACTIONS: usize = 16;
+const DEFAULT_Q_VALUE_SCALE: f32 = 0.02;
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
     pub seed: u64,
     pub gumbel_scale: f32,
     pub max_considered_actions: usize,
+    pub q_value_scale: f32,
     /// Maximum search depth in plies below root. 0 keeps the default:
     /// max_depth = num_simulations.
     pub max_depth: usize,
@@ -36,6 +38,7 @@ impl Default for AzSearchLimits {
             seed: 0,
             gumbel_scale: DEFAULT_GUMBEL_SCALE,
             max_considered_actions: DEFAULT_MAX_CONSIDERED_ACTIONS,
+            q_value_scale: DEFAULT_Q_VALUE_SCALE,
             max_depth: 0,
             draw_score: 0.0,
             value_scale: 1.0,
@@ -305,6 +308,7 @@ struct AzTree<'a> {
     root: usize,
     gumbel_scale: f32,
     max_considered_actions: usize,
+    q_value_scale: f32,
     search_seed: u64,
     draw_score: f32,
     value_scale: f32,
@@ -590,6 +594,7 @@ impl<'a> AzTree<'a> {
             root: 0,
             gumbel_scale: limits.gumbel_scale.max(0.0),
             max_considered_actions: limits.max_considered_actions.max(1),
+            q_value_scale: limits.q_value_scale.max(0.0),
             search_seed: limits.seed,
             draw_score: limits.draw_score.clamp(-1.0, 1.0),
             value_scale: limits.value_scale.clamp(0.0, 1.0),
@@ -1156,7 +1161,7 @@ impl<'a> AzTree<'a> {
         let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let range = (max - min).max(1.0e-8);
         let max_visits = children.iter().map(|child| child.visits).max().unwrap_or(0) as f32;
-        let scale = (50.0 + max_visits) * 0.1;
+        let scale = (50.0 + max_visits) * self.q_value_scale;
         values
             .iter_mut()
             .for_each(|value| *value = (*value - min) / range * scale);
@@ -1321,6 +1326,71 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn lower_q_value_scale_softens_1600_simulation_policy() {
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let model = AzNnue::random(4, 107);
+        let policy = |q_value_scale| {
+            let mut tree = AzTree::new(
+                position.clone(),
+                position.initial_rule_history(),
+                None,
+                &model,
+                AzSearchLimits {
+                    simulations: 1600,
+                    seed: 109,
+                    gumbel_scale: 0.0,
+                    q_value_scale,
+                    ..AzSearchLimits::default()
+                },
+            );
+            tree.set_node_children(
+                tree.root,
+                legal
+                    .iter()
+                    .take(16)
+                    .enumerate()
+                    .map(|(index, &mv)| AzChild {
+                        mv,
+                        prior: 1.0 / 16.0,
+                        gives_check: false,
+                        visits: 100,
+                        value_wdl_sum: if index == 0 {
+                            [90.0, 0.0, 10.0]
+                        } else {
+                            [60.0, 0.0, 40.0]
+                        },
+                        moves_left_sum: 0.0,
+                        child: NO_CHILD,
+                    }),
+            );
+            tree.improved_policy(tree.root)
+        };
+        let default_mctx = policy(0.1);
+        let softened = policy(0.02);
+        let top1 = |policy: &[f32]| policy.iter().copied().fold(0.0, f32::max);
+        let entropy = |policy: &[f32]| {
+            -policy
+                .iter()
+                .map(|&probability| {
+                    let probability = probability.max(f32::MIN_POSITIVE);
+                    probability * probability.ln()
+                })
+                .sum::<f32>()
+        };
+
+        eprintln!(
+            "1600 simulations: q_scale=0.1 top1={:.6} entropy={:.6}; q_scale=0.02 top1={:.6} entropy={:.6}",
+            top1(&default_mctx),
+            entropy(&default_mctx),
+            top1(&softened),
+            entropy(&softened),
+        );
+        assert!(top1(&softened) < top1(&default_mctx));
+        assert!(entropy(&softened) > entropy(&default_mctx));
     }
 
     #[test]
