@@ -6,8 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64,
-    rule_context_features,
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;
@@ -366,6 +365,8 @@ struct AzTree<'a> {
 struct AzNode {
     position: Position,
     accumulator_offset: u32,
+    parent: u32,
+    incoming_move: Option<Move>,
     rule_entry: Option<RuleHistoryEntry>,
     children_offset: u32,
     children_len: u16,
@@ -545,7 +546,11 @@ impl<'a> AzTree<'a> {
             limits,
             Vec::with_capacity(initial_nodes),
             Vec::with_capacity(initial_nodes.saturating_mul(INITIAL_CHILDREN_PER_NODE_ESTIMATE)),
-            Vec::with_capacity(initial_nodes.saturating_mul(model.hidden_size.saturating_mul(2))),
+            Vec::with_capacity(
+                initial_nodes
+                    .saturating_add(1)
+                    .saturating_mul(model.hidden_size),
+            ),
             Vec::new(),
             AzEvalScratch::new(model.arch),
             Vec::new(),
@@ -600,9 +605,15 @@ impl<'a> AzTree<'a> {
         rule_history_scratch.extend_from_slice(rule_history);
         let accumulator = AzEvalAccumulator::new(model, &position);
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
+        let root_accumulator_offset = match position.side_to_move() {
+            Color::Red => 0,
+            Color::Black => model.hidden_size,
+        };
         nodes.push(AzNode {
             position,
-            accumulator_offset: 0,
+            accumulator_offset: root_accumulator_offset as u32,
+            parent: NO_CHILD,
+            incoming_move: None,
             rule_entry: None,
             children_offset: 0,
             children_len: 0,
@@ -773,7 +784,7 @@ impl<'a> AzTree<'a> {
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
+            let accumulator_end = accumulator_start + self.model.hidden_size;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
@@ -899,25 +910,58 @@ impl<'a> AzTree<'a> {
                 let mut child_position = self.nodes[node_index].position.clone();
                 let moved = child_position.piece_at(mv.from as usize).unwrap();
                 let captured = child_position.piece_at(mv.to as usize);
-                let parent_accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-                let parent_accumulator_end = parent_accumulator_start + self.model.hidden_size * 2;
-                let child_accumulator_offset = self.accumulator_arena.len();
-                self.accumulator_arena
-                    .extend_from_within(parent_accumulator_start..parent_accumulator_end);
                 let mover = child_position.side_to_move();
                 {
                     crate::scope_profile!("az.search.child_make_move");
                     child_position.make_move(mv);
                 }
-                AzEvalAccumulator::apply_transition_to_hidden(
+                let perspective = child_position.side_to_move();
+                let child_accumulator_offset = self.accumulator_arena.len();
+                let base_offset = if node_index == self.root {
+                    match perspective {
+                        Color::Red => 0,
+                        Color::Black => self.model.hidden_size,
+                    }
+                } else {
+                    let grandparent = self.nodes[node_index].parent as usize;
+                    self.nodes[grandparent].accumulator_offset as usize
+                };
+                self.accumulator_arena
+                    .extend_from_within(base_offset..base_offset + self.model.hidden_size);
+                let accumulator = &mut self.accumulator_arena
+                    [child_accumulator_offset..child_accumulator_offset + self.model.hidden_size];
+                if node_index != self.root {
+                    let grandparent = self.nodes[node_index].parent as usize;
+                    let parent_move = self.nodes[node_index]
+                        .incoming_move
+                        .expect("non-root node must have an incoming move");
+                    let parent_moved = self.nodes[grandparent]
+                        .position
+                        .piece_at(parent_move.from as usize)
+                        .expect("incoming move must start on an occupied square");
+                    let parent_captured = self.nodes[grandparent]
+                        .position
+                        .piece_at(parent_move.to as usize);
+                    AzEvalAccumulator::apply_transition_for_perspective(
+                        self.model,
+                        &self.nodes[grandparent].position,
+                        &self.nodes[node_index].position,
+                        parent_move,
+                        parent_moved,
+                        parent_captured,
+                        perspective,
+                        accumulator,
+                    );
+                }
+                AzEvalAccumulator::apply_transition_for_perspective(
                     self.model,
                     &self.nodes[node_index].position,
                     &child_position,
                     mv,
                     moved,
                     captured,
-                    &mut self.accumulator_arena[child_accumulator_offset
-                        ..child_accumulator_offset + self.model.hidden_size * 2],
+                    perspective,
+                    accumulator,
                 );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv.to as usize);
@@ -926,6 +970,9 @@ impl<'a> AzTree<'a> {
                     position: child_position,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
+                    parent: u32::try_from(node_index)
+                        .expect("MCTS node index exceeds compact parent range"),
+                    incoming_move: Some(mv),
                     rule_entry: Some(child_rule_entry),
                     children_offset: 0,
                     children_len: 0,
@@ -1003,7 +1050,7 @@ impl<'a> AzTree<'a> {
         let mut eval = {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size * 2;
+            let accumulator_end = accumulator_start + self.model.hidden_size;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
@@ -1790,6 +1837,8 @@ mod tests {
         let parent = AzNode {
             position,
             accumulator_offset: 0,
+            parent: NO_CHILD,
+            incoming_move: None,
             rule_entry: None,
             children_offset: 0,
             children_len: 0,
@@ -2021,7 +2070,7 @@ mod tests {
         assert_eq!(tree.nodes.capacity(), INITIAL_TREE_NODE_CAPACITY);
         assert_eq!(
             tree.accumulator_arena.capacity(),
-            INITIAL_TREE_NODE_CAPACITY * model.hidden_size * 2
+            (INITIAL_TREE_NODE_CAPACITY + 1) * model.hidden_size
         );
         assert_eq!(
             tree.children.capacity(),

@@ -1,5 +1,5 @@
 use super::{
-    Color, Move, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome,
+    Color, Move, MoveGenMode, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome,
     geom::soldier_crossed_river,
 };
 
@@ -204,36 +204,34 @@ impl Position {
 
     fn chased_masks_by_origin(&self, color: Color, origin: usize) -> (u128, u16) {
         crate::scope_profile!("xiangqi.chased_mask_by");
+        let Some(piece) = self.board[origin].filter(|piece| piece.color == color) else {
+            return (0, 0);
+        };
+        let mut captures = Vec::with_capacity(8);
+        self.gen_piece_moves(origin, piece, MoveGenMode::Captures, &mut captures);
         let mut work = self.clone();
         work.side_to_move = color;
 
         let mut square_mask = 0u128;
         let mut piece_mask = 0u16;
-        for target in 0..super::BOARD_SIZE {
+        for mv in captures {
+            let target = mv.to as usize;
             let Some(target_piece) = self.board[target] else {
                 continue;
             };
             if !self.is_chase_target_piece(target_piece, color, target) {
                 continue;
             }
-
-            self.visit_attacker_origins_to(target, color, |from| {
-                if from != origin {
-                    return false;
-                }
-                if !self.is_effective_chase(target_piece, target, from) {
-                    return true;
-                }
-                let mv = Move::new(from, target);
-                let captured = work.make_move_board_only(mv);
-                let legal = !work.in_check(color);
-                work.unmake_move_board_only(mv, captured);
-                if legal {
-                    square_mask |= 1u128 << target;
-                    piece_mask |= 1u16 << chased_piece_index(target_piece);
-                }
-                true
-            });
+            if !self.is_effective_chase(target_piece, target, origin) {
+                continue;
+            }
+            let captured = work.make_move_board_only(mv);
+            let legal = !work.in_check(color);
+            work.unmake_move_board_only(mv, captured);
+            if legal {
+                square_mask |= 1u128 << target;
+                piece_mask |= 1u16 << chased_piece_index(target_piece);
+            }
         }
         (square_mask, piece_mask)
     }

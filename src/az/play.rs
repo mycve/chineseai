@@ -181,7 +181,8 @@ impl AzSelfplayData {
     pub fn add_assign(&mut self, other: &Self) {
         self.samples.extend(other.samples.iter().cloned());
         self.games.extend(other.games.iter().cloned());
-        self.position_fens.extend(other.position_fens.iter().cloned());
+        self.position_fens
+            .extend(other.position_fens.iter().cloned());
         self.red_wins += other.red_wins;
         self.black_wins += other.black_wins;
         self.draws += other.draws;

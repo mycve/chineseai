@@ -234,7 +234,11 @@ impl AzCandleModel {
                 MOVES_LEFT_HEAD_SIZE,
                 device,
             )?,
-            moves_left_output: var_from_slice(&model.moves_left_output, MOVES_LEFT_HEAD_SIZE, device)?,
+            moves_left_output: var_from_slice(
+                &model.moves_left_output,
+                MOVES_LEFT_HEAD_SIZE,
+                device,
+            )?,
             moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_consequence_output: var_from_slice(
@@ -379,12 +383,7 @@ mod tests {
         }
 
         let mut cpu = AzEvalScratch::new(model.arch);
-        model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut cpu,
-        );
+        model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
 
         let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
@@ -492,4 +491,3 @@ mod tests {
         );
     }
 }
-

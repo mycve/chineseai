@@ -14,8 +14,7 @@ use chineseai::{
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
         SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
         alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
-        generate_selfplay_data, global_training_step_sample_count,
-        play_arena_games_from_positions,
+        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
         train_samples_weighted, train_samples_weighted_owned,
     },
     opening_book::ObkBook,
@@ -381,7 +380,6 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AzLoopProgressState {
@@ -442,11 +440,7 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
-fn save_az_loop_progress_pair(
-    config_path: &str,
-    next_update: usize,
-    best_elo: f32,
-) {
+fn save_az_loop_progress_pair(config_path: &str, next_update: usize, best_elo: f32) {
     save_az_loop_progress(
         config_path,
         &AzLoopProgressState {
@@ -2823,9 +2817,7 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                if config.arena_interval == 0
-                    || update <= config.selfplay_update_warmup_updates
-                {
+                if config.arena_interval == 0 || update <= config.selfplay_update_warmup_updates {
                     let updated_numa_models =
                         build_numa_model_replicas(&deployed_model, &numa_nodes);
                     let mut shared = shared_model
@@ -3429,11 +3421,10 @@ impl LabelEvalStats {
         if n <= 1.0 {
             return 0.0;
         }
-        let cov = self.raw_value_target_cross_sum
-            - self.raw_value_q_sum * self.raw_target_q_sum / n;
+        let cov =
+            self.raw_value_target_cross_sum - self.raw_value_q_sum * self.raw_target_q_sum / n;
         let left = self.raw_value_q_sq_sum - self.raw_value_q_sum * self.raw_value_q_sum / n;
-        let right = self.raw_target_q_sq_sum
-            - self.raw_target_q_sum * self.raw_target_q_sum / n;
+        let right = self.raw_target_q_sq_sum - self.raw_target_q_sum * self.raw_target_q_sum / n;
         if left <= 0.0 || right <= 0.0 {
             0.0
         } else {
@@ -3635,7 +3626,8 @@ fn load_pikafish_label_rows(
     limit: usize,
 ) -> rusqlite::Result<Vec<PikafishLabelRow>> {
     let mut query =
-        "SELECT id, fen, bestmove, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id".to_string();
+        "SELECT id, fen, bestmove, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id"
+            .to_string();
     if limit > 0 {
         query.push_str(" LIMIT ?1");
         let mut stmt = conn.prepare(&query)?;

@@ -1,12 +1,12 @@
 use crate::az::{
-    alphazero_search_with_rules_controlled_with_progress, AzNnue, AzSearchControl, AzSearchLimits,
-    AzSearchResult,
+    AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult,
+    alphazero_search_with_rules_controlled_with_progress,
 };
 use crate::xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome};
 use std::io::{self, BufRead, Write};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
