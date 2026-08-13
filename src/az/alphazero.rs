@@ -66,10 +66,14 @@ pub struct AzCandidate {
 #[derive(Clone, Debug)]
 pub struct AzSearchResult {
     pub best_move: Option<Move>,
+    /// Value of the action actually selected by Gumbel search.
     pub value_q: f32,
     pub value_cp: i32,
-    /// Root win/draw/loss probabilities from the side-to-move perspective.
+    /// Selected action win/draw/loss probabilities from the root player's perspective.
     pub value_wdl: [f32; 3],
+    /// Visit-weighted mean over every explored root action. Diagnostic only.
+    pub root_mean_q: f32,
+    pub root_mean_wdl: [f32; 3],
     /// Raw moves-left prediction at the root position.
     pub moves_left: f32,
     pub simulations: usize,
@@ -199,6 +203,8 @@ pub fn gumbel_search_with_rules_controlled_with_progress(
             value_q,
             value_cp: cp_from_q(value_q),
             value_wdl: tree.nodes[root].value_wdl,
+            root_mean_q: value_q,
+            root_mean_wdl: tree.nodes[root].value_wdl,
             moves_left: tree.nodes[root].moves_left,
             simulations: 0,
             search_depth_avg: 0.0,
@@ -397,7 +403,7 @@ impl<'a> AzTree<'a> {
         } else {
             root_node.value_wdl
         };
-        let searched_value = wdl_utility(searched_wdl, self.draw_score);
+        let root_mean_value = wdl_utility(searched_wdl, self.draw_score);
         let policy = {
             crate::scope_profile!("az.search.root_policy");
             self.root_policy(self.root)
@@ -436,15 +442,25 @@ impl<'a> AzTree<'a> {
                     .then_with(|| right.policy.total_cmp(&left.policy))
             })
         });
-        let best_move = self
-            .best_root_child(self.root)
+        let best_child_index = self.best_root_child(self.root);
+        let best_move = best_child_index
             .map(|child_index| root_children[child_index].mv)
             .or_else(|| candidates.first().map(|candidate| candidate.mv));
+        let selected_wdl = best_child_index
+            .filter(|&child_index| root_children[child_index].visits > 0)
+            .map(|child_index| {
+                let child = &root_children[child_index];
+                child.value_wdl_sum.map(|value| value / child.visits as f32)
+            })
+            .unwrap_or(root_node.value_wdl);
+        let selected_value = wdl_utility(selected_wdl, self.draw_score);
         AzSearchResult {
             best_move,
-            value_q: searched_value,
-            value_cp: cp_from_q(searched_value),
-            value_wdl: searched_wdl,
+            value_q: selected_value,
+            value_cp: cp_from_q(selected_value),
+            value_wdl: selected_wdl,
+            root_mean_q: root_mean_value,
+            root_mean_wdl: searched_wdl,
             moves_left: root_node.moves_left,
             simulations,
             search_depth_avg: self.search_depth_avg(),
@@ -1410,6 +1426,54 @@ mod tests {
         );
         assert!(top1(&softened) < top1(&default_mctx));
         assert!(entropy(&softened) > entropy(&default_mctx));
+    }
+
+    #[test]
+    fn search_result_separates_selected_value_from_root_mean() {
+        let position = Position::startpos();
+        let legal = position.legal_moves();
+        let model = AzNnue::random(4, 113);
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.set_node_children(
+            tree.root,
+            [
+                AzChild {
+                    mv: legal[0],
+                    prior: 0.5,
+                    gives_check: false,
+                    visits: 10,
+                    value_wdl_sum: [9.0, 0.0, 1.0],
+                    moves_left_sum: 0.0,
+                    child: NO_CHILD,
+                },
+                AzChild {
+                    mv: legal[1],
+                    prior: 0.5,
+                    gives_check: false,
+                    visits: 10,
+                    value_wdl_sum: [1.0, 0.0, 9.0],
+                    moves_left_sum: 0.0,
+                    child: NO_CHILD,
+                },
+            ],
+        );
+        tree.root_gumbel = vec![0.0; 2];
+        tree.nodes[tree.root].visits = 20;
+        tree.nodes[tree.root].value_wdl_sum = [10.0, 0.0, 10.0];
+
+        let result = tree.search_result(20);
+
+        assert_eq!(result.best_move, Some(legal[0]));
+        assert!((result.value_q - 0.8).abs() < 1e-6);
+        assert!(result.root_mean_q.abs() < 1e-6);
+        assert_eq!(result.value_wdl, [0.9, 0.0, 0.1]);
+        assert_eq!(result.root_mean_wdl, [0.5, 0.0, 0.5]);
     }
 
     #[test]

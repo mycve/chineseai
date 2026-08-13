@@ -1320,13 +1320,20 @@ fn main() {
                 })
                 .sum::<f32>();
             println!(
-                "root     : q={:.4} cp={} wdl={:.4}/{:.4}/{:.4} net_ml={:.1}",
+                "selected : q={:.4} cp={} wdl={:.4}/{:.4}/{:.4} net_ml={:.1}",
                 result.value_q,
                 result.value_cp,
                 result.value_wdl[0],
                 result.value_wdl[1],
                 result.value_wdl[2],
                 result.moves_left,
+            );
+            println!(
+                "root_mean: q={:.4} wdl={:.4}/{:.4}/{:.4} diagnostic_only=true",
+                result.root_mean_q,
+                result.root_mean_wdl[0],
+                result.root_mean_wdl[1],
+                result.root_mean_wdl[2],
             );
             println!(
                 "policy   : target_top1={:.6} entropy={:.4} effective_actions={:.2}",
