@@ -477,7 +477,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_qvs{}_op{}_rc{}_",
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_qvs{}_tdl{}_op{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_sd{}"
         ),
         config.simulations,
@@ -496,6 +496,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.gumbel_scale),
         config.max_considered_actions,
         f32_slug(config.q_value_scale),
+        f32_slug(config.value_td_lambda),
         if config.opening_fens_path.trim().is_empty() {
             "none".to_string()
         } else {
@@ -735,6 +736,7 @@ fn build_az_loop_config(
         gumbel_scale: config.gumbel_scale,
         max_considered_actions: config.max_considered_actions,
         q_value_scale: config.q_value_scale,
+        value_td_lambda: config.value_td_lambda,
         draw_score: config.draw_score,
         opening_positions: opening_positions.to_vec(),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
@@ -1813,12 +1815,13 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=gumbel-alphazero sims={} gumbel_scale={} max_considered_actions={} q_value_scale={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} batch_size(global)={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} arena_interval={} arena_sims={} pikafish_label_eval(sqlite={},interval={},limit={},sims={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=gumbel-alphazero sims={} gumbel_scale={} max_considered_actions={} q_value_scale={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} batch_size(global)={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} arena_interval={} arena_sims={} pikafish_label_eval(sqlite={},interval={},limit={},sims={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.gumbel_scale,
                 config.max_considered_actions,
                 config.q_value_scale,
+                config.value_td_lambda,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
                 config.selfplay_samples_per_update,
@@ -1847,10 +1850,11 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : gumbel_scale={} max_considered_actions={} q_value_scale={} opening_fen_games={:.1}%",
+                "explore  : gumbel_scale={} max_considered_actions={} q_value_scale={} value_td_lambda={} opening_fen_games={:.1}%",
                 config.gumbel_scale,
                 config.max_considered_actions,
                 config.q_value_scale,
+                config.value_td_lambda,
                 config.opening_fen_game_fraction * 100.0
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();

@@ -335,6 +335,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         };
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
+        let mut game_bootstrap_wdls = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
         for ply in 0..config.max_plies {
@@ -454,6 +455,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     1.0,
                 );
                 game_samples.push(sample);
+                game_bootstrap_wdls.push(search.network_value_wdl);
             }
             let mover = position.side_to_move();
             position.make_move(mv);
@@ -513,7 +515,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            assign_value_targets(&mut game_samples, result);
+            assign_td_lambda_value_targets(
+                &mut game_samples,
+                &game_bootstrap_wdls,
+                result,
+                config.value_td_lambda,
+            );
             assign_moves_left_targets(&mut game_samples, config.max_plies);
         }
         samples.extend(game_samples.clone());
@@ -717,12 +724,35 @@ fn move_search_meta(
     meta
 }
 
-fn assign_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
-    for sample in samples {
-        let outcome = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
-        sample.value_wdl = scalar_value_to_wdl_target(outcome);
-        sample.value = outcome;
+fn assign_td_lambda_value_targets(
+    samples: &mut [AzTrainingSample],
+    bootstrap_wdls: &[[f32; 3]],
+    game_result_red: f32,
+    td_lambda: f32,
+) {
+    assert_eq!(samples.len(), bootstrap_wdls.len());
+    let Some(last) = samples.last_mut() else {
+        return;
+    };
+    let lambda = td_lambda.clamp(0.0, 1.0);
+    let terminal = scalar_value_to_wdl_target((game_result_red * last.side_sign).clamp(-1.0, 1.0));
+    last.value_wdl = terminal;
+    last.value = terminal[0] - terminal[2];
+    let mut next_target = terminal;
+    for index in (0..samples.len().saturating_sub(1)).rev() {
+        let bootstrap = flip_wdl(bootstrap_wdls[index + 1]);
+        let continuation = flip_wdl(next_target);
+        let target = std::array::from_fn(|part| {
+            (1.0 - lambda) * bootstrap[part] + lambda * continuation[part]
+        });
+        samples[index].value_wdl = target;
+        samples[index].value = target[0] - target[2];
+        next_target = target;
     }
+}
+
+fn flip_wdl(wdl: [f32; 3]) -> [f32; 3] {
+    [wdl[2], wdl[1], wdl[0]]
 }
 
 pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_plies: usize) {
@@ -953,17 +983,33 @@ mod tests {
     }
 
     #[test]
-    fn value_targets_use_only_terminal_outcome() {
+    fn td_lambda_one_is_terminal_mc() {
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
         samples[0].meta.root_q = -1.0;
         samples[1].meta.root_q = 1.0;
 
-        assign_value_targets(&mut samples, 1.0);
+        assign_td_lambda_value_targets(&mut samples, &[[0.2, 0.3, 0.5], [0.6, 0.2, 0.2]], 1.0, 1.0);
 
         assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(samples[0].value, 1.0);
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
+    }
+
+    #[test]
+    fn td_lambda_mixes_wdl_bootstrap_and_terminal_return() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
+        let bootstraps = [[0.4, 0.4, 0.2], [0.1, 0.6, 0.3], [0.6, 0.2, 0.2]];
+
+        assign_td_lambda_value_targets(&mut samples, &bootstraps, 1.0, 0.9);
+
+        let expected = [[0.894, 0.078, 0.028], [0.02, 0.02, 0.96], [1.0, 0.0, 0.0]];
+        for (sample, expected) in samples.iter().zip(expected) {
+            for (actual, expected) in sample.value_wdl.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+            assert!((sample.value - (expected[0] - expected[2])).abs() < 1.0e-6);
+        }
     }
 
     #[test]

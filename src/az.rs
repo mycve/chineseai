@@ -603,6 +603,7 @@ pub struct AzLoopConfig {
     pub gumbel_scale: f32,
     pub max_considered_actions: usize,
     pub q_value_scale: f32,
+    pub value_td_lambda: f32,
     pub draw_score: f32,
     pub opening_positions: Vec<Position>,
     pub opening_fen_game_fraction: f32,

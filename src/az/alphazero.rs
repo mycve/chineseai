@@ -71,6 +71,8 @@ pub struct AzSearchResult {
     pub value_cp: i32,
     /// Selected action win/draw/loss probabilities from the root player's perspective.
     pub value_wdl: [f32; 3],
+    /// Raw network WDL at the root before search. Used only for TD bootstrapping.
+    pub network_value_wdl: [f32; 3],
     /// Visit-weighted mean over every explored root action. Diagnostic only.
     pub root_mean_q: f32,
     pub root_mean_wdl: [f32; 3],
@@ -203,6 +205,7 @@ pub fn gumbel_search_with_rules_controlled_with_progress(
             value_q,
             value_cp: cp_from_q(value_q),
             value_wdl: tree.nodes[root].value_wdl,
+            network_value_wdl: tree.nodes[root].value_wdl,
             root_mean_q: value_q,
             root_mean_wdl: tree.nodes[root].value_wdl,
             moves_left: tree.nodes[root].moves_left,
@@ -459,6 +462,7 @@ impl<'a> AzTree<'a> {
             value_q: selected_value,
             value_cp: cp_from_q(selected_value),
             value_wdl: selected_wdl,
+            network_value_wdl: root_node.value_wdl,
             root_mean_q: root_mean_value,
             root_mean_wdl: searched_wdl,
             moves_left: root_node.moves_left,
