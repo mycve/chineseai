@@ -41,7 +41,7 @@ impl Default for UciState {
             threads: 1,
             gumbel_scale: 0.0,
             max_considered_actions: 16,
-            q_value_scale: 0.02,
+            q_value_scale: 0.03,
             draw_score: 0.0,
             seed: 20260409,
         }
@@ -128,7 +128,7 @@ fn print_uci_id() {
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name GumbelScale type string default 0.0");
     println!("option name MaxConsideredActions type spin default 16 min 1 max 256");
-    println!("option name QValueScale type string default 0.02");
+    println!("option name QValueScale type string default 0.03");
     println!("option name DrawScore type string default 0.0");
     println!("uciok");
     flush();

@@ -83,7 +83,7 @@ impl Default for AzLoopFileConfig {
             workers: 0,
             gumbel_scale: 1.0,
             max_considered_actions: 16,
-            q_value_scale: 0.02,
+            q_value_scale: 0.03,
             draw_score: 0.0,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
@@ -277,7 +277,7 @@ mod tests {
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
         assert!(text.contains("max_considered_actions = 16\n"));
-        assert!(text.contains("q_value_scale = 0.02\n"));
+        assert!(text.contains("q_value_scale = 0.03\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));

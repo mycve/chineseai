@@ -16,7 +16,7 @@ const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
 const DEFAULT_GUMBEL_SCALE: f32 = 1.0;
 const DEFAULT_MAX_CONSIDERED_ACTIONS: usize = 16;
-const DEFAULT_Q_VALUE_SCALE: f32 = 0.02;
+const DEFAULT_Q_VALUE_SCALE: f32 = 0.03;
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,

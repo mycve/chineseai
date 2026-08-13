@@ -118,7 +118,7 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
     /// Scale applied to normalized completed Q-values.
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = 0.03)]
     q_value_scale: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
@@ -169,7 +169,7 @@ struct AzBenchArgs {
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
     /// Scale applied to normalized completed Q-values.
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = 0.03)]
     q_value_scale: f32,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -256,7 +256,7 @@ struct VsPikafishArgs {
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
     /// Scale applied to normalized completed Q-values.
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = 0.03)]
     q_value_scale: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
@@ -340,7 +340,7 @@ struct PikafishLabelEvalArgs {
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
     /// Scale applied to normalized completed Q-values.
-    #[arg(long, default_value_t = 0.02)]
+    #[arg(long, default_value_t = 0.03)]
     q_value_scale: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
