@@ -111,6 +111,9 @@ struct AzSearchArgs {
     /// Root Gumbel noise scale; 0 makes analysis deterministic.
     #[arg(long, default_value_t = 0.0)]
     gumbel_scale: f32,
+    /// Random seed for reproducible root Gumbel samples.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
     /// Maximum root actions retained by Sequential Halving.
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
@@ -123,7 +126,10 @@ struct AzSearchArgs {
     /// Draw value in Q = W - L + draw_score * D.
     #[arg(long, default_value_t = 0.0)]
     draw_score: f32,
-    /// Independently re-search this many top-visited root moves after making each move.
+    /// Candidate rows to print; 0 prints every legal move.
+    #[arg(long, default_value_t = 16)]
+    top: usize,
+    /// Independently re-search this many top-ranked root moves after making each move.
     #[arg(long, default_value_t = 0)]
     verify_top: usize,
     /// Independently re-search specific root moves (repeat the option for multiple moves).
@@ -1188,7 +1194,7 @@ fn main() {
             });
             let search_limits = AzSearchLimits {
                 simulations,
-                seed: 0,
+                seed: cmd.seed,
                 gumbel_scale: cmd.gumbel_scale.max(0.0),
                 max_considered_actions: cmd.max_considered_actions.max(1),
                 q_value_scale: cmd.q_value_scale.max(0.0),
@@ -1215,6 +1221,7 @@ fn main() {
                     .parse_uci_move(text)
                     .unwrap_or_else(|| panic!("invalid or illegal --trace-move `{text}`"))
             });
+            let search_started = Instant::now();
             let (result, trace) = if let Some(trace_move) = trace_move {
                 gumbel_search_trace_with_rules(
                     &position,
@@ -1236,14 +1243,27 @@ fn main() {
                     Vec::new(),
                 )
             };
+            let search_elapsed = search_started.elapsed();
+            let simulations_per_second =
+                result.simulations as f64 / search_elapsed.as_secs_f64().max(f64::EPSILON);
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
-            println!("sims     : {}", result.simulations);
-            println!("search   : gumbel-alphazero");
-            println!("gumbel_scale: {}", cmd.gumbel_scale);
-            println!("max_considered_actions: {}", cmd.max_considered_actions);
-            println!("q_value_scale: {}", cmd.q_value_scale);
-            println!("draw_score: {}", cmd.draw_score);
+            println!("search   : gumbel-alphazero seed={}", cmd.seed);
+            println!(
+                "budget   : simulations={}/{} legal={} max_considered={} elapsed_ms={:.2} sims/s={:.0}",
+                result.simulations,
+                simulations,
+                result.candidates.len(),
+                cmd.max_considered_actions.max(1),
+                search_elapsed.as_secs_f64() * 1000.0,
+                simulations_per_second,
+            );
+            println!(
+                "params   : gumbel_scale={} q_value_scale={} draw_score={}",
+                cmd.gumbel_scale.max(0.0),
+                cmd.q_value_scale.max(0.0),
+                cmd.draw_score.clamp(-1.0, 1.0),
+            );
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
@@ -1272,52 +1292,104 @@ fn main() {
                     );
                 }
             }
-            println!("value_cp : {}", result.value_cp);
+            let considered_actions = result
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.visits > 0)
+                .count();
+            let max_root_visits = result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.visits)
+                .max()
+                .unwrap_or(0);
+            let finalist_actions = result
+                .candidates
+                .iter()
+                .filter(|candidate| max_root_visits > 0 && candidate.visits == max_root_visits)
+                .count();
+            let policy_top1 = result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.policy)
+                .fold(0.0f32, f32::max);
+            let policy_entropy = -result
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    let probability = candidate.policy.max(f32::MIN_POSITIVE);
+                    probability * probability.ln()
+                })
+                .sum::<f32>();
             println!(
-                "bestmove : {}",
+                "root     : q={:.4} cp={} wdl={:.4}/{:.4}/{:.4}",
+                result.value_q,
+                result.value_cp,
+                result.value_wdl[0],
+                result.value_wdl[1],
+                result.value_wdl[2],
+            );
+            println!(
+                "policy   : target_top1={:.6} entropy={:.4} effective_actions={:.2}",
+                policy_top1,
+                policy_entropy,
+                policy_entropy.exp(),
+            );
+            println!(
+                "result   : bestmove={} considered={}/{} finalists={}",
                 result
                     .best_move
                     .map(|mv| mv.to_string())
-                    .unwrap_or_else(|| "(none)".into())
+                    .unwrap_or_else(|| "(none)".into()),
+                considered_actions,
+                result.candidates.len(),
+                finalist_actions,
             );
             println!(
-                "visited_actions: {}",
-                result
-                    .candidates
-                    .iter()
-                    .filter(|candidate| candidate.visits > 0)
-                    .count()
+                "ranking  : *=selected F=finalist C=considered; ordered by visits then root_score"
             );
-            println!("by_policy:");
-            for candidate in &result.candidates {
+            println!(
+                " rk   move   state visits       q      cQ     prior    target   gumbel    score    ml"
+            );
+            let ranked = result.candidates.clone();
+            let rows = if cmd.top == 0 {
+                ranked.len()
+            } else {
+                cmd.top.min(ranked.len())
+            };
+            for (index, candidate) in ranked.iter().take(rows).enumerate() {
+                let selected = if result.best_move == Some(candidate.mv) {
+                    '*'
+                } else {
+                    ' '
+                };
+                let state = if max_root_visits > 0 && candidate.visits == max_root_visits {
+                    'F'
+                } else if candidate.visits > 0 {
+                    'C'
+                } else {
+                    '-'
+                };
                 println!(
-                    "candidate: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    "{:>3} {} {:>5}     {} {:>6} {:+.4} {:+.4} {:.6} {:.6} {:+.4} {:+.4} {:>5.1}",
+                    index + 1,
+                    selected,
                     candidate.mv,
+                    state,
                     candidate.visits,
                     candidate.q,
-                    candidate.moves_left,
+                    candidate.completed_q,
                     candidate.prior,
-                    candidate.policy
+                    candidate.policy,
+                    candidate.gumbel,
+                    candidate.root_score,
+                    candidate.moves_left,
                 );
             }
-            println!("by_visits:");
-            let mut by_visits = result.candidates.clone();
-            by_visits.sort_by(|left, right| {
-                right
-                    .visits
-                    .cmp(&left.visits)
-                    .then_with(|| right.policy.total_cmp(&left.policy))
-                    .then_with(|| right.q.total_cmp(&left.q))
-            });
-            for candidate in &by_visits {
+            if rows < ranked.len() {
                 println!(
-                    "visited: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
-                    candidate.mv,
-                    candidate.visits,
-                    candidate.q,
-                    candidate.moves_left,
-                    candidate.prior,
-                    candidate.policy
+                    "... {} rows hidden; use --top 0 to show all",
+                    ranked.len() - rows
                 );
             }
             let verify_sims = if cmd.verify_sims == 0 {
@@ -1325,7 +1397,7 @@ fn main() {
             } else {
                 cmd.verify_sims
             };
-            let mut verify_moves = by_visits
+            let mut verify_moves = ranked
                 .iter()
                 .take(cmd.verify_top)
                 .map(|candidate| candidate.mv)

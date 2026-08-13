@@ -51,6 +51,12 @@ pub struct AzCandidate {
     pub mv: Move,
     pub visits: u32,
     pub q: f32,
+    /// Completed and scaled Q-value used by Gumbel action selection.
+    pub completed_q: f32,
+    /// Root Gumbel sample after applying `gumbel_scale`.
+    pub gumbel: f32,
+    /// `gumbel + log(prior) + completed_q` at the root.
+    pub root_score: f32,
     pub moves_left: f32,
     pub raw_prior: f32,
     pub prior: f32,
@@ -393,30 +399,39 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.root_policy");
             self.root_policy(self.root)
         };
+        let completed_q = self.completed_qvalues(self.root);
         let mut candidates = root_children
             .iter()
             .zip(policy)
             .enumerate()
-            .map(|(index, (child, policy))| AzCandidate {
-                mv: child.mv,
-                visits: child.visits,
-                q: child.q(self.draw_score),
-                moves_left: child.moves_left(),
-                raw_prior: self
-                    .root_raw_priors
-                    .get(index)
-                    .copied()
-                    .unwrap_or(child.prior),
-                prior: child.prior,
-                policy,
+            .map(|(index, (child, policy))| {
+                let completed_q = completed_q[index];
+                let gumbel = self.root_gumbel.get(index).copied().unwrap_or(0.0);
+                AzCandidate {
+                    mv: child.mv,
+                    visits: child.visits,
+                    q: child.q(self.draw_score),
+                    completed_q,
+                    gumbel,
+                    root_score: gumbel + child.prior.max(f32::MIN_POSITIVE).ln() + completed_q,
+                    moves_left: child.moves_left(),
+                    raw_prior: self
+                        .root_raw_priors
+                        .get(index)
+                        .copied()
+                        .unwrap_or(child.prior),
+                    prior: child.prior,
+                    policy,
+                }
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            right
-                .policy
-                .total_cmp(&left.policy)
-                .then_with(|| right.visits.cmp(&left.visits))
-                .then_with(|| right.q.total_cmp(&left.q))
+            right.visits.cmp(&left.visits).then_with(|| {
+                right
+                    .root_score
+                    .total_cmp(&left.root_score)
+                    .then_with(|| right.policy.total_cmp(&left.policy))
+            })
         });
         let best_move = self
             .best_root_child(self.root)
@@ -1546,12 +1561,21 @@ mod tests {
 
         assert_eq!(result.simulations, 128);
         assert!(result.best_move.is_some());
+        assert_eq!(
+            result.candidates.first().map(|candidate| candidate.mv),
+            result.best_move
+        );
         assert!(
             result
                 .candidates
                 .iter()
                 .any(|candidate| candidate.visits > 0)
         );
+        assert!(result.candidates.iter().all(|candidate| {
+            candidate.completed_q.is_finite()
+                && candidate.gumbel.is_finite()
+                && candidate.root_score.is_finite()
+        }));
         assert!((total_policy - 1.0).abs() < 1e-3);
     }
 
@@ -1596,6 +1620,9 @@ mod tests {
             assert_eq!(actual.mv, expected.mv);
             assert_eq!(actual.visits, expected.visits);
             assert_eq!(actual.q.to_bits(), expected.q.to_bits());
+            assert_eq!(actual.completed_q.to_bits(), expected.completed_q.to_bits());
+            assert_eq!(actual.gumbel.to_bits(), expected.gumbel.to_bits());
+            assert_eq!(actual.root_score.to_bits(), expected.root_score.to_bits());
             assert_eq!(actual.policy.to_bits(), expected.policy.to_bits());
             assert_eq!(actual.prior.to_bits(), expected.prior.to_bits());
         }
