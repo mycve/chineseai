@@ -1313,6 +1313,11 @@ fn main() {
                 .iter()
                 .map(|candidate| candidate.policy)
                 .fold(0.0f32, f32::max);
+            let target_move = result
+                .candidates
+                .iter()
+                .max_by(|left, right| left.policy.total_cmp(&right.policy))
+                .map(|candidate| candidate.mv);
             let policy_entropy = -result
                 .candidates
                 .iter()
@@ -1322,12 +1327,13 @@ fn main() {
                 })
                 .sum::<f32>();
             println!(
-                "root     : q={:.4} cp={} wdl={:.4}/{:.4}/{:.4}",
+                "root     : q={:.4} cp={} wdl={:.4}/{:.4}/{:.4} net_ml={:.1}",
                 result.value_q,
                 result.value_cp,
                 result.value_wdl[0],
                 result.value_wdl[1],
                 result.value_wdl[2],
+                result.moves_left,
             );
             println!(
                 "policy   : target_top1={:.6} entropy={:.4} effective_actions={:.2}",
@@ -1336,9 +1342,12 @@ fn main() {
                 policy_entropy.exp(),
             );
             println!(
-                "result   : bestmove={} considered={}/{} finalists={}",
+                "result   : bestmove={} targetmove={} considered={}/{} finalists={}",
                 result
                     .best_move
+                    .map(|mv| mv.to_string())
+                    .unwrap_or_else(|| "(none)".into()),
+                target_move
                     .map(|mv| mv.to_string())
                     .unwrap_or_else(|| "(none)".into()),
                 considered_actions,
@@ -1346,10 +1355,10 @@ fn main() {
                 finalist_actions,
             );
             println!(
-                "ranking  : *=selected F=finalist C=considered; ordered by visits then root_score"
+                "ranking  : *=selected T=target-top F=finalist C=considered; cQ=scaled completed-Q"
             );
             println!(
-                " rk   move   state visits       q      cQ     prior    target   gumbel    score    ml"
+                " rk    move   state visits       q      cQ     prior    target   gumbel    score    ml"
             );
             let ranked = result.candidates.clone();
             let rows = if cmd.top == 0 {
@@ -1363,6 +1372,11 @@ fn main() {
                 } else {
                     ' '
                 };
+                let target = if target_move == Some(candidate.mv) {
+                    'T'
+                } else {
+                    ' '
+                };
                 let state = if max_root_visits > 0 && candidate.visits == max_root_visits {
                     'F'
                 } else if candidate.visits > 0 {
@@ -1371,9 +1385,10 @@ fn main() {
                     '-'
                 };
                 println!(
-                    "{:>3} {} {:>5}     {} {:>6} {:+.4} {:+.4} {:.6} {:.6} {:+.4} {:+.4} {:>5.1}",
+                    "{:>3} {}{} {:>5}     {} {:>6} {:+.4} {:+.4} {:.6} {:.6} {:+.4} {:+.4} {:>5.1}",
                     index + 1,
                     selected,
+                    target,
                     candidate.mv,
                     state,
                     candidate.visits,

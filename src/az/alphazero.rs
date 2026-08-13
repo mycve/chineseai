@@ -70,6 +70,8 @@ pub struct AzSearchResult {
     pub value_cp: i32,
     /// Root win/draw/loss probabilities from the side-to-move perspective.
     pub value_wdl: [f32; 3],
+    /// Raw moves-left prediction at the root position.
+    pub moves_left: f32,
     pub simulations: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
@@ -197,6 +199,7 @@ pub fn gumbel_search_with_rules_controlled_with_progress(
             value_q,
             value_cp: cp_from_q(value_q),
             value_wdl: tree.nodes[root].value_wdl,
+            moves_left: tree.nodes[root].moves_left,
             simulations: 0,
             search_depth_avg: 0.0,
             search_depth_max: 0,
@@ -442,6 +445,7 @@ impl<'a> AzTree<'a> {
             value_q: searched_value,
             value_cp: cp_from_q(searched_value),
             value_wdl: searched_wdl,
+            moves_left: root_node.moves_left,
             simulations,
             search_depth_avg: self.search_depth_avg(),
             search_depth_max: self.search_depth_max,
