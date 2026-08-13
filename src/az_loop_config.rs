@@ -36,7 +36,6 @@ pub struct AzLoopFileConfig {
     pub max_considered_actions: usize,
     pub q_value_scale: f32,
     pub draw_score: f32,
-    pub value_target_search_q_mix: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
     pub resign_percentage: f32,
@@ -88,7 +87,6 @@ impl Default for AzLoopFileConfig {
             max_considered_actions: 16,
             q_value_scale: 0.02,
             draw_score: 0.0,
-            value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
             resign_percentage: 1.0,
@@ -167,10 +165,6 @@ impl AzLoopFileConfig {
         line!("max_considered_actions", self.max_considered_actions);
         line!("q_value_scale", f(self.q_value_scale));
         line!("draw_score", f(self.draw_score));
-        line!(
-            "value_target_search_q_mix",
-            f(self.value_target_search_q_mix)
-        );
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!(
             "opening_fen_game_fraction",
@@ -253,7 +247,6 @@ impl AzLoopFileConfig {
         self.q_value_scale = self.q_value_scale.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
-        self.value_target_search_q_mix = self.value_target_search_q_mix.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -287,14 +280,14 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 10\n"));
+        assert!(text.starts_with("format_version = 11\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
         assert!(text.contains("max_considered_actions = 16\n"));
         assert!(text.contains("q_value_scale = 0.02\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("value_target_search_q_mix = 0.4\n"));
+        assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));

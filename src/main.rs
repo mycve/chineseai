@@ -738,7 +738,6 @@ fn build_az_loop_config(
         max_considered_actions: config.max_considered_actions,
         q_value_scale: config.q_value_scale,
         draw_score: config.draw_score,
-        value_target_search_q_mix: config.value_target_search_q_mix,
         opening_positions: opening_positions.to_vec(),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
         resign_percentage: config.resign_percentage,

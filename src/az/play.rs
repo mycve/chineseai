@@ -547,7 +547,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            assign_value_targets(&mut game_samples, result, config);
+            assign_value_targets(&mut game_samples, result);
             assign_moves_left_targets(&mut game_samples, config.max_plies);
         }
         samples.extend(game_samples.clone());
@@ -751,19 +751,11 @@ fn move_search_meta(
     meta
 }
 
-fn assign_value_targets(
-    samples: &mut [AzTrainingSample],
-    game_result_red: f32,
-    config: &AzLoopConfig,
-) {
-    // 价值目标 = MCTS 根搜索 Q 与终局结果的混合：0.25 * root_q + 0.75 * 终局结果。
-    // 两者都已换算到行棋方视角（root_q 来自行棋方正对的搜索，终局结果乘以 side_sign）。
-    let mix = config.value_target_search_q_mix.clamp(0.0, 1.0);
+fn assign_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
     for sample in samples {
-        let side_result = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
-        let blended = (mix * sample.meta.root_q + (1.0 - mix) * side_result).clamp(-1.0, 1.0);
-        sample.value_wdl = scalar_value_to_wdl_target(blended);
-        sample.value = blended;
+        let outcome = (game_result_red * sample.side_sign).clamp(-1.0, 1.0);
+        sample.value_wdl = scalar_value_to_wdl_target(outcome);
+        sample.value = outcome;
     }
 }
 
@@ -1000,6 +992,20 @@ mod tests {
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
+    }
+
+    #[test]
+    fn value_targets_use_only_terminal_outcome() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        samples[0].meta.root_q = -1.0;
+        samples[1].meta.root_q = 1.0;
+
+        assign_value_targets(&mut samples, 1.0);
+
+        assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(samples[0].value, 1.0);
+        assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
+        assert_eq!(samples[1].value, -1.0);
     }
 
     #[test]

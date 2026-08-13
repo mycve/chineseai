@@ -62,8 +62,6 @@ pub(super) const POLICY_PATTERN_BUCKETS: usize = 64;
 pub(super) const POLICY_PATTERN_TABLE_SIZE: usize =
     POLICY_PATTERN_BUCKETS * 7 * POLICY_PATTERN_TARGETS;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
-/// 自对弈价值目标：终局结果 与 MCTS 根搜索 Q 的混合权重（root_q 占比）。
-pub const VALUE_TARGET_SEARCH_Q_MIX: f32 = 0.40;
 pub(super) const MOVES_LEFT_HEAD_SIZE: usize = 32;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
@@ -606,7 +604,6 @@ pub struct AzLoopConfig {
     pub max_considered_actions: usize,
     pub q_value_scale: f32,
     pub draw_score: f32,
-    pub value_target_search_q_mix: f32,
     pub opening_positions: Vec<Position>,
     pub opening_fen_game_fraction: f32,
     pub resign_percentage: f32,
