@@ -38,8 +38,6 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
-    pub resign_percentage: f32,
-    pub resign_playthrough: f32,
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_games: u32,
@@ -89,8 +87,6 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
-            resign_percentage: 1.0,
-            resign_playthrough: 20.0,
             replay_capacity: 1000000,
             replay_recent_sample_fraction: 0.35,
             replay_recent_games: 5000,
@@ -170,8 +166,6 @@ impl AzLoopFileConfig {
             "opening_fen_game_fraction",
             f(self.opening_fen_game_fraction)
         );
-        line!("resign_percentage", f(self.resign_percentage));
-        line!("resign_playthrough", f(self.resign_playthrough));
         line!("replay_capacity", self.replay_capacity);
         line!(
             "replay_recent_sample_fraction",
@@ -247,8 +241,6 @@ impl AzLoopFileConfig {
         self.q_value_scale = self.q_value_scale.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
-        self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
-        self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
@@ -280,7 +272,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 11\n"));
+        assert!(text.starts_with("format_version = 12\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
@@ -290,8 +282,8 @@ mod tests {
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
-        assert!(text.contains("resign_percentage = 1.0\n"));
-        assert!(text.contains("resign_playthrough = 20.0\n"));
+        assert!(!text.contains("resign_percentage"));
+        assert!(!text.contains("resign_playthrough"));
         assert!(text.contains("simulations = 1600\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));

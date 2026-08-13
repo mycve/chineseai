@@ -606,8 +606,6 @@ pub struct AzLoopConfig {
     pub draw_score: f32,
     pub opening_positions: Vec<Position>,
     pub opening_fen_game_fraction: f32,
-    pub resign_percentage: f32,
-    pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub record_fens: bool,
 }
@@ -692,8 +690,6 @@ pub struct AzLoopReport {
     pub terminal_rule_draw_mutual_long_chase: usize,
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
-    pub terminal_resign_red: usize,
-    pub terminal_resign_black: usize,
     pub terminal_max_plies: usize,
 }
 

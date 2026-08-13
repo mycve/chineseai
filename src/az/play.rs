@@ -26,8 +26,6 @@ pub struct AzTerminalStats {
     pub rule_draw_mutual_long_chase: usize,
     pub rule_win_red: usize,
     pub rule_win_black: usize,
-    pub resign_red: usize,
-    pub resign_black: usize,
     pub max_plies: usize,
 }
 
@@ -56,8 +54,6 @@ impl AzTerminalStats {
         self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
         self.rule_win_red += other.rule_win_red;
         self.rule_win_black += other.rule_win_black;
-        self.resign_red += other.resign_red;
-        self.resign_black += other.resign_black;
         self.max_plies += other.max_plies;
     }
 }
@@ -341,8 +337,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
-        let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
-
         for ply in 0..config.max_plies {
             plies = ply + 1;
             let legal = {
@@ -414,34 +408,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             } else {
                 entropy_mid_sum += entropy;
                 entropy_mid_count += 1;
-            }
-            if allow_resign && should_resign(search.value_q, config) {
-                let meta = root_search_meta(
-                    &search.candidates,
-                    search.value_q,
-                    config.generation_update,
-                    config.seed ^ game_index as u64,
-                    ply,
-                );
-                let sample = make_training_sample(
-                    &position,
-                    &rule_history,
-                    &search.candidates,
-                    search.value_q,
-                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-                    meta,
-                    search_simulation_count,
-                    1.0,
-                );
-                game_samples.push(sample);
-                result = Some(if position.side_to_move() == Color::Red {
-                    terminal.resign_red += 1;
-                    -1.0
-                } else {
-                    terminal.resign_black += 1;
-                    1.0
-                });
-                break;
             }
             let mv_opt = search.best_move;
             let Some(mv) = mv_opt else {
@@ -757,14 +723,6 @@ fn assign_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) 
         sample.value_wdl = scalar_value_to_wdl_target(outcome);
         sample.value = outcome;
     }
-}
-
-fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
-    if config.resign_percentage <= 0.0 {
-        return false;
-    }
-    let threshold = -(1.0 - config.resign_percentage.clamp(0.0, 100.0) / 100.0);
-    root_q <= threshold
 }
 
 pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_plies: usize) {

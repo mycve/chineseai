@@ -477,7 +477,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_qvs{}_op{}_rs{}_rp{}_rc{}_",
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_qvs{}_op{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_sd{}"
         ),
         config.simulations,
@@ -501,8 +501,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         } else {
             format!("{:016x}", fnv1a64(config.opening_fens_path.as_bytes()))
         },
-        f32_slug(config.resign_percentage),
-        f32_slug(config.resign_playthrough),
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
@@ -740,8 +738,6 @@ fn build_az_loop_config(
         draw_score: config.draw_score,
         opening_positions: opening_positions.to_vec(),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
-        resign_percentage: config.resign_percentage,
-        resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         record_fens: false,
     }
@@ -942,8 +938,6 @@ fn build_async_training_report(
         terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
-        terminal_resign_red: pending.selfplay.terminal.resign_red,
-        terminal_resign_black: pending.selfplay.terminal.resign_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
     }
 }
@@ -2216,8 +2210,6 @@ fn main() {
                                         terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
-                                        terminal_resign_red: 0,
-                                        terminal_resign_black: 0,
                                         terminal_max_plies: 0,
                                         ..AzLoopReport::default()
                                     },
@@ -2289,8 +2281,6 @@ fn main() {
                                         terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
-                                        terminal_resign_red: 0,
-                                        terminal_resign_black: 0,
                                         terminal_max_plies: 0,
                                         ..AzLoopReport::default()
                                     },
@@ -2775,18 +2765,6 @@ fn main() {
                     "terminal/rule_win_black",
                     update,
                     report.terminal_rule_win_black as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/resign_red",
-                    update,
-                    report.terminal_resign_red as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/resign_black",
-                    update,
-                    report.terminal_resign_black as f32,
                 );
                 log_scalar(
                     &mut tb,
