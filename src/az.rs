@@ -39,10 +39,9 @@ use crate::xiangqi::{
 };
 
 pub use alphazero::{
-    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,
-    alphazero_search, alphazero_search_trace_with_rules, alphazero_search_with_rules,
-    alphazero_search_with_rules_controlled, alphazero_search_with_rules_controlled_with_progress,
-    cp_from_q,
+    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep, cp_from_q,
+    gumbel_search, gumbel_search_trace_with_rules, gumbel_search_with_rules,
+    gumbel_search_with_rules_controlled, gumbel_search_with_rules_controlled_with_progress,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
@@ -58,6 +57,10 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
+pub(super) const POLICY_PATTERN_TARGETS: usize = 8;
+pub(super) const POLICY_PATTERN_BUCKETS: usize = 64;
+pub(super) const POLICY_PATTERN_TABLE_SIZE: usize =
+    POLICY_PATTERN_BUCKETS * 7 * POLICY_PATTERN_TARGETS;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 /// 自对弈价值目标：终局结果 与 MCTS 根搜索 Q 的混合权重（root_q 占比）。
 pub const VALUE_TARGET_SEARCH_Q_MIX: f32 = 0.40;
@@ -213,6 +216,7 @@ macro_rules! az_weight_tensors {
         $visit!(moves_left_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
+        $visit!(policy_pattern_table, [POLICY_PATTERN_TABLE_SIZE]);
         $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h]);
         $visit!(
             policy_move_context,
@@ -500,26 +504,38 @@ fn canonical_square_for(perspective: Color, sq: usize) -> usize {
 }
 
 #[inline]
-fn policy_piece_square_logit_from_scores(
+fn policy_move_pattern_from_scores(
     scores: &[f32],
     position: &Position,
     side: Color,
     mv: Move,
-) -> f32 {
+    move_index: usize,
+) -> (f32, usize) {
     let Some(moved) = position.piece_at(mv.from as usize) else {
-        return 0.0;
+        return (0.0, 0);
     };
     let canonical = canonical_move(side, mv);
     let moved_piece_index =
         (if moved.color == side { 0 } else { 7 }) + piece_kind_index(moved.kind);
     let from_feature = moved_piece_index * BOARD_SIZE + canonical.from as usize;
     let to_feature = moved_piece_index * BOARD_SIZE + canonical.to as usize;
-    let captured_score = position.piece_at(mv.to as usize).map_or(0.0, |captured| {
+    let captured = position.piece_at(mv.to as usize);
+    let captured_score = captured.map_or(0.0, |captured| {
         let piece_index =
             (if captured.color == side { 0 } else { 7 }) + piece_kind_index(captured.kind);
         scores[piece_index * BOARD_SIZE + canonical.to as usize]
     });
-    scores[to_feature] - scores[from_feature] - captured_score
+    let target_kind = captured
+        .map(|piece| piece_kind_index(piece.kind))
+        .unwrap_or(POLICY_PATTERN_TARGETS - 1);
+    let pattern_index = ((move_index & (POLICY_PATTERN_BUCKETS - 1)) * 7
+        + piece_kind_index(moved.kind))
+        * POLICY_PATTERN_TARGETS
+        + target_kind;
+    (
+        scores[to_feature] - scores[from_feature] - captured_score,
+        pattern_index,
+    )
 }
 
 #[derive(Debug)]
@@ -542,6 +558,7 @@ pub struct AzNnue {
     pub moves_left_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
+    pub policy_pattern_table: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
     pub policy_move_context: Vec<f32>,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
@@ -569,6 +586,7 @@ impl Clone for AzNnue {
             moves_left_bias: self.moves_left_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
+            policy_pattern_table: self.policy_pattern_table.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
             policy_move_context: self.policy_move_context.clone(),
             gpu_trainer: None,
@@ -584,33 +602,9 @@ pub struct AzLoopConfig {
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
-    pub opening_exploration_plies: usize,
-    pub temperature_start: f32,
-    pub temperature_endgame: f32,
-    pub temperature_decay_delay_plies: usize,
-    pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub opening_root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
+    pub gumbel_scale: f32,
+    pub max_considered_actions: usize,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
-    pub policy_softmax_temp: f32,
-    pub opening_policy_softmax_temp: f32,
     pub value_target_search_q_mix: f32,
     pub opening_positions: Vec<Position>,
     pub opening_fen_game_fraction: f32,
@@ -1015,6 +1009,7 @@ impl AzNnue {
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
+        let policy_pattern_table = vec![0.0; POLICY_PATTERN_TABLE_SIZE];
         // One factor starts random and the other at zero: the new branch is
         // exactly policy-neutral at initialization, while gradients can update
         // move embeddings on the first optimization step.
@@ -1041,6 +1036,7 @@ impl AzNnue {
             moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
+            policy_pattern_table,
             policy_context_hidden,
             policy_move_context,
             gpu_trainer: None,
@@ -1109,6 +1105,7 @@ impl AzNnue {
                 &tensors,
                 "policy_consequence_output",
             )?,
+            policy_pattern_table: load_candle_f32_tensor(&tensors, "policy_pattern_table")?,
             policy_context_hidden: load_candle_f32_tensor(&tensors, "policy_context_hidden")?,
             policy_move_context: load_candle_f32_tensor(&tensors, "policy_move_context")?,
             gpu_trainer: None,
@@ -1276,13 +1273,16 @@ impl AzNnue {
                     );
                     let move_index = dense as usize;
                     let context_start = move_index * POLICY_MOVE_CONTEXT_SIZE;
+                    let (consequence, pattern_index) = policy_move_pattern_from_scores(
+                        &scratch.policy_piece_square_scores,
+                        position,
+                        side,
+                        *mv,
+                        move_index,
+                    );
                     scratch.logits[index] = self.policy_move_bias[move_index]
-                        + policy_piece_square_logit_from_scores(
-                            &scratch.policy_piece_square_scores,
-                            position,
-                            side,
-                            *mv,
-                        )
+                        + self.policy_pattern_table[pattern_index]
+                        + consequence
                         + dot_product(
                             &scratch.policy_context,
                             &self.policy_move_context
@@ -2715,6 +2715,7 @@ mod tests {
             model.policy_consequence_output,
             loaded.policy_consequence_output
         );
+        assert_eq!(model.policy_pattern_table, loaded.policy_pattern_table);
         assert_eq!(model.policy_context_hidden, loaded.policy_context_hidden);
         assert_eq!(model.policy_move_context, loaded.policy_move_context);
     }

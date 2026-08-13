@@ -9,43 +9,23 @@ use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64, rule_context_features,
 };
 
-const DEFAULT_CPUCT: f32 = 1.5;
-const DEFAULT_CPUCT_BASE: f32 = 19652.0;
-const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
 const NO_CHILD: u32 = u32::MAX;
 const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
-const PRIOR_INDEPENDENT_EXPLORATION: f32 = 0.10;
-const CHECK_EXPLORATION_MULTIPLIER: f32 = 5.0;
-const CAPTURE_EXPLORATION_MULTIPLIER: f32 = 3.0;
+const DEFAULT_GUMBEL_SCALE: f32 = 1.0;
+const DEFAULT_MAX_CONSIDERED_ACTIONS: usize = 16;
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
     pub seed: u64,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
+    pub gumbel_scale: f32,
+    pub max_considered_actions: usize,
     /// Maximum search depth in plies below root. 0 keeps the default:
     /// max_depth = num_simulations.
     pub max_depth: usize,
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    /// Divisor applied to policy logits before softmax. Values above 1 flatten priors.
-    pub policy_softmax_temp: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
     pub value_scale: f32,
 }
 
@@ -54,25 +34,10 @@ impl Default for AzSearchLimits {
         Self {
             simulations: 10_000,
             seed: 0,
-            cpuct: DEFAULT_CPUCT,
-            cpuct_at_root: DEFAULT_CPUCT,
-            cpuct_base: DEFAULT_CPUCT_BASE,
-            cpuct_factor: DEFAULT_CPUCT_FACTOR,
-            cpuct_base_at_root: DEFAULT_CPUCT_BASE,
-            cpuct_factor_at_root: DEFAULT_CPUCT_FACTOR,
+            gumbel_scale: DEFAULT_GUMBEL_SCALE,
+            max_considered_actions: DEFAULT_MAX_CONSIDERED_ACTIONS,
             max_depth: 0,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            fpu_value: 0.23,
-            fpu_value_at_root: 1.0,
-            policy_softmax_temp: 1.0,
             draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.002,
-            moves_left_threshold: 0.6,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.15,
-            moves_left_quadratic_factor: 0.85,
             value_scale: 1.0,
         }
     }
@@ -138,17 +103,17 @@ impl AzSearchControl {
     }
 }
 
-pub fn alphazero_search_with_rules(
+pub fn gumbel_search_with_rules(
     position: &Position,
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    alphazero_search_with_rules_controlled(position, rule_history, root_moves, model, limits, None)
+    gumbel_search_with_rules_controlled(position, rule_history, root_moves, model, limits, None)
 }
 
-pub fn alphazero_search_trace_with_rules(
+pub fn gumbel_search_trace_with_rules(
     position: &Position,
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
@@ -165,15 +130,16 @@ pub fn alphazero_search_trace_with_rules(
     );
     let root = tree.root;
     tree.expand(root);
-    for _ in 0..limits.simulations {
-        tree.simulate(root, 0);
+    tree.init_gumbel_root(limits.simulations);
+    for simulation in 0..limits.simulations {
+        tree.simulate_root(simulation);
     }
     let result = tree.search_result(limits.simulations);
     let trace = tree.trace_root_move(trace_move);
     (result, trace)
 }
 
-pub fn alphazero_search_with_rules_controlled(
+pub fn gumbel_search_with_rules_controlled(
     position: &Position,
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
@@ -181,7 +147,7 @@ pub fn alphazero_search_with_rules_controlled(
     limits: AzSearchLimits,
     control: Option<&AzSearchControl>,
 ) -> AzSearchResult {
-    alphazero_search_with_rules_controlled_with_progress(
+    gumbel_search_with_rules_controlled_with_progress(
         position,
         rule_history,
         root_moves,
@@ -192,7 +158,7 @@ pub fn alphazero_search_with_rules_controlled(
     )
 }
 
-pub fn alphazero_search_with_rules_controlled_with_progress(
+pub fn gumbel_search_with_rules_controlled_with_progress(
     position: &Position,
     rule_history: Option<Vec<RuleHistoryEntry>>,
     root_moves: Option<Vec<Move>>,
@@ -201,7 +167,7 @@ pub fn alphazero_search_with_rules_controlled_with_progress(
     control: Option<&AzSearchControl>,
     mut progress: Option<&mut dyn FnMut(&AzSearchResult)>,
 ) -> AzSearchResult {
-    crate::scope_profile!("az.alphazero_search");
+    crate::scope_profile!("az.gumbel_search");
     let mut tree = AzTree::new(
         position.clone(),
         rule_history.unwrap_or_else(|| position.initial_rule_history()),
@@ -214,6 +180,7 @@ pub fn alphazero_search_with_rules_controlled_with_progress(
         crate::scope_profile!("az.search.root_expand");
         tree.expand(root);
     }
+    tree.init_gumbel_root(limits.simulations);
     if tree.nodes[root].children_len == 0 {
         let value_q = wdl_utility(tree.nodes[root].value_wdl, tree.draw_score);
         return AzSearchResult {
@@ -234,11 +201,11 @@ pub fn alphazero_search_with_rules_controlled_with_progress(
     let mut last_progress = Instant::now();
     {
         crate::scope_profile!("az.search.simulations");
-        for _ in 0..limits.simulations {
+        for simulation in 0..limits.simulations {
             if control.is_some_and(AzSearchControl::should_stop) {
                 break;
             }
-            tree.simulate(root, 0);
+            tree.simulate_root(simulation);
             used += 1;
             if used % SEARCH_PROGRESS_POLL_SIMULATIONS == 0
                 && progress.is_some()
@@ -255,12 +222,12 @@ pub fn alphazero_search_with_rules_controlled_with_progress(
     tree.search_result(used)
 }
 
-pub fn alphazero_search(
+pub fn gumbel_search(
     position: &Position,
     model: &AzNnue,
     limits: AzSearchLimits,
 ) -> AzSearchResult {
-    alphazero_search_with_rules(position, None, None, model, limits)
+    gumbel_search_with_rules(position, None, None, model, limits)
 }
 
 pub(super) struct AzSearchWorkspace {
@@ -285,7 +252,7 @@ impl AzSearchWorkspace {
     }
 }
 
-pub(super) fn alphazero_search_with_rules_reusing(
+pub(super) fn gumbel_search_with_rules_reusing(
     position: &Position,
     rule_history: &[RuleHistoryEntry],
     root_moves: Vec<Move>,
@@ -293,7 +260,7 @@ pub(super) fn alphazero_search_with_rules_reusing(
     limits: AzSearchLimits,
     workspace: &mut AzSearchWorkspace,
 ) -> AzSearchResult {
-    crate::scope_profile!("az.alphazero_search");
+    crate::scope_profile!("az.gumbel_search");
     let mut tree = AzTree::new_reusing(
         position.clone(),
         rule_history,
@@ -307,12 +274,13 @@ pub(super) fn alphazero_search_with_rules_reusing(
         crate::scope_profile!("az.search.root_expand");
         tree.expand(root);
     }
+    tree.init_gumbel_root(limits.simulations);
     let used = if tree.nodes[root].children_len == 0 {
         0
     } else {
         crate::scope_profile!("az.search.simulations");
-        for _ in 0..limits.simulations {
-            tree.simulate(root, 0);
+        for simulation in 0..limits.simulations {
+            tree.simulate_root(simulation);
         }
         limits.simulations
     };
@@ -332,26 +300,13 @@ struct AzTree<'a> {
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
     root_raw_priors: Vec<f32>,
+    root_gumbel: Vec<f32>,
+    root_considered_visits: Vec<u32>,
     root: usize,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    cpuct_base: f32,
-    cpuct_factor: f32,
-    cpuct_base_at_root: f32,
-    cpuct_factor_at_root: f32,
-    root_dirichlet_alpha: f32,
-    root_exploration_fraction: f32,
-    root_noise_seed: u64,
-    fpu_value: f32,
-    fpu_value_at_root: f32,
-    policy_softmax_temp: f32,
+    gumbel_scale: f32,
+    max_considered_actions: usize,
+    search_seed: u64,
     draw_score: f32,
-    moves_left_max_effect: f32,
-    moves_left_slope: f32,
-    moves_left_threshold: f32,
-    moves_left_constant_factor: f32,
-    moves_left_scaled_factor: f32,
-    moves_left_quadratic_factor: f32,
     value_scale: f32,
     max_depth: usize,
     search_depth_sum: usize,
@@ -382,7 +337,6 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     prior: f32,
-    is_capture: bool,
     gives_check: bool,
     visits: u32,
     value_wdl_sum: [f32; 3],
@@ -631,44 +585,13 @@ impl<'a> AzTree<'a> {
             model,
             root_moves,
             root_raw_priors,
+            root_gumbel: Vec::new(),
+            root_considered_visits: Vec::new(),
             root: 0,
-            cpuct: if limits.cpuct > 0.0 {
-                limits.cpuct
-            } else {
-                DEFAULT_CPUCT
-            },
-            cpuct_at_root: if limits.cpuct_at_root > 0.0 {
-                limits.cpuct_at_root
-            } else if limits.cpuct > 0.0 {
-                limits.cpuct
-            } else {
-                DEFAULT_CPUCT
-            },
-            cpuct_base: limits.cpuct_base.max(1.0),
-            cpuct_factor: limits.cpuct_factor.max(0.0),
-            cpuct_base_at_root: if limits.cpuct_base_at_root > 0.0 {
-                limits.cpuct_base_at_root
-            } else {
-                limits.cpuct_base.max(1.0)
-            },
-            cpuct_factor_at_root: if limits.cpuct_factor_at_root >= 0.0 {
-                limits.cpuct_factor_at_root
-            } else {
-                limits.cpuct_factor.max(0.0)
-            },
-            root_dirichlet_alpha: limits.root_dirichlet_alpha.max(0.0),
-            root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
-            root_noise_seed: limits.seed,
-            fpu_value: limits.fpu_value.max(0.0),
-            fpu_value_at_root: limits.fpu_value_at_root.clamp(-1.0, 1.0),
-            policy_softmax_temp: limits.policy_softmax_temp.max(1.0e-3),
+            gumbel_scale: limits.gumbel_scale.max(0.0),
+            max_considered_actions: limits.max_considered_actions.max(1),
+            search_seed: limits.seed,
             draw_score: limits.draw_score.clamp(-1.0, 1.0),
-            moves_left_max_effect: limits.moves_left_max_effect.max(0.0),
-            moves_left_slope: limits.moves_left_slope.max(0.0),
-            moves_left_threshold: limits.moves_left_threshold.clamp(0.0, 1.0),
-            moves_left_constant_factor: limits.moves_left_constant_factor,
-            moves_left_scaled_factor: limits.moves_left_scaled_factor,
-            moves_left_quadratic_factor: limits.moves_left_quadratic_factor,
             value_scale: limits.value_scale.clamp(0.0, 1.0),
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
@@ -802,27 +725,14 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.softmax");
             softmax_into(
                 &self.eval_scratch.logits[..moves.len()],
-                self.policy_softmax_temp,
                 &mut self.eval_scratch.priors,
             )
         };
         if node_index == self.root {
             self.root_raw_priors.clone_from(priors);
         }
-        if node_index == self.root
-            && self.root_dirichlet_alpha > 0.0
-            && self.root_exploration_fraction > 0.0
-        {
-            apply_root_dirichlet_noise(
-                priors,
-                self.root_dirichlet_alpha,
-                self.root_exploration_fraction,
-                self.root_noise_seed,
-            );
-        }
         {
             crate::scope_profile!("az.search.children_build");
-            let position = &self.nodes[node_index].position;
             let gives_checks = &self.eval_scratch.policy_gives_check;
             let priors = &mut self.eval_scratch.priors;
             let offset = self.children.len();
@@ -834,7 +744,6 @@ impl<'a> AzTree<'a> {
                     .map(|((mv, prior), gives_check)| AzChild {
                         mv,
                         prior,
-                        is_capture: position.piece_at(mv.to as usize).is_some(),
                         gives_check: gives_check != 0.0,
                         visits: 0,
                         value_wdl_sum: [0.0; 3],
@@ -1110,167 +1019,171 @@ impl<'a> AzTree<'a> {
         }
     }
 
+    fn init_gumbel_root(&mut self, simulations: usize) {
+        let action_count = self.node_children(self.root).len();
+        let considered = action_count.min(self.max_considered_actions).max(1);
+        let mut rng = SplitMix64::new(self.search_seed);
+        self.root_gumbel.clear();
+        self.root_gumbel.extend((0..action_count).map(|_| {
+            let uniform = rng.unit_f32().clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+            -(-uniform.ln()).ln() * self.gumbel_scale
+        }));
+        self.root_considered_visits = sequential_halving_visits(considered, simulations);
+    }
+
+    fn simulate_root(&mut self, simulation: usize) -> AzEvalOutput {
+        let child = self.select_root_child(simulation);
+        self.simulate_child(self.root, child, 1)
+    }
+
+    fn select_root_child(&self, simulation: usize) -> usize {
+        let considered_visit = self
+            .root_considered_visits
+            .get(simulation)
+            .copied()
+            .unwrap_or(0);
+        let completed_q = self.completed_qvalues(self.root);
+        self.node_children(self.root)
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.visits == considered_visit)
+            .max_by(|(left_index, left), (right_index, right)| {
+                let left_score = self.root_gumbel[*left_index]
+                    + left.prior.max(f32::MIN_POSITIVE).ln()
+                    + completed_q[*left_index];
+                let right_score = self.root_gumbel[*right_index]
+                    + right.prior.max(f32::MIN_POSITIVE).ln()
+                    + completed_q[*right_index];
+                left_score.total_cmp(&right_score)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| self.best_root_child(self.root).unwrap_or(0))
+    }
+
     fn select_child(&self, node_index: usize) -> usize {
-        let node = &self.nodes[node_index];
         let children = self.node_children(node_index);
-        let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
-        let is_root = node_index == self.root;
-        let draw_score = self.node_draw_score(node_index);
-        let fpu_value = if is_root {
-            self.fpu_value_at_root
-        } else {
-            alphazero_fpu_value_reduction(node, children, self.fpu_value, draw_score)
-        };
-        let cpuct = self.compute_cpuct(node.visits, is_root);
-        let mut best: Option<(usize, f32, f32)> = None;
-        for (index, child) in children.iter().enumerate() {
-            let score = self.child_score(
-                node,
-                child,
-                draw_score,
-                fpu_value,
-                parent_visits_sqrt,
-                cpuct,
-            );
-            if best.is_none_or(|(_, best_prior, best_score)| {
-                score.total_cmp(&best_score).is_gt()
-                    || (score.total_cmp(&best_score).is_eq()
-                        && child.prior.total_cmp(&best_prior).is_gt())
-            }) {
-                best = Some((index, child.prior, score));
-            }
-        }
-        best.map(|(index, _, _)| index).unwrap_or(0)
+        let improved = self.improved_policy(node_index);
+        let denominator = 1.0 + children.iter().map(|child| child.visits).sum::<u32>() as f32;
+        improved
+            .iter()
+            .zip(children)
+            .enumerate()
+            .max_by(
+                |(_, (left_probability, left)), (_, (right_probability, right))| {
+                    let left_score = **left_probability - left.visits as f32 / denominator;
+                    let right_score = **right_probability - right.visits as f32 / denominator;
+                    left_score.total_cmp(&right_score)
+                },
+            )
+            .map(|(index, _)| index)
+            .unwrap_or(0)
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
-        let draw_score = self.node_draw_score(node_index);
         let children = self.node_children(node_index);
-        let first = children.first()?;
-        let mut best_index = 0;
-        let mut best_visits = first.visits;
-        let mut best_q = first.q(draw_score);
-        let mut best_prior = first.prior;
-        for (index, child) in children.iter().enumerate().skip(1) {
-            let q = child.q(draw_score);
-            if child.visits > best_visits
-                || (child.visits == best_visits
-                    && (q.total_cmp(&best_q).is_gt()
-                        || (q.total_cmp(&best_q).is_eq()
-                            && child.prior.total_cmp(&best_prior).is_gt())))
-            {
-                best_index = index;
-                best_visits = child.visits;
-                best_q = q;
-                best_prior = child.prior;
-            }
-        }
-        Some(best_index)
-    }
-
-    fn compute_cpuct(&self, visits: u32, is_root: bool) -> f32 {
-        let init = if is_root {
-            self.cpuct_at_root
-        } else {
-            self.cpuct
-        };
-        let factor = if is_root {
-            self.cpuct_factor_at_root
-        } else {
-            self.cpuct_factor
-        };
-        if factor <= 0.0 {
-            return init;
-        }
-        let base = if is_root {
-            self.cpuct_base_at_root
-        } else {
-            self.cpuct_base
-        }
-        .max(1.0);
-        init + factor * ((visits as f32 + base) / base).ln()
-    }
-
-    fn child_score(
-        &self,
-        parent: &AzNode,
-        child: &AzChild,
-        draw_score: f32,
-        fpu_value: f32,
-        parent_visits_sqrt: f32,
-        cpuct: f32,
-    ) -> f32 {
-        let q = if child.visits > 0 {
-            child.q(draw_score)
-        } else {
-            fpu_value
-        };
-        let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        let tactical_exploration = if child.gives_check {
-            CHECK_EXPLORATION_MULTIPLIER
-        } else if child.is_capture {
-            CAPTURE_EXPLORATION_MULTIPLIER
-        } else {
-            1.0
-        };
-        let independent_u = PRIOR_INDEPENDENT_EXPLORATION
-            * tactical_exploration
-            * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt();
-        q + u + independent_u + self.moves_left_utility(parent, child, q)
-    }
-
-    fn moves_left_utility(&self, parent: &AzNode, child: &AzChild, q: f32) -> f32 {
-        if self.moves_left_slope <= 0.0 || self.moves_left_max_effect <= 0.0 {
-            return 0.0;
-        }
-        if q.abs() <= self.moves_left_threshold {
-            return 0.0;
-        }
-        let child_m = if child.visits == 0 {
-            parent.moves_left
-        } else {
-            child.moves_left()
-        };
-        let mut effect = self.moves_left_slope * (child_m - parent.moves_left);
-        effect = effect.clamp(-self.moves_left_max_effect, self.moves_left_max_effect);
-        effect *= -q.signum();
-
-        let q_abs = if self.moves_left_threshold > 0.0 && self.moves_left_threshold < 1.0 {
-            ((q.abs() - self.moves_left_threshold) / (1.0 - self.moves_left_threshold))
-                .clamp(0.0, 1.0)
-        } else {
-            q.abs()
-        };
-        let weight = self.moves_left_constant_factor
-            + self.moves_left_scaled_factor * q_abs
-            + self.moves_left_quadratic_factor * q_abs * q_abs;
-        effect * weight
+        let max_visits = children.iter().map(|child| child.visits).max()?;
+        let completed_q = self.completed_qvalues(node_index);
+        children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.visits == max_visits)
+            .max_by(|(left_index, left), (right_index, right)| {
+                let left_score = self.root_gumbel.get(*left_index).copied().unwrap_or(0.0)
+                    + left.prior.max(f32::MIN_POSITIVE).ln()
+                    + completed_q[*left_index];
+                let right_score = self.root_gumbel.get(*right_index).copied().unwrap_or(0.0)
+                    + right.prior.max(f32::MIN_POSITIVE).ln()
+                    + completed_q[*right_index];
+                left_score.total_cmp(&right_score)
+            })
+            .map(|(index, _)| index)
     }
 
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
-        let children = self.node_children(node_index);
-        let total_visits = children
-            .iter()
-            .map(|child| child.visits as f32)
-            .sum::<f32>()
-            .max(1.0);
-        if children.iter().any(|child| child.visits > 0) {
-            return children
-                .iter()
-                .map(|child| child.visits as f32 / total_visits)
-                .collect();
-        }
-
-        let total_prior = children
-            .iter()
-            .map(|child| child.prior)
-            .sum::<f32>()
-            .max(1e-12);
-        children
-            .iter()
-            .map(|child| child.prior / total_prior)
-            .collect()
+        self.improved_policy(node_index)
     }
+
+    fn improved_policy(&self, node_index: usize) -> Vec<f32> {
+        let children = self.node_children(node_index);
+        let completed_q = self.completed_qvalues(node_index);
+        let max_logit = children
+            .iter()
+            .zip(&completed_q)
+            .map(|(child, &q)| child.prior.max(f32::MIN_POSITIVE).ln() + q)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut probabilities = children
+            .iter()
+            .zip(completed_q)
+            .map(|(child, q)| (child.prior.max(f32::MIN_POSITIVE).ln() + q - max_logit).exp())
+            .collect::<Vec<_>>();
+        let total = probabilities.iter().sum::<f32>().max(f32::MIN_POSITIVE);
+        probabilities.iter_mut().for_each(|value| *value /= total);
+        probabilities
+    }
+
+    fn completed_qvalues(&self, node_index: usize) -> Vec<f32> {
+        let children = self.node_children(node_index);
+        let draw_score = self.node_draw_score(node_index);
+        let raw_value = wdl_utility(self.nodes[node_index].value_wdl, draw_score);
+        let visited_prior = children
+            .iter()
+            .filter(|child| child.visits > 0)
+            .map(|child| child.prior.max(f32::MIN_POSITIVE))
+            .sum::<f32>();
+        let weighted_q = if visited_prior > 0.0 {
+            children
+                .iter()
+                .filter(|child| child.visits > 0)
+                .map(|child| child.prior.max(f32::MIN_POSITIVE) * child.q(draw_score))
+                .sum::<f32>()
+                / visited_prior
+        } else {
+            raw_value
+        };
+        let total_visits = children.iter().map(|child| child.visits).sum::<u32>() as f32;
+        let mixed_value = (raw_value + total_visits * weighted_q) / (total_visits + 1.0);
+        let mut values = children
+            .iter()
+            .map(|child| {
+                if child.visits > 0 {
+                    child.q(draw_score)
+                } else {
+                    mixed_value
+                }
+            })
+            .collect::<Vec<_>>();
+        let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let range = (max - min).max(1.0e-8);
+        let max_visits = children.iter().map(|child| child.visits).max().unwrap_or(0) as f32;
+        let scale = (50.0 + max_visits) * 0.1;
+        values
+            .iter_mut()
+            .for_each(|value| *value = (*value - min) / range * scale);
+        values
+    }
+}
+
+fn sequential_halving_visits(max_considered: usize, simulations: usize) -> Vec<u32> {
+    if max_considered <= 1 {
+        return (0..simulations as u32).collect();
+    }
+    let rounds = max_considered.next_power_of_two().trailing_zeros() as usize;
+    let mut sequence = Vec::with_capacity(simulations);
+    let mut visits = vec![0u32; max_considered];
+    let mut considered = max_considered;
+    while sequence.len() < simulations {
+        let extra = (simulations / (rounds.max(1) * considered)).max(1);
+        for _ in 0..extra {
+            sequence.extend_from_slice(&visits[..considered]);
+            visits[..considered]
+                .iter_mut()
+                .for_each(|visit| *visit += 1);
+        }
+        considered = (considered / 2).max(2);
+    }
+    sequence.truncate(simulations);
+    sequence
 }
 
 fn wdl_utility(wdl: [f32; 3], draw_score: f32) -> f32 {
@@ -1282,30 +1195,6 @@ fn wdl_sum_utility(wdl_sum: [f32; 3], visits: u32, draw_score: f32) -> f32 {
         return 0.0;
     }
     wdl_utility(wdl_sum.map(|part| part / visits as f32), draw_score)
-}
-
-fn alphazero_fpu_value_reduction(
-    node: &AzNode,
-    children: &[AzChild],
-    reduction: f32,
-    draw_score: f32,
-) -> f32 {
-    let parent_q = if node.visits > 0 {
-        wdl_sum_utility(node.value_wdl_sum, node.visits, draw_score)
-    } else {
-        wdl_utility(node.value_wdl, draw_score)
-    };
-    if reduction <= 0.0 {
-        return parent_q;
-    }
-
-    let visited_prior = children
-        .iter()
-        .filter(|child| child.visits > 0)
-        .map(|child| child.prior.max(0.0))
-        .sum::<f32>()
-        .clamp(0.0, 1.0);
-    (parent_q - reduction * visited_prior.sqrt()).clamp(-1.0, 1.0)
 }
 
 fn add_wdl(sum: &mut [f32; 3], wdl: [f32; 3]) {
@@ -1367,11 +1256,7 @@ fn terminal_value(position: &Position, rule_history: &[RuleHistoryEntry]) -> Opt
     None
 }
 
-fn softmax_into<'a>(
-    logits: &[f32],
-    temperature: f32,
-    output: &'a mut Vec<f32>,
-) -> &'a mut Vec<f32> {
+fn softmax_into<'a>(logits: &[f32], output: &'a mut Vec<f32>) -> &'a mut Vec<f32> {
     output.clear();
     if logits.is_empty() {
         return output;
@@ -1379,9 +1264,8 @@ fn softmax_into<'a>(
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     output.reserve(logits.len());
-    let inverse_temperature = temperature.max(1.0e-3).recip();
     for &logit in logits {
-        let value = ((logit - max_logit) * inverse_temperature).exp();
+        let value = (logit - max_logit).exp();
         output.push(value);
         sum += value;
     }
@@ -1392,84 +1276,51 @@ fn softmax_into<'a>(
     output
 }
 
-fn apply_root_dirichlet_noise(
-    priors: &mut [f32],
-    alpha: f32,
-    exploration_fraction: f32,
-    seed: u64,
-) {
-    let noise = sample_dirichlet(priors.len(), alpha, seed);
-    let keep = 1.0 - exploration_fraction;
-    for (prior, noise_value) in priors.iter_mut().zip(noise) {
-        *prior = keep * *prior + exploration_fraction * noise_value;
-    }
-}
-
-fn sample_dirichlet(dim: usize, alpha: f32, seed: u64) -> Vec<f32> {
-    let mut rng = SplitMix64::new(seed ^ 0xD1A1_71C7_0000_0000u64 ^ dim as u64);
-    let mut samples = Vec::with_capacity(dim);
-    let mut sum = 0.0f32;
-    for index in 0..dim {
-        let value = sample_gamma(alpha.max(1e-3), &mut rng, seed ^ index as u64).max(1e-12);
-        samples.push(value);
-        sum += value;
-    }
-    let inv_sum = sum.max(1e-12).recip();
-    for value in &mut samples {
-        *value *= inv_sum;
-    }
-    samples
-}
-
-fn sample_gamma(alpha: f32, rng: &mut SplitMix64, salt: u64) -> f32 {
-    if alpha < 1.0 {
-        let u = rng.unit_f32().max(1e-12);
-        return sample_gamma(alpha + 1.0, rng, salt) * u.powf(1.0 / alpha);
-    }
-
-    let d = alpha - 1.0 / 3.0;
-    let c = (1.0 / (9.0 * d)).sqrt();
-    loop {
-        let x = sample_standard_normal(rng, salt);
-        let v = 1.0 + c * x;
-        if v <= 0.0 {
-            continue;
-        }
-        let v3 = v * v * v;
-        let u = rng.unit_f32().max(1e-12);
-        if u < 1.0 - 0.0331 * x * x * x * x {
-            return d * v3;
-        }
-        if u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
-            return d * v3;
-        }
-    }
-}
-
-fn sample_standard_normal(rng: &mut SplitMix64, salt: u64) -> f32 {
-    let u1 = rng.unit_f32().max(1e-12);
-    let mut aux = SplitMix64::new(rng.next_u64() ^ salt.rotate_left(17));
-    let u2 = aux.unit_f32();
-    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
 
     #[test]
-    fn policy_softmax_temperature_flattens_network_priors() {
+    fn policy_softmax_is_normalized() {
         let logits = [2.0, 0.0];
-        let mut normal = Vec::new();
-        let mut softened = Vec::new();
+        let mut priors = Vec::new();
 
-        softmax_into(&logits, 1.0, &mut normal);
-        softmax_into(&logits, 2.0, &mut softened);
+        softmax_into(&logits, &mut priors);
 
-        assert!(softened[0] < normal[0]);
-        assert!(softened[1] > normal[1]);
-        assert!((softened.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(priors[0] > priors[1]);
+        assert!((priors.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sequential_halving_allocates_budget_by_round() {
+        assert_eq!(
+            sequential_halving_visits(4, 16),
+            vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+        );
+    }
+
+    #[test]
+    fn gumbel_root_respects_max_considered_actions() {
+        let result = gumbel_search(
+            &Position::startpos(),
+            &AzNnue::random(4, 101),
+            AzSearchLimits {
+                simulations: 64,
+                seed: 103,
+                max_considered_actions: 4,
+                ..AzSearchLimits::default()
+            },
+        );
+
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.visits > 0)
+                .count(),
+            4
+        );
     }
 
     #[test]
@@ -1481,7 +1332,7 @@ mod tests {
         checked.make_move(checking_move);
         assert_eq!(checked.legal_moves(), [Move::from_uci("c0a2").unwrap()]);
 
-        let result = alphazero_search_with_rules(
+        let result = gumbel_search_with_rules(
             &position,
             None,
             Some(vec![checking_move]),
@@ -1509,7 +1360,7 @@ mod tests {
         assert!(checked.in_check(checked.side_to_move()));
         assert!(checked.legal_moves().len() > 1);
 
-        let result = alphazero_search_with_rules(
+        let result = gumbel_search_with_rules(
             &position,
             None,
             Some(vec![checking_move]),
@@ -1531,7 +1382,6 @@ mod tests {
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
-            is_capture: false,
             gives_check: false,
             visits: 0,
             value_wdl_sum: [0.0; 3],
@@ -1547,7 +1397,7 @@ mod tests {
     fn stopped_search_returns_root_result_without_running_simulations() {
         let stop = Arc::new(AtomicBool::new(true));
         let control = AzSearchControl::new(stop, None);
-        let result = alphazero_search_with_rules_controlled(
+        let result = gumbel_search_with_rules_controlled(
             &Position::startpos(),
             None,
             None,
@@ -1568,7 +1418,6 @@ mod tests {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
-            is_capture: false,
             gives_check: false,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
@@ -1605,21 +1454,15 @@ mod tests {
     }
 
     #[test]
-    fn alphazero_search_populates_visit_distribution() {
+    fn gumbel_search_populates_visit_distribution() {
         let model = AzNnue::random(4, 7);
-        let result = alphazero_search(
+        let result = gumbel_search(
             &Position::startpos(),
             &model,
             AzSearchLimits {
                 simulations: 128,
                 seed: 11,
-                cpuct: 1.5,
-                cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1651,11 +1494,10 @@ mod tests {
         let limits = AzSearchLimits {
             simulations: 128,
             seed: 91,
-            root_dirichlet_alpha: 0.12,
-            root_exploration_fraction: 0.1,
+            gumbel_scale: 1.0,
             ..AzSearchLimits::default()
         };
-        let expected = alphazero_search_with_rules(
+        let expected = gumbel_search_with_rules(
             &position,
             Some(history.clone()),
             Some(legal.clone()),
@@ -1663,7 +1505,7 @@ mod tests {
             limits,
         );
         let mut workspace = AzSearchWorkspace::new(&model);
-        let actual = alphazero_search_with_rules_reusing(
+        let actual = gumbel_search_with_rules_reusing(
             &position,
             &history,
             legal,
@@ -1692,19 +1534,13 @@ mod tests {
     #[test]
     fn search_reports_leaf_depth_and_depth_cutoffs() {
         let model = AzNnue::random(4, 7);
-        let result = alphazero_search(
+        let result = gumbel_search(
             &Position::startpos(),
             &model,
             AzSearchLimits {
                 simulations: 32,
                 seed: 13,
-                cpuct: 1.5,
-                cpuct_at_root: 1.5,
                 max_depth: 1,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1715,55 +1551,6 @@ mod tests {
         assert_eq!(result.search_depth_limit, 1);
         assert!((result.search_depth_avg - 1.0).abs() < 1e-6);
         assert_eq!(result.search_depth_cutoffs, 32);
-    }
-
-    #[test]
-    fn dirichlet_noise_changes_root_prior_distribution() {
-        let position = Position::startpos();
-        let model = AzNnue::random(4, 7);
-        let plain = alphazero_search(
-            &position,
-            &model,
-            AzSearchLimits {
-                simulations: 1,
-                seed: 19,
-                cpuct: 1.5,
-                cpuct_at_root: 1.5,
-                max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
-                value_scale: 1.0,
-                ..AzSearchLimits::default()
-            },
-        );
-        let noisy = alphazero_search(
-            &position,
-            &model,
-            AzSearchLimits {
-                simulations: 1,
-                seed: 19,
-                cpuct: 1.5,
-                cpuct_at_root: 1.5,
-                max_depth: 0,
-                root_dirichlet_alpha: 0.3,
-                root_exploration_fraction: 0.25,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
-                value_scale: 1.0,
-                ..AzSearchLimits::default()
-            },
-        );
-
-        assert_eq!(plain.candidates.len(), noisy.candidates.len());
-        assert!(
-            plain
-                .candidates
-                .iter()
-                .zip(&noisy.candidates)
-                .any(|(left, right)| (left.prior - right.prior).abs() > 1e-6)
-        );
     }
 
     #[test]
@@ -1781,25 +1568,17 @@ mod tests {
             AzSearchLimits {
                 simulations: 1,
                 seed: 31,
-                cpuct: 1.5,
-                cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
         );
-        tree.cpuct_at_root = 0.0;
         tree.set_node_children(
             tree.root,
             vec![
                 AzChild {
                     mv: legal[0],
                     prior: 0.10,
-                    is_capture: false,
                     gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
@@ -1809,7 +1588,6 @@ mod tests {
                 AzChild {
                     mv: legal[1],
                     prior: 0.90,
-                    is_capture: false,
                     gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
@@ -1823,57 +1601,13 @@ mod tests {
     }
 
     #[test]
-    fn tactical_exploration_prefers_check_then_capture() {
-        let model = AzNnue::random(4, 17);
-        let position = Position::startpos();
-        let legal = position.legal_moves();
-        let tree = AzTree::new(
-            position.clone(),
-            position.initial_rule_history(),
-            None,
-            &model,
-            AzSearchLimits::default(),
-        );
-        let parent = AzNode {
-            position,
-            accumulator_offset: 0,
-            parent: NO_CHILD,
-            incoming_move: None,
-            rule_entry: None,
-            children_offset: 0,
-            children_len: 0,
-            visits: 64,
-            value_wdl_sum: [0.0; 3],
-            value: 0.0,
-            value_wdl: [0.0, 1.0, 0.0],
-            moves_left: 0.0,
-            expanded: true,
-        };
-        let child = |is_capture, gives_check| AzChild {
-            mv: legal[0],
-            prior: 0.0,
-            is_capture,
-            gives_check,
-            visits: 1,
-            value_wdl_sum: [0.0, 1.0, 0.0],
-            moves_left_sum: 0.0,
-            child: NO_CHILD,
-        };
-        let score = |candidate: &AzChild| tree.child_score(&parent, candidate, 0.0, 0.0, 8.0, 0.0);
-        let quiet = score(&child(false, false));
-        let capture = score(&child(true, false));
-        let check = score(&child(false, true));
-        assert!(check > capture && capture > quiet);
-    }
-
-    #[test]
     fn search_value_scale_reduces_non_terminal_network_value() {
         let position = Position::startpos();
         let mut model = AzNnue::random(4, 7);
         model.value_head_bias[0] = 2.0;
         model.value_head_output[0] = 1.0;
 
-        let full = alphazero_search(
+        let full = gumbel_search(
             &position,
             &model,
             AzSearchLimits {
@@ -1883,7 +1617,7 @@ mod tests {
                 ..AzSearchLimits::default()
             },
         );
-        let scaled = alphazero_search(
+        let scaled = gumbel_search(
             &position,
             &model,
             AzSearchLimits {

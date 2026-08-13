@@ -2,9 +2,10 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::
 
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_CONSEQUENCE_SIZE,
-    POLICY_MOVE_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
-    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
-    dataloader::PackedBatch, fused_feature_pool::feature_pool, fused_policy::fused_policy,
+    POLICY_MOVE_CONTEXT_SIZE, POLICY_PATTERN_TABLE_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
+    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
+    WDL_HEAD_SIZE, dataloader::PackedBatch, fused_feature_pool::feature_pool,
+    fused_policy::fused_policy,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -29,6 +30,7 @@ pub(super) struct AzCandleModel {
     moves_left_bias: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
+    policy_pattern_table: Var,
     policy_context_hidden: Var,
     policy_move_context: Var,
 }
@@ -99,6 +101,7 @@ impl AzCandleModel {
                 &piece_square_policy,
                 &self.policy_consequence_output.flatten_all()?,
                 &self.policy_move_bias.flatten_all()?,
+                &self.policy_pattern_table.flatten_all()?,
                 &self.policy_move_context.flatten_all()?,
             ],
             0,
@@ -246,6 +249,11 @@ impl AzCandleModel {
                 POLICY_CONSEQUENCE_SIZE,
                 device,
             )?,
+            policy_pattern_table: var_from_slice(
+                &model.policy_pattern_table,
+                POLICY_PATTERN_TABLE_SIZE,
+                device,
+            )?,
             policy_context_hidden: var_from_slice(
                 &model.policy_context_hidden,
                 (POLICY_MOVE_CONTEXT_SIZE, hidden),
@@ -277,6 +285,7 @@ impl AzCandleModel {
         vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
+        vars.push(self.policy_pattern_table.clone());
         vars.push(self.policy_context_hidden.clone());
         vars.push(self.policy_move_context.clone());
         vars
@@ -308,6 +317,7 @@ impl AzCandleModel {
             &self.policy_consequence_output,
             &mut model.policy_consequence_output,
         )?;
+        copy_var(&self.policy_pattern_table, &mut model.policy_pattern_table)?;
         copy_var(
             &self.policy_context_hidden,
             &mut model.policy_context_hidden,
@@ -381,6 +391,9 @@ mod tests {
         for (index, weight) in model.policy_move_context.iter_mut().enumerate() {
             *weight = ((index % POLICY_MOVE_CONTEXT_SIZE) as f32 + 1.0) * 0.002;
         }
+        for (index, weight) in model.policy_pattern_table.iter_mut().enumerate() {
+            *weight = ((index % 29) as f32 - 14.0) * 0.001;
+        }
 
         let mut cpu = AzEvalScratch::new(model.arch);
         model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
@@ -431,6 +444,18 @@ mod tests {
             .unwrap();
         assert!(
             output_gradient
+                .iter()
+                .any(|gradient| gradient.abs() > 1.0e-8)
+        );
+        let pattern_gradient = gradients
+            .get(&gradient_candle.policy_pattern_table)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            pattern_gradient
                 .iter()
                 .any(|gradient| gradient.abs() > 1.0e-8)
         );
@@ -486,6 +511,7 @@ mod tests {
             moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
+            policy_pattern_table,
             policy_context_hidden,
             policy_move_context,
         );

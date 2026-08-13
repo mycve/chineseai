@@ -12,10 +12,10 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
-        SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
-        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples_weighted, train_samples_weighted_owned,
+        SplitMix64, benchmark_training, evaluate_policy_groups, generate_selfplay_data,
+        global_training_step_sample_count, gumbel_search, gumbel_search_trace_with_rules,
+        gumbel_search_with_rules, play_arena_games_from_positions, train_samples_weighted,
+        train_samples_weighted_owned,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -101,47 +101,25 @@ impl AzInitArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-search model.safetensors
-  chineseai az-search model.safetensors 50000 1.5 --cpuct-at-root 3.0 startpos
-  chineseai az-search model.safetensors 10000 1.5 --cpuct-at-root 3.0 startpos")]
+  chineseai az-search model.safetensors 50000 --gumbel-scale 0 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
     /// Number of MCTS simulations.
     #[arg(default_value_t = 10_000)]
     simulations: usize,
-    /// Non-root PUCT init.
-    #[arg(default_value_t = 1.5)]
-    cpuct: f32,
-    /// Root PUCT init.
-    #[arg(long, default_value_t = 3.0)]
-    cpuct_at_root: f32,
-    /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.23)]
-    fpu_value: f32,
-    /// Root first-play urgency value.
-    #[arg(long, default_value_t = 1.0)]
-    fpu_value_at_root: f32,
-    /// Dynamic PUCT base.
-    #[arg(long, default_value_t = 19652.0)]
-    cpuct_base: f32,
-    /// Dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 2.0)]
-    cpuct_factor: f32,
-    /// Root dynamic PUCT base.
-    #[arg(long, default_value_t = 19652.0)]
-    cpuct_base_at_root: f32,
-    /// Root dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 2.0)]
-    cpuct_factor_at_root: f32,
+    /// Root Gumbel noise scale; 0 makes analysis deterministic.
+    #[arg(long, default_value_t = 0.0)]
+    gumbel_scale: f32,
+    /// Maximum root actions retained by Sequential Halving.
+    #[arg(long, default_value_t = 16)]
+    max_considered_actions: usize,
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
     /// Draw value in Q = W - L + draw_score * D.
     #[arg(long, default_value_t = 0.0)]
     draw_score: f32,
-    /// Enable moves-left utility.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    moves_left_utility: bool,
     /// Independently re-search this many top-visited root moves after making each move.
     #[arg(long, default_value_t = 0)]
     verify_top: usize,
@@ -168,8 +146,7 @@ struct AzSearchArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai az-bench model.safetensors 512 100 1.5 startpos
-  chineseai az-bench model.safetensors 512 100 1.5 startpos")]
+  chineseai az-bench model.safetensors 512 100 startpos")]
 struct AzBenchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -179,9 +156,9 @@ struct AzBenchArgs {
     /// Number of repeated searches.
     #[arg(default_value_t = 100)]
     repeat: usize,
-    /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.5)]
-    cpuct: f32,
+    /// Maximum root actions retained by Sequential Halving.
+    #[arg(long, default_value_t = 16)]
+    max_considered_actions: usize,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     fen: Vec<String>,
@@ -263,12 +240,9 @@ struct VsPikafishArgs {
     /// ChineseAI MCTS simulations per move.
     #[arg(short = 's', long)]
     simulations: Option<usize>,
-    /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.5)]
-    cpuct: f32,
-    /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 3.0)]
-    cpuct_at_root: f32,
+    /// Maximum root actions retained by Sequential Halving.
+    #[arg(long, default_value_t = 16)]
+    max_considered_actions: usize,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
@@ -347,9 +321,9 @@ struct PikafishLabelEvalArgs {
     /// ChineseAI MCTS simulations per position.
     #[arg(short = 's', long, default_value_t = 64)]
     simulations: usize,
-    /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.5)]
-    cpuct: f32,
+    /// Maximum root actions retained by Sequential Halving.
+    #[arg(long, default_value_t = 16)]
+    max_considered_actions: usize,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
@@ -485,8 +459,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_gs{}_mca{}_op{}_rs{}_rp{}_rc{}_",
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -501,17 +475,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.lr_decay_start_update,
         config.lr_decay_interval,
         f32_slug(config.lr_decay_factor),
-        f32_slug(config.cpuct),
-        f32_slug(config.cpuct_at_root),
-        f32_slug(config.fpu_value),
-        f32_slug(config.fpu_value_at_root),
-        f32_slug(config.policy_softmax_temp),
-        f32_slug(config.temperature_start),
-        f32_slug(config.temperature_endgame),
-        config.temperature_decay_delay_plies,
-        config.temperature_decay_plies,
-        f32_slug(config.temperature_value_cutoff),
-        f32_slug(config.temperature_visit_offset),
+        f32_slug(config.gumbel_scale),
+        config.max_considered_actions,
         if config.opening_fens_path.trim().is_empty() {
             "none".to_string()
         } else {
@@ -526,9 +491,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.checkpoint_interval,
         config.arena_interval,
         config.arena_simulations,
-        f32_slug(config.arena_cpuct),
-        f32_slug(config.root_dirichlet_alpha),
-        f32_slug(config.root_exploration_fraction),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -753,33 +715,9 @@ fn build_az_loop_config(
         seed,
         workers,
         generation_update,
-        opening_exploration_plies: config.opening_exploration_plies,
-        temperature_start: config.temperature_start,
-        temperature_endgame: config.temperature_endgame,
-        temperature_decay_delay_plies: config.temperature_decay_delay_plies,
-        temperature_decay_plies: config.temperature_decay_plies,
-        temperature_value_cutoff: config.temperature_value_cutoff,
-        temperature_visit_offset: config.temperature_visit_offset,
-        cpuct: config.cpuct,
-        cpuct_at_root: config.cpuct_at_root,
-        cpuct_base: config.cpuct_base,
-        cpuct_factor: config.cpuct_factor,
-        cpuct_base_at_root: config.cpuct_base_at_root,
-        cpuct_factor_at_root: config.cpuct_factor_at_root,
-        root_dirichlet_alpha: config.root_dirichlet_alpha,
-        root_exploration_fraction: config.root_exploration_fraction,
-        opening_root_exploration_fraction: config.opening_root_exploration_fraction,
-        fpu_value: config.fpu_value,
-        fpu_value_at_root: config.fpu_value_at_root,
+        gumbel_scale: config.gumbel_scale,
+        max_considered_actions: config.max_considered_actions,
         draw_score: config.draw_score,
-        moves_left_max_effect: config.moves_left_max_effect,
-        moves_left_slope: config.moves_left_slope,
-        moves_left_threshold: config.moves_left_threshold,
-        moves_left_constant_factor: config.moves_left_constant_factor,
-        moves_left_scaled_factor: config.moves_left_scaled_factor,
-        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
-        policy_softmax_temp: config.policy_softmax_temp,
-        opening_policy_softmax_temp: config.opening_policy_softmax_temp,
         value_target_search_q_mix: config.value_target_search_q_mix,
         opening_positions: opening_positions.to_vec(),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
@@ -1074,7 +1012,7 @@ struct ArenaThreadConfig {
     eval_positions: Arc<Vec<Position>>,
     simulations: usize,
     max_plies: usize,
-    cpuct: f32,
+    max_considered_actions: usize,
     thread_count: usize,
     seed: u64,
 }
@@ -1100,7 +1038,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let eval_positions = Arc::clone(&config.eval_positions);
         let simulations = config.simulations;
         let max_plies = config.max_plies;
-        let cpuct = config.cpuct;
+        let max_considered_actions = config.max_considered_actions;
         let seed = config.seed ^ index as u64;
         let thread_start_index = start_index;
         start_index += red_games;
@@ -1116,7 +1054,8 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                     games_as_black: black_games,
                     start_index: thread_start_index,
                     seed,
-                    cpuct,
+                    gumbel_scale: 0.0,
+                    max_considered_actions,
                 },
             )
         }));
@@ -1170,31 +1109,17 @@ fn build_arena_start_positions(
 fn fixed_az_search_limits(
     simulations: usize,
     seed: u64,
-    cpuct: f32,
+    gumbel_scale: f32,
+    max_considered_actions: usize,
     max_depth: usize,
 ) -> AzSearchLimits {
     AzSearchLimits {
         simulations,
         seed,
-        cpuct,
-        cpuct_at_root: cpuct,
-        cpuct_base: 19652.0,
-        cpuct_factor: 2.0,
-        cpuct_base_at_root: 19652.0,
-        cpuct_factor_at_root: 2.0,
+        gumbel_scale,
+        max_considered_actions: max_considered_actions.max(1),
         max_depth,
-        root_dirichlet_alpha: 0.0,
-        root_exploration_fraction: 0.0,
-        fpu_value: 0.23,
-        fpu_value_at_root: 1.0,
-        policy_softmax_temp: 1.0,
         draw_score: 0.0,
-        moves_left_max_effect: 0.0,
-        moves_left_slope: 0.0,
-        moves_left_threshold: 0.6,
-        moves_left_constant_factor: 0.0,
-        moves_left_scaled_factor: 0.0,
-        moves_left_quadratic_factor: 0.0,
         value_scale: 1.0,
     }
 }
@@ -1229,8 +1154,6 @@ fn main() {
         Some(CliCommand::AzSearch(cmd)) => {
             let model_path = cmd.model;
             let simulations = cmd.simulations.max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let fen = cmd.fen.join(" ");
             let mut position = parse_position(&fen);
             let mut rule_history = position.initial_rule_history();
@@ -1247,25 +1170,10 @@ fn main() {
             let search_limits = AzSearchLimits {
                 simulations,
                 seed: 0,
-                cpuct,
-                cpuct_at_root,
-                cpuct_base: cmd.cpuct_base.max(1.0),
-                cpuct_factor: cmd.cpuct_factor.max(0.0),
-                cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
-                cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
+                gumbel_scale: cmd.gumbel_scale.max(0.0),
+                max_considered_actions: cmd.max_considered_actions.max(1),
                 max_depth: cmd.max_depth,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: cmd.fpu_value.max(0.0),
-                fpu_value_at_root: cmd.fpu_value_at_root.clamp(-1.0, 1.0),
-                policy_softmax_temp: 1.0,
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                moves_left_max_effect: if cmd.moves_left_utility { 0.25 } else { 0.0 },
-                moves_left_slope: if cmd.moves_left_utility { 0.004 } else { 0.0 },
-                moves_left_threshold: 0.7,
-                moves_left_constant_factor: if cmd.moves_left_utility { 0.05 } else { 0.0 },
-                moves_left_scaled_factor: if cmd.moves_left_utility { 0.20 } else { 0.0 },
-                moves_left_quadratic_factor: if cmd.moves_left_utility { 0.75 } else { 0.0 },
                 value_scale: 1.0,
             };
             let root_moves = if cmd.root_moves.is_empty() {
@@ -1288,7 +1196,7 @@ fn main() {
                     .unwrap_or_else(|| panic!("invalid or illegal --trace-move `{text}`"))
             });
             let (result, trace) = if let Some(trace_move) = trace_move {
-                alphazero_search_trace_with_rules(
+                gumbel_search_trace_with_rules(
                     &position,
                     Some(rule_history.clone()),
                     root_moves,
@@ -1298,7 +1206,7 @@ fn main() {
                 )
             } else {
                 (
-                    alphazero_search_with_rules(
+                    gumbel_search_with_rules(
                         &position,
                         Some(rule_history.clone()),
                         root_moves,
@@ -1311,13 +1219,10 @@ fn main() {
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
             println!("sims     : {}", result.simulations);
-            println!("search   : alphazero");
-            println!("cpuct    : {cpuct}");
-            println!("cpuct_at_root: {cpuct_at_root}");
-            println!("fpu_value: {}", cmd.fpu_value);
-            println!("fpu_value_at_root: {}", cmd.fpu_value_at_root);
+            println!("search   : gumbel-alphazero");
+            println!("gumbel_scale: {}", cmd.gumbel_scale);
+            println!("max_considered_actions: {}", cmd.max_considered_actions);
             println!("draw_score: {}", cmd.draw_score);
-            println!("moves_left_utility: {}", cmd.moves_left_utility);
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
@@ -1430,7 +1335,7 @@ fn main() {
                 let mut verify_limits = search_limits;
                 verify_limits.simulations = verify_sims.max(1);
                 verify_limits.seed = 0;
-                let verified = alphazero_search_with_rules(
+                let verified = gumbel_search_with_rules(
                     &child,
                     Some(child_rule_history),
                     Some(child_legal),
@@ -1460,27 +1365,33 @@ fn main() {
             let model_path = cmd.model;
             let simulations = cmd.simulations.max(1);
             let repeat = cmd.repeat.max(1);
-            let cpuct = cmd.cpuct.max(0.0);
+            let max_considered_actions = cmd.max_considered_actions.max(1);
             let fen = cmd.fen.join(" ");
             let position = parse_position(&fen);
             let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
                 panic!("failed to load `{model_path}`: {err}");
             });
 
-            let _ = alphazero_search(
+            let _ = gumbel_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, 0),
+                fixed_az_search_limits(simulations, 0, 0.0, max_considered_actions, 0),
             );
 
             let started = std::time::Instant::now();
             let mut total_sims = 0usize;
             let mut best_move = None;
             for iteration in 0..repeat {
-                let result = alphazero_search(
+                let result = gumbel_search(
                     &position,
                     &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, 0),
+                    fixed_az_search_limits(
+                        simulations,
+                        iteration as u64,
+                        0.0,
+                        max_considered_actions,
+                        0,
+                    ),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -1492,9 +1403,9 @@ fn main() {
             println!("fen          : {}", position.to_fen());
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
-            println!("search       : alphazero");
+            println!("search       : gumbel-alphazero");
             println!("simd         : {}", chineseai::az::inference_simd_backend());
-            println!("cpuct        : {cpuct}");
+            println!("max_actions  : {max_considered_actions}");
             println!("total_sims   : {total_sims}");
             println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
             println!(
@@ -1790,66 +1701,27 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(global)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=gumbel-alphazero sims={} gumbel_scale={} max_considered_actions={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} batch_size(global)={} max_plies={} selfplay_workers={} opening_fens={} opening_count={} arena_interval={} arena_sims={} pikafish_label_eval(sqlite={},interval={},limit={},sims={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
+                config.gumbel_scale,
+                config.max_considered_actions,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
                 config.selfplay_samples_per_update,
                 effective_train_to_selfplay_ratio,
                 config.lr,
-                config.lr_min,
-                config.lr_decay_start_update,
-                config.lr_decay_interval,
-                config.lr_decay_factor,
                 config.batch_size,
-                global_training_step_sample_count(config.batch_size),
-                config.train_warmup_samples,
-                config.train_samples_per_update,
-                config.train_epochs_per_update,
                 config.max_plies,
                 config.workers,
-                config.temperature_start,
-                config.temperature_endgame,
-                config.temperature_decay_delay_plies,
-                config.temperature_decay_plies,
-                config.temperature_value_cutoff,
-                config.temperature_visit_offset,
-                config.cpuct,
-                config.cpuct_at_root,
-                config.fpu_value,
-                config.fpu_value_at_root,
-                config.policy_softmax_temp,
-                config.root_dirichlet_alpha,
-                config.root_exploration_fraction,
                 if config.opening_fens_path.trim().is_empty() {
                     "(none)"
                 } else {
                     config.opening_fens_path.as_str()
                 },
                 opening_positions.len(),
-                config.resign_percentage,
-                config.resign_playthrough,
-                config.replay_capacity,
-                config.mirror_probability,
-                config.train_value_weight,
-                config.train_policy_weight,
-                config.checkpoint_interval,
-                config.max_checkpoints,
                 config.arena_interval,
                 config.arena_simulations,
-                config.arena_cpuct,
-                config.arena_promotion_rate,
-                config.arena_promotion_confidence_z,
-                config.arena_processes,
-                if config.arena_opening_book.trim().is_empty() {
-                    "(none)"
-                } else {
-                    config.arena_opening_book.as_str()
-                },
-                config.arena_opening_positions,
-                config.arena_opening_plies_min,
-                config.arena_opening_plies_max,
                 if config.pikafish_label_eval_sqlite.trim().is_empty() {
                     "(none)"
                 } else {
@@ -1858,20 +1730,13 @@ fn main() {
                 config.pikafish_label_eval_interval,
                 config.pikafish_label_eval_limit,
                 config.pikafish_label_eval_simulations,
-                config.pikafish_label_eval_cpuct,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : opening={}ply policy_temp={} root_noise(alpha={},fraction={}) move_temp={}..{} normal_policy_temp={} normal_noise_fraction={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
-                config.opening_exploration_plies,
-                config.opening_policy_softmax_temp,
-                config.root_dirichlet_alpha,
-                config.opening_root_exploration_fraction,
-                config.temperature_start,
-                config.temperature_endgame,
-                config.policy_softmax_temp,
-                config.root_exploration_fraction,
+                "explore  : gumbel_scale={} max_considered_actions={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
+                config.gumbel_scale,
+                config.max_considered_actions,
                 config.opening_fen_game_fraction * 100.0,
                 config.selfplay_update_warmup_updates
             );
@@ -2853,7 +2718,7 @@ fn main() {
                             eval_positions: Arc::new(arena_start_positions),
                             simulations: config.arena_simulations,
                             max_plies: config.max_plies,
-                            cpuct: config.arena_cpuct,
+                            max_considered_actions: config.max_considered_actions,
                             thread_count: config.arena_processes,
                             seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                         });
@@ -2995,7 +2860,7 @@ fn main() {
                                 rows,
                                 config.pikafish_label_eval_simulations,
                                 config.seed ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
-                                config.pikafish_label_eval_cpuct,
+                                config.max_considered_actions,
                                 config.max_plies,
                                 config.arena_processes,
                             )
@@ -3184,8 +3049,6 @@ fn main() {
             let pikafish_exe = cmd.pikafish_exe;
             let model_path = cmd.model;
             let simulations = cmd.simulations.unwrap_or(192).max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let max_plies = cmd.max_plies.max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
@@ -3238,8 +3101,8 @@ fn main() {
                     simulations,
                     seed: cmd.seed,
                     parallel_games,
-                    cpuct,
-                    cpuct_at_root,
+                    gumbel_scale: 0.0,
+                    max_considered_actions: cmd.max_considered_actions.max(1),
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
@@ -3258,7 +3121,7 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
+                "vs-pikafish: model={} search=gumbel-alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} max_considered_actions={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),
@@ -3278,8 +3141,7 @@ fn main() {
                 pikafish_depth,
                 max_plies,
                 simulations,
-                cpuct,
-                cpuct_at_root
+                cmd.max_considered_actions.max(1)
             );
         }
         Some(CliCommand::PikafishLabelRandom(cmd)) => {
@@ -3470,7 +3332,7 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         rows,
         cmd.simulations.max(1),
         cmd.seed,
-        cmd.cpuct.max(0.0),
+        cmd.max_considered_actions.max(1),
         cmd.max_depth,
         cmd.threads,
     )?;
@@ -3503,7 +3365,7 @@ fn evaluate_pikafish_labels(
     rows: &[PikafishLabelRow],
     simulations: usize,
     seed: u64,
-    cpuct: f32,
+    max_considered_actions: usize,
     max_depth: usize,
     mut progress: impl FnMut(usize, usize),
 ) -> io::Result<LabelEvalStats> {
@@ -3523,10 +3385,16 @@ fn evaluate_pikafish_labels(
         let legal_moves = position.legal_moves_with_rules(&rule_history);
         let raw_value = model.evaluate_value_with_rules(&position, &rule_history, &legal_moves);
         stats.push_raw_value_pair(raw_value, row.best_wdl);
-        let result = alphazero_search(
+        let result = gumbel_search(
             &position,
             model,
-            fixed_az_search_limits(simulations.max(1), seed ^ row.id as u64, cpuct, max_depth),
+            fixed_az_search_limits(
+                simulations.max(1),
+                seed ^ row.id as u64,
+                0.0,
+                max_considered_actions,
+                max_depth,
+            ),
         );
         stats.count += 1;
         if result.best_move == Some(label_move) {
@@ -3579,7 +3447,7 @@ fn evaluate_pikafish_labels_parallel(
     rows: Vec<PikafishLabelRow>,
     simulations: usize,
     seed: u64,
-    cpuct: f32,
+    max_considered_actions: usize,
     max_depth: usize,
     thread_count: usize,
 ) -> io::Result<LabelEvalStats> {
@@ -3604,7 +3472,7 @@ fn evaluate_pikafish_labels_parallel(
                 &shard,
                 simulations,
                 seed ^ (thread_id as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
-                cpuct,
+                max_considered_actions,
                 max_depth,
                 |_, _| {},
             )

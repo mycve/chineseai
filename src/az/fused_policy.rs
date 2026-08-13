@@ -2,7 +2,10 @@ use std::sync::OnceLock;
 
 use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
-use super::{DENSE_MOVE_SPACE, POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE};
+use super::{
+    DENSE_MOVE_SPACE, POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE, POLICY_PATTERN_BUCKETS,
+    POLICY_PATTERN_TABLE_SIZE, POLICY_PATTERN_TARGETS,
+};
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
 const MOVE_BITS: u32 = 12;
@@ -14,13 +17,14 @@ const POLICY_VALID_BIT: u32 = CAPTURE_VALID_BIT + 1;
 const INPUT_LEN: usize = AZ_NNUE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE;
 const CONSEQUENCE_OFFSET: usize = INPUT_LEN;
 const BIAS_OFFSET: usize = CONSEQUENCE_OFFSET + POLICY_CONSEQUENCE_SIZE;
-const CONTEXT_OFFSET: usize = BIAS_OFFSET + DENSE_MOVE_SPACE;
+const PATTERN_OFFSET: usize = BIAS_OFFSET + DENSE_MOVE_SPACE;
+const CONTEXT_OFFSET: usize = PATTERN_OFFSET + POLICY_PATTERN_TABLE_SIZE;
 const TABLE_LEN: usize = CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE;
 const _: () = assert!(AZ_NNUE_INPUT_SIZE == 1260);
 const _: () = assert!(POLICY_CONSEQUENCE_SIZE == 32 && POLICY_MOVE_CONTEXT_SIZE == 16);
 const _: () = assert!(DENSE_MOVE_SPACE == 2086);
 const _: () = assert!(CONSEQUENCE_OFFSET == 40320 && BIAS_OFFSET == 40352);
-const _: () = assert!(CONTEXT_OFFSET == 42438 && TABLE_LEN == 75814);
+const _: () = assert!(PATTERN_OFFSET == 42438 && CONTEXT_OFFSET == 46022 && TABLE_LEN == 79398);
 
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void fused_policy_fwd(
@@ -38,6 +42,10 @@ extern "C" __global__ void fused_policy_fwd(
         unsigned int to = (packed >> 23) & 0x7ffu;
         unsigned int captured = (packed >> 34) & 0x7ffu;
         bool has_capture = ((packed >> 46) & 1u) != 0u;
+        unsigned int mover = from / 90u;
+        unsigned int target = has_capture ? (captured / 90u) % 7u : 7u;
+        unsigned int pattern = (((move_index & 63u) * 7u + mover) * 8u + target);
+        value += tables[42438u + pattern];
         for (unsigned int h = 0; h < 32u; ++h) {
             float delta = tables[to * 32u + h] - tables[from * 32u + h];
             if (has_capture) delta -= tables[captured * 32u + h];
@@ -45,7 +53,7 @@ extern "C" __global__ void fused_policy_fwd(
         }
         for (unsigned int h = 0; h < 16u; ++h) {
             value += context[(index / moves) * 16u + h]
-                   * tables[42438u + move_index * 16u + h];
+                   * tables[46022u + move_index * 16u + h];
         }
     }
     output[index] = value;
@@ -64,7 +72,7 @@ extern "C" __global__ void fused_policy_grad(
     const float* context = context_grad;
     const float* grad_output = context_grad + batch * 16u;
     float* grad_tables = output;
-    float* grad_context = output + 75814u;
+    float* grad_context = output + 79398u;
     float g = grad_output[index];
     atomicAdd(grad_tables + 40352u + move_index, g);
     if (((packed >> 45) & 1u) == 0u) return;
@@ -73,6 +81,10 @@ extern "C" __global__ void fused_policy_grad(
     unsigned int to = (packed >> 23) & 0x7ffu;
     unsigned int captured = (packed >> 34) & 0x7ffu;
     bool has_capture = ((packed >> 46) & 1u) != 0u;
+    unsigned int mover = from / 90u;
+    unsigned int target = has_capture ? (captured / 90u) % 7u : 7u;
+    unsigned int pattern = (((move_index & 63u) * 7u + mover) * 8u + target);
+    atomicAdd(grad_tables + 42438u + pattern, g);
     for (unsigned int h = 0; h < 32u; ++h) {
         float w = tables[40320u + h];
         float delta = tables[to * 32u + h] - tables[from * 32u + h];
@@ -85,7 +97,7 @@ extern "C" __global__ void fused_policy_grad(
         atomicAdd(grad_tables + 40320u + h, g * delta);
     }
     for (unsigned int h = 0; h < 16u; ++h) {
-        unsigned int context_index = 42438u + move_index * 16u + h;
+        unsigned int context_index = 46022u + move_index * 16u + h;
         atomicAdd(grad_tables + context_index, g * context[b * 16u + h]);
         atomicAdd(grad_context + b * 16u + h, g * tables[context_index]);
     }
@@ -171,6 +183,7 @@ impl CustomOp3 for FusedPolicy {
                 let to = feature(packed, MOVE_BITS + FEATURE_BITS);
                 let captured = feature(packed, MOVE_BITS + FEATURE_BITS * 2);
                 let b = index / self.moves;
+                value += tables[PATTERN_OFFSET + pattern_index(packed, move_index, from, captured)];
                 for h in 0..POLICY_CONSEQUENCE_SIZE {
                     let mut delta = tables[to * POLICY_CONSEQUENCE_SIZE + h]
                         - tables[from * POLICY_CONSEQUENCE_SIZE + h];
@@ -278,6 +291,7 @@ impl CustomOp3 for FusedPolicyGrad {
             let from = feature(packed, MOVE_BITS);
             let to = feature(packed, MOVE_BITS + FEATURE_BITS);
             let captured = feature(packed, MOVE_BITS + FEATURE_BITS * 2);
+            grad_tables[PATTERN_OFFSET + pattern_index(packed, move_index, from, captured)] += g;
             for h in 0..POLICY_CONSEQUENCE_SIZE {
                 let w = tables[CONSEQUENCE_OFFSET + h];
                 let mut delta = tables[to * POLICY_CONSEQUENCE_SIZE + h]
@@ -322,6 +336,17 @@ impl CustomOp3 for FusedPolicyGrad {
             &self.0,
         )
     }
+}
+
+#[inline]
+fn pattern_index(packed: u64, move_index: usize, from: usize, captured: usize) -> usize {
+    let mover = from / 90;
+    let target = if flag(packed, CAPTURE_VALID_BIT) {
+        (captured / 90) % 7
+    } else {
+        POLICY_PATTERN_TARGETS - 1
+    };
+    ((move_index & (POLICY_PATTERN_BUCKETS - 1)) * 7 + mover) * POLICY_PATTERN_TARGETS + target
 }
 
 fn feature(packed: u64, shift: u32) -> usize {
