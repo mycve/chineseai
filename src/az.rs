@@ -40,8 +40,9 @@ use crate::xiangqi::{
 
 pub use alphazero::{
     AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep, cp_from_q,
-    gumbel_search, gumbel_search_trace_with_rules, gumbel_search_with_rules,
-    gumbel_search_with_rules_controlled, gumbel_search_with_rules_controlled_with_progress,
+    gumbel_root_parallel_search_with_rules_controlled, gumbel_search,
+    gumbel_search_trace_with_rules, gumbel_search_with_rules, gumbel_search_with_rules_controlled,
+    gumbel_search_with_rules_controlled_with_progress,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
