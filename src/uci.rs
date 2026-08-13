@@ -1,6 +1,5 @@
 use crate::az::{
     AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult,
-    gumbel_root_parallel_search_with_rules_controlled,
     gumbel_search_with_rules_controlled_with_progress,
 };
 use crate::xiangqi::{Color, Position, RuleHistoryEntry, RuleOutcome};
@@ -24,7 +23,6 @@ struct UciState {
     model: Option<Arc<AzNnue>>,
     simulations: usize,
     threads: usize,
-    root_parallel: bool,
     gumbel_scale: f32,
     max_considered_actions: usize,
     q_value_scale: f32,
@@ -41,7 +39,6 @@ impl Default for UciState {
             model: None,
             simulations: 10_000,
             threads: 1,
-            root_parallel: false,
             gumbel_scale: 0.0,
             max_considered_actions: 16,
             q_value_scale: 0.02,
@@ -128,8 +125,7 @@ fn print_uci_id() {
     println!("id author ChineseAI");
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
-    println!("option name Threads type spin default 1 min 1 max 256");
-    println!("option name RootParallel type check default false");
+    println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name GumbelScale type string default 0.0");
     println!("option name MaxConsideredActions type spin default 16 min 1 max 256");
     println!("option name QValueScale type string default 0.02");
@@ -177,14 +173,8 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.simulations = value.parse::<usize>().unwrap_or(state.simulations).max(1);
         }
         "threads" => {
-            state.threads = value
-                .parse::<usize>()
-                .unwrap_or(state.threads)
-                .clamp(1, 256);
-        }
-        "rootparallel" => {
-            state.root_parallel =
-                matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "on");
+            let _ = value;
+            state.threads = 1;
         }
         "gumbelscale" => {
             state.gumbel_scale = value.parse::<f32>().unwrap_or(state.gumbel_scale).max(0.0);
@@ -409,43 +399,24 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         print_search_info(progress, started);
         flush();
     };
-    let limits = AzSearchLimits {
-        simulations,
-        seed: state.seed,
-        gumbel_scale: state.gumbel_scale,
-        max_considered_actions: state.max_considered_actions,
-        q_value_scale: state.q_value_scale,
-        max_depth: params.depth.unwrap_or(0),
-        draw_score: state.draw_score,
-        value_scale: 1.0,
-    };
-    let result = if state.root_parallel {
-        println!(
-            "info string search gumbel-root-parallel threads {} actions {}",
-            state.threads,
-            state.max_considered_actions.min(state.threads)
-        );
-        flush();
-        gumbel_root_parallel_search_with_rules_controlled(
-            &state.position,
-            Some(rule_history),
-            Some(legal),
-            model,
-            limits,
-            state.threads,
-            Some(&control),
-        )
-    } else {
-        gumbel_search_with_rules_controlled_with_progress(
-            &state.position,
-            Some(rule_history),
-            Some(legal),
-            model,
-            limits,
-            Some(&control),
-            Some(&mut report_progress),
-        )
-    };
+    let result = gumbel_search_with_rules_controlled_with_progress(
+        &state.position,
+        Some(rule_history),
+        Some(legal),
+        model,
+        AzSearchLimits {
+            simulations,
+            seed: state.seed,
+            gumbel_scale: state.gumbel_scale,
+            max_considered_actions: state.max_considered_actions,
+            q_value_scale: state.q_value_scale,
+            max_depth: params.depth.unwrap_or(0),
+            draw_score: state.draw_score,
+            value_scale: 1.0,
+        },
+        Some(&control),
+        Some(&mut report_progress),
+    );
     // UCI 规定无限分析在收到 `stop` 前不发送 bestmove。只有达到内部 u32
     // 节点索引的表示上限时才会进入等待；正常分析不会受配置节点数限制。
     while params.infinite && !stop.load(Ordering::Relaxed) {
@@ -581,14 +552,10 @@ mod tests {
     #[test]
     fn uci_accepts_only_gumbel_search_tuning() {
         let mut state = UciState::default();
-        handle_setoption("setoption name Threads value 12", &mut state);
-        handle_setoption("setoption name RootParallel value true", &mut state);
         handle_setoption("setoption name GumbelScale value 1.25", &mut state);
         handle_setoption("setoption name MaxConsideredActions value 32", &mut state);
         handle_setoption("setoption name QValueScale value 0.015", &mut state);
 
-        assert_eq!(state.threads, 12);
-        assert!(state.root_parallel);
         assert_eq!(state.gumbel_scale, 1.25);
         assert_eq!(state.max_considered_actions, 32);
         assert_eq!(state.q_value_scale, 0.015);

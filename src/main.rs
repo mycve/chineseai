@@ -13,9 +13,9 @@ use chineseai::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE,
         SplitMix64, benchmark_training, evaluate_policy_groups, generate_selfplay_data,
-        global_training_step_sample_count, gumbel_root_parallel_search_with_rules_controlled,
-        gumbel_search, gumbel_search_trace_with_rules, gumbel_search_with_rules,
-        play_arena_games_from_positions, train_samples_weighted, train_samples_weighted_owned,
+        global_training_step_sample_count, gumbel_search, gumbel_search_trace_with_rules,
+        gumbel_search_with_rules, play_arena_games_from_positions, train_samples_weighted,
+        train_samples_weighted_owned,
     },
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -117,12 +117,6 @@ struct AzSearchArgs {
     /// Maximum root actions retained by Sequential Halving.
     #[arg(long, default_value_t = 16)]
     max_considered_actions: usize,
-    /// Search considered root actions as independent subtrees (experimental).
-    #[arg(long)]
-    root_parallel: bool,
-    /// Worker threads used by --root-parallel.
-    #[arg(long, default_value_t = 16)]
-    threads: usize,
     /// Scale applied to normalized completed Q-values.
     #[arg(long, default_value_t = 0.02)]
     q_value_scale: f32,
@@ -1227,10 +1221,6 @@ fn main() {
                     .parse_uci_move(text)
                     .unwrap_or_else(|| panic!("invalid or illegal --trace-move `{text}`"))
             });
-            assert!(
-                !(cmd.root_parallel && trace_move.is_some()),
-                "--trace-move is unavailable with --root-parallel"
-            );
             let search_started = Instant::now();
             let (result, trace) = if let Some(trace_move) = trace_move {
                 gumbel_search_trace_with_rules(
@@ -1240,19 +1230,6 @@ fn main() {
                     &model,
                     search_limits,
                     trace_move,
-                )
-            } else if cmd.root_parallel {
-                (
-                    gumbel_root_parallel_search_with_rules_controlled(
-                        &position,
-                        Some(rule_history.clone()),
-                        root_moves,
-                        &model,
-                        search_limits,
-                        cmd.threads.max(1),
-                        None,
-                    ),
-                    Vec::new(),
                 )
             } else {
                 (
@@ -1271,15 +1248,7 @@ fn main() {
                 result.simulations as f64 / search_elapsed.as_secs_f64().max(f64::EPSILON);
             println!("fen      : {}", position.to_fen());
             println!("model    : {model_path}");
-            if cmd.root_parallel {
-                println!(
-                    "search   : gumbel-root-parallel seed={} threads={}",
-                    cmd.seed,
-                    cmd.threads.max(1)
-                );
-            } else {
-                println!("search   : gumbel-alphazero seed={}", cmd.seed);
-            }
+            println!("search   : gumbel-alphazero seed={}", cmd.seed);
             println!(
                 "budget   : simulations={}/{} legal={} max_considered={} elapsed_ms={:.2} sims/s={:.0}",
                 result.simulations,
@@ -1373,7 +1342,7 @@ fn main() {
                 policy_entropy.exp(),
             );
             println!(
-                "result   : bestmove={} targetmove={} considered={}/{} {}={}",
+                "result   : bestmove={} targetmove={} considered={}/{} finalists={}",
                 result
                     .best_move
                     .map(|mv| mv.to_string())
@@ -1383,22 +1352,11 @@ fn main() {
                     .unwrap_or_else(|| "(none)".into()),
                 considered_actions,
                 result.candidates.len(),
-                if cmd.root_parallel {
-                    "compared"
-                } else {
-                    "finalists"
-                },
                 finalist_actions,
             );
-            if cmd.root_parallel {
-                println!(
-                    "ranking  : *=selected T=target-top P=parallel-compared; cQ=scaled completed-Q"
-                );
-            } else {
-                println!(
-                    "ranking  : *=selected T=target-top F=finalist C=considered; cQ=scaled completed-Q"
-                );
-            }
+            println!(
+                "ranking  : *=selected T=target-top F=finalist C=considered; cQ=scaled completed-Q"
+            );
             println!(
                 " rk    move   state visits       q      cQ     prior    target   gumbel    score    ml"
             );
@@ -1419,9 +1377,7 @@ fn main() {
                 } else {
                     ' '
                 };
-                let state = if cmd.root_parallel && candidate.visits > 0 {
-                    'P'
-                } else if max_root_visits > 0 && candidate.visits == max_root_visits {
+                let state = if max_root_visits > 0 && candidate.visits == max_root_visits {
                     'F'
                 } else if candidate.visits > 0 {
                     'C'
