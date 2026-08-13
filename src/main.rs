@@ -1664,12 +1664,8 @@ fn main() {
                 }
                 reference
             };
-            let initial_selfplay_model = if config.arena_interval == 0 {
-                selfplay_model.clone()
-            } else {
-                println!("selfplay : champion gate active; start from arena best");
-                initial_arena_reference_model.clone()
-            };
+            let initial_selfplay_model = selfplay_model.clone();
+            println!("selfplay : latest model is published without arena gating");
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -1764,12 +1760,11 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : gumbel_scale={} max_considered_actions={} q_value_scale={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
+                "explore  : gumbel_scale={} max_considered_actions={} q_value_scale={} opening_fen_games={:.1}%",
                 config.gumbel_scale,
                 config.max_considered_actions,
                 config.q_value_scale,
-                config.opening_fen_game_fraction * 100.0,
-                config.selfplay_update_warmup_updates
+                config.opening_fen_game_fraction * 100.0
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -2713,21 +2708,15 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                if config.arena_interval == 0 || update <= config.selfplay_update_warmup_updates {
-                    let updated_numa_models =
-                        build_numa_model_replicas(&deployed_model, &numa_nodes);
+                let updated_numa_models = build_numa_model_replicas(&deployed_model, &numa_nodes);
+                {
                     let mut shared = shared_model
                         .write()
                         .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
                     shared.models_by_numa_node = updated_numa_models;
                     shared.version = shared.version.wrapping_add(1);
-                    if config.arena_interval > 0 {
-                        println!(
-                            "selfplay : warmup publish raw update {update}/{}",
-                            config.selfplay_update_warmup_updates
-                        );
-                    }
                 }
+                println!("selfplay : published latest update {update}");
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
                         let (pause_lock, _) = &*selfplay_pause;
@@ -2758,23 +2747,9 @@ fn main() {
                         let candidate_elo = arena.anchored_elo(ref_elo);
                         let elo_diff = arena.elo_diff_vs_even();
                         let arena_se = arena.score_rate_standard_error();
-                        let arena_lcb =
-                            arena.score_rate_lower_bound(config.arena_promotion_confidence_z);
-                        let promoted = arena.promotes_with_lower_bound(
-                            config.arena_promotion_rate,
-                            config.arena_promotion_confidence_z,
-                        );
-                        if promoted {
+                        let new_best = arena.score_rate() > 0.5;
+                        if new_best {
                             arena_reference_model = deployed_model.clone();
-                            let updated_numa_models =
-                                build_numa_model_replicas(&deployed_model, &numa_nodes);
-                            {
-                                let mut shared = shared_model
-                                    .write()
-                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                                shared.models_by_numa_node = updated_numa_models;
-                                shared.version = shared.version.wrapping_add(1);
-                            }
                             let best_checkpoint = save_best_checkpoint_model(
                                 &deployed_model,
                                 &config.model_path,
@@ -2784,17 +2759,9 @@ fn main() {
                             save_model(&deployed_model, &best_path);
                             arena_best_elo = candidate_elo;
                             println!("best     : saved {}", best_checkpoint.display());
-                        } else if update > config.selfplay_update_warmup_updates {
-                            let updated_numa_models =
-                                build_numa_model_replicas(&arena_reference_model, &numa_nodes);
-                            let mut shared = shared_model
-                                .write()
-                                .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                            shared.models_by_numa_node = updated_numa_models;
-                            shared.version = shared.version.wrapping_add(1);
                         }
                         println!(
-                            "arena {update:04}: mode={} total={} positions={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} se={:.3} lcb={:.3} promote_at={:.3} z={:.2} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
+                            "arena {update:04}: monitor_only mode={} total={} positions={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} se={:.3} ref_elo={:.1} elo={:.1} elo_diff={:+.1}{}",
                             arena_mode,
                             arena.total_games(),
                             arena_position_count,
@@ -2808,21 +2775,13 @@ fn main() {
                             arena.score(),
                             arena.score_rate(),
                             arena_se,
-                            arena_lcb,
-                            config.arena_promotion_rate,
-                            config.arena_promotion_confidence_z,
                             ref_elo,
                             candidate_elo,
                             elo_diff,
-                            if promoted {
-                                " promoted=current saved_best"
-                            } else {
-                                ""
-                            }
+                            if new_best { " saved_best" } else { "" }
                         );
                         log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
                         log_scalar(&mut tb, "arena/score_rate_se", update, arena_se);
-                        log_scalar(&mut tb, "arena/score_rate_lcb", update, arena_lcb);
                         log_scalar(&mut tb, "arena/ref_elo", update, ref_elo);
                         log_scalar(&mut tb, "arena/elo", update, candidate_elo);
                         log_scalar(&mut tb, "arena/elo_diff", update, elo_diff);
@@ -2852,9 +2811,9 @@ fn main() {
                         );
                         log_scalar(
                             &mut tb,
-                            "arena/promoted",
+                            "arena/new_best",
                             update,
-                            if promoted { 1.0 } else { 0.0 },
+                            if new_best { 1.0 } else { 0.0 },
                         );
                     }
                     {

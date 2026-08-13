@@ -39,7 +39,6 @@ pub struct AzLoopFileConfig {
     pub value_target_search_q_mix: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
-    pub selfplay_update_warmup_updates: usize,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
@@ -56,8 +55,6 @@ pub struct AzLoopFileConfig {
     pub max_checkpoints: usize,
     pub arena_interval: usize,
     pub arena_simulations: usize,
-    pub arena_promotion_rate: f32,
-    pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
     pub arena_opening_book: String,
     pub arena_opening_positions: usize,
@@ -94,7 +91,6 @@ impl Default for AzLoopFileConfig {
             value_target_search_q_mix: chineseai::az::VALUE_TARGET_SEARCH_Q_MIX,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
-            selfplay_update_warmup_updates: 5,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
@@ -111,8 +107,6 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 10,
             arena_simulations: 4000,
-            arena_promotion_rate: 0.50,
-            arena_promotion_confidence_z: 1.28,
             arena_processes: 128,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 300,
@@ -182,10 +176,6 @@ impl AzLoopFileConfig {
             "opening_fen_game_fraction",
             f(self.opening_fen_game_fraction)
         );
-        line!(
-            "selfplay_update_warmup_updates",
-            self.selfplay_update_warmup_updates
-        );
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
         line!("replay_capacity", self.replay_capacity);
@@ -205,11 +195,6 @@ impl AzLoopFileConfig {
         line!("max_checkpoints", self.max_checkpoints);
         line!("arena_interval", self.arena_interval);
         line!("arena_simulations", self.arena_simulations);
-        line!("arena_promotion_rate", f(self.arena_promotion_rate));
-        line!(
-            "arena_promotion_confidence_z",
-            f(self.arena_promotion_confidence_z)
-        );
         line!("arena_processes", self.arena_processes);
         line!("arena_opening_book", q(&self.arena_opening_book));
         line!("arena_opening_positions", self.arena_opening_positions);
@@ -281,8 +266,6 @@ impl AzLoopFileConfig {
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
-        self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
-        self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_simulations = self.arena_simulations.max(1);
         self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
@@ -304,7 +287,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 9\n"));
+        assert!(text.starts_with("format_version = 10\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("gumbel_scale = 1.0\n"));
@@ -314,7 +297,6 @@ mod tests {
         assert!(text.contains("value_target_search_q_mix = 0.4\n"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
-        assert!(text.contains("selfplay_update_warmup_updates = 5\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("simulations = 1600\n"));
@@ -377,6 +359,9 @@ mod tests {
             "fpu_value = 0.0\n",
             "moves_left_slope = 0.004\n",
             "policy_softmax_temp = 1.0\n",
+            "arena_promotion_rate = 0.5\n",
+            "arena_promotion_confidence_z = 1.28\n",
+            "selfplay_update_warmup_updates = 5\n",
             "replay_recent_window_updates = 5000\n",
             "deblunder_q_gap = 0.05\n",
             "low_simulations = 2000\n",
