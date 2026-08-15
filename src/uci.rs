@@ -321,21 +321,12 @@ fn apply_uci_moves(
         let Some(mv) = position.parse_uci_move(text) else {
             break;
         };
-        // 外部引擎的重复、长将和长捉判罚可能与训练规则不同。UCI 导入只校验
-        // 棋盘着法合法性，避免规则分歧导致后续着法被静默截断。
-        if !position.legal_moves().contains(&mv) {
+        if !position.legal_moves_with_rules(rule_history).contains(&mv) {
             break;
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
-}
-
-fn uci_search_rule_history(position: &Position) -> Vec<RuleHistoryEntry> {
-    // 外部着法历史只用于还原棋盘，不作为我方胜负评分依据。否则对方采用不同的
-    // 长将、长捉或重复规则时，会被内部规则误判为我方 ±1000 分。搜索规则从当前
-    // 根局面重新计数，之后由我方搜索产生的循环仍按内部规则约束。
-    position.initial_rule_history()
 }
 
 fn position_is_rule_draw(position: &Position, rule_history: &[RuleHistoryEntry]) -> bool {
@@ -450,16 +441,15 @@ fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
 
 fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let model = state.model.as_ref().expect("model was loaded");
-    let rule_history = uci_search_rule_history(&state.position);
 
-    if position_is_rule_draw(&state.position, &rule_history) {
+    if position_is_rule_draw(&state.position, &state.rule_history) {
         println!("info depth 0 nodes 0 time 0 score cp 0");
         println!("bestmove 0000");
         flush();
         return;
     }
 
-    let mut legal = state.position.legal_moves_with_rules(&rule_history);
+    let mut legal = state.position.legal_moves_with_rules(&state.rule_history);
     if !params.searchmoves.is_empty() {
         legal.retain(|mv| {
             params
@@ -488,7 +478,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     };
     let result = alphazero_search_with_rules_controlled_with_progress(
         &state.position,
-        Some(rule_history),
+        Some(state.rule_history.clone()),
         Some(legal),
         model,
         AzSearchLimits {
@@ -651,60 +641,45 @@ mod tests {
     }
 
     #[test]
-    fn uci_search_does_not_score_external_long_check_as_a_win() {
-        let entry = |hash, side_to_move, mover| RuleHistoryEntry {
-            hash,
-            side_to_move,
-            mover,
-            gives_check: false,
-            chased_mask: 0,
-            chased_piece_mask: 0,
-        };
-        let external_history = vec![
-            entry(1, Color::Red, None),
-            RuleHistoryEntry {
-                gives_check: true,
-                ..entry(2, Color::Black, Some(Color::Red))
-            },
-            entry(3, Color::Red, Some(Color::Black)),
-            RuleHistoryEntry {
-                gives_check: true,
-                ..entry(4, Color::Black, Some(Color::Red))
-            },
-            entry(1, Color::Red, Some(Color::Black)),
-        ];
-        assert_eq!(
-            Position::rule_outcome(&external_history),
-            Some(RuleOutcome::Win(Color::Black))
-        );
+    fn uci_import_stops_before_repeated_long_check() {
+        let mut position = Position::from_fen(
+            "2Rakab2/8r/4c1n2/p3p1p1p/2p6/9/P3P3P/1CN1NC3/9/1RBAKArc1 b - - 0 1",
+        )
+        .unwrap();
+        let mut history = position.initial_rule_history();
+        let moves = ["g0g1", "f0e1", "g1g0", "e1f0", "g0g1"];
+        apply_uci_moves(&mut position, &mut history, &moves);
 
-        let position = Position::startpos();
-        let search_history = uci_search_rule_history(&position);
-        assert_eq!(position.rule_outcome_with_history(&search_history), None);
+        assert_eq!(history.len(), moves.len());
+        assert_eq!(
+            position.rule_outcome_with_history(&history),
+            Some(RuleOutcome::Win(Color::Red))
+        );
+        assert_eq!(position.side_to_move(), Color::Black);
+        let repeated_check = position.parse_uci_move("g0g1").unwrap();
+        assert!(
+            !position
+                .legal_moves_with_rules(&history)
+                .contains(&repeated_check)
+        );
     }
 
     #[test]
-    fn uci_accepts_external_single_cycle_and_can_search_it() {
-        let mut position = Position::startpos();
+    fn uci_import_stops_before_repeated_long_chase() {
+        let mut position =
+            Position::from_fen("2bak4/4a4/2ncb2c1/p3p2CP/9/1N1RP4/P5r2/4C4/9/2BAKA3 b - - 0 1")
+                .unwrap();
         let mut history = position.initial_rule_history();
-        let moves = "g3g4 c9e7 c3c4 h9i7 h0i2 i9i8 f0e1 c6c5 c4c5 i8c8 \
-                     c0e2 c8c5 b0a2 c5e5 h2f2 i6i5 b2d2 e5e3 a0c0 e3a3 \
-                     a2c3 b9a7 c3d5 a9c9 c0c9 e7c9 d5b6 d9e8 i0h0 h7f7 \
-                     d2c2 c9e7 h0h8 f7f6 b6d5 f6f5 e2c0 f5e5 c2e2 a3d3 \
-                     d5b6 d3c3 b6d5 c3d3"
-            .split_whitespace()
-            .collect::<Vec<_>>();
+        let moves = ["c7b5", "d4d5", "b5c7", "d5d4", "c7b5"];
         apply_uci_moves(&mut position, &mut history, &moves);
 
-        assert_eq!(history.len(), moves.len() + 1);
-        assert_eq!(
-            position.rule_outcome_with_history(&history),
-            Some(RuleOutcome::Draw(
-                crate::xiangqi::RuleDrawReason::Repetition
-            ))
+        assert_eq!(history.len(), moves.len());
+        assert_eq!(position.side_to_move(), Color::Black);
+        let repeated_chase = position.parse_uci_move("c7b5").unwrap();
+        assert!(
+            !position
+                .legal_moves_with_rules(&history)
+                .contains(&repeated_chase)
         );
-        let search_history = uci_search_rule_history(&position);
-        assert_eq!(position.rule_outcome_with_history(&search_history), None);
-        assert!(!position.legal_moves_with_rules(&search_history).is_empty());
     }
 }
