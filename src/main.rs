@@ -121,7 +121,7 @@ struct AzSearchArgs {
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
     /// Root PUCT init.
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(long, default_value_t = 1.5)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
     #[arg(long, default_value_t = 0.30)]
@@ -133,13 +133,13 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 19652.0)]
     cpuct_base: f32,
     /// Dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 1.5)]
     cpuct_factor: f32,
     /// Root dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
     cpuct_base_at_root: f32,
     /// Root dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 1.5)]
     cpuct_factor_at_root: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
@@ -1270,7 +1270,7 @@ fn print_az_search_candidates(result: &chineseai::az::AzSearchResult, top: usize
         "\nCANDIDATES — visits descending ({shown}/{})",
         candidates.len()
     );
-    println!("    #  B  MOVE      VISITS   TARGET       Q      CP   RAW PRIOR       PRIOR");
+    println!("    #  B  MOVE      VISITS  VISIT P       Q      CP       NET P      TREE P");
     println!("  ---- --  -------  --------  -------  ------  ------  ----------  ----------");
     for (rank, candidate) in candidates.into_iter().take(shown).enumerate() {
         let best = if Some(candidate.mv) == result.best_move {
@@ -2111,13 +2111,14 @@ fn main() {
                             .fetch_add(1, Ordering::SeqCst)
                             .min(u32::MAX as u64)
                             as u32;
-                        let loop_config = build_az_loop_config(
+                        let mut loop_config = build_az_loop_config(
                             &selfplay_config,
                             batch_seed,
                             1,
                             generation_update,
                             &selfplay_opening_positions,
                         );
+                        loop_config.games = 4;
                         let started = Instant::now();
                         let data = generate_selfplay_data(
                             local_model
@@ -3228,9 +3229,17 @@ fn main() {
                         }
                         println!("resume   : selfplay resumed after pikafish label eval");
                     } else {
+                        let resolved = if sqlite_path.is_absolute() {
+                            sqlite_path.to_path_buf()
+                        } else {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join(sqlite_path)
+                        };
                         println!(
-                            "pikafish-label {update:04}: skipped missing sqlite={}",
-                            config.pikafish_label_eval_sqlite
+                            "pikafish-label {update:04}: skipped missing sqlite={} resolved={} (copy the label DB or update pikafish_label_eval_sqlite)",
+                            config.pikafish_label_eval_sqlite,
+                            resolved.display()
                         );
                     }
                 }
@@ -4482,6 +4491,27 @@ fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
 mod reporting_tests {
     use super::*;
     use chineseai::az::AzSampleMeta;
+
+    #[test]
+    fn az_search_defaults_match_selfplay_and_uci_search() {
+        let cli = Cli::try_parse_from([
+            "chineseai",
+            "az-search",
+            "model.safetensors",
+            "3200",
+            "0.65",
+        ])
+        .unwrap();
+        let Some(CliCommand::AzSearch(args)) = cli.command else {
+            panic!("expected az-search command");
+        };
+        assert_eq!(args.cpuct, 0.65);
+        assert_eq!(args.cpuct_at_root, 1.5);
+        assert_eq!(args.cpuct_factor, 1.5);
+        assert_eq!(args.cpuct_factor_at_root, 1.5);
+        assert_eq!(args.fpu_value, 0.30);
+        assert_eq!(args.fpu_value_at_root, 0.20);
+    }
 
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         AzTrainingSample {
