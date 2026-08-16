@@ -162,4 +162,23 @@ INT8 稀疏节点 accumulator 加入后，同一活跃 v10 权重的基本 INT8 
 
 最终 v11 release 五次 NPS 为 203,353 / 203,368 / 208,701 / 204,574 / 201,946，均值 204,388；相对此前同权重体系 v10 历史均值 206,374，约下降 0.96%，但两者不是同场交替。零表 v11 历史均值为 201,396 NPS。最终判断仍以固定总自博弈墙钟和 Elo 为准。
 
-多局面 leaf batching 设计采用每线程维护四棵独立树、每棵树最多挂起一个 leaf，再统一执行推理。这样不需要同树 virtual loss，也不会改变单棵树内部 simulation 次序。固定 batch=4 的 AVX2/FMA 增量评估内核已实现并与逐树输出逐项对齐；fast 模式微基准中四次逐树评估为 31.010 ms，batch4 为 25.900 ms，纯 leaf 推理提升 1.197×。下一步仍需把 MCTS 拆成 select / batch-evaluate / backprop 三阶段并比较整体自博弈 samples/s；上述 NPS 尚未计入跨树调度收益。
+多局面 leaf batching 采用四棵独立树、每棵树最多挂起一个 leaf，再统一执行推理。这样不需要同树 virtual loss，也不会改变单棵树内部 simulation 次序。固定 batch=4 的 AVX2/FMA 增量评估内核和完整 select / batch-evaluate / backprop 调度器均已实现；四个不同局面的回归测试在 best move、simulation 数、根访问总数和 Q 上与标量搜索一致。fast 模式、hidden=128、每局 512 simulations 的完整搜索微基准为四次标量 8.890 ms、四树 batch 8.129 ms，钟墙提升 1.094×。纯 leaf 内核提升高于完整搜索，说明走树和走法生成已成为下一阶段瓶颈。自博弈每线程四局状态机仍需单独接入后再测整体 samples/s。
+
+## v12 FPU 修正与移除 Moves-left
+
+旧 root FPU 把 `fpu_value_at_root=1.0` 直接当作未访问子节点绝对 Q，而非 reduction，导致根部未访问着被当成必胜。v12 统一采用 `parent Q - reduction × sqrt(visited prior)`，根与非根默认 reduction 均为 0.33，并增加关闭 PUCT 后的根 FPU 回归测试。与此同时删除未经实验验证、会绕开 policy 的额外探索项（将军 ×5、吃子 ×3 和 prior-independent U）。
+
+Moves-left 没有在本项目中证明棋力收益，旧参数也不是由当前象棋网络调出的。v12 因此从模型权重、CPU/SIMD 推理、Candle 训练图、loss、replay、自博弈参数和 UCI 中完整删除该头；model/replay/az-loop 格式分别升级到 v12/v35/v9，不保留运行时兼容代码。保留的 v11 权重仅做一次性离线剥离，得到 `eval/policy-sparse-v12.safetensors`。同一 100,000 个 depth-12 标签、`simulations=1` 复测 raw-prior Top-1 仍为 38.505%，确认删除辅助头没有改变 policy 输出。
+
+相同机器、fast profile、startpos、512 simulations × 100 repeats，v11/v12 五组交替结果如下。该比较控制了权重主体和运行环境，但 v12 同时包含 FPU/额外探索清理，所以只能视为整批搜索改动收益，不能把全部差值归因于 Moves-left：
+
+| 配对 | v11 NPS | v12 NPS | 变化 |
+|---:|---:|---:|---:|
+| 1 | 213,961 | 236,860 | +10.70% |
+| 2 | 206,416 | 237,529 | +15.07% |
+| 3 | 208,709 | 225,778 | +8.18% |
+| 4 | 211,053 | 242,109 | +14.71% |
+| 5 | 202,572 | 238,168 | +17.57% |
+| **均值** | **208,542** | **236,089** | **+13.21%** |
+
+当前 fast 全套测试为 109 passed、2 ignored，主程序 4 passed，且 `cargo check --profile fast --all-targets` 零警告。训练仍使用同一 dense AdamW 更新；在不改变优化轨迹的前提下，通用 Candle 暂无简单的稀疏提速。严格等价方案需要实现 lazy Adam，对未激活行补做中间 step 的一阶/二阶动量、bias correction 和 weight decay 更新；复杂度与验证成本高于当前可接受的训练耗时，因此本轮不改优化器。
