@@ -109,8 +109,8 @@ impl AzInitArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai az-search model.safetensors
-  chineseai az-search model.safetensors 50000 1.5 --cpuct-at-root 3.0 startpos
-  chineseai az-search model.safetensors 10000 1.5 --cpuct-at-root 3.0 startpos")]
+  chineseai az-search model.safetensors 50000 1.5 --top 12 startpos
+  chineseai az-search model.safetensors 10000 --trace-move b0c2 --verify-top 3 startpos")]
 struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
@@ -162,6 +162,9 @@ struct AzSearchArgs {
     /// Simulations for every independent child verification; 0 uses the root simulation count.
     #[arg(long, default_value_t = 0)]
     verify_sims: usize,
+    /// Candidate rows to display, sorted by visits; 0 displays every legal root move.
+    #[arg(long, default_value_t = 20)]
+    top: usize,
     /// Apply legal UCI moves before searching; repeat for a move sequence.
     #[arg(long = "move")]
     moves: Vec<String>,
@@ -1249,6 +1252,81 @@ fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
 }
 
+fn print_az_search_candidates(result: &chineseai::az::AzSearchResult, top: usize) {
+    let mut candidates = result.candidates.iter().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .visits
+            .cmp(&left.visits)
+            .then_with(|| right.policy.total_cmp(&left.policy))
+            .then_with(|| right.q.total_cmp(&left.q))
+    });
+    let shown = if top == 0 {
+        candidates.len()
+    } else {
+        top.min(candidates.len())
+    };
+    println!(
+        "\nCANDIDATES — visits descending ({shown}/{})",
+        candidates.len()
+    );
+    println!("    #  B  MOVE      VISITS   TARGET       Q      CP   RAW PRIOR       PRIOR");
+    println!("  ---- --  -------  --------  -------  ------  ------  ----------  ----------");
+    for (rank, candidate) in candidates.into_iter().take(shown).enumerate() {
+        let best = if Some(candidate.mv) == result.best_move {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "  {:>4}  {}  {:<7}  {:>8}  {:>6.2}%  {:>+6.3}  {:>+6}  {:>9.5}  {:>9.5}",
+            rank + 1,
+            best,
+            candidate.mv,
+            candidate.visits,
+            candidate.policy * 100.0,
+            candidate.q,
+            chineseai::az::cp_from_q(candidate.q),
+            candidate.raw_prior,
+            candidate.prior,
+        );
+    }
+}
+
+fn print_az_search_trace(trace_move: Move, trace: &[chineseai::az::AzSearchTraceStep]) {
+    println!(
+        "\nPRINCIPAL TRACE — root {trace_move}, {} plies",
+        trace.len()
+    );
+    if trace.is_empty() {
+        println!("  Root move was not expanded.");
+        return;
+    }
+    println!(
+        "  PLY  MOVE      VISITS       Q     PRIOR  CHECK  EXPANDED    CHILD Q       CHILD W/D/L"
+    );
+    println!(
+        "  ---  -------  --------  ------  --------  -----  --------  --------  ------------------"
+    );
+    for step in trace {
+        println!(
+            "  {:>3}  {:<7}  {:>8}  {:>+6.3}  {:>7.5}  {:>5}  {:>8}  {:>+8.3}  {:>5.1}%/{:>5.1}%/{:>5.1}%",
+            step.ply,
+            step.mv,
+            step.visits,
+            step.q,
+            step.prior,
+            if step.gives_check { "yes" } else { "no" },
+            if step.child_expanded { "yes" } else { "no" },
+            step.child_value,
+            step.child_value_wdl[0] * 100.0,
+            step.child_value_wdl[1] * 100.0,
+            step.child_value_wdl[2] * 100.0,
+        );
+        println!("       fen: {}", step.child_fen);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -1327,6 +1405,7 @@ fn main() {
                     .parse_uci_move(text)
                     .unwrap_or_else(|| panic!("invalid or illegal --trace-move `{text}`"))
             });
+            let search_started = Instant::now();
             let (result, trace) = if let Some(trace_move) = trace_move {
                 alphazero_search_trace_with_rules(
                     &position,
@@ -1348,66 +1427,7 @@ fn main() {
                     Vec::new(),
                 )
             };
-            println!("fen      : {}", position.to_fen());
-            println!("model    : {model_path}");
-            println!("sims     : {}", result.simulations);
-            println!("search   : alphazero");
-            println!("cpuct    : {cpuct}");
-            println!("cpuct_at_root: {cpuct_at_root}");
-            println!("fpu_value: {}", cmd.fpu_value);
-            println!("fpu_value_at_root: {}", cmd.fpu_value_at_root);
-            println!("draw_score: {}", cmd.draw_score);
-            println!(
-                "depth    : avg={:.2} max={} limit={} cutoffs={}",
-                result.search_depth_avg,
-                result.search_depth_max,
-                result.search_depth_limit,
-                result.search_depth_cutoffs
-            );
-            if let Some(trace_move) = trace_move {
-                println!("trace    : root_move={trace_move} pv_plies={}", trace.len());
-                for step in &trace {
-                    println!(
-                        "trace[{ply:02}]: move={mv} visits={visits} q={q:.3} prior={prior:.5} check={check} child_net={value:.3} child_wdl={win:.3}/{draw:.3}/{loss:.3} expanded={expanded} fen={fen}",
-                        ply = step.ply,
-                        mv = step.mv,
-                        visits = step.visits,
-                        q = step.q,
-                        prior = step.prior,
-                        check = step.gives_check,
-                        value = step.child_value,
-                        win = step.child_value_wdl[0],
-                        draw = step.child_value_wdl[1],
-                        loss = step.child_value_wdl[2],
-                        expanded = step.child_expanded,
-                        fen = step.child_fen,
-                    );
-                }
-            }
-            println!("value_cp : {}", result.value_cp);
-            println!(
-                "bestmove : {}",
-                result
-                    .best_move
-                    .map(|mv| mv.to_string())
-                    .unwrap_or_else(|| "(none)".into())
-            );
-            println!(
-                "visited_actions: {}",
-                result
-                    .candidates
-                    .iter()
-                    .filter(|candidate| candidate.visits > 0)
-                    .count()
-            );
-            println!("by_policy:");
-            for candidate in &result.candidates {
-                println!(
-                    "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-                );
-            }
-            println!("by_visits:");
+            let search_elapsed = search_started.elapsed();
             let mut by_visits = result.candidates.clone();
             by_visits.sort_by(|left, right| {
                 right
@@ -1416,11 +1436,87 @@ fn main() {
                     .then_with(|| right.policy.total_cmp(&left.policy))
                     .then_with(|| right.q.total_cmp(&left.q))
             });
-            for candidate in &by_visits {
-                println!(
-                    "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
-                );
+            let visited_actions = by_visits
+                .iter()
+                .filter(|candidate| candidate.visits > 0)
+                .count();
+            let elapsed_seconds = search_elapsed.as_secs_f64().max(f64::EPSILON);
+            let best_move = result
+                .best_move
+                .map(|mv| mv.to_string())
+                .unwrap_or_else(|| "(none)".into());
+            println!("AZ SEARCH");
+            println!("=========");
+            println!("\nPOSITION");
+            println!("  FEN          {}", position.to_fen());
+            println!("  Side         {:?}", position.side_to_move());
+            println!(
+                "  Applied      {}",
+                if cmd.moves.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    cmd.moves.join(" ")
+                }
+            );
+            println!(
+                "  Root moves   {}",
+                if cmd.root_moves.is_empty() {
+                    "all legal".to_string()
+                } else {
+                    cmd.root_moves.join(" ")
+                }
+            );
+            println!("\nCONFIGURATION");
+            println!("  Model        {model_path}");
+            println!("  Simulations  {simulations}");
+            println!(
+                "  PUCT         non-root={cpuct:.3} root={cpuct_at_root:.3} base={:.1}/{:.1} factor={:.3}/{:.3}",
+                search_limits.cpuct_base,
+                search_limits.cpuct_base_at_root,
+                search_limits.cpuct_factor,
+                search_limits.cpuct_factor_at_root
+            );
+            println!(
+                "  FPU reduce   non-root={:.3} root={:.3}",
+                search_limits.fpu_value, search_limits.fpu_value_at_root
+            );
+            println!("  Draw score   {:.3}", search_limits.draw_score);
+            println!("\nRESULT");
+            println!("  Best move    {best_move}");
+            println!(
+                "  Search value Q={:+.4}  CP={:+}  W/D/L={:.2}%/{:.2}%/{:.2}%",
+                result.value_q,
+                result.value_cp,
+                result.value_wdl[0] * 100.0,
+                result.value_wdl[1] * 100.0,
+                result.value_wdl[2] * 100.0
+            );
+            println!(
+                "  Network WDL  {:.2}%/{:.2}%/{:.2}%",
+                result.network_value_wdl[0] * 100.0,
+                result.network_value_wdl[1] * 100.0,
+                result.network_value_wdl[2] * 100.0
+            );
+            println!(
+                "  Root actions {} legal, {} visited",
+                result.candidates.len(),
+                visited_actions
+            );
+            println!(
+                "  Depth        avg={:.2} max={} limit={} cutoffs={}",
+                result.search_depth_avg,
+                result.search_depth_max,
+                result.search_depth_limit,
+                result.search_depth_cutoffs
+            );
+            println!(
+                "  Performance  {:.3} ms, {:.0} simulations/s",
+                search_elapsed.as_secs_f64() * 1000.0,
+                result.simulations as f64 / elapsed_seconds
+            );
+            print_az_search_candidates(&result, cmd.top);
+            if let Some(trace_move) = trace_move {
+                print_az_search_trace(trace_move, &trace);
             }
             let verify_sims = if cmd.verify_sims == 0 {
                 simulations
@@ -1441,12 +1537,18 @@ fn main() {
                 }
             }
             if !verify_moves.is_empty() {
-                println!("verify_children: sims={verify_sims}");
+                println!("\nCHILD VERIFICATION — {verify_sims} simulations each");
+                println!(
+                    "  MOVE     VISITS   ROOT Q     NN Q   DEEP Q       ΔQ      CP  OPPONENT REPLY"
+                );
+                println!(
+                    "  -------  -------  -------  -------  -------  -------  ------  --------------"
+                );
             }
             for mv in verify_moves {
                 let Some(root_candidate) = result.candidates.iter().find(|item| item.mv == mv)
                 else {
-                    println!("verify: {mv} unavailable_at_root");
+                    println!("  {mv:<7}  unavailable at root");
                     continue;
                 };
                 let mut child_rule_history = rule_history.clone();
@@ -1468,15 +1570,14 @@ fn main() {
                 let verified_root_q = -verified.value_q;
                 let verified_root_cp = -verified.value_cp;
                 println!(
-                    "verify: {} root_q={:.3} root_visits={} prior={:.5} child_nn_q={:.3} verified_q={:.3} verified_cp={} delta={:+.3} child_best={}",
+                    "  {:<7}  {:>7}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+6}  {}",
                     mv,
-                    root_candidate.q,
                     root_candidate.visits,
-                    root_candidate.prior,
+                    root_candidate.q,
                     -child_nn_q,
                     verified_root_q,
-                    verified_root_cp,
                     verified_root_q - root_candidate.q,
+                    verified_root_cp,
                     verified
                         .best_move
                         .map(|best| best.to_string())
