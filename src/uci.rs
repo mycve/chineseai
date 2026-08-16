@@ -534,17 +534,6 @@ fn humanized_target_ms(standard_startpos: bool, game_ply: usize, difficulty: f32
     (target_ms.round() as u64).clamp(HUMANIZED_OPENING_MIN_TIME_MS, HUMANIZED_MAX_TIME_MS)
 }
 
-fn humanized_delay_with_budget(
-    desired: Duration,
-    search_elapsed: Duration,
-    budget_ms: Option<u64>,
-) -> Duration {
-    let Some(budget_ms) = budget_ms else {
-        return desired;
-    };
-    desired.min(Duration::from_millis(budget_ms).saturating_sub(search_elapsed))
-}
-
 fn wait_for_or_stop(delay: Duration, stop: &AtomicBool) {
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -641,8 +630,9 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         thread::park_timeout(Duration::from_millis(10));
     }
     if state.humanize && !params.infinite && result.best_move.is_some() {
-        let desired_delay = humanized_think_time(&result, state.standard_startpos, state.game_ply);
-        let delay = humanized_delay_with_budget(desired_delay, started.elapsed(), budget_ms);
+        let delay = humanized_think_time(&result, state.standard_startpos, state.game_ply);
+        println!("info string humanize delay {} ms", delay.as_millis());
+        flush();
         wait_for_or_stop(delay, &stop);
     }
     match result.best_move {
@@ -753,28 +743,6 @@ mod tests {
         assert!(clear_first_move < clear_mid_opening);
         assert!(clear_mid_opening < clear_after_opening);
         assert!(clear_after_opening < hard_position);
-    }
-
-    #[test]
-    fn humanized_delay_is_additional_but_never_exceeds_clock_budget() {
-        let desired = Duration::from_millis(2_000);
-
-        assert_eq!(
-            humanized_delay_with_budget(desired, Duration::from_millis(900), None),
-            desired
-        );
-        assert_eq!(
-            humanized_delay_with_budget(desired, Duration::from_millis(900), Some(5_000)),
-            desired
-        );
-        assert_eq!(
-            humanized_delay_with_budget(desired, Duration::from_millis(900), Some(2_000)),
-            Duration::from_millis(1_100)
-        );
-        assert_eq!(
-            humanized_delay_with_budget(desired, Duration::from_millis(1_200), Some(1_000)),
-            Duration::ZERO
-        );
     }
 
     #[test]
