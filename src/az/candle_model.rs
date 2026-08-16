@@ -6,6 +6,7 @@ use super::{
     RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE,
     STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch,
     fused_feature_pool::feature_pool, fused_policy::fused_policy,
+    fused_sparse_policy::sparse_policy,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -113,10 +114,7 @@ impl AzCandleModel {
             ],
             0,
         )?;
-        let sparse_logits = sparse_tables
-            .index_select(&batch.policy_sparse_indices.flatten_all()?, 0)?
-            .reshape((batch.batch_size, batch.max_policy_moves, 7))?
-            .sum(2)?;
+        let sparse_logits = sparse_policy(&sparse_tables, &batch.policy_sparse_indices)?;
         let policy_logits = (policy_logits + sparse_logits)?;
 
         Ok(ForwardOutput {
@@ -136,7 +134,6 @@ pub(super) struct BatchTensors {
     pub(super) feature_items: Tensor,
     pub(super) policy_items: Tensor,
     pub(super) policy_sparse_indices: Tensor,
-    pub(super) max_policy_moves: usize,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) value_wdl: Tensor,
@@ -169,7 +166,6 @@ impl BatchTensors {
                 (batch_size, max_policy_moves, 7),
                 device,
             )?,
-            max_policy_moves,
             policy_targets: Tensor::from_vec(
                 packed.policy_targets,
                 (batch_size, max_policy_moves),

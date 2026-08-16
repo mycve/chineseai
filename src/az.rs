@@ -16,6 +16,7 @@ mod candle_model;
 mod dataloader;
 mod fused_feature_pool;
 mod fused_policy;
+mod fused_sparse_policy;
 mod play;
 mod replay;
 mod train;
