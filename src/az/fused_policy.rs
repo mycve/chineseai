@@ -2,7 +2,9 @@ use std::sync::OnceLock;
 
 use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
-use super::{DENSE_MOVE_SPACE, POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE};
+use super::{
+    DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE,
+};
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
 const MOVE_BITS: u32 = 12;
@@ -15,12 +17,22 @@ const INPUT_LEN: usize = AZ_NNUE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE;
 const CONSEQUENCE_OFFSET: usize = INPUT_LEN;
 const BIAS_OFFSET: usize = CONSEQUENCE_OFFSET + POLICY_CONSEQUENCE_SIZE;
 const CONTEXT_OFFSET: usize = BIAS_OFFSET + DENSE_MOVE_SPACE;
-const TABLE_LEN: usize = CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE;
+const ACCUMULATOR_FEATURE_OFFSET: usize =
+    CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE;
+const ACCUMULATOR_MOVE_OFFSET: usize =
+    ACCUMULATOR_FEATURE_OFFSET + AZ_NNUE_INPUT_SIZE * POLICY_ACCUMULATOR_RANK;
+const TABLE_LEN: usize = ACCUMULATOR_MOVE_OFFSET + DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK;
+const POLICY_CONTEXT_TOTAL: usize = POLICY_MOVE_CONTEXT_SIZE + POLICY_ACCUMULATOR_RANK;
 const _: () = assert!(AZ_NNUE_INPUT_SIZE == 1260);
-const _: () = assert!(POLICY_CONSEQUENCE_SIZE == 32 && POLICY_MOVE_CONTEXT_SIZE == 16);
+const _: () = assert!(
+    POLICY_CONSEQUENCE_SIZE == 32
+        && POLICY_MOVE_CONTEXT_SIZE == 16
+        && POLICY_ACCUMULATOR_RANK == 32
+);
 const _: () = assert!(DENSE_MOVE_SPACE == 2086);
 const _: () = assert!(CONSEQUENCE_OFFSET == 40320 && BIAS_OFFSET == 40352);
-const _: () = assert!(CONTEXT_OFFSET == 42438 && TABLE_LEN == 75814);
+const _: () = assert!(CONTEXT_OFFSET == 42438 && ACCUMULATOR_FEATURE_OFFSET == 75814);
+const _: () = assert!(ACCUMULATOR_MOVE_OFFSET == 116134 && TABLE_LEN == 182886);
 
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void fused_policy_fwd(
@@ -44,8 +56,15 @@ extern "C" __global__ void fused_policy_fwd(
             value += delta * tables[40320u + h];
         }
         for (unsigned int h = 0; h < 16u; ++h) {
-            value += context[(index / moves) * 16u + h]
+            value += context[(index / moves) * 48u + h]
                    * tables[42438u + move_index * 16u + h];
+        }
+        for (unsigned int h = 0; h < 32u; ++h) {
+            float after = context[(index / moves) * 48u + 16u + h]
+                        + tables[75814u + to * 32u + h]
+                        - tables[75814u + from * 32u + h];
+            if (has_capture) after -= tables[75814u + captured * 32u + h];
+            value += after * tables[116134u + move_index * 32u + h];
         }
     }
     output[index] = value;
@@ -62,9 +81,9 @@ extern "C" __global__ void fused_policy_grad(
     if (((packed >> 47) & 1u) == 0u) return;
     unsigned int move_index = packed & 0xfffu;
     const float* context = context_grad;
-    const float* grad_output = context_grad + batch * 16u;
+    const float* grad_output = context_grad + batch * 48u;
     float* grad_tables = output;
-    float* grad_context = output + 75814u;
+    float* grad_context = output + 182886u;
     float g = grad_output[index];
     atomicAdd(grad_tables + 40352u + move_index, g);
     if (((packed >> 45) & 1u) == 0u) return;
@@ -86,8 +105,23 @@ extern "C" __global__ void fused_policy_grad(
     }
     for (unsigned int h = 0; h < 16u; ++h) {
         unsigned int context_index = 42438u + move_index * 16u + h;
-        atomicAdd(grad_tables + context_index, g * context[b * 16u + h]);
-        atomicAdd(grad_context + b * 16u + h, g * tables[context_index]);
+        atomicAdd(grad_tables + context_index, g * context[b * 48u + h]);
+        atomicAdd(grad_context + b * 48u + h, g * tables[context_index]);
+    }
+    for (unsigned int h = 0; h < 32u; ++h) {
+        unsigned int move_factor = 116134u + move_index * 32u + h;
+        float w = tables[move_factor];
+        float after = context[b * 48u + 16u + h]
+                    + tables[75814u + to * 32u + h]
+                    - tables[75814u + from * 32u + h];
+        atomicAdd(grad_context + b * 48u + 16u + h, g * w);
+        atomicAdd(grad_tables + 75814u + to * 32u + h, g * w);
+        atomicAdd(grad_tables + 75814u + from * 32u + h, -g * w);
+        if (has_capture) {
+            after -= tables[75814u + captured * 32u + h];
+            atomicAdd(grad_tables + 75814u + captured * 32u + h, -g * w);
+        }
+        atomicAdd(grad_tables + move_factor, g * after);
     }
 }
 "#;
@@ -126,7 +160,7 @@ pub(super) fn fused_policy(tables: &Tensor, context: &Tensor, items: &Tensor) ->
     let table_len = tables.dims1()?;
     let (batch, context_size) = context.dims2()?;
     let (item_batch, moves) = items.dims2()?;
-    if table_len != TABLE_LEN || context_size != POLICY_MOVE_CONTEXT_SIZE || item_batch != batch {
+    if table_len != TABLE_LEN || context_size != POLICY_CONTEXT_TOTAL || item_batch != batch {
         candle_core::bail!(
             "fused policy shape mismatch: tables={table_len}, context={:?}, items={:?}",
             context.dims(),
@@ -180,8 +214,21 @@ impl CustomOp3 for FusedPolicy {
                     value += delta * tables[CONSEQUENCE_OFFSET + h];
                 }
                 for h in 0..POLICY_MOVE_CONTEXT_SIZE {
-                    value += context[b * POLICY_MOVE_CONTEXT_SIZE + h]
+                    value += context[b * POLICY_CONTEXT_TOTAL + h]
                         * tables[CONTEXT_OFFSET + move_index * POLICY_MOVE_CONTEXT_SIZE + h];
+                }
+                for h in 0..POLICY_ACCUMULATOR_RANK {
+                    let mut after = context
+                        [b * POLICY_CONTEXT_TOTAL + POLICY_MOVE_CONTEXT_SIZE + h]
+                        + tables[ACCUMULATOR_FEATURE_OFFSET + to * POLICY_ACCUMULATOR_RANK + h]
+                        - tables[ACCUMULATOR_FEATURE_OFFSET + from * POLICY_ACCUMULATOR_RANK + h];
+                    if flag(packed, CAPTURE_VALID_BIT) {
+                        after -= tables
+                            [ACCUMULATOR_FEATURE_OFFSET + captured * POLICY_ACCUMULATOR_RANK + h];
+                    }
+                    value += after
+                        * tables
+                            [ACCUMULATOR_MOVE_OFFSET + move_index * POLICY_ACCUMULATOR_RANK + h];
                 }
             }
             output[index] = value;
@@ -226,8 +273,8 @@ impl CustomOp3 for FusedPolicy {
             tables.apply_op3_no_bwd(items, &context_grad, &FusedPolicyGrad(self.clone()))?;
         let grad_tables = grads.narrow(0, 0, TABLE_LEN)?;
         let grad_context = grads
-            .narrow(0, TABLE_LEN, self.batch * POLICY_MOVE_CONTEXT_SIZE)?
-            .reshape((self.batch, POLICY_MOVE_CONTEXT_SIZE))?;
+            .narrow(0, TABLE_LEN, self.batch * POLICY_CONTEXT_TOTAL)?
+            .reshape((self.batch, POLICY_CONTEXT_TOTAL))?;
         Ok((Some(grad_tables), Some(grad_context), None))
     }
 }
@@ -259,7 +306,7 @@ impl CustomOp3 for FusedPolicyGrad {
             "policy context and gradient",
         )?;
         let op = &self.0;
-        let context_len = op.batch * POLICY_MOVE_CONTEXT_SIZE;
+        let context_len = op.batch * POLICY_CONTEXT_TOTAL;
         let (context, grad_output) = context_grad.split_at(context_len);
         let mut output = vec![0.0f32; TABLE_LEN + context_len];
         let (grad_tables, grad_context) = output.split_at_mut(TABLE_LEN);
@@ -292,8 +339,27 @@ impl CustomOp3 for FusedPolicyGrad {
             }
             for h in 0..POLICY_MOVE_CONTEXT_SIZE {
                 let context_index = CONTEXT_OFFSET + move_index * POLICY_MOVE_CONTEXT_SIZE + h;
-                grad_tables[context_index] += g * context[b * POLICY_MOVE_CONTEXT_SIZE + h];
-                grad_context[b * POLICY_MOVE_CONTEXT_SIZE + h] += g * tables[context_index];
+                grad_tables[context_index] += g * context[b * POLICY_CONTEXT_TOTAL + h];
+                grad_context[b * POLICY_CONTEXT_TOTAL + h] += g * tables[context_index];
+            }
+            for h in 0..POLICY_ACCUMULATOR_RANK {
+                let move_factor =
+                    ACCUMULATOR_MOVE_OFFSET + move_index * POLICY_ACCUMULATOR_RANK + h;
+                let w = tables[move_factor];
+                let context_index = b * POLICY_CONTEXT_TOTAL + POLICY_MOVE_CONTEXT_SIZE + h;
+                let to_index = ACCUMULATOR_FEATURE_OFFSET + to * POLICY_ACCUMULATOR_RANK + h;
+                let from_index = ACCUMULATOR_FEATURE_OFFSET + from * POLICY_ACCUMULATOR_RANK + h;
+                let mut after = context[context_index] + tables[to_index] - tables[from_index];
+                grad_context[context_index] += g * w;
+                grad_tables[to_index] += g * w;
+                grad_tables[from_index] -= g * w;
+                if flag(packed, CAPTURE_VALID_BIT) {
+                    let captured_index =
+                        ACCUMULATOR_FEATURE_OFFSET + captured * POLICY_ACCUMULATOR_RANK + h;
+                    after -= tables[captured_index];
+                    grad_tables[captured_index] -= g * w;
+                }
+                grad_tables[move_factor] += g * after;
             }
         }
         Ok((CpuStorage::F32(output), (TABLE_LEN + context_len).into()))
@@ -384,7 +450,7 @@ fn cuda_forward(
     let output = unsafe { device.alloc::<f32>(op.batch * op.moves)? };
     let function = device.get_or_load_custom_func(
         "fused_policy_fwd",
-        "chineseai_fused_policy_v1",
+        "chineseai_fused_policy_v2",
         policy_ptx()?,
     )?;
     let mut builder = function.builder();
@@ -427,11 +493,11 @@ fn cuda_gradient(
     let items = cuda_view(items, item_layout, "policy items")?;
     let context_grad = cuda_view(context_grad, context_grad_layout, "policy context/gradient")?;
     let device = &table_storage.device;
-    let output_len = TABLE_LEN + op.batch * POLICY_MOVE_CONTEXT_SIZE;
+    let output_len = TABLE_LEN + op.batch * POLICY_CONTEXT_TOTAL;
     let output = device.alloc_zeros::<f32>(output_len)?;
     let function = device.get_or_load_custom_func(
         "fused_policy_grad",
-        "chineseai_fused_policy_v1",
+        "chineseai_fused_policy_v2",
         policy_ptx()?,
     )?;
     let mut builder = function.builder();
@@ -477,11 +543,11 @@ mod tests {
         let table_values = (0..TABLE_LEN)
             .map(|index| ((index % 97) as f32 - 48.0) * 0.001)
             .collect::<Vec<_>>();
-        let context_values = (0..2 * POLICY_MOVE_CONTEXT_SIZE)
+        let context_values = (0..2 * POLICY_CONTEXT_TOTAL)
             .map(|index| (index as f32 - 12.0) * 0.01)
             .collect::<Vec<_>>();
         let tables = Var::from_slice(&table_values, TABLE_LEN, device)?;
-        let context = Var::from_slice(&context_values, (2, POLICY_MOVE_CONTEXT_SIZE), device)?;
+        let context = Var::from_slice(&context_values, (2, POLICY_CONTEXT_TOTAL), device)?;
         let items = [
             pack_policy_item(3, 10, 11, 20, true, true),
             pack_policy_item(7, 30, 40, 0, true, false),

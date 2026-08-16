@@ -1,10 +1,11 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_CONSEQUENCE_SIZE,
-    POLICY_MOVE_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
-    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
-    dataloader::PackedBatch, fused_feature_pool::feature_pool, fused_policy::fused_policy,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_ACCUMULATOR_RANK,
+    POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
+    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
+    WDL_HEAD_SIZE, dataloader::PackedBatch, fused_feature_pool::feature_pool,
+    fused_policy::fused_policy,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -31,6 +32,8 @@ pub(super) struct AzCandleModel {
     policy_consequence_output: Var,
     policy_context_hidden: Var,
     policy_move_context: Var,
+    policy_accumulator_hidden: Var,
+    policy_accumulator_move: Var,
 }
 
 impl AzCandleModel {
@@ -94,12 +97,20 @@ impl AzCandleModel {
         };
         let piece_square_policy = piece_square_policy.flatten_all()?;
         let policy_context = hidden.matmul(&self.policy_context_hidden.t()?)?;
+        let accumulator_context = sparse_pre.matmul(&self.policy_accumulator_hidden.t()?)?;
+        let policy_context = Tensor::cat(&[&policy_context, &accumulator_context], 1)?;
+        let accumulator_feature = self
+            .input_hidden
+            .matmul(&self.policy_accumulator_hidden.t()?)?
+            .flatten_all()?;
         let policy_tables = Tensor::cat(
             &[
                 &piece_square_policy,
                 &self.policy_consequence_output.flatten_all()?,
                 &self.policy_move_bias.flatten_all()?,
                 &self.policy_move_context.flatten_all()?,
+                &accumulator_feature,
+                &self.policy_accumulator_move.flatten_all()?,
             ],
             0,
         )?;
@@ -256,6 +267,16 @@ impl AzCandleModel {
                 (DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE),
                 device,
             )?,
+            policy_accumulator_hidden: var_from_slice(
+                &model.policy_accumulator_hidden,
+                (POLICY_ACCUMULATOR_RANK, hidden),
+                device,
+            )?,
+            policy_accumulator_move: var_from_slice(
+                &model.policy_accumulator_move,
+                (DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK),
+                device,
+            )?,
         })
     }
 
@@ -279,6 +300,8 @@ impl AzCandleModel {
         vars.push(self.policy_consequence_output.clone());
         vars.push(self.policy_context_hidden.clone());
         vars.push(self.policy_move_context.clone());
+        vars.push(self.policy_accumulator_hidden.clone());
+        vars.push(self.policy_accumulator_move.clone());
         vars
     }
 
@@ -313,6 +336,15 @@ impl AzCandleModel {
             &mut model.policy_context_hidden,
         )?;
         copy_var(&self.policy_move_context, &mut model.policy_move_context)?;
+        copy_var(
+            &self.policy_accumulator_hidden,
+            &mut model.policy_accumulator_hidden,
+        )?;
+        copy_var(
+            &self.policy_accumulator_move,
+            &mut model.policy_accumulator_move,
+        )?;
+        model.rebuild_policy_accumulator_feature();
         Ok(())
     }
 
@@ -381,6 +413,10 @@ mod tests {
         for (index, weight) in model.policy_move_context.iter_mut().enumerate() {
             *weight = ((index % POLICY_MOVE_CONTEXT_SIZE) as f32 + 1.0) * 0.002;
         }
+        for (index, weight) in model.policy_accumulator_move.iter_mut().enumerate() {
+            *weight = ((index % POLICY_ACCUMULATOR_RANK) as f32 + 1.0) * 0.0002;
+        }
+        model.rebuild_policy_accumulator_feature();
 
         let mut cpu = AzEvalScratch::new(model.arch);
         model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
@@ -446,6 +482,18 @@ mod tests {
                 .iter()
                 .any(|gradient| gradient.abs() > 1.0e-8)
         );
+        let accumulator_move_gradient = gradients
+            .get(&gradient_candle.policy_accumulator_move)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            accumulator_move_gradient
+                .iter()
+                .any(|gradient| gradient.abs() > 1.0e-8)
+        );
     }
 
     /// CPU ???`AzNnue`?? Candle GPU ???????????
@@ -488,6 +536,8 @@ mod tests {
             policy_consequence_output,
             policy_context_hidden,
             policy_move_context,
+            policy_accumulator_hidden,
+            policy_accumulator_move,
         );
     }
 }
