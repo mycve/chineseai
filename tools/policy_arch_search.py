@@ -389,6 +389,8 @@ def main():
     parser.add_argument("--output", default="eval/torch-policy-search")
     parser.add_argument("--init-model")
     parser.add_argument("--value-weight", type=float, default=0.0)
+    parser.add_argument("--margin-weight", type=float, default=0.0)
+    parser.add_argument("--margin", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=1)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
@@ -427,7 +429,13 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     logits, value = model(*(t[ids] for t in tensors[:5]))
-                    loss = F.cross_entropy(logits.float(), tensors[5][ids])
+                    policy_logits = logits.float()
+                    targets = tensors[5][ids]
+                    loss = F.cross_entropy(policy_logits, targets)
+                    if args.margin_weight:
+                        correct = policy_logits.gather(1, targets[:, None]).squeeze(1)
+                        wrong = policy_logits.scatter(1, targets[:, None], -torch.inf).amax(1)
+                        loss += args.margin_weight * F.relu(args.margin - correct + wrong).mean()
                     loss += args.value_weight * (-(tensors[6][ids] * F.log_softmax(value.float(), -1)).sum(-1)).mean()
                     if hasattr(model, "moe_aux_loss"):
                         loss += 0.01 * model.moe_aux_loss
