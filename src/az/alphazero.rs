@@ -6,8 +6,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, POLICY_ACCUMULATOR_RANK, SplitMix64,
-    color_index, rule_context_features,
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzIncrementalEvalRequest, AzNnue,
+    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;
@@ -308,6 +308,116 @@ pub(super) fn alphazero_search_with_rules_reusing(
     result
 }
 
+pub struct AzBatchSearchInput {
+    pub position: Position,
+    pub rule_history: Vec<RuleHistoryEntry>,
+    pub root_moves: Vec<Move>,
+    pub limits: AzSearchLimits,
+}
+
+pub fn alphazero_search_batch4(
+    inputs: [AzBatchSearchInput; 4],
+    model: &AzNnue,
+) -> [AzSearchResult; 4] {
+    let [a, b, c, d] = inputs;
+    let simulation_targets = [
+        a.limits.simulations,
+        b.limits.simulations,
+        c.limits.simulations,
+        d.limits.simulations,
+    ];
+    let mut trees = [
+        AzTree::new(a.position, a.rule_history, Some(a.root_moves), model, a.limits),
+        AzTree::new(b.position, b.rule_history, Some(b.root_moves), model, b.limits),
+        AzTree::new(c.position, c.rule_history, Some(c.root_moves), model, c.limits),
+        AzTree::new(d.position, d.rule_history, Some(d.root_moves), model, d.limits),
+    ];
+    for tree in &mut trees {
+        let root = tree.root;
+        tree.expand(root);
+    }
+
+    let mut completed = [0usize; 4];
+    let mut active: [Option<BatchSimulation>; 4] = std::array::from_fn(|_| None);
+    let mut pending: [Option<PendingLeaf>; 4] = std::array::from_fn(|_| None);
+    loop {
+        for index in 0..4 {
+            while pending[index].is_none() && completed[index] < simulation_targets[index] {
+                let simulation = active[index].take().unwrap_or_else(|| BatchSimulation {
+                    node_index: trees[index].root,
+                    depth: 0,
+                    path: Vec::with_capacity(64),
+                    root_history_len: trees[index].rule_history_scratch.len(),
+                });
+                match trees[index].prepare_batch_simulation(simulation) {
+                    BatchPrepare::Pending(leaf) => pending[index] = Some(leaf),
+                    BatchPrepare::Complete => completed[index] += 1,
+                }
+            }
+        }
+        if completed
+            .iter()
+            .zip(simulation_targets)
+            .all(|(&done, target)| done >= target)
+        {
+            break;
+        }
+
+        if pending.iter().all(Option::is_some) {
+            let [tree0, tree1, tree2, tree3] = &mut trees;
+            let [leaf0, leaf1, leaf2, leaf3] = &pending;
+            let leaf0 = leaf0.as_ref().unwrap();
+            let leaf1 = leaf1.as_ref().unwrap();
+            let leaf2 = leaf2.as_ref().unwrap();
+            let leaf3 = leaf3.as_ref().unwrap();
+            let mut requests = [
+                pending_leaf_request(tree0, leaf0, model.hidden_size),
+                pending_leaf_request(tree1, leaf1, model.hidden_size),
+                pending_leaf_request(tree2, leaf2, model.hidden_size),
+                pending_leaf_request(tree3, leaf3, model.hidden_size),
+            ];
+            let evals = model.evaluate_incremental_batch4(&mut requests);
+            drop(requests);
+            for index in 0..4 {
+                let leaf = pending[index].take().unwrap();
+                active[index] = trees[index].finalize_pending_leaf(leaf, evals[index]);
+                if active[index].is_none() {
+                    completed[index] += 1;
+                }
+            }
+        } else {
+            for index in 0..4 {
+                let Some(leaf) = pending[index].take() else {
+                    continue;
+                };
+                let node_index = leaf.simulation.node_index;
+                let start = trees[index].nodes[node_index].accumulator_offset as usize;
+                let end = start + model.hidden_size;
+                let eval = model.evaluate_incremental_with_scratch_output(
+                    &trees[index].nodes[node_index].position,
+                    &trees[index].accumulator_arena[start..end],
+                    &trees[index].nodes[node_index].policy_accumulator,
+                    &leaf.moves,
+                    &leaf.rule_context,
+                    &mut trees[index].eval_scratch,
+                );
+                active[index] = trees[index].finalize_pending_leaf(leaf, eval);
+                if active[index].is_none() {
+                    completed[index] += 1;
+                }
+            }
+        }
+    }
+
+    let [tree0, tree1, tree2, tree3] = trees;
+    [
+        tree0.search_result(completed[0]),
+        tree1.search_result(completed[1]),
+        tree2.search_result(completed[2]),
+        tree3.search_result(completed[3]),
+    ]
+}
+
 pub fn cp_from_q(q: f32) -> i32 {
     (q.clamp(-1.0, 1.0) * 1000.0).round() as i32
 }
@@ -368,6 +478,43 @@ struct AzChild {
     visits: u32,
     value_wdl_sum: [f32; 3],
     child: u32,
+}
+
+struct BatchSimulation {
+    node_index: usize,
+    depth: usize,
+    path: Vec<(usize, usize)>,
+    root_history_len: usize,
+}
+
+struct PendingLeaf {
+    simulation: BatchSimulation,
+    moves: Vec<Move>,
+    rule_context: [f32; super::RULE_CONTEXT_SIZE],
+    was_in_check: bool,
+    cutoff: bool,
+}
+
+enum BatchPrepare {
+    Pending(PendingLeaf),
+    Complete,
+}
+
+fn pending_leaf_request<'a>(
+    tree: &'a mut AzTree<'_>,
+    leaf: &'a PendingLeaf,
+    hidden_size: usize,
+) -> AzIncrementalEvalRequest<'a> {
+    let node = &tree.nodes[leaf.simulation.node_index];
+    let start = node.accumulator_offset as usize;
+    AzIncrementalEvalRequest {
+        position: &node.position,
+        accumulator_hidden: &tree.accumulator_arena[start..start + hidden_size],
+        policy_accumulator: &node.policy_accumulator,
+        moves: &leaf.moves,
+        rule_context: &leaf.rule_context,
+        scratch: &mut tree.eval_scratch,
+    }
 }
 
 impl AzChild {
@@ -991,6 +1138,307 @@ impl<'a> AzTree<'a> {
         add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
         self.add_node_visit(node_index, eval);
         eval
+    }
+
+    fn ensure_child_node(&mut self, node_index: usize, child_index: usize) -> usize {
+        if let Some(child_node) = self.node_children(node_index)[child_index].child_node() {
+            return child_node;
+        }
+        let mv = self.node_children(node_index)[child_index].mv;
+        let mut child_position = self.nodes[node_index].position.clone();
+        let moved = child_position.piece_at(mv.from as usize).unwrap();
+        let captured = child_position.piece_at(mv.to as usize);
+        let mover = child_position.side_to_move();
+        child_position.make_move(mv);
+        let perspective = child_position.side_to_move();
+        let mut child_policy_accumulator = if node_index == self.root {
+            self.root_policy_accumulators[color_index(perspective)]
+        } else {
+            let grandparent = self.nodes[node_index].parent as usize;
+            self.nodes[grandparent].policy_accumulator
+        };
+        let child_accumulator_offset = self.accumulator_arena.len();
+        let base_offset = if node_index == self.root {
+            match perspective {
+                Color::Red => 0,
+                Color::Black => self.model.hidden_size,
+            }
+        } else {
+            let grandparent = self.nodes[node_index].parent as usize;
+            self.nodes[grandparent].accumulator_offset as usize
+        };
+        self.accumulator_arena
+            .extend_from_within(base_offset..base_offset + self.model.hidden_size);
+        let accumulator = &mut self.accumulator_arena
+            [child_accumulator_offset..child_accumulator_offset + self.model.hidden_size];
+        if node_index != self.root {
+            let grandparent = self.nodes[node_index].parent as usize;
+            let parent_move = self.nodes[node_index]
+                .incoming_move
+                .expect("non-root node must have an incoming move");
+            let parent_moved = self.nodes[grandparent]
+                .position
+                .piece_at(parent_move.from as usize)
+                .expect("incoming move must start on an occupied square");
+            let parent_captured = self.nodes[grandparent]
+                .position
+                .piece_at(parent_move.to as usize);
+            AzEvalAccumulator::apply_transition_for_perspective(
+                self.model,
+                &self.nodes[grandparent].position,
+                &self.nodes[node_index].position,
+                parent_move,
+                parent_moved,
+                parent_captured,
+                perspective,
+                accumulator,
+            );
+            self.model.apply_quantized_policy_transition(
+                &self.nodes[grandparent].position,
+                &self.nodes[node_index].position,
+                parent_move,
+                parent_moved,
+                parent_captured,
+                perspective,
+                &mut child_policy_accumulator,
+            );
+        }
+        AzEvalAccumulator::apply_transition_for_perspective(
+            self.model,
+            &self.nodes[node_index].position,
+            &child_position,
+            mv,
+            moved,
+            captured,
+            perspective,
+            accumulator,
+        );
+        self.model.apply_quantized_policy_transition(
+            &self.nodes[node_index].position,
+            &child_position,
+            mv,
+            moved,
+            captured,
+            perspective,
+            &mut child_policy_accumulator,
+        );
+        let child_rule_entry =
+            child_position.rule_history_entry_after_moved(mover, mv.to as usize);
+        let child_node = self.nodes.len();
+        self.nodes.push(AzNode {
+            position: child_position,
+            accumulator_offset: u32::try_from(child_accumulator_offset)
+                .expect("MCTS accumulator arena exceeds compact offset range"),
+            policy_accumulator: child_policy_accumulator,
+            parent: u32::try_from(node_index)
+                .expect("MCTS node index exceeds compact parent range"),
+            incoming_move: Some(mv),
+            rule_entry: Some(child_rule_entry),
+            children_offset: 0,
+            children_len: 0,
+            visits: 0,
+            value_wdl_sum: [0.0; 3],
+            value: 0.0,
+            value_wdl: [0.0, 1.0, 0.0],
+            expanded: false,
+        });
+        self.node_children_mut(node_index)[child_index].set_child_node(child_node);
+        child_node
+    }
+
+    fn finish_batch_simulation(
+        &mut self,
+        simulation: BatchSimulation,
+        mut eval: AzEvalOutput,
+        cutoff: bool,
+    ) {
+        self.add_node_visit(simulation.node_index, eval);
+        self.record_leaf_depth(simulation.depth, cutoff);
+        for (parent, child_index) in simulation.path.into_iter().rev() {
+            eval = AzEvalOutput {
+                value_wdl: flip_wdl(eval.value_wdl),
+                value: -eval.value,
+            };
+            let child = &mut self.node_children_mut(parent)[child_index];
+            child.visits += 1;
+            add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
+            self.add_node_visit(parent, eval);
+        }
+        self.rule_history_scratch
+            .truncate(simulation.root_history_len);
+    }
+
+    fn prepare_batch_simulation(&mut self, mut simulation: BatchSimulation) -> BatchPrepare {
+        loop {
+            let node_index = simulation.node_index;
+            if simulation.depth >= self.max_depth {
+                if self.nodes[node_index].expanded {
+                    let eval = self.node_eval(node_index);
+                    self.finish_batch_simulation(simulation, eval, true);
+                    return BatchPrepare::Complete;
+                }
+                if let Some(value) =
+                    terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
+                {
+                    let eval = AzEvalOutput {
+                        value_wdl: scalar_terminal_wdl(value),
+                        value,
+                    };
+                    self.nodes[node_index].value = value;
+                    self.nodes[node_index].value_wdl = eval.value_wdl;
+                    self.finish_batch_simulation(simulation, eval, true);
+                    return BatchPrepare::Complete;
+                }
+                let moves = self.nodes[node_index]
+                    .position
+                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
+                    .into_iter()
+                    .map(|(mv, _)| mv)
+                    .collect::<Vec<_>>();
+                if moves.is_empty() {
+                    let eval = AzEvalOutput {
+                        value_wdl: [0.0, 0.0, 1.0],
+                        value: -1.0,
+                    };
+                    self.nodes[node_index].value = eval.value;
+                    self.nodes[node_index].value_wdl = eval.value_wdl;
+                    self.finish_batch_simulation(simulation, eval, true);
+                    return BatchPrepare::Complete;
+                }
+                let rule_context = rule_context_features(
+                    &self.nodes[node_index].position,
+                    &self.rule_history_scratch,
+                );
+                return BatchPrepare::Pending(PendingLeaf {
+                    simulation,
+                    moves,
+                    rule_context,
+                    was_in_check: false,
+                    cutoff: true,
+                });
+            }
+
+            if !self.nodes[node_index].expanded {
+                if let Some(value) =
+                    terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
+                {
+                    let eval = AzEvalOutput {
+                        value_wdl: scalar_terminal_wdl(value),
+                        value,
+                    };
+                    self.nodes[node_index].value = value;
+                    self.nodes[node_index].value_wdl = eval.value_wdl;
+                    self.nodes[node_index].expanded = true;
+                    self.finish_batch_simulation(simulation, eval, false);
+                    return BatchPrepare::Complete;
+                }
+                let moves = self.nodes[node_index]
+                    .position
+                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
+                    .into_iter()
+                    .map(|(mv, _)| mv)
+                    .collect::<Vec<_>>();
+                if moves.is_empty() {
+                    let eval = AzEvalOutput {
+                        value_wdl: [0.0, 0.0, 1.0],
+                        value: -1.0,
+                    };
+                    self.nodes[node_index].value = eval.value;
+                    self.nodes[node_index].value_wdl = eval.value_wdl;
+                    self.nodes[node_index].expanded = true;
+                    self.finish_batch_simulation(simulation, eval, false);
+                    return BatchPrepare::Complete;
+                }
+                let was_in_check = self.nodes[node_index]
+                    .position
+                    .in_check(self.nodes[node_index].position.side_to_move());
+                let rule_context = rule_context_features(
+                    &self.nodes[node_index].position,
+                    &self.rule_history_scratch,
+                );
+                return BatchPrepare::Pending(PendingLeaf {
+                    simulation,
+                    moves,
+                    rule_context,
+                    was_in_check,
+                    cutoff: false,
+                });
+            }
+
+            if self.nodes[node_index].children_len == 0 {
+                let eval = self.node_eval(node_index);
+                self.finish_batch_simulation(simulation, eval, false);
+                return BatchPrepare::Complete;
+            }
+            let child_index = self.select_child(node_index);
+            let child_node = self.ensure_child_node(node_index, child_index);
+            simulation.path.push((node_index, child_index));
+            simulation.node_index = child_node;
+            simulation.depth += 1;
+            if let Some(entry) = self.nodes[child_node].rule_entry {
+                self.rule_history_scratch.push(entry);
+            }
+        }
+    }
+
+    fn finalize_pending_leaf(
+        &mut self,
+        pending: PendingLeaf,
+        mut eval: AzEvalOutput,
+    ) -> Option<BatchSimulation> {
+        let node_index = pending.simulation.node_index;
+        eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
+        eval.value *= self.value_scale;
+        self.nodes[node_index].value = eval.value;
+        self.nodes[node_index].value_wdl = eval.value_wdl;
+        if pending.cutoff {
+            self.finish_batch_simulation(pending.simulation, eval, true);
+            return None;
+        }
+
+        let priors = softmax_into(
+            &self.eval_scratch.logits[..pending.moves.len()],
+            self.policy_softmax_temp,
+            &mut self.eval_scratch.priors,
+        );
+        let gives_checks = &self.eval_scratch.policy_gives_check;
+        let offset = self.children.len();
+        self.children.extend(
+            pending
+                .moves
+                .into_iter()
+                .zip(priors.drain(..))
+                .zip(gives_checks.iter().copied())
+                .map(|((mv, prior), gives_check)| AzChild {
+                    mv,
+                    prior,
+                    gives_check: gives_check != 0.0,
+                    visits: 0,
+                    value_wdl_sum: [0.0; 3],
+                    child: NO_CHILD,
+                }),
+        );
+        let len = self.children.len() - offset;
+        self.nodes[node_index].children_offset =
+            u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
+        self.nodes[node_index].children_len =
+            u16::try_from(len).expect("MCTS node has too many legal moves");
+        self.nodes[node_index].expanded = true;
+
+        if len > 0 && (pending.was_in_check || len == 1) {
+            let mut simulation = pending.simulation;
+            let child_node = self.ensure_child_node(node_index, 0);
+            simulation.path.push((node_index, 0));
+            simulation.node_index = child_node;
+            simulation.depth += 1;
+            if let Some(entry) = self.nodes[child_node].rule_entry {
+                self.rule_history_scratch.push(entry);
+            }
+            Some(simulation)
+        } else {
+            self.finish_batch_simulation(pending.simulation, eval, false);
+            None
+        }
     }
 
     fn cutoff_value(&mut self, node_index: usize) -> AzEvalOutput {
@@ -1754,6 +2202,90 @@ mod tests {
         );
 
         assert_eq!(tree.select_child(tree.root), 1);
+    }
+
+    #[test]
+    fn four_tree_batch_search_matches_scalar_search() {
+        let model = AzNnue::random(32, 73);
+        let positions = std::array::from_fn(|index| {
+            let mut position = Position::startpos();
+            for ply in 0..index {
+                let legal = position.legal_moves();
+                position.make_move(legal[(index + ply) % legal.len()]);
+            }
+            position
+        });
+        let limits = AzSearchLimits {
+            simulations: 24,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            ..AzSearchLimits::default()
+        };
+        let scalar = positions.each_ref().map(|position| {
+            alphazero_search_with_rules(position, None, None, &model, limits)
+        });
+        let inputs = positions.map(|position| AzBatchSearchInput {
+            root_moves: position.legal_moves(),
+            rule_history: position.initial_rule_history(),
+            position,
+            limits,
+        });
+        let batched = alphazero_search_batch4(inputs, &model);
+
+        for (scalar, batched) in scalar.iter().zip(&batched) {
+            assert_eq!(scalar.best_move, batched.best_move);
+            assert_eq!(scalar.simulations, batched.simulations);
+            assert_eq!(scalar.candidates.len(), batched.candidates.len());
+            assert_eq!(
+                scalar.candidates.iter().map(|child| child.visits).sum::<u32>(),
+                batched.candidates.iter().map(|child| child.visits).sum::<u32>()
+            );
+            assert!((scalar.value_q - batched.value_q).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual fast-profile four-tree search benchmark"]
+    fn benchmark_four_tree_batch_search() {
+        let model = AzNnue::random(128, 79);
+        let positions = std::array::from_fn(|index| {
+            let mut position = Position::startpos();
+            for ply in 0..index {
+                let legal = position.legal_moves();
+                position.make_move(legal[(index + ply) % legal.len()]);
+            }
+            position
+        });
+        let limits = AzSearchLimits {
+            simulations: 512,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            ..AzSearchLimits::default()
+        };
+        let started = Instant::now();
+        for position in &positions {
+            std::hint::black_box(alphazero_search_with_rules(
+                position,
+                None,
+                None,
+                &model,
+                limits,
+            ));
+        }
+        let scalar = started.elapsed();
+        let inputs = positions.map(|position| AzBatchSearchInput {
+            root_moves: position.legal_moves(),
+            rule_history: position.initial_rule_history(),
+            position,
+            limits,
+        });
+        let started = Instant::now();
+        std::hint::black_box(alphazero_search_batch4(inputs, &model));
+        let batched = started.elapsed();
+        eprintln!(
+            "four-tree search: scalar={scalar:?} batch4={batched:?} speedup={:.3}x",
+            scalar.as_secs_f64() / batched.as_secs_f64()
+        );
     }
 
     #[test]
