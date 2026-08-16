@@ -86,10 +86,11 @@ class ResidualTrunk(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList(nn.Sequential(nn.Linear(hidden, hidden * 2), nn.SiLU(),
                                                   nn.Linear(hidden * 2, hidden)) for _ in range(depth))
+        self.scales = nn.Parameter(torch.zeros(depth))
 
     def forward(self, value):
-        for block in self.blocks:
-            value = value + block(F.rms_norm(value, (value.shape[-1],)))
+        for scale, block in zip(self.scales, self.blocks):
+            value = value + scale * block(F.rms_norm(value, (value.shape[-1],)))
         return value
 
 
@@ -99,7 +100,8 @@ class PolicyNet(nn.Module):
         self.variant, self.rank = variant, rank
         self.feature = nn.Embedding(feature_vocab + 1, hidden, padding_idx=feature_vocab)
         self.norm = nn.RMSNorm(hidden)
-        self.trunk = ResidualTrunk(hidden) if "deep" in variant else nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU())
+        self.trunk = (ResidualTrunk(hidden, 8 if "verydeep" in variant else 4)
+                      if "deep" in variant else nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU()))
         if "conv" in variant:
             channels = 64
             self.board_piece = nn.Embedding(15, channels)
@@ -118,6 +120,26 @@ class PolicyNet(nn.Module):
         self.move_bias = nn.Embedding(move_vocab, 1)
         self.move = nn.Embedding(move_vocab, rank)
         self.query = nn.Linear(hidden, rank)
+        if variant.startswith("full_accumulator"):
+            accumulator_input = hidden + rank
+            self.accumulator_move = nn.Embedding(move_vocab, rank)
+            self.accumulator_check = nn.Embedding(2, rank)
+            if "piece_moe" in variant:
+                self.piece_moe_experts = nn.ModuleList(
+                    nn.Sequential(nn.Linear(policy_input, rank * 2), nn.SiLU(), nn.Linear(rank * 2, 1))
+                    for _ in range(8))
+            elif "moe" in variant:
+                self.moe_gate = nn.Linear(accumulator_input, 8)
+                self.moe_experts = nn.ModuleList(
+                    nn.Sequential(nn.Linear(accumulator_input, hidden * 2), nn.SiLU(),
+                                  nn.Linear(hidden * 2, 1)) for _ in range(8))
+            else:
+                depth = 3 if "deep" in variant else 1
+                layers = [nn.Linear(accumulator_input, hidden * 2), nn.SiLU()]
+                for _ in range(depth - 1):
+                    layers.extend((nn.Linear(hidden * 2, hidden * 2), nn.SiLU()))
+                layers.append(nn.Linear(hidden * 2, 1))
+                self.accumulator_head = nn.Sequential(*layers)
         if variant == "current_like":
             self.current_consequence = nn.Embedding(feature_vocab + 1, 1, padding_idx=feature_vocab)
         pairs = dense_move_squares()
@@ -145,8 +167,24 @@ class PolicyNet(nn.Module):
                 policy_input = rank * 5
             else:
                 policy_input = rank * 3
-            self.policy_mlp = nn.Sequential(nn.Linear(policy_input, rank * 2), nn.SiLU(), nn.Linear(rank * 2, 1))
-        elif variant not in ("dot", "current_like"):
+            if "moe" in variant:
+                self.policy_moe_gate = nn.Linear(policy_input, 8)
+                self.policy_moe_experts = nn.ModuleList(
+                    nn.Sequential(nn.Linear(policy_input, rank * 2), nn.SiLU(), nn.Linear(rank * 2, 1))
+                    for _ in range(8))
+            else:
+                self.policy_mlp = nn.Sequential(nn.Linear(policy_input, rank * 2), nn.SiLU(), nn.Linear(rank * 2, 1))
+            if "accumulator" in variant:
+                if "factor" in variant:
+                    self.accumulator_factor_hidden = nn.Linear(hidden, rank, bias=False)
+                    self.accumulator_factor_move = nn.Embedding(move_vocab, rank)
+                    nn.init.zeros_(self.accumulator_factor_move.weight)
+                else:
+                    self.accumulator_residual = nn.Sequential(
+                        nn.Linear(hidden + rank, hidden * 2), nn.SiLU(), nn.Linear(hidden * 2, 1))
+                    nn.init.zeros_(self.accumulator_residual[-1].weight)
+                    nn.init.zeros_(self.accumulator_residual[-1].bias)
+        elif variant not in ("dot", "current_like") and not variant.startswith("full_accumulator"):
             raise ValueError(variant)
         self.value = nn.Sequential(nn.Linear(hidden, 96), nn.SiLU(), nn.Linear(96, 3))
 
@@ -184,6 +222,37 @@ class PolicyNet(nn.Module):
             if hasattr(self, "pretrained_bias"):
                 summed = summed + self.pretrained_bias
             context = self.trunk(self.norm(summed))
+        if self.variant.startswith("full_accumulator"):
+            sources, targets = self.move_from[moves], self.move_to[moves]
+            moving = board.gather(1, sources)
+            captured = board.gather(1, targets)
+            moving_kind = moving - 1
+            padding_id = torch.full_like(targets, self.feature.padding_idx)
+            after_id = torch.where(moving > 0, moving_kind * 90 + targets, padding_id)
+            before_id = torch.where(moving > 0, moving_kind * 90 + sources, padding_id)
+            captured_id = torch.where(captured > 0, (captured - 1) * 90 + targets, padding_id)
+            root = tokens.sum(1)
+            after = root[:, None] + self.feature(after_id) - self.feature(before_id) - self.feature(captured_id)
+            move_state = self.accumulator_move(moves) + self.accumulator_check(checks)
+            policy_input = torch.cat((F.rms_norm(after, (after.shape[-1],)), move_state), -1)
+            if hasattr(self, "moe_gate"):
+                gate_logits = self.moe_gate(policy_input)
+                top_values, top_indices = gate_logits.topk(2, dim=-1)
+                top_weights = top_values.softmax(-1)
+                gate_prob = gate_logits.softmax(-1)
+                assignment = F.one_hot(top_indices, len(self.moe_experts)).float().sum(-2) * 0.5
+                valid = mask[..., None]
+                denominator = valid.sum().clamp_min(1)
+                self.moe_aux_loss = 8 * (((gate_prob * valid).sum((0, 1)) / denominator)
+                                         * ((assignment * valid).sum((0, 1)) / denominator)).sum()
+                expert_logits = torch.stack(
+                    [expert(policy_input).squeeze(-1) for expert in self.moe_experts], -1)
+                logits = ((expert_logits * gate_prob).sum(-1) if self.training else
+                          expert_logits.gather(-1, top_indices).mul(top_weights).sum(-1))
+            else:
+                logits = self.accumulator_head(policy_input).squeeze(-1)
+            logits = logits + self.move_bias(moves).squeeze(-1)
+            return logits.masked_fill(~mask, -1e4), self.value(context)
         move = self.move(moves)
         if self.variant.startswith("structured"):
             sources, targets = self.move_from[moves], self.move_to[moves]
@@ -234,7 +303,38 @@ class PolicyNet(nn.Module):
                                           padding_id)
                 delta = self.consequence(after_id) - self.consequence(before_id) - self.consequence(captured_id)
                 policy_inputs.extend((delta, q * delta))
-            logits = self.policy_mlp(torch.cat(policy_inputs, -1)).squeeze(-1)
+            policy_input = torch.cat(policy_inputs, -1)
+            if hasattr(self, "piece_moe_experts"):
+                expert_logits = torch.stack(
+                    [expert(policy_input).squeeze(-1) for expert in self.piece_moe_experts], -1)
+                route = torch.where(checks.bool(), torch.full_like(checks, 7), (moving - 1).clamp(0, 6))
+                logits = expert_logits.gather(-1, route[..., None]).squeeze(-1)
+            elif hasattr(self, "policy_moe_gate"):
+                gate_logits = self.policy_moe_gate(policy_input)
+                top_values, top_indices = gate_logits.topk(2, dim=-1)
+                top_weights = top_values.softmax(-1)
+                gate_prob = gate_logits.softmax(-1)
+                assignment = F.one_hot(top_indices, len(self.policy_moe_experts)).float().sum(-2) * 0.5
+                valid = mask[..., None]
+                denominator = valid.sum().clamp_min(1)
+                self.moe_aux_loss = 8 * (((gate_prob * valid).sum((0, 1)) / denominator)
+                                         * ((assignment * valid).sum((0, 1)) / denominator)).sum()
+                expert_logits = torch.stack(
+                    [expert(policy_input).squeeze(-1) for expert in self.policy_moe_experts], -1)
+                logits = ((expert_logits * gate_prob).sum(-1) if self.training else
+                          expert_logits.gather(-1, top_indices).mul(top_weights).sum(-1))
+            else:
+                logits = self.policy_mlp(policy_input).squeeze(-1)
+            if hasattr(self, "accumulator_residual"):
+                root = tokens.sum(1)
+                after = root[:, None] + self.feature(after_id) - self.feature(before_id) - self.feature(captured_id)
+                accumulator_input = torch.cat((F.rms_norm(after, (after.shape[-1],)), move), -1)
+                logits += self.accumulator_residual(accumulator_input).squeeze(-1)
+            elif hasattr(self, "accumulator_factor_hidden"):
+                root = tokens.sum(1)
+                after = root[:, None] + self.feature(after_id) - self.feature(before_id) - self.feature(captured_id)
+                logits += (self.accumulator_factor_hidden(F.rms_norm(after, (after.shape[-1],)))
+                           * self.accumulator_factor_move(moves)).sum(-1)
             if self.variant in ("residual_mlp", "structured_residual"):
                 logits += (q * move).sum(-1)
         else:
@@ -329,6 +429,8 @@ def main():
                     logits, value = model(*(t[ids] for t in tensors[:5]))
                     loss = F.cross_entropy(logits.float(), tensors[5][ids])
                     loss += args.value_weight * (-(tensors[6][ids] * F.log_softmax(value.float(), -1)).sum(-1)).mean()
+                    if hasattr(model, "moe_aux_loss"):
+                        loss += 0.01 * model.moe_aux_loss
                 loss.backward(); optimizer.step()
                 steps += 1; processed += len(ids)
         torch.cuda.synchronize()
