@@ -14,10 +14,6 @@ use std::time::{Duration, Instant};
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const HUMANIZED_OPENING_MIN_TIME_MS: u64 = 600;
-const HUMANIZED_BASE_TIME_MS: u64 = 2_000;
-const HUMANIZED_MAX_TIME_MS: u64 = 5_000;
-const HUMANIZED_OPENING_PLIES: usize = 24;
 
 #[derive(Clone, Debug)]
 struct UciState {
@@ -27,9 +23,6 @@ struct UciState {
     model: Option<Arc<AzNnue>>,
     simulations: usize,
     threads: usize,
-    humanize: bool,
-    standard_startpos: bool,
-    game_ply: usize,
     cpuct: f32,
     cpuct_at_root: f32,
     cpuct_base: f32,
@@ -57,9 +50,6 @@ impl Default for UciState {
             model: None,
             simulations: 10_000,
             threads: 1,
-            humanize: false,
-            standard_startpos: true,
-            game_ply: 0,
             cpuct: 0.65,
             cpuct_at_root: 1.5,
             cpuct_base: 19652.0,
@@ -121,8 +111,6 @@ pub fn run_uci() {
                 stop_active_search(&mut active_search);
                 state.position = Position::startpos();
                 state.rule_history = state.position.initial_rule_history();
-                state.standard_startpos = true;
-                state.game_ply = 0;
                 state.seed = 20260409;
             }
             Some("setoption") => {
@@ -160,7 +148,6 @@ fn print_uci_id() {
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default 10000 min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name Humanize type check default false");
     println!("option name Cpuct type string default 0.65");
     println!("option name CpuctAtRoot type string default 1.5");
     println!("option name CpuctBase type string default 19652.0");
@@ -221,11 +208,6 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         "threads" => {
             let _ = value;
             state.threads = 1;
-        }
-        "humanize" => {
-            if let Some(enabled) = parse_uci_bool(&value) {
-                state.humanize = enabled;
-            }
         }
         "cpuct" => {
             state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
@@ -303,25 +285,14 @@ fn handle_setoption(line: &str, state: &mut UciState) {
     }
 }
 
-fn parse_uci_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "on" | "yes" => Some(true),
-        "false" | "0" | "off" | "no" => Some(false),
-        _ => None,
-    }
-}
-
 fn handle_position(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     if tokens.get(1) == Some(&"startpos") {
         state.position = Position::startpos();
         state.rule_history = state.position.initial_rule_history();
-        state.standard_startpos = true;
-        state.game_ply = 0;
         if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
             let move_list = &tokens[moves_index + 1..];
             apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
-            state.game_ply = state.rule_history.len() - 1;
         }
         return;
     }
@@ -333,12 +304,9 @@ fn handle_position(line: &str, state: &mut UciState) {
         if let Ok(position) = Position::from_fen(&fen) {
             state.position = position;
             state.rule_history = state.position.initial_rule_history();
-            state.standard_startpos = false;
-            state.game_ply = 0;
             if let Some(moves_index) = moves_index {
                 let move_list = &tokens[moves_index + 1..];
                 apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
-                state.game_ply = state.rule_history.len() - 1;
             }
         }
     }
@@ -460,89 +428,6 @@ fn time_budget_ms(params: &GoParams, side: Color) -> Option<u64> {
     Some(target_ms.clamp(1, maximum_ms).min(MAX_UCI_TIME_MS))
 }
 
-fn humanized_think_time(
-    result: &AzSearchResult,
-    standard_startpos: bool,
-    game_ply: usize,
-) -> Duration {
-    let visit_policy = result
-        .candidates
-        .iter()
-        .map(|candidate| candidate.policy)
-        .collect::<Vec<_>>();
-    let raw_prior = result
-        .candidates
-        .iter()
-        .map(|candidate| candidate.raw_prior)
-        .collect::<Vec<_>>();
-    let difficulty = blended_policy_difficulty(&visit_policy, &raw_prior, result.simulations);
-    Duration::from_millis(humanized_target_ms(standard_startpos, game_ply, difficulty))
-}
-
-fn blended_policy_difficulty(visit_policy: &[f32], raw_prior: &[f32], simulations: usize) -> f32 {
-    if visit_policy.len() <= 1 || visit_policy.len() != raw_prior.len() {
-        return 0.0;
-    }
-    let visit_sum = visit_policy.iter().map(|value| value.max(0.0)).sum::<f32>();
-    let prior_sum = raw_prior.iter().map(|value| value.max(0.0)).sum::<f32>();
-    if visit_sum <= 0.0 && prior_sum <= 0.0 {
-        return 0.0;
-    }
-    let search_weight = simulations as f32 / (simulations as f32 + 256.0);
-    let mut policy = visit_policy
-        .iter()
-        .zip(raw_prior)
-        .map(|(&visits, &prior)| {
-            let visits = if visit_sum > 0.0 {
-                visits.max(0.0) / visit_sum
-            } else {
-                0.0
-            };
-            let prior = if prior_sum > 0.0 {
-                prior.max(0.0) / prior_sum
-            } else {
-                visits
-            };
-            search_weight * visits + (1.0 - search_weight) * prior
-        })
-        .collect::<Vec<_>>();
-    policy.sort_by(|left, right| right.total_cmp(left));
-
-    let top_two_competition =
-        (2.0 * policy[1] / (policy[0] + policy[1]).max(1.0e-12)).clamp(0.0, 1.0);
-    let concentration = policy
-        .iter()
-        .map(|probability| probability * probability)
-        .sum::<f32>();
-    let effective_choices = concentration.max(1.0e-12).recip();
-    let candidate_breadth = ((effective_choices - 1.0) / 3.0).clamp(0.0, 1.0);
-    (0.65 * top_two_competition + 0.35 * candidate_breadth).clamp(0.0, 1.0)
-}
-
-fn humanized_target_ms(standard_startpos: bool, game_ply: usize, difficulty: f32) -> u64 {
-    let difficulty = difficulty.clamp(0.0, 1.0);
-    let in_standard_opening = standard_startpos && game_ply < HUMANIZED_OPENING_PLIES;
-    let target_ms = if in_standard_opening {
-        let progress = game_ply as f32 / HUMANIZED_OPENING_PLIES as f32;
-        let base = HUMANIZED_OPENING_MIN_TIME_MS as f32
-            + (HUMANIZED_BASE_TIME_MS - HUMANIZED_OPENING_MIN_TIME_MS) as f32 * progress;
-        let difficulty_weight = 0.35 + 0.65 * progress;
-        base + 3_000.0 * difficulty * difficulty_weight
-    } else {
-        HUMANIZED_BASE_TIME_MS as f32 + 3_000.0 * difficulty
-    };
-    (target_ms.round() as u64).clamp(HUMANIZED_OPENING_MIN_TIME_MS, HUMANIZED_MAX_TIME_MS)
-}
-
-fn wait_until_or_stop(started: Instant, target: Duration, stop: &AtomicBool) {
-    while !stop.load(Ordering::Relaxed) {
-        let Some(remaining) = target.checked_sub(started.elapsed()) else {
-            break;
-        };
-        thread::park_timeout(remaining.min(Duration::from_millis(10)));
-    }
-}
-
 fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
     ensure_model(state);
     let params = parse_go(line);
@@ -628,13 +513,6 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     while params.infinite && !stop.load(Ordering::Relaxed) {
         thread::park_timeout(Duration::from_millis(10));
     }
-    if state.humanize && !params.infinite && result.best_move.is_some() {
-        let mut target = humanized_think_time(&result, state.standard_startpos, state.game_ply);
-        if let Some(budget_ms) = budget_ms {
-            target = target.min(Duration::from_millis(budget_ms));
-        }
-        wait_until_or_stop(started, target, &stop);
-    }
     match result.best_move {
         Some(mv) => {
             let best_text = mv.to_string();
@@ -713,75 +591,6 @@ fn flush() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn humanize_option_is_disabled_by_default_and_parses_uci_values() {
-        let mut state = UciState::default();
-        assert!(!state.humanize);
-
-        handle_setoption("setoption name Humanize value true", &mut state);
-        assert!(state.humanize);
-        handle_setoption("setoption name Humanize value false", &mut state);
-        assert!(!state.humanize);
-    }
-
-    #[test]
-    fn humanized_time_matches_professional_rapid_pacing() {
-        let clear_first_move = humanized_target_ms(true, 0, 0.0);
-        let hard_first_move = humanized_target_ms(true, 0, 1.0);
-        let clear_mid_opening = humanized_target_ms(true, 12, 0.0);
-        let clear_after_opening = humanized_target_ms(true, 24, 0.0);
-        let fen_with_no_history = humanized_target_ms(false, 0, 0.0);
-        let hard_position = humanized_target_ms(true, 24, 1.0);
-
-        assert_eq!(clear_first_move, 600);
-        assert_eq!(hard_first_move, 1_650);
-        assert_eq!(clear_mid_opening, 1_300);
-        assert_eq!(clear_after_opening, 2_000);
-        assert_eq!(fen_with_no_history, 2_000);
-        assert_eq!(hard_position, 5_000);
-        assert!(clear_first_move < clear_mid_opening);
-        assert!(clear_mid_opening < clear_after_opening);
-        assert!(clear_after_opening < hard_position);
-    }
-
-    #[test]
-    fn policy_difficulty_distinguishes_clear_and_competing_moves() {
-        let sharp = blended_policy_difficulty(&[0.92, 0.05, 0.03], &[0.90, 0.07, 0.03], 10_000);
-        let close = blended_policy_difficulty(&[0.50, 0.46, 0.04], &[0.48, 0.47, 0.05], 10_000);
-        let broad =
-            blended_policy_difficulty(&[0.25, 0.25, 0.25, 0.25], &[0.25, 0.25, 0.25, 0.25], 10_000);
-
-        assert!(sharp < 0.15);
-        assert!(close > 0.70);
-        assert!((broad - 1.0).abs() < 1.0e-6);
-        assert!(sharp < close);
-        assert!(close < broad);
-    }
-
-    #[test]
-    fn low_visit_policy_uses_network_prior_instead_of_false_confidence() {
-        let low_search = blended_policy_difficulty(&[1.0, 0.0], &[0.5, 0.5], 1);
-        let established_search = blended_policy_difficulty(&[1.0, 0.0], &[0.5, 0.5], 10_000);
-
-        assert!(low_search > 0.70);
-        assert!(established_search < 0.10);
-    }
-
-    #[test]
-    fn only_position_startpos_is_treated_as_standard_opening() {
-        let mut state = UciState::default();
-        handle_position("position startpos moves g3g4 c6c5", &mut state);
-        assert!(state.standard_startpos);
-        assert_eq!(state.game_ply, 2);
-
-        handle_position(
-            &format!("position fen {}", crate::xiangqi::STARTPOS_FEN),
-            &mut state,
-        );
-        assert!(!state.standard_startpos);
-        assert_eq!(state.game_ply, 0);
-    }
 
     #[test]
     fn parses_standard_go_time_and_search_limits() {
