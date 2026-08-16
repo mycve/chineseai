@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const HUMANIZED_OPENING_MIN_TIME_MS: u64 = 600;
+const HUMANIZED_OPENING_MIN_TIME_MS: u64 = 1_000;
 const HUMANIZED_BASE_TIME_MS: u64 = 2_000;
 const HUMANIZED_MAX_TIME_MS: u64 = 5_000;
 const HUMANIZED_OPENING_PLIES: usize = 24;
@@ -534,9 +534,21 @@ fn humanized_target_ms(standard_startpos: bool, game_ply: usize, difficulty: f32
     (target_ms.round() as u64).clamp(HUMANIZED_OPENING_MIN_TIME_MS, HUMANIZED_MAX_TIME_MS)
 }
 
-fn wait_until_or_stop(started: Instant, target: Duration, stop: &AtomicBool) {
+fn humanized_delay_with_budget(
+    desired: Duration,
+    search_elapsed: Duration,
+    budget_ms: Option<u64>,
+) -> Duration {
+    let Some(budget_ms) = budget_ms else {
+        return desired;
+    };
+    desired.min(Duration::from_millis(budget_ms).saturating_sub(search_elapsed))
+}
+
+fn wait_for_or_stop(delay: Duration, stop: &AtomicBool) {
+    let started = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let Some(remaining) = target.checked_sub(started.elapsed()) else {
+        let Some(remaining) = delay.checked_sub(started.elapsed()) else {
             break;
         };
         thread::park_timeout(remaining.min(Duration::from_millis(10)));
@@ -629,11 +641,9 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         thread::park_timeout(Duration::from_millis(10));
     }
     if state.humanize && !params.infinite && result.best_move.is_some() {
-        let mut target = humanized_think_time(&result, state.standard_startpos, state.game_ply);
-        if let Some(budget_ms) = budget_ms {
-            target = target.min(Duration::from_millis(budget_ms));
-        }
-        wait_until_or_stop(started, target, &stop);
+        let desired_delay = humanized_think_time(&result, state.standard_startpos, state.game_ply);
+        let delay = humanized_delay_with_budget(desired_delay, started.elapsed(), budget_ms);
+        wait_for_or_stop(delay, &stop);
     }
     match result.best_move {
         Some(mv) => {
@@ -734,15 +744,37 @@ mod tests {
         let fen_with_no_history = humanized_target_ms(false, 0, 0.0);
         let hard_position = humanized_target_ms(true, 24, 1.0);
 
-        assert_eq!(clear_first_move, 600);
-        assert_eq!(hard_first_move, 1_650);
-        assert_eq!(clear_mid_opening, 1_300);
+        assert_eq!(clear_first_move, 1_000);
+        assert_eq!(hard_first_move, 2_050);
+        assert_eq!(clear_mid_opening, 1_500);
         assert_eq!(clear_after_opening, 2_000);
         assert_eq!(fen_with_no_history, 2_000);
         assert_eq!(hard_position, 5_000);
         assert!(clear_first_move < clear_mid_opening);
         assert!(clear_mid_opening < clear_after_opening);
         assert!(clear_after_opening < hard_position);
+    }
+
+    #[test]
+    fn humanized_delay_is_additional_but_never_exceeds_clock_budget() {
+        let desired = Duration::from_millis(2_000);
+
+        assert_eq!(
+            humanized_delay_with_budget(desired, Duration::from_millis(900), None),
+            desired
+        );
+        assert_eq!(
+            humanized_delay_with_budget(desired, Duration::from_millis(900), Some(5_000)),
+            desired
+        );
+        assert_eq!(
+            humanized_delay_with_budget(desired, Duration::from_millis(900), Some(2_000)),
+            Duration::from_millis(1_100)
+        );
+        assert_eq!(
+            humanized_delay_with_budget(desired, Duration::from_millis(1_200), Some(1_000)),
+            Duration::ZERO
+        );
     }
 
     #[test]
