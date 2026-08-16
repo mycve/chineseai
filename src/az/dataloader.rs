@@ -9,12 +9,13 @@ use crate::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
 
 use super::{
-    AzTrainingSample, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
+    AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
     canonical_general_buckets_from_features, decode_current_piece_square_feature,
     dense_move_squares,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
-    normalize_wdl_target,
+    normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
+    policy_sparse_main_index,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -105,6 +106,7 @@ pub(super) struct PackedBatch {
     pub max_policy_moves: usize,
     pub feature_items: Vec<u32>,
     pub policy_items: Vec<i64>,
+    pub policy_sparse_indices: Vec<i64>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
     pub value_wdl: Vec<f32>,
@@ -144,6 +146,10 @@ impl PackedBatch {
             max_policy_moves,
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
+            policy_sparse_indices: vec![
+                (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
+                batch_size * max_policy_moves * 7
+            ],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
@@ -195,6 +201,7 @@ impl PackedBatch {
 
     fn pack_policy(&mut self, row: usize, sample: &AzTrainingSample) {
         let policy_base = row * self.max_policy_moves;
+        let king_buckets = canonical_general_buckets_from_features(&sample.features);
         let mut board_features = [usize::MAX; BOARD_SIZE];
         for &feature in &sample.features {
             if let Some(structural) = decode_current_piece_square_feature(feature) {
@@ -235,6 +242,31 @@ impl PackedBatch {
                     move_valid,
                     capture_valid,
                 );
+                if move_valid {
+                    let moved_piece = consequence_from / BOARD_SIZE;
+                    let captured_piece = capture_valid.then_some(consequence_captured / BOARD_SIZE);
+                    let sparse_base = item_index * 7;
+                    self.policy_sparse_indices[sparse_base] = policy_sparse_main_index(
+                        move_index,
+                        moved_piece,
+                        king_buckets.0,
+                        king_buckets.1,
+                    ) as i64;
+                    self.policy_sparse_indices[sparse_base + 1] =
+                        policy_sparse_capture_index(move_index, captured_piece) as i64;
+                    for (offset, factor) in policy_sparse_factor_indices(
+                        move_index,
+                        moved_piece,
+                        king_buckets.0,
+                        king_buckets.1,
+                    )
+                    .into_iter()
+                    .enumerate()
+                    {
+                        self.policy_sparse_indices[sparse_base + 2 + offset] =
+                            (POLICY_SPARSE_TABLE_SIZE + factor) as i64;
+                    }
+                }
                 policy_offset += 1;
             }
         }

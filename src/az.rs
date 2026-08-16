@@ -59,6 +59,29 @@ pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 32;
+pub(super) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
+pub(super) const POLICY_SPARSE_MAIN_SIZE: usize =
+    DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
+pub(super) const POLICY_SPARSE_CAPTURE_SIZE: usize =
+    DENSE_MOVE_SPACE * POLICY_SPARSE_CAPTURE_CLASSES;
+pub(super) const POLICY_SPARSE_TABLE_SIZE: usize =
+    POLICY_SPARSE_MAIN_SIZE + POLICY_SPARSE_CAPTURE_SIZE + 1;
+pub(super) const POLICY_SPARSE_MOVE_PIECE_SIZE: usize = DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE;
+pub(super) const POLICY_SPARSE_MOVE_KING_SIZE: usize =
+    DENSE_MOVE_SPACE * V2_KING_BUCKETS * V2_KING_BUCKETS;
+pub(super) const POLICY_SPARSE_PIECE_KING_SIZE: usize =
+    STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
+pub(super) const POLICY_KING_DISTANCE_BUCKETS: usize = 6;
+pub(super) const POLICY_KING_APPROACH_BUCKETS: usize = 5;
+pub(super) const POLICY_SPARSE_DISTANCE_SIZE: usize =
+    STRUCTURAL_PIECE_SIZE * POLICY_KING_DISTANCE_BUCKETS;
+pub(super) const POLICY_SPARSE_APPROACH_SIZE: usize =
+    STRUCTURAL_PIECE_SIZE * POLICY_KING_APPROACH_BUCKETS;
+pub(super) const POLICY_SPARSE_FACTOR_SIZE: usize = POLICY_SPARSE_MOVE_PIECE_SIZE
+    + POLICY_SPARSE_MOVE_KING_SIZE
+    + POLICY_SPARSE_PIECE_KING_SIZE
+    + POLICY_SPARSE_DISTANCE_SIZE
+    + POLICY_SPARSE_APPROACH_SIZE;
 const POLICY_ACCUMULATOR_PIECE_OFFSET: usize = AZ_NNUE_INPUT_SIZE;
 const POLICY_ACCUMULATOR_RANK_OFFSET: usize =
     POLICY_ACCUMULATOR_PIECE_OFFSET + STRUCTURAL_PIECE_SIZE;
@@ -233,6 +256,8 @@ macro_rules! az_weight_tensors {
             policy_accumulator_move,
             [DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK]
         );
+        $visit!(policy_sparse_table, [POLICY_SPARSE_TABLE_SIZE]);
+        $visit!(policy_sparse_factor, [POLICY_SPARSE_FACTOR_SIZE]);
     };
 }
 
@@ -536,6 +561,78 @@ fn policy_consequence_features(
     Some((from, to, captured))
 }
 
+#[inline]
+pub(super) const fn policy_sparse_main_index(
+    move_index: usize,
+    moved_piece: usize,
+    us_king_bucket: usize,
+    them_king_bucket: usize,
+) -> usize {
+    (((move_index * STRUCTURAL_PIECE_SIZE + moved_piece) * V2_KING_BUCKETS + us_king_bucket)
+        * V2_KING_BUCKETS)
+        + them_king_bucket
+}
+
+#[inline]
+pub(super) const fn policy_sparse_capture_index(
+    move_index: usize,
+    captured_piece: Option<usize>,
+) -> usize {
+    POLICY_SPARSE_MAIN_SIZE
+        + move_index * POLICY_SPARSE_CAPTURE_CLASSES
+        + match captured_piece {
+            Some(piece) => piece,
+            None => STRUCTURAL_PIECE_SIZE,
+        }
+}
+
+#[inline]
+pub(super) fn policy_sparse_factor_indices(
+    move_index: usize,
+    moved_piece: usize,
+    us_king_bucket: usize,
+    them_king_bucket: usize,
+) -> [usize; 5] {
+    let king_pair = us_king_bucket * V2_KING_BUCKETS + them_king_bucket;
+    let (distance, approach) = policy_king_distance_buckets(move_index, them_king_bucket);
+    let distance_offset = POLICY_SPARSE_MOVE_PIECE_SIZE
+        + POLICY_SPARSE_MOVE_KING_SIZE
+        + POLICY_SPARSE_PIECE_KING_SIZE;
+    [
+        move_index * STRUCTURAL_PIECE_SIZE + moved_piece,
+        POLICY_SPARSE_MOVE_PIECE_SIZE + move_index * V2_KING_BUCKETS * V2_KING_BUCKETS + king_pair,
+        POLICY_SPARSE_MOVE_PIECE_SIZE
+            + POLICY_SPARSE_MOVE_KING_SIZE
+            + moved_piece * V2_KING_BUCKETS * V2_KING_BUCKETS
+            + king_pair,
+        distance_offset + moved_piece * POLICY_KING_DISTANCE_BUCKETS + distance,
+        distance_offset
+            + POLICY_SPARSE_DISTANCE_SIZE
+            + moved_piece * POLICY_KING_APPROACH_BUCKETS
+            + approach,
+    ]
+}
+
+fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
+    let sparse = move_map().dense_to_sparse[move_index] as usize;
+    let from = sparse / BOARD_SIZE;
+    let to = sparse % BOARD_SIZE;
+    let king_own_rank = 7 + them_king_bucket / 3;
+    let king_own_file = 3 + them_king_bucket % 3;
+    let king = BOARD_SIZE - 1 - (king_own_rank * BOARD_FILES + king_own_file);
+    let distance = |square: usize| {
+        (square / BOARD_FILES).abs_diff(king / BOARD_FILES)
+            + (square % BOARD_FILES).abs_diff(king % BOARD_FILES)
+    };
+    let before = distance(from);
+    let after = distance(to);
+    let approach = (before as isize - after as isize).clamp(-2, 2) + 2;
+    (
+        after.min(POLICY_KING_DISTANCE_BUCKETS - 1),
+        approach as usize,
+    )
+}
+
 #[derive(Debug)]
 pub struct AzNnue {
     pub hidden_size: usize,
@@ -560,12 +657,16 @@ pub struct AzNnue {
     pub policy_move_context: Vec<f32>,
     pub policy_accumulator_hidden: Vec<f32>,
     pub policy_accumulator_move: Vec<f32>,
+    pub policy_sparse_table: Vec<f32>,
+    pub policy_sparse_factor: Vec<f32>,
     policy_accumulator_feature_q: Vec<i8>,
     policy_accumulator_move_q: Vec<i8>,
     policy_accumulator_moved_delta_q: Vec<i32>,
     policy_accumulator_capture_q: Vec<i32>,
     policy_accumulator_feature_scale: f32,
     policy_accumulator_move_scale: f32,
+    policy_sparse_table_q: Vec<i8>,
+    policy_sparse_table_scale: f32,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -595,12 +696,16 @@ impl Clone for AzNnue {
             policy_move_context: self.policy_move_context.clone(),
             policy_accumulator_hidden: self.policy_accumulator_hidden.clone(),
             policy_accumulator_move: self.policy_accumulator_move.clone(),
+            policy_sparse_table: self.policy_sparse_table.clone(),
+            policy_sparse_factor: self.policy_sparse_factor.clone(),
             policy_accumulator_feature_q: self.policy_accumulator_feature_q.clone(),
             policy_accumulator_move_q: self.policy_accumulator_move_q.clone(),
             policy_accumulator_moved_delta_q: self.policy_accumulator_moved_delta_q.clone(),
             policy_accumulator_capture_q: self.policy_accumulator_capture_q.clone(),
             policy_accumulator_feature_scale: self.policy_accumulator_feature_scale,
             policy_accumulator_move_scale: self.policy_accumulator_move_scale,
+            policy_sparse_table_q: self.policy_sparse_table_q.clone(),
+            policy_sparse_table_scale: self.policy_sparse_table_scale,
             gpu_trainer: None,
         }
     }
@@ -1056,6 +1161,8 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let policy_accumulator_move = vec![0.0; DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK];
+        let policy_sparse_table = vec![0.0; POLICY_SPARSE_TABLE_SIZE];
+        let policy_sparse_factor = vec![0.0; POLICY_SPARSE_FACTOR_SIZE];
         let mut model = Self {
             hidden_size,
             arch,
@@ -1079,12 +1186,16 @@ impl AzNnue {
             policy_move_context,
             policy_accumulator_hidden,
             policy_accumulator_move,
+            policy_sparse_table,
+            policy_sparse_factor,
             policy_accumulator_feature_q: Vec::new(),
             policy_accumulator_move_q: Vec::new(),
             policy_accumulator_moved_delta_q: Vec::new(),
             policy_accumulator_capture_q: Vec::new(),
             policy_accumulator_feature_scale: 1.0,
             policy_accumulator_move_scale: 1.0,
+            policy_sparse_table_q: Vec::new(),
+            policy_sparse_table_scale: 1.0,
             gpu_trainer: None,
         };
         model.rebuild_policy_accumulator_quantization();
@@ -1166,12 +1277,16 @@ impl AzNnue {
                 "policy_accumulator_hidden",
             )?,
             policy_accumulator_move: load_candle_f32_tensor(&tensors, "policy_accumulator_move")?,
+            policy_sparse_table: load_candle_f32_tensor(&tensors, "policy_sparse_table")?,
+            policy_sparse_factor: load_candle_f32_tensor(&tensors, "policy_sparse_factor")?,
             policy_accumulator_feature_q: Vec::new(),
             policy_accumulator_move_q: Vec::new(),
             policy_accumulator_moved_delta_q: Vec::new(),
             policy_accumulator_capture_q: Vec::new(),
             policy_accumulator_feature_scale: 1.0,
             policy_accumulator_move_scale: 1.0,
+            policy_sparse_table_q: Vec::new(),
+            policy_sparse_table_scale: 1.0,
             gpu_trainer: None,
         };
         model.rebuild_policy_accumulator_quantization();
@@ -1312,6 +1427,7 @@ impl AzNnue {
         }
         let move_map = move_map();
         let side = position.side_to_move();
+        let king_buckets = canonical_buckets_for_perspective(position, side);
         {
             crate::scope_profile!("az.eval.policy_logits");
             scratch.policy_gives_check.resize(moves.len(), 0.0);
@@ -1372,6 +1488,21 @@ impl AzNnue {
                     } else {
                         0.0
                     };
+                    let sparse_logit = consequence.map_or(0.0, |(from, _, captured)| {
+                        let moved_piece = from / BOARD_SIZE;
+                        let captured_piece = captured.map(|feature| feature / BOARD_SIZE);
+                        let main = policy_sparse_main_index(
+                            move_index,
+                            moved_piece,
+                            king_buckets.0,
+                            king_buckets.1,
+                        );
+                        let capture = policy_sparse_capture_index(move_index, captured_piece);
+                        (i32::from(self.policy_sparse_table_q[main])
+                            + i32::from(self.policy_sparse_table_q[capture]))
+                            as f32
+                            * self.policy_sparse_table_scale
+                    });
                     scratch.logits[index] = self.policy_move_bias[move_index]
                         + piece_square_logit
                         + dot_product(
@@ -1379,7 +1510,8 @@ impl AzNnue {
                             &self.policy_move_context
                                 [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
                         )
-                        + accumulator_logit;
+                        + accumulator_logit
+                        + sparse_logit;
                 }
             }
         }
@@ -1680,6 +1812,42 @@ impl AzNnue {
             })
             .collect();
 
+        let mut folded_sparse = self.policy_sparse_table.clone();
+        for move_index in 0..DENSE_MOVE_SPACE {
+            for moved_piece in 0..STRUCTURAL_PIECE_SIZE {
+                for us_bucket in 0..V2_KING_BUCKETS {
+                    for them_bucket in 0..V2_KING_BUCKETS {
+                        let main = policy_sparse_main_index(
+                            move_index,
+                            moved_piece,
+                            us_bucket,
+                            them_bucket,
+                        );
+                        for factor in policy_sparse_factor_indices(
+                            move_index,
+                            moved_piece,
+                            us_bucket,
+                            them_bucket,
+                        ) {
+                            folded_sparse[main] += self.policy_sparse_factor[factor];
+                        }
+                    }
+                }
+            }
+        }
+        let sparse_max = folded_sparse
+            .iter()
+            .fold(0.0f32, |maximum, value| maximum.max(value.abs()));
+        self.policy_sparse_table_scale = (sparse_max / 127.0).max(1.0e-12);
+        self.policy_sparse_table_q = folded_sparse
+            .iter()
+            .map(|value| {
+                (*value / self.policy_sparse_table_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+
         let cache_size = DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE;
         self.policy_accumulator_moved_delta_q = vec![0; cache_size];
         self.policy_accumulator_capture_q = vec![0; cache_size];
@@ -1856,6 +2024,7 @@ impl AzNnue {
             || self.policy_accumulator_moved_delta_q.len()
                 != DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE
             || self.policy_accumulator_capture_q.len() != DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE
+            || self.policy_sparse_table_q.len() != POLICY_SPARSE_TABLE_SIZE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

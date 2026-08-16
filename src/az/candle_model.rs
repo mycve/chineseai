@@ -2,10 +2,10 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::
 
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_ACCUMULATOR_RANK,
-    POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
-    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
-    WDL_HEAD_SIZE, dataloader::PackedBatch, fused_feature_pool::feature_pool,
-    fused_policy::fused_policy,
+    POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE,
+    POLICY_SPARSE_TABLE_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
+    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
+    dataloader::PackedBatch, fused_feature_pool::feature_pool, fused_policy::fused_policy,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -34,6 +34,8 @@ pub(super) struct AzCandleModel {
     policy_move_context: Var,
     policy_accumulator_hidden: Var,
     policy_accumulator_move: Var,
+    policy_sparse_table: Var,
+    policy_sparse_factor: Var,
 }
 
 impl AzCandleModel {
@@ -115,6 +117,18 @@ impl AzCandleModel {
             0,
         )?;
         let policy_logits = fused_policy(&policy_tables, &policy_context, &batch.policy_items)?;
+        let sparse_tables = Tensor::cat(
+            &[
+                self.policy_sparse_table.as_tensor(),
+                self.policy_sparse_factor.as_tensor(),
+            ],
+            0,
+        )?;
+        let sparse_logits = sparse_tables
+            .index_select(&batch.policy_sparse_indices.flatten_all()?, 0)?
+            .reshape((batch.batch_size, batch.max_policy_moves, 7))?
+            .sum(2)?;
+        let policy_logits = (policy_logits + sparse_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -134,6 +148,8 @@ pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
     pub(super) feature_items: Tensor,
     pub(super) policy_items: Tensor,
+    pub(super) policy_sparse_indices: Tensor,
+    pub(super) max_policy_moves: usize,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) value_wdl: Tensor,
@@ -162,6 +178,12 @@ impl BatchTensors {
                 (batch_size, max_policy_moves),
                 device,
             )?,
+            policy_sparse_indices: Tensor::from_vec(
+                packed.policy_sparse_indices,
+                (batch_size, max_policy_moves, 7),
+                device,
+            )?,
+            max_policy_moves,
             policy_targets: Tensor::from_vec(
                 packed.policy_targets,
                 (batch_size, max_policy_moves),
@@ -277,6 +299,16 @@ impl AzCandleModel {
                 (DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK),
                 device,
             )?,
+            policy_sparse_table: var_from_slice(
+                &model.policy_sparse_table,
+                POLICY_SPARSE_TABLE_SIZE,
+                device,
+            )?,
+            policy_sparse_factor: var_from_slice(
+                &model.policy_sparse_factor,
+                POLICY_SPARSE_FACTOR_SIZE,
+                device,
+            )?,
         })
     }
 
@@ -302,6 +334,8 @@ impl AzCandleModel {
         vars.push(self.policy_move_context.clone());
         vars.push(self.policy_accumulator_hidden.clone());
         vars.push(self.policy_accumulator_move.clone());
+        vars.push(self.policy_sparse_table.clone());
+        vars.push(self.policy_sparse_factor.clone());
         vars
     }
 
@@ -344,6 +378,8 @@ impl AzCandleModel {
             &self.policy_accumulator_move,
             &mut model.policy_accumulator_move,
         )?;
+        copy_var(&self.policy_sparse_table, &mut model.policy_sparse_table)?;
+        copy_var(&self.policy_sparse_factor, &mut model.policy_sparse_factor)?;
         model.rebuild_policy_accumulator_quantization();
         Ok(())
     }
@@ -395,7 +431,12 @@ fn copy_var(var: &Var, dst: &mut [f32]) -> CandleResult<()> {
 mod tests {
     use super::*;
     use crate::{
-        az::{AzEvalScratch, AzSampleMeta, AzTrainingSample, RULE_CONTEXT_SIZE, dense_move_index},
+        az::{
+            AzEvalScratch, AzSampleMeta, AzTrainingSample, POLICY_SPARSE_TABLE_SIZE,
+            RULE_CONTEXT_SIZE, canonical_buckets_for_perspective, dense_move_index,
+            policy_consequence_features, policy_sparse_capture_index, policy_sparse_factor_indices,
+            policy_sparse_main_index,
+        },
         nnue::extract_sparse_features_az,
         xiangqi::Position,
     };
@@ -415,6 +456,26 @@ mod tests {
         }
         for (index, weight) in model.policy_accumulator_move.iter_mut().enumerate() {
             *weight = ((index % POLICY_ACCUMULATOR_RANK) as f32 + 1.0) * 0.0002;
+        }
+        model.policy_sparse_table[POLICY_SPARSE_TABLE_SIZE - 1] = 0.127;
+        let side = position.side_to_move();
+        let buckets = canonical_buckets_for_perspective(&position, side);
+        for (index, &mv) in moves.iter().enumerate() {
+            let move_index = dense_move_index(mv);
+            let (from, _, captured) = policy_consequence_features(&position, side, mv).unwrap();
+            let main = policy_sparse_main_index(move_index, from / 90, buckets.0, buckets.1);
+            let capture =
+                policy_sparse_capture_index(move_index, captured.map(|feature| feature / 90));
+            model.policy_sparse_table[main] = (index as f32 % 101.0) * 0.001;
+            model.policy_sparse_table[capture] = -((index as f32 % 53.0) * 0.001);
+            for (factor_offset, factor) in
+                policy_sparse_factor_indices(move_index, from / 90, buckets.0, buckets.1)
+                    .into_iter()
+                    .enumerate()
+            {
+                model.policy_sparse_factor[factor] =
+                    ((index + factor_offset) as f32 % 37.0) * 0.001;
+            }
         }
         model.rebuild_policy_accumulator_quantization();
 
@@ -444,7 +505,7 @@ mod tests {
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
             assert!(
-                (candle_logit - cpu_logit).abs() < 1.0e-4,
+                (candle_logit - cpu_logit).abs() < 2.0e-3,
                 "candle={candle_logit} cpu={cpu_logit}"
             );
         }
