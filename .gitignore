@@ -13,7 +13,13 @@ runs
 *azloop*
 *.log
 tools
+!tools/
+tools/*
+!tools/policy_arch_search.py
 eval/*.csv
 eval/*.fens
+eval/*.bin
+eval/*.sqlite
+eval/torch-policy-*/
 eval/torch/
 POTENTIAL_IMPROVEMENT_PLAN.md
