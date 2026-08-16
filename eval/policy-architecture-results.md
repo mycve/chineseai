@@ -162,4 +162,4 @@ INT8 稀疏节点 accumulator 加入后，同一活跃 v10 权重的基本 INT8 
 
 最终 v11 release 五次 NPS 为 203,353 / 203,368 / 208,701 / 204,574 / 201,946，均值 204,388；相对此前同权重体系 v10 历史均值 206,374，约下降 0.96%，但两者不是同场交替。零表 v11 历史均值为 201,396 NPS。最终判断仍以固定总自博弈墙钟和 Elo 为准。
 
-多局面 leaf batching 设计采用每线程维护多棵独立树、每棵树最多挂起一个 leaf，再统一执行推理。这样不需要同树 virtual loss，也不会改变单棵树内部 simulation 次序；实现必须把搜索拆成 select / batch-evaluate / backprop 三阶段。当前自博弈仍是多线程单树搜索，尚未把跨树 batch 收益计入上述 NPS。
+多局面 leaf batching 设计采用每线程维护四棵独立树、每棵树最多挂起一个 leaf，再统一执行推理。这样不需要同树 virtual loss，也不会改变单棵树内部 simulation 次序。固定 batch=4 的 AVX2/FMA 增量评估内核已实现并与逐树输出逐项对齐；fast 模式微基准中四次逐树评估为 31.010 ms，batch4 为 25.900 ms，纯 leaf 推理提升 1.197×。下一步仍需把 MCTS 拆成 select / batch-evaluate / backprop 三阶段并比较整体自博弈 samples/s；上述 NPS 尚未计入跨树调度收益。
