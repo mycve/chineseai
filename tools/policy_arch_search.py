@@ -118,6 +118,8 @@ class PolicyNet(nn.Module):
         self.move_bias = nn.Embedding(move_vocab, 1)
         self.move = nn.Embedding(move_vocab, rank)
         self.query = nn.Linear(hidden, rank)
+        if variant == "current_like":
+            self.current_consequence = nn.Embedding(feature_vocab + 1, 1, padding_idx=feature_vocab)
         pairs = dense_move_squares()
         if len(pairs) < move_vocab:
             raise ValueError(f"move vocabulary mismatch: {move_vocab} > {len(pairs)}")
@@ -144,7 +146,7 @@ class PolicyNet(nn.Module):
             else:
                 policy_input = rank * 3
             self.policy_mlp = nn.Sequential(nn.Linear(policy_input, rank * 2), nn.SiLU(), nn.Linear(rank * 2, 1))
-        elif variant != "dot":
+        elif variant not in ("dot", "current_like"):
             raise ValueError(variant)
         self.value = nn.Sequential(nn.Linear(hidden, 96), nn.SiLU(), nn.Linear(96, 3))
 
@@ -202,8 +204,19 @@ class PolicyNet(nn.Module):
                 target_local = flat.gather(1, targets[..., None].expand(-1, -1, flat.shape[-1]))
                 move = move + self.move_local(torch.cat((source_local, target_local), -1))
         query = self.query(context)
-        if self.variant == "dot":
+        if self.variant in ("dot", "current_like"):
             logits = (move * query[:, None]).sum(-1)
+            if self.variant == "current_like":
+                sources, targets = self.move_from[moves], self.move_to[moves]
+                moving = board.gather(1, sources)
+                captured = board.gather(1, targets)
+                moving_kind = moving - 1
+                padding_id = torch.full_like(targets, self.feature.padding_idx)
+                after_id = torch.where(moving > 0, moving_kind * 90 + targets, padding_id)
+                before_id = torch.where(moving > 0, moving_kind * 90 + sources, padding_id)
+                captured_id = torch.where(captured > 0, (captured - 1) * 90 + targets, padding_id)
+                logits += (self.current_consequence(after_id) - self.current_consequence(before_id)
+                           - self.current_consequence(captured_id)).squeeze(-1)
         elif self.variant == "gated":
             logits = (move * query[:, None] * (2 * torch.sigmoid(self.gate(context)))[:, None]).sum(-1)
         elif self.variant == "hyper2":
@@ -309,7 +322,7 @@ def main():
         torch.cuda.synchronize()
         started = time.perf_counter()
         for epoch in range(args.epochs):
-            epoch_ids = train_ids[torch.randperm(split, device=device)] if epoch else train_ids
+            epoch_ids = train_ids[torch.randperm(split, device=device)]
             for ids in epoch_ids.split(args.batch_size):
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", dtype=torch.bfloat16):

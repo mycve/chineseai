@@ -30,3 +30,15 @@
 利用 SQLite 中已有 depth-12 principal variation 扩展出 767,141 个同源局面，并按原始局面 group 隔离验证；单遍历最好 CE 为 2.36293，仅小幅改善。PV 单线分布不能替代独立局面或多走法分布标签。
 
 结论：在当前 100k 独立局面、Pikafish 单一 bestmove one-hot 标签下，尚未达到 CE 2.0。下一步应优先采集 MultiPV/走法分数形成软 policy，或增加独立标注局面；继续扩大 raw-policy 网络的收益已经很低。最终结构仍需回植 Rust 后按固定自博弈墙钟比较 sims/s 和 samples/s。
+
+## 严格控制变量复测
+
+正式复测统一使用相同的 90k/10k group 切分、seed=20260816、hidden=128、batch=16、lr=0.001、value weight=0.25、单 epoch、训练顺序和验证样本。`current_like` 复现 move bias + context dot + consequence delta；实验组只改变 policy 交互及结构化走法输入。
+
+| 结构 | rank | 参数量 | Policy CE | 校准 CE | Top-1 | Top-3 |
+|---|---:|---:|---:|---:|---:|---:|
+| current-like | 64 | 335,830 | 2.75086 | 2.72692 | 22.12% | 43.05% |
+| structured consequence | 64 | 470,058 | 2.39246 | 2.39246 | 30.91% | 53.51% |
+| structured consequence（参数匹配） | 32 | 321,194 | 2.42995 | 2.42995 | 30.34% | 52.36% |
+
+固定 rank 下原始 CE 相对改善 13.03%，Top-1 增加 8.79 个百分点。参数匹配组比基线少 4.36% 参数，CE 仍相对改善 11.67%，Top-1 增加 8.22 个百分点。该结果控制了训练变量和参数量，但仍是 PyTorch 等价 policy-head 代理实验；必须回植 Rust 后才能给出真实单节点推理、自博弈 sims/s 和 samples/s 变化。
