@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const HUMANIZED_OPENING_MIN_TIME_MS: u64 = 1_000;
-const HUMANIZED_BASE_TIME_MS: u64 = 2_000;
-const HUMANIZED_MAX_TIME_MS: u64 = 5_000;
+const HUMANIZED_OPENING_MIN_TIME_MS: u64 = 100;
+const HUMANIZED_BASE_TIME_MS: u64 = 400;
+const HUMANIZED_MAX_TIME_MS: u64 = 1_600;
+const HUMANIZED_DIFFICULTY_TIME_MS: f32 = 1_200.0;
 const HUMANIZED_OPENING_PLIES: usize = 24;
 
 #[derive(Clone, Debug)]
@@ -527,9 +528,9 @@ fn humanized_target_ms(standard_startpos: bool, game_ply: usize, difficulty: f32
         let base = HUMANIZED_OPENING_MIN_TIME_MS as f32
             + (HUMANIZED_BASE_TIME_MS - HUMANIZED_OPENING_MIN_TIME_MS) as f32 * progress;
         let difficulty_weight = 0.35 + 0.65 * progress;
-        base + 3_000.0 * difficulty * difficulty_weight
+        base + HUMANIZED_DIFFICULTY_TIME_MS * difficulty * difficulty_weight
     } else {
-        HUMANIZED_BASE_TIME_MS as f32 + 3_000.0 * difficulty
+        HUMANIZED_BASE_TIME_MS as f32 + HUMANIZED_DIFFICULTY_TIME_MS * difficulty
     };
     (target_ms.round() as u64).clamp(HUMANIZED_OPENING_MIN_TIME_MS, HUMANIZED_MAX_TIME_MS)
 }
@@ -734,12 +735,12 @@ mod tests {
         let fen_with_no_history = humanized_target_ms(false, 0, 0.0);
         let hard_position = humanized_target_ms(true, 24, 1.0);
 
-        assert_eq!(clear_first_move, 1_000);
-        assert_eq!(hard_first_move, 2_050);
-        assert_eq!(clear_mid_opening, 1_500);
-        assert_eq!(clear_after_opening, 2_000);
-        assert_eq!(fen_with_no_history, 2_000);
-        assert_eq!(hard_position, 5_000);
+        assert_eq!(clear_first_move, 100);
+        assert_eq!(hard_first_move, 520);
+        assert_eq!(clear_mid_opening, 250);
+        assert_eq!(clear_after_opening, 400);
+        assert_eq!(fen_with_no_history, 400);
+        assert_eq!(hard_position, 1_600);
         assert!(clear_first_move < clear_mid_opening);
         assert!(clear_mid_opening < clear_after_opening);
         assert!(clear_after_opening < hard_position);
