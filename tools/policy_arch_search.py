@@ -391,6 +391,8 @@ def main():
     parser.add_argument("--value-weight", type=float, default=0.0)
     parser.add_argument("--margin-weight", type=float, default=0.0)
     parser.add_argument("--margin", type=float, default=0.5)
+    parser.add_argument("--train-groups", type=int, default=0,
+                        help="Use a nested prefix of shuffled non-validation groups (0 = all)")
     parser.add_argument("--epochs", type=int, default=1)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
@@ -406,7 +408,13 @@ def main():
     validation_groups = torch.zeros(group_count, dtype=torch.bool, device=device)
     validation_groups[group_order[-max(1, group_count // 10):]] = True
     is_validation = validation_groups[tensors[7]]
-    train_ids = (~is_validation).nonzero().flatten()
+    if args.train_groups:
+        available_groups = group_count - max(1, group_count // 10)
+        selected_groups = torch.zeros(group_count, dtype=torch.bool, device=device)
+        selected_groups[group_order[:min(args.train_groups, available_groups)]] = True
+        train_ids = selected_groups[tensors[7]].nonzero().flatten()
+    else:
+        train_ids = (~is_validation).nonzero().flatten()
     validation_ids = (is_validation & (tensors[8] == 0)).nonzero().flatten()
     split = len(train_ids)
     output = Path(args.output)
