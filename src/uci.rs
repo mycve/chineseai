@@ -50,8 +50,8 @@ impl Default for UciState {
             cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
             cpuct_factor_at_root: 1.5,
-            fpu_value: 0.33,
-            fpu_value_at_root: 0.33,
+            fpu_value: 0.30,
+            fpu_value_at_root: 0.20,
             draw_score: 0.0,
             seed: 20260409,
         }
@@ -142,8 +142,8 @@ fn print_uci_id() {
     println!("option name CpuctFactor type string default 1.5");
     println!("option name CpuctBaseAtRoot type string default 19652.0");
     println!("option name CpuctFactorAtRoot type string default 1.5");
-    println!("option name FpuValue type string default 0.33");
-    println!("option name FpuValueAtRoot type string default 0.33");
+    println!("option name FpuValue type string default 0.30");
+    println!("option name FpuValueAtRoot type string default 0.20");
     println!("option name DrawScore type string default 0.0");
     println!("uciok");
     flush();

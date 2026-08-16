@@ -55,8 +55,8 @@ impl Default for AzSearchLimits {
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            fpu_value: 0.33,
-            fpu_value_at_root: 0.33,
+            fpu_value: 0.30,
+            fpu_value_at_root: 0.20,
             policy_softmax_temp: 1.0,
             draw_score: 0.0,
             value_scale: 1.0,
@@ -327,10 +327,34 @@ pub fn alphazero_search_batch4(
         d.limits.simulations,
     ];
     let mut trees = [
-        AzTree::new(a.position, a.rule_history, Some(a.root_moves), model, a.limits),
-        AzTree::new(b.position, b.rule_history, Some(b.root_moves), model, b.limits),
-        AzTree::new(c.position, c.rule_history, Some(c.root_moves), model, c.limits),
-        AzTree::new(d.position, d.rule_history, Some(d.root_moves), model, d.limits),
+        AzTree::new(
+            a.position,
+            a.rule_history,
+            Some(a.root_moves),
+            model,
+            a.limits,
+        ),
+        AzTree::new(
+            b.position,
+            b.rule_history,
+            Some(b.root_moves),
+            model,
+            b.limits,
+        ),
+        AzTree::new(
+            c.position,
+            c.rule_history,
+            Some(c.root_moves),
+            model,
+            c.limits,
+        ),
+        AzTree::new(
+            d.position,
+            d.rule_history,
+            Some(d.root_moves),
+            model,
+            d.limits,
+        ),
     ];
     for tree in &mut trees {
         let root = tree.root;
@@ -536,7 +560,6 @@ impl AzChild {
             wdl_sum_utility(self.value_wdl_sum, self.visits, draw_score)
         }
     }
-
 }
 
 impl<'a> AzTree<'a> {
@@ -859,10 +882,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].expanded = true;
-            return AzEvalOutput {
-                value_wdl,
-                value,
-            };
+            return AzEvalOutput { value_wdl, value };
         }
 
         let moves = {
@@ -1222,8 +1242,7 @@ impl<'a> AzTree<'a> {
             perspective,
             &mut child_policy_accumulator,
         );
-        let child_rule_entry =
-            child_position.rule_history_entry_after_moved(mover, mv.to as usize);
+        let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv.to as usize);
         let child_node = self.nodes.len();
         self.nodes.push(AzNode {
             position: child_position,
@@ -1454,10 +1473,7 @@ impl<'a> AzTree<'a> {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
-            return AzEvalOutput {
-                value_wdl,
-                value,
-            };
+            return AzEvalOutput { value_wdl, value };
         }
         let moves: Vec<_> = {
             crate::scope_profile!("az.search.expand_legal_moves");
@@ -1549,18 +1565,11 @@ impl<'a> AzTree<'a> {
         } else {
             self.fpu_value
         };
-        let fpu_value =
-            alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score);
+        let fpu_value = alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score);
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let mut best: Option<(usize, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
-            let score = self.child_score(
-                child,
-                draw_score,
-                fpu_value,
-                parent_visits_sqrt,
-                cpuct,
-            );
+            let score = self.child_score(child, draw_score, fpu_value, parent_visits_sqrt, cpuct);
             if best.is_none_or(|(_, best_prior, best_score)| {
                 score.total_cmp(&best_score).is_gt()
                     || (score.total_cmp(&best_score).is_eq()
@@ -2221,9 +2230,9 @@ mod tests {
             root_exploration_fraction: 0.0,
             ..AzSearchLimits::default()
         };
-        let scalar = positions.each_ref().map(|position| {
-            alphazero_search_with_rules(position, None, None, &model, limits)
-        });
+        let scalar = positions
+            .each_ref()
+            .map(|position| alphazero_search_with_rules(position, None, None, &model, limits));
         let inputs = positions.map(|position| AzBatchSearchInput {
             root_moves: position.legal_moves(),
             rule_history: position.initial_rule_history(),
@@ -2237,8 +2246,16 @@ mod tests {
             assert_eq!(scalar.simulations, batched.simulations);
             assert_eq!(scalar.candidates.len(), batched.candidates.len());
             assert_eq!(
-                scalar.candidates.iter().map(|child| child.visits).sum::<u32>(),
-                batched.candidates.iter().map(|child| child.visits).sum::<u32>()
+                scalar
+                    .candidates
+                    .iter()
+                    .map(|child| child.visits)
+                    .sum::<u32>(),
+                batched
+                    .candidates
+                    .iter()
+                    .map(|child| child.visits)
+                    .sum::<u32>()
             );
             assert!((scalar.value_q - batched.value_q).abs() < 1.0e-5);
         }
@@ -2265,11 +2282,7 @@ mod tests {
         let started = Instant::now();
         for position in &positions {
             std::hint::black_box(alphazero_search_with_rules(
-                position,
-                None,
-                None,
-                &model,
-                limits,
+                position, None, None, &model, limits,
             ));
         }
         let scalar = started.elapsed();

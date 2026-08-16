@@ -124,10 +124,10 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 3.0)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.33)]
+    #[arg(long, default_value_t = 0.30)]
     fpu_value: f32,
     /// Root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.33)]
+    #[arg(long, default_value_t = 0.20)]
     fpu_value_at_root: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
@@ -1237,8 +1237,8 @@ fn fixed_az_search_limits(
         max_depth,
         root_dirichlet_alpha: 0.0,
         root_exploration_fraction: 0.0,
-        fpu_value: 0.33,
-        fpu_value_at_root: 0.33,
+        fpu_value: 0.30,
+        fpu_value_at_root: 0.20,
         policy_softmax_temp: 1.0,
         draw_score: 0.0,
         value_scale: 1.0,
@@ -1404,11 +1404,7 @@ fn main() {
             for candidate in &result.candidates {
                 println!(
                     "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv,
-                    candidate.visits,
-                    candidate.q,
-                    candidate.prior,
-                    candidate.policy
+                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
                 );
             }
             println!("by_visits:");
@@ -1423,11 +1419,7 @@ fn main() {
             for candidate in &by_visits {
                 println!(
                     "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
-                    candidate.mv,
-                    candidate.visits,
-                    candidate.q,
-                    candidate.prior,
-                    candidate.policy
+                    candidate.mv, candidate.visits, candidate.q, candidate.prior, candidate.policy
                 );
             }
             let verify_sims = if cmd.verify_sims == 0 {

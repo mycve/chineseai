@@ -1759,7 +1759,6 @@ impl AzNnue {
         (wdls, values)
     }
 
-
     fn fill_policy_piece_square_scores(&self, scores: &mut Vec<f32>) {
         let consequence_size = POLICY_CONSEQUENCE_SIZE.min(self.hidden_size);
         scores.resize(PIECE_SQUARE_INPUT_SIZE, 0.0);

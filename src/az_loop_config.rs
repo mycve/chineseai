@@ -122,8 +122,8 @@ impl Default for AzLoopFileConfig {
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.10,
             opening_root_exploration_fraction: 0.30,
-            fpu_value: 0.33,
-            fpu_value_at_root: 0.33,
+            fpu_value: 0.30,
+            fpu_value_at_root: 0.20,
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
             opening_policy_softmax_temp: 3.0,
@@ -412,8 +412,8 @@ mod tests {
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
         assert!(text.contains("opening_root_exploration_fraction = 0.3\n"));
-        assert!(text.contains("fpu_value = 0.33\n"));
-        assert!(text.contains("fpu_value_at_root = 0.33\n"));
+        assert!(text.contains("fpu_value = 0.3\n"));
+        assert!(text.contains("fpu_value_at_root = 0.2\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(text.contains("opening_policy_softmax_temp = 3.0\n"));

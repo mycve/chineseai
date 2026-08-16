@@ -166,7 +166,7 @@ INT8 稀疏节点 accumulator 加入后，同一活跃 v10 权重的基本 INT8 
 
 ## v12 FPU 修正与移除 Moves-left
 
-旧 root FPU 把 `fpu_value_at_root=1.0` 直接当作未访问子节点绝对 Q，而非 reduction，导致根部未访问着被当成必胜。v12 统一采用 `parent Q - reduction × sqrt(visited prior)`，根与非根默认 reduction 均为 0.33，并增加关闭 PUCT 后的根 FPU 回归测试。与此同时删除未经实验验证、会绕开 policy 的额外探索项（将军 ×5、吃子 ×3 和 prior-independent U）。
+旧 root FPU 把 `fpu_value_at_root=1.0` 直接当作未访问子节点绝对 Q，而非 reduction，导致根部未访问着被当成必胜。v12 统一采用 `parent Q - reduction × sqrt(visited prior)` 并增加关闭 PUCT 后的根 FPU 回归测试。修正后的首个基线为根/非根 0.33；当前中国象棋候选默认改为非根 0.30、根 0.20，以增加根部探索，后续仍需用成对开局 Elo 验证。与此同时删除未经实验验证、会绕开 policy 的额外探索项（将军 ×5、吃子 ×3 和 prior-independent U）。
 
 Moves-left 没有在本项目中证明棋力收益，旧参数也不是由当前象棋网络调出的。v12 因此从模型权重、CPU/SIMD 推理、Candle 训练图、loss、replay、自博弈参数和 UCI 中完整删除该头；model/replay/az-loop 格式分别升级到 v12/v35/v9，不保留运行时兼容代码。保留的 v11 权重仅做一次性离线剥离，得到 `eval/policy-sparse-v12.safetensors`。同一 100,000 个 depth-12 标签、`simulations=1` 复测 raw-prior Top-1 仍为 38.505%，确认删除辅助头没有改变 policy 输出。
 
