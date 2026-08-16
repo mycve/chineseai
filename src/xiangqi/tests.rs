@@ -190,6 +190,34 @@ fn fast_attack_detection_matches_slow_scan() {
 }
 
 #[test]
+fn batched_attack_mask_matches_individual_queries() {
+    let mut rng = 0xD1B54A32D192ED03u64;
+    let mut position = Position::startpos();
+    for ply in 0..1_000 {
+        for color in [Color::Red, Color::Black] {
+            let mask = position.attacked_squares_mask(color);
+            for square in 0..BOARD_SIZE {
+                assert_eq!(
+                    mask & (1u128 << square) != 0,
+                    position.is_square_attacked(square, color),
+                    "ply={ply} color={color:?} square={square} fen={}",
+                    position.to_fen()
+                );
+            }
+        }
+        let moves = position.legal_moves();
+        if moves.is_empty() {
+            position = Position::startpos();
+            continue;
+        }
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        position.make_move(moves[rng as usize % moves.len()]);
+    }
+}
+
+#[test]
 fn dynamic_material_cache_updates_across_make_and_unmake() {
     let mut position = Position::from_fen("4k4/9/9/9/9/9/4R4/9/9/4K4 w").unwrap();
     assert!(position.has_dynamic_material(Color::Red));
