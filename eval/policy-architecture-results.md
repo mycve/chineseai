@@ -108,9 +108,11 @@ rank32 参数折中版做了三个独立 seed 的严格配对：dense structured
 
 ## Rust rank32 低秩全增量器与 NPS
 
-正式 Rust 实现采用适合热路径融合的残差形式：根局面预先计算 `a = P * hidden_raw`，候选着使用投影后的棋子格增量 `a' = a - PE(from) + PE(to) - PE(captured)`，最终增加 `a' · move_factor`。`P` 和输入 embedding 在 Candle 训练图中共享梯度；CPU 推理缓存 `PE`，每个节点只做一次 32×hidden 根投影，每个候选着做 32 维增量点积。没有移植实验用的昂贵逐候选 MLP，因此本节只验证可部署低秩残差的成本，不能直接把 PyTorch 完整结构的 Top-1 增益视为 Rust 实际收益。
+正式 Rust 实现采用适合热路径融合的残差形式：根局面预先计算 `a = P * hidden_raw`，候选着使用投影后的棋子格增量 `a' = a - PE(from) + PE(to) - PE(captured)`，最终增加 `a' · move_factor`。`P` 和输入 embedding 在 Candle 训练图中共享梯度；训练仍用 BF16/FP32，CPU 搜索推理则将投影特征和 move factor 全局对称量化为 INT8，每个 MCTS 节点只保存 32 个 INT16 accumulator（64 bytes），走子后按稀疏棋子特征增量更新。
 
-实现覆盖 CPU `AzNnue`、Candle CPU/CUDA 前向反向及 fused CUDA kernel。模型格式升级为 v10；v9 权重可兼容加载，新分支 move factor 零初始化，原 policy 输出保持不变。基准使用相同 release profile、`best.safetensors`、startpos、cpuct=1.5、1024 simulations × 1000 repeats，交替运行五组：
+候选热路径进一步预计算 `move × 棋子类型` 的移动增量和吃子贡献表（约 228 KiB），所以每个合法着只需一次 AVX2 INT16×INT8 的 32 维点积和最多两次数组查表，不再读取三条 32 维特征行。没有移植实验用的昂贵逐候选 MLP，因此本节只验证可部署低秩残差的成本，不能直接把 PyTorch 完整结构的 Top-1 增益视为 Rust 实际收益。
+
+实现覆盖 CPU `AzNnue`、Candle CPU/CUDA 前向反向及 fused CUDA kernel。模型格式为 v10 且只接受 v10，不保留 v9 兼容代码。原始 FP32 低秩版的历史基准如下；协议为相同 release profile、startpos、cpuct=1.5、1024 simulations × 1000 repeats，交替运行五组：
 
 | 配对 | v9 基线 NPS | rank32 全增量器 NPS | 变化 |
 |---:|---:|---:|---:|
@@ -121,4 +123,25 @@ rank32 参数折中版做了三个独立 seed 的严格配对：dense structured
 | 5 | 223,267 | 187,549 | -16.00% |
 | **均值** | **225,425** | **193,289** | **-14.26%** |
 
-两边最后最佳着均为 `b2e2`。完整测试为 108 个库测试、4 个主程序测试全通过；CUDA fused policy 的输出、table 梯度和 context 梯度均与 CPU 对齐。一次真实 CUDA training smoke 成功处理 256 个样本，确认新增参数进入训练图。当前结论是 rank32 可部署但付出约 14% 单线程搜索 NPS；是否值得采用必须用训练后的 v10 权重做固定总墙钟 Elo，而不能只看未兑现的离线 Top-1。
+INT8 稀疏节点 accumulator 加入后，同一活跃 v10 权重的基本 INT8 版为 191,074 NPS；增加走法增量查表与 AVX2 点积后，再做五组 FP32/INT8 交替配对：
+
+| 配对 | FP32 低秩 NPS | INT8 稀疏+查表 NPS | 变化 |
+|---:|---:|---:|---:|
+| 1 | 187,863 | 203,950 | +8.56% |
+| 2 | 189,597 | 209,054 | +10.26% |
+| 3 | 189,652 | 201,745 | +6.38% |
+| 4 | 190,193 | 210,581 | +10.72% |
+| 5 | 187,754 | 206,539 | +10.00% |
+| **均值** | **189,012** | **206,374** | **+9.19%** |
+
+零残差等价权重的同场配对均值为 FP32 198,302、INT8 查表 215,509 NPS，提升 8.68%。与更早、尚无低秩分支的原始 v9 历史均值 225,425 NPS 相比，当前 v10 仍约低 4.40%；后二者不是同场配对，只用于估计剩余架构成本，不能视作精确差值。
+
+量化精度用 100,000 个 depth-12 标签、`simulations=1` 验证：
+
+| 推理 | Raw-prior Top-1 | Top-2 | Top-4 | Top-8 |
+|---|---:|---:|---:|---:|
+| FP32 | 37.236% | 41.828% | 48.328% | 58.742% |
+| INT8 | 37.232% | 41.805% | 48.319% | 58.745% |
+| 差值 | -0.004pp | -0.023pp | -0.009pp | +0.003pp |
+
+活跃权重用 30 秒 CUDA 拟合得到 validation Policy CE 2.260943，保留为 `eval/policy-accumulator-int8-v10.safetensors`。所有基准最后最佳着均为 `b2e2`。完整测试为 109 个库测试、4 个主程序测试全通过；CUDA fused policy 的输出与梯度均与 CPU 对齐。结论：INT8 几乎无可测策略损失，且查表后收回约 9% 相对 FP32 低秩实现的吞吐；当前结构相对原始网络仍有约 4%--5% 的估计 NPS 成本。是否值得采用，最终必须比较固定总自博弈墙钟下的 samples/s 和成对开局 Elo。

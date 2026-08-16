@@ -59,6 +59,15 @@ pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 32;
+const POLICY_ACCUMULATOR_PIECE_OFFSET: usize = AZ_NNUE_INPUT_SIZE;
+const POLICY_ACCUMULATOR_RANK_OFFSET: usize =
+    POLICY_ACCUMULATOR_PIECE_OFFSET + STRUCTURAL_PIECE_SIZE;
+const POLICY_ACCUMULATOR_FILE_OFFSET: usize = POLICY_ACCUMULATOR_RANK_OFFSET + STRUCTURAL_RANK_SIZE;
+const POLICY_ACCUMULATOR_KING_PIECE_OFFSET: usize =
+    POLICY_ACCUMULATOR_FILE_OFFSET + STRUCTURAL_FILE_SIZE;
+const POLICY_ACCUMULATOR_BIAS_ROW: usize =
+    POLICY_ACCUMULATOR_KING_PIECE_OFFSET + STRUCTURAL_KING_PIECE_SIZE;
+const POLICY_ACCUMULATOR_QUANT_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
 pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.95;
@@ -261,8 +270,7 @@ pub(super) struct AzEvalScratch {
     features: Vec<usize>,
     hidden: Vec<f32>,
     policy_context: Vec<f32>,
-    policy_accumulator_raw: Vec<f32>,
-    policy_accumulator_context: Vec<f32>,
+    policy_accumulator_context: [i16; POLICY_ACCUMULATOR_RANK],
     policy_piece_square_scores: Vec<f32>,
     value_head: Vec<f32>,
     policy_gives_check: Vec<f32>,
@@ -277,8 +285,7 @@ impl AzEvalScratch {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
             policy_context: vec![0.0; POLICY_MOVE_CONTEXT_SIZE],
-            policy_accumulator_raw: vec![0.0; hidden_size],
-            policy_accumulator_context: vec![0.0; POLICY_ACCUMULATOR_RANK],
+            policy_accumulator_context: [0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             policy_gives_check: Vec::with_capacity(192),
@@ -292,8 +299,7 @@ impl AzEvalScratch {
             features: Vec::new(),
             hidden: Vec::new(),
             policy_context: Vec::new(),
-            policy_accumulator_raw: Vec::new(),
-            policy_accumulator_context: Vec::new(),
+            policy_accumulator_context: [0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
             value_head: Vec::new(),
             policy_gives_check: Vec::new(),
@@ -554,7 +560,12 @@ pub struct AzNnue {
     pub policy_move_context: Vec<f32>,
     pub policy_accumulator_hidden: Vec<f32>,
     pub policy_accumulator_move: Vec<f32>,
-    policy_accumulator_feature: Vec<f32>,
+    policy_accumulator_feature_q: Vec<i8>,
+    policy_accumulator_move_q: Vec<i8>,
+    policy_accumulator_moved_delta_q: Vec<i32>,
+    policy_accumulator_capture_q: Vec<i32>,
+    policy_accumulator_feature_scale: f32,
+    policy_accumulator_move_scale: f32,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -584,7 +595,12 @@ impl Clone for AzNnue {
             policy_move_context: self.policy_move_context.clone(),
             policy_accumulator_hidden: self.policy_accumulator_hidden.clone(),
             policy_accumulator_move: self.policy_accumulator_move.clone(),
-            policy_accumulator_feature: self.policy_accumulator_feature.clone(),
+            policy_accumulator_feature_q: self.policy_accumulator_feature_q.clone(),
+            policy_accumulator_move_q: self.policy_accumulator_move_q.clone(),
+            policy_accumulator_moved_delta_q: self.policy_accumulator_moved_delta_q.clone(),
+            policy_accumulator_capture_q: self.policy_accumulator_capture_q.clone(),
+            policy_accumulator_feature_scale: self.policy_accumulator_feature_scale,
+            policy_accumulator_move_scale: self.policy_accumulator_move_scale,
             gpu_trainer: None,
         }
     }
@@ -1063,10 +1079,15 @@ impl AzNnue {
             policy_move_context,
             policy_accumulator_hidden,
             policy_accumulator_move,
-            policy_accumulator_feature: Vec::new(),
+            policy_accumulator_feature_q: Vec::new(),
+            policy_accumulator_move_q: Vec::new(),
+            policy_accumulator_moved_delta_q: Vec::new(),
+            policy_accumulator_capture_q: Vec::new(),
+            policy_accumulator_feature_scale: 1.0,
+            policy_accumulator_move_scale: 1.0,
             gpu_trainer: None,
         };
-        model.rebuild_policy_accumulator_feature();
+        model.rebuild_policy_accumulator_quantization();
         model
     }
 
@@ -1104,7 +1125,7 @@ impl AzNnue {
                 "missing AZ model format",
             ));
         };
-        if format_version != 9.0 && format_version != MODEL_FORMAT_VERSION {
+        if format_version != MODEL_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1116,21 +1137,6 @@ impl AzNnue {
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
-        let (policy_accumulator_hidden, policy_accumulator_move) = if format_version >= 10.0 {
-            (
-                load_candle_f32_tensor(&tensors, "policy_accumulator_hidden")?,
-                load_candle_f32_tensor(&tensors, "policy_accumulator_move")?,
-            )
-        } else {
-            let mut projection = vec![0.0; POLICY_ACCUMULATOR_RANK * hidden_size];
-            for rank in 0..POLICY_ACCUMULATOR_RANK.min(hidden_size) {
-                projection[rank * hidden_size + rank] = 1.0;
-            }
-            (
-                projection,
-                vec![0.0; DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK],
-            )
-        };
         let mut model = Self {
             hidden_size,
             arch,
@@ -1155,12 +1161,20 @@ impl AzNnue {
             )?,
             policy_context_hidden: load_candle_f32_tensor(&tensors, "policy_context_hidden")?,
             policy_move_context: load_candle_f32_tensor(&tensors, "policy_move_context")?,
-            policy_accumulator_hidden,
-            policy_accumulator_move,
-            policy_accumulator_feature: Vec::new(),
+            policy_accumulator_hidden: load_candle_f32_tensor(
+                &tensors,
+                "policy_accumulator_hidden",
+            )?,
+            policy_accumulator_move: load_candle_f32_tensor(&tensors, "policy_accumulator_move")?,
+            policy_accumulator_feature_q: Vec::new(),
+            policy_accumulator_move_q: Vec::new(),
+            policy_accumulator_moved_delta_q: Vec::new(),
+            policy_accumulator_capture_q: Vec::new(),
+            policy_accumulator_feature_scale: 1.0,
+            policy_accumulator_move_scale: 1.0,
             gpu_trainer: None,
         };
-        model.rebuild_policy_accumulator_feature();
+        model.rebuild_policy_accumulator_quantization();
         model.validate()?;
         Ok(model)
     }
@@ -1214,10 +1228,8 @@ impl AzNnue {
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
             self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
         }
-        scratch.policy_accumulator_raw.resize(self.hidden_size, 0.0);
-        scratch
-            .policy_accumulator_raw
-            .copy_from_slice(&scratch.hidden);
+        scratch.policy_accumulator_context =
+            self.quantized_policy_accumulator(position, position.side_to_move());
         {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
@@ -1244,6 +1256,7 @@ impl AzNnue {
         &self,
         position: &Position,
         accumulator_hidden: &[f32],
+        policy_accumulator: &[i16; POLICY_ACCUMULATOR_RANK],
         moves: &[Move],
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
@@ -1261,10 +1274,9 @@ impl AzNnue {
         };
         scratch.hidden.copy_from_slice(hidden);
         self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
-        scratch.policy_accumulator_raw.resize(self.hidden_size, 0.0);
         scratch
-            .policy_accumulator_raw
-            .copy_from_slice(&scratch.hidden);
+            .policy_accumulator_context
+            .copy_from_slice(policy_accumulator);
         {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
@@ -1311,16 +1323,6 @@ impl AzNnue {
                     &self.policy_context_hidden[start..start + self.hidden_size],
                 );
             }
-            scratch
-                .policy_accumulator_context
-                .resize(POLICY_ACCUMULATOR_RANK, 0.0);
-            for (rank, context) in scratch.policy_accumulator_context.iter_mut().enumerate() {
-                let start = rank * self.hidden_size;
-                *context = dot_product(
-                    &scratch.policy_accumulator_raw,
-                    &self.policy_accumulator_hidden[start..start + self.hidden_size],
-                );
-            }
             let work = position.clone();
             {
                 crate::scope_profile!("az.eval.policy.gives_check");
@@ -1343,7 +1345,7 @@ impl AzNnue {
                     let move_index = dense as usize;
                     let context_start = move_index * POLICY_MOVE_CONTEXT_SIZE;
                     let accumulator_start = move_index * POLICY_ACCUMULATOR_RANK;
-                    let accumulator_move = &self.policy_accumulator_move
+                    let accumulator_move = &self.policy_accumulator_move_q
                         [accumulator_start..accumulator_start + POLICY_ACCUMULATOR_RANK];
                     let consequence = policy_consequence_features(position, side, *mv);
                     let piece_square_logit = consequence.map_or(0.0, |(from, to, captured)| {
@@ -1353,20 +1355,20 @@ impl AzNnue {
                                 .map_or(0.0, |feature| scratch.policy_piece_square_scores[feature])
                     });
                     let accumulator_logit = if let Some((from, to, captured)) = consequence {
-                        let from = from * POLICY_ACCUMULATOR_RANK;
-                        let to = to * POLICY_ACCUMULATOR_RANK;
-                        let captured = captured.map(|feature| feature * POLICY_ACCUMULATOR_RANK);
-                        let mut value = 0.0;
-                        for rank in 0..POLICY_ACCUMULATOR_RANK {
-                            let mut after = scratch.policy_accumulator_context[rank]
-                                + self.policy_accumulator_feature[to + rank]
-                                - self.policy_accumulator_feature[from + rank];
-                            if let Some(captured) = captured {
-                                after -= self.policy_accumulator_feature[captured + rank];
-                            }
-                            value += after * accumulator_move[rank];
+                        debug_assert_eq!(from / BOARD_SIZE, to / BOARD_SIZE);
+                        let cache_start = move_index * STRUCTURAL_PIECE_SIZE;
+                        let mut value = dot_product_i16_i8_32(
+                            &scratch.policy_accumulator_context,
+                            accumulator_move,
+                        ) + self.policy_accumulator_moved_delta_q
+                            [cache_start + from / BOARD_SIZE];
+                        if let Some(captured) = captured {
+                            value -= self.policy_accumulator_capture_q
+                                [cache_start + captured / BOARD_SIZE];
                         }
-                        value
+                        value as f32
+                            * self.policy_accumulator_feature_scale
+                            * self.policy_accumulator_move_scale
                     } else {
                         0.0
                     };
@@ -1626,18 +1628,193 @@ impl AzNnue {
         }
     }
 
-    fn rebuild_policy_accumulator_feature(&mut self) {
-        self.policy_accumulator_feature
-            .resize(AZ_NNUE_INPUT_SIZE * POLICY_ACCUMULATOR_RANK, 0.0);
-        for feature in 0..AZ_NNUE_INPUT_SIZE {
-            let input =
-                &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            for rank in 0..POLICY_ACCUMULATOR_RANK {
-                let projection = &self.policy_accumulator_hidden
-                    [rank * self.hidden_size..(rank + 1) * self.hidden_size];
-                self.policy_accumulator_feature[feature * POLICY_ACCUMULATOR_RANK + rank] =
-                    dot_product(input, projection);
+    fn rebuild_policy_accumulator_quantization(&mut self) {
+        let mut projected =
+            Vec::with_capacity(POLICY_ACCUMULATOR_QUANT_ROWS * POLICY_ACCUMULATOR_RANK);
+        let projection = &self.policy_accumulator_hidden;
+        let hidden = self.hidden_size;
+        let mut append = |table: &[f32]| {
+            debug_assert_eq!(table.len() % hidden, 0);
+            for row in table.chunks_exact(hidden) {
+                for rank in 0..POLICY_ACCUMULATOR_RANK {
+                    let weights = &projection[rank * hidden..(rank + 1) * hidden];
+                    projected.push(dot_product(row, weights));
+                }
             }
+        };
+        append(&self.input_hidden);
+        append(&self.input_piece_hidden);
+        append(&self.input_rank_hidden);
+        append(&self.input_file_hidden);
+        append(&self.input_king_piece_hidden);
+        append(&self.hidden_bias);
+        debug_assert_eq!(
+            projected.len(),
+            POLICY_ACCUMULATOR_QUANT_ROWS * POLICY_ACCUMULATOR_RANK
+        );
+        let feature_max = projected
+            .iter()
+            .fold(0.0f32, |maximum, value| maximum.max(value.abs()));
+        self.policy_accumulator_feature_scale = (feature_max / 127.0).max(1.0e-12);
+        self.policy_accumulator_feature_q = projected
+            .into_iter()
+            .map(|value| {
+                (value / self.policy_accumulator_feature_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+
+        let move_max = self
+            .policy_accumulator_move
+            .iter()
+            .fold(0.0f32, |maximum, value| maximum.max(value.abs()));
+        self.policy_accumulator_move_scale = (move_max / 127.0).max(1.0e-12);
+        self.policy_accumulator_move_q = self
+            .policy_accumulator_move
+            .iter()
+            .map(|value| {
+                (*value / self.policy_accumulator_move_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+
+        let cache_size = DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE;
+        self.policy_accumulator_moved_delta_q = vec![0; cache_size];
+        self.policy_accumulator_capture_q = vec![0; cache_size];
+        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
+            let sparse = sparse as usize;
+            let from_square = sparse / BOARD_SIZE;
+            let to_square = sparse % BOARD_SIZE;
+            let move_start = move_index * POLICY_ACCUMULATOR_RANK;
+            let move_weights =
+                &self.policy_accumulator_move_q[move_start..move_start + POLICY_ACCUMULATOR_RANK];
+            for piece_index in 0..STRUCTURAL_PIECE_SIZE {
+                let from_start = (piece_index * BOARD_SIZE + from_square) * POLICY_ACCUMULATOR_RANK;
+                let to_start = (piece_index * BOARD_SIZE + to_square) * POLICY_ACCUMULATOR_RANK;
+                let mut moved_delta = 0i32;
+                let mut capture = 0i32;
+                for rank in 0..POLICY_ACCUMULATOR_RANK {
+                    let weight = i32::from(move_weights[rank]);
+                    let to = i32::from(self.policy_accumulator_feature_q[to_start + rank]);
+                    let from = i32::from(self.policy_accumulator_feature_q[from_start + rank]);
+                    moved_delta += (to - from) * weight;
+                    capture += to * weight;
+                }
+                let cache_index = move_index * STRUCTURAL_PIECE_SIZE + piece_index;
+                self.policy_accumulator_moved_delta_q[cache_index] = moved_delta;
+                self.policy_accumulator_capture_q[cache_index] = capture;
+            }
+        }
+    }
+
+    pub(super) fn quantized_policy_accumulator(
+        &self,
+        position: &Position,
+        perspective: Color,
+    ) -> [i16; POLICY_ACCUMULATOR_RANK] {
+        let mut accumulator = [0i16; POLICY_ACCUMULATOR_RANK];
+        self.add_quantized_policy_row(&mut accumulator, POLICY_ACCUMULATOR_BIAS_ROW, 1);
+        let buckets = canonical_buckets_for_perspective(position, perspective);
+        for square in 0..BOARD_SIZE {
+            if let Some(piece) = position.piece_at(square) {
+                self.add_quantized_policy_piece(
+                    &mut accumulator,
+                    perspective,
+                    buckets,
+                    square,
+                    piece,
+                    1,
+                );
+            }
+        }
+        accumulator
+    }
+
+    pub(super) fn apply_quantized_policy_transition(
+        &self,
+        before: &Position,
+        after: &Position,
+        mv: Move,
+        moved: Piece,
+        captured: Option<Piece>,
+        perspective: Color,
+        accumulator: &mut [i16; POLICY_ACCUMULATOR_RANK],
+    ) {
+        let before_buckets = canonical_buckets_for_perspective(before, perspective);
+        let after_buckets = canonical_buckets_for_perspective(after, perspective);
+        if before_buckets != after_buckets {
+            *accumulator = self.quantized_policy_accumulator(after, perspective);
+            return;
+        }
+        self.add_quantized_policy_piece(
+            accumulator,
+            perspective,
+            before_buckets,
+            mv.from as usize,
+            moved,
+            -1,
+        );
+        if let Some(captured) = captured {
+            self.add_quantized_policy_piece(
+                accumulator,
+                perspective,
+                before_buckets,
+                mv.to as usize,
+                captured,
+                -1,
+            );
+        }
+        self.add_quantized_policy_piece(
+            accumulator,
+            perspective,
+            after_buckets,
+            mv.to as usize,
+            moved,
+            1,
+        );
+    }
+
+    fn add_quantized_policy_piece(
+        &self,
+        accumulator: &mut [i16; POLICY_ACCUMULATOR_RANK],
+        perspective: Color,
+        buckets: (usize, usize),
+        square: usize,
+        piece: Piece,
+        sign: i32,
+    ) {
+        let relative_color = if piece.color == perspective { 0 } else { 7 };
+        let piece_index = relative_color + piece_kind_index(piece.kind);
+        let relative_square = canonical_square_for(perspective, square);
+        let rank = relative_square / BOARD_FILES;
+        let file = relative_square % BOARD_FILES;
+        for row in [
+            piece_index * BOARD_SIZE + relative_square,
+            POLICY_ACCUMULATOR_PIECE_OFFSET + piece_index,
+            POLICY_ACCUMULATOR_RANK_OFFSET + rank,
+            POLICY_ACCUMULATOR_FILE_OFFSET + file,
+            POLICY_ACCUMULATOR_KING_PIECE_OFFSET
+                + structural_king_piece_index(0, buckets.0, piece_index),
+            POLICY_ACCUMULATOR_KING_PIECE_OFFSET
+                + structural_king_piece_index(1, buckets.1, piece_index),
+        ] {
+            self.add_quantized_policy_row(accumulator, row, sign);
+        }
+    }
+
+    fn add_quantized_policy_row(
+        &self,
+        accumulator: &mut [i16; POLICY_ACCUMULATOR_RANK],
+        row: usize,
+        sign: i32,
+    ) {
+        let start = row * POLICY_ACCUMULATOR_RANK;
+        let values = &self.policy_accumulator_feature_q[start..start + POLICY_ACCUMULATOR_RANK];
+        for (target, &value) in accumulator.iter_mut().zip(values) {
+            *target = (i32::from(*target) + sign * i32::from(value))
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
     }
 
@@ -1673,10 +1850,16 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(validate_tensor, hidden);
-        if self.policy_accumulator_feature.len() != AZ_NNUE_INPUT_SIZE * POLICY_ACCUMULATOR_RANK {
+        if self.policy_accumulator_feature_q.len()
+            != POLICY_ACCUMULATOR_QUANT_ROWS * POLICY_ACCUMULATOR_RANK
+            || self.policy_accumulator_move_q.len() != DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK
+            || self.policy_accumulator_moved_delta_q.len()
+                != DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE
+            || self.policy_accumulator_capture_q.len() != DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "az model derived policy accumulator cache length mismatch",
+                "az model derived quantized policy accumulator cache length mismatch",
             ));
         }
         Ok(())
@@ -1791,6 +1974,40 @@ fn softplus(value: f32) -> f32 {
     } else {
         value.exp().ln_1p()
     }
+}
+
+#[inline]
+fn dot_product_i16_i8_32(left: &[i16; POLICY_ACCUMULATOR_RANK], right: &[i8]) -> i32 {
+    debug_assert_eq!(right.len(), POLICY_ACCUMULATOR_RANK);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was checked at runtime and both inputs contain exactly 32 elements.
+        return unsafe { dot_product_i16_i8_32_avx2(left, right) };
+    }
+    left.iter()
+        .zip(right)
+        .map(|(&a, &b)| i32::from(a) * i32::from(b))
+        .sum()
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_product_i16_i8_32_avx2(left: &[i16; POLICY_ACCUMULATOR_RANK], right: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mut sums = _mm256_setzero_si256();
+    for offset in [0, 16] {
+        let a = unsafe { _mm256_loadu_si256(left.as_ptr().add(offset).cast()) };
+        let b8 = unsafe { _mm_loadu_si128(right.as_ptr().add(offset).cast()) };
+        let b = _mm256_cvtepi8_epi16(b8);
+        sums = _mm256_add_epi32(sums, _mm256_madd_epi16(a, b));
+    }
+    let mut lanes = [0i32; 8];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), sums) };
+    lanes.into_iter().sum()
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {
@@ -2508,6 +2725,7 @@ mod tests {
 
         let mut active = model.clone();
         active.policy_accumulator_move.fill(0.01);
+        active.rebuild_policy_accumulator_quantization();
         let mut changed = AzEvalScratch::new(model.arch);
         active.evaluate_with_scratch_output(
             &position,
@@ -2556,6 +2774,38 @@ mod tests {
             let refreshed = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
             for (&incremental, &full) in hidden.iter().zip(&refreshed) {
                 assert!((incremental - full).abs() < 2.0e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_policy_accumulator_matches_full_refresh() {
+        let model = AzNnue::random(128, 20260817);
+        let mut position = Position::startpos();
+        let mut accumulators = [
+            model.quantized_policy_accumulator(&position, Color::Red),
+            model.quantized_policy_accumulator(&position, Color::Black),
+        ];
+        for _ in 0..32 {
+            let mv = position.legal_moves()[0];
+            let moved = position.piece_at(mv.from as usize).unwrap();
+            let captured = position.piece_at(mv.to as usize);
+            let before = position.clone();
+            position.make_move(mv);
+            for perspective in [Color::Red, Color::Black] {
+                model.apply_quantized_policy_transition(
+                    &before,
+                    &position,
+                    mv,
+                    moved,
+                    captured,
+                    perspective,
+                    &mut accumulators[color_index(perspective)],
+                );
+                assert_eq!(
+                    accumulators[color_index(perspective)],
+                    model.quantized_policy_accumulator(&position, perspective)
+                );
             }
         }
     }

@@ -6,7 +6,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, SplitMix64, rule_context_features,
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, POLICY_ACCUMULATOR_RANK, SplitMix64,
+    color_index, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;
@@ -332,6 +333,7 @@ struct AzTree<'a> {
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
+    root_policy_accumulators: [[i16; POLICY_ACCUMULATOR_RANK]; 2],
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
     root_raw_priors: Vec<f32>,
@@ -368,6 +370,7 @@ struct AzTree<'a> {
 struct AzNode {
     position: Position,
     accumulator_offset: u32,
+    policy_accumulator: [i16; POLICY_ACCUMULATOR_RANK],
     parent: u32,
     incoming_move: Option<Move>,
     rule_entry: Option<RuleHistoryEntry>,
@@ -609,13 +612,20 @@ impl<'a> AzTree<'a> {
         rule_history_scratch.extend_from_slice(rule_history);
         let accumulator = AzEvalAccumulator::new(model, &position);
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
+        let root_policy_accumulators = [
+            model.quantized_policy_accumulator(&position, Color::Red),
+            model.quantized_policy_accumulator(&position, Color::Black),
+        ];
         let root_accumulator_offset = match position.side_to_move() {
             Color::Red => 0,
             Color::Black => model.hidden_size,
         };
+        let root_policy_accumulator =
+            root_policy_accumulators[color_index(position.side_to_move())];
         nodes.push(AzNode {
             position,
             accumulator_offset: root_accumulator_offset as u32,
+            policy_accumulator: root_policy_accumulator,
             parent: NO_CHILD,
             incoming_move: None,
             rule_entry: None,
@@ -632,6 +642,7 @@ impl<'a> AzTree<'a> {
             nodes,
             children,
             accumulator_arena,
+            root_policy_accumulators,
             model,
             root_moves,
             root_raw_priors,
@@ -792,6 +803,7 @@ impl<'a> AzTree<'a> {
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
+                &self.nodes[node_index].policy_accumulator,
                 &moves,
                 &rule_context_features(
                     &self.nodes[node_index].position,
@@ -920,6 +932,12 @@ impl<'a> AzTree<'a> {
                     child_position.make_move(mv);
                 }
                 let perspective = child_position.side_to_move();
+                let mut child_policy_accumulator = if node_index == self.root {
+                    self.root_policy_accumulators[color_index(perspective)]
+                } else {
+                    let grandparent = self.nodes[node_index].parent as usize;
+                    self.nodes[grandparent].policy_accumulator
+                };
                 let child_accumulator_offset = self.accumulator_arena.len();
                 let base_offset = if node_index == self.root {
                     match perspective {
@@ -956,6 +974,15 @@ impl<'a> AzTree<'a> {
                         perspective,
                         accumulator,
                     );
+                    self.model.apply_quantized_policy_transition(
+                        &self.nodes[grandparent].position,
+                        &self.nodes[node_index].position,
+                        parent_move,
+                        parent_moved,
+                        parent_captured,
+                        perspective,
+                        &mut child_policy_accumulator,
+                    );
                 }
                 AzEvalAccumulator::apply_transition_for_perspective(
                     self.model,
@@ -967,6 +994,15 @@ impl<'a> AzTree<'a> {
                     perspective,
                     accumulator,
                 );
+                self.model.apply_quantized_policy_transition(
+                    &self.nodes[node_index].position,
+                    &child_position,
+                    mv,
+                    moved,
+                    captured,
+                    perspective,
+                    &mut child_policy_accumulator,
+                );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv.to as usize);
                 let child_node = self.nodes.len();
@@ -974,6 +1010,7 @@ impl<'a> AzTree<'a> {
                     position: child_position,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
+                    policy_accumulator: child_policy_accumulator,
                     parent: u32::try_from(node_index)
                         .expect("MCTS node index exceeds compact parent range"),
                     incoming_move: Some(mv),
@@ -1058,6 +1095,7 @@ impl<'a> AzTree<'a> {
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
+                &self.nodes[node_index].policy_accumulator,
                 &moves,
                 &rule_context_features(
                     &self.nodes[node_index].position,
@@ -1841,6 +1879,7 @@ mod tests {
         let parent = AzNode {
             position,
             accumulator_offset: 0,
+            policy_accumulator: [0; POLICY_ACCUMULATOR_RANK],
             parent: NO_CHILD,
             incoming_move: None,
             rule_entry: None,

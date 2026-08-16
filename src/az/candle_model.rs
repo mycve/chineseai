@@ -50,10 +50,11 @@ impl AzCandleModel {
             ],
             0,
         )?;
-        let sparse_pre = feature_pool(&feature_tables, &batch.feature_items)?
+        let board_pre = feature_pool(&feature_tables, &batch.feature_items)?
             .broadcast_add(&self.hidden_bias)?;
+        let accumulator_context = board_pre.matmul(&self.policy_accumulator_hidden.t()?)?;
         let rule_pre = batch.rule_context.matmul(&self.rule_context_hidden)?;
-        let sparse_pre = (sparse_pre + rule_pre)?;
+        let sparse_pre = (board_pre + rule_pre)?;
         let sparse_hidden = sparse_pre.relu()?;
         let rms = sparse_hidden
             .sqr()?
@@ -97,7 +98,6 @@ impl AzCandleModel {
         };
         let piece_square_policy = piece_square_policy.flatten_all()?;
         let policy_context = hidden.matmul(&self.policy_context_hidden.t()?)?;
-        let accumulator_context = sparse_pre.matmul(&self.policy_accumulator_hidden.t()?)?;
         let policy_context = Tensor::cat(&[&policy_context, &accumulator_context], 1)?;
         let accumulator_feature = self
             .input_hidden
@@ -344,7 +344,7 @@ impl AzCandleModel {
             &self.policy_accumulator_move,
             &mut model.policy_accumulator_move,
         )?;
-        model.rebuild_policy_accumulator_feature();
+        model.rebuild_policy_accumulator_quantization();
         Ok(())
     }
 
@@ -416,7 +416,7 @@ mod tests {
         for (index, weight) in model.policy_accumulator_move.iter_mut().enumerate() {
             *weight = ((index % POLICY_ACCUMULATOR_RANK) as f32 + 1.0) * 0.0002;
         }
-        model.rebuild_policy_accumulator_feature();
+        model.rebuild_policy_accumulator_quantization();
 
         let mut cpu = AzEvalScratch::new(model.arch);
         model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
