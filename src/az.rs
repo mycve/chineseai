@@ -1325,6 +1325,7 @@ impl AzNnue {
             self.value_wdl_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
+        self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
         scratch.features = features;
         AzEvalOutput { value_wdl, value }
     }
@@ -1400,9 +1401,25 @@ impl AzNnue {
             requests[3].scratch.hidden.as_slice(),
         ];
         let (value_wdls, values) = self.value_wdl_batch4(hiddens);
+        let mut contexts = [[0.0f32; POLICY_MOVE_CONTEXT_SIZE]; 4];
+        for context_index in 0..POLICY_MOVE_CONTEXT_SIZE {
+            let start = context_index * self.hidden_size;
+            let dots = dot_product_f32_batch4(
+                hiddens,
+                &self.policy_context_hidden[start..start + self.hidden_size],
+            );
+            for batch in 0..4 {
+                contexts[batch][context_index] = dots[batch];
+            }
+        }
         for index in 0..4 {
             let request = &mut requests[index];
-            self.evaluate_prepared_hidden_with_scratch(
+            request.scratch.policy_context.clear();
+            request
+                .scratch
+                .policy_context
+                .extend_from_slice(&contexts[index]);
+            self.evaluate_prepared_hidden_with_context(
                 request.position,
                 &[],
                 values[index],
@@ -1424,6 +1441,25 @@ impl AzNnue {
         moves: &[Move],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
+        scratch.policy_context.resize(POLICY_MOVE_CONTEXT_SIZE, 0.0);
+        for (context_index, context) in scratch.policy_context.iter_mut().enumerate() {
+            let start = context_index * self.hidden_size;
+            *context = dot_product(
+                &scratch.hidden,
+                &self.policy_context_hidden[start..start + self.hidden_size],
+            );
+        }
+        self.evaluate_prepared_hidden_with_context(position, features, value, moves, scratch)
+    }
+
+    fn evaluate_prepared_hidden_with_context(
+        &self,
+        position: &Position,
+        features: &[usize],
+        value: f32,
+        moves: &[Move],
+        scratch: &mut AzEvalScratch,
+    ) -> f32 {
         scratch.logits.resize(moves.len(), 0.0);
         if scratch.policy_piece_square_scores.is_empty() {
             self.fill_policy_piece_square_scores(&mut scratch.policy_piece_square_scores);
@@ -1433,22 +1469,6 @@ impl AzNnue {
         let king_buckets = canonical_buckets_for_perspective(position, side);
         {
             crate::scope_profile!("az.eval.policy_logits");
-            scratch.policy_gives_check.resize(moves.len(), 0.0);
-            scratch.policy_context.resize(POLICY_MOVE_CONTEXT_SIZE, 0.0);
-            for (context_index, context) in scratch.policy_context.iter_mut().enumerate() {
-                let start = context_index * self.hidden_size;
-                *context = dot_product(
-                    &scratch.hidden,
-                    &self.policy_context_hidden[start..start + self.hidden_size],
-                );
-            }
-            let work = position.clone();
-            {
-                crate::scope_profile!("az.eval.policy.gives_check");
-                for (flag, &mv) in scratch.policy_gives_check.iter_mut().zip(moves) {
-                    *flag = f32::from(work.gives_check_after_move_fast(mv));
-                }
-            }
             {
                 crate::scope_profile!("az.eval.policy.logit_arith");
                 for (index, mv) in moves.iter().enumerate() {
@@ -1520,6 +1540,14 @@ impl AzNnue {
         }
         let _ = features;
         value
+    }
+
+    fn fill_policy_gives_checks(&self, position: &Position, moves: &[Move], output: &mut Vec<f32>) {
+        crate::scope_profile!("az.eval.policy.gives_check");
+        output.resize(moves.len(), 0.0);
+        for (flag, &mv) in output.iter_mut().zip(moves) {
+            *flag = f32::from(position.gives_check_after_move_fast(mv));
+        }
     }
 
     #[inline]

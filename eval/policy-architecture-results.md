@@ -182,3 +182,11 @@ Moves-left 没有在本项目中证明棋力收益，旧参数也不是由当前
 | **均值** | **208,542** | **236,089** | **+13.21%** |
 
 当前 fast 全套测试为 109 passed、2 ignored，主程序 4 passed，且 `cargo check --profile fast --all-targets` 零警告。训练仍使用同一 dense AdamW 更新；在不改变优化轨迹的前提下，通用 Candle 暂无简单的稀疏提速。严格等价方案需要实现 lazy Adam，对未激活行补做中间 step 的一阶/二阶动量、bias correction 和 weight decay 更新；复杂度与验证成本高于当前可接受的训练耗时，因此本轮不改优化器。
+
+## 四局批量自博弈接入
+
+四树 batch4 进一步批量化 value head 与 policy-context 点积，并加入跨根搜索复用的节点、子节点、accumulator、eval scratch 和 simulation path 缓冲。`az-loop` 的每个固定 CPU worker 从单局改为同时维护四个独立局面；每局拥有独立树、规则历史和 RNG，提前结束的局面使用空槽，不引入同树 virtual loss。完整自博弈样本生成测试以及带开局温度、Dirichlet 噪声的标量/四树搜索等价测试均通过。
+
+逐候选“是否将军”原先在每次 leaf 推理中计算，但只供 trace 展示，不参与 policy logit、PUCT 或训练标签；现改为 trace 时按需计算。四 worker、hidden=128 的 fast 自博弈基准中，256 simulations 时最终 batch4 相对同版本标量均值约提升 1.10 倍；连同移除无用将军预计算，相对改动前路径约提升 1.20 倍。生产配置 1600 simulations 时，batch4 调度本身约提升 1.02 倍，说明合法着生成、规则历史、select/backprop 已占主导，继续扩大推理 batch 不再可能接近线性收益。
+
+同时修正诊断语义：`raw_prior` 现在固定表示温度与根噪声之前的网络 softmax；实际树先验单独记录为 `prior`，MCTS 访问分布为 `policy`。`az-search` 表头相应显示 `NET P / TREE P / VISIT P`，并把 root PUCT 和 dynamic factor 默认值统一到自博弈/UCI 的 1.5。

@@ -8,7 +8,10 @@ use crate::nnue::{
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
-use super::alphazero::{AzSearchWorkspace, alphazero_search_with_rules_reusing};
+use super::alphazero::{
+    AzBatchSearchInput, AzBatchSearchWorkspace, AzSearchWorkspace, alphazero_search_batch4_reusing,
+    alphazero_search_with_rules_reusing,
+};
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
     alphazero_search_with_rules, dense_move_index, rule_context_features,
@@ -293,8 +296,47 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
+fn selfplay_search_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSearchLimits {
+    let opening = ply < config.opening_exploration_plies;
+    AzSearchLimits {
+        simulations: config.simulations.max(1),
+        seed,
+        cpuct: config.cpuct,
+        cpuct_at_root: config.cpuct_at_root,
+        cpuct_base: config.cpuct_base,
+        cpuct_factor: config.cpuct_factor,
+        cpuct_base_at_root: config.cpuct_base_at_root,
+        cpuct_factor_at_root: config.cpuct_factor_at_root,
+        max_depth: 0,
+        root_dirichlet_alpha: config.root_dirichlet_alpha,
+        root_exploration_fraction: if opening {
+            config.opening_root_exploration_fraction
+        } else {
+            config.root_exploration_fraction
+        },
+        fpu_value: config.fpu_value,
+        fpu_value_at_root: config.fpu_value_at_root,
+        policy_softmax_temp: if opening {
+            config.opening_policy_softmax_temp
+        } else {
+            config.policy_softmax_temp
+        },
+        draw_score: config.draw_score,
+        value_scale: 1.0,
+    }
+}
+
 fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.chunk");
+    if config.games >= 4 {
+        generate_selfplay_chunk_batch4(model, config)
+    } else {
+        generate_selfplay_chunk_scalar(model, config)
+    }
+}
+
+fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    crate::scope_profile!("az.selfplay.chunk_scalar");
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
     let mut position_fens = Vec::new();
@@ -376,33 +418,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let search_simulation_count = config.simulations.max(1);
             search_simulations.searches += 1;
             search_simulations.simulations_sum += search_simulation_count;
-            let opening_exploration = ply < config.opening_exploration_plies;
-            let limits = AzSearchLimits {
-                simulations: search_simulation_count,
-                seed: rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                cpuct: config.cpuct,
-                cpuct_at_root: config.cpuct_at_root,
-                cpuct_base: config.cpuct_base,
-                cpuct_factor: config.cpuct_factor,
-                cpuct_base_at_root: config.cpuct_base_at_root,
-                cpuct_factor_at_root: config.cpuct_factor_at_root,
-                max_depth: 0,
-                root_dirichlet_alpha: config.root_dirichlet_alpha,
-                root_exploration_fraction: if opening_exploration {
-                    config.opening_root_exploration_fraction
-                } else {
-                    config.root_exploration_fraction
-                },
-                fpu_value: config.fpu_value,
-                fpu_value_at_root: config.fpu_value_at_root,
-                policy_softmax_temp: if opening_exploration {
-                    config.opening_policy_softmax_temp
-                } else {
-                    config.policy_softmax_temp
-                },
-                draw_score: config.draw_score,
-                value_scale: 1.0,
-            };
+            let limits = selfplay_search_limits(
+                config,
+                ply,
+                rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
+            );
             let search = {
                 crate::scope_profile!("az.selfplay.search");
                 alphazero_search_with_rules_reusing(
@@ -639,6 +659,329 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         terminal,
         search_simulations,
     }
+}
+
+struct BatchedSelfplayGame {
+    game_index: usize,
+    position: Position,
+    rule_history: Vec<RuleHistoryEntry>,
+    samples: Vec<AzTrainingSample>,
+    bootstrap_wdls: Vec<[f32; 3]>,
+    result: Option<f32>,
+    ply: usize,
+    reported_plies: usize,
+    allow_resign: bool,
+    rng: SplitMix64,
+}
+
+fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> BatchedSelfplayGame {
+    let mut rng =
+        SplitMix64::new(config.seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let position = if use_opening_fen(
+        !config.opening_positions.is_empty(),
+        config.opening_fen_game_fraction,
+        rng.unit_f32(),
+    ) {
+        let index = (rng.next_u64() as usize) % config.opening_positions.len();
+        config.opening_positions[index].clone()
+    } else {
+        Position::startpos()
+    };
+    let rule_history = position.initial_rule_history();
+    let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
+    BatchedSelfplayGame {
+        game_index,
+        position,
+        rule_history,
+        samples: Vec::new(),
+        bootstrap_wdls: Vec::new(),
+        result: None,
+        ply: 0,
+        reported_plies: 0,
+        allow_resign,
+        rng,
+    }
+}
+
+fn record_batched_search_stats(
+    data: &mut AzSelfplayData,
+    search: &super::AzSearchResult,
+    ply: usize,
+    config: &AzLoopConfig,
+) {
+    let entropy = policy_entropy(&search.candidates);
+    let shape = policy_shape_stats(&search.candidates);
+    data.raw_prior_top1_sum += shape.raw_prior_top1;
+    data.raw_prior_top2_sum += shape.raw_prior_top2;
+    data.policy_top1_sum += shape.policy_top1;
+    data.policy_top2_sum += shape.policy_top2;
+    data.q_gap_sum += shape.q_gap;
+    data.q_top1_abs_sum += shape.q_top1_abs;
+    data.visited_actions_sum += shape.visited_actions;
+    data.shape_count += 1;
+    data.entropy_all_sum += entropy;
+    data.entropy_all_count += 1;
+    if ply < temperature_opening_plies(config) {
+        data.entropy_opening_sum += entropy;
+        data.entropy_opening_count += 1;
+        data.opening_raw_prior_top1_sum += shape.raw_prior_top1;
+        data.opening_raw_prior_top2_sum += shape.raw_prior_top2;
+        data.opening_policy_top1_sum += shape.policy_top1;
+        data.opening_policy_top2_sum += shape.policy_top2;
+        data.opening_q_gap_sum += shape.q_gap;
+        data.opening_q_top1_abs_sum += shape.q_top1_abs;
+        data.opening_visited_actions_sum += shape.visited_actions;
+        data.opening_shape_count += 1;
+    } else {
+        data.entropy_mid_sum += entropy;
+        data.entropy_mid_count += 1;
+    }
+}
+
+fn inactive_batch_input(config: &AzLoopConfig) -> AzBatchSearchInput {
+    let position = Position::startpos();
+    let rule_history = position.initial_rule_history();
+    let root_moves = position.legal_moves();
+    let mut limits = selfplay_search_limits(config, 0, 0);
+    limits.simulations = 0;
+    AzBatchSearchInput {
+        position,
+        rule_history,
+        root_moves,
+        limits,
+    }
+}
+
+fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    crate::scope_profile!("az.selfplay.chunk_batch4");
+    let mut data = AzSelfplayData::default();
+    let mut workspace = AzBatchSearchWorkspace::new(model);
+    for group_start in (0..config.games).step_by(4) {
+        let mut states: [Option<BatchedSelfplayGame>; 4] = std::array::from_fn(|slot| {
+            let game_index = group_start + slot;
+            (game_index < config.games).then(|| new_batched_selfplay_game(game_index, config))
+        });
+        loop {
+            let mut legal_moves: [Vec<Move>; 4] = std::array::from_fn(|_| Vec::new());
+            let mut searched = [false; 4];
+            for index in 0..4 {
+                let Some(state) = states[index].as_mut() else {
+                    continue;
+                };
+                if state.result.is_some() {
+                    continue;
+                }
+                if state.ply >= config.max_plies {
+                    state.result = Some(0.0);
+                    data.terminal.max_plies += 1;
+                    continue;
+                }
+                state.reported_plies = state.ply + 1;
+                legal_moves[index] = state
+                    .position
+                    .legal_moves_with_rules_and_repetition(&state.rule_history)
+                    .into_iter()
+                    .map(|(mv, _)| mv)
+                    .collect();
+                if legal_moves[index].is_empty() {
+                    state.result = Some(if state.position.side_to_move() == Color::Red {
+                        -1.0
+                    } else {
+                        1.0
+                    });
+                    data.terminal.no_legal_moves += 1;
+                } else {
+                    searched[index] = true;
+                }
+            }
+            if !searched.iter().any(|&active| active) {
+                break;
+            }
+            let inputs = std::array::from_fn(|index| {
+                if !searched[index] {
+                    return inactive_batch_input(config);
+                }
+                let state = states[index].as_mut().unwrap();
+                let seed =
+                    state.rng.next_u64() ^ ((state.game_index as u64) << 32) ^ state.ply as u64;
+                AzBatchSearchInput {
+                    position: state.position.clone(),
+                    rule_history: state.rule_history.clone(),
+                    root_moves: std::mem::take(&mut legal_moves[index]),
+                    limits: selfplay_search_limits(config, state.ply, seed),
+                }
+            });
+            let searches = alphazero_search_batch4_reusing(inputs, model, &mut workspace);
+            for index in 0..4 {
+                if !searched[index] {
+                    continue;
+                }
+                let state = states[index].as_mut().unwrap();
+                let search = &searches[index];
+                data.search_simulations.searches += 1;
+                data.search_simulations.simulations_sum += search.simulations;
+                record_batched_search_stats(&mut data, search, state.ply, config);
+                if state.allow_resign && should_resign(search.value_q, config) {
+                    let meta = root_search_meta(
+                        &search.candidates,
+                        search.value_q,
+                        config.generation_update,
+                        config.seed ^ state.game_index as u64,
+                        state.ply,
+                    );
+                    state.samples.push(make_training_sample(
+                        &state.position,
+                        &state.rule_history,
+                        &search.candidates,
+                        search.value_q,
+                        state.rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                        meta,
+                        search.simulations,
+                        1.0,
+                    ));
+                    state.bootstrap_wdls.push(search.network_value_wdl);
+                    state.result = Some(if state.position.side_to_move() == Color::Red {
+                        data.terminal.resign_red += 1;
+                        -1.0
+                    } else {
+                        data.terminal.resign_black += 1;
+                        1.0
+                    });
+                    continue;
+                }
+                let temperature = temperature_for_ply(config, state.ply);
+                let mv = if temperature <= 1e-6 {
+                    search.best_move.or_else(|| {
+                        choose_selfplay_move(
+                            &search.candidates,
+                            temperature,
+                            0.0,
+                            0.0,
+                            &mut state.rng,
+                        )
+                    })
+                } else {
+                    choose_selfplay_move(
+                        &search.candidates,
+                        temperature,
+                        config.temperature_value_cutoff,
+                        config.temperature_visit_offset,
+                        &mut state.rng,
+                    )
+                };
+                let Some(mv) = mv else {
+                    state.result = Some(0.0);
+                    continue;
+                };
+                let meta = move_search_meta(
+                    &search.candidates,
+                    mv,
+                    search.value_q,
+                    config.generation_update,
+                    config.seed ^ state.game_index as u64,
+                    state.ply,
+                );
+                data.sampled_moves += 1;
+                data.sampled_best_moves += usize::from(meta.best_index == meta.played_index);
+                data.best_played_q_gap_sum += (meta.best_q - meta.played_q).max(0.0);
+                let top_visits = search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.visits)
+                    .max()
+                    .unwrap_or(0);
+                data.played_top_visit_ratio_sum += if top_visits == 0 {
+                    0.0
+                } else {
+                    meta.played_visits as f32 / top_visits as f32
+                };
+                data.best_q_sum += meta.best_q;
+                data.played_q_sum += meta.played_q;
+                if config.record_fens {
+                    data.position_fens.push(state.position.to_fen());
+                }
+                state.samples.push(make_training_sample(
+                    &state.position,
+                    &state.rule_history,
+                    &search.candidates,
+                    search.value_q,
+                    state.rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
+                    meta,
+                    search.simulations,
+                    1.0,
+                ));
+                state.bootstrap_wdls.push(search.network_value_wdl);
+                let mover = state.position.side_to_move();
+                state.position.make_move(mv);
+                state.rule_history.push(
+                    state
+                        .position
+                        .rule_history_entry_after_moved(mover, mv.to as usize),
+                );
+                state.ply += 1;
+                if !state.position.has_general(Color::Red) {
+                    state.result = Some(-1.0);
+                    data.terminal.red_general_missing += 1;
+                    continue;
+                }
+                if !state.position.has_general(Color::Black) {
+                    state.result = Some(1.0);
+                    data.terminal.black_general_missing += 1;
+                    continue;
+                }
+                if let Some(outcome) = state
+                    .position
+                    .rule_outcome_with_history(&state.rule_history)
+                {
+                    state.result = Some(match outcome {
+                        RuleOutcome::Draw(_) => 0.0,
+                        RuleOutcome::Win(Color::Red) => 1.0,
+                        RuleOutcome::Win(Color::Black) => -1.0,
+                    });
+                    match outcome {
+                        RuleOutcome::Draw(reason) => {
+                            data.terminal.rule_draw += 1;
+                            match reason {
+                                RuleDrawReason::Halfmove120 => {
+                                    data.terminal.rule_draw_halfmove120 += 1
+                                }
+                                RuleDrawReason::Repetition => {
+                                    data.terminal.rule_draw_repetition += 1
+                                }
+                                RuleDrawReason::MutualLongCheck => {
+                                    data.terminal.rule_draw_mutual_long_check += 1
+                                }
+                                RuleDrawReason::MutualLongChase => {
+                                    data.terminal.rule_draw_mutual_long_chase += 1
+                                }
+                            }
+                        }
+                        RuleOutcome::Win(Color::Red) => data.terminal.rule_win_red += 1,
+                        RuleOutcome::Win(Color::Black) => data.terminal.rule_win_black += 1,
+                    }
+                }
+            }
+        }
+        for state in states.into_iter().flatten() {
+            let result = state.result.unwrap_or(0.0);
+            match result.total_cmp(&0.0) {
+                std::cmp::Ordering::Greater => data.red_wins += 1,
+                std::cmp::Ordering::Less => data.black_wins += 1,
+                std::cmp::Ordering::Equal => data.draws += 1,
+            }
+            data.plies_total += state.reported_plies;
+            let mut game_samples = state.samples;
+            assign_td_lambda_value_targets(
+                &mut game_samples,
+                &state.bootstrap_wdls,
+                result,
+                config.value_td_lambda,
+            );
+            data.samples.extend(game_samples.iter().cloned());
+            data.games.push(game_samples);
+        }
+    }
+    data
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1110,6 +1453,146 @@ fn play_arena_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selfplay_test_config(games: usize) -> AzLoopConfig {
+        AzLoopConfig {
+            games,
+            max_plies: 12,
+            simulations: 64,
+            seed: 20260817,
+            workers: 1,
+            generation_update: 0,
+            opening_exploration_plies: 0,
+            temperature_start: 0.0,
+            temperature_endgame: 0.0,
+            temperature_decay_delay_plies: 0,
+            temperature_decay_plies: 0,
+            temperature_value_cutoff: 0.0,
+            temperature_visit_offset: 0.0,
+            cpuct: 0.65,
+            cpuct_at_root: 1.5,
+            cpuct_base: 19652.0,
+            cpuct_factor: 1.5,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 1.5,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            opening_root_exploration_fraction: 0.0,
+            fpu_value: 0.30,
+            fpu_value_at_root: 0.20,
+            draw_score: 0.0,
+            policy_softmax_temp: 1.0,
+            opening_policy_softmax_temp: 1.0,
+            value_td_lambda: 0.9,
+            opening_positions: Vec::new(),
+            opening_fen_game_fraction: 0.0,
+            resign_percentage: 0.0,
+            resign_playthrough: 100.0,
+            mirror_probability: 0.0,
+            record_fens: false,
+        }
+    }
+
+    #[test]
+    fn batch4_selfplay_produces_complete_games_and_samples() {
+        let model = AzNnue::random(32, 41);
+        let config = selfplay_test_config(5);
+        let data = generate_selfplay_chunk_batch4(&model, &config);
+        assert_eq!(data.games.len(), 5);
+        assert_eq!(data.red_wins + data.black_wins + data.draws, 5);
+        assert_eq!(
+            data.samples.len(),
+            data.games.iter().map(Vec::len).sum::<usize>()
+        );
+        assert_eq!(data.search_simulations.searches, data.samples.len());
+        assert!(
+            data.games
+                .iter()
+                .all(|game| !game.is_empty() && game.len() <= config.max_plies)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual fast-profile end-to-end selfplay benchmark"]
+    fn benchmark_batch4_selfplay() {
+        use std::time::Instant;
+
+        let model = AzNnue::random(128, 41);
+        let mut config = selfplay_test_config(8);
+        config.max_plies = 24;
+        config.simulations = 256;
+
+        let scalar_started = Instant::now();
+        let scalar = generate_selfplay_chunk_scalar(&model, &config);
+        let scalar_elapsed = scalar_started.elapsed();
+        let batch_started = Instant::now();
+        let batch = generate_selfplay_chunk_batch4(&model, &config);
+        let batch_elapsed = batch_started.elapsed();
+
+        eprintln!(
+            "selfplay: scalar={:.3}ms batch4={:.3}ms speedup={:.3}x scalar_sims/s={:.0} batch_sims/s={:.0}",
+            scalar_elapsed.as_secs_f64() * 1e3,
+            batch_elapsed.as_secs_f64() * 1e3,
+            scalar_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64(),
+            scalar.search_simulations.simulations_sum as f64 / scalar_elapsed.as_secs_f64(),
+            batch.search_simulations.simulations_sum as f64 / batch_elapsed.as_secs_f64(),
+        );
+        assert!(scalar.search_simulations.searches > 0);
+        assert!(batch.search_simulations.searches > 0);
+        crate::profile::print_report();
+    }
+
+    #[test]
+    #[ignore = "manual fast-profile multi-worker selfplay benchmark"]
+    fn benchmark_batch4_selfplay_workers() {
+        use std::time::Instant;
+
+        let workers = 4;
+        let model = AzNnue::random(128, 41);
+        let mut config = selfplay_test_config(4);
+        config.max_plies = 8;
+        config.simulations = 1600;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let scalar_started = Instant::now();
+        let scalar_sims = pool.install(|| {
+            (0..workers)
+                .into_par_iter()
+                .map(|worker| {
+                    let mut worker_config = config.clone();
+                    worker_config.seed ^= worker as u64;
+                    generate_selfplay_chunk_scalar(&model, &worker_config)
+                        .search_simulations
+                        .simulations_sum
+                })
+                .sum::<usize>()
+        });
+        let scalar_elapsed = scalar_started.elapsed();
+        let batch_started = Instant::now();
+        let batch_sims = pool.install(|| {
+            (0..workers)
+                .into_par_iter()
+                .map(|worker| {
+                    let mut worker_config = config.clone();
+                    worker_config.seed ^= worker as u64;
+                    generate_selfplay_chunk_batch4(&model, &worker_config)
+                        .search_simulations
+                        .simulations_sum
+                })
+                .sum::<usize>()
+        });
+        let batch_elapsed = batch_started.elapsed();
+        eprintln!(
+            "selfplay-workers={workers}: scalar={:.3}ms batch4={:.3}ms speedup={:.3}x scalar_sims/s={:.0} batch_sims/s={:.0}",
+            scalar_elapsed.as_secs_f64() * 1e3,
+            batch_elapsed.as_secs_f64() * 1e3,
+            scalar_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64(),
+            scalar_sims as f64 / scalar_elapsed.as_secs_f64(),
+            batch_sims as f64 / batch_elapsed.as_secs_f64(),
+        );
+    }
 
     #[test]
     fn opening_fen_sampling_respects_configured_fraction() {

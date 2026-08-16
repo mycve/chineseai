@@ -257,6 +257,7 @@ pub(super) struct AzSearchWorkspace {
     root_raw_priors: Vec<f32>,
     eval_scratch: Option<AzEvalScratch>,
     rule_history_scratch: Vec<RuleHistoryEntry>,
+    batch_path_scratch: Vec<(usize, usize)>,
 }
 
 impl AzSearchWorkspace {
@@ -268,6 +269,7 @@ impl AzSearchWorkspace {
             root_raw_priors: Vec::new(),
             eval_scratch: Some(AzEvalScratch::new(model.arch)),
             rule_history_scratch: Vec::new(),
+            batch_path_scratch: Vec::with_capacity(64),
         }
     }
 }
@@ -319,6 +321,27 @@ pub fn alphazero_search_batch4(
     inputs: [AzBatchSearchInput; 4],
     model: &AzNnue,
 ) -> [AzSearchResult; 4] {
+    let mut workspace = AzBatchSearchWorkspace::new(model);
+    alphazero_search_batch4_reusing(inputs, model, &mut workspace)
+}
+
+pub(super) struct AzBatchSearchWorkspace {
+    workspaces: [AzSearchWorkspace; 4],
+}
+
+impl AzBatchSearchWorkspace {
+    pub(super) fn new(model: &AzNnue) -> Self {
+        Self {
+            workspaces: std::array::from_fn(|_| AzSearchWorkspace::new(model)),
+        }
+    }
+}
+
+pub(super) fn alphazero_search_batch4_reusing(
+    inputs: [AzBatchSearchInput; 4],
+    model: &AzNnue,
+    workspace: &mut AzBatchSearchWorkspace,
+) -> [AzSearchResult; 4] {
     let [a, b, c, d] = inputs;
     let simulation_targets = [
         a.limits.simulations,
@@ -326,39 +349,46 @@ pub fn alphazero_search_batch4(
         c.limits.simulations,
         d.limits.simulations,
     ];
+    let [workspace0, workspace1, workspace2, workspace3] = &mut workspace.workspaces;
     let mut trees = [
-        AzTree::new(
+        AzTree::new_reusing(
             a.position,
-            a.rule_history,
+            &a.rule_history,
             Some(a.root_moves),
             model,
             a.limits,
+            workspace0,
         ),
-        AzTree::new(
+        AzTree::new_reusing(
             b.position,
-            b.rule_history,
+            &b.rule_history,
             Some(b.root_moves),
             model,
             b.limits,
+            workspace1,
         ),
-        AzTree::new(
+        AzTree::new_reusing(
             c.position,
-            c.rule_history,
+            &c.rule_history,
             Some(c.root_moves),
             model,
             c.limits,
+            workspace2,
         ),
-        AzTree::new(
+        AzTree::new_reusing(
             d.position,
-            d.rule_history,
+            &d.rule_history,
             Some(d.root_moves),
             model,
             d.limits,
+            workspace3,
         ),
     ];
-    for tree in &mut trees {
-        let root = tree.root;
-        tree.expand(root);
+    for (index, tree) in trees.iter_mut().enumerate() {
+        if simulation_targets[index] > 0 {
+            let root = tree.root;
+            tree.expand(root);
+        }
     }
 
     let mut completed = [0usize; 4];
@@ -370,7 +400,7 @@ pub fn alphazero_search_batch4(
                 let simulation = active[index].take().unwrap_or_else(|| BatchSimulation {
                     node_index: trees[index].root,
                     depth: 0,
-                    path: Vec::with_capacity(64),
+                    path: std::mem::take(&mut trees[index].batch_path_scratch),
                     root_history_len: trees[index].rule_history_scratch.len(),
                 });
                 match trees[index].prepare_batch_simulation(simulation) {
@@ -433,13 +463,13 @@ pub fn alphazero_search_batch4(
         }
     }
 
+    let results = std::array::from_fn(|index| trees[index].search_result(completed[index]));
     let [tree0, tree1, tree2, tree3] = trees;
-    [
-        tree0.search_result(completed[0]),
-        tree1.search_result(completed[1]),
-        tree2.search_result(completed[2]),
-        tree3.search_result(completed[3]),
-    ]
+    tree0.recycle_into(workspace0);
+    tree1.recycle_into(workspace1);
+    tree2.recycle_into(workspace2);
+    tree3.recycle_into(workspace3);
+    results
 }
 
 pub fn cp_from_q(q: f32) -> i32 {
@@ -476,6 +506,7 @@ struct AzTree<'a> {
     search_depth_cutoffs: usize,
     eval_scratch: AzEvalScratch,
     rule_history_scratch: Vec<RuleHistoryEntry>,
+    batch_path_scratch: Vec<(usize, usize)>,
 }
 
 struct AzNode {
@@ -498,7 +529,6 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     prior: f32,
-    gives_check: bool,
     visits: u32,
     value_wdl_sum: [f32; 3],
     child: u32,
@@ -643,7 +673,9 @@ impl<'a> AzTree<'a> {
                 visits: child.visits,
                 q: child.q(self.node_draw_score(node_index)),
                 prior: child.prior,
-                gives_check: child.gives_check,
+                gives_check: self.nodes[node_index]
+                    .position
+                    .gives_check_after_move_fast(child.mv),
                 child_expanded: next_node.expanded,
                 child_value: next_node.value,
                 child_value_wdl: next_node.value_wdl,
@@ -696,6 +728,7 @@ impl<'a> AzTree<'a> {
             Vec::new(),
             AzEvalScratch::new(model.arch),
             Vec::new(),
+            Vec::with_capacity(64),
         )
     }
 
@@ -722,6 +755,7 @@ impl<'a> AzTree<'a> {
                 .take()
                 .unwrap_or_else(|| AzEvalScratch::new(model.arch)),
             std::mem::take(&mut workspace.rule_history_scratch),
+            std::mem::take(&mut workspace.batch_path_scratch),
         )
     }
 
@@ -738,6 +772,7 @@ impl<'a> AzTree<'a> {
         mut root_raw_priors: Vec<f32>,
         eval_scratch: AzEvalScratch,
         mut rule_history_scratch: Vec<RuleHistoryEntry>,
+        mut batch_path_scratch: Vec<(usize, usize)>,
     ) -> Self {
         nodes.clear();
         children.clear();
@@ -745,6 +780,7 @@ impl<'a> AzTree<'a> {
         root_raw_priors.clear();
         rule_history_scratch.clear();
         rule_history_scratch.extend_from_slice(rule_history);
+        batch_path_scratch.clear();
         let accumulator = AzEvalAccumulator::new(model, &position);
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         let root_policy_accumulators = [
@@ -824,6 +860,7 @@ impl<'a> AzTree<'a> {
             search_depth_cutoffs: 0,
             eval_scratch,
             rule_history_scratch,
+            batch_path_scratch,
         }
     }
 
@@ -837,6 +874,7 @@ impl<'a> AzTree<'a> {
             AzEvalScratch::empty(),
         ));
         workspace.rule_history_scratch = std::mem::take(&mut self.rule_history_scratch);
+        workspace.batch_path_scratch = std::mem::take(&mut self.batch_path_scratch);
     }
 
     fn node_children(&self, node_index: usize) -> &[AzChild] {
@@ -935,6 +973,13 @@ impl<'a> AzTree<'a> {
         };
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
         eval.value *= self.value_scale;
+        if node_index == self.root {
+            softmax_into(
+                &self.eval_scratch.logits[..moves.len()],
+                1.0,
+                &mut self.root_raw_priors,
+            );
+        }
         let priors = {
             crate::scope_profile!("az.search.softmax");
             softmax_into(
@@ -943,9 +988,6 @@ impl<'a> AzTree<'a> {
                 &mut self.eval_scratch.priors,
             )
         };
-        if node_index == self.root {
-            self.root_raw_priors.clone_from(priors);
-        }
         if node_index == self.root
             && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
@@ -959,23 +1001,21 @@ impl<'a> AzTree<'a> {
         }
         {
             crate::scope_profile!("az.search.children_build");
-            let gives_checks = &self.eval_scratch.policy_gives_check;
             let priors = &mut self.eval_scratch.priors;
             let offset = self.children.len();
-            self.children.extend(
-                moves
-                    .into_iter()
-                    .zip(priors.drain(..))
-                    .zip(gives_checks.iter().copied())
-                    .map(|((mv, prior), gives_check)| AzChild {
-                        mv,
-                        prior,
-                        gives_check: gives_check != 0.0,
-                        visits: 0,
-                        value_wdl_sum: [0.0; 3],
-                        child: NO_CHILD,
-                    }),
-            );
+            self.children
+                .extend(
+                    moves
+                        .into_iter()
+                        .zip(priors.drain(..))
+                        .map(|(mv, prior)| AzChild {
+                            mv,
+                            prior,
+                            visits: 0,
+                            value_wdl_sum: [0.0; 3],
+                            child: NO_CHILD,
+                        }),
+                );
             let len = self.children.len() - offset;
             self.nodes[node_index].children_offset =
                 u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
@@ -1267,13 +1307,13 @@ impl<'a> AzTree<'a> {
 
     fn finish_batch_simulation(
         &mut self,
-        simulation: BatchSimulation,
+        mut simulation: BatchSimulation,
         mut eval: AzEvalOutput,
         cutoff: bool,
     ) {
         self.add_node_visit(simulation.node_index, eval);
         self.record_leaf_depth(simulation.depth, cutoff);
-        for (parent, child_index) in simulation.path.into_iter().rev() {
+        for &(parent, child_index) in simulation.path.iter().rev() {
             eval = AzEvalOutput {
                 value_wdl: flip_wdl(eval.value_wdl),
                 value: -eval.value,
@@ -1285,6 +1325,8 @@ impl<'a> AzTree<'a> {
         }
         self.rule_history_scratch
             .truncate(simulation.root_history_len);
+        simulation.path.clear();
+        self.batch_path_scratch = simulation.path;
     }
 
     fn prepare_batch_simulation(&mut self, mut simulation: BatchSimulation) -> BatchPrepare {
@@ -1415,23 +1457,38 @@ impl<'a> AzTree<'a> {
             return None;
         }
 
+        if node_index == self.root {
+            softmax_into(
+                &self.eval_scratch.logits[..pending.moves.len()],
+                1.0,
+                &mut self.root_raw_priors,
+            );
+        }
         let priors = softmax_into(
             &self.eval_scratch.logits[..pending.moves.len()],
             self.policy_softmax_temp,
             &mut self.eval_scratch.priors,
         );
-        let gives_checks = &self.eval_scratch.policy_gives_check;
+        if node_index == self.root
+            && self.root_dirichlet_alpha > 0.0
+            && self.root_exploration_fraction > 0.0
+        {
+            apply_root_dirichlet_noise(
+                priors,
+                self.root_dirichlet_alpha,
+                self.root_exploration_fraction,
+                self.root_noise_seed,
+            );
+        }
         let offset = self.children.len();
         self.children.extend(
             pending
                 .moves
                 .into_iter()
                 .zip(priors.drain(..))
-                .zip(gives_checks.iter().copied())
-                .map(|((mv, prior), gives_check)| AzChild {
+                .map(|(mv, prior)| AzChild {
                     mv,
                     prior,
-                    gives_check: gives_check != 0.0,
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
                     child: NO_CHILD,
@@ -1930,7 +1987,6 @@ mod tests {
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
-            gives_check: false,
             visits: 0,
             value_wdl_sum: [0.0; 3],
             child: NO_CHILD,
@@ -1965,7 +2021,6 @@ mod tests {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
-            gives_check: false,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
             child: NO_CHILD,
@@ -2194,7 +2249,6 @@ mod tests {
                 AzChild {
                     mv: legal[0],
                     prior: 0.10,
-                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     child: NO_CHILD,
@@ -2202,7 +2256,6 @@ mod tests {
                 AzChild {
                     mv: legal[1],
                     prior: 0.90,
-                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     child: NO_CHILD,
@@ -2226,8 +2279,10 @@ mod tests {
         });
         let limits = AzSearchLimits {
             simulations: 24,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
+            seed: 20260817,
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.30,
+            policy_softmax_temp: 3.0,
             ..AzSearchLimits::default()
         };
         let scalar = positions
@@ -2258,7 +2313,63 @@ mod tests {
                     .sum::<u32>()
             );
             assert!((scalar.value_q - batched.value_q).abs() < 1.0e-5);
+            for candidate in &scalar.candidates {
+                let other = batched
+                    .candidates
+                    .iter()
+                    .find(|other| other.mv == candidate.mv)
+                    .unwrap();
+                assert!((candidate.raw_prior - other.raw_prior).abs() < 1.0e-6);
+                assert!((candidate.prior - other.prior).abs() < 1.0e-6);
+            }
+            assert!(
+                scalar
+                    .candidates
+                    .iter()
+                    .any(|candidate| (candidate.raw_prior - candidate.prior).abs() > 1.0e-5)
+            );
         }
+    }
+
+    #[test]
+    fn raw_prior_is_network_policy_before_temperature_and_noise() {
+        let mut model = AzNnue::random(32, 83);
+        for (index, bias) in model.policy_move_bias.iter_mut().enumerate() {
+            *bias = (index % 17) as f32 * 0.1;
+        }
+        let position = Position::startpos();
+        let normal = alphazero_search(
+            &position,
+            &model,
+            AzSearchLimits {
+                simulations: 1,
+                policy_softmax_temp: 1.0,
+                ..AzSearchLimits::default()
+            },
+        );
+        let softened = alphazero_search(
+            &position,
+            &model,
+            AzSearchLimits {
+                simulations: 1,
+                policy_softmax_temp: 3.0,
+                ..AzSearchLimits::default()
+            },
+        );
+        for candidate in &normal.candidates {
+            let other = softened
+                .candidates
+                .iter()
+                .find(|other| other.mv == candidate.mv)
+                .unwrap();
+            assert!((candidate.raw_prior - other.raw_prior).abs() < 1.0e-6);
+        }
+        assert!(
+            softened
+                .candidates
+                .iter()
+                .any(|candidate| (candidate.raw_prior - candidate.prior).abs() > 1.0e-5)
+        );
     }
 
     #[test]
@@ -2327,7 +2438,6 @@ mod tests {
                 AzChild {
                     mv: legal[0],
                     prior: 0.25,
-                    gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     child: NO_CHILD,
@@ -2335,7 +2445,6 @@ mod tests {
                 AzChild {
                     mv: legal[1],
                     prior: 0.75,
-                    gives_check: false,
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
                     child: NO_CHILD,
