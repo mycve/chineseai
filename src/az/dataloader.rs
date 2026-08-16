@@ -111,7 +111,6 @@ pub(super) struct PackedBatch {
     pub policy_mask: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
-    pub moves_left: Vec<f32>,
     pub rule_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
@@ -154,7 +153,6 @@ impl PackedBatch {
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
-            moves_left: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
@@ -168,7 +166,6 @@ impl PackedBatch {
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
-            packed.moves_left[row] = sample.moves_left.max(0.0);
             packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
                 .copy_from_slice(&sample.rule_context);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
@@ -425,7 +422,6 @@ mod tests {
             value_wdl: [1.0, 0.0, 0.0],
             value: 2.0,
             side_sign: 1.0,
-            moves_left: -1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 0,
@@ -475,7 +471,6 @@ mod tests {
         assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
         assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
         assert_eq!(packed.values, vec![1.0, 1.0]);
-        assert_eq!(packed.moves_left, vec![0.0, 0.0]);
     }
 
     #[test]

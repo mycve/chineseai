@@ -120,7 +120,6 @@ pub(super) fn train_samples_gpu(
         stats.loss /= denom;
         stats.value_loss /= denom;
         stats.policy_ce /= denom;
-        stats.moves_left_loss /= denom;
     }
     let trainer = model
         .gpu_trainer
@@ -630,7 +629,6 @@ impl GpuReplica {
             global_batch_len,
             loss_weights.value,
             loss_weights.policy,
-            loss_weights.moves_left,
         )?;
         profile_sync(&self.device)?;
         let loss_seconds = loss_started.elapsed().as_secs_f64();
@@ -672,7 +670,6 @@ impl GpuReplica {
         global_batch_len: usize,
         value_weight: f32,
         policy_weight: f32,
-        moves_left_weight: f32,
     ) -> CandleResult<BatchLossOutput> {
         let forward = self.model.forward(batch_tensors)?;
         let value_log_probs = log_softmax(&forward.value_logits, 1)?;
@@ -682,12 +679,6 @@ impl GpuReplica {
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
         let value_ce = value_ce_per_sample.sum_all()?;
-        let moves_left_pred = tensor_softplus(&forward.moves_left_logits)?.squeeze(1)?;
-        let moves_left_error =
-            (&tensor_log1p(&moves_left_pred)? - &tensor_log1p(&batch_tensors.moves_left)?)?;
-        let moves_left_sse_per_sample = moves_left_error.sqr()?;
-        let moves_left_sse = moves_left_sse_per_sample.sum_all()?;
-
         let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -701,22 +692,17 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
-        let weighted_moves_left_loss = moves_left_sse_per_sample
-            .broadcast_mul(&batch_tensors.value_weights)?
-            .sum_all()?
-            .affine(moves_left_weight.max(0.0) as f64, 0.0)?;
-        let loss_sum = ((weighted_value_loss + weighted_policy_ce)? + weighted_moves_left_loss)?;
+        let loss_sum = (weighted_value_loss + weighted_policy_ce)?;
         let loss_tensor = (&loss_sum / global_batch_len as f64)?;
 
         let value_sq = value.sqr()?;
         let target_sq = batch_tensors.values.sqr()?;
         let pred_target = value.broadcast_mul(&batch_tensors.values)?;
         let error_sq = value_error.sqr()?;
-        let mut metrics = Vec::with_capacity(10 + 3 * 7);
+        let mut metrics = Vec::with_capacity(9 + 3 * 7);
         metrics.push(loss_sum);
         metrics.push(value_ce);
         metrics.push(policy_ce);
-        metrics.push(moves_left_sse);
         metrics.push(value.sum_all()?);
         metrics.push(value_sq.sum_all()?);
         metrics.push(batch_tensors.values.sum_all()?);
@@ -738,7 +724,7 @@ impl GpuReplica {
         }
         let metrics = Tensor::stack(&metrics, 0)?.to_vec1::<f32>()?;
         let mut phase_value = [AzValueMomentStats::default(); 3];
-        for (phase_stats, values) in phase_value.iter_mut().zip(metrics[10..].chunks_exact(7)) {
+        for (phase_stats, values) in phase_value.iter_mut().zip(metrics[9..].chunks_exact(7)) {
             phase_stats.samples = values[0].round().max(0.0) as usize;
             phase_stats.pred_sum = values[1];
             phase_stats.pred_sq_sum = values[2];
@@ -751,13 +737,12 @@ impl GpuReplica {
             loss: metrics[0],
             value_loss: metrics[1],
             policy_ce: metrics[2],
-            moves_left_loss: metrics[3],
-            value_pred_sum: metrics[4],
-            value_pred_sq_sum: metrics[5],
-            value_target_sum: metrics[6],
-            value_target_sq_sum: metrics[7],
-            value_pred_target_sum: metrics[8],
-            value_error_sq_sum: metrics[9],
+            value_pred_sum: metrics[3],
+            value_pred_sq_sum: metrics[4],
+            value_target_sum: metrics[5],
+            value_target_sq_sum: metrics[6],
+            value_pred_target_sum: metrics[7],
+            value_error_sq_sum: metrics[8],
             samples: batch_tensors.batch_size,
             phase_value,
         };
@@ -765,19 +750,9 @@ impl GpuReplica {
     }
 }
 
-fn tensor_softplus(input: &Tensor) -> CandleResult<Tensor> {
-    let relu = input.relu()?;
-    let exp_neg_abs = input.abs()?.neg()?.exp()?;
-    Ok((relu + tensor_log1p(&exp_neg_abs)?)?)
-}
-
 fn wdl_probs_to_q(probs: &Tensor) -> CandleResult<Tensor> {
     let weights = Tensor::from_vec(vec![1.0f32, 0.0, -1.0], (WDL_HEAD_SIZE, 1), probs.device())?;
     probs.matmul(&weights)
-}
-
-fn tensor_log1p(input: &Tensor) -> CandleResult<Tensor> {
-    input.affine(1.0, 1.0)?.log()
 }
 
 #[cfg(feature = "nccl-train")]

@@ -91,7 +91,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
-    replay_push_f32(out, sample.moves_left);
     replay_push_f32(out, sample.policy_weight);
     replay_push_f32(out, sample.value_weight);
     replay_push_u32(out, sample.search_simulations);
@@ -200,7 +199,6 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     value_wdl = normalize_wdl_target(value_wdl);
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
-    let moves_left = replay_read_f32(reader)?;
     let policy_weight = replay_read_f32(reader)?;
     let value_weight = replay_read_f32(reader)?;
     let search_simulations = replay_read_u32(reader)?;
@@ -224,7 +222,6 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         value_wdl,
         value,
         side_sign,
-        moves_left,
         policy_weight,
         value_weight,
         search_simulations,

@@ -32,12 +32,6 @@ struct UciState {
     fpu_value: f32,
     fpu_value_at_root: f32,
     draw_score: f32,
-    moves_left_max_effect: f32,
-    moves_left_slope: f32,
-    moves_left_threshold: f32,
-    moves_left_constant_factor: f32,
-    moves_left_scaled_factor: f32,
-    moves_left_quadratic_factor: f32,
     seed: u64,
 }
 
@@ -56,15 +50,9 @@ impl Default for UciState {
             cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
             cpuct_factor_at_root: 1.5,
-            fpu_value: 0.0,
-            fpu_value_at_root: 1.0,
+            fpu_value: 0.33,
+            fpu_value_at_root: 0.33,
             draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.004,
-            moves_left_threshold: 0.7,
-            moves_left_constant_factor: 0.05,
-            moves_left_scaled_factor: 0.2,
-            moves_left_quadratic_factor: 0.75,
             seed: 20260409,
         }
     }
@@ -154,15 +142,9 @@ fn print_uci_id() {
     println!("option name CpuctFactor type string default 1.5");
     println!("option name CpuctBaseAtRoot type string default 19652.0");
     println!("option name CpuctFactorAtRoot type string default 1.5");
-    println!("option name FpuValue type string default 0.0");
-    println!("option name FpuValueAtRoot type string default 1.0");
+    println!("option name FpuValue type string default 0.33");
+    println!("option name FpuValueAtRoot type string default 0.33");
     println!("option name DrawScore type string default 0.0");
-    println!("option name MovesLeftMaxEffect type string default 0.25");
-    println!("option name MovesLeftSlope type string default 0.004");
-    println!("option name MovesLeftThreshold type string default 0.7");
-    println!("option name MovesLeftConstantFactor type string default 0.05");
-    println!("option name MovesLeftScaledFactor type string default 0.2");
-    println!("option name MovesLeftQuadraticFactor type string default 0.75");
     println!("uciok");
     flush();
 }
@@ -240,46 +222,13 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.fpu_value_at_root = value
                 .parse::<f32>()
                 .unwrap_or(state.fpu_value_at_root)
-                .clamp(-1.0, 1.0);
+                .max(0.0);
         }
         "drawscore" => {
             state.draw_score = value
                 .parse::<f32>()
                 .unwrap_or(state.draw_score)
                 .clamp(-1.0, 1.0);
-        }
-        "movesleftmaxeffect" => {
-            state.moves_left_max_effect = value
-                .parse::<f32>()
-                .unwrap_or(state.moves_left_max_effect)
-                .max(0.0);
-        }
-        "movesleftslope" => {
-            state.moves_left_slope = value
-                .parse::<f32>()
-                .unwrap_or(state.moves_left_slope)
-                .max(0.0);
-        }
-        "movesleftthreshold" => {
-            state.moves_left_threshold = value
-                .parse::<f32>()
-                .unwrap_or(state.moves_left_threshold)
-                .clamp(0.0, 1.0);
-        }
-        "movesleftconstantfactor" => {
-            state.moves_left_constant_factor = value
-                .parse::<f32>()
-                .unwrap_or(state.moves_left_constant_factor);
-        }
-        "movesleftscaledfactor" => {
-            state.moves_left_scaled_factor = value
-                .parse::<f32>()
-                .unwrap_or(state.moves_left_scaled_factor);
-        }
-        "movesleftquadraticfactor" => {
-            state.moves_left_quadratic_factor = value
-                .parse::<f32>()
-                .unwrap_or(state.moves_left_quadratic_factor);
         }
         _ => {}
     }
@@ -497,12 +446,6 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             fpu_value_at_root: state.fpu_value_at_root,
             policy_softmax_temp: 1.0,
             draw_score: state.draw_score,
-            moves_left_max_effect: state.moves_left_max_effect,
-            moves_left_slope: state.moves_left_slope,
-            moves_left_threshold: state.moves_left_threshold,
-            moves_left_constant_factor: state.moves_left_constant_factor,
-            moves_left_scaled_factor: state.moves_left_scaled_factor,
-            moves_left_quadratic_factor: state.moves_left_quadratic_factor,
             value_scale: 1.0,
         },
         Some(&control),

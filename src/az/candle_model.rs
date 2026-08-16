@@ -1,7 +1,7 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, MOVES_LEFT_HEAD_SIZE, POLICY_ACCUMULATOR_RANK,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK,
     POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE,
     POLICY_SPARSE_TABLE_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
     STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE,
@@ -24,10 +24,6 @@ pub(super) struct AzCandleModel {
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_output: Var,
-    moves_left_hidden: Var,
-    moves_left_bias_hidden: Var,
-    moves_left_output: Var,
-    moves_left_bias: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
     policy_context_hidden: Var,
@@ -69,13 +65,6 @@ impl AzCandleModel {
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
-        let moves_left_head = hidden
-            .matmul(&self.moves_left_hidden.t()?)?
-            .broadcast_add(&self.moves_left_bias_hidden)?
-            .relu()?;
-        let moves_left_logits = moves_left_head
-            .matmul(&self.moves_left_output.reshape((MOVES_LEFT_HEAD_SIZE, 1))?)?
-            .broadcast_add(&self.moves_left_bias)?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
@@ -133,7 +122,6 @@ impl AzCandleModel {
         Ok(ForwardOutput {
             value_logits,
             policy_logits,
-            moves_left_logits,
         })
     }
 }
@@ -141,7 +129,6 @@ impl AzCandleModel {
 pub(super) struct ForwardOutput {
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
-    pub(super) moves_left_logits: Tensor,
 }
 
 pub(super) struct BatchTensors {
@@ -154,7 +141,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_mask: Tensor,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
-    pub(super) moves_left: Tensor,
     pub(super) rule_context: Tensor,
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
@@ -196,7 +182,6 @@ impl BatchTensors {
             )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
-            moves_left: Tensor::from_vec(packed.moves_left, batch_size, device)?,
             rule_context: Tensor::from_vec(
                 packed.rule_context,
                 (batch_size, RULE_CONTEXT_SIZE),
@@ -257,22 +242,6 @@ impl AzCandleModel {
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
-            moves_left_hidden: var_from_slice(
-                &model.moves_left_hidden,
-                (MOVES_LEFT_HEAD_SIZE, hidden),
-                device,
-            )?,
-            moves_left_bias_hidden: var_from_slice(
-                &model.moves_left_bias_hidden,
-                MOVES_LEFT_HEAD_SIZE,
-                device,
-            )?,
-            moves_left_output: var_from_slice(
-                &model.moves_left_output,
-                MOVES_LEFT_HEAD_SIZE,
-                device,
-            )?,
-            moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_consequence_output: var_from_slice(
                 &model.policy_consequence_output,
@@ -324,10 +293,6 @@ impl AzCandleModel {
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_output.clone());
-        vars.push(self.moves_left_hidden.clone());
-        vars.push(self.moves_left_bias_hidden.clone());
-        vars.push(self.moves_left_output.clone());
-        vars.push(self.moves_left_bias.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
         vars.push(self.policy_context_hidden.clone());
@@ -353,13 +318,6 @@ impl AzCandleModel {
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
-        copy_var(&self.moves_left_hidden, &mut model.moves_left_hidden)?;
-        copy_var(
-            &self.moves_left_bias_hidden,
-            &mut model.moves_left_bias_hidden,
-        )?;
-        copy_var(&self.moves_left_output, &mut model.moves_left_output)?;
-        copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(
             &self.policy_consequence_output,
@@ -490,7 +448,6 @@ mod tests {
             value_wdl: [0.0, 1.0, 0.0],
             value: 0.0,
             side_sign: 1.0,
-            moves_left: 0.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 1,
@@ -589,10 +546,6 @@ mod tests {
             value_head_hidden,
             value_head_bias,
             value_head_output,
-            moves_left_hidden,
-            moves_left_bias_hidden,
-            moves_left_output,
-            moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
             policy_context_hidden,

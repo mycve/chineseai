@@ -18,9 +18,6 @@ const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
-const PRIOR_INDEPENDENT_EXPLORATION: f32 = 0.10;
-const CHECK_EXPLORATION_MULTIPLIER: f32 = 5.0;
-const CAPTURE_EXPLORATION_MULTIPLIER: f32 = 3.0;
 #[derive(Clone, Copy, Debug)]
 pub struct AzSearchLimits {
     pub simulations: usize,
@@ -41,12 +38,6 @@ pub struct AzSearchLimits {
     /// Divisor applied to policy logits before softmax. Values above 1 flatten priors.
     pub policy_softmax_temp: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
     pub value_scale: f32,
 }
 
@@ -64,16 +55,10 @@ impl Default for AzSearchLimits {
             max_depth: 0,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            fpu_value: 0.23,
-            fpu_value_at_root: 1.0,
+            fpu_value: 0.33,
+            fpu_value_at_root: 0.33,
             policy_softmax_temp: 1.0,
             draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.002,
-            moves_left_threshold: 0.6,
-            moves_left_constant_factor: 0.0,
-            moves_left_scaled_factor: 0.15,
-            moves_left_quadratic_factor: 0.85,
             value_scale: 1.0,
         }
     }
@@ -84,7 +69,6 @@ pub struct AzCandidate {
     pub mv: Move,
     pub visits: u32,
     pub q: f32,
-    pub moves_left: f32,
     pub raw_prior: f32,
     pub prior: f32,
     pub policy: f32,
@@ -118,7 +102,6 @@ pub struct AzSearchTraceStep {
     pub child_expanded: bool,
     pub child_value: f32,
     pub child_value_wdl: [f32; 3],
-    pub child_moves_left: f32,
     pub child_fen: String,
 }
 
@@ -351,12 +334,6 @@ struct AzTree<'a> {
     fpu_value_at_root: f32,
     policy_softmax_temp: f32,
     draw_score: f32,
-    moves_left_max_effect: f32,
-    moves_left_slope: f32,
-    moves_left_threshold: f32,
-    moves_left_constant_factor: f32,
-    moves_left_scaled_factor: f32,
-    moves_left_quadratic_factor: f32,
     value_scale: f32,
     max_depth: usize,
     search_depth_sum: usize,
@@ -380,7 +357,6 @@ struct AzNode {
     value_wdl_sum: [f32; 3],
     value: f32,
     value_wdl: [f32; 3],
-    moves_left: f32,
     expanded: bool,
 }
 
@@ -388,11 +364,9 @@ struct AzNode {
 struct AzChild {
     mv: Move,
     prior: f32,
-    is_capture: bool,
     gives_check: bool,
     visits: u32,
     value_wdl_sum: [f32; 3],
-    moves_left_sum: f32,
     child: u32,
 }
 
@@ -416,13 +390,6 @@ impl AzChild {
         }
     }
 
-    fn moves_left(&self) -> f32 {
-        if self.visits == 0 {
-            0.0
-        } else {
-            self.moves_left_sum / self.visits as f32
-        }
-    }
 }
 
 impl<'a> AzTree<'a> {
@@ -449,7 +416,6 @@ impl<'a> AzTree<'a> {
                 mv: child.mv,
                 visits: child.visits,
                 q: child.q(self.draw_score),
-                moves_left: child.moves_left(),
                 raw_prior: self
                     .root_raw_priors
                     .get(index)
@@ -511,7 +477,6 @@ impl<'a> AzTree<'a> {
                 child_expanded: next_node.expanded,
                 child_value: next_node.value,
                 child_value_wdl: next_node.value_wdl,
-                child_moves_left: next_node.moves_left,
                 child_fen: next_node.position.to_fen(),
             });
             if !next_node.expanded || next_node.children_len == 0 {
@@ -635,7 +600,6 @@ impl<'a> AzTree<'a> {
             value_wdl_sum: [0.0; 3],
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
-            moves_left: 0.0,
             expanded: false,
         });
         Self {
@@ -675,15 +639,9 @@ impl<'a> AzTree<'a> {
             root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
             root_noise_seed: limits.seed,
             fpu_value: limits.fpu_value.max(0.0),
-            fpu_value_at_root: limits.fpu_value_at_root.clamp(-1.0, 1.0),
+            fpu_value_at_root: limits.fpu_value_at_root.max(0.0),
             policy_softmax_temp: limits.policy_softmax_temp.max(1.0e-3),
             draw_score: limits.draw_score.clamp(-1.0, 1.0),
-            moves_left_max_effect: limits.moves_left_max_effect.max(0.0),
-            moves_left_slope: limits.moves_left_slope.max(0.0),
-            moves_left_threshold: limits.moves_left_threshold.clamp(0.0, 1.0),
-            moves_left_constant_factor: limits.moves_left_constant_factor,
-            moves_left_scaled_factor: limits.moves_left_scaled_factor,
-            moves_left_quadratic_factor: limits.moves_left_quadratic_factor,
             value_scale: limits.value_scale.clamp(0.0, 1.0),
             max_depth: if limits.max_depth == 0 {
                 limits.simulations
@@ -753,12 +711,10 @@ impl<'a> AzTree<'a> {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
-            self.nodes[node_index].moves_left = 0.0;
             self.nodes[node_index].expanded = true;
             return AzEvalOutput {
                 value_wdl,
                 value,
-                moves_left: 0.0,
             };
         }
 
@@ -787,12 +743,10 @@ impl<'a> AzTree<'a> {
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
-            self.nodes[node_index].moves_left = 0.0;
             self.nodes[node_index].expanded = true;
             return AzEvalOutput {
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
-                moves_left: 0.0,
             };
         }
 
@@ -838,7 +792,6 @@ impl<'a> AzTree<'a> {
         }
         {
             crate::scope_profile!("az.search.children_build");
-            let position = &self.nodes[node_index].position;
             let gives_checks = &self.eval_scratch.policy_gives_check;
             let priors = &mut self.eval_scratch.priors;
             let offset = self.children.len();
@@ -850,11 +803,9 @@ impl<'a> AzTree<'a> {
                     .map(|((mv, prior), gives_check)| AzChild {
                         mv,
                         prior,
-                        is_capture: position.piece_at(mv.to as usize).is_some(),
                         gives_check: gives_check != 0.0,
                         visits: 0,
                         value_wdl_sum: [0.0; 3],
-                        moves_left_sum: 0.0,
                         child: NO_CHILD,
                     }),
             );
@@ -866,7 +817,6 @@ impl<'a> AzTree<'a> {
         }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
-        self.nodes[node_index].moves_left = eval.moves_left;
         self.nodes[node_index].expanded = true;
         eval
     }
@@ -1021,7 +971,6 @@ impl<'a> AzTree<'a> {
                     value_wdl_sum: [0.0; 3],
                     value: 0.0,
                     value_wdl: [0.0, 1.0, 0.0],
-                    moves_left: 0.0,
                     expanded: false,
                 });
                 self.node_children_mut(node_index)[child_index].set_child_node(child_node);
@@ -1036,15 +985,10 @@ impl<'a> AzTree<'a> {
         let eval = AzEvalOutput {
             value_wdl: flip_wdl(child_eval.value_wdl),
             value: -child_eval.value,
-            // moves-left由子节点视角预测“从子节点到终局”的剩余步数。
-            // 回传到父节点边时必须计入刚走的这一着；否则不同搜索深度的
-            // 叶子会被直接混合，utility会错误偏爱搜索得更深的分支。
-            moves_left: child_eval.moves_left + 1.0,
         };
         let child = &mut self.node_children_mut(node_index)[child_index];
         child.visits += 1;
         add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
-        child.moves_left_sum += eval.moves_left;
         self.add_node_visit(node_index, eval);
         eval
     }
@@ -1062,11 +1006,9 @@ impl<'a> AzTree<'a> {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
-            self.nodes[node_index].moves_left = 0.0;
             return AzEvalOutput {
                 value_wdl,
                 value,
-                moves_left: 0.0,
             };
         }
         let moves: Vec<_> = {
@@ -1081,11 +1023,9 @@ impl<'a> AzTree<'a> {
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
-            self.nodes[node_index].moves_left = 0.0;
             return AzEvalOutput {
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
-                moves_left: 0.0,
             };
         }
         let mut eval = {
@@ -1108,7 +1048,6 @@ impl<'a> AzTree<'a> {
         eval.value *= self.value_scale;
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
-        self.nodes[node_index].moves_left = eval.moves_left;
         eval
     }
 
@@ -1116,7 +1055,6 @@ impl<'a> AzTree<'a> {
         AzEvalOutput {
             value_wdl: self.nodes[node_index].value_wdl,
             value: self.nodes[node_index].value,
-            moves_left: self.nodes[node_index].moves_left,
         }
     }
 
@@ -1158,16 +1096,17 @@ impl<'a> AzTree<'a> {
         let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
         let is_root = node_index == self.root;
         let draw_score = self.node_draw_score(node_index);
-        let fpu_value = if is_root {
+        let fpu_reduction = if is_root {
             self.fpu_value_at_root
         } else {
-            alphazero_fpu_value_reduction(node, children, self.fpu_value, draw_score)
+            self.fpu_value
         };
+        let fpu_value =
+            alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score);
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let mut best: Option<(usize, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
             let score = self.child_score(
-                node,
                 child,
                 draw_score,
                 fpu_value,
@@ -1235,7 +1174,6 @@ impl<'a> AzTree<'a> {
 
     fn child_score(
         &self,
-        parent: &AzNode,
         child: &AzChild,
         draw_score: f32,
         fpu_value: f32,
@@ -1248,45 +1186,7 @@ impl<'a> AzTree<'a> {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        let tactical_exploration = if child.gives_check {
-            CHECK_EXPLORATION_MULTIPLIER
-        } else if child.is_capture {
-            CAPTURE_EXPLORATION_MULTIPLIER
-        } else {
-            1.0
-        };
-        let independent_u = PRIOR_INDEPENDENT_EXPLORATION
-            * tactical_exploration
-            * ((parent.visits as f32 + 1.0).ln() / (child.visits as f32 + 1.0)).sqrt();
-        q + u + independent_u + self.moves_left_utility(parent, child, q)
-    }
-
-    fn moves_left_utility(&self, parent: &AzNode, child: &AzChild, q: f32) -> f32 {
-        if self.moves_left_slope <= 0.0 || self.moves_left_max_effect <= 0.0 {
-            return 0.0;
-        }
-        if q.abs() <= self.moves_left_threshold {
-            return 0.0;
-        }
-        let child_m = if child.visits == 0 {
-            parent.moves_left
-        } else {
-            child.moves_left()
-        };
-        let mut effect = self.moves_left_slope * (child_m - parent.moves_left);
-        effect = effect.clamp(-self.moves_left_max_effect, self.moves_left_max_effect);
-        effect *= -q.signum();
-
-        let q_abs = if self.moves_left_threshold > 0.0 && self.moves_left_threshold < 1.0 {
-            ((q.abs() - self.moves_left_threshold) / (1.0 - self.moves_left_threshold))
-                .clamp(0.0, 1.0)
-        } else {
-            q.abs()
-        };
-        let weight = self.moves_left_constant_factor
-            + self.moves_left_scaled_factor * q_abs
-            + self.moves_left_quadratic_factor * q_abs * q_abs;
-        effect * weight
+        q + u
     }
 
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
@@ -1573,11 +1473,9 @@ mod tests {
         let mut child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
-            is_capture: false,
             gives_check: false,
             visits: 0,
             value_wdl_sum: [0.0; 3],
-            moves_left_sum: 0.0,
             child: NO_CHILD,
         };
         assert_eq!(child.child_node(), None);
@@ -1610,11 +1508,9 @@ mod tests {
         let child = AzChild {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
-            is_capture: false,
             gives_check: false,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
-            moves_left_sum: 0.0,
             child: NO_CHILD,
         };
 
@@ -1660,8 +1556,8 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
+                fpu_value: 0.33,
+                fpu_value_at_root: 0.33,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1745,8 +1641,8 @@ mod tests {
                 max_depth: 1,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
+                fpu_value: 0.33,
+                fpu_value_at_root: 0.33,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1774,8 +1670,8 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
+                fpu_value: 0.33,
+                fpu_value_at_root: 0.33,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1791,8 +1687,8 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.3,
                 root_exploration_fraction: 0.25,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
+                fpu_value: 0.33,
+                fpu_value_at_root: 0.33,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1828,8 +1724,8 @@ mod tests {
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
+                fpu_value: 0.33,
+                fpu_value_at_root: 0.33,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1841,21 +1737,17 @@ mod tests {
                 AzChild {
                     mv: legal[0],
                     prior: 0.10,
-                    is_capture: false,
                     gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
-                    moves_left_sum: 0.0,
                     child: NO_CHILD,
                 },
                 AzChild {
                     mv: legal[1],
                     prior: 0.90,
-                    is_capture: false,
                     gives_check: false,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
-                    moves_left_sum: 0.0,
                     child: NO_CHILD,
                 },
             ],
@@ -1865,48 +1757,48 @@ mod tests {
     }
 
     #[test]
-    fn tactical_exploration_prefers_check_then_capture() {
-        let model = AzNnue::random(4, 17);
+    fn root_fpu_is_a_parent_value_reduction_not_an_absolute_q() {
+        let model = AzNnue::random(4, 41);
         let position = Position::startpos();
         let legal = position.legal_moves();
-        let tree = AzTree::new(
+        let mut tree = AzTree::new(
             position.clone(),
             position.initial_rule_history(),
             None,
             &model,
-            AzSearchLimits::default(),
+            AzSearchLimits {
+                cpuct_at_root: 0.0,
+                cpuct_factor_at_root: 0.0,
+                fpu_value_at_root: 0.33,
+                ..AzSearchLimits::default()
+            },
         );
-        let parent = AzNode {
-            position,
-            accumulator_offset: 0,
-            policy_accumulator: [0; POLICY_ACCUMULATOR_RANK],
-            parent: NO_CHILD,
-            incoming_move: None,
-            rule_entry: None,
-            children_offset: 0,
-            children_len: 0,
-            visits: 64,
-            value_wdl_sum: [0.0; 3],
-            value: 0.0,
-            value_wdl: [0.0, 1.0, 0.0],
-            moves_left: 0.0,
-            expanded: true,
-        };
-        let child = |is_capture, gives_check| AzChild {
-            mv: legal[0],
-            prior: 0.0,
-            is_capture,
-            gives_check,
-            visits: 1,
-            value_wdl_sum: [0.0, 1.0, 0.0],
-            moves_left_sum: 0.0,
-            child: NO_CHILD,
-        };
-        let score = |candidate: &AzChild| tree.child_score(&parent, candidate, 0.0, 0.0, 8.0, 0.0);
-        let quiet = score(&child(false, false));
-        let capture = score(&child(true, false));
-        let check = score(&child(false, true));
-        assert!(check > capture && capture > quiet);
+        tree.cpuct_at_root = 0.0;
+        tree.nodes[tree.root].visits = 1;
+        tree.nodes[tree.root].value_wdl_sum = [0.0, 1.0, 0.0];
+        tree.set_node_children(
+            tree.root,
+            [
+                AzChild {
+                    mv: legal[0],
+                    prior: 0.25,
+                    gives_check: false,
+                    visits: 1,
+                    value_wdl_sum: [0.0, 1.0, 0.0],
+                    child: NO_CHILD,
+                },
+                AzChild {
+                    mv: legal[1],
+                    prior: 0.75,
+                    gives_check: false,
+                    visits: 0,
+                    value_wdl_sum: [0.0; 3],
+                    child: NO_CHILD,
+                },
+            ],
+        );
+
+        assert_eq!(tree.select_child(tree.root), 0);
     }
 
     #[test]

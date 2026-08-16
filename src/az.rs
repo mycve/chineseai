@@ -94,14 +94,11 @@ const POLICY_ACCUMULATOR_QUANT_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
 pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.95;
-pub(super) const MOVES_LEFT_HEAD_SIZE: usize = 32;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
 pub const RULE_CONTEXT_SIZE: usize = 7;
-#[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
-pub(super) const MOVES_LEFT_AUX_WEIGHT: f32 = 0.05;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(super) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
@@ -240,10 +237,6 @@ macro_rules! az_weight_tensors {
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
-        $visit!(moves_left_hidden, [MOVES_LEFT_HEAD_SIZE, $h]);
-        $visit!(moves_left_bias_hidden, [MOVES_LEFT_HEAD_SIZE]);
-        $visit!(moves_left_output, [MOVES_LEFT_HEAD_SIZE]);
-        $visit!(moves_left_bias, [1]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
         $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h]);
@@ -657,10 +650,6 @@ pub struct AzNnue {
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_output: Vec<f32>,
-    pub moves_left_hidden: Vec<f32>,
-    pub moves_left_bias_hidden: Vec<f32>,
-    pub moves_left_output: Vec<f32>,
-    pub moves_left_bias: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
@@ -696,10 +685,6 @@ impl Clone for AzNnue {
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_output: self.value_head_output.clone(),
-            moves_left_hidden: self.moves_left_hidden.clone(),
-            moves_left_bias_hidden: self.moves_left_bias_hidden.clone(),
-            moves_left_output: self.moves_left_output.clone(),
-            moves_left_bias: self.moves_left_bias.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
@@ -748,12 +733,6 @@ pub struct AzLoopConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
     pub opening_policy_softmax_temp: f32,
     pub value_td_lambda: f32,
@@ -789,7 +768,6 @@ pub struct AzLoopReport {
     pub phase_value: [AzPhaseValueReport; 3],
     pub policy_ce: f32,
     pub policy_target_entropy: f32,
-    pub moves_left_loss: f32,
     pub policy_kl: f32,
     pub root_visit_entropy: f32,
     pub entropy_opening: f32,
@@ -874,7 +852,6 @@ pub struct AzTrainingSample {
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
     pub side_sign: f32,
-    pub moves_left: f32,
     pub policy_weight: f32,
     pub value_weight: f32,
     pub search_simulations: u32,
@@ -1048,7 +1025,6 @@ pub struct AzSampleMeta {
 pub(super) struct AzEvalOutput {
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
-    pub moves_left: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1057,7 +1033,6 @@ pub struct AzTrainStats {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
-    pub moves_left_loss: f32,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -1083,7 +1058,6 @@ pub struct AzValueMomentStats {
 pub struct AzTrainLossWeights {
     pub value: f32,
     pub policy: f32,
-    pub moves_left: f32,
 }
 
 impl Default for AzTrainLossWeights {
@@ -1091,7 +1065,6 @@ impl Default for AzTrainLossWeights {
         Self {
             value: 1.0,
             policy: 1.0,
-            moves_left: MOVES_LEFT_AUX_WEIGHT,
         }
     }
 }
@@ -1102,7 +1075,6 @@ impl AzTrainStats {
         self.loss += other.loss;
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
-        self.moves_left_loss += other.moves_left_loss;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;
@@ -1151,12 +1123,6 @@ impl AzNnue {
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
-        let moves_left_hidden = (0..MOVES_LEFT_HEAD_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
-            .collect();
-        let moves_left_bias_hidden = vec![0.0; MOVES_LEFT_HEAD_SIZE];
-        let moves_left_output = vec![0.0; MOVES_LEFT_HEAD_SIZE];
-        let moves_left_bias = vec![0.0; 1];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
@@ -1186,10 +1152,6 @@ impl AzNnue {
             value_head_hidden,
             value_head_bias,
             value_head_output,
-            moves_left_hidden,
-            moves_left_bias_hidden,
-            moves_left_output,
-            moves_left_bias,
             policy_move_bias,
             policy_consequence_output,
             policy_context_hidden,
@@ -1271,10 +1233,6 @@ impl AzNnue {
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
-            moves_left_hidden: load_candle_f32_tensor(&tensors, "moves_left_hidden")?,
-            moves_left_bias_hidden: load_candle_f32_tensor(&tensors, "moves_left_bias_hidden")?,
-            moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
-            moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_consequence_output: load_candle_f32_tensor(
                 &tensors,
@@ -1364,17 +1322,9 @@ impl AzNnue {
             crate::scope_profile!("az.eval.value_head");
             self.value_wdl_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
         };
-        let moves_left = {
-            crate::scope_profile!("az.eval.moves_left_head");
-            self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
-        };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
         scratch.features = features;
-        AzEvalOutput {
-            value_wdl,
-            value,
-            moves_left,
-        }
+        AzEvalOutput { value_wdl, value }
     }
 
     pub(super) fn evaluate_incremental_with_scratch_output(
@@ -1411,16 +1361,8 @@ impl AzNnue {
             crate::scope_profile!("az.eval.value_head");
             self.value_wdl_from_hidden_into(&scratch.hidden, &[], &mut scratch.value_head)
         };
-        let moves_left = {
-            crate::scope_profile!("az.eval.moves_left_head");
-            self.moves_left_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
-        };
         self.evaluate_prepared_hidden_with_scratch(position, &[], value, moves, scratch);
-        AzEvalOutput {
-            value_wdl,
-            value,
-            moves_left,
-        }
+        AzEvalOutput { value_wdl, value }
     }
 
     #[allow(dead_code)]
@@ -1456,7 +1398,6 @@ impl AzNnue {
             requests[3].scratch.hidden.as_slice(),
         ];
         let (value_wdls, values) = self.value_wdl_batch4(hiddens);
-        let moves_left = self.moves_left_batch4(hiddens);
         for index in 0..4 {
             let request = &mut requests[index];
             self.evaluate_prepared_hidden_with_scratch(
@@ -1470,7 +1411,6 @@ impl AzNnue {
         std::array::from_fn(|index| AzEvalOutput {
             value_wdl: value_wdls[index],
             value: values[index],
-            moves_left: moves_left[index],
         })
     }
 
@@ -1818,39 +1758,6 @@ impl AzNnue {
         (wdls, values)
     }
 
-    #[allow(dead_code)]
-    fn moves_left_batch4(&self, hiddens: [&[f32]; 4]) -> [f32; 4] {
-        let mut heads = [[0.0f32; MOVES_LEFT_HEAD_SIZE]; 4];
-        for feature in 0..MOVES_LEFT_HEAD_SIZE {
-            let row = &self.moves_left_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            let dots = dot_product_f32_batch4(hiddens, row);
-            for batch in 0..4 {
-                heads[batch][feature] =
-                    (self.moves_left_bias_hidden[feature] + dots[batch]).max(0.0);
-            }
-        }
-        std::array::from_fn(|batch| {
-            softplus(dot_product(&heads[batch], &self.moves_left_output) + self.moves_left_bias[0])
-        })
-    }
-
-    fn moves_left_from_hidden_into(&self, hidden: &[f32], moves_left_head: &mut Vec<f32>) -> f32 {
-        moves_left_head.resize(MOVES_LEFT_HEAD_SIZE, 0.0);
-        moves_left_head.copy_from_slice(&self.moves_left_bias_hidden);
-        for (feature, value) in moves_left_head
-            .iter_mut()
-            .enumerate()
-            .take(MOVES_LEFT_HEAD_SIZE)
-        {
-            let hidden_row = &self.moves_left_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            *value += dot_product(hidden, hidden_row);
-            *value = (*value).max(0.0);
-        }
-        let logit = dot_product(moves_left_head, &self.moves_left_output) + self.moves_left_bias[0];
-        softplus(logit)
-    }
 
     fn fill_policy_piece_square_scores(&self, scores: &mut Vec<f32>) {
         let consequence_size = POLICY_CONSEQUENCE_SIZE.min(self.hidden_size);
@@ -2182,7 +2089,6 @@ pub fn benchmark_training(
             value_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign: 1.0,
-            moves_left: 0.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 0,
@@ -2236,16 +2142,6 @@ pub(super) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_H
         wdl
     } else {
         [0.0, 1.0, 0.0]
-    }
-}
-
-fn softplus(value: f32) -> f32 {
-    if value > 20.0 {
-        value
-    } else if value < -20.0 {
-        value.exp()
-    } else {
-        value.exp().ln_1p()
     }
 }
 
@@ -2921,7 +2817,6 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             value_wdl: scalar_value_to_wdl_target(0.1),
             value: 0.1,
             side_sign: 1.0,
-            moves_left: 0.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 0,
@@ -3198,7 +3093,6 @@ mod tests {
         let batch = model.evaluate_incremental_batch4(&mut requests);
         for index in 0..4 {
             assert!((scalar[index].value - batch[index].value).abs() < 1.0e-5);
-            assert!((scalar[index].moves_left - batch[index].moves_left).abs() < 1.0e-5);
             for (left, right) in scalar_scratch[index]
                 .logits
                 .iter()
@@ -3327,7 +3221,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3341,7 +3234,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3355,7 +3247,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(0.75),
                 value: 0.75,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3369,7 +3260,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(-0.75),
                 value: -0.75,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3401,7 +3291,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3415,7 +3304,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3429,7 +3317,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(0.5),
                 value: 0.5,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3443,7 +3330,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(-0.5),
                 value: -0.5,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3487,7 +3373,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(1.0),
                 value: 1.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3501,7 +3386,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(-1.0),
                 value: -1.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3515,7 +3399,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(0.75),
                 value: 0.75,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3529,7 +3412,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(-0.75),
                 value: -0.75,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3545,7 +3427,6 @@ mod tests {
         let weights = AzTrainLossWeights {
             value: 1.0,
             policy: 0.0,
-            moves_left: 0.0,
         };
         train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights).unwrap();
 
@@ -3584,10 +3465,6 @@ mod tests {
         assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
         assert_eq!(model.value_head_bias, loaded.value_head_bias);
         assert_eq!(model.value_head_output, loaded.value_head_output);
-        assert_eq!(model.moves_left_hidden, loaded.moves_left_hidden);
-        assert_eq!(model.moves_left_bias_hidden, loaded.moves_left_bias_hidden);
-        assert_eq!(model.moves_left_output, loaded.moves_left_output);
-        assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
         assert_eq!(
             model.policy_consequence_output,
@@ -3637,7 +3514,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(0.0),
                 value: 0.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,
@@ -3678,7 +3554,6 @@ mod tests {
                 value_wdl: scalar_value_to_wdl_target(0.0),
                 value: 0.0,
                 side_sign: 1.0,
-                moves_left: 0.0,
                 policy_weight: 1.0,
                 value_weight: 1.0,
                 search_simulations: 0,

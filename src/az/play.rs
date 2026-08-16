@@ -401,12 +401,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     config.policy_softmax_temp
                 },
                 draw_score: config.draw_score,
-                moves_left_max_effect: config.moves_left_max_effect,
-                moves_left_slope: config.moves_left_slope,
-                moves_left_threshold: config.moves_left_threshold,
-                moves_left_constant_factor: config.moves_left_constant_factor,
-                moves_left_scaled_factor: config.moves_left_scaled_factor,
-                moves_left_quadratic_factor: config.moves_left_quadratic_factor,
                 value_scale: 1.0,
             };
             let search = {
@@ -601,7 +595,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 result,
                 config.value_td_lambda,
             );
-            assign_moves_left_targets(&mut game_samples, config.max_plies);
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -747,7 +740,6 @@ fn make_training_sample(
         value_wdl: scalar_value_to_wdl_target(value),
         value: value.clamp(-1.0, 1.0),
         side_sign,
-        moves_left: 0.0,
         policy_weight: policy_weight.max(0.0),
         value_weight: 1.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
@@ -841,14 +833,6 @@ fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
     }
     let threshold = -(1.0 - config.resign_percentage.clamp(0.0, 100.0) / 100.0);
     root_q <= threshold
-}
-
-pub(super) fn assign_moves_left_targets(samples: &mut [AzTrainingSample], _max_plies: usize) {
-    let game_len = samples.len();
-    for (index, sample) in samples.iter_mut().enumerate() {
-        let remaining = game_len.saturating_sub(index).max(1) as f32;
-        sample.moves_left = remaining;
-    }
 }
 
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
@@ -1092,16 +1076,10 @@ fn play_arena_game(
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
+                fpu_value: 0.33,
+                fpu_value_at_root: 0.33,
                 policy_softmax_temp: 1.0,
                 draw_score: 0.0,
-                moves_left_max_effect: 0.0,
-                moves_left_slope: 0.0,
-                moves_left_threshold: 0.6,
-                moves_left_constant_factor: 0.0,
-                moves_left_scaled_factor: 0.0,
-                moves_left_quadratic_factor: 0.0,
                 value_scale: 1.0,
             },
         );
@@ -1147,7 +1125,6 @@ mod tests {
             mv,
             visits: (policy * 100.0) as u32,
             q: 0.0,
-            moves_left: 0.0,
             raw_prior: policy,
             prior: policy,
             policy,
@@ -1159,7 +1136,6 @@ mod tests {
             mv,
             visits,
             q,
-            moves_left: 0.0,
             raw_prior: 0.0,
             prior: 0.0,
             policy: 0.0,
@@ -1175,7 +1151,6 @@ mod tests {
             value_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign,
-            moves_left: 0.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 0,
@@ -1269,21 +1244,6 @@ mod tests {
         for (actual, expected) in sample.policy.iter().zip(expected_policy) {
             assert!((actual - expected / expected_total).abs() < 1e-6);
         }
-    }
-
-    #[test]
-    fn moves_left_targets_use_raw_remaining_plies() {
-        let mut samples = vec![sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
-
-        assign_moves_left_targets(&mut samples, 300);
-
-        assert_eq!(
-            samples
-                .iter()
-                .map(|sample| sample.moves_left)
-                .collect::<Vec<_>>(),
-            vec![3.0, 2.0, 1.0]
-        );
     }
 
     #[test]

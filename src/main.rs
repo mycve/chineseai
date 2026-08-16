@@ -124,10 +124,10 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 3.0)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.23)]
+    #[arg(long, default_value_t = 0.33)]
     fpu_value: f32,
-    /// Root first-play urgency value.
-    #[arg(long, default_value_t = 1.0)]
+    /// Root first-play urgency reduction.
+    #[arg(long, default_value_t = 0.33)]
     fpu_value_at_root: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
@@ -147,9 +147,6 @@ struct AzSearchArgs {
     /// Draw value in Q = W - L + draw_score * D.
     #[arg(long, default_value_t = 0.0)]
     draw_score: f32,
-    /// Enable moves-left utility.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    moves_left_utility: bool,
     /// Independently re-search this many top-visited root moves after making each move.
     #[arg(long, default_value_t = 0)]
     verify_top: usize,
@@ -834,12 +831,6 @@ fn build_az_loop_config(
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         draw_score: config.draw_score,
-        moves_left_max_effect: config.moves_left_max_effect,
-        moves_left_slope: config.moves_left_slope,
-        moves_left_threshold: config.moves_left_threshold,
-        moves_left_constant_factor: config.moves_left_constant_factor,
-        moves_left_scaled_factor: config.moves_left_scaled_factor,
-        moves_left_quadratic_factor: config.moves_left_quadratic_factor,
         policy_softmax_temp: config.policy_softmax_temp,
         opening_policy_softmax_temp: config.opening_policy_softmax_temp,
         value_td_lambda: config.value_td_lambda,
@@ -988,7 +979,6 @@ fn build_async_training_report(
         phase_value,
         policy_ce: stats.policy_ce,
         policy_target_entropy: train_source.policy_target_entropy,
-        moves_left_loss: stats.moves_left_loss,
         policy_kl: stats.policy_ce - train_source.policy_target_entropy,
         root_visit_entropy,
         entropy_opening: pending.selfplay.entropy_opening_sum
@@ -1247,16 +1237,10 @@ fn fixed_az_search_limits(
         max_depth,
         root_dirichlet_alpha: 0.0,
         root_exploration_fraction: 0.0,
-        fpu_value: 0.23,
-        fpu_value_at_root: 1.0,
+        fpu_value: 0.33,
+        fpu_value_at_root: 0.33,
         policy_softmax_temp: 1.0,
         draw_score: 0.0,
-        moves_left_max_effect: 0.0,
-        moves_left_slope: 0.0,
-        moves_left_threshold: 0.6,
-        moves_left_constant_factor: 0.0,
-        moves_left_scaled_factor: 0.0,
-        moves_left_quadratic_factor: 0.0,
         value_scale: 1.0,
     }
 }
@@ -1319,15 +1303,9 @@ fn main() {
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: cmd.fpu_value.max(0.0),
-                fpu_value_at_root: cmd.fpu_value_at_root.clamp(-1.0, 1.0),
+                fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
                 policy_softmax_temp: 1.0,
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                moves_left_max_effect: if cmd.moves_left_utility { 0.25 } else { 0.0 },
-                moves_left_slope: if cmd.moves_left_utility { 0.004 } else { 0.0 },
-                moves_left_threshold: 0.7,
-                moves_left_constant_factor: if cmd.moves_left_utility { 0.05 } else { 0.0 },
-                moves_left_scaled_factor: if cmd.moves_left_utility { 0.20 } else { 0.0 },
-                moves_left_quadratic_factor: if cmd.moves_left_utility { 0.75 } else { 0.0 },
                 value_scale: 1.0,
             };
             let root_moves = if cmd.root_moves.is_empty() {
@@ -1379,7 +1357,6 @@ fn main() {
             println!("fpu_value: {}", cmd.fpu_value);
             println!("fpu_value_at_root: {}", cmd.fpu_value_at_root);
             println!("draw_score: {}", cmd.draw_score);
-            println!("moves_left_utility: {}", cmd.moves_left_utility);
             println!(
                 "depth    : avg={:.2} max={} limit={} cutoffs={}",
                 result.search_depth_avg,
@@ -1391,7 +1368,7 @@ fn main() {
                 println!("trace    : root_move={trace_move} pv_plies={}", trace.len());
                 for step in &trace {
                     println!(
-                        "trace[{ply:02}]: move={mv} visits={visits} q={q:.3} prior={prior:.5} check={check} child_net={value:.3} child_wdl={win:.3}/{draw:.3}/{loss:.3} child_ml={moves_left:.1} expanded={expanded} fen={fen}",
+                        "trace[{ply:02}]: move={mv} visits={visits} q={q:.3} prior={prior:.5} check={check} child_net={value:.3} child_wdl={win:.3}/{draw:.3}/{loss:.3} expanded={expanded} fen={fen}",
                         ply = step.ply,
                         mv = step.mv,
                         visits = step.visits,
@@ -1402,7 +1379,6 @@ fn main() {
                         win = step.child_value_wdl[0],
                         draw = step.child_value_wdl[1],
                         loss = step.child_value_wdl[2],
-                        moves_left = step.child_moves_left,
                         expanded = step.child_expanded,
                         fen = step.child_fen,
                     );
@@ -1427,11 +1403,10 @@ fn main() {
             println!("by_policy:");
             for candidate in &result.candidates {
                 println!(
-                    "candidate: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    "candidate: {} visits={} q={:.3} prior={:.5} policy={:.5}",
                     candidate.mv,
                     candidate.visits,
                     candidate.q,
-                    candidate.moves_left,
                     candidate.prior,
                     candidate.policy
                 );
@@ -1447,11 +1422,10 @@ fn main() {
             });
             for candidate in &by_visits {
                 println!(
-                    "visited: {} visits={} q={:.3} ml={:.1} prior={:.5} policy={:.5}",
+                    "visited: {} visits={} q={:.3} prior={:.5} policy={:.5}",
                     candidate.mv,
                     candidate.visits,
                     candidate.q,
-                    candidate.moves_left,
                     candidate.prior,
                     candidate.policy
                 );
@@ -2419,7 +2393,7 @@ fn main() {
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} ml_log_mse={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2449,7 +2423,6 @@ fn main() {
                     report.avg_search_simulations,
                     report.loss,
                     report.value_loss,
-                    report.moves_left_loss,
                     value_rmse,
                     report.value_pred_mean,
                     report.value_target_mean,
@@ -2503,12 +2476,6 @@ fn main() {
                 );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
                 log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
-                log_scalar(
-                    &mut tb,
-                    "train/moves_left_log_mse",
-                    update,
-                    report.moves_left_loss,
-                );
                 log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
                 log_scalar(
                     &mut tb,
@@ -4233,7 +4200,6 @@ fn load_pikafish_training_samples(path: &str) -> io::Result<Vec<AzTrainingSample
             } else {
                 -1.0
             },
-            moves_left: 0.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 0,
@@ -4433,7 +4399,6 @@ mod reporting_tests {
             value_wdl: [0.0, 1.0, 0.0],
             value: 0.0,
             side_sign: 1.0,
-            moves_left: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
             search_simulations: 2_000,

@@ -434,7 +434,6 @@ fn three_long_chase_cycles_lose() {
 }
 
 #[test]
-#[test]
 fn chased_piece_escape_does_not_make_mutual_long_chase() {
     let mut position =
         Position::from_fen("r3kab1r/4a4/2n1bc2n/p1p1p1pc1/8p/5NP2/P1P1P3P/2N1C2C1/8R/1RBAKAB2 w")

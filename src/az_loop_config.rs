@@ -51,12 +51,6 @@ pub struct AzLoopFileConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
-    pub moves_left_max_effect: f32,
-    pub moves_left_slope: f32,
-    pub moves_left_threshold: f32,
-    pub moves_left_constant_factor: f32,
-    pub moves_left_scaled_factor: f32,
-    pub moves_left_quadratic_factor: f32,
     pub policy_softmax_temp: f32,
     pub opening_policy_softmax_temp: f32,
     pub value_td_lambda: f32,
@@ -128,15 +122,9 @@ impl Default for AzLoopFileConfig {
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.10,
             opening_root_exploration_fraction: 0.30,
-            fpu_value: 0.0,
-            fpu_value_at_root: 1.0,
+            fpu_value: 0.33,
+            fpu_value_at_root: 0.33,
             draw_score: 0.0,
-            moves_left_max_effect: 0.25,
-            moves_left_slope: 0.004,
-            moves_left_threshold: 0.7,
-            moves_left_constant_factor: 0.05,
-            moves_left_scaled_factor: 0.20,
-            moves_left_quadratic_factor: 0.75,
             policy_softmax_temp: 1.45,
             opening_policy_softmax_temp: 3.0,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
@@ -247,18 +235,6 @@ impl AzLoopFileConfig {
         line!("fpu_value", f(self.fpu_value));
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
-        line!("moves_left_max_effect", f(self.moves_left_max_effect));
-        line!("moves_left_slope", f(self.moves_left_slope));
-        line!("moves_left_threshold", f(self.moves_left_threshold));
-        line!(
-            "moves_left_constant_factor",
-            f(self.moves_left_constant_factor)
-        );
-        line!("moves_left_scaled_factor", f(self.moves_left_scaled_factor));
-        line!(
-            "moves_left_quadratic_factor",
-            f(self.moves_left_quadratic_factor)
-        );
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!(
             "opening_policy_softmax_temp",
@@ -373,11 +349,8 @@ impl AzLoopFileConfig {
         self.opening_root_exploration_fraction =
             self.opening_root_exploration_fraction.clamp(0.0, 1.0);
         self.fpu_value = self.fpu_value.max(0.0);
-        self.fpu_value_at_root = self.fpu_value_at_root.clamp(-1.0, 1.0);
+        self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
-        self.moves_left_max_effect = self.moves_left_max_effect.max(0.0);
-        self.moves_left_slope = self.moves_left_slope.max(0.0);
-        self.moves_left_threshold = self.moves_left_threshold.clamp(0.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.opening_policy_softmax_temp = self.opening_policy_softmax_temp.max(1e-3);
         self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
@@ -419,7 +392,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 8\n"));
+        assert!(text.starts_with("format_version = 9\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -439,15 +412,9 @@ mod tests {
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
         assert!(text.contains("opening_root_exploration_fraction = 0.3\n"));
-        assert!(text.contains("fpu_value = 0.0\n"));
-        assert!(text.contains("fpu_value_at_root = 1.0\n"));
+        assert!(text.contains("fpu_value = 0.33\n"));
+        assert!(text.contains("fpu_value_at_root = 0.33\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("moves_left_max_effect = 0.25\n"));
-        assert!(text.contains("moves_left_slope = 0.004\n"));
-        assert!(text.contains("moves_left_threshold = 0.7\n"));
-        assert!(text.contains("moves_left_constant_factor = 0.05\n"));
-        assert!(text.contains("moves_left_scaled_factor = 0.2\n"));
-        assert!(text.contains("moves_left_quadratic_factor = 0.75\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(text.contains("opening_policy_softmax_temp = 3.0\n"));
         assert!(text.contains("value_td_lambda = 0.95\n"));
