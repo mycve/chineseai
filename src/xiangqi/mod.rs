@@ -441,7 +441,7 @@ impl Position {
     /// legal opponent move). Under that precondition, after `mv` the enemy king
     /// can only newly be in check via the changes at `mv.from`/`mv.to`, so no
     /// full-board make/unmake or scan is needed.
-    pub(crate) fn gives_check_after_move_fast(&self, mv: Move) -> bool {
+    pub fn gives_check_after_move_fast(&self, mv: Move) -> bool {
         let s = self.side_to_move;
         let from = mv.from as usize;
         let to = mv.to as usize;

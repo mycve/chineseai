@@ -21,5 +21,6 @@ eval/*.fens
 eval/*.bin
 eval/*.sqlite
 eval/torch-policy-*/
+eval/*/
 eval/torch/
 POTENTIAL_IMPROVEMENT_PLAN.md

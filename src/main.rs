@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs, io,
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -391,6 +391,9 @@ struct PikafishExportTorchArgs {
     sqlite: String,
     #[arg(long, default_value = "eval/pikafish-policy.bin")]
     output: String,
+    /// Include up to this many positions from each stored principal variation.
+    #[arg(long, default_value_t = 0)]
+    pv_plies: usize,
 }
 
 #[derive(Args, Debug)]
@@ -4321,34 +4324,92 @@ fn run_pikafish_policy_fit(cmd: PikafishPolicyFitArgs) -> io::Result<()> {
 }
 
 fn run_pikafish_export_torch(cmd: PikafishExportTorchArgs) -> io::Result<()> {
-    let samples = load_pikafish_training_samples(&cmd.sqlite)?;
+    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT fen, best_pv, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id",
+        )
+        .map_err(sqlite_io_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                [
+                    row.get::<_, f32>(2)?,
+                    row.get::<_, f32>(3)?,
+                    row.get::<_, f32>(4)?,
+                ],
+            ))
+        })
+        .map_err(sqlite_io_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_io_error)?;
     let output = Path::new(&cmd.output);
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     let mut writer = BufWriter::new(fs::File::create(output)?);
     writer.write_all(b"XQPF")?;
-    writer.write_u32::<LittleEndian>(1)?;
-    writer.write_u32::<LittleEndian>(samples.len() as u32)?;
-    for sample in &samples {
-        let best = sample.policy.iter().position(|&p| p > 0.5).unwrap_or(0);
-        writer.write_u16::<LittleEndian>(sample.features.len() as u16)?;
-        writer.write_u16::<LittleEndian>(sample.move_indices.len() as u16)?;
-        writer.write_u16::<LittleEndian>(best as u16)?;
-        for value in sample.value_wdl {
-            writer.write_f32::<LittleEndian>(value)?;
-        }
-        for &feature in &sample.features {
-            writer.write_u16::<LittleEndian>(feature as u16)?;
-        }
-        for &mv in &sample.move_indices {
-            writer.write_u16::<LittleEndian>(mv as u16)?;
+    writer.write_u32::<LittleEndian>(3)?;
+    writer.write_u32::<LittleEndian>(0)?;
+    let mut exported = 0u32;
+    for (group, (fen, pv, raw_wdl)) in rows.iter().enumerate() {
+        let mut position = Position::from_fen(fen)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let pv = pv
+            .split_whitespace()
+            .take(cmd.pv_plies.max(1))
+            .collect::<Vec<_>>();
+        for (ply, bestmove) in pv.into_iter().enumerate() {
+            if cmd.pv_plies == 0 && ply > 0 {
+                break;
+            }
+            let Some(best_move) = position.parse_uci_move(bestmove) else {
+                break;
+            };
+            let legal = position.legal_moves();
+            let Some(best) = legal.iter().position(|&mv| mv == best_move) else {
+                break;
+            };
+            let side = position.side_to_move();
+            let features = extract_sparse_features_az(&position);
+            let move_indices = legal
+                .iter()
+                .map(|&mv| chineseai::az::dense_move_index(canonical_move(side, mv)))
+                .collect::<Vec<_>>();
+            let sum = raw_wdl.iter().sum::<f32>().max(1.0);
+            let mut wdl = raw_wdl.map(|value| value / sum);
+            if ply % 2 == 1 {
+                wdl.swap(0, 2);
+            }
+            writer.write_u32::<LittleEndian>(group as u32)?;
+            writer.write_u8(ply as u8)?;
+            writer.write_u16::<LittleEndian>(features.len() as u16)?;
+            writer.write_u16::<LittleEndian>(move_indices.len() as u16)?;
+            writer.write_u16::<LittleEndian>(best as u16)?;
+            for value in wdl {
+                writer.write_f32::<LittleEndian>(value)?;
+            }
+            for feature in features {
+                writer.write_u16::<LittleEndian>(feature as u16)?;
+            }
+            for mv in move_indices {
+                writer.write_u16::<LittleEndian>(mv as u16)?;
+            }
+            for &mv in &legal {
+                writer.write_u8(u8::from(position.gives_check_after_move_fast(mv)))?;
+            }
+            exported += 1;
+            position.make_move(best_move);
         }
     }
     writer.flush()?;
+    writer.seek(SeekFrom::Start(8))?;
+    writer.write_u32::<LittleEndian>(exported)?;
     println!(
         "pikafish-export-torch: samples={} output={}",
-        samples.len(),
+        exported,
         output.display()
     );
     Ok(())
