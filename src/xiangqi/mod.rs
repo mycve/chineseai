@@ -188,6 +188,212 @@ impl Position {
         self.board[sq]
     }
 
+    pub(crate) fn visit_occupied_attacks(
+        &self,
+        mut visitor: impl FnMut(usize, Piece, usize, Piece),
+    ) {
+        for source in 0..BOARD_SIZE {
+            let Some(piece) = self.board[source] else {
+                continue;
+            };
+            let file = file_of(source) as i32;
+            let rank = rank_of(source) as i32;
+            let mut visit_step = |df: i32, dr: i32| {
+                let target_file = file + df;
+                let target_rank = rank + dr;
+                if inside_board(target_file, target_rank) {
+                    let target = index(target_file as usize, target_rank as usize);
+                    if let Some(attacked) = self.board[target] {
+                        visitor(source, piece, target, attacked);
+                    }
+                }
+            };
+            match piece.kind {
+                PieceKind::General => {
+                    for (df, dr) in ORTHOGONAL_STEPS {
+                        let target_file = file + df;
+                        let target_rank = rank + dr;
+                        if inside_board(target_file, target_rank)
+                            && inside_palace(
+                                piece.color,
+                                target_file as usize,
+                                target_rank as usize,
+                            )
+                        {
+                            visit_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Advisor => {
+                    for (df, dr) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                        let target_file = file + df;
+                        let target_rank = rank + dr;
+                        if inside_board(target_file, target_rank)
+                            && inside_palace(
+                                piece.color,
+                                target_file as usize,
+                                target_rank as usize,
+                            )
+                        {
+                            visit_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Elephant => {
+                    for (df, dr) in [(-2, -2), (-2, 2), (2, -2), (2, 2)] {
+                        let target_file = file + df;
+                        let target_rank = rank + dr;
+                        if inside_board(target_file, target_rank)
+                            && elephant_stays_home(piece.color, target_rank as usize)
+                            && self.board[index((file + df / 2) as usize, (rank + dr / 2) as usize)]
+                                .is_none()
+                        {
+                            visit_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Horse => {
+                    for ((leg_df, leg_dr), (df, dr)) in HORSE_STEPS {
+                        if inside_board(file + df, rank + dr)
+                            && inside_board(file + leg_df, rank + leg_dr)
+                            && self.board[index((file + leg_df) as usize, (rank + leg_dr) as usize)]
+                                .is_none()
+                        {
+                            visit_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Rook | PieceKind::Cannon => {
+                    for (df, dr) in ORTHOGONAL_STEPS {
+                        let mut target_file = file + df;
+                        let mut target_rank = rank + dr;
+                        let mut occupied = 0;
+                        while inside_board(target_file, target_rank) {
+                            let target = index(target_file as usize, target_rank as usize);
+                            if let Some(attacked) = self.board[target] {
+                                occupied += 1;
+                                if piece.kind == PieceKind::Rook || occupied == 2 {
+                                    visitor(source, piece, target, attacked);
+                                    break;
+                                }
+                            }
+                            target_file += df;
+                            target_rank += dr;
+                        }
+                    }
+                }
+                PieceKind::Soldier => {
+                    visit_step(0, piece.color.forward_step());
+                    if soldier_crossed_river(piece.color, rank as usize) {
+                        visit_step(-1, 0);
+                        visit_step(1, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn attacked_squares_mask(&self, by: Color) -> u128 {
+        let mut mask = 0u128;
+        for source in 0..BOARD_SIZE {
+            let Some(piece) = self.board[source].filter(|piece| piece.color == by) else {
+                continue;
+            };
+            let file = file_of(source) as i32;
+            let rank = rank_of(source) as i32;
+            let mut add_step = |df: i32, dr: i32| {
+                let target_file = file + df;
+                let target_rank = rank + dr;
+                if inside_board(target_file, target_rank) {
+                    mask |= 1u128 << index(target_file as usize, target_rank as usize);
+                }
+            };
+            match piece.kind {
+                PieceKind::General => {
+                    for (df, dr) in ORTHOGONAL_STEPS {
+                        let target_file = file + df;
+                        let target_rank = rank + dr;
+                        if inside_board(target_file, target_rank)
+                            && inside_palace(by, target_file as usize, target_rank as usize)
+                        {
+                            add_step(df, dr);
+                        }
+                    }
+                    if let Some(enemy_general) = self.find_general(by.opposite())
+                        && file_of(enemy_general) == file as usize
+                        && self.clear_file_between(source, enemy_general)
+                    {
+                        mask |= 1u128 << enemy_general;
+                    }
+                }
+                PieceKind::Advisor => {
+                    for (df, dr) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                        let target_file = file + df;
+                        let target_rank = rank + dr;
+                        if inside_board(target_file, target_rank)
+                            && inside_palace(by, target_file as usize, target_rank as usize)
+                        {
+                            add_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Elephant => {
+                    for (df, dr) in [(-2, -2), (-2, 2), (2, -2), (2, 2)] {
+                        let target_file = file + df;
+                        let target_rank = rank + dr;
+                        if inside_board(target_file, target_rank)
+                            && elephant_stays_home(by, target_rank as usize)
+                            && self.board[index((file + df / 2) as usize, (rank + dr / 2) as usize)]
+                                .is_none()
+                        {
+                            add_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Horse => {
+                    for ((leg_df, leg_dr), (df, dr)) in HORSE_STEPS {
+                        if inside_board(file + df, rank + dr)
+                            && self.board[index((file + leg_df) as usize, (rank + leg_dr) as usize)]
+                                .is_none()
+                        {
+                            add_step(df, dr);
+                        }
+                    }
+                }
+                PieceKind::Rook | PieceKind::Cannon => {
+                    for (df, dr) in ORTHOGONAL_STEPS {
+                        let mut target_file = file + df;
+                        let mut target_rank = rank + dr;
+                        let mut screen = false;
+                        while inside_board(target_file, target_rank) {
+                            let target = index(target_file as usize, target_rank as usize);
+                            let occupied = self.board[target].is_some();
+                            if piece.kind == PieceKind::Rook || screen {
+                                mask |= 1u128 << target;
+                            }
+                            if occupied {
+                                if piece.kind == PieceKind::Rook || screen {
+                                    break;
+                                }
+                                screen = true;
+                            }
+                            target_file += df;
+                            target_rank += dr;
+                        }
+                    }
+                }
+                PieceKind::Soldier => {
+                    add_step(0, by.forward_step());
+                    if soldier_crossed_river(by, rank as usize) {
+                        add_step(-1, 0);
+                        add_step(1, 0);
+                    }
+                }
+            }
+        }
+        mask
+    }
+
     #[inline(always)]
     pub fn has_general(&self, color: Color) -> bool {
         self.general_squares[color_hash_index(color)].is_some()

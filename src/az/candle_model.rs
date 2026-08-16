@@ -3,9 +3,12 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
-    RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE,
-    STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, WDL_HEAD_SIZE, dataloader::PackedBatch,
-    fused_feature_pool::feature_pool, fused_policy::fused_policy,
+    POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
+    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, VALUE_THREAT_RANK,
+    VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    dataloader::PackedBatch,
+    fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
+    fused_policy::fused_policy,
     fused_sparse_policy::sparse_policy,
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
@@ -25,6 +28,8 @@ pub(super) struct AzCandleModel {
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_output: Var,
+    value_threat_embedding: Var,
+    value_threat_output: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
     policy_context_hidden: Var,
@@ -33,6 +38,7 @@ pub(super) struct AzCandleModel {
     policy_accumulator_move: Var,
     policy_sparse_table: Var,
     policy_sparse_factor: Var,
+    policy_tactical: Var,
 }
 
 impl AzCandleModel {
@@ -66,6 +72,13 @@ impl AzCandleModel {
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
+        let threat_accumulator = sparse_pool(
+            self.value_threat_embedding.as_tensor(),
+            &batch.value_threat_indices,
+        )?;
+        let threat_activation = threat_accumulator.clamp(0.0f64, 1.0f64)?;
+        let threat_pair = Tensor::cat(&[&threat_activation, &threat_activation.sqr()?], 1)?;
+        let value_logits = (value_logits + threat_pair.matmul(&self.value_threat_output.t()?)?)?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
@@ -115,7 +128,18 @@ impl AzCandleModel {
             0,
         )?;
         let sparse_logits = sparse_policy(&sparse_tables, &batch.policy_sparse_indices)?;
-        let policy_logits = (policy_logits + sparse_logits)?;
+        let tactical_table = Tensor::cat(
+            &[
+                self.policy_tactical.as_tensor(),
+                &Tensor::zeros(1, DType::F32, self.input_hidden.device())?,
+            ],
+            0,
+        )?;
+        let tactical_logits = tactical_table
+            .index_select(&batch.policy_tactical_indices.flatten_all()?, 0)?
+            .reshape((batch.batch_size, batch.max_policy_moves, 2))?
+            .sum(2)?;
+        let policy_logits = (policy_logits + sparse_logits + tactical_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -132,8 +156,10 @@ pub(super) struct ForwardOutput {
 pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
     pub(super) feature_items: Tensor,
+    pub(super) value_threat_indices: Tensor,
     pub(super) policy_items: Tensor,
     pub(super) policy_sparse_indices: Tensor,
+    pub(super) policy_tactical_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) value_wdl: Tensor,
@@ -142,6 +168,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
     pub(super) value_phase_masks: Tensor,
+    pub(super) max_policy_moves: usize,
 }
 
 impl BatchTensors {
@@ -149,11 +176,24 @@ impl BatchTensors {
         let batch_size = packed.batch_size;
         let max_features = packed.max_features;
         let max_policy_moves = packed.max_policy_moves;
+        let max_value_threats = packed.max_value_threats;
+        assert!(
+            packed
+                .value_threat_indices
+                .iter()
+                .all(|&index| index == PADDING_ITEM || index < VALUE_THREAT_VOCAB as u32),
+            "value threat index exceeds vocabulary"
+        );
         Ok(Self {
             batch_size,
             feature_items: Tensor::from_vec(
                 packed.feature_items,
                 (batch_size, max_features),
+                device,
+            )?,
+            value_threat_indices: Tensor::from_vec(
+                packed.value_threat_indices,
+                (batch_size, max_value_threats),
                 device,
             )?,
             policy_items: Tensor::from_vec(
@@ -164,6 +204,11 @@ impl BatchTensors {
             policy_sparse_indices: Tensor::from_vec(
                 packed.policy_sparse_indices,
                 (batch_size, max_policy_moves, 7),
+                device,
+            )?,
+            policy_tactical_indices: Tensor::from_vec(
+                packed.policy_tactical_indices,
+                (batch_size, max_policy_moves, 2),
                 device,
             )?,
             policy_targets: Tensor::from_vec(
@@ -186,6 +231,7 @@ impl BatchTensors {
             policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
+            max_policy_moves,
         })
     }
 }
@@ -238,6 +284,16 @@ impl AzCandleModel {
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
+            value_threat_embedding: var_from_slice(
+                &model.value_threat_embedding,
+                (VALUE_THREAT_VOCAB, VALUE_THREAT_RANK),
+                device,
+            )?,
+            value_threat_output: var_from_slice(
+                &model.value_threat_output,
+                (WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2),
+                device,
+            )?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_consequence_output: var_from_slice(
                 &model.policy_consequence_output,
@@ -274,6 +330,7 @@ impl AzCandleModel {
                 POLICY_SPARSE_FACTOR_SIZE,
                 device,
             )?,
+            policy_tactical: var_from_slice(&model.policy_tactical, POLICY_TACTICAL_SIZE, device)?,
         })
     }
 
@@ -289,6 +346,8 @@ impl AzCandleModel {
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_output.clone());
+        vars.push(self.value_threat_embedding.clone());
+        vars.push(self.value_threat_output.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
         vars.push(self.policy_context_hidden.clone());
@@ -297,6 +356,7 @@ impl AzCandleModel {
         vars.push(self.policy_accumulator_move.clone());
         vars.push(self.policy_sparse_table.clone());
         vars.push(self.policy_sparse_factor.clone());
+        vars.push(self.policy_tactical.clone());
         vars
     }
 
@@ -314,6 +374,11 @@ impl AzCandleModel {
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
+        copy_var(
+            &self.value_threat_embedding,
+            &mut model.value_threat_embedding,
+        )?;
+        copy_var(&self.value_threat_output, &mut model.value_threat_output)?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(
             &self.policy_consequence_output,
@@ -334,6 +399,9 @@ impl AzCandleModel {
         )?;
         copy_var(&self.policy_sparse_table, &mut model.policy_sparse_table)?;
         copy_var(&self.policy_sparse_factor, &mut model.policy_sparse_factor)?;
+        copy_var(&self.policy_tactical, &mut model.policy_tactical)?;
+        model.rebuild_value_threat_quantization();
+        model.rebuild_policy_tactical();
         model.rebuild_policy_accumulator_quantization();
         Ok(())
     }

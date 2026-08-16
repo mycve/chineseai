@@ -74,6 +74,36 @@ extern "C" __global__ void feature_pool_grad(
     atomicAdd(grad_tables + (1293u + us_bucket * 14u + piece) * hidden + h, g);
     atomicAdd(grad_tables + (1293u + (9u + them_bucket) * 14u + piece) * hidden + h, g);
 }
+
+extern "C" __global__ void sparse_pool_fwd(
+    const float* table, const unsigned int* items, float* output,
+    unsigned int batch, unsigned int item_count, unsigned int hidden
+) {
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= batch * hidden) return;
+    unsigned int b = index / hidden;
+    unsigned int h = index - b * hidden;
+    float sum = 0.0f;
+    for (unsigned int i = 0; i < item_count; ++i) {
+        unsigned int item = items[b * item_count + i];
+        if (item != 0xffffffffu) sum += table[item * hidden + h];
+    }
+    output[index] = sum;
+}
+
+extern "C" __global__ void sparse_pool_grad(
+    const unsigned int* items, const float* grad_output, float* grad_table,
+    unsigned int batch, unsigned int item_count, unsigned int hidden
+) {
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= batch * item_count * hidden) return;
+    unsigned int h = index % hidden;
+    unsigned int item_index = index / hidden;
+    unsigned int item = items[item_index];
+    if (item == 0xffffffffu) return;
+    unsigned int b = item_index / item_count;
+    atomicAdd(grad_table + item * hidden + h, grad_output[b * hidden + h]);
+}
 "#;
 
 #[derive(Clone, Debug)]
@@ -85,6 +115,17 @@ struct FeaturePool {
 
 #[derive(Clone, Debug)]
 struct FeaturePoolGrad(FeaturePool);
+
+#[derive(Clone, Debug)]
+struct SparsePool {
+    rows: usize,
+    batch: usize,
+    items: usize,
+    hidden: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SparsePoolGrad(SparsePool);
 
 pub(super) const fn pack_feature(feature: usize, us_bucket: usize, them_bucket: usize) -> u32 {
     feature as u32 | (us_bucket as u32) << 11 | (them_bucket as u32) << 15
@@ -99,6 +140,20 @@ pub(super) fn feature_pool(tables: &Tensor, items: &Tensor) -> Result<Tensor> {
     tables.apply_op2(
         items,
         FeaturePool {
+            batch,
+            items: item_count,
+            hidden,
+        },
+    )
+}
+
+pub(super) fn sparse_pool(table: &Tensor, items: &Tensor) -> Result<Tensor> {
+    let (rows, hidden) = table.dims2()?;
+    let (batch, item_count) = items.dims2()?;
+    table.apply_op2(
+        items,
+        SparsePool {
+            rows,
             batch,
             items: item_count,
             hidden,
@@ -218,6 +273,116 @@ impl CustomOp3 for FeaturePoolGrad {
         grad_layout: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         cuda_gradient(items, item_layout, grad, grad_layout, &self.0)
+    }
+}
+
+impl CustomOp2 for SparsePool {
+    fn name(&self) -> &'static str {
+        "az-sparse-pool"
+    }
+
+    fn cpu_fwd(
+        &self,
+        table_storage: &CpuStorage,
+        table_layout: &Layout,
+        item_storage: &CpuStorage,
+        item_layout: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (CpuStorage::F32(table), CpuStorage::U32(items)) = (table_storage, item_storage) else {
+            candle_core::bail!("sparse pool expects f32 table and u32 items")
+        };
+        let table = contiguous_slice(table, table_layout, "sparse table")?;
+        let items = contiguous_slice(items, item_layout, "sparse items")?;
+        let mut output = vec![0.0f32; self.batch * self.hidden];
+        for batch in 0..self.batch {
+            for &item in &items[batch * self.items..(batch + 1) * self.items] {
+                if item == PADDING_ITEM {
+                    continue;
+                }
+                let item = item as usize;
+                for hidden in 0..self.hidden {
+                    output[batch * self.hidden + hidden] += table[item * self.hidden + hidden];
+                }
+            }
+        }
+        Ok((CpuStorage::F32(output), (self.batch, self.hidden).into()))
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    fn cuda_fwd(
+        &self,
+        table: &candle_core::CudaStorage,
+        table_layout: &Layout,
+        items: &candle_core::CudaStorage,
+        item_layout: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        cuda_sparse_forward(table, table_layout, items, item_layout, self)
+    }
+
+    fn bwd(
+        &self,
+        table: &Tensor,
+        items: &Tensor,
+        _result: &Tensor,
+        grad_result: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let grad = table.apply_op3_no_bwd(items, grad_result, &SparsePoolGrad(self.clone()))?;
+        Ok((Some(grad), None))
+    }
+}
+
+impl CustomOp3 for SparsePoolGrad {
+    fn name(&self) -> &'static str {
+        "az-sparse-pool-grad"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _table_storage: &CpuStorage,
+        _table_layout: &Layout,
+        item_storage: &CpuStorage,
+        item_layout: &Layout,
+        grad_storage: &CpuStorage,
+        grad_layout: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (CpuStorage::U32(items), CpuStorage::F32(grad)) = (item_storage, grad_storage) else {
+            candle_core::bail!("sparse pool gradient expects u32 items and f32 gradient")
+        };
+        let items = contiguous_slice(items, item_layout, "sparse items")?;
+        let grad = contiguous_slice(grad, grad_layout, "sparse gradient")?;
+        let op = &self.0;
+        let mut output = vec![0.0f32; op.rows * op.hidden];
+        for batch in 0..op.batch {
+            for &item in &items[batch * op.items..(batch + 1) * op.items] {
+                if item == PADDING_ITEM {
+                    continue;
+                }
+                let item = item as usize;
+                for hidden in 0..op.hidden {
+                    output[item * op.hidden + hidden] += grad[batch * op.hidden + hidden];
+                }
+            }
+        }
+        Ok((CpuStorage::F32(output), (op.rows, op.hidden).into()))
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    fn cuda_fwd(
+        &self,
+        _table: &candle_core::CudaStorage,
+        _table_layout: &Layout,
+        items: &candle_core::CudaStorage,
+        item_layout: &Layout,
+        grad: &candle_core::CudaStorage,
+        grad_layout: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        cuda_sparse_gradient(items, item_layout, grad, grad_layout, &self.0)
     }
 }
 
@@ -348,6 +513,90 @@ fn cuda_gradient(
     target_os = "windows",
     all(target_os = "linux", not(target_env = "musl"))
 ))]
+fn cuda_sparse_forward(
+    table_storage: &candle_core::CudaStorage,
+    table_layout: &Layout,
+    item_storage: &candle_core::CudaStorage,
+    item_layout: &Layout,
+    op: &SparsePool,
+) -> Result<(candle_core::CudaStorage, Shape)> {
+    use candle_core::cuda_backend::CudaStorageSlice::{F32, U32};
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    let (F32(table), U32(items)) = (&table_storage.slice, &item_storage.slice) else {
+        candle_core::bail!("sparse pool CUDA kernel expects f32 table and u32 items")
+    };
+    let table = cuda_view(table, table_layout, "sparse table")?;
+    let items = cuda_view(items, item_layout, "sparse items")?;
+    let device = &table_storage.device;
+    let output = unsafe { device.alloc::<f32>(op.batch * op.hidden)? };
+    let function = device.get_or_load_custom_func(
+        "sparse_pool_fwd",
+        "chineseai_feature_pool_v2",
+        feature_ptx()?,
+    )?;
+    let mut builder = function.builder();
+    builder.arg(&table).arg(&items).arg(&output);
+    candle_core::builder_arg!(builder, op.batch as u32, op.items as u32, op.hidden as u32);
+    unsafe { builder.launch(LaunchConfig::for_num_elems((op.batch * op.hidden) as u32)) }
+        .map_err(|error| candle_core::Error::Msg(format!("sparse pool launch failed: {error}")))?;
+    Ok((
+        candle_core::CudaStorage {
+            slice: F32(output),
+            device: device.clone(),
+        },
+        (op.batch, op.hidden).into(),
+    ))
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn cuda_sparse_gradient(
+    item_storage: &candle_core::CudaStorage,
+    item_layout: &Layout,
+    grad_storage: &candle_core::CudaStorage,
+    grad_layout: &Layout,
+    op: &SparsePool,
+) -> Result<(candle_core::CudaStorage, Shape)> {
+    use candle_core::cuda_backend::CudaStorageSlice::{F32, U32};
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    let (U32(items), F32(grad)) = (&item_storage.slice, &grad_storage.slice) else {
+        candle_core::bail!("sparse pool gradient CUDA kernel expects u32 items and f32 gradient")
+    };
+    let items = cuda_view(items, item_layout, "sparse items")?;
+    let grad = cuda_view(grad, grad_layout, "sparse gradient")?;
+    let device = &item_storage.device;
+    let output = device.alloc_zeros::<f32>(op.rows * op.hidden)?;
+    let function = device.get_or_load_custom_func(
+        "sparse_pool_grad",
+        "chineseai_feature_pool_v2",
+        feature_ptx()?,
+    )?;
+    let mut builder = function.builder();
+    builder.arg(&items).arg(&grad).arg(&output);
+    candle_core::builder_arg!(builder, op.batch as u32, op.items as u32, op.hidden as u32);
+    unsafe {
+        builder.launch(LaunchConfig::for_num_elems(
+            (op.batch * op.items * op.hidden) as u32,
+        ))
+    }
+    .map_err(|error| {
+        candle_core::Error::Msg(format!("sparse pool gradient launch failed: {error}"))
+    })?;
+    Ok((
+        candle_core::CudaStorage {
+            slice: F32(output),
+            device: device.clone(),
+        },
+        (op.rows, op.hidden).into(),
+    ))
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
 fn cuda_view<'a, T: candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
     values: &'a candle_core::cuda_backend::cudarc::driver::CudaSlice<T>,
     layout: &Layout,
@@ -387,6 +636,23 @@ mod tests {
         ))
     }
 
+    fn sparse_output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
+        let rows = 11;
+        let hidden = 7;
+        let values = (0..rows * hidden)
+            .map(|index| (index as f32 - 30.0) * 0.01)
+            .collect::<Vec<_>>();
+        let table = Var::from_slice(&values, (rows, hidden), device)?;
+        let items = [1u32, 4, PADDING_ITEM, 1, 10, 3, 3, PADDING_ITEM];
+        let items = Tensor::from_slice(&items, (2, 4), device)?;
+        let output = sparse_pool(&table, &items)?;
+        let grads = output.sum_all()?.backward()?;
+        Ok((
+            output.flatten_all()?.to_vec1()?,
+            grads.get(&table).unwrap().flatten_all()?.to_vec1()?,
+        ))
+    }
+
     fn assert_close(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
         for (&left, &right) in left.iter().zip(right) {
@@ -401,6 +667,18 @@ mod tests {
             return Ok(());
         };
         let gpu = output_and_grad(&cuda)?;
+        assert_close(&cpu.0, &gpu.0);
+        assert_close(&cpu.1, &gpu.1);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_pool_cuda_matches_cpu_forward_and_gradient() -> Result<()> {
+        let cpu = sparse_output_and_grad(&Device::Cpu)?;
+        let Ok(cuda) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let gpu = sparse_output_and_grad(&cuda)?;
         assert_close(&cpu.0, &gpu.0);
         assert_close(&cpu.1, &gpu.1);
         Ok(())

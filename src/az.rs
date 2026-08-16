@@ -61,6 +61,7 @@ pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 32;
+pub(super) const POLICY_TACTICAL_SIZE: usize = STRUCTURAL_PIECE_SIZE / 2 * 3;
 pub(super) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
 pub(super) const POLICY_SPARSE_MAIN_SIZE: usize =
     DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
@@ -94,6 +95,9 @@ const POLICY_ACCUMULATOR_BIAS_ROW: usize =
     POLICY_ACCUMULATOR_KING_PIECE_OFFSET + STRUCTURAL_KING_PIECE_SIZE;
 const POLICY_ACCUMULATOR_QUANT_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
+pub(super) const VALUE_THREAT_RANK: usize = 64;
+pub(super) const VALUE_THREAT_VOCAB: usize = 57_702;
+pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 96;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
 pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.95;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
@@ -239,6 +243,11 @@ macro_rules! az_weight_tensors {
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(
+            value_threat_embedding,
+            [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK]
+        );
+        $visit!(value_threat_output, [WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2]);
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
         $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h]);
@@ -253,6 +262,7 @@ macro_rules! az_weight_tensors {
         );
         $visit!(policy_sparse_table, [POLICY_SPARSE_TABLE_SIZE]);
         $visit!(policy_sparse_factor, [POLICY_SPARSE_FACTOR_SIZE]);
+        $visit!(policy_tactical, [POLICY_TACTICAL_SIZE]);
     };
 }
 
@@ -293,6 +303,8 @@ pub(super) struct AzEvalScratch {
     policy_accumulator_context: [i16; POLICY_ACCUMULATOR_RANK],
     policy_piece_square_scores: Vec<f32>,
     value_head: Vec<f32>,
+    value_threat_accumulator: Vec<i16>,
+    value_threat_activation: Vec<f32>,
     policy_gives_check: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
@@ -318,6 +330,8 @@ impl AzEvalScratch {
             policy_accumulator_context: [0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
+            value_threat_accumulator: vec![0; VALUE_THREAT_RANK],
+            value_threat_activation: vec![0.0; VALUE_THREAT_RANK * 2],
             policy_gives_check: Vec::with_capacity(192),
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
@@ -332,6 +346,8 @@ impl AzEvalScratch {
             policy_accumulator_context: [0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
             value_head: Vec::new(),
+            value_threat_accumulator: Vec::new(),
+            value_threat_activation: Vec::new(),
             policy_gives_check: Vec::new(),
             logits: Vec::new(),
             priors: Vec::new(),
@@ -547,6 +563,173 @@ fn canonical_square_for(perspective: Color, sq: usize) -> usize {
     }
 }
 
+fn threat_relation_map() -> &'static [u32] {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<Vec<u32>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = vec![u32::MAX; STRUCTURAL_PIECE_SIZE * BOARD_SIZE * BOARD_SIZE];
+        let mut next = 0u32;
+        for attacker in 0..STRUCTURAL_PIECE_SIZE {
+            let ours = attacker < 7;
+            let kind = attacker % 7;
+            for source in 0..BOARD_SIZE {
+                if !threat_reachable_square(attacker, source) {
+                    continue;
+                }
+                let rank = source / BOARD_FILES;
+                let file = source % BOARD_FILES;
+                let mut targets = Vec::with_capacity(18);
+                if kind == 4 || kind == 5 {
+                    targets.extend((0..BOARD_SIZE).filter(|&target| {
+                        target != source
+                            && (target / BOARD_FILES == rank || target % BOARD_FILES == file)
+                    }));
+                } else {
+                    let steps: &[(isize, isize)] = match kind {
+                        0 => &[(0, -1), (0, 1), (-1, 0), (1, 0)],
+                        1 => &[(-1, -1), (1, -1), (-1, 1), (1, 1)],
+                        2 => &[(-2, -2), (2, -2), (-2, 2), (2, 2)],
+                        3 => &[
+                            (-1, -2),
+                            (1, -2),
+                            (-1, 2),
+                            (1, 2),
+                            (-2, -1),
+                            (-2, 1),
+                            (2, -1),
+                            (2, 1),
+                        ],
+                        6 if ours && rank <= 4 => &[(0, -1), (-1, 0), (1, 0)],
+                        6 if !ours && rank >= 5 => &[(0, 1), (-1, 0), (1, 0)],
+                        6 if ours => &[(0, -1)],
+                        6 => &[(0, 1)],
+                        _ => unreachable!(),
+                    };
+                    for &(df, dr) in steps {
+                        let target_file = file as isize + df;
+                        let target_rank = rank as isize + dr;
+                        if !(0..BOARD_FILES as isize).contains(&target_file)
+                            || !(0..BOARD_RANKS as isize).contains(&target_rank)
+                        {
+                            continue;
+                        }
+                        if (kind == 0 || kind == 1)
+                            && (!(3..=5).contains(&(target_file as usize))
+                                || if ours {
+                                    target_rank < 7
+                                } else {
+                                    target_rank > 2
+                                })
+                        {
+                            continue;
+                        }
+                        if kind == 2
+                            && if ours {
+                                target_rank < 5
+                            } else {
+                                target_rank > 4
+                            }
+                        {
+                            continue;
+                        }
+                        targets.push(target_rank as usize * BOARD_FILES + target_file as usize);
+                    }
+                }
+                for target in targets {
+                    let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
+                    map[relation] = next;
+                    next += (0..STRUCTURAL_PIECE_SIZE)
+                        .filter(|&piece| threat_reachable_square(piece, target))
+                        .count() as u32;
+                }
+            }
+        }
+        assert_eq!(next as usize, VALUE_THREAT_VOCAB);
+        map
+    })
+}
+
+fn threat_reachable_square(piece: usize, square: usize) -> bool {
+    let rank = square / BOARD_FILES;
+    let file = square % BOARD_FILES;
+    let ours = piece < 7;
+    match piece % 7 {
+        0 => (3..=5).contains(&file) && if ours { rank >= 7 } else { rank <= 2 },
+        1 => {
+            if ours {
+                matches!((rank, file), (7, 3) | (7, 5) | (8, 4) | (9, 3) | (9, 5))
+            } else {
+                matches!((rank, file), (0, 3) | (0, 5) | (1, 4) | (2, 3) | (2, 5))
+            }
+        }
+        2 => {
+            if ours {
+                matches!(
+                    (rank, file),
+                    (5, 2) | (5, 6) | (7, 0) | (7, 4) | (7, 8) | (9, 2) | (9, 6)
+                )
+            } else {
+                matches!(
+                    (rank, file),
+                    (0, 2) | (0, 6) | (2, 0) | (2, 4) | (2, 8) | (4, 2) | (4, 6)
+                )
+            }
+        }
+        6 => {
+            if ours {
+                rank <= 4 || (rank == 5 || rank == 6) && file.is_multiple_of(2)
+            } else {
+                rank >= 5 || (rank == 3 || rank == 4) && file.is_multiple_of(2)
+            }
+        }
+        _ => true,
+    }
+}
+
+fn threat_attacked_offsets() -> &'static [u8] {
+    use std::sync::OnceLock;
+    static OFFSETS: OnceLock<Vec<u8>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        let mut offsets = vec![u8::MAX; BOARD_SIZE * STRUCTURAL_PIECE_SIZE];
+        for square in 0..BOARD_SIZE {
+            let mut next = 0u8;
+            for piece in 0..STRUCTURAL_PIECE_SIZE {
+                if threat_reachable_square(piece, square) {
+                    offsets[square * STRUCTURAL_PIECE_SIZE + piece] = next;
+                    next += 1;
+                }
+            }
+        }
+        offsets
+    })
+}
+
+#[inline]
+fn value_threat_index(
+    perspective: Color,
+    source: usize,
+    attacker: Piece,
+    target: usize,
+    attacked: Piece,
+) -> usize {
+    let attacker =
+        (if attacker.color == perspective { 0 } else { 7 }) + piece_kind_index(attacker.kind);
+    let attacked =
+        (if attacked.color == perspective { 0 } else { 7 }) + piece_kind_index(attacked.kind);
+    let source = canonical_square_for(perspective, source);
+    let target = canonical_square_for(perspective, target);
+    let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
+    let base = threat_relation_map()[relation];
+    if base == u32::MAX {
+        return VALUE_THREAT_VOCAB;
+    }
+    let offset = threat_attacked_offsets()[target * STRUCTURAL_PIECE_SIZE + attacked];
+    if offset == u8::MAX {
+        return VALUE_THREAT_VOCAB;
+    }
+    base as usize + usize::from(offset)
+}
+
 #[inline]
 fn policy_consequence_features(
     position: &Position,
@@ -652,6 +835,8 @@ pub struct AzNnue {
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_output: Vec<f32>,
+    pub value_threat_embedding: Vec<f32>,
+    pub value_threat_output: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
@@ -660,6 +845,7 @@ pub struct AzNnue {
     pub policy_accumulator_move: Vec<f32>,
     pub policy_sparse_table: Vec<f32>,
     pub policy_sparse_factor: Vec<f32>,
+    pub policy_tactical: Vec<f32>,
     policy_accumulator_feature_q: Vec<i8>,
     policy_accumulator_move_q: Vec<i8>,
     policy_accumulator_moved_delta_q: Vec<i32>,
@@ -668,6 +854,10 @@ pub struct AzNnue {
     policy_accumulator_move_scale: f32,
     policy_sparse_table_q: Vec<i8>,
     policy_sparse_table_scale: f32,
+    value_threat_embedding_q: Vec<i8>,
+    value_threat_embedding_scale: f32,
+    value_threat_active: bool,
+    policy_tactical_active: bool,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -687,6 +877,8 @@ impl Clone for AzNnue {
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_output: self.value_head_output.clone(),
+            value_threat_embedding: self.value_threat_embedding.clone(),
+            value_threat_output: self.value_threat_output.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
@@ -695,6 +887,7 @@ impl Clone for AzNnue {
             policy_accumulator_move: self.policy_accumulator_move.clone(),
             policy_sparse_table: self.policy_sparse_table.clone(),
             policy_sparse_factor: self.policy_sparse_factor.clone(),
+            policy_tactical: self.policy_tactical.clone(),
             policy_accumulator_feature_q: self.policy_accumulator_feature_q.clone(),
             policy_accumulator_move_q: self.policy_accumulator_move_q.clone(),
             policy_accumulator_moved_delta_q: self.policy_accumulator_moved_delta_q.clone(),
@@ -703,6 +896,10 @@ impl Clone for AzNnue {
             policy_accumulator_move_scale: self.policy_accumulator_move_scale,
             policy_sparse_table_q: self.policy_sparse_table_q.clone(),
             policy_sparse_table_scale: self.policy_sparse_table_scale,
+            value_threat_embedding_q: self.value_threat_embedding_q.clone(),
+            value_threat_embedding_scale: self.value_threat_embedding_scale,
+            value_threat_active: self.value_threat_active,
+            policy_tactical_active: self.policy_tactical_active,
             gpu_trainer: None,
         }
     }
@@ -1125,6 +1322,10 @@ impl AzNnue {
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
+        let value_threat_embedding = (0..VALUE_THREAT_VOCAB * VALUE_THREAT_RANK)
+            .map(|_| rng.weight(0.02))
+            .collect();
+        let value_threat_output = vec![0.0; WDL_HEAD_SIZE * VALUE_THREAT_RANK * 2];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
@@ -1141,6 +1342,7 @@ impl AzNnue {
         let policy_accumulator_move = vec![0.0; DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK];
         let policy_sparse_table = vec![0.0; POLICY_SPARSE_TABLE_SIZE];
         let policy_sparse_factor = vec![0.0; POLICY_SPARSE_FACTOR_SIZE];
+        let policy_tactical = vec![0.0; POLICY_TACTICAL_SIZE];
         let mut model = Self {
             hidden_size,
             arch,
@@ -1154,6 +1356,8 @@ impl AzNnue {
             value_head_hidden,
             value_head_bias,
             value_head_output,
+            value_threat_embedding,
+            value_threat_output,
             policy_move_bias,
             policy_consequence_output,
             policy_context_hidden,
@@ -1162,6 +1366,7 @@ impl AzNnue {
             policy_accumulator_move,
             policy_sparse_table,
             policy_sparse_factor,
+            policy_tactical,
             policy_accumulator_feature_q: Vec::new(),
             policy_accumulator_move_q: Vec::new(),
             policy_accumulator_moved_delta_q: Vec::new(),
@@ -1170,9 +1375,14 @@ impl AzNnue {
             policy_accumulator_move_scale: 1.0,
             policy_sparse_table_q: Vec::new(),
             policy_sparse_table_scale: 1.0,
+            value_threat_embedding_q: Vec::new(),
+            value_threat_embedding_scale: 1.0,
+            value_threat_active: false,
+            policy_tactical_active: false,
             gpu_trainer: None,
         };
         model.rebuild_policy_accumulator_quantization();
+        model.rebuild_value_threat_quantization();
         model
     }
 
@@ -1235,6 +1445,8 @@ impl AzNnue {
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
+            value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
+            value_threat_output: load_candle_f32_tensor(&tensors, "value_threat_output")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_consequence_output: load_candle_f32_tensor(
                 &tensors,
@@ -1249,6 +1461,7 @@ impl AzNnue {
             policy_accumulator_move: load_candle_f32_tensor(&tensors, "policy_accumulator_move")?,
             policy_sparse_table: load_candle_f32_tensor(&tensors, "policy_sparse_table")?,
             policy_sparse_factor: load_candle_f32_tensor(&tensors, "policy_sparse_factor")?,
+            policy_tactical: load_candle_f32_tensor(&tensors, "policy_tactical")?,
             policy_accumulator_feature_q: Vec::new(),
             policy_accumulator_move_q: Vec::new(),
             policy_accumulator_moved_delta_q: Vec::new(),
@@ -1257,9 +1470,15 @@ impl AzNnue {
             policy_accumulator_move_scale: 1.0,
             policy_sparse_table_q: Vec::new(),
             policy_sparse_table_scale: 1.0,
+            value_threat_embedding_q: Vec::new(),
+            value_threat_embedding_scale: 1.0,
+            value_threat_active: false,
+            policy_tactical_active: false,
             gpu_trainer: None,
         };
         model.rebuild_policy_accumulator_quantization();
+        model.rebuild_value_threat_quantization();
+        model.rebuild_policy_tactical();
         model.validate()?;
         Ok(model)
     }
@@ -1322,10 +1541,19 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(&scratch.hidden, &features, &mut scratch.value_head)
+            let threat_logits = self.value_threat_logits(
+                position,
+                &mut scratch.value_threat_accumulator,
+                &mut scratch.value_threat_activation,
+            );
+            self.value_wdl_from_hidden_into(
+                &scratch.hidden,
+                &features,
+                &mut scratch.value_head,
+                threat_logits,
+            )
         };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
-        self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
         scratch.features = features;
         AzEvalOutput { value_wdl, value }
     }
@@ -1362,7 +1590,17 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(&scratch.hidden, &[], &mut scratch.value_head)
+            let threat_logits = self.value_threat_logits(
+                position,
+                &mut scratch.value_threat_accumulator,
+                &mut scratch.value_threat_activation,
+            );
+            self.value_wdl_from_hidden_into(
+                &scratch.hidden,
+                &[],
+                &mut scratch.value_head,
+                threat_logits,
+            )
         };
         self.evaluate_prepared_hidden_with_scratch(position, &[], value, moves, scratch);
         AzEvalOutput { value_wdl, value }
@@ -1394,13 +1632,20 @@ impl AzNnue {
             rms_norm_in_place(&mut request.scratch.hidden);
         }
 
+        let threat_logits = std::array::from_fn(|index| {
+            self.value_threat_logits(
+                requests[index].position,
+                &mut requests[index].scratch.value_threat_accumulator,
+                &mut requests[index].scratch.value_threat_activation,
+            )
+        });
         let hiddens = [
             requests[0].scratch.hidden.as_slice(),
             requests[1].scratch.hidden.as_slice(),
             requests[2].scratch.hidden.as_slice(),
             requests[3].scratch.hidden.as_slice(),
         ];
-        let (value_wdls, values) = self.value_wdl_batch4(hiddens);
+        let (value_wdls, values) = self.value_wdl_batch4(hiddens, threat_logits);
         let mut contexts = [[0.0f32; POLICY_MOVE_CONTEXT_SIZE]; 4];
         for context_index in 0..POLICY_MOVE_CONTEXT_SIZE {
             let start = context_index * self.hidden_size;
@@ -1467,6 +1712,11 @@ impl AzNnue {
         let move_map = move_map();
         let side = position.side_to_move();
         let king_buckets = canonical_buckets_for_perspective(position, side);
+        self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
+        let opponent_attacks = self
+            .policy_tactical_active
+            .then(|| position.attacked_squares_mask(side.opposite()))
+            .unwrap_or_default();
         {
             crate::scope_profile!("az.eval.policy_logits");
             {
@@ -1526,6 +1776,18 @@ impl AzNnue {
                             as f32
                             * self.policy_sparse_table_scale
                     });
+                    let tactical_logit = if self.policy_tactical_active {
+                        crate::scope_profile!("az.eval.policy.tactical");
+                        consequence.map_or(0.0, |(from, _, _)| {
+                            let base = from / BOARD_SIZE * 3;
+                            let check = scratch.policy_gives_check[index];
+                            let hanging = opponent_attacks & (1u128 << mv.to as usize) != 0;
+                            check * self.policy_tactical[base]
+                                + self.policy_tactical[base + 1 + usize::from(hanging)]
+                        })
+                    } else {
+                        0.0
+                    };
                     scratch.logits[index] = self.policy_move_bias[move_index]
                         + piece_square_logit
                         + dot_product(
@@ -1534,7 +1796,8 @@ impl AzNnue {
                                 [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
                         )
                         + accumulator_logit
-                        + sparse_logit;
+                        + sparse_logit
+                        + tactical_logit;
                 }
             }
         }
@@ -1726,6 +1989,50 @@ impl AzNnue {
         self.add_factorized_structure_into(features, hidden);
     }
 
+    fn value_threat_logits(
+        &self,
+        position: &Position,
+        accumulator: &mut Vec<i16>,
+        activation: &mut Vec<f32>,
+    ) -> [f32; WDL_HEAD_SIZE] {
+        if !self.value_threat_active {
+            return [0.0; WDL_HEAD_SIZE];
+        }
+        crate::scope_profile!("az.eval.value_threat");
+        accumulator.resize(VALUE_THREAT_RANK, 0);
+        accumulator.fill(0);
+        let perspective = position.side_to_move();
+        {
+            crate::scope_profile!("az.eval.value_threat.accumulate");
+            position.visit_occupied_attacks(|source, attacker, target, attacked| {
+                let feature = value_threat_index(perspective, source, attacker, target, attacked);
+                if feature == VALUE_THREAT_VOCAB {
+                    return;
+                }
+                let row = &self.value_threat_embedding_q
+                    [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
+                add_i8_row_to_i16(accumulator, row);
+            });
+        }
+        let mut logits = [0.0; WDL_HEAD_SIZE];
+        {
+            crate::scope_profile!("az.eval.value_threat.output");
+            activation.resize(VALUE_THREAT_RANK * 2, 0.0);
+            for rank in 0..VALUE_THREAT_RANK {
+                let value = (f32::from(accumulator[rank]) * self.value_threat_embedding_scale)
+                    .clamp(0.0, 1.0);
+                activation[rank] = value;
+                activation[VALUE_THREAT_RANK + rank] = value * value;
+            }
+            for (output, logit) in logits.iter_mut().enumerate() {
+                let row = &self.value_threat_output
+                    [output * VALUE_THREAT_RANK * 2..(output + 1) * VALUE_THREAT_RANK * 2];
+                *logit = dot_product(activation, row);
+            }
+        }
+        logits
+    }
+
     #[allow(dead_code)]
     fn value_from_hidden_into(
         &self,
@@ -1733,7 +2040,7 @@ impl AzNnue {
         features: &[usize],
         value_head: &mut Vec<f32>,
     ) -> f32 {
-        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head);
+        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head, [0.0; 3]);
         probs.1
     }
 
@@ -1742,6 +2049,7 @@ impl AzNnue {
         hidden: &[f32],
         features: &[usize],
         value_head: &mut Vec<f32>,
+        threat_logits: [f32; WDL_HEAD_SIZE],
     ) -> ([f32; WDL_HEAD_SIZE], f32) {
         value_head.resize(VALUE_HEAD_SIZE, 0.0);
         value_head.copy_from_slice(&self.value_head_bias);
@@ -1755,7 +2063,7 @@ impl AzNnue {
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
             let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-            *logit = dot_product(value_head, row);
+            *logit = dot_product(value_head, row) + threat_logits[out];
         }
         let wdl = softmax_fixed3(logits);
         let q = wdl[0] - wdl[2];
@@ -1763,7 +2071,11 @@ impl AzNnue {
     }
 
     #[allow(dead_code)]
-    fn value_wdl_batch4(&self, hiddens: [&[f32]; 4]) -> ([[f32; WDL_HEAD_SIZE]; 4], [f32; 4]) {
+    fn value_wdl_batch4(
+        &self,
+        hiddens: [&[f32]; 4],
+        threat_logits: [[f32; WDL_HEAD_SIZE]; 4],
+    ) -> ([[f32; WDL_HEAD_SIZE]; 4], [f32; 4]) {
         let mut heads = [[0.0f32; VALUE_HEAD_SIZE]; 4];
         for feature in 0..VALUE_HEAD_SIZE {
             let row = &self.value_head_hidden
@@ -1780,7 +2092,7 @@ impl AzNnue {
             for (out, logit) in logits.iter_mut().enumerate() {
                 let row =
                     &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-                *logit = dot_product(&heads[batch], row);
+                *logit = dot_product(&heads[batch], row) + threat_logits[batch][out];
             }
             wdls[batch] = softmax_fixed3(logits);
             values[batch] = wdls[batch][0] - wdls[batch][2];
@@ -1798,6 +2110,28 @@ impl AzNnue {
                 &self.policy_consequence_output[..consequence_size],
             );
         }
+    }
+
+    fn rebuild_value_threat_quantization(&mut self) {
+        self.value_threat_active = self.value_threat_output.iter().any(|&weight| weight != 0.0);
+        let maximum = self
+            .value_threat_embedding
+            .iter()
+            .fold(0.0f32, |current, value| current.max(value.abs()));
+        self.value_threat_embedding_scale = (maximum / 127.0).max(1.0e-12);
+        self.value_threat_embedding_q = self
+            .value_threat_embedding
+            .iter()
+            .map(|value| {
+                (*value / self.value_threat_embedding_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+    }
+
+    fn rebuild_policy_tactical(&mut self) {
+        self.policy_tactical_active = self.policy_tactical.iter().any(|&weight| weight != 0.0);
     }
 
     fn rebuild_policy_accumulator_quantization(&mut self) {
@@ -2186,6 +2520,47 @@ fn dot_product_i16_i8_32(left: &[i16; POLICY_ACCUMULATOR_RANK], right: &[i8]) ->
         .zip(right)
         .map(|(&a, &b)| i32::from(a) * i32::from(b))
         .sum()
+}
+
+#[inline]
+fn add_i8_row_to_i16(accumulator: &mut [i16], row: &[i8]) {
+    debug_assert_eq!(accumulator.len(), row.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if accumulator.len().is_multiple_of(32) && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was checked at runtime and both slices have equal 32-byte chunks.
+        unsafe { add_i8_row_to_i16_avx2(accumulator, row) };
+        return;
+    }
+    for (sum, &weight) in accumulator.iter_mut().zip(row) {
+        *sum += i16::from(weight);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn add_i8_row_to_i16_avx2(accumulator: &mut [i16], row: &[i8]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    for offset in (0..row.len()).step_by(32) {
+        let packed = unsafe { _mm256_loadu_si256(row.as_ptr().add(offset).cast()) };
+        let low = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(packed));
+        let high = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(packed));
+        unsafe {
+            let low_sum = _mm256_loadu_si256(accumulator.as_ptr().add(offset).cast());
+            let high_sum = _mm256_loadu_si256(accumulator.as_ptr().add(offset + 16).cast());
+            _mm256_storeu_si256(
+                accumulator.as_mut_ptr().add(offset).cast(),
+                _mm256_add_epi16(low_sum, low),
+            );
+            _mm256_storeu_si256(
+                accumulator.as_mut_ptr().add(offset + 16).cast(),
+                _mm256_add_epi16(high_sum, high),
+            );
+        }
+    }
 }
 
 #[allow(dead_code)]
