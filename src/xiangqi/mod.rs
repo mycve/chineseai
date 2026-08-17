@@ -152,6 +152,14 @@ impl Position {
     }
 
     pub fn to_fen(&self) -> String {
+        self.to_fen_with_rule60_clock(self.halfmove_clock)
+    }
+
+    pub fn to_fen_with_history(&self, history: &[RuleHistoryEntry]) -> String {
+        self.to_fen_with_rule60_clock(self.rule60_count_with_history(history))
+    }
+
+    fn to_fen_with_rule60_clock(&self, rule60_clock: u16) -> String {
         let mut board_part = String::new();
         for rank in 0..BOARD_RANKS {
             if rank > 0 {
@@ -181,7 +189,7 @@ impl Position {
             Color::Black => "b",
         };
 
-        format!("{board_part} {side} - - {} 1", self.halfmove_clock)
+        format!("{board_part} {side} - - {rule60_clock} 1")
     }
 
     #[inline(always)]

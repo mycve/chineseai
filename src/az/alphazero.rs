@@ -1160,7 +1160,8 @@ impl<'a> AzTree<'a> {
                     perspective,
                     &mut child_policy_accumulator,
                 );
-                let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv);
+                let child_rule_entry =
+                    child_position.rule_history_entry_after_moved(mover, mv, captured);
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
@@ -1281,7 +1282,7 @@ impl<'a> AzTree<'a> {
             perspective,
             &mut child_policy_accumulator,
         );
-        let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv);
+        let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv, captured);
         let child_node = self.nodes.len();
         self.nodes.push(AzNode {
             position: child_position,
@@ -2594,6 +2595,8 @@ mod tests {
                 gives_check: false,
                 chased_mask: 0,
                 mv: None,
+                captured: None,
+                rule60_clock: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2602,6 +2605,8 @@ mod tests {
                 gives_check: false,
                 chased_mask: 0,
                 mv: None,
+                captured: None,
+                rule60_clock: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2610,6 +2615,8 @@ mod tests {
                 gives_check: false,
                 chased_mask: 0,
                 mv: None,
+                captured: None,
+                rule60_clock: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2618,6 +2625,8 @@ mod tests {
                 gives_check: false,
                 chased_mask: 0,
                 mv: None,
+                captured: None,
+                rule60_clock: 0,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2626,6 +2635,8 @@ mod tests {
                 gives_check: false,
                 chased_mask: 0,
                 mv: None,
+                captured: None,
+                rule60_clock: 0,
             },
         ];
 

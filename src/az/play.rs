@@ -546,7 +546,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             {
                 crate::scope_profile!("az.selfplay.make_sample");
                 if config.record_fens {
-                    position_fens.push(position.to_fen());
+                    position_fens.push(position.to_fen_with_history(&rule_history));
                 }
                 let sample = make_training_sample(
                     &position,
@@ -562,8 +562,9 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 game_bootstrap_wdls.push(search.network_value_wdl);
             }
             let mover = position.side_to_move();
+            let captured = position.piece_at(mv.to as usize);
             position.make_move(mv);
-            rule_history.push(position.rule_history_entry_after_moved(mover, mv));
+            rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
 
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
@@ -916,7 +917,8 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 data.best_q_sum += meta.best_q;
                 data.played_q_sum += meta.played_q;
                 if config.record_fens {
-                    data.position_fens.push(state.position.to_fen());
+                    data.position_fens
+                        .push(state.position.to_fen_with_history(&state.rule_history));
                 }
                 state.samples.push(make_training_sample(
                     &state.position,
@@ -930,10 +932,13 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 ));
                 state.bootstrap_wdls.push(search.network_value_wdl);
                 let mover = state.position.side_to_move();
+                let captured = state.position.piece_at(mv.to as usize);
                 state.position.make_move(mv);
-                state
-                    .rule_history
-                    .push(state.position.rule_history_entry_after_moved(mover, mv));
+                state.rule_history.push(
+                    state
+                        .position
+                        .rule_history_entry_after_moved(mover, mv, captured),
+                );
                 state.ply += 1;
                 if !state.position.has_general(Color::Red) {
                     state.result = Some(-1.0);
@@ -1488,8 +1493,9 @@ fn play_arena_game(
             return 0.0;
         };
         let mover = position.side_to_move();
+        let captured = position.piece_at(mv.to as usize);
         position.make_move(mv);
-        rule_history.push(position.rule_history_entry_after_moved(mover, mv));
+        rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
 
         if !position.has_general(Color::Red) {
             return -1.0;

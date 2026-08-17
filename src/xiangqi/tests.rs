@@ -87,6 +87,41 @@ fn repetition_violation_precedes_natural_move_limit() {
 }
 
 #[test]
+fn checks_after_ten_and_their_replies_do_not_advance_rule60() {
+    let mut position = Position::from_fen("3k5/9/9/9/9/9/9/4R4/9/4K4 w - - 22 1").unwrap();
+    let mut history = vec![test_rule_entry(1, Color::Red, None, false, 0)];
+    for index in 0..11u64 {
+        history.push(test_rule_entry(
+            10 + index * 2,
+            Color::Black,
+            Some(Color::Red),
+            true,
+            0,
+        ));
+        history.push(test_rule_entry(
+            11 + index * 2,
+            Color::Red,
+            Some(Color::Black),
+            false,
+            0,
+        ));
+    }
+    assert_eq!(position.rule60_count_with_history(&history), 20);
+    assert!(
+        position
+            .to_fen_with_history(&history)
+            .ends_with(" - - 20 1")
+    );
+    position.set_rule60_max_ply(Some(21));
+    assert_eq!(position.rule_outcome_with_history(&history), None);
+    position.set_rule60_max_ply(Some(20));
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit))
+    );
+}
+
+#[test]
 fn square_names_follow_pikafish_uci_coordinates() {
     assert_eq!(square_name(index(0, 9)), "a0");
     assert_eq!(square_name(index(8, 0)), "i9");
@@ -347,6 +382,23 @@ fn rule_entry_ignores_advisor_and_elephant_chase() {
 }
 
 #[test]
+fn unprotected_advisor_can_be_a_chase_target() {
+    let position = Position::from_fen("4k4/9/3a5/9/9/9/3R5/9/9/K8 b").unwrap();
+    let advisor = index(3, 2);
+    let chased = position.rule_history_entry(Some(Color::Red)).chased_mask;
+    assert_ne!(chased & (1u128 << advisor), 0);
+}
+
+#[test]
+fn pinned_recapture_does_not_protect_chase_target() {
+    let position = Position::from_fen("4k4/9/3nr4/9/9/9/3RR4/9/9/K8 b").unwrap();
+    let horse = index(3, 2);
+    assert!(position.is_piece_protected(horse, Color::Black));
+    let chased = position.rule_history_entry(Some(Color::Red)).chased_mask;
+    assert_ne!(chased & (1u128 << horse), 0);
+}
+
+#[test]
 fn rule_entry_ignores_protected_chase_target() {
     let protected = Position::from_fen("4k4/9/9/4r4/4P4/4R4/9/9/9/4K4 b").unwrap();
     let protected_chased = protected.rule_history_entry(Some(Color::Black)).chased_mask;
@@ -385,6 +437,8 @@ fn test_rule_entry(
         gives_check,
         chased_mask,
         mv: None,
+        captured: None,
+        rule60_clock: 0,
     }
 }
 

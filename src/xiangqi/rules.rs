@@ -24,6 +24,8 @@ impl Position {
             gives_check: self.in_check(self.side_to_move),
             chased_mask,
             mv: None,
+            captured: None,
+            rule60_clock: self.halfmove_clock,
         }
     }
 
@@ -38,10 +40,15 @@ impl Position {
             crate::scope_profile!("xiangqi.rule_history.make_move");
             next.make_move(mv);
         }
-        next.rule_history_entry_after_moved(mover, mv)
+        next.rule_history_entry_after_moved(mover, mv, self.piece_at(mv.to as usize))
     }
 
-    pub fn rule_history_entry_after_moved(&self, mover: Color, mv: Move) -> RuleHistoryEntry {
+    pub fn rule_history_entry_after_moved(
+        &self,
+        mover: Color,
+        mv: Move,
+        captured: Option<super::Piece>,
+    ) -> RuleHistoryEntry {
         crate::scope_profile!("xiangqi.rule_history_after_moved");
         let chased_mask = {
             crate::scope_profile!("xiangqi.rule_history.chased_origin");
@@ -58,66 +65,70 @@ impl Position {
             gives_check,
             chased_mask,
             mv: Some(mv),
+            captured,
+            rule60_clock: self.halfmove_clock,
         }
     }
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome_with_history");
-        if let Some(outcome) = Self::rule_outcome(history) {
-            return Some(outcome);
+        if let Some(entries) = repetition_cycle(history) {
+            let exact_entries = self.recompute_cycle_chases(entries);
+            return Some(adjudicate_repetition(
+                exact_entries.as_deref().unwrap_or(entries),
+            ));
         }
         if self
             .rule60_max_ply
-            .is_some_and(|max_ply| self.halfmove_clock >= max_ply)
+            .is_some_and(|max_ply| self.rule60_count_with_history(history) >= max_ply)
         {
             return Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit));
         }
         self.insufficient_material_outcome()
     }
 
+    pub fn rule60_count_with_history(&self, history: &[RuleHistoryEntry]) -> u16 {
+        // Exemptions cannot begin before one side has made its 11th check,
+        // which takes at least 21 capture-free plies. Keep the overwhelmingly
+        // common search path O(1).
+        if self.halfmove_clock <= 20 {
+            return self.halfmove_clock;
+        }
+        let Some(initial) = history.first() else {
+            return self.halfmove_clock;
+        };
+        let mut clock = initial.rule60_clock;
+        let mut checks = [0u16; 2];
+        let mut previous_excess_check = false;
+        for entry in &history[1..] {
+            if entry.captured.is_some() {
+                clock = 0;
+                checks = [0; 2];
+                previous_excess_check = false;
+                continue;
+            }
+            if entry.gives_check {
+                let Some(mover) = entry.mover else {
+                    continue;
+                };
+                let index = super::color_index(mover);
+                checks[index] = checks[index].saturating_add(1);
+                previous_excess_check = checks[index] > 10;
+                if !previous_excess_check {
+                    clock = clock.saturating_add(1);
+                }
+            } else if previous_excess_check {
+                previous_excess_check = false;
+            } else {
+                clock = clock.saturating_add(1);
+            }
+        }
+        clock
+    }
+
     pub fn rule_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome");
-        let current_index = history.len().checked_sub(1)?;
-        let current = history[current_index];
-        let repeated_indices = history[..current_index]
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                (entry.hash == current.hash && entry.side_to_move == current.side_to_move)
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if repeated_indices.is_empty() {
-            return None;
-        }
-
-        let cycle_start = repeated_indices[0] + 1;
-        let red_violation =
-            repeated_rule_violation(&history[cycle_start..=current_index], Color::Red);
-        let black_violation =
-            repeated_rule_violation(&history[cycle_start..=current_index], Color::Black);
-
-        // 长将和长捉都只允许一轮：同局面第 2 次出现时立即裁决，
-        // 并据此在走法生成时过滤第二轮的重复将军或捉子。优先级：将 > 捉。
-        match (red_violation, black_violation) {
-            (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
-                return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck));
-            }
-            (Some(RuleViolation::LongCheck), _) => return Some(RuleOutcome::Win(Color::Black)),
-            (_, Some(RuleViolation::LongCheck)) => return Some(RuleOutcome::Win(Color::Red)),
-            _ => {}
-        }
-
-        match (red_violation, black_violation) {
-            (Some(RuleViolation::LongChase), Some(RuleViolation::LongChase)) => {
-                return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase));
-            }
-            (Some(RuleViolation::LongChase), _) => return Some(RuleOutcome::Win(Color::Black)),
-            (_, Some(RuleViolation::LongChase)) => return Some(RuleOutcome::Win(Color::Red)),
-            _ => {}
-        }
-
-        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+        repetition_cycle(history).map(adjudicate_repetition)
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -188,6 +199,11 @@ impl Position {
             }
 
             self.visit_attacker_origins_to(target, color, |from| {
+                if self.board[from].is_some_and(|piece| {
+                    matches!(piece.kind, PieceKind::General | PieceKind::Soldier)
+                }) {
+                    return false;
+                }
                 if !self.is_effective_chase(target_piece, target, from) {
                     return false;
                 }
@@ -210,6 +226,9 @@ impl Position {
         let Some(piece) = self.board[origin].filter(|piece| piece.color == color) else {
             return 0;
         };
+        if matches!(piece.kind, PieceKind::General | PieceKind::Soldier) {
+            return 0;
+        }
         let mut captures = Vec::with_capacity(8);
         self.gen_piece_moves(origin, piece, MoveGenMode::Captures, &mut captures);
         let mut work = self.clone();
@@ -242,20 +261,56 @@ impl Position {
             return false;
         }
         match piece.kind {
-            PieceKind::General | PieceKind::Advisor | PieceKind::Elephant => false,
+            PieceKind::General => false,
             PieceKind::Soldier => soldier_crossed_river(piece.color, super::geom::rank_of(sq)),
-            PieceKind::Horse | PieceKind::Rook | PieceKind::Cannon => true,
+            PieceKind::Advisor
+            | PieceKind::Elephant
+            | PieceKind::Horse
+            | PieceKind::Rook
+            | PieceKind::Cannon => true,
         }
     }
 
     fn is_effective_chase(&self, target: super::Piece, target_sq: usize, from: usize) -> bool {
-        if !self.is_piece_protected(target_sq, target.color) {
+        let Some(attacker) = self.board[from] else {
+            return false;
+        };
+        if matches!(
+            (attacker.kind, target.kind),
+            (PieceKind::Horse | PieceKind::Cannon, PieceKind::Rook)
+                | (
+                    PieceKind::Advisor | PieceKind::Elephant,
+                    PieceKind::Rook | PieceKind::Cannon | PieceKind::Horse
+                )
+        ) {
             return true;
         }
-        matches!(
-            (self.board[from].map(|piece| piece.kind), target.kind),
-            (Some(PieceKind::Horse), PieceKind::Rook)
-        )
+        if attacker.kind == target.kind {
+            let mut reverse = self.clone();
+            reverse.side_to_move = target.color;
+            if reverse.is_legal_move(Move::new(target_sq, from)) {
+                return false;
+            }
+        }
+
+        let mut after = self.clone();
+        after.side_to_move = attacker.color;
+        after.make_move_board_only(Move::new(from, target_sq));
+        after.side_to_move = target.color;
+        let recapture_position = after.clone();
+        let mut legal_recapture = false;
+        recapture_position.visit_attacker_origins_to(target_sq, target.color, |recapture_from| {
+            let mv = Move::new(recapture_from, target_sq);
+            let captured = after.make_move_board_only(mv);
+            let legal = !after.in_check(target.color);
+            after.unmake_move_board_only(mv, captured);
+            if legal {
+                legal_recapture = true;
+                return true;
+            }
+            false
+        });
+        !legal_recapture
     }
 
     fn insufficient_material_outcome(&self) -> Option<RuleOutcome> {
@@ -333,6 +388,66 @@ impl Position {
         }
         Some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial))
     }
+
+    fn recompute_cycle_chases(
+        &self,
+        entries: &[RuleHistoryEntry],
+    ) -> Option<Vec<RuleHistoryEntry>> {
+        let mut position = self.clone();
+        for entry in entries.iter().rev() {
+            let mv = entry.mv?;
+            position.unmake_move_board_only(mv, entry.captured);
+            position.side_to_move = entry.mover?;
+        }
+
+        let mut exact = Vec::with_capacity(entries.len());
+        for &entry in entries {
+            let mv = entry.mv?;
+            let mover = entry.mover?;
+            let before = position.chased_masks_by(mover);
+            let captured = position.make_move_board_only(mv);
+            debug_assert_eq!(captured, entry.captured);
+            position.side_to_move = mover.opposite();
+            let after = position.chased_masks_by(mover);
+            exact.push(RuleHistoryEntry {
+                chased_mask: after & !before,
+                ..entry
+            });
+        }
+        Some(exact)
+    }
+}
+
+fn repetition_cycle(history: &[RuleHistoryEntry]) -> Option<&[RuleHistoryEntry]> {
+    let current_index = history.len().checked_sub(1)?;
+    let current = history[current_index];
+    let cycle_start = history[..current_index].iter().position(|entry| {
+        entry.hash == current.hash && entry.side_to_move == current.side_to_move
+    })? + 1;
+    Some(&history[cycle_start..=current_index])
+}
+
+fn adjudicate_repetition(entries: &[RuleHistoryEntry]) -> RuleOutcome {
+    let red_violation = repeated_rule_violation(entries, Color::Red);
+    let black_violation = repeated_rule_violation(entries, Color::Black);
+
+    // Asian 2fold: 长将 > 长捉同一子 > 其他循环。
+    match (red_violation, black_violation) {
+        (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
+            return RuleOutcome::Draw(RuleDrawReason::MutualLongCheck);
+        }
+        (Some(RuleViolation::LongCheck), _) => return RuleOutcome::Win(Color::Black),
+        (_, Some(RuleViolation::LongCheck)) => return RuleOutcome::Win(Color::Red),
+        _ => {}
+    }
+    match (red_violation, black_violation) {
+        (Some(RuleViolation::LongChase), Some(RuleViolation::LongChase)) => {
+            RuleOutcome::Draw(RuleDrawReason::MutualLongChase)
+        }
+        (Some(RuleViolation::LongChase), _) => RuleOutcome::Win(Color::Black),
+        (_, Some(RuleViolation::LongChase)) => RuleOutcome::Win(Color::Red),
+        _ => RuleOutcome::Draw(RuleDrawReason::Repetition),
+    }
 }
 
 fn rule_outcome_forbidden_for_mover(outcome: Option<RuleOutcome>, mover: Color) -> bool {
@@ -387,4 +502,24 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
     chased_identity_intersection
         .is_some_and(|identities| identities != 0)
         .then_some(RuleViolation::LongChase)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_cycle_chase_diff_detects_discovered_attack() {
+        let mut position = Position::from_fen("3k5/9/9/9/n8/9/9/C8/9/R3K4 w").unwrap();
+        let horse = super::super::geom::index(0, 4);
+        let before = position.chased_masks_by(Color::Red);
+        let mv = position.parse_uci_move("a2b2").unwrap();
+        let recorded = position.rule_history_entry_after_move(mv);
+        assert_eq!(recorded.chased_mask & (1u128 << horse), 0);
+        position.make_move(mv);
+        let after = position.chased_masks_by(Color::Red);
+        assert_ne!((after & !before) & (1u128 << horse), 0);
+        let exact = position.recompute_cycle_chases(&[recorded]).unwrap();
+        assert_ne!(exact[0].chased_mask & (1u128 << horse), 0);
+    }
 }

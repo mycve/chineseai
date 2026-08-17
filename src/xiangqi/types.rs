@@ -151,6 +151,8 @@ pub struct RuleHistoryEntry {
     pub gives_check: bool,
     pub chased_mask: u128,
     pub mv: Option<Move>,
+    pub captured: Option<Piece>,
+    pub rule60_clock: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

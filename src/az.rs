@@ -1199,7 +1199,7 @@ pub fn rule_context_features(
     let is_chase = |entry: &crate::xiangqi::RuleHistoryEntry| entry.chased_mask != 0;
     [
         position.rule60_max_ply().map_or(0.0, |max_ply| {
-            position.halfmove_clock() as f32 / max_ply as f32
+            position.rule60_count_with_history(history) as f32 / max_ply as f32
         }),
         (prior_matches as f32 / 3.0).min(1.0),
         (cycle.len() as f32 / 32.0).min(1.0),
