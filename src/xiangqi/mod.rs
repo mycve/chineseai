@@ -64,6 +64,7 @@ impl Position {
             dynamic_material_counts: [0; 2],
             general_squares: [None; 2],
             halfmove_clock: 0,
+            rule60_max_ply: Some(120),
         };
         let state = position.compute_state();
         Self {
@@ -84,10 +85,14 @@ impl Position {
         let mut parts = fen.split_whitespace();
         let board_part = parts.next().ok_or("missing board description")?;
         let side_part = parts.next().unwrap_or("w");
-        let halfmove_clock = parts
-            .next()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(0);
+        let remaining = parts.collect::<Vec<_>>();
+        let halfmove_clock = match remaining.as_slice() {
+            ["-", "-", value, ..] => value
+                .parse::<u16>()
+                .map_err(|_| format!("invalid halfmove clock: {value}"))?,
+            [value, ..] => value.parse::<u16>().unwrap_or(0),
+            [] => 0,
+        };
 
         let mut board = [None; BOARD_SIZE];
         let ranks: Vec<&str> = board_part.split('/').collect();
@@ -131,6 +136,7 @@ impl Position {
             dynamic_material_counts: [0; 2],
             general_squares: [None; 2],
             halfmove_clock,
+            rule60_max_ply: Some(120),
         };
         let state = position.compute_state();
         let position = Self {
@@ -175,7 +181,7 @@ impl Position {
             Color::Black => "b",
         };
 
-        format!("{board_part} {side}")
+        format!("{board_part} {side} - - {} 1", self.halfmove_clock)
     }
 
     #[inline(always)]
@@ -436,6 +442,15 @@ impl Position {
         self.halfmove_clock
     }
 
+    #[inline(always)]
+    pub fn rule60_max_ply(&self) -> Option<u16> {
+        self.rule60_max_ply
+    }
+
+    pub fn set_rule60_max_ply(&mut self, max_ply: Option<u16>) {
+        self.rule60_max_ply = max_ply.map(|value| value.max(1));
+    }
+
     pub fn mirror_files(&self) -> Self {
         let mut board = [None; BOARD_SIZE];
         for sq in 0..BOARD_SIZE {
@@ -454,6 +469,7 @@ impl Position {
             dynamic_material_counts: [0; 2],
             general_squares: [None; 2],
             halfmove_clock: self.halfmove_clock,
+            rule60_max_ply: self.rule60_max_ply,
         };
         let state = position.compute_state();
         Self {
@@ -571,7 +587,7 @@ impl Position {
         self.hash ^= zobrist_piece_key(to, moving);
         self.side_to_move = self.side_to_move.opposite();
         self.hash ^= SIDE_TO_MOVE_KEY;
-        self.halfmove_clock = if undo.captured.is_some() || moving.kind == PieceKind::Soldier {
+        self.halfmove_clock = if undo.captured.is_some() {
             0
         } else {
             self.halfmove_clock.saturating_add(1)

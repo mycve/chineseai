@@ -33,6 +33,8 @@ struct UciState {
     fpu_value_at_root: f32,
     policy_softmax_temp: f32,
     draw_score: f32,
+    sixty_move_rule: bool,
+    rule60_max_ply: u16,
     seed: u64,
 }
 
@@ -55,6 +57,8 @@ impl Default for UciState {
             fpu_value_at_root: 0.20,
             policy_softmax_temp: 1.0,
             draw_score: 0.0,
+            sixty_move_rule: true,
+            rule60_max_ply: 120,
             seed: 20260409,
         }
     }
@@ -100,6 +104,7 @@ pub fn run_uci() {
             Some("ucinewgame") => {
                 stop_active_search(&mut active_search);
                 state.position = Position::startpos();
+                apply_rule_options(&mut state);
                 state.rule_history = state.position.initial_rule_history();
                 state.seed = 20260409;
             }
@@ -148,6 +153,8 @@ fn print_uci_id() {
     println!("option name FpuValueAtRoot type string default 0.20");
     println!("option name PolicySoftmaxTemp type string default 1.0");
     println!("option name DrawScore type string default 0.0");
+    println!("option name Sixty Move Rule type check default true");
+    println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
     println!("uciok");
     flush();
 }
@@ -239,14 +246,32 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .unwrap_or(state.draw_score)
                 .clamp(-1.0, 1.0);
         }
+        "sixty move rule" => {
+            state.sixty_move_rule = value.eq_ignore_ascii_case("true");
+            apply_rule_options(state);
+        }
+        "rule60maxply" => {
+            state.rule60_max_ply = value
+                .parse::<u16>()
+                .unwrap_or(state.rule60_max_ply)
+                .clamp(1, 150);
+            apply_rule_options(state);
+        }
         _ => {}
     }
+}
+
+fn apply_rule_options(state: &mut UciState) {
+    state
+        .position
+        .set_rule60_max_ply(state.sixty_move_rule.then_some(state.rule60_max_ply));
 }
 
 fn handle_position(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     if tokens.get(1) == Some(&"startpos") {
         state.position = Position::startpos();
+        apply_rule_options(state);
         state.rule_history = state.position.initial_rule_history();
         if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
             let move_list = &tokens[moves_index + 1..];
@@ -261,6 +286,7 @@ fn handle_position(line: &str, state: &mut UciState) {
         let fen = tokens[2..fen_end].join(" ");
         if let Ok(position) = Position::from_fen(&fen) {
             state.position = position;
+            apply_rule_options(state);
             state.rule_history = state.position.initial_rule_history();
             if let Some(moves_index) = moves_index {
                 let move_list = &tokens[moves_index + 1..];
@@ -597,6 +623,17 @@ mod tests {
         let mut state = UciState::default();
         handle_setoption("setoption name PolicySoftmaxTemp value 1.5", &mut state);
         assert_eq!(state.policy_softmax_temp, 1.5);
+    }
+
+    #[test]
+    fn natural_move_limit_is_configurable() {
+        let mut state = UciState::default();
+        handle_setoption("setoption name Rule60MaxPly value 80", &mut state);
+        assert_eq!(state.position.rule60_max_ply(), Some(80));
+        handle_setoption("setoption name Sixty Move Rule value false", &mut state);
+        assert_eq!(state.position.rule60_max_ply(), None);
+        handle_position("position startpos", &mut state);
+        assert_eq!(state.position.rule60_max_ply(), None);
     }
 
     #[test]

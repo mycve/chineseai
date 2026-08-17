@@ -253,8 +253,7 @@ fn play_one_game(
 ) -> std::io::Result<(GameEnd, String, String)> {
     let _ = external.write_line("ucinewgame");
     let mut position = initial_position.clone();
-    let initial_fen =
-        (position.to_fen() != crate::xiangqi::STARTPOS_FEN).then(|| position.to_fen());
+    let initial_fen = (position != Position::startpos()).then(|| position.to_fen());
     let mut rule_history = position.initial_rule_history();
     let mut moves_uci: Vec<String> = Vec::new();
     let mut ply_count = 0usize;

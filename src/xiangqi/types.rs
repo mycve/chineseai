@@ -155,7 +155,7 @@ pub struct RuleHistoryEntry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuleDrawReason {
-    Halfmove120,
+    NaturalMoveLimit,
     Repetition,
     MutualLongCheck,
     MutualLongChase,
@@ -177,6 +177,7 @@ pub struct Position {
     pub(super) dynamic_material_counts: [u8; 2],
     pub(super) general_squares: [Option<usize>; 2],
     pub(super) halfmove_clock: u16,
+    pub(super) rule60_max_ply: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

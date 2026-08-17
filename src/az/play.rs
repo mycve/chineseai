@@ -24,7 +24,7 @@ pub struct AzTerminalStats {
     pub red_general_missing: usize,
     pub black_general_missing: usize,
     pub rule_draw: usize,
-    pub rule_draw_halfmove120: usize,
+    pub rule_draw_natural_limit: usize,
     pub rule_draw_repetition: usize,
     pub rule_draw_mutual_long_check: usize,
     pub rule_draw_mutual_long_chase: usize,
@@ -54,7 +54,7 @@ impl AzTerminalStats {
         self.red_general_missing += other.red_general_missing;
         self.black_general_missing += other.black_general_missing;
         self.rule_draw += other.rule_draw;
-        self.rule_draw_halfmove120 += other.rule_draw_halfmove120;
+        self.rule_draw_natural_limit += other.rule_draw_natural_limit;
         self.rule_draw_repetition += other.rule_draw_repetition;
         self.rule_draw_mutual_long_check += other.rule_draw_mutual_long_check;
         self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
@@ -326,6 +326,11 @@ fn selfplay_search_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSea
     }
 }
 
+fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
+    position.set_rule60_max_ply(config.rule60_max_ply);
+    position
+}
+
 fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.chunk");
     if config.games >= 4 {
@@ -378,16 +383,19 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
-        let mut position = if use_opening_fen(
-            !config.opening_positions.is_empty(),
-            config.opening_fen_game_fraction,
-            rng.unit_f32(),
-        ) {
-            let index = (rng.next_u64() as usize) % config.opening_positions.len();
-            config.opening_positions[index].clone()
-        } else {
-            Position::startpos()
-        };
+        let mut position = configure_selfplay_rules(
+            if use_opening_fen(
+                !config.opening_positions.is_empty(),
+                config.opening_fen_game_fraction,
+                rng.unit_f32(),
+            ) {
+                let index = (rng.next_u64() as usize) % config.opening_positions.len();
+                config.opening_positions[index].clone()
+            } else {
+                Position::startpos()
+            },
+            config,
+        );
         let mut rule_history = position.initial_rule_history();
         let mut game_samples = Vec::new();
         let mut game_bootstrap_wdls = Vec::new();
@@ -579,7 +587,9 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     RuleOutcome::Draw(reason) => {
                         terminal.rule_draw += 1;
                         match reason {
-                            RuleDrawReason::Halfmove120 => terminal.rule_draw_halfmove120 += 1,
+                            RuleDrawReason::NaturalMoveLimit => {
+                                terminal.rule_draw_natural_limit += 1
+                            }
                             RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
                             RuleDrawReason::MutualLongCheck => {
                                 terminal.rule_draw_mutual_long_check += 1
@@ -677,16 +687,19 @@ struct BatchedSelfplayGame {
 fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> BatchedSelfplayGame {
     let mut rng =
         SplitMix64::new(config.seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let position = if use_opening_fen(
-        !config.opening_positions.is_empty(),
-        config.opening_fen_game_fraction,
-        rng.unit_f32(),
-    ) {
-        let index = (rng.next_u64() as usize) % config.opening_positions.len();
-        config.opening_positions[index].clone()
-    } else {
-        Position::startpos()
-    };
+    let position = configure_selfplay_rules(
+        if use_opening_fen(
+            !config.opening_positions.is_empty(),
+            config.opening_fen_game_fraction,
+            rng.unit_f32(),
+        ) {
+            let index = (rng.next_u64() as usize) % config.opening_positions.len();
+            config.opening_positions[index].clone()
+        } else {
+            Position::startpos()
+        },
+        config,
+    );
     let rule_history = position.initial_rule_history();
     let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
     BatchedSelfplayGame {
@@ -739,7 +752,7 @@ fn record_batched_search_stats(
 }
 
 fn inactive_batch_input(config: &AzLoopConfig) -> AzBatchSearchInput {
-    let position = Position::startpos();
+    let position = configure_selfplay_rules(Position::startpos(), config);
     let rule_history = position.initial_rule_history();
     let root_moves = position.legal_moves();
     let mut limits = selfplay_search_limits(config, 0, 0);
@@ -942,8 +955,8 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                         RuleOutcome::Draw(reason) => {
                             data.terminal.rule_draw += 1;
                             match reason {
-                                RuleDrawReason::Halfmove120 => {
-                                    data.terminal.rule_draw_halfmove120 += 1
+                                RuleDrawReason::NaturalMoveLimit => {
+                                    data.terminal.rule_draw_natural_limit += 1
                                 }
                                 RuleDrawReason::Repetition => {
                                     data.terminal.rule_draw_repetition += 1
@@ -1302,6 +1315,7 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
 pub struct AzArenaConfig {
     pub simulations: usize,
     pub max_plies: usize,
+    pub rule60_max_ply: Option<u16>,
     pub games_as_red: usize,
     pub games_as_black: usize,
     pub start_index: usize,
@@ -1327,7 +1341,8 @@ pub fn play_arena_games_from_positions(
     let mut report = AzArenaReport::default();
     let mut game_seed = config.seed;
     for game_index in 0..config.games_as_red {
-        let position = arena_start_position(positions, config.start_index + game_index);
+        let mut position = arena_start_position(positions, config.start_index + game_index);
+        position.set_rule60_max_ply(config.rule60_max_ply);
         let outcome = play_arena_game(
             &position,
             candidate,
@@ -1360,7 +1375,8 @@ pub fn play_arena_games_from_positions(
         game_seed = game_seed.wrapping_add(1);
     }
     for game_index in 0..config.games_as_black {
-        let position = arena_start_position(positions, config.start_index + game_index);
+        let mut position = arena_start_position(positions, config.start_index + game_index);
+        position.set_rule60_max_ply(config.rule60_max_ply);
         let outcome = play_arena_game(
             &position,
             baseline,
@@ -1494,6 +1510,7 @@ mod tests {
         AzLoopConfig {
             games,
             max_plies: 12,
+            rule60_max_ply: Some(120),
             simulations: 64,
             seed: 20260817,
             workers: 1,

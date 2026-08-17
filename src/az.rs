@@ -909,6 +909,7 @@ impl Clone for AzNnue {
 pub struct AzLoopConfig {
     pub games: usize,
     pub max_plies: usize,
+    pub rule60_max_ply: Option<u16>,
     pub simulations: usize,
     pub seed: u64,
     pub workers: usize,
@@ -1016,7 +1017,7 @@ pub struct AzLoopReport {
     pub terminal_red_general_missing: usize,
     pub terminal_black_general_missing: usize,
     pub terminal_rule_draw: usize,
-    pub terminal_rule_draw_halfmove120: usize,
+    pub terminal_rule_draw_natural_limit: usize,
     pub terminal_rule_draw_repetition: usize,
     pub terminal_rule_draw_mutual_long_check: usize,
     pub terminal_rule_draw_mutual_long_chase: usize,
@@ -1196,7 +1197,9 @@ pub fn rule_context_features(
     let is_check = |entry: &crate::xiangqi::RuleHistoryEntry| entry.gives_check;
     let is_chase = |entry: &crate::xiangqi::RuleHistoryEntry| entry.chased_mask != 0;
     [
-        position.halfmove_clock() as f32 / 120.0,
+        position.rule60_max_ply().map_or(0.0, |max_ply| {
+            position.halfmove_clock() as f32 / max_ply as f32
+        }),
         (prior_matches as f32 / 3.0).min(1.0),
         (cycle.len() as f32 / 32.0).min(1.0),
         (cycle_count(side, is_check) as f32 / 4.0).min(1.0),

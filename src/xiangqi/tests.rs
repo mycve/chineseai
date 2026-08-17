@@ -3,7 +3,50 @@ use super::*;
 #[test]
 fn startpos_roundtrip_fen() {
     let position = Position::startpos();
-    assert_eq!(position.to_fen(), STARTPOS_FEN);
+    assert_eq!(position.to_fen(), format!("{STARTPOS_FEN} - - 0 1"));
+}
+
+#[test]
+fn full_fen_preserves_rule60_clock() {
+    let fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - - 57 80";
+    let position = Position::from_fen(fen).unwrap();
+    assert_eq!(position.halfmove_clock(), 57);
+    assert_eq!(
+        position.to_fen(),
+        format!("{} b - - 57 1", fen.split_once(' ').unwrap().0)
+    );
+}
+
+#[test]
+fn soldier_move_does_not_reset_rule60_clock() {
+    let mut position = Position::from_fen(
+        "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 57 1",
+    )
+    .unwrap();
+    let mv = position.parse_uci_move("a3a4").unwrap();
+    position.make_move(mv);
+    assert_eq!(position.halfmove_clock(), 58);
+}
+
+#[test]
+fn capture_resets_rule60_clock() {
+    let mut position = Position::from_fen("4k4/9/9/9/9/9/4p4/4R4/9/3K5 w - - 57 1").unwrap();
+    let mv = position.parse_uci_move("e2e3").unwrap();
+    position.make_move(mv);
+    assert_eq!(position.halfmove_clock(), 0);
+}
+
+#[test]
+fn rule60_can_be_disabled_or_use_a_custom_limit() {
+    let mut position = Position::from_fen("4k4/9/9/9/9/9/9/4R4/9/3K5 w - - 20 1").unwrap();
+    let history = position.initial_rule_history();
+    position.set_rule60_max_ply(Some(20));
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit))
+    );
+    position.set_rule60_max_ply(None);
+    assert_eq!(position.rule_outcome_with_history(&history), None);
 }
 
 #[test]
@@ -542,7 +585,7 @@ fn one_long_check_cycle_filters_the_next_repeated_check() {
     }
     assert_eq!(
         position.to_fen(),
-        "2Rakab2/8r/4c1n2/p3p1p1p/2p6/9/P3P3P/1CN1NC3/9/1RBAKArc1 b"
+        "2Rakab2/8r/4c1n2/p3p1p1p/2p6/9/P3P3P/1CN1NC3/9/1RBAKArc1 b - - 4 1"
     );
     assert_eq!(
         position.rule_outcome_with_history(&history),

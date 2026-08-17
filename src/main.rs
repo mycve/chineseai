@@ -557,7 +557,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     let encoded = format!(
         concat!(
-            "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
+            "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_tdl{}_op{}_rs{}_rp{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
         ),
@@ -567,6 +567,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.lr),
         config.hidden_size,
         config.max_plies,
+        u8::from(config.sixty_move_rule),
+        config.rule60_max_ply,
         config.workers,
         f32_slug(config.replay_recent_sample_fraction),
         config.replay_recent_games,
@@ -825,6 +827,7 @@ fn build_az_loop_config(
     AzLoopConfig {
         games: 1,
         max_plies: config.max_plies,
+        rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
         simulations: config.simulations,
         seed,
         workers,
@@ -1048,7 +1051,7 @@ fn build_async_training_report(
         terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
         terminal_rule_draw: pending.selfplay.terminal.rule_draw,
-        terminal_rule_draw_halfmove120: pending.selfplay.terminal.rule_draw_halfmove120,
+        terminal_rule_draw_natural_limit: pending.selfplay.terminal.rule_draw_natural_limit,
         terminal_rule_draw_repetition: pending.selfplay.terminal.rule_draw_repetition,
         terminal_rule_draw_mutual_long_check: pending.selfplay.terminal.rule_draw_mutual_long_check,
         terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
@@ -1143,6 +1146,7 @@ struct ArenaThreadConfig {
     eval_positions: Arc<Vec<Position>>,
     simulations: usize,
     max_plies: usize,
+    rule60_max_ply: Option<u16>,
     cpuct: f32,
     cpuct_at_root: f32,
     cpuct_base: f32,
@@ -1178,6 +1182,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let eval_positions = Arc::clone(&config.eval_positions);
         let simulations = config.simulations;
         let max_plies = config.max_plies;
+        let rule60_max_ply = config.rule60_max_ply;
         let cpuct = config.cpuct;
         let cpuct_at_root = config.cpuct_at_root;
         let cpuct_base = config.cpuct_base;
@@ -1199,6 +1204,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                 AzArenaConfig {
                     simulations,
                     max_plies,
+                    rule60_max_ply,
                     games_as_red: red_games,
                     games_as_black: black_games,
                     start_index: thread_start_index,
@@ -1963,7 +1969,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(global)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(global)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -1982,6 +1988,8 @@ fn main() {
                 config.train_samples_per_update,
                 config.train_epochs_per_update,
                 config.max_plies,
+                config.sixty_move_rule,
+                config.rule60_max_ply,
                 config.workers,
                 config.temperature_start,
                 config.temperature_endgame,
@@ -2412,7 +2420,7 @@ fn main() {
                                         terminal_red_general_missing: 0,
                                         terminal_black_general_missing: 0,
                                         terminal_rule_draw: 0,
-                                        terminal_rule_draw_halfmove120: 0,
+                                        terminal_rule_draw_natural_limit: 0,
                                         terminal_rule_draw_repetition: 0,
                                         terminal_rule_draw_mutual_long_check: 0,
                                         terminal_rule_draw_mutual_long_chase: 0,
@@ -2485,7 +2493,7 @@ fn main() {
                                         terminal_red_general_missing: 0,
                                         terminal_black_general_missing: 0,
                                         terminal_rule_draw: 0,
-                                        terminal_rule_draw_halfmove120: 0,
+                                        terminal_rule_draw_natural_limit: 0,
                                         terminal_rule_draw_repetition: 0,
                                         terminal_rule_draw_mutual_long_check: 0,
                                         terminal_rule_draw_mutual_long_chase: 0,
@@ -2937,9 +2945,9 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw_halfmove120",
+                    "terminal/rule_draw_natural_limit",
                     update,
-                    report.terminal_rule_draw_halfmove120 as f32,
+                    report.terminal_rule_draw_natural_limit as f32,
                 );
                 log_scalar(
                     &mut tb,
@@ -3025,6 +3033,7 @@ fn main() {
                             eval_positions: Arc::new(arena_start_positions),
                             simulations: config.arena_simulations,
                             max_plies: config.max_plies,
+                            rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
                             cpuct: config.arena_cpuct,
                             cpuct_at_root: config.arena_cpuct_at_root,
                             cpuct_base: config.cpuct_base,

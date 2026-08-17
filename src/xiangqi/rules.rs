@@ -64,8 +64,11 @@ impl Position {
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome_with_history");
-        if self.halfmove_clock >= 120 {
-            return Some(RuleOutcome::Draw(RuleDrawReason::Halfmove120));
+        if self
+            .rule60_max_ply
+            .is_some_and(|max_ply| self.halfmove_clock >= max_ply)
+        {
+            return Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit));
         }
         Self::rule_outcome(history)
     }

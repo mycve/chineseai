@@ -29,6 +29,8 @@ pub struct AzLoopFileConfig {
     pub lr_decay_factor: f32,
     pub batch_size: usize,
     pub max_plies: usize,
+    pub sixty_move_rule: bool,
+    pub rule60_max_ply: u16,
     pub hidden_size: usize,
     pub seed: u64,
     pub workers: usize,
@@ -107,6 +109,8 @@ impl Default for AzLoopFileConfig {
             lr_decay_factor: 0.97,
             batch_size: 1024,
             max_plies: 200,
+            sixty_move_rule: true,
+            rule60_max_ply: 120,
             hidden_size: 128,
             seed: 20260420,
             workers: 0,
@@ -212,6 +216,8 @@ impl AzLoopFileConfig {
         line!("lr_decay_factor", f(self.lr_decay_factor));
         line!("batch_size", self.batch_size);
         line!("max_plies", self.max_plies);
+        line!("sixty_move_rule", self.sixty_move_rule);
+        line!("rule60_max_ply", self.rule60_max_ply);
         line!("hidden_size", self.hidden_size);
         line!("seed", self.seed);
         line!("workers", self.workers);
@@ -349,6 +355,7 @@ impl AzLoopFileConfig {
         self.lr_decay_factor = self.lr_decay_factor.clamp(0.0, 1.0);
         self.batch_size = self.batch_size.max(1);
         self.max_plies = self.max_plies.max(1);
+        self.rule60_max_ply = self.rule60_max_ply.clamp(1, 150);
         self.hidden_size = self.hidden_size.max(1);
         if self.workers == 0 {
             self.workers = system_physical_cores();
@@ -418,10 +425,12 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 10\n"));
+        assert!(text.starts_with("format_version = 11\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
+        assert!(text.contains("sixty_move_rule = true\n"));
+        assert!(text.contains("rule60_max_ply = 120\n"));
         assert!(text.contains("temperature_endgame = 0.3\n"));
         assert!(text.contains("temperature_decay_delay_plies = 30\n"));
         assert!(text.contains("temperature_decay_plies = 60\n"));
