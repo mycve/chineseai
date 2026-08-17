@@ -347,8 +347,51 @@ fn test_rule_entry(
         mover,
         gives_check,
         chased_mask,
-        chased_piece_mask: 0,
+        mv: None,
     }
+}
+
+fn test_rule_move_entry(
+    hash: u64,
+    side_to_move: Color,
+    mover: Color,
+    mv: Move,
+    chased_mask: u128,
+) -> RuleHistoryEntry {
+    RuleHistoryEntry {
+        mv: Some(mv),
+        ..test_rule_entry(hash, side_to_move, Some(mover), false, chased_mask)
+    }
+}
+
+#[test]
+fn long_chase_tracks_one_piece_across_squares() {
+    let history = vec![
+        test_rule_entry(1, Color::Red, None, false, 0),
+        test_rule_move_entry(2, Color::Black, Color::Red, Move::new(0, 1), 1 << 10),
+        test_rule_move_entry(3, Color::Red, Color::Black, Move::new(10, 11), 0),
+        test_rule_move_entry(4, Color::Black, Color::Red, Move::new(1, 0), 1 << 11),
+        test_rule_move_entry(1, Color::Red, Color::Black, Move::new(11, 10), 0),
+    ];
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
+fn alternating_same_kind_targets_are_not_one_long_chase() {
+    let history = vec![
+        test_rule_entry(1, Color::Red, None, false, 0),
+        test_rule_move_entry(2, Color::Black, Color::Red, Move::new(0, 1), 1 << 10),
+        test_rule_move_entry(3, Color::Red, Color::Black, Move::new(20, 21), 0),
+        test_rule_move_entry(4, Color::Black, Color::Red, Move::new(1, 0), 1 << 11),
+        test_rule_move_entry(1, Color::Red, Color::Black, Move::new(21, 20), 0),
+    ];
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+    );
 }
 
 #[test]

@@ -1160,8 +1160,7 @@ impl<'a> AzTree<'a> {
                     perspective,
                     &mut child_policy_accumulator,
                 );
-                let child_rule_entry =
-                    child_position.rule_history_entry_after_moved(mover, mv.to as usize);
+                let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv);
                 let child_node = self.nodes.len();
                 self.nodes.push(AzNode {
                     position: child_position,
@@ -1282,7 +1281,7 @@ impl<'a> AzTree<'a> {
             perspective,
             &mut child_policy_accumulator,
         );
-        let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv.to as usize);
+        let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv);
         let child_node = self.nodes.len();
         self.nodes.push(AzNode {
             position: child_position,
@@ -2594,7 +2593,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
-                chased_piece_mask: 0,
+                mv: None,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2602,7 +2601,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
-                chased_piece_mask: 0,
+                mv: None,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2610,7 +2609,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
-                chased_piece_mask: 0,
+                mv: None,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2618,7 +2617,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
-                chased_piece_mask: 0,
+                mv: None,
             },
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2626,7 +2625,7 @@ mod tests {
                 mover: Some(Color::Black),
                 gives_check: false,
                 chased_mask: 0,
-                chased_piece_mask: 0,
+                mv: None,
             },
         ];
 

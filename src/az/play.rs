@@ -561,7 +561,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             }
             let mover = position.side_to_move();
             position.make_move(mv);
-            rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
+            rule_history.push(position.rule_history_entry_after_moved(mover, mv));
 
             if !position.has_general(Color::Red) {
                 result = Some(-1.0);
@@ -926,11 +926,9 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 state.bootstrap_wdls.push(search.network_value_wdl);
                 let mover = state.position.side_to_move();
                 state.position.make_move(mv);
-                state.rule_history.push(
-                    state
-                        .position
-                        .rule_history_entry_after_moved(mover, mv.to as usize),
-                );
+                state
+                    .rule_history
+                    .push(state.position.rule_history_entry_after_moved(mover, mv));
                 state.ply += 1;
                 if !state.position.has_general(Color::Red) {
                     state.result = Some(-1.0);
@@ -1483,7 +1481,7 @@ fn play_arena_game(
         };
         let mover = position.side_to_move();
         position.make_move(mv);
-        rule_history.push(position.rule_history_entry_after_moved(mover, mv.to as usize));
+        rule_history.push(position.rule_history_entry_after_moved(mover, mv));
 
         if !position.has_general(Color::Red) {
             return -1.0;

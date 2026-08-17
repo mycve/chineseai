@@ -16,15 +16,14 @@ impl Position {
 
     pub fn rule_history_entry(&self, mover: Option<Color>) -> RuleHistoryEntry {
         crate::scope_profile!("xiangqi.rule_history_entry");
-        let (chased_mask, chased_piece_mask) =
-            mover.map_or((0, 0), |color| self.chased_masks_by(color));
+        let chased_mask = mover.map_or(0, |color| self.chased_masks_by(color));
         RuleHistoryEntry {
             hash: self.hash,
             side_to_move: self.side_to_move,
             mover,
             gives_check: self.in_check(self.side_to_move),
             chased_mask,
-            chased_piece_mask,
+            mv: None,
         }
     }
 
@@ -39,14 +38,14 @@ impl Position {
             crate::scope_profile!("xiangqi.rule_history.make_move");
             next.make_move(mv);
         }
-        next.rule_history_entry_after_moved(mover, mv.to as usize)
+        next.rule_history_entry_after_moved(mover, mv)
     }
 
-    pub fn rule_history_entry_after_moved(&self, mover: Color, origin: usize) -> RuleHistoryEntry {
+    pub fn rule_history_entry_after_moved(&self, mover: Color, mv: Move) -> RuleHistoryEntry {
         crate::scope_profile!("xiangqi.rule_history_after_moved");
-        let (chased_mask, chased_piece_mask) = {
+        let chased_mask = {
             crate::scope_profile!("xiangqi.rule_history.chased_origin");
-            self.chased_masks_by_origin(mover, origin)
+            self.chased_masks_by_origin(mover, mv.to as usize)
         };
         let gives_check = {
             crate::scope_profile!("xiangqi.rule_history.gives_check");
@@ -58,7 +57,7 @@ impl Position {
             mover: Some(mover),
             gives_check,
             chased_mask,
-            chased_piece_mask,
+            mv: Some(mv),
         }
     }
 
@@ -171,13 +170,12 @@ impl Position {
             .collect()
     }
 
-    fn chased_masks_by(&self, color: Color) -> (u128, u16) {
+    fn chased_masks_by(&self, color: Color) -> u128 {
         crate::scope_profile!("xiangqi.chased_mask_by");
         let mut work = self.clone();
         work.side_to_move = color;
 
         let mut square_mask = 0u128;
-        let mut piece_mask = 0u16;
         for target in 0..super::BOARD_SIZE {
             let Some(target_piece) = self.board[target] else {
                 continue;
@@ -196,19 +194,18 @@ impl Position {
                 work.unmake_move_board_only(mv, captured);
                 if legal {
                     square_mask |= 1u128 << target;
-                    piece_mask |= 1u16 << chased_piece_index(target_piece);
                     return true;
                 }
                 false
             });
         }
-        (square_mask, piece_mask)
+        square_mask
     }
 
-    fn chased_masks_by_origin(&self, color: Color, origin: usize) -> (u128, u16) {
+    fn chased_masks_by_origin(&self, color: Color, origin: usize) -> u128 {
         crate::scope_profile!("xiangqi.chased_mask_by");
         let Some(piece) = self.board[origin].filter(|piece| piece.color == color) else {
-            return (0, 0);
+            return 0;
         };
         let mut captures = Vec::with_capacity(8);
         self.gen_piece_moves(origin, piece, MoveGenMode::Captures, &mut captures);
@@ -216,7 +213,6 @@ impl Position {
         work.side_to_move = color;
 
         let mut square_mask = 0u128;
-        let mut piece_mask = 0u16;
         for mv in captures {
             let target = mv.to as usize;
             let Some(target_piece) = self.board[target] else {
@@ -233,10 +229,9 @@ impl Position {
             work.unmake_move_board_only(mv, captured);
             if legal {
                 square_mask |= 1u128 << target;
-                piece_mask |= 1u16 << chased_piece_index(target_piece);
             }
         }
-        (square_mask, piece_mask)
+        square_mask
     }
 
     fn is_chase_target_piece(&self, piece: super::Piece, attacker: Color, sq: usize) -> bool {
@@ -286,32 +281,31 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
         return Some(RuleViolation::LongCheck);
     }
 
-    let chased_intersection = mover_entries
-        .iter()
-        .map(|entry| entry.chased_mask)
-        .reduce(|a, b| a & b)
-        .unwrap_or(0);
-    let chased_piece_intersection = mover_entries
-        .iter()
-        .map(|entry| entry.chased_piece_mask)
-        .reduce(|a, b| a & b)
-        .unwrap_or(0);
-    (chased_intersection != 0 || chased_piece_intersection != 0).then_some(RuleViolation::LongChase)
-}
-
-fn chased_piece_index(piece: super::Piece) -> usize {
-    let color_offset = match piece.color {
-        Color::Red => 0,
-        Color::Black => 7,
-    };
-    let kind_offset = match piece.kind {
-        PieceKind::General => 0,
-        PieceKind::Advisor => 1,
-        PieceKind::Elephant => 2,
-        PieceKind::Horse => 3,
-        PieceKind::Rook => 4,
-        PieceKind::Cannon => 5,
-        PieceKind::Soldier => 6,
-    };
-    color_offset + kind_offset
+    let mut identity_at_square = std::array::from_fn::<_, { super::BOARD_SIZE }, _>(|sq| sq as u8);
+    let mut chased_identity_intersection = None::<u128>;
+    for entry in entries {
+        if let Some(mv) = entry.mv {
+            let identity = identity_at_square[mv.from as usize];
+            identity_at_square[mv.from as usize] = u8::MAX;
+            identity_at_square[mv.to as usize] = identity;
+        }
+        if entry.mover != Some(color) {
+            continue;
+        }
+        let mut squares = entry.chased_mask;
+        let mut identities = 0u128;
+        while squares != 0 {
+            let square = squares.trailing_zeros() as usize;
+            squares &= squares - 1;
+            let identity = identity_at_square[square];
+            if identity != u8::MAX {
+                identities |= 1u128 << identity;
+            }
+        }
+        chased_identity_intersection =
+            Some(chased_identity_intersection.map_or(identities, |current| current & identities));
+    }
+    chased_identity_intersection
+        .is_some_and(|identities| identities != 0)
+        .then_some(RuleViolation::LongChase)
 }
