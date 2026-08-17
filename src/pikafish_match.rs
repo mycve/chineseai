@@ -45,6 +45,7 @@ pub struct VsPikafishConfig {
     pub parallel_games: usize,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
+    pub policy_softmax_temp: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +76,7 @@ struct GameConfig {
     seed: u64,
     cpuct: f32,
     cpuct_at_root: f32,
+    policy_softmax_temp: f32,
 }
 
 struct ExternalUci {
@@ -286,15 +288,15 @@ fn play_one_game(
                     cpuct: config.cpuct,
                     cpuct_at_root: config.cpuct_at_root,
                     cpuct_base: 19652.0,
-                    cpuct_factor: 2.0,
+                    cpuct_factor: 1.5,
                     cpuct_base_at_root: 19652.0,
-                    cpuct_factor_at_root: 2.0,
+                    cpuct_factor_at_root: 1.5,
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
                     fpu_value: 0.30,
                     fpu_value_at_root: 0.20,
-                    policy_softmax_temp: 1.0,
+                    policy_softmax_temp: config.policy_softmax_temp,
                     draw_score: 0.0,
                     value_scale: 1.0,
                 },
@@ -408,6 +410,7 @@ pub fn run_vs_pikafish(
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                             cpuct: config.cpuct,
                             cpuct_at_root: config.cpuct_at_root,
+                            policy_softmax_temp: config.policy_softmax_temp,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));

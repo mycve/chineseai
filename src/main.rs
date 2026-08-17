@@ -275,11 +275,14 @@ struct VsPikafishArgs {
     #[arg(short = 's', long)]
     simulations: Option<usize>,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 0.65)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(long, default_value_t = 1.5)]
     cpuct_at_root: f32,
+    /// Divisor applied to ChineseAI policy logits before search.
+    #[arg(long, default_value_t = 1.3)]
+    policy_softmax_temp: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
     max_plies: usize,
@@ -412,10 +415,13 @@ struct PikafishLabelEvalArgs {
     #[arg(short = 's', long, default_value_t = 64)]
     simulations: usize,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 0.65)]
     cpuct: f32,
+    /// ChineseAI root PUCT constant.
+    #[arg(long, default_value_t = 1.5)]
+    cpuct_at_root: f32,
     /// Divisor applied to policy logits before search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.5)]
     policy_softmax_temp: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
@@ -553,7 +559,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_tdl{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -595,6 +601,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.arena_interval,
         config.arena_simulations,
         f32_slug(config.arena_cpuct),
+        f32_slug(config.arena_cpuct_at_root),
+        f32_slug(config.arena_policy_softmax_temp),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
         config.seed,
@@ -1136,6 +1144,15 @@ struct ArenaThreadConfig {
     simulations: usize,
     max_plies: usize,
     cpuct: f32,
+    cpuct_at_root: f32,
+    cpuct_base: f32,
+    cpuct_factor: f32,
+    cpuct_base_at_root: f32,
+    cpuct_factor_at_root: f32,
+    fpu_value: f32,
+    fpu_value_at_root: f32,
+    draw_score: f32,
+    policy_softmax_temp: f32,
     thread_count: usize,
     seed: u64,
 }
@@ -1162,6 +1179,15 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let simulations = config.simulations;
         let max_plies = config.max_plies;
         let cpuct = config.cpuct;
+        let cpuct_at_root = config.cpuct_at_root;
+        let cpuct_base = config.cpuct_base;
+        let cpuct_factor = config.cpuct_factor;
+        let cpuct_base_at_root = config.cpuct_base_at_root;
+        let cpuct_factor_at_root = config.cpuct_factor_at_root;
+        let fpu_value = config.fpu_value;
+        let fpu_value_at_root = config.fpu_value_at_root;
+        let draw_score = config.draw_score;
+        let policy_softmax_temp = config.policy_softmax_temp;
         let seed = config.seed ^ index as u64;
         let thread_start_index = start_index;
         start_index += red_games;
@@ -1178,6 +1204,15 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                     start_index: thread_start_index,
                     seed,
                     cpuct,
+                    cpuct_at_root,
+                    cpuct_base,
+                    cpuct_factor,
+                    cpuct_base_at_root,
+                    cpuct_factor_at_root,
+                    fpu_value,
+                    fpu_value_at_root,
+                    draw_score,
+                    policy_softmax_temp,
                 },
             )
         }));
@@ -1232,6 +1267,7 @@ fn fixed_az_search_limits(
     simulations: usize,
     seed: u64,
     cpuct: f32,
+    cpuct_at_root: f32,
     max_depth: usize,
     policy_softmax_temp: f32,
 ) -> AzSearchLimits {
@@ -1239,11 +1275,11 @@ fn fixed_az_search_limits(
         simulations,
         seed,
         cpuct,
-        cpuct_at_root: cpuct,
+        cpuct_at_root,
         cpuct_base: 19652.0,
-        cpuct_factor: 2.0,
+        cpuct_factor: 1.5,
         cpuct_base_at_root: 19652.0,
-        cpuct_factor_at_root: 2.0,
+        cpuct_factor_at_root: 1.5,
         max_depth,
         root_dirichlet_alpha: 0.0,
         root_exploration_fraction: 0.0,
@@ -1607,7 +1643,7 @@ fn main() {
             let _ = alphazero_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, 0, 1.0),
+                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.0),
             );
 
             let started = std::time::Instant::now();
@@ -1617,7 +1653,7 @@ fn main() {
                 let result = alphazero_search(
                     &position,
                     &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, 0, 1.0),
+                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.0),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -1927,7 +1963,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(global)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena_cpuct={} arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(global)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -1977,6 +2013,8 @@ fn main() {
                 config.arena_interval,
                 config.arena_simulations,
                 config.arena_cpuct,
+                config.arena_cpuct_at_root,
+                config.arena_policy_softmax_temp,
                 config.arena_promotion_rate,
                 config.arena_promotion_confidence_z,
                 config.arena_processes,
@@ -1997,6 +2035,8 @@ fn main() {
                 config.pikafish_label_eval_limit,
                 config.pikafish_label_eval_simulations,
                 config.pikafish_label_eval_cpuct,
+                config.pikafish_label_eval_cpuct_at_root,
+                config.pikafish_label_eval_policy_softmax_temp,
                 config.tensorboard_logdir,
                 tensorboard_encoded_subdir(&config)
             );
@@ -2986,6 +3026,15 @@ fn main() {
                             simulations: config.arena_simulations,
                             max_plies: config.max_plies,
                             cpuct: config.arena_cpuct,
+                            cpuct_at_root: config.arena_cpuct_at_root,
+                            cpuct_base: config.cpuct_base,
+                            cpuct_factor: config.cpuct_factor,
+                            cpuct_base_at_root: config.cpuct_base_at_root,
+                            cpuct_factor_at_root: config.cpuct_factor_at_root,
+                            fpu_value: config.fpu_value,
+                            fpu_value_at_root: config.fpu_value_at_root,
+                            draw_score: config.draw_score,
+                            policy_softmax_temp: config.arena_policy_softmax_temp,
                             thread_count: config.arena_processes,
                             seed: config.seed ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                         });
@@ -3125,12 +3174,27 @@ fn main() {
                             evaluate_pikafish_labels_parallel(
                                 Arc::new(deployed_model.clone()),
                                 rows,
-                                config.pikafish_label_eval_simulations,
-                                config.seed ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
-                                config.pikafish_label_eval_cpuct,
-                                config.max_plies,
+                                AzSearchLimits {
+                                    simulations: config.pikafish_label_eval_simulations,
+                                    seed: config.seed
+                                        ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
+                                    cpuct: config.pikafish_label_eval_cpuct,
+                                    cpuct_at_root: config.pikafish_label_eval_cpuct_at_root,
+                                    cpuct_base: config.cpuct_base,
+                                    cpuct_factor: config.cpuct_factor,
+                                    cpuct_base_at_root: config.cpuct_base_at_root,
+                                    cpuct_factor_at_root: config.cpuct_factor_at_root,
+                                    max_depth: config.max_plies,
+                                    root_dirichlet_alpha: 0.0,
+                                    root_exploration_fraction: 0.0,
+                                    fpu_value: config.fpu_value,
+                                    fpu_value_at_root: config.fpu_value_at_root,
+                                    policy_softmax_temp: config
+                                        .pikafish_label_eval_policy_softmax_temp,
+                                    draw_score: config.draw_score,
+                                    value_scale: 1.0,
+                                },
                                 config.arena_processes,
-                                config.policy_softmax_temp,
                             )
                         })();
                         {
@@ -3327,6 +3391,7 @@ fn main() {
             let simulations = cmd.simulations.unwrap_or(192).max(1);
             let cpuct = cmd.cpuct.max(0.0);
             let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
+            let policy_softmax_temp = cmd.policy_softmax_temp.max(1.0e-3);
             let max_plies = cmd.max_plies.max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
@@ -3381,6 +3446,7 @@ fn main() {
                     parallel_games,
                     cpuct,
                     cpuct_at_root,
+                    policy_softmax_temp,
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
@@ -3399,7 +3465,7 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={} cpuct_at_root={}",
+                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}/{} policy_temp={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),
@@ -3420,7 +3486,8 @@ fn main() {
                 max_plies,
                 simulations,
                 cpuct,
-                cpuct_at_root
+                cpuct_at_root,
+                policy_softmax_temp
             );
         }
         Some(CliCommand::PikafishLabelRandom(cmd)) => {
@@ -3621,16 +3688,19 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
     let stats = evaluate_pikafish_labels_parallel(
         Arc::new(model),
         rows,
-        cmd.simulations.max(1),
-        cmd.seed,
-        cmd.cpuct.max(0.0),
-        cmd.max_depth,
+        fixed_az_search_limits(
+            cmd.simulations.max(1),
+            cmd.seed,
+            cmd.cpuct.max(0.0),
+            cmd.cpuct_at_root.max(0.0),
+            cmd.max_depth,
+            cmd.policy_softmax_temp,
+        ),
         cmd.threads,
-        cmd.policy_softmax_temp,
     )?;
 
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} policy_temp={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} cpuct={}/{} policy_temp={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
@@ -3638,6 +3708,8 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         stats.value_count(),
         cmd.simulations.max(1),
         cmd.threads.max(1),
+        cmd.cpuct,
+        cmd.cpuct_at_root,
         cmd.policy_softmax_temp,
         100.0 * stats.top1_rate(),
         100.0 * stats.top2_rate(),
@@ -3656,11 +3728,7 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
 fn evaluate_pikafish_labels(
     model: &AzNnue,
     rows: &[PikafishLabelRow],
-    simulations: usize,
-    seed: u64,
-    cpuct: f32,
-    max_depth: usize,
-    policy_softmax_temp: f32,
+    search_limits: AzSearchLimits,
     mut progress: impl FnMut(usize, usize),
 ) -> io::Result<LabelEvalStats> {
     let mut stats = LabelEvalStats::default();
@@ -3682,13 +3750,10 @@ fn evaluate_pikafish_labels(
         let result = alphazero_search(
             &position,
             model,
-            fixed_az_search_limits(
-                simulations.max(1),
-                seed ^ row.id as u64,
-                cpuct,
-                max_depth,
-                policy_softmax_temp,
-            ),
+            AzSearchLimits {
+                seed: search_limits.seed ^ row.id as u64,
+                ..search_limits
+            },
         );
         stats.count += 1;
         if result.best_move == Some(label_move) {
@@ -3739,12 +3804,8 @@ fn evaluate_pikafish_labels(
 fn evaluate_pikafish_labels_parallel(
     model: Arc<AzNnue>,
     rows: Vec<PikafishLabelRow>,
-    simulations: usize,
-    seed: u64,
-    cpuct: f32,
-    max_depth: usize,
+    search_limits: AzSearchLimits,
     thread_count: usize,
-    policy_softmax_temp: f32,
 ) -> io::Result<LabelEvalStats> {
     if rows.is_empty() {
         return Ok(LabelEvalStats::default());
@@ -3762,16 +3823,7 @@ fn evaluate_pikafish_labels_parallel(
                 .filter(|(index, _)| index % thread_count == thread_id)
                 .map(|(_, row)| row.clone())
                 .collect();
-            evaluate_pikafish_labels(
-                &model,
-                &shard,
-                simulations,
-                seed ^ (thread_id as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
-                cpuct,
-                max_depth,
-                policy_softmax_temp,
-                |_, _| {},
-            )
+            evaluate_pikafish_labels(&model, &shard, search_limits, |_, _| {})
         }));
     }
 

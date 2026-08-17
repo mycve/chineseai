@@ -74,6 +74,8 @@ pub struct AzLoopFileConfig {
     pub arena_interval: usize,
     pub arena_simulations: usize,
     pub arena_cpuct: f32,
+    pub arena_cpuct_at_root: f32,
+    pub arena_policy_softmax_temp: f32,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
@@ -86,6 +88,8 @@ pub struct AzLoopFileConfig {
     pub pikafish_label_eval_limit: usize,
     pub pikafish_label_eval_simulations: usize,
     pub pikafish_label_eval_cpuct: f32,
+    pub pikafish_label_eval_cpuct_at_root: f32,
+    pub pikafish_label_eval_policy_softmax_temp: f32,
     pub tensorboard_logdir: String,
 }
 
@@ -125,8 +129,8 @@ impl Default for AzLoopFileConfig {
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
             draw_score: 0.0,
-            policy_softmax_temp: 1.45,
-            opening_policy_softmax_temp: 3.0,
+            policy_softmax_temp: 1.3,
+            opening_policy_softmax_temp: 1.5,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.75,
@@ -147,7 +151,9 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 10,
             arena_simulations: 4000,
-            arena_cpuct: 1.5,
+            arena_cpuct: 0.65,
+            arena_cpuct_at_root: 1.5,
+            arena_policy_softmax_temp: 1.3,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_processes: 128,
@@ -159,7 +165,9 @@ impl Default for AzLoopFileConfig {
             pikafish_label_eval_interval: 10,
             pikafish_label_eval_limit: 1000,
             pikafish_label_eval_simulations: 3000,
-            pikafish_label_eval_cpuct: 1.5,
+            pikafish_label_eval_cpuct: 0.65,
+            pikafish_label_eval_cpuct_at_root: 1.5,
+            pikafish_label_eval_policy_softmax_temp: 1.5,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -270,6 +278,11 @@ impl AzLoopFileConfig {
         line!("arena_interval", self.arena_interval);
         line!("arena_simulations", self.arena_simulations);
         line!("arena_cpuct", f(self.arena_cpuct));
+        line!("arena_cpuct_at_root", f(self.arena_cpuct_at_root));
+        line!(
+            "arena_policy_softmax_temp",
+            f(self.arena_policy_softmax_temp)
+        );
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
         line!(
             "arena_promotion_confidence_z",
@@ -296,6 +309,14 @@ impl AzLoopFileConfig {
         line!(
             "pikafish_label_eval_cpuct",
             f(self.pikafish_label_eval_cpuct)
+        );
+        line!(
+            "pikafish_label_eval_cpuct_at_root",
+            f(self.pikafish_label_eval_cpuct_at_root)
+        );
+        line!(
+            "pikafish_label_eval_policy_softmax_temp",
+            f(self.pikafish_label_eval_policy_softmax_temp)
         );
         line!("tensorboard_logdir", q(&self.tensorboard_logdir));
         out
@@ -363,6 +384,8 @@ impl AzLoopFileConfig {
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
+        self.arena_cpuct_at_root = self.arena_cpuct_at_root.max(0.0);
+        self.arena_policy_softmax_temp = self.arena_policy_softmax_temp.max(1e-3);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
@@ -374,6 +397,9 @@ impl AzLoopFileConfig {
         self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
         self.pikafish_label_eval_cpuct = self.pikafish_label_eval_cpuct.max(0.0);
+        self.pikafish_label_eval_cpuct_at_root = self.pikafish_label_eval_cpuct_at_root.max(0.0);
+        self.pikafish_label_eval_policy_softmax_temp =
+            self.pikafish_label_eval_policy_softmax_temp.max(1e-3);
         if self.arena_opening_plies_min > self.arena_opening_plies_max {
             std::mem::swap(
                 &mut self.arena_opening_plies_min,
@@ -392,7 +418,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 9\n"));
+        assert!(text.starts_with("format_version = 10\n"));
         assert!(text.contains("lr = 0.001\n"));
         assert!(text.contains("lr_min = 0.0003\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -415,8 +441,8 @@ mod tests {
         assert!(text.contains("fpu_value = 0.3\n"));
         assert!(text.contains("fpu_value_at_root = 0.2\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("policy_softmax_temp = 1.45\n"));
-        assert!(text.contains("opening_policy_softmax_temp = 3.0\n"));
+        assert!(text.contains("policy_softmax_temp = 1.3\n"));
+        assert!(text.contains("opening_policy_softmax_temp = 1.5\n"));
         assert!(text.contains("value_td_lambda = 0.95\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
@@ -448,6 +474,9 @@ mod tests {
         assert!(text.contains("arena_opening_plies_max = 10\n"));
         assert!(text.contains("arena_interval = 10\n"));
         assert!(text.contains("arena_simulations = 4000\n"));
+        assert!(text.contains("arena_cpuct = 0.65\n"));
+        assert!(text.contains("arena_cpuct_at_root = 1.5\n"));
+        assert!(text.contains("arena_policy_softmax_temp = 1.3\n"));
         assert!(
             text.contains(
                 "pikafish_label_eval_sqlite = \"eval/pikafish-selfplay-5000-d20.sqlite\"\n"
@@ -456,7 +485,9 @@ mod tests {
         assert!(text.contains("pikafish_label_eval_interval = 10\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
         assert!(text.contains("pikafish_label_eval_simulations = 3000\n"));
-        assert!(text.contains("pikafish_label_eval_cpuct = 1.5\n"));
+        assert!(text.contains("pikafish_label_eval_cpuct = 0.65\n"));
+        assert!(text.contains("pikafish_label_eval_cpuct_at_root = 1.5\n"));
+        assert!(text.contains("pikafish_label_eval_policy_softmax_temp = 1.5\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));

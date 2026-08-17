@@ -1307,6 +1307,15 @@ pub struct AzArenaConfig {
     pub start_index: usize,
     pub seed: u64,
     pub cpuct: f32,
+    pub cpuct_at_root: f32,
+    pub cpuct_base: f32,
+    pub cpuct_factor: f32,
+    pub cpuct_base_at_root: f32,
+    pub cpuct_factor_at_root: f32,
+    pub fpu_value: f32,
+    pub fpu_value_at_root: f32,
+    pub draw_score: f32,
+    pub policy_softmax_temp: f32,
 }
 
 pub fn play_arena_games_from_positions(
@@ -1327,6 +1336,15 @@ pub fn play_arena_games_from_positions(
             config.max_plies,
             game_seed,
             config.cpuct,
+            config.cpuct_at_root,
+            config.cpuct_base,
+            config.cpuct_factor,
+            config.cpuct_base_at_root,
+            config.cpuct_factor_at_root,
+            config.fpu_value,
+            config.fpu_value_at_root,
+            config.draw_score,
+            config.policy_softmax_temp,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1351,6 +1369,15 @@ pub fn play_arena_games_from_positions(
             config.max_plies,
             game_seed,
             config.cpuct,
+            config.cpuct_at_root,
+            config.cpuct_base,
+            config.cpuct_factor,
+            config.cpuct_base_at_root,
+            config.cpuct_factor_at_root,
+            config.fpu_value,
+            config.fpu_value_at_root,
+            config.draw_score,
+            config.policy_softmax_temp,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1385,6 +1412,15 @@ fn play_arena_game(
     max_plies: usize,
     seed: u64,
     cpuct: f32,
+    cpuct_at_root: f32,
+    cpuct_base: f32,
+    cpuct_factor: f32,
+    cpuct_base_at_root: f32,
+    cpuct_factor_at_root: f32,
+    fpu_value: f32,
+    fpu_value_at_root: f32,
+    draw_score: f32,
+    policy_softmax_temp: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut rule_history = position.initial_rule_history();
@@ -1411,18 +1447,18 @@ fn play_arena_game(
                 simulations,
                 seed: seed ^ ((ply as u64) << 32),
                 cpuct,
-                cpuct_at_root: cpuct,
-                cpuct_base: 19652.0,
-                cpuct_factor: 2.0,
-                cpuct_base_at_root: 19652.0,
-                cpuct_factor_at_root: 2.0,
+                cpuct_at_root,
+                cpuct_base,
+                cpuct_factor,
+                cpuct_base_at_root,
+                cpuct_factor_at_root,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value: 0.30,
-                fpu_value_at_root: 0.20,
-                policy_softmax_temp: 1.0,
-                draw_score: 0.0,
+                fpu_value,
+                fpu_value_at_root,
+                policy_softmax_temp,
+                draw_score,
                 value_scale: 1.0,
             },
         );
