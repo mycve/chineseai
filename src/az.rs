@@ -1018,6 +1018,7 @@ pub struct AzLoopReport {
     pub terminal_black_general_missing: usize,
     pub terminal_rule_draw: usize,
     pub terminal_rule_draw_natural_limit: usize,
+    pub terminal_rule_draw_insufficient_material: usize,
     pub terminal_rule_draw_repetition: usize,
     pub terminal_rule_draw_mutual_long_check: usize,
     pub terminal_rule_draw_mutual_long_chase: usize,

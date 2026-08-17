@@ -25,6 +25,7 @@ pub struct AzTerminalStats {
     pub black_general_missing: usize,
     pub rule_draw: usize,
     pub rule_draw_natural_limit: usize,
+    pub rule_draw_insufficient_material: usize,
     pub rule_draw_repetition: usize,
     pub rule_draw_mutual_long_check: usize,
     pub rule_draw_mutual_long_chase: usize,
@@ -55,6 +56,7 @@ impl AzTerminalStats {
         self.black_general_missing += other.black_general_missing;
         self.rule_draw += other.rule_draw;
         self.rule_draw_natural_limit += other.rule_draw_natural_limit;
+        self.rule_draw_insufficient_material += other.rule_draw_insufficient_material;
         self.rule_draw_repetition += other.rule_draw_repetition;
         self.rule_draw_mutual_long_check += other.rule_draw_mutual_long_check;
         self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
@@ -590,6 +592,9 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                             RuleDrawReason::NaturalMoveLimit => {
                                 terminal.rule_draw_natural_limit += 1
                             }
+                            RuleDrawReason::InsufficientMaterial => {
+                                terminal.rule_draw_insufficient_material += 1
+                            }
                             RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
                             RuleDrawReason::MutualLongCheck => {
                                 terminal.rule_draw_mutual_long_check += 1
@@ -955,6 +960,9 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                             match reason {
                                 RuleDrawReason::NaturalMoveLimit => {
                                     data.terminal.rule_draw_natural_limit += 1
+                                }
+                                RuleDrawReason::InsufficientMaterial => {
+                                    data.terminal.rule_draw_insufficient_material += 1
                                 }
                                 RuleDrawReason::Repetition => {
                                     data.terminal.rule_draw_repetition += 1

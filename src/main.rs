@@ -1052,6 +1052,10 @@ fn build_async_training_report(
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
         terminal_rule_draw: pending.selfplay.terminal.rule_draw,
         terminal_rule_draw_natural_limit: pending.selfplay.terminal.rule_draw_natural_limit,
+        terminal_rule_draw_insufficient_material: pending
+            .selfplay
+            .terminal
+            .rule_draw_insufficient_material,
         terminal_rule_draw_repetition: pending.selfplay.terminal.rule_draw_repetition,
         terminal_rule_draw_mutual_long_check: pending.selfplay.terminal.rule_draw_mutual_long_check,
         terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
@@ -2421,6 +2425,7 @@ fn main() {
                                         terminal_black_general_missing: 0,
                                         terminal_rule_draw: 0,
                                         terminal_rule_draw_natural_limit: 0,
+                                        terminal_rule_draw_insufficient_material: 0,
                                         terminal_rule_draw_repetition: 0,
                                         terminal_rule_draw_mutual_long_check: 0,
                                         terminal_rule_draw_mutual_long_chase: 0,
@@ -2494,6 +2499,7 @@ fn main() {
                                         terminal_black_general_missing: 0,
                                         terminal_rule_draw: 0,
                                         terminal_rule_draw_natural_limit: 0,
+                                        terminal_rule_draw_insufficient_material: 0,
                                         terminal_rule_draw_repetition: 0,
                                         terminal_rule_draw_mutual_long_check: 0,
                                         terminal_rule_draw_mutual_long_chase: 0,
@@ -2948,6 +2954,12 @@ fn main() {
                     "terminal/rule_draw_natural_limit",
                     update,
                     report.terminal_rule_draw_natural_limit as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_draw_insufficient_material",
+                    update,
+                    report.terminal_rule_draw_insufficient_material as f32,
                 );
                 log_scalar(
                     &mut tb,

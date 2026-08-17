@@ -63,13 +63,16 @@ impl Position {
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome_with_history");
+        if let Some(outcome) = Self::rule_outcome(history) {
+            return Some(outcome);
+        }
         if self
             .rule60_max_ply
             .is_some_and(|max_ply| self.halfmove_clock >= max_ply)
         {
             return Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit));
         }
-        Self::rule_outcome(history)
+        self.insufficient_material_outcome()
     }
 
     pub fn rule_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
@@ -253,6 +256,82 @@ impl Position {
             (self.board[from].map(|piece| piece.kind), target.kind),
             (Some(PieceKind::Horse), PieceKind::Rook)
         )
+    }
+
+    fn insufficient_material_outcome(&self) -> Option<RuleOutcome> {
+        if self.dynamic_material_counts[0] + self.dynamic_material_counts[1] > 2 {
+            return None;
+        }
+        let mut counts = [[0u8; 7]; 2];
+        for piece in self.board.iter().flatten() {
+            let color = super::color_index(piece.color);
+            let kind = super::piece_kind_index(piece.kind);
+            counts[color][kind] += 1;
+        }
+        let count = |color: usize, kind: PieceKind| counts[color][super::piece_kind_index(kind)];
+        let total = |kind: PieceKind| count(0, kind) + count(1, kind);
+        if total(PieceKind::Soldier) != 0 {
+            return None;
+        }
+
+        let attacking = |color: usize| {
+            count(color, PieceKind::Rook)
+                + count(color, PieceKind::Cannon)
+                + count(color, PieceKind::Horse)
+        };
+        let total_attacking = attacking(0) + attacking(1);
+        let direct_draw = if total_attacking == 0 {
+            true
+        } else if total_attacking == 1 && total(PieceKind::Cannon) == 1 {
+            let cannon_side = usize::from(count(0, PieceKind::Cannon) == 0);
+            let other = 1 - cannon_side;
+            count(cannon_side, PieceKind::Advisor) == 0
+                && match count(other, PieceKind::Advisor) {
+                    0 => true,
+                    1 => count(cannon_side, PieceKind::Elephant) == 0,
+                    _ => false,
+                }
+        } else {
+            total_attacking == 2
+                && count(0, PieceKind::Cannon) == 1
+                && count(1, PieceKind::Cannon) == 1
+                && total(PieceKind::Advisor) == 0
+                && total(PieceKind::Elephant) == 0
+        };
+        if direct_draw {
+            return Some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial));
+        }
+
+        let mate_sensitive_draw = if total_attacking == 1 && total(PieceKind::Cannon) == 1 {
+            let cannon_side = usize::from(count(0, PieceKind::Cannon) == 0);
+            let other = 1 - cannon_side;
+            count(cannon_side, PieceKind::Advisor) == 0
+                && ((count(other, PieceKind::Advisor) == 1
+                    && count(cannon_side, PieceKind::Elephant) != 0)
+                    || (count(other, PieceKind::Advisor) >= 2
+                        && count(cannon_side, PieceKind::Elephant) == 0))
+        } else {
+            total_attacking == 2
+                && count(0, PieceKind::Cannon) == 1
+                && count(1, PieceKind::Cannon) == 1
+                && total(PieceKind::Advisor) == 0
+        };
+        if !mate_sensitive_draw {
+            return None;
+        }
+
+        let legal = self.legal_moves();
+        if legal.is_empty() {
+            return Some(RuleOutcome::Win(self.side_to_move.opposite()));
+        }
+        for mv in legal {
+            let mut next = self.clone();
+            next.make_move(mv);
+            if next.legal_moves().is_empty() {
+                return None;
+            }
+        }
+        Some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial))
     }
 }
 

@@ -50,6 +50,43 @@ fn rule60_can_be_disabled_or_use_a_custom_limit() {
 }
 
 #[test]
+fn insufficient_material_draws_bare_defenders_and_lone_cannon() {
+    for fen in ["3k5/9/9/9/9/9/9/9/9/4K4 w", "3k5/9/9/9/9/9/9/4C4/9/4K4 w"] {
+        let position = Position::from_fen(fen).unwrap();
+        assert_eq!(
+            position.rule_outcome_with_history(&position.initial_rule_history()),
+            Some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial)),
+            "{fen}"
+        );
+    }
+}
+
+#[test]
+fn horse_material_is_not_an_automatic_draw() {
+    let position = Position::from_fen("3k5/9/9/9/9/9/9/4N4/9/4K4 w").unwrap();
+    assert_eq!(
+        position.rule_outcome_with_history(&position.initial_rule_history()),
+        None
+    );
+}
+
+#[test]
+fn repetition_violation_precedes_natural_move_limit() {
+    let position = Position::from_fen("3k5/9/9/9/9/9/9/4R4/9/4K4 w - - 120 1").unwrap();
+    let history = vec![
+        test_rule_entry(1, Color::Red, None, false, 0),
+        test_rule_entry(2, Color::Black, Some(Color::Red), true, 0),
+        test_rule_entry(3, Color::Red, Some(Color::Black), false, 0),
+        test_rule_entry(4, Color::Black, Some(Color::Red), true, 0),
+        test_rule_entry(1, Color::Red, Some(Color::Black), false, 0),
+    ];
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
 fn square_names_follow_pikafish_uci_coordinates() {
     assert_eq!(square_name(index(0, 9)), "a0");
     assert_eq!(square_name(index(8, 0)), "i9");

@@ -156,6 +156,7 @@ pub struct RuleHistoryEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuleDrawReason {
     NaturalMoveLimit,
+    InsufficientMaterial,
     Repetition,
     MutualLongCheck,
     MutualLongChase,
