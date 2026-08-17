@@ -129,6 +129,9 @@ struct AzSearchArgs {
     /// Root first-play urgency reduction.
     #[arg(long, default_value_t = 0.20)]
     fpu_value_at_root: f32,
+    /// Divisor applied to policy logits before root search; above 1 flattens priors.
+    #[arg(long, default_value_t = 1.0)]
+    policy_softmax_temp: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
     cpuct_base: f32,
@@ -411,6 +414,9 @@ struct PikafishLabelEvalArgs {
     /// ChineseAI PUCT constant.
     #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
+    /// Divisor applied to policy logits before search; above 1 flattens priors.
+    #[arg(long, default_value_t = 1.0)]
+    policy_softmax_temp: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
@@ -1227,6 +1233,7 @@ fn fixed_az_search_limits(
     seed: u64,
     cpuct: f32,
     max_depth: usize,
+    policy_softmax_temp: f32,
 ) -> AzSearchLimits {
     AzSearchLimits {
         simulations,
@@ -1242,7 +1249,7 @@ fn fixed_az_search_limits(
         root_exploration_fraction: 0.0,
         fpu_value: 0.30,
         fpu_value_at_root: 0.20,
-        policy_softmax_temp: 1.0,
+        policy_softmax_temp: policy_softmax_temp.max(1.0e-3),
         draw_score: 0.0,
         value_scale: 1.0,
     }
@@ -1382,7 +1389,7 @@ fn main() {
                 root_exploration_fraction: 0.0,
                 fpu_value: cmd.fpu_value.max(0.0),
                 fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
-                policy_softmax_temp: 1.0,
+                policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
                 value_scale: 1.0,
             };
@@ -1480,6 +1487,7 @@ fn main() {
                 "  FPU reduce   non-root={:.3} root={:.3}",
                 search_limits.fpu_value, search_limits.fpu_value_at_root
             );
+            println!("  Policy temp  {:.3}", search_limits.policy_softmax_temp);
             println!("  Draw score   {:.3}", search_limits.draw_score);
             println!("\nRESULT");
             println!("  Best move    {best_move}");
@@ -1599,7 +1607,7 @@ fn main() {
             let _ = alphazero_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, 0),
+                fixed_az_search_limits(simulations, 0, cpuct, 0, 1.0),
             );
 
             let started = std::time::Instant::now();
@@ -1609,7 +1617,7 @@ fn main() {
                 let result = alphazero_search(
                     &position,
                     &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, 0),
+                    fixed_az_search_limits(simulations, iteration as u64, cpuct, 0, 1.0),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -3122,6 +3130,7 @@ fn main() {
                                 config.pikafish_label_eval_cpuct,
                                 config.max_plies,
                                 config.arena_processes,
+                                config.policy_softmax_temp,
                             )
                         })();
                         {
@@ -3617,10 +3626,11 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         cmd.cpuct.max(0.0),
         cmd.max_depth,
         cmd.threads,
+        cmd.policy_softmax_temp,
     )?;
 
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} policy_temp={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
@@ -3628,6 +3638,7 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         stats.value_count(),
         cmd.simulations.max(1),
         cmd.threads.max(1),
+        cmd.policy_softmax_temp,
         100.0 * stats.top1_rate(),
         100.0 * stats.top2_rate(),
         100.0 * stats.top4_rate(),
@@ -3649,6 +3660,7 @@ fn evaluate_pikafish_labels(
     seed: u64,
     cpuct: f32,
     max_depth: usize,
+    policy_softmax_temp: f32,
     mut progress: impl FnMut(usize, usize),
 ) -> io::Result<LabelEvalStats> {
     let mut stats = LabelEvalStats::default();
@@ -3670,7 +3682,13 @@ fn evaluate_pikafish_labels(
         let result = alphazero_search(
             &position,
             model,
-            fixed_az_search_limits(simulations.max(1), seed ^ row.id as u64, cpuct, max_depth),
+            fixed_az_search_limits(
+                simulations.max(1),
+                seed ^ row.id as u64,
+                cpuct,
+                max_depth,
+                policy_softmax_temp,
+            ),
         );
         stats.count += 1;
         if result.best_move == Some(label_move) {
@@ -3726,6 +3744,7 @@ fn evaluate_pikafish_labels_parallel(
     cpuct: f32,
     max_depth: usize,
     thread_count: usize,
+    policy_softmax_temp: f32,
 ) -> io::Result<LabelEvalStats> {
     if rows.is_empty() {
         return Ok(LabelEvalStats::default());
@@ -3750,6 +3769,7 @@ fn evaluate_pikafish_labels_parallel(
                 seed ^ (thread_id as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
                 cpuct,
                 max_depth,
+                policy_softmax_temp,
                 |_, _| {},
             )
         }));

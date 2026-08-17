@@ -31,6 +31,7 @@ struct UciState {
     cpuct_factor_at_root: f32,
     fpu_value: f32,
     fpu_value_at_root: f32,
+    policy_softmax_temp: f32,
     draw_score: f32,
     seed: u64,
 }
@@ -52,6 +53,7 @@ impl Default for UciState {
             cpuct_factor_at_root: 1.5,
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
+            policy_softmax_temp: 1.0,
             draw_score: 0.0,
             seed: 20260409,
         }
@@ -144,6 +146,7 @@ fn print_uci_id() {
     println!("option name CpuctFactorAtRoot type string default 1.5");
     println!("option name FpuValue type string default 0.30");
     println!("option name FpuValueAtRoot type string default 0.20");
+    println!("option name PolicySoftmaxTemp type string default 1.0");
     println!("option name DrawScore type string default 0.0");
     println!("uciok");
     flush();
@@ -223,6 +226,12 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .parse::<f32>()
                 .unwrap_or(state.fpu_value_at_root)
                 .max(0.0);
+        }
+        "policysoftmaxtemp" => {
+            state.policy_softmax_temp = value
+                .parse::<f32>()
+                .unwrap_or(state.policy_softmax_temp)
+                .max(1.0e-3);
         }
         "drawscore" => {
             state.draw_score = value
@@ -444,7 +453,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             root_exploration_fraction: 0.0,
             fpu_value: state.fpu_value,
             fpu_value_at_root: state.fpu_value_at_root,
-            policy_softmax_temp: 1.0,
+            policy_softmax_temp: state.policy_softmax_temp,
             draw_score: state.draw_score,
             value_scale: 1.0,
         },
@@ -581,6 +590,13 @@ mod tests {
             uci_simulation_limit(&timed, 10_000, true),
             MAX_UCI_SIMULATIONS
         );
+    }
+
+    #[test]
+    fn policy_softmax_temperature_is_configurable() {
+        let mut state = UciState::default();
+        handle_setoption("setoption name PolicySoftmaxTemp value 1.5", &mut state);
+        assert_eq!(state.policy_softmax_temp, 1.5);
     }
 
     #[test]
