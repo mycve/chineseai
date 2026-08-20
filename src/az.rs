@@ -42,9 +42,9 @@ use crate::xiangqi::{
 pub use alphazero::{
     AzBatchSearchInput, AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult,
     AzSearchTraceStep, alphazero_search, alphazero_search_batch4,
-    alphazero_search_trace_with_rules, alphazero_search_with_rules,
-    alphazero_search_with_rules_controlled, alphazero_search_with_rules_controlled_with_progress,
-    cp_from_q,
+    alphazero_search_external_root_controlled_with_progress, alphazero_search_trace_with_rules,
+    alphazero_search_with_rules, alphazero_search_with_rules_controlled,
+    alphazero_search_with_rules_controlled_with_progress, cp_from_q,
 };
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,

@@ -185,7 +185,54 @@ pub fn alphazero_search_with_rules_controlled_with_progress(
     model: &AzNnue,
     limits: AzSearchLimits,
     control: Option<&AzSearchControl>,
+    progress: Option<&mut dyn FnMut(&AzSearchResult)>,
+) -> AzSearchResult {
+    alphazero_search_with_rules_controlled_with_progress_root_mode(
+        position,
+        rule_history,
+        root_moves,
+        model,
+        limits,
+        control,
+        progress,
+        true,
+    )
+}
+
+/// Search a position supplied by an external game controller. The controller owns
+/// root adjudication; rule outcomes are still applied below root and rule-forbidden
+/// moves can still be excluded from `root_moves` by the caller.
+pub fn alphazero_search_external_root_controlled_with_progress(
+    position: &Position,
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    control: Option<&AzSearchControl>,
+    progress: Option<&mut dyn FnMut(&AzSearchResult)>,
+) -> AzSearchResult {
+    alphazero_search_with_rules_controlled_with_progress_root_mode(
+        position,
+        rule_history,
+        root_moves,
+        model,
+        limits,
+        control,
+        progress,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alphazero_search_with_rules_controlled_with_progress_root_mode(
+    position: &Position,
+    rule_history: Option<Vec<RuleHistoryEntry>>,
+    root_moves: Option<Vec<Move>>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    control: Option<&AzSearchControl>,
     mut progress: Option<&mut dyn FnMut(&AzSearchResult)>,
+    adjudicate_root_rules: bool,
 ) -> AzSearchResult {
     crate::scope_profile!("az.alphazero_search");
     let mut tree = AzTree::new(
@@ -195,6 +242,7 @@ pub fn alphazero_search_with_rules_controlled_with_progress(
         model,
         limits,
     );
+    tree.adjudicate_root_rules = adjudicate_root_rules;
     let root = tree.root;
     {
         crate::scope_profile!("az.search.root_expand");
@@ -485,6 +533,7 @@ struct AzTree<'a> {
     root_moves: Option<Vec<Move>>,
     root_raw_priors: Vec<f32>,
     root: usize,
+    adjudicate_root_rules: bool,
     cpuct: f32,
     cpuct_at_root: f32,
     cpuct_base: f32,
@@ -817,6 +866,7 @@ impl<'a> AzTree<'a> {
             root_moves,
             root_raw_priors,
             root: 0,
+            adjudicate_root_rules: true,
             cpuct: if limits.cpuct > 0.0 {
                 limits.cpuct
             } else {
@@ -911,10 +961,12 @@ impl<'a> AzTree<'a> {
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
         }
-        let terminal = {
-            crate::scope_profile!("az.search.terminal_value");
-            terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
-        };
+        let terminal = (node_index != self.root || self.adjudicate_root_rules)
+            .then(|| {
+                crate::scope_profile!("az.search.terminal_value");
+                terminal_value(&self.nodes[node_index].position, &self.rule_history_scratch)
+            })
+            .flatten();
         if let Some(value) = terminal {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].value = value;
@@ -2649,6 +2701,48 @@ mod tests {
             position.rule_outcome_with_history(&rule_history),
             Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
         );
+    }
+
+    #[test]
+    fn external_controller_mode_does_not_adjudicate_the_root() {
+        let position = Position::startpos();
+        let rule_history = vec![
+            position.rule_history_entry(None),
+            RuleHistoryEntry {
+                hash: position.hash(),
+                side_to_move: position.side_to_move(),
+                mover: Some(Color::Black),
+                gives_check: false,
+                chased_mask: 0,
+                mv: None,
+                captured: None,
+                rule60_clock: 0,
+            },
+        ];
+        assert!(position.rule_outcome_with_history(&rule_history).is_some());
+
+        let model = AzNnue::random(4, 72);
+        let root_moves = position.legal_moves();
+        let mut internal = AzTree::new(
+            position.clone(),
+            rule_history.clone(),
+            Some(root_moves.clone()),
+            &model,
+            AzSearchLimits::default(),
+        );
+        internal.expand(internal.root);
+        assert_eq!(internal.node_children(internal.root).len(), 0);
+
+        let mut external = AzTree::new(
+            position,
+            rule_history,
+            Some(root_moves),
+            &model,
+            AzSearchLimits::default(),
+        );
+        external.adjudicate_root_rules = false;
+        external.expand(external.root);
+        assert!(!external.node_children(external.root).is_empty());
     }
 
     #[test]

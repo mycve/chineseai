@@ -188,7 +188,42 @@ impl Position {
         crate::scope_profile!("xiangqi.chased_mask_by");
         let mut work = self.clone();
         work.side_to_move = color;
+        let mut captures = Vec::with_capacity(16);
+        let mut square_mask = 0u128;
+        for origin in 0..super::BOARD_SIZE {
+            let Some(piece) = self.board[origin].filter(|piece| piece.color == color) else {
+                continue;
+            };
+            if matches!(piece.kind, PieceKind::General | PieceKind::Soldier) {
+                continue;
+            }
+            captures.clear();
+            self.gen_piece_moves(origin, piece, MoveGenMode::Captures, &mut captures);
+            for &mv in &captures {
+                let target = mv.to as usize;
+                let Some(target_piece) = self.board[target] else {
+                    continue;
+                };
+                if !self.is_chase_target_piece(target_piece, color, target)
+                    || !self.is_effective_chase(target_piece, target, origin)
+                {
+                    continue;
+                }
+                let captured = work.make_move_board_only(mv);
+                let legal = !work.in_check(color);
+                work.unmake_move_board_only(mv, captured);
+                if legal {
+                    square_mask |= 1u128 << target;
+                }
+            }
+        }
+        square_mask
+    }
 
+    #[cfg(test)]
+    fn chased_masks_by_target_scan(&self, color: Color) -> u128 {
+        let mut work = self.clone();
+        work.side_to_move = color;
         let mut square_mask = 0u128;
         for target in 0..super::BOARD_SIZE {
             let Some(target_piece) = self.board[target] else {
@@ -197,14 +232,11 @@ impl Position {
             if !self.is_chase_target_piece(target_piece, color, target) {
                 continue;
             }
-
             self.visit_attacker_origins_to(target, color, |from| {
                 if self.board[from].is_some_and(|piece| {
                     matches!(piece.kind, PieceKind::General | PieceKind::Soldier)
-                }) {
-                    return false;
-                }
-                if !self.is_effective_chase(target_piece, target, from) {
+                }) || !self.is_effective_chase(target_piece, target, from)
+                {
                     return false;
                 }
                 let mv = Move::new(from, target);
@@ -213,9 +245,8 @@ impl Position {
                 work.unmake_move_board_only(mv, captured);
                 if legal {
                     square_mask |= 1u128 << target;
-                    return true;
                 }
-                false
+                legal
             });
         }
         square_mask
@@ -521,5 +552,26 @@ mod tests {
         assert_ne!((after & !before) & (1u128 << horse), 0);
         let exact = position.recompute_cycle_chases(&[recorded]).unwrap();
         assert_ne!(exact[0].chased_mask & (1u128 << horse), 0);
+    }
+
+    #[test]
+    fn origin_scan_chase_masks_match_target_scan() {
+        let mut position = Position::startpos();
+        for ply in 0..160usize {
+            for color in [Color::Red, Color::Black] {
+                assert_eq!(
+                    position.chased_masks_by(color),
+                    position.chased_masks_by_target_scan(color),
+                    "mismatch at ply {ply}, color {color:?}, fen {}",
+                    position.to_fen()
+                );
+            }
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            let index = (ply.wrapping_mul(37).wrapping_add(11)) % legal.len();
+            position.make_move(legal[index]);
+        }
     }
 }
