@@ -14,6 +14,14 @@ use std::time::{Duration, Instant};
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_SIMULATIONS: usize = 10_000;
+const DEFAULT_CPUCT: f32 = 0.9;
+const DEFAULT_CPUCT_AT_ROOT: f32 = 2.0;
+const DEFAULT_CPUCT_BASE: f32 = 19_652.0;
+const DEFAULT_CPUCT_FACTOR: f32 = 1.5;
+const DEFAULT_FPU_VALUE: f32 = 0.20;
+const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 0.10;
+const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.2;
 
 #[derive(Clone, Debug)]
 struct UciState {
@@ -45,17 +53,17 @@ impl Default for UciState {
             rule_history: Position::startpos().initial_rule_history(),
             eval_file: "model.safetensors".into(),
             model: None,
-            simulations: 10_000,
+            simulations: DEFAULT_SIMULATIONS,
             threads: 1,
-            cpuct: 0.9,
-            cpuct_at_root: 2.0,
-            cpuct_base: 19652.0,
-            cpuct_factor: 1.5,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 1.5,
-            fpu_value: 0.20,
-            fpu_value_at_root: 0.10,
-            policy_softmax_temp: 1.2,
+            cpuct: DEFAULT_CPUCT,
+            cpuct_at_root: DEFAULT_CPUCT_AT_ROOT,
+            cpuct_base: DEFAULT_CPUCT_BASE,
+            cpuct_factor: DEFAULT_CPUCT_FACTOR,
+            cpuct_base_at_root: DEFAULT_CPUCT_BASE,
+            cpuct_factor_at_root: DEFAULT_CPUCT_FACTOR,
+            fpu_value: DEFAULT_FPU_VALUE,
+            fpu_value_at_root: DEFAULT_FPU_VALUE_AT_ROOT,
+            policy_softmax_temp: DEFAULT_POLICY_SOFTMAX_TEMP,
             draw_score: 0.0,
             sixty_move_rule: true,
             rule60_max_ply: 120,
@@ -141,17 +149,17 @@ fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
     println!("option name EvalFile type string default model.safetensors");
-    println!("option name Simulations type spin default 10000 min 1 max 100000000");
+    println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
-    println!("option name Cpuct type string default 0.65");
-    println!("option name CpuctAtRoot type string default 1.5");
-    println!("option name CpuctBase type string default 19652.0");
-    println!("option name CpuctFactor type string default 1.5");
-    println!("option name CpuctBaseAtRoot type string default 19652.0");
-    println!("option name CpuctFactorAtRoot type string default 1.5");
-    println!("option name FpuValue type string default 0.30");
-    println!("option name FpuValueAtRoot type string default 0.20");
-    println!("option name PolicySoftmaxTemp type string default 1.0");
+    println!("option name Cpuct type string default {DEFAULT_CPUCT}");
+    println!("option name CpuctAtRoot type string default {DEFAULT_CPUCT_AT_ROOT}");
+    println!("option name CpuctBase type string default {DEFAULT_CPUCT_BASE}");
+    println!("option name CpuctFactor type string default {DEFAULT_CPUCT_FACTOR}");
+    println!("option name CpuctBaseAtRoot type string default {DEFAULT_CPUCT_BASE}");
+    println!("option name CpuctFactorAtRoot type string default {DEFAULT_CPUCT_FACTOR}");
+    println!("option name FpuValue type string default {DEFAULT_FPU_VALUE}");
+    println!("option name FpuValueAtRoot type string default {DEFAULT_FPU_VALUE_AT_ROOT}");
+    println!("option name PolicySoftmaxTemp type string default {DEFAULT_POLICY_SOFTMAX_TEMP}");
     println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
@@ -454,6 +462,19 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AzSearchControl::new(Arc::clone(&stop), deadline);
+    println!(
+        "info string searchparams cpuct={:.4}/{:.4} base={:.1}/{:.1} factor={:.4}/{:.4} fpu={:.4}/{:.4} policytemp={:.4}",
+        state.cpuct,
+        state.cpuct_at_root,
+        state.cpuct_base,
+        state.cpuct_base_at_root,
+        state.cpuct_factor,
+        state.cpuct_factor_at_root,
+        state.fpu_value,
+        state.fpu_value_at_root,
+        state.policy_softmax_temp
+    );
+    flush();
     let mut report_progress = |progress: &AzSearchResult| {
         print_search_info(progress, started);
         flush();
@@ -567,6 +588,21 @@ fn flush() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_defaults_use_the_single_uci_default_source() {
+        let state = UciState::default();
+        assert_eq!(state.simulations, DEFAULT_SIMULATIONS);
+        assert_eq!(state.cpuct, DEFAULT_CPUCT);
+        assert_eq!(state.cpuct_at_root, DEFAULT_CPUCT_AT_ROOT);
+        assert_eq!(state.cpuct_base, DEFAULT_CPUCT_BASE);
+        assert_eq!(state.cpuct_factor, DEFAULT_CPUCT_FACTOR);
+        assert_eq!(state.cpuct_base_at_root, DEFAULT_CPUCT_BASE);
+        assert_eq!(state.cpuct_factor_at_root, DEFAULT_CPUCT_FACTOR);
+        assert_eq!(state.fpu_value, DEFAULT_FPU_VALUE);
+        assert_eq!(state.fpu_value_at_root, DEFAULT_FPU_VALUE_AT_ROOT);
+        assert_eq!(state.policy_softmax_temp, DEFAULT_POLICY_SOFTMAX_TEMP);
+    }
 
     #[test]
     fn parses_standard_go_time_and_search_limits() {
