@@ -1,6 +1,6 @@
 use crate::version::REPLAY_FILE_VERSION;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -154,6 +154,7 @@ pub struct AzReplayWindowStats {
 pub struct AzReplaySampleBatch {
     pub samples: Vec<AzTrainingSample>,
     pub recent_samples: usize,
+    pub actual_recent_samples: usize,
     pub full_window_samples: usize,
 }
 
@@ -302,16 +303,11 @@ impl AzExperiencePool {
         if self.sample_count == 0 || count == 0 {
             return Vec::new();
         }
+        let chunk_ends = self.chunk_ends();
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            let mut index = (rng.next_u64() as usize) % self.sample_count;
-            for chunk in &self.chunks {
-                if index < chunk.len() {
-                    out.push(chunk.entries[index].sample.clone());
-                    break;
-                }
-                index -= chunk.len();
-            }
+            let index = (rng.next_u64() as usize) % self.sample_count;
+            out.push(self.sample_by_flat_index(index, &chunk_ends));
         }
         out
     }
@@ -326,60 +322,73 @@ impl AzExperiencePool {
         if self.sample_count == 0 || count == 0 {
             return AzReplaySampleBatch::default();
         }
-        let recent_indices = self.recent_flat_indices(recent_games.max(1));
-        if recent_indices.is_empty() {
+        let Some(recent_start) = self.recent_start_flat(recent_games.max(1)) else {
             return AzReplaySampleBatch {
                 samples: self.sample_uniform(count, rng),
                 recent_samples: 0,
+                actual_recent_samples: 0,
                 full_window_samples: count,
             };
-        }
+        };
+        let recent_count = self.sample_count - recent_start;
         let recent_target = ((count as f32) * recent_fraction.clamp(0.0, 1.0)).round() as usize;
         let recent_target = recent_target.min(count);
+        let chunk_ends = self.chunk_ends();
         let mut samples = Vec::with_capacity(count);
         for _ in 0..recent_target {
-            let flat = recent_indices[(rng.next_u64() as usize) % recent_indices.len()];
-            samples.push(self.sample_by_flat_index(flat));
+            let flat = recent_start + (rng.next_u64() as usize) % recent_count;
+            samples.push(self.sample_by_flat_index(flat, &chunk_ends));
         }
         let full_count = count - recent_target;
-        samples.extend(self.sample_uniform(full_count, rng));
+        let mut actual_recent_samples = recent_target;
+        for _ in 0..full_count {
+            let flat = (rng.next_u64() as usize) % self.sample_count;
+            actual_recent_samples += usize::from(flat >= recent_start);
+            samples.push(self.sample_by_flat_index(flat, &chunk_ends));
+        }
         AzReplaySampleBatch {
             samples,
             recent_samples: recent_target,
+            actual_recent_samples,
             full_window_samples: full_count,
         }
     }
 
-    fn recent_flat_indices(&self, recent_games: u32) -> Vec<usize> {
-        let newest = self
-            .chunks
-            .iter()
-            .map(|chunk| chunk.generation_update)
-            .max()
-            .unwrap_or(0);
-        let oldest_recent = newest.saturating_sub(recent_games.saturating_sub(1));
-        let mut out = Vec::new();
-        let mut flat = 0usize;
-        for chunk in &self.chunks {
-            if chunk.generation_update >= oldest_recent {
-                out.extend(flat..flat + chunk.len());
-            }
-            flat += chunk.len();
+    fn recent_start_flat(&self, recent_games: u32) -> Option<usize> {
+        if self.chunks.is_empty() {
+            return None;
         }
-        out
+        let old_games = self
+            .chunks
+            .len()
+            .saturating_sub((recent_games as usize).max(1));
+        Some(
+            self.chunks
+                .iter()
+                .take(old_games)
+                .map(ReplayChunk::len)
+                .sum(),
+        )
     }
 
-    fn sample_by_flat_index(&self, mut index: usize) -> AzTrainingSample {
-        for chunk in &self.chunks {
-            if index < chunk.len() {
-                return chunk.entries[index].sample.clone();
-            }
-            index -= chunk.len();
-        }
+    fn chunk_ends(&self) -> Vec<usize> {
+        let mut total = 0usize;
         self.chunks
-            .back()
-            .and_then(|chunk| chunk.entries.last())
-            .expect("non-empty replay pool")
+            .iter()
+            .map(|chunk| {
+                total += chunk.len();
+                total
+            })
+            .collect()
+    }
+
+    fn sample_by_flat_index(&self, index: usize, chunk_ends: &[usize]) -> AzTrainingSample {
+        debug_assert!(index < self.sample_count);
+        let chunk_index = chunk_ends.partition_point(|&end| end <= index);
+        let chunk_start = chunk_index
+            .checked_sub(1)
+            .map_or(0, |previous| chunk_ends[previous]);
+        self.chunks[chunk_index].entries[index - chunk_start]
             .sample
             .clone()
     }
@@ -417,15 +426,15 @@ impl AzExperiencePool {
             .unwrap_or(0);
         let newest = self.max_generation_update();
         let mut weighted_sum = 0u64;
-        let mut by_update = BTreeMap::<u32, usize>::new();
         for chunk in &self.chunks {
             weighted_sum += chunk.generation_update as u64 * chunk.len() as u64;
-            *by_update.entry(chunk.generation_update).or_default() += chunk.len();
         }
-        let recent_oldest = newest.saturating_sub(recent_games.max(1).saturating_sub(1));
-        let recent_samples = by_update
+        let recent_samples = self
+            .chunks
             .iter()
-            .filter_map(|(&update, &count)| (update >= recent_oldest).then_some(count))
+            .rev()
+            .take(recent_games.max(1) as usize)
+            .map(ReplayChunk::len)
             .sum::<usize>();
         AzReplayWindowStats {
             chunks: self.chunks.len(),
@@ -433,7 +442,7 @@ impl AzExperiencePool {
             oldest_generation_update: oldest,
             newest_generation_update: newest,
             avg_generation_update: weighted_sum as f32 / self.sample_count as f32,
-            window_games: newest.saturating_sub(oldest).saturating_add(1),
+            window_games: self.chunks.len().min(u32::MAX as usize) as u32,
             recent_window_sample_fraction: recent_samples as f32 / self.sample_count as f32,
         }
     }

@@ -4079,6 +4079,43 @@ mod tests {
         assert_eq!(batch.samples.len(), 10);
         assert_eq!(batch.recent_samples, 4);
         assert_eq!(batch.full_window_samples, 6);
+        assert!((4..=10).contains(&batch.actual_recent_samples));
+    }
+
+    #[test]
+    fn replay_recent_games_counts_complete_games_not_generation_batches() {
+        fn sample(game_id: u64) -> AzTrainingSample {
+            AzTrainingSample {
+                features: vec![1],
+                rule_context: [0.0; RULE_CONTEXT_SIZE],
+                move_indices: vec![0],
+                policy: vec![1.0],
+                value_wdl: scalar_value_to_wdl_target(0.0),
+                value: 0.0,
+                side_sign: 1.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 0,
+                meta: AzSampleMeta {
+                    generation_update: 7,
+                    game_id,
+                    ..AzSampleMeta::default()
+                },
+            }
+        }
+
+        let mut pool = AzExperiencePool::new(8);
+        for game_id in 1..=4 {
+            pool.add_games(vec![vec![sample(game_id)]]);
+        }
+        let stats = pool.window_stats(2);
+        assert_eq!(stats.window_games, 4);
+        assert!((stats.recent_window_sample_fraction - 0.5).abs() < 1e-6);
+
+        let mut rng = SplitMix64::new(9);
+        let batch = pool.sample_mixed_recent(100, 1.0, 2, &mut rng);
+        assert!(batch.samples.iter().all(|sample| sample.meta.game_id >= 3));
+        assert_eq!(batch.actual_recent_samples, 100);
     }
 
     #[test]

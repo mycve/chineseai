@@ -1062,8 +1062,7 @@ fn train_batch_source_stats(
     samples: &[AzTrainingSample],
     full_simulations: usize,
     recent_quota_samples: usize,
-    newest_generation: u32,
-    recent_window_games: u32,
+    actual_recent_samples: usize,
 ) -> TrainBatchSourceStats {
     if samples.is_empty() {
         return TrainBatchSourceStats::default();
@@ -1072,19 +1071,15 @@ fn train_batch_source_stats(
     let mut fast = 0usize;
     let mut policy_weight_sum = 0.0f32;
     let mut value_weight_sum = 0.0f32;
-    let mut actual_recent = 0usize;
     let mut target_entropy_sum = 0.0f32;
     let mut target_top1_sum = 0.0f32;
     let mut target_top2_sum = 0.0f32;
-    let recent_oldest =
-        newest_generation.saturating_sub(recent_window_games.max(1).saturating_sub(1));
     for sample in samples {
         fast += usize::from(
             sample.search_simulations > 0 && sample.search_simulations < full_simulations,
         );
         policy_weight_sum += sample.policy_weight.max(0.0);
         value_weight_sum += sample.value_weight.max(0.0);
-        actual_recent += usize::from(sample.meta.generation_update >= recent_oldest);
         let active_targets = sample
             .move_indices
             .iter()
@@ -1128,7 +1123,7 @@ fn train_batch_source_stats(
         policy_weight_mean: policy_weight_sum / denom,
         value_weight_mean: value_weight_sum / denom,
         recent_quota_rate: recent_quota_samples.min(samples.len()) as f32 / denom,
-        actual_recent_sample_rate: actual_recent as f32 / denom,
+        actual_recent_sample_rate: actual_recent_samples.min(samples.len()) as f32 / denom,
         policy_target_entropy: target_entropy_sum / denom,
         policy_target_top1: target_top1_sum / denom,
         policy_target_top2: target_top2_sum / denom,
@@ -2304,8 +2299,7 @@ fn main() {
                         &train_data,
                         trainer_config.simulations,
                         sampled_batch.recent_samples,
-                        pool.max_generation_update(),
-                        trainer_config.replay_recent_games,
+                        sampled_batch.actual_recent_samples,
                     );
                     let train_update = trainer_start_update.saturating_add(train_index);
                     let current_lr = learning_rate_for_update(&trainer_config, train_update);
@@ -4664,7 +4658,7 @@ mod reporting_tests {
             reporting_sample(10, vec![3.0, 1.0]),
             reporting_sample(5, vec![2.0, 2.0]),
         ];
-        let stats = train_batch_source_stats(&samples, 4_000, 1, 10, 3);
+        let stats = train_batch_source_stats(&samples, 4_000, 1, 1);
 
         assert!((stats.recent_quota_rate - 0.5).abs() < 1e-6);
         assert!((stats.actual_recent_sample_rate - 0.5).abs() < 1e-6);
