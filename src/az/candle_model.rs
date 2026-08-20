@@ -9,7 +9,7 @@ use super::{
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
-    fused_sparse_policy::sparse_policy,
+    fused_sparse_policy::{sparse_policy, tactical_policy},
 };
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
 
@@ -137,10 +137,7 @@ impl AzCandleModel {
             ],
             0,
         )?;
-        let tactical_logits = tactical_table
-            .index_select(&batch.policy_tactical_indices.flatten_all()?, 0)?
-            .reshape((batch.batch_size, batch.max_policy_moves, 2))?
-            .sum(2)?;
+        let tactical_logits = tactical_policy(&tactical_table, &batch.policy_tactical_indices)?;
         let policy_logits = (policy_logits + sparse_logits + tactical_logits)?;
 
         Ok(ForwardOutput {
@@ -170,7 +167,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
     pub(super) value_phase_masks: Tensor,
-    pub(super) max_policy_moves: usize,
 }
 
 impl BatchTensors {
@@ -233,7 +229,6 @@ impl BatchTensors {
             policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
-            max_policy_moves,
         })
     }
 }
