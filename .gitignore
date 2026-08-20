@@ -8,6 +8,7 @@ pikafish.nnue
 chineseai*
 *.toml.progress
 *.replay.lz4
+midgame-pool.lz4
 distill_data
 runs
 *azloop*

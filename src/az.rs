@@ -18,6 +18,7 @@ mod dataloader;
 mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
+mod midgame;
 mod play;
 mod replay;
 mod train;
@@ -47,6 +48,7 @@ pub use alphazero::{
     alphazero_search_with_rules, alphazero_search_with_rules_controlled,
     alphazero_search_with_rules_controlled_with_progress, cp_from_q,
 };
+pub use midgame::{AzMidgamePool, AzStartSnapshot};
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions,
@@ -978,6 +980,8 @@ pub struct AzLoopConfig {
     pub value_td_lambda: f32,
     pub opening_positions: Arc<[Position]>,
     pub opening_fen_game_fraction: f32,
+    pub midgame_positions: Arc<[AzStartSnapshot]>,
+    pub midgame_start_fraction: f32,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,

@@ -13,9 +13,9 @@ use super::alphazero::{
     alphazero_search_with_rules_reusing,
 };
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzTrainingSample, SplitMix64,
-    alphazero_search_with_rules, dense_move_index, rule_context_features,
-    scalar_value_to_wdl_target,
+    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
+    AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
+    rule_context_features, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,6 +146,7 @@ pub struct AzSelfplayData {
     pub samples: Vec<AzTrainingSample>,
     pub games: Vec<Vec<AzTrainingSample>>,
     pub position_fens: Vec<String>,
+    pub midgame_snapshots: Vec<AzStartSnapshot>,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -188,6 +189,8 @@ impl AzSelfplayData {
         self.games.extend(other.games.iter().cloned());
         self.position_fens
             .extend(other.position_fens.iter().cloned());
+        self.midgame_snapshots
+            .extend(other.midgame_snapshots.iter().cloned());
         self.red_wins += other.red_wins;
         self.black_wins += other.black_wins;
         self.draws += other.draws;
@@ -258,6 +261,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.samples.extend(chunk.samples);
         merged.games.extend(chunk.games);
         merged.position_fens.extend(chunk.position_fens);
+        merged.midgame_snapshots.extend(chunk.midgame_snapshots);
         merged.red_wins += chunk.red_wins;
         merged.black_wins += chunk.black_wins;
         merged.draws += chunk.draws;
@@ -333,6 +337,76 @@ fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Po
     position
 }
 
+const OPENING_FEN_PHASE_PLY: usize = 8;
+
+struct SelfplayStart {
+    position: Position,
+    rule_history: Vec<RuleHistoryEntry>,
+    phase_ply: usize,
+    harvest_ply: Option<usize>,
+}
+
+fn choose_harvest_ply(rng: &mut SplitMix64, phase_ply: usize, max_plies: usize) -> Option<usize> {
+    let roll = rng.unit_f32();
+    let (start, width) = if roll < 0.50 {
+        (30usize, 30usize)
+    } else if roll < 0.85 {
+        (60, 40)
+    } else {
+        (100, 40)
+    };
+    let target = start + (rng.next_u64() as usize % width);
+    (target >= phase_ply && target < max_plies).then_some(target)
+}
+
+fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> SelfplayStart {
+    let roll = rng.unit_f32();
+    let configured_midgame_fraction = config.midgame_start_fraction.clamp(0.0, 1.0);
+    let pool_empty = config.midgame_positions.is_empty();
+    let midgame_fraction = if pool_empty {
+        0.0
+    } else {
+        configured_midgame_fraction
+    };
+    if roll < midgame_fraction {
+        let index = rng.next_u64() as usize % config.midgame_positions.len();
+        let snapshot = &config.midgame_positions[index];
+        return SelfplayStart {
+            position: configure_selfplay_rules(snapshot.position.clone(), config),
+            rule_history: snapshot.rule_history.clone(),
+            phase_ply: snapshot.phase_ply as usize,
+            harvest_ply: None,
+        };
+    }
+    let use_opening = use_opening_fen(
+        !config.opening_positions.is_empty(),
+        config.opening_fen_game_fraction
+            + if pool_empty {
+                configured_midgame_fraction
+            } else {
+                0.0
+            },
+        roll - midgame_fraction,
+    );
+    let (position, phase_ply) = if use_opening {
+        let index = rng.next_u64() as usize % config.opening_positions.len();
+        (
+            config.opening_positions[index].clone(),
+            OPENING_FEN_PHASE_PLY,
+        )
+    } else {
+        (Position::startpos(), 0)
+    };
+    let position = configure_selfplay_rules(position, config);
+    let rule_history = position.initial_rule_history();
+    SelfplayStart {
+        position,
+        rule_history,
+        phase_ply,
+        harvest_ply: choose_harvest_ply(rng, phase_ply, config.max_plies),
+    }
+}
+
 fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.chunk");
     if config.games >= 4 {
@@ -347,6 +421,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
     let mut position_fens = Vec::new();
+    let mut midgame_snapshots = Vec::new();
     let mut red_wins = 0usize;
     let mut black_wins = 0usize;
     let mut draws = 0usize;
@@ -385,28 +460,28 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
-        let mut position = configure_selfplay_rules(
-            if use_opening_fen(
-                !config.opening_positions.is_empty(),
-                config.opening_fen_game_fraction,
-                rng.unit_f32(),
-            ) {
-                let index = (rng.next_u64() as usize) % config.opening_positions.len();
-                config.opening_positions[index].clone()
-            } else {
-                Position::startpos()
-            },
-            config,
-        );
-        let mut rule_history = position.initial_rule_history();
+        let start = choose_selfplay_start(config, &mut rng);
+        let mut position = start.position;
+        let mut rule_history = start.rule_history;
+        let start_phase_ply = start.phase_ply;
+        let harvest_ply = start.harvest_ply;
         let mut game_samples = Vec::new();
         let mut game_bootstrap_wdls = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
 
-        for ply in 0..config.max_plies {
-            plies = ply + 1;
+        for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
+            let ply = start_phase_ply + local_ply;
+            plies = local_ply + 1;
+            if harvest_ply == Some(ply) {
+                midgame_snapshots.push(AzStartSnapshot {
+                    position: position.clone(),
+                    rule_history: rule_history.clone(),
+                    phase_ply: ply.min(u16::MAX as usize) as u16,
+                    generation: config.generation_update,
+                });
+            }
             let legal = {
                 crate::scope_profile!("az.selfplay.root_legal_moves");
                 position
@@ -640,6 +715,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         samples,
         games,
         position_fens,
+        midgame_snapshots,
         red_wins,
         black_wins,
         draws,
@@ -685,6 +761,8 @@ struct BatchedSelfplayGame {
     bootstrap_wdls: Vec<[f32; 3]>,
     result: Option<f32>,
     ply: usize,
+    phase_ply: usize,
+    harvest_ply: Option<usize>,
     reported_plies: usize,
     allow_resign: bool,
     rng: SplitMix64,
@@ -693,29 +771,18 @@ struct BatchedSelfplayGame {
 fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> BatchedSelfplayGame {
     let mut rng =
         SplitMix64::new(config.seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let position = configure_selfplay_rules(
-        if use_opening_fen(
-            !config.opening_positions.is_empty(),
-            config.opening_fen_game_fraction,
-            rng.unit_f32(),
-        ) {
-            let index = (rng.next_u64() as usize) % config.opening_positions.len();
-            config.opening_positions[index].clone()
-        } else {
-            Position::startpos()
-        },
-        config,
-    );
-    let rule_history = position.initial_rule_history();
+    let start = choose_selfplay_start(config, &mut rng);
     let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
     BatchedSelfplayGame {
         game_index,
-        position,
-        rule_history,
+        position: start.position,
+        rule_history: start.rule_history,
         samples: Vec::new(),
         bootstrap_wdls: Vec::new(),
         result: None,
         ply: 0,
+        phase_ply: start.phase_ply,
+        harvest_ply: start.harvest_ply,
         reported_plies: 0,
         allow_resign,
         rng,
@@ -790,12 +857,21 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 if state.result.is_some() {
                     continue;
                 }
-                if state.ply >= config.max_plies {
+                if state.phase_ply >= config.max_plies {
                     state.result = Some(0.0);
                     data.terminal.max_plies += 1;
                     continue;
                 }
                 state.reported_plies = state.ply + 1;
+                if state.harvest_ply == Some(state.phase_ply) {
+                    data.midgame_snapshots.push(AzStartSnapshot {
+                        position: state.position.clone(),
+                        rule_history: state.rule_history.clone(),
+                        phase_ply: state.phase_ply.min(u16::MAX as usize) as u16,
+                        generation: config.generation_update,
+                    });
+                    state.harvest_ply = None;
+                }
                 legal_moves[index] = state
                     .position
                     .legal_moves_with_rules_and_repetition(&state.rule_history)
@@ -821,13 +897,14 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     return inactive_batch_input(config);
                 }
                 let state = states[index].as_mut().unwrap();
-                let seed =
-                    state.rng.next_u64() ^ ((state.game_index as u64) << 32) ^ state.ply as u64;
+                let seed = state.rng.next_u64()
+                    ^ ((state.game_index as u64) << 32)
+                    ^ state.phase_ply as u64;
                 AzBatchSearchInput {
                     position: state.position.clone(),
                     rule_history: state.rule_history.clone(),
                     root_moves: std::mem::take(&mut legal_moves[index]),
-                    limits: selfplay_search_limits(config, state.ply, seed),
+                    limits: selfplay_search_limits(config, state.phase_ply, seed),
                 }
             });
             let searches = alphazero_search_batch4_reusing(inputs, model, &mut workspace);
@@ -839,14 +916,14 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 let search = &searches[index];
                 data.search_simulations.searches += 1;
                 data.search_simulations.simulations_sum += search.simulations;
-                record_batched_search_stats(&mut data, search, state.ply, config);
+                record_batched_search_stats(&mut data, search, state.phase_ply, config);
                 if state.allow_resign && should_resign(search.value_q, config) {
                     let meta = root_search_meta(
                         &search.candidates,
                         search.value_q,
                         config.generation_update,
                         config.seed ^ state.game_index as u64,
-                        state.ply,
+                        state.phase_ply,
                     );
                     state.samples.push(make_training_sample(
                         &state.position,
@@ -868,7 +945,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     });
                     continue;
                 }
-                let temperature = temperature_for_ply(config, state.ply);
+                let temperature = temperature_for_ply(config, state.phase_ply);
                 let mv = if temperature <= 1e-6 {
                     search.best_move.or_else(|| {
                         choose_selfplay_move(
@@ -898,7 +975,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     search.value_q,
                     config.generation_update,
                     config.seed ^ state.game_index as u64,
-                    state.ply,
+                    state.phase_ply,
                 );
                 data.sampled_moves += 1;
                 data.sampled_best_moves += usize::from(meta.best_index == meta.played_index);
@@ -940,6 +1017,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                         .rule_history_entry_after_moved(mover, mv, captured),
                 );
                 state.ply += 1;
+                state.phase_ply += 1;
                 if !state.position.has_general(Color::Red) {
                     state.result = Some(-1.0);
                     data.terminal.red_general_missing += 1;
@@ -1551,11 +1629,56 @@ mod tests {
             value_td_lambda: 0.9,
             opening_positions: Default::default(),
             opening_fen_game_fraction: 0.0,
+            midgame_positions: Default::default(),
+            midgame_start_fraction: 0.0,
             resign_percentage: 0.0,
             resign_playthrough: 100.0,
             mirror_probability: 0.0,
             record_fens: false,
         }
+    }
+
+    #[test]
+    fn midgame_start_preserves_phase_and_rule_history_without_reharvesting() {
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 100;
+        config.midgame_start_fraction = 1.0;
+        let position = Position::startpos();
+        let rule_history = position.initial_rule_history();
+        config.midgame_positions = vec![AzStartSnapshot {
+            position,
+            rule_history: rule_history.clone(),
+            phase_ply: 57,
+            generation: 9,
+        }]
+        .into();
+        let start = choose_selfplay_start(&config, &mut SplitMix64::new(3));
+        assert_eq!(start.position.hash(), rule_history.last().unwrap().hash);
+        assert_eq!(start.rule_history, rule_history);
+        assert_eq!(start.phase_ply, 57);
+        assert_eq!(start.harvest_ply, None);
+    }
+
+    #[test]
+    fn empty_midgame_pool_falls_back_to_opening_share() {
+        let mut config = selfplay_test_config(1);
+        config.opening_positions = vec![
+            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/4P4/P1P3P1P/1C5C1/9/RNBAKABNR b")
+                .unwrap(),
+        ]
+        .into();
+        config.opening_fen_game_fraction = 0.5;
+        config.midgame_start_fraction = 0.3;
+        let opening_hash = config.opening_positions[0].hash();
+        let openings = (0..10_000)
+            .filter(|seed| {
+                choose_selfplay_start(&config, &mut SplitMix64::new(*seed))
+                    .position
+                    .hash()
+                    == opening_hash
+            })
+            .count();
+        assert!((7_700..8_300).contains(&openings));
     }
 
     #[test]

@@ -58,6 +58,9 @@ pub struct AzLoopFileConfig {
     pub value_td_lambda: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
+    pub midgame_start_fraction: f32,
+    pub midgame_reservoir_capacity: usize,
+    pub midgame_snapshot_path: String,
     pub selfplay_update_warmup_updates: usize,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -137,7 +140,10 @@ impl Default for AzLoopFileConfig {
             opening_policy_softmax_temp: 1.35,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
             opening_fens_path: "opening_fens.txt".into(),
-            opening_fen_game_fraction: 0.75,
+            opening_fen_game_fraction: 0.50,
+            midgame_start_fraction: 0.30,
+            midgame_reservoir_capacity: 50_000,
+            midgame_snapshot_path: "midgame-pool.lz4".into(),
             selfplay_update_warmup_updates: 5,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
@@ -260,6 +266,12 @@ impl AzLoopFileConfig {
             "opening_fen_game_fraction",
             f(self.opening_fen_game_fraction)
         );
+        line!("midgame_start_fraction", f(self.midgame_start_fraction));
+        line!(
+            "midgame_reservoir_capacity",
+            self.midgame_reservoir_capacity
+        );
+        line!("midgame_snapshot_path", q(&self.midgame_snapshot_path));
         line!(
             "selfplay_update_warmup_updates",
             self.selfplay_update_warmup_updates
@@ -381,7 +393,10 @@ impl AzLoopFileConfig {
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.opening_policy_softmax_temp = self.opening_policy_softmax_temp.max(1e-3);
-        self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
+        self.midgame_start_fraction = self.midgame_start_fraction.clamp(0.0, 1.0);
+        self.opening_fen_game_fraction = self
+            .opening_fen_game_fraction
+            .clamp(0.0, 1.0 - self.midgame_start_fraction);
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
@@ -425,7 +440,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 11\n"));
+        assert!(text.starts_with("format_version = 12\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00012\n"));
         assert!(text.contains("temperature_start = 0.8\n"));
@@ -455,7 +470,10 @@ mod tests {
         assert!(text.contains("value_td_lambda = 0.95\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
-        assert!(text.contains("opening_fen_game_fraction = 0.75\n"));
+        assert!(text.contains("opening_fen_game_fraction = 0.5\n"));
+        assert!(text.contains("midgame_start_fraction = 0.3\n"));
+        assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
+        assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
         assert!(text.contains("selfplay_update_warmup_updates = 5\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));

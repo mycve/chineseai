@@ -11,8 +11,8 @@ use chineseai::version::AZ_LOOP_PROGRESS_VERSION;
 use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
+        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
         DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
         alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
         generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
@@ -849,6 +849,8 @@ fn build_az_loop_config(
         value_td_lambda: config.value_td_lambda,
         opening_positions: Arc::clone(opening_positions),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
+        midgame_positions: Arc::default(),
+        midgame_start_fraction: config.midgame_start_fraction,
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
@@ -1951,6 +1953,27 @@ fn main() {
             });
             let mut tb = SummaryWriter::new(&tb_dir);
             let opening_positions = load_opening_positions(&config.opening_fens_path);
+            let midgame_snapshot_path = PathBuf::from(&config.midgame_snapshot_path);
+            let midgame_pool = if config.midgame_reservoir_capacity == 0 {
+                AzMidgamePool::new(0)
+            } else if midgame_snapshot_path.exists() {
+                AzMidgamePool::load_lz4(&midgame_snapshot_path, config.midgame_reservoir_capacity)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to restore midgame pool `{}`: {err}",
+                            midgame_snapshot_path.display()
+                        )
+                    })
+            } else {
+                AzMidgamePool::new(config.midgame_reservoir_capacity)
+            };
+            println!(
+                "midgame  : restored {}/{} snapshots from `{}`",
+                midgame_pool.len(),
+                midgame_pool.capacity(),
+                midgame_snapshot_path.display()
+            );
+            let shared_midgame_pool = Arc::new(RwLock::new(midgame_pool));
             let next_selfplay_generation = replay_pool
                 .as_ref()
                 .map(AzExperiencePool::max_generation_update)
@@ -2042,7 +2065,7 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : opening={}ply policy_temp={} root_noise(alpha={},fraction={}) move_temp={}..{} normal_policy_temp={} normal_noise_fraction={} opening_fen_games={:.1}% raw_selfplay_warmup={}updates",
+                "explore  : opening={}ply policy_temp={} root_noise(alpha={},fraction={}) move_temp={}..{} normal_policy_temp={} normal_noise_fraction={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} raw_selfplay_warmup={}updates",
                 config.opening_exploration_plies,
                 config.opening_policy_softmax_temp,
                 config.root_dirichlet_alpha,
@@ -2051,7 +2074,10 @@ fn main() {
                 config.temperature_endgame,
                 config.policy_softmax_temp,
                 config.root_exploration_fraction,
+                (1.0 - config.opening_fen_game_fraction - config.midgame_start_fraction) * 100.0,
                 config.opening_fen_game_fraction * 100.0,
+                config.midgame_start_fraction * 100.0,
+                config.midgame_reservoir_capacity,
                 config.selfplay_update_warmup_updates
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
@@ -2108,6 +2134,7 @@ fn main() {
                 let shared_model = Arc::clone(&shared_model);
                 let selfplay_pause = Arc::clone(&selfplay_pause);
                 let selfplay_generation = Arc::clone(&selfplay_generation);
+                let selfplay_midgame_pool = Arc::clone(&shared_midgame_pool);
                 selfplay_handles.push(thread::spawn(move || {
                     if let Err(err) = chineseai::cpu_topology::pin_current_thread(placement.cpu) {
                         eprintln!(
@@ -2158,6 +2185,12 @@ fn main() {
                             &selfplay_opening_positions,
                         );
                         loop_config.games = 4;
+                        let mut pool_rng = SplitMix64::new(batch_seed ^ 0xA076_1D64_78BD_642F);
+                        loop_config.midgame_positions = selfplay_midgame_pool
+                            .read()
+                            .unwrap_or_else(|_| panic!("midgame pool poisoned"))
+                            .sample(loop_config.games, &mut pool_rng)
+                            .into();
                         let data = generate_selfplay_data(
                             local_model
                                 .as_deref()
@@ -2178,6 +2211,7 @@ fn main() {
             let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingTrainingData>(1);
             let collector_config = config.clone();
             let collector_needs_warmup = !resumed_model;
+            let collector_midgame_pool = Arc::clone(&shared_midgame_pool);
             println!(
                 "warmup   : {} (model={})",
                 if collector_needs_warmup {
@@ -2191,7 +2225,14 @@ fn main() {
                 let mut pending = PendingTrainingData::default();
                 let mut batch_index = 0usize;
                 let mut window_started = Instant::now();
-                while let Ok(batch) = selfplay_rx.recv() {
+                while let Ok(mut batch) = selfplay_rx.recv() {
+                    let snapshots = std::mem::take(&mut batch.data.midgame_snapshots);
+                    if !snapshots.is_empty() {
+                        collector_midgame_pool
+                            .write()
+                            .unwrap_or_else(|_| panic!("midgame pool poisoned"))
+                            .add_snapshots(snapshots, collector_config.seed ^ batch_index as u64);
+                    }
                     pending.push(batch);
                     let required_samples = if collector_needs_warmup && batch_index == 0 {
                         collector_config
@@ -2524,8 +2565,12 @@ fn main() {
                     None
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
+                let midgame_pool_len = shared_midgame_pool
+                    .read()
+                    .unwrap_or_else(|_| panic!("midgame pool poisoned"))
+                    .len();
                 println!(
-                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} total_samples={} train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.total_samples_generated,
@@ -2537,6 +2582,8 @@ fn main() {
                     } else {
                         100.0 * report.pool_samples as f32 / report.pool_capacity as f32
                     },
+                    midgame_pool_len,
+                    config.midgame_reservoir_capacity,
                     report.replay_chunks,
                     report.replay_oldest_update,
                     report.replay_newest_update,
@@ -3341,6 +3388,23 @@ fn main() {
             trainer_handle
                 .join()
                 .unwrap_or_else(|_| panic!("training thread panicked"));
+            if config.midgame_reservoir_capacity > 0 {
+                let pool = shared_midgame_pool
+                    .read()
+                    .unwrap_or_else(|_| panic!("midgame pool poisoned"));
+                pool.save_lz4(&midgame_snapshot_path).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to save midgame pool `{}`: {err}",
+                        midgame_snapshot_path.display()
+                    )
+                });
+                println!(
+                    "midgame  : saved {}/{} snapshots to `{}`",
+                    pool.len(),
+                    pool.capacity(),
+                    midgame_snapshot_path.display()
+                );
+            }
             if exited_after_ctrl_c {
                 while let Ok(event) = trainer_rx.try_recv() {
                     interrupt_save_model = Some(event.candidate_model);
