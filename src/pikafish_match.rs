@@ -45,6 +45,12 @@ pub struct VsPikafishConfig {
     pub parallel_games: usize,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
+    pub cpuct_base: f32,
+    pub cpuct_factor: f32,
+    pub cpuct_base_at_root: f32,
+    pub cpuct_factor_at_root: f32,
+    pub fpu_value: f32,
+    pub fpu_value_at_root: f32,
     pub policy_softmax_temp: f32,
 }
 
@@ -76,6 +82,12 @@ struct GameConfig {
     seed: u64,
     cpuct: f32,
     cpuct_at_root: f32,
+    cpuct_base: f32,
+    cpuct_factor: f32,
+    cpuct_base_at_root: f32,
+    cpuct_factor_at_root: f32,
+    fpu_value: f32,
+    fpu_value_at_root: f32,
     policy_softmax_temp: f32,
 }
 
@@ -286,15 +298,15 @@ fn play_one_game(
                     seed,
                     cpuct: config.cpuct,
                     cpuct_at_root: config.cpuct_at_root,
-                    cpuct_base: 19652.0,
-                    cpuct_factor: 1.5,
-                    cpuct_base_at_root: 19652.0,
-                    cpuct_factor_at_root: 1.5,
+                    cpuct_base: config.cpuct_base,
+                    cpuct_factor: config.cpuct_factor,
+                    cpuct_base_at_root: config.cpuct_base_at_root,
+                    cpuct_factor_at_root: config.cpuct_factor_at_root,
                     max_depth: 0,
                     root_dirichlet_alpha: 0.0,
                     root_exploration_fraction: 0.0,
-                    fpu_value: 0.30,
-                    fpu_value_at_root: 0.20,
+                    fpu_value: config.fpu_value,
+                    fpu_value_at_root: config.fpu_value_at_root,
                     policy_softmax_temp: config.policy_softmax_temp,
                     draw_score: 0.0,
                     value_scale: 1.0,
@@ -393,7 +405,7 @@ pub fn run_vs_pikafish(
                 for game_index in (worker_id..config.total_games).step_by(parallel) {
                     let chinese_red = game_index % 2 == 0;
                     let start_position = positions
-                        .get(game_index % positions.len().max(1))
+                        .get((game_index / 2) % positions.len().max(1))
                         .cloned()
                         .unwrap_or_else(Position::startpos);
                     let (end, final_fen, position_command) = play_one_game(
@@ -409,6 +421,12 @@ pub fn run_vs_pikafish(
                                 ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                             cpuct: config.cpuct,
                             cpuct_at_root: config.cpuct_at_root,
+                            cpuct_base: config.cpuct_base,
+                            cpuct_factor: config.cpuct_factor,
+                            cpuct_base_at_root: config.cpuct_base_at_root,
+                            cpuct_factor_at_root: config.cpuct_factor_at_root,
+                            fpu_value: config.fpu_value,
+                            fpu_value_at_root: config.fpu_value_at_root,
                             policy_softmax_temp: config.policy_softmax_temp,
                         },
                     )?;

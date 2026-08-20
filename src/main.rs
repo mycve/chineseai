@@ -275,13 +275,31 @@ struct VsPikafishArgs {
     #[arg(short = 's', long)]
     simulations: Option<usize>,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 0.65)]
+    #[arg(long, default_value_t = 0.9)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 2.0)]
     cpuct_at_root: f32,
+    /// ChineseAI dynamic PUCT base.
+    #[arg(long, default_value_t = 19652.0)]
+    cpuct_base: f32,
+    /// ChineseAI dynamic PUCT growth factor.
+    #[arg(long, default_value_t = 1.5)]
+    cpuct_factor: f32,
+    /// ChineseAI root dynamic PUCT base.
+    #[arg(long, default_value_t = 19652.0)]
+    cpuct_base_at_root: f32,
+    /// ChineseAI root dynamic PUCT growth factor.
+    #[arg(long, default_value_t = 1.5)]
+    cpuct_factor_at_root: f32,
+    /// ChineseAI non-root first-play urgency reduction.
+    #[arg(long, default_value_t = 0.2)]
+    fpu_value: f32,
+    /// ChineseAI root first-play urgency reduction.
+    #[arg(long, default_value_t = 0.1)]
+    fpu_value_at_root: f32,
     /// Divisor applied to ChineseAI policy logits before search.
-    #[arg(long, default_value_t = 1.3)]
+    #[arg(long, default_value_t = 1.2)]
     policy_softmax_temp: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 300)]
@@ -3445,6 +3463,12 @@ fn main() {
             let simulations = cmd.simulations.unwrap_or(192).max(1);
             let cpuct = cmd.cpuct.max(0.0);
             let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
+            let cpuct_base = cmd.cpuct_base.max(1.0);
+            let cpuct_factor = cmd.cpuct_factor.max(0.0);
+            let cpuct_base_at_root = cmd.cpuct_base_at_root.max(1.0);
+            let cpuct_factor_at_root = cmd.cpuct_factor_at_root.max(0.0);
+            let fpu_value = cmd.fpu_value.max(0.0);
+            let fpu_value_at_root = cmd.fpu_value_at_root.max(0.0);
             let policy_softmax_temp = cmd.policy_softmax_temp.max(1.0e-3);
             let max_plies = cmd.max_plies.max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
@@ -3500,6 +3524,12 @@ fn main() {
                     parallel_games,
                     cpuct,
                     cpuct_at_root,
+                    cpuct_base,
+                    cpuct_factor,
+                    cpuct_base_at_root,
+                    cpuct_factor_at_root,
+                    fpu_value,
+                    fpu_value_at_root,
                     policy_softmax_temp,
                 },
             )
@@ -3519,7 +3549,7 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}/{} policy_temp={}",
+                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}/{} base={}/{} factor={}/{} fpu={}/{} policy_temp={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),
@@ -3541,6 +3571,12 @@ fn main() {
                 simulations,
                 cpuct,
                 cpuct_at_root,
+                cpuct_base,
+                cpuct_base_at_root,
+                cpuct_factor,
+                cpuct_factor_at_root,
+                fpu_value,
+                fpu_value_at_root,
                 policy_softmax_temp
             );
         }
