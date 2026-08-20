@@ -1549,7 +1549,7 @@ mod tests {
             policy_softmax_temp: 1.0,
             opening_policy_softmax_temp: 1.0,
             value_td_lambda: 0.9,
-            opening_positions: Vec::new(),
+            opening_positions: Default::default(),
             opening_fen_game_fraction: 0.0,
             resign_percentage: 0.0,
             resign_playthrough: 100.0,

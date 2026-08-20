@@ -746,7 +746,6 @@ fn prune_old_checkpoints(
 
 struct SelfplayBatch {
     data: AzSelfplayData,
-    selfplay_seconds: f32,
 }
 
 struct TrainerEvent {
@@ -779,19 +778,17 @@ fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> V
 #[derive(Default)]
 struct SelfplayPauseState {
     arena_paused: bool,
-    backlog_paused: bool,
 }
 
 impl SelfplayPauseState {
     fn is_paused(&self) -> bool {
-        self.arena_paused || self.backlog_paused
+        self.arena_paused
     }
 }
 
 #[derive(Default)]
 struct PendingTrainingData {
-    selfplay_seconds: f32,
-    started: Option<Instant>,
+    collection_seconds: f32,
     selfplay: AzSelfplayData,
 }
 
@@ -809,10 +806,6 @@ struct TrainBatchSourceStats {
 
 impl PendingTrainingData {
     fn push(&mut self, batch: SelfplayBatch) {
-        if self.started.is_none() {
-            self.started = Some(Instant::now());
-        }
-        self.selfplay_seconds += batch.selfplay_seconds;
         self.selfplay.add_assign(&batch.data);
     }
 }
@@ -822,7 +815,7 @@ fn build_az_loop_config(
     seed: u64,
     workers: usize,
     generation_update: u32,
-    opening_positions: &[Position],
+    opening_positions: &Arc<[Position]>,
 ) -> AzLoopConfig {
     AzLoopConfig {
         games: 1,
@@ -854,7 +847,7 @@ fn build_az_loop_config(
         policy_softmax_temp: config.policy_softmax_temp,
         opening_policy_softmax_temp: config.opening_policy_softmax_temp,
         value_td_lambda: config.value_td_lambda,
-        opening_positions: opening_positions.to_vec(),
+        opening_positions: Arc::clone(opening_positions),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
@@ -863,10 +856,10 @@ fn build_az_loop_config(
     }
 }
 
-fn load_opening_positions(path: &str) -> Vec<Position> {
+fn load_opening_positions(path: &str) -> Arc<[Position]> {
     let path = path.trim();
     if path.is_empty() {
-        return Vec::new();
+        return Arc::default();
     }
     let text = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read opening_fens_path `{path}`: {err}"));
@@ -910,7 +903,7 @@ fn load_opening_positions(path: &str) -> Vec<Position> {
         source_count.saturating_sub(positions.len()),
         positions.len()
     );
-    positions
+    positions.into()
 }
 
 fn build_async_training_report(
@@ -928,10 +921,7 @@ fn build_async_training_report(
     train_source: TrainBatchSourceStats,
 ) -> AzLoopReport {
     let selfplay_samples = pending.selfplay.samples.len();
-    let total_seconds = pending
-        .started
-        .map(|started| started.elapsed().as_secs_f32())
-        .unwrap_or(train_seconds);
+    let total_seconds = pending.collection_seconds.max(1.0e-6);
     let train_stat_samples = stats.samples.max(1) as f32;
     let root_visit_entropy =
         pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
@@ -1025,7 +1015,6 @@ fn build_async_training_report(
         avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
         avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
-        selfplay_seconds: pending.selfplay_seconds,
         train_seconds,
         total_seconds,
         games_per_second: selfplay_games as f32 / total_seconds.max(1e-6),
@@ -2068,10 +2057,8 @@ fn main() {
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
             let selfplay_worker_count = config.workers.max(1).min(cpu_placements.len().max(1));
-            // Trainer在一次GPU反向传播期间不会消费自博弈结果。双worker容量在高吞吐
-            // 服务器上会很快填满，令全部worker周期性阻塞在send。保留有界背压，
-            // 但缓冲足够覆盖一个训练窗口。
-            let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(8).max(32);
+            // 覆盖一次GPU更新期间完成的批次，同时限制旧模型样本和内存积压。
+            let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(2).max(32);
             let (selfplay_tx, selfplay_rx) =
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
@@ -2179,17 +2166,13 @@ fn main() {
                             &selfplay_opening_positions,
                         );
                         loop_config.games = 4;
-                        let started = Instant::now();
                         let data = generate_selfplay_data(
                             local_model
                                 .as_deref()
                                 .expect("selfplay model not initialized"),
                             &loop_config,
                         );
-                        let batch = SelfplayBatch {
-                            data,
-                            selfplay_seconds: started.elapsed().as_secs_f32(),
-                        };
+                        let batch = SelfplayBatch { data };
                         if selfplay_tx.send(batch).is_err() {
                             break;
                         }
@@ -2215,6 +2198,7 @@ fn main() {
             let collector_handle = thread::spawn(move || {
                 let mut pending = PendingTrainingData::default();
                 let mut batch_index = 0usize;
+                let mut window_started = Instant::now();
                 while let Ok(batch) = selfplay_rx.recv() {
                     pending.push(batch);
                     let required_samples = if collector_needs_warmup && batch_index == 0 {
@@ -2227,6 +2211,8 @@ fn main() {
                     if pending.selfplay.samples.len() < required_samples {
                         continue;
                     }
+                    pending.collection_seconds = window_started.elapsed().as_secs_f32();
+                    window_started = Instant::now();
                     if ready_tx.send(std::mem::take(&mut pending)).is_err() {
                         break;
                     }
@@ -2411,7 +2397,6 @@ fn main() {
                                         avg_played_top_visit_ratio: 0.0,
                                         avg_best_q: 0.0,
                                         avg_played_q: 0.0,
-                                        selfplay_seconds: 0.0,
                                         train_seconds: 0.0,
                                         total_seconds: 0.0,
                                         games_per_second: 0.0,
@@ -2485,7 +2470,6 @@ fn main() {
                                         avg_played_top_visit_ratio: 0.0,
                                         avg_best_q: 0.0,
                                         avg_played_q: 0.0,
-                                        selfplay_seconds: 0.0,
                                         train_seconds: 0.0,
                                         total_seconds: 0.0,
                                         games_per_second: 0.0,
@@ -3352,7 +3336,6 @@ fn main() {
                     .lock()
                     .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
                 pause_state.arena_paused = false;
-                pause_state.backlog_paused = false;
                 pause_cvar.notify_all();
             }
             for handle in selfplay_handles {
@@ -4295,12 +4278,11 @@ fn run_pikafish_label_selfplay(cmd: PikafishLabelSelfplayArgs) -> io::Result<()>
             cmd.seed ^ batch.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             cmd.workers.max(1),
             0,
-            &[],
+            &Arc::default(),
         );
         config.games = games;
         config.simulations = cmd.simulations.max(1);
         config.max_plies = cmd.max_plies.max(1);
-        config.opening_positions.clear();
         config.opening_fen_game_fraction = 0.0;
         config.record_fens = true;
         config.mirror_probability = 0.0;

@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
@@ -975,7 +976,7 @@ pub struct AzLoopConfig {
     pub policy_softmax_temp: f32,
     pub opening_policy_softmax_temp: f32,
     pub value_td_lambda: f32,
-    pub opening_positions: Vec<Position>,
+    pub opening_positions: Arc<[Position]>,
     pub opening_fen_game_fraction: f32,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -1030,7 +1031,6 @@ pub struct AzLoopReport {
     pub avg_played_top_visit_ratio: f32,
     pub avg_best_q: f32,
     pub avg_played_q: f32,
-    pub selfplay_seconds: f32,
     pub train_seconds: f32,
     pub total_seconds: f32,
     pub games_per_second: f32,
