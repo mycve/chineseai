@@ -100,10 +100,10 @@ impl Default for AzLoopFileConfig {
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
-            simulations: 1600,
+            simulations: 400,
             selfplay_samples_per_update: 120000,
-            lr: 0.001,
-            lr_min: 0.0003,
+            lr: 0.0004,
+            lr_min: 0.00012,
             lr_decay_start_update: 100,
             lr_decay_interval: 200,
             lr_decay_factor: 0.97,
@@ -426,8 +426,8 @@ mod tests {
         let text = AzLoopFileConfig::default().to_file_text();
 
         assert!(text.starts_with("format_version = 11\n"));
-        assert!(text.contains("lr = 0.001\n"));
-        assert!(text.contains("lr_min = 0.0003\n"));
+        assert!(text.contains("lr = 0.0004\n"));
+        assert!(text.contains("lr_min = 0.00012\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
@@ -459,7 +459,7 @@ mod tests {
         assert!(text.contains("selfplay_update_warmup_updates = 5\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
-        assert!(text.contains("simulations = 1600\n"));
+        assert!(text.contains("simulations = 400\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));
@@ -506,7 +506,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.001).abs() < 1e-9);
+        assert!((parsed.lr - 0.0004).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 10);
         assert_eq!(parsed.pikafish_label_eval_interval, 10);
     }
