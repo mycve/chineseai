@@ -3,9 +3,9 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
-    POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE,
-    STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE, VALUE_THREAT_RANK,
-    VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    POLICY_TACTICAL_SIZE, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
+    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
+    VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
@@ -30,6 +30,7 @@ pub(super) struct AzCandleModel {
     value_head_output: Var,
     value_threat_embedding: Var,
     value_threat_output: Var,
+    policy_threat_context: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
     policy_context_hidden: Var,
@@ -102,7 +103,8 @@ impl AzCandleModel {
             piece_square_policy
         };
         let piece_square_policy = piece_square_policy.flatten_all()?;
-        let policy_context = hidden.matmul(&self.policy_context_hidden.t()?)?;
+        let policy_context = (hidden.matmul(&self.policy_context_hidden.t()?)?
+            + threat_pair.matmul(&self.policy_threat_context.t()?)?)?;
         let policy_context = Tensor::cat(&[&policy_context, &accumulator_context], 1)?;
         let accumulator_feature = self
             .input_hidden
@@ -294,6 +296,11 @@ impl AzCandleModel {
                 (WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2),
                 device,
             )?,
+            policy_threat_context: var_from_slice(
+                &model.policy_threat_context,
+                (POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2),
+                device,
+            )?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_consequence_output: var_from_slice(
                 &model.policy_consequence_output,
@@ -348,6 +355,7 @@ impl AzCandleModel {
         vars.push(self.value_head_output.clone());
         vars.push(self.value_threat_embedding.clone());
         vars.push(self.value_threat_output.clone());
+        vars.push(self.policy_threat_context.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
         vars.push(self.policy_context_hidden.clone());
@@ -379,6 +387,10 @@ impl AzCandleModel {
             &mut model.value_threat_embedding,
         )?;
         copy_var(&self.value_threat_output, &mut model.value_threat_output)?;
+        copy_var(
+            &self.policy_threat_context,
+            &mut model.policy_threat_context,
+        )?;
         copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
         copy_var(
             &self.policy_consequence_output,
@@ -610,6 +622,7 @@ mod tests {
             value_head_hidden,
             value_head_bias,
             value_head_output,
+            policy_threat_context,
             policy_move_bias,
             policy_consequence_output,
             policy_context_hidden,

@@ -60,8 +60,15 @@ const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
+pub(super) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 32;
-pub(super) const POLICY_TACTICAL_SIZE: usize = STRUCTURAL_PIECE_SIZE / 2 * 3;
+pub(super) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
+pub(super) const POLICY_TACTICAL_EXACT_SIZE: usize =
+    DENSE_MOVE_SPACE * (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+pub(super) const POLICY_TACTICAL_FACTOR_SIZE: usize =
+    (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+pub(super) const POLICY_TACTICAL_SIZE: usize =
+    POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
 pub(super) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
 pub(super) const POLICY_SPARSE_MAIN_SIZE: usize =
     DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
@@ -248,6 +255,10 @@ macro_rules! az_weight_tensors {
             [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK]
         );
         $visit!(value_threat_output, [WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2]);
+        $visit!(
+            policy_threat_context,
+            [POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2]
+        );
         $visit!(policy_move_bias, [DENSE_MOVE_SPACE]);
         $visit!(policy_consequence_output, [POLICY_CONSEQUENCE_SIZE]);
         $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h]);
@@ -801,6 +812,32 @@ pub(super) fn policy_sparse_factor_indices(
     ]
 }
 
+#[inline]
+pub(super) fn policy_tactical_indices(
+    move_index: usize,
+    moved_piece: usize,
+    source_attacked: bool,
+    destination_attacked: bool,
+    source_defended: bool,
+    destination_defended: bool,
+    capture: bool,
+    check: bool,
+) -> [usize; 2] {
+    debug_assert!(moved_piece < STRUCTURAL_PIECE_SIZE / 2);
+    let signature = usize::from(source_attacked)
+        | usize::from(destination_attacked) << 1
+        | usize::from(source_defended) << 2
+        | usize::from(destination_defended) << 3
+        | usize::from(capture) << 4
+        | usize::from(check) << 5;
+    let exact = (move_index * (STRUCTURAL_PIECE_SIZE / 2) + moved_piece)
+        * POLICY_TACTICAL_SIGNATURE_BUCKETS
+        + signature;
+    let factor =
+        POLICY_TACTICAL_EXACT_SIZE + moved_piece * POLICY_TACTICAL_SIGNATURE_BUCKETS + signature;
+    [exact, factor]
+}
+
 fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
     let sparse = move_map().dense_to_sparse[move_index] as usize;
     let from = sparse / BOARD_SIZE;
@@ -837,6 +874,7 @@ pub struct AzNnue {
     pub value_head_output: Vec<f32>,
     pub value_threat_embedding: Vec<f32>,
     pub value_threat_output: Vec<f32>,
+    pub policy_threat_context: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
@@ -879,6 +917,7 @@ impl Clone for AzNnue {
             value_head_output: self.value_head_output.clone(),
             value_threat_embedding: self.value_threat_embedding.clone(),
             value_threat_output: self.value_threat_output.clone(),
+            policy_threat_context: self.policy_threat_context.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
@@ -1330,6 +1369,7 @@ impl AzNnue {
             .map(|_| rng.weight(0.02))
             .collect();
         let value_threat_output = vec![0.0; WDL_HEAD_SIZE * VALUE_THREAT_RANK * 2];
+        let policy_threat_context = vec![0.0; POLICY_THREAT_CONTEXT_SIZE * VALUE_THREAT_RANK * 2];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         let policy_consequence_output = vec![0.0; POLICY_CONSEQUENCE_SIZE];
@@ -1362,6 +1402,7 @@ impl AzNnue {
             value_head_output,
             value_threat_embedding,
             value_threat_output,
+            policy_threat_context,
             policy_move_bias,
             policy_consequence_output,
             policy_context_hidden,
@@ -1451,6 +1492,7 @@ impl AzNnue {
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
             value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
             value_threat_output: load_candle_f32_tensor(&tensors, "value_threat_output")?,
+            policy_threat_context: load_candle_f32_tensor(&tensors, "policy_threat_context")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_consequence_output: load_candle_f32_tensor(
                 &tensors,
@@ -1658,7 +1700,19 @@ impl AzNnue {
                 &self.policy_context_hidden[start..start + self.hidden_size],
             );
             for batch in 0..4 {
-                contexts[batch][context_index] = dots[batch];
+                let threat = &requests[batch].scratch.value_threat_activation;
+                let threat_logit = if context_index < POLICY_THREAT_CONTEXT_SIZE
+                    && threat.len() == VALUE_THREAT_RANK * 2
+                {
+                    let start = context_index * VALUE_THREAT_RANK * 2;
+                    dot_product(
+                        threat,
+                        &self.policy_threat_context[start..start + VALUE_THREAT_RANK * 2],
+                    )
+                } else {
+                    0.0
+                };
+                contexts[batch][context_index] = dots[batch] + threat_logit;
             }
         }
         for index in 0..4 {
@@ -1697,6 +1751,15 @@ impl AzNnue {
                 &scratch.hidden,
                 &self.policy_context_hidden[start..start + self.hidden_size],
             );
+            if context_index < POLICY_THREAT_CONTEXT_SIZE
+                && scratch.value_threat_activation.len() == VALUE_THREAT_RANK * 2
+            {
+                let threat_start = context_index * VALUE_THREAT_RANK * 2;
+                *context += dot_product(
+                    &scratch.value_threat_activation,
+                    &self.policy_threat_context[threat_start..threat_start + VALUE_THREAT_RANK * 2],
+                );
+            }
         }
         self.evaluate_prepared_hidden_with_context(position, features, value, moves, scratch)
     }
@@ -1720,6 +1783,10 @@ impl AzNnue {
         let opponent_attacks = self
             .policy_tactical_active
             .then(|| position.attacked_squares_mask(side.opposite()))
+            .unwrap_or_default();
+        let own_attacks = self
+            .policy_tactical_active
+            .then(|| position.attacked_squares_mask(side))
             .unwrap_or_default();
         {
             crate::scope_profile!("az.eval.policy_logits");
@@ -1782,12 +1849,28 @@ impl AzNnue {
                     });
                     let tactical_logit = if self.policy_tactical_active {
                         crate::scope_profile!("az.eval.policy.tactical");
-                        consequence.map_or(0.0, |(from, _, _)| {
-                            let base = from / BOARD_SIZE * 3;
+                        consequence.map_or(0.0, |(from, _, captured)| {
+                            let moved_piece = from / BOARD_SIZE;
                             let check = scratch.policy_gives_check[index];
-                            let hanging = opponent_attacks & (1u128 << mv.to as usize) != 0;
-                            check * self.policy_tactical[base]
-                                + self.policy_tactical[base + 1 + usize::from(hanging)]
+                            let source_attacked =
+                                opponent_attacks & (1u128 << mv.from as usize) != 0;
+                            let destination_attacked =
+                                opponent_attacks & (1u128 << mv.to as usize) != 0;
+                            let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
+                            let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
+                            policy_tactical_indices(
+                                move_index,
+                                moved_piece,
+                                source_attacked,
+                                destination_attacked,
+                                source_defended,
+                                destination_defended,
+                                captured.is_some(),
+                                check != 0.0,
+                            )
+                            .into_iter()
+                            .map(|tactical| self.policy_tactical[tactical])
+                            .sum()
                         })
                     } else {
                         0.0
@@ -2117,7 +2200,11 @@ impl AzNnue {
     }
 
     fn rebuild_value_threat_quantization(&mut self) {
-        self.value_threat_active = self.value_threat_output.iter().any(|&weight| weight != 0.0);
+        self.value_threat_active = self.value_threat_output.iter().any(|&weight| weight != 0.0)
+            || self
+                .policy_threat_context
+                .iter()
+                .any(|&weight| weight != 0.0);
         let maximum = self
             .value_threat_embedding
             .iter()

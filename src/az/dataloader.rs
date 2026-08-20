@@ -16,7 +16,7 @@ use super::{
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
-    policy_sparse_main_index, value_threat_index,
+    policy_sparse_main_index, policy_tactical_indices, value_threat_index,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -228,6 +228,7 @@ impl PackedBatch {
         }
         let position = Position::from_canonical_piece_squares(&pieces);
         let opponent_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Black);
+        let own_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Red);
         let mut policy_offset = 0usize;
         for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
             if move_index < DENSE_MOVE_SPACE {
@@ -241,7 +242,7 @@ impl PackedBatch {
                 if let Some((from, to)) = dense_move_squares(move_index) {
                     let moved_feature = board_features[from];
                     if moved_feature != usize::MAX
-                        && moved_feature / BOARD_SIZE < POLICY_TACTICAL_SIZE / 3
+                        && moved_feature / BOARD_SIZE < super::STRUCTURAL_PIECE_SIZE / 2
                     {
                         let piece_index = moved_feature / BOARD_SIZE;
                         consequence_from = moved_feature;
@@ -292,14 +293,26 @@ impl PackedBatch {
                         consequence_to % BOARD_SIZE,
                     );
                     let check = position.gives_check_after_move_fast(mv);
-                    let hanging = opponent_attacks & (1u128 << mv.to as usize) != 0;
+                    let source_attacked = opponent_attacks & (1u128 << mv.from as usize) != 0;
+                    let destination_attacked = opponent_attacks & (1u128 << mv.to as usize) != 0;
+                    let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
+                    let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
                     let tactical_base = item_index * 2;
-                    let piece_base = moved_piece * 3;
-                    if check {
-                        self.policy_tactical_indices[tactical_base] = piece_base as i64;
+                    for (offset, tactical) in policy_tactical_indices(
+                        move_index,
+                        moved_piece,
+                        source_attacked,
+                        destination_attacked,
+                        source_defended,
+                        destination_defended,
+                        capture_valid,
+                        check,
+                    )
+                    .into_iter()
+                    .enumerate()
+                    {
+                        self.policy_tactical_indices[tactical_base + offset] = tactical as i64;
                     }
-                    self.policy_tactical_indices[tactical_base + 1] =
-                        (piece_base + 1 + usize::from(hanging)) as i64;
                 }
                 policy_offset += 1;
             }
