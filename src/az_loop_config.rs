@@ -121,8 +121,8 @@ impl Default for AzLoopFileConfig {
             temperature_decay_plies: 60,
             temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
-            cpuct: 0.65,
-            cpuct_at_root: 1.5,
+            cpuct: 0.9,
+            cpuct_at_root: 2.0,
             cpuct_base: 19652.0,
             cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
@@ -130,10 +130,10 @@ impl Default for AzLoopFileConfig {
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.10,
             opening_root_exploration_fraction: 0.30,
-            fpu_value: 0.30,
-            fpu_value_at_root: 0.20,
+            fpu_value: 0.20,
+            fpu_value_at_root: 0.10,
             draw_score: 0.0,
-            policy_softmax_temp: 1.3,
+            policy_softmax_temp: 1.2,
             opening_policy_softmax_temp: 1.5,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
             opening_fens_path: "opening_fens.txt".into(),
@@ -155,9 +155,9 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 10,
             arena_simulations: 4000,
-            arena_cpuct: 0.65,
-            arena_cpuct_at_root: 1.5,
-            arena_policy_softmax_temp: 1.3,
+            arena_cpuct: 0.9,
+            arena_cpuct_at_root: 2.0,
+            arena_policy_softmax_temp: 1.2,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_processes: 128,
@@ -438,8 +438,8 @@ mod tests {
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.12\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
-        assert!(text.contains("cpuct = 0.65\n"));
-        assert!(text.contains("cpuct_at_root = 1.5\n"));
+        assert!(text.contains("cpuct = 0.9\n"));
+        assert!(text.contains("cpuct_at_root = 2.0\n"));
         assert!(text.contains("cpuct_base = 19652.0\n"));
         assert!(text.contains("cpuct_factor = 1.5\n"));
         assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
@@ -447,10 +447,10 @@ mod tests {
         assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
         assert!(text.contains("root_exploration_fraction = 0.1\n"));
         assert!(text.contains("opening_root_exploration_fraction = 0.3\n"));
-        assert!(text.contains("fpu_value = 0.3\n"));
-        assert!(text.contains("fpu_value_at_root = 0.2\n"));
+        assert!(text.contains("fpu_value = 0.2\n"));
+        assert!(text.contains("fpu_value_at_root = 0.1\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("policy_softmax_temp = 1.3\n"));
+        assert!(text.contains("policy_softmax_temp = 1.2\n"));
         assert!(text.contains("opening_policy_softmax_temp = 1.5\n"));
         assert!(text.contains("value_td_lambda = 0.95\n"));
         assert!(!text.contains("value_target_search_q_mix"));
@@ -483,9 +483,9 @@ mod tests {
         assert!(text.contains("arena_opening_plies_max = 10\n"));
         assert!(text.contains("arena_interval = 10\n"));
         assert!(text.contains("arena_simulations = 4000\n"));
-        assert!(text.contains("arena_cpuct = 0.65\n"));
-        assert!(text.contains("arena_cpuct_at_root = 1.5\n"));
-        assert!(text.contains("arena_policy_softmax_temp = 1.3\n"));
+        assert!(text.contains("arena_cpuct = 0.9\n"));
+        assert!(text.contains("arena_cpuct_at_root = 2.0\n"));
+        assert!(text.contains("arena_policy_softmax_temp = 1.2\n"));
         assert!(
             text.contains(
                 "pikafish_label_eval_sqlite = \"eval/pikafish-selfplay-5000-d20.sqlite\"\n"

@@ -118,19 +118,19 @@ struct AzSearchArgs {
     #[arg(default_value_t = 10_000)]
     simulations: usize,
     /// Non-root PUCT init.
-    #[arg(default_value_t = 1.5)]
+    #[arg(default_value_t = 0.9)]
     cpuct: f32,
     /// Root PUCT init.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 2.0)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.30)]
+    #[arg(long, default_value_t = 0.20)]
     fpu_value: f32,
     /// Root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.20)]
+    #[arg(long, default_value_t = 0.10)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before root search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.2)]
     policy_softmax_temp: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
@@ -4561,23 +4561,18 @@ mod reporting_tests {
 
     #[test]
     fn az_search_defaults_match_selfplay_and_uci_search() {
-        let cli = Cli::try_parse_from([
-            "chineseai",
-            "az-search",
-            "model.safetensors",
-            "3200",
-            "0.65",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["chineseai", "az-search", "model.safetensors", "3200"]).unwrap();
         let Some(CliCommand::AzSearch(args)) = cli.command else {
             panic!("expected az-search command");
         };
-        assert_eq!(args.cpuct, 0.65);
-        assert_eq!(args.cpuct_at_root, 1.5);
+        assert_eq!(args.cpuct, 0.9);
+        assert_eq!(args.cpuct_at_root, 2.0);
         assert_eq!(args.cpuct_factor, 1.5);
         assert_eq!(args.cpuct_factor_at_root, 1.5);
-        assert_eq!(args.fpu_value, 0.30);
-        assert_eq!(args.fpu_value_at_root, 0.20);
+        assert_eq!(args.fpu_value, 0.20);
+        assert_eq!(args.fpu_value_at_root, 0.10);
+        assert_eq!(args.policy_softmax_temp, 1.2);
     }
 
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
