@@ -7,7 +7,6 @@ pub struct CpuPlacement {
     pub package: usize,
     pub core: usize,
     pub llc: usize,
-    pub smt_level: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -85,52 +84,46 @@ fn allowed_cpus() -> Vec<usize> {
 pub fn cpu_placements() -> Vec<CpuPlacement> {
     #[cfg(target_os = "linux")]
     {
-        let mut siblings = BTreeMap::<(usize, usize), Vec<(usize, usize, usize)>>::new();
+        let mut physical_cores = BTreeMap::<(usize, usize), Vec<(usize, usize, usize)>>::new();
         for cpu in allowed_cpus() {
             let topology = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
             let package = read_usize(format!("{topology}/physical_package_id")).unwrap_or(0);
             let core = read_usize(format!("{topology}/core_id")).unwrap_or(cpu);
-            siblings.entry((package, core)).or_default().push((
+            physical_cores.entry((package, core)).or_default().push((
                 cpu_node(cpu),
                 cpu_llc(cpu, package),
                 cpu,
             ));
         }
-        for cpus in siblings.values_mut() {
+        for cpus in physical_cores.values_mut() {
             cpus.sort_unstable();
         }
-        let max_smt = siblings.values().map(Vec::len).max().unwrap_or(1);
-        let mut out = Vec::new();
-        for smt_level in 0..max_smt {
-            let level = siblings
-                .iter()
-                .filter_map(|(&(package, core), cpus)| {
-                    let &(node, llc, cpu) = cpus.get(smt_level)?;
+        return interleave_by_llc(
+            physical_cores
+                .into_iter()
+                .filter_map(|((package, core), cpus)| {
+                    let &(node, llc, cpu) = cpus.first()?;
                     Some(CpuPlacement {
                         cpu,
                         node,
                         package,
                         core,
                         llc,
-                        smt_level,
                     })
                 })
-                .collect::<Vec<_>>();
-            out.extend(interleave_by_llc(level));
-        }
-        return out;
+                .collect(),
+        );
     }
     #[cfg(not(target_os = "linux"))]
     {
         interleave_by_llc(
-            (0..std::thread::available_parallelism().map_or(1, usize::from))
+            (0..num_cpus::get_physical().max(1))
                 .map(|cpu| CpuPlacement {
                     cpu,
                     node: 0,
                     package: 0,
                     core: cpu,
                     llc: 0,
-                    smt_level: 0,
                 })
                 .collect(),
         )
@@ -169,17 +162,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placements_are_unique_and_physical_cores_come_first() {
+    fn placements_contain_one_cpu_per_physical_core() {
         let placements = cpu_placements();
         assert!(!placements.is_empty());
         let unique = placements.iter().map(|p| p.cpu).collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), placements.len());
-        let first_smt = placements
+        let unique_cores = placements
             .iter()
-            .position(|p| p.smt_level > 0)
-            .unwrap_or(placements.len());
-        assert!(placements[..first_smt].iter().all(|p| p.smt_level == 0));
-        assert!(placements[first_smt..].iter().all(|p| p.smt_level > 0));
+            .map(|p| (p.package, p.core))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique_cores.len(), placements.len());
     }
 
     #[test]
@@ -191,7 +183,6 @@ mod tests {
                 package: 0,
                 core: 0,
                 llc: 0,
-                smt_level: 0,
             },
             CpuPlacement {
                 cpu: 1,
@@ -199,7 +190,6 @@ mod tests {
                 package: 0,
                 core: 1,
                 llc: 0,
-                smt_level: 0,
             },
             CpuPlacement {
                 cpu: 2,
@@ -207,7 +197,6 @@ mod tests {
                 package: 0,
                 core: 2,
                 llc: 1,
-                smt_level: 0,
             },
             CpuPlacement {
                 cpu: 3,
@@ -215,7 +204,6 @@ mod tests {
                 package: 0,
                 core: 3,
                 llc: 1,
-                smt_level: 0,
             },
         ]);
         assert_eq!(

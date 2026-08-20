@@ -2062,25 +2062,17 @@ fn main() {
             let (selfplay_tx, selfplay_rx) =
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
-            let physical_cpus = cpu_placements
-                .iter()
-                .filter(|placement| placement.smt_level == 0)
-                .count();
             let llc_domains = cpu_placements
                 .iter()
                 .map(|placement| (placement.node, placement.package, placement.llc))
                 .collect::<HashSet<_>>()
                 .len();
-            let smt_workers = selfplay_worker_count.saturating_sub(physical_cpus);
             println!(
-                "cpu      : allowed={} physical={} numa_nodes={} llc_domains={} selfplay_workers={} physical_workers={} smt_workers={} selfplay_queue={} affinity={} model_replicas={}",
+                "cpu      : physical={} numa_nodes={} llc_domains={} selfplay_workers={} selfplay_queue={} affinity={} model_replicas={}",
                 cpu_placements.len(),
-                physical_cpus,
                 numa_nodes.len(),
                 llc_domains,
                 selfplay_worker_count,
-                selfplay_worker_count.min(physical_cpus),
-                smt_workers,
                 selfplay_queue_capacity,
                 if cfg!(target_os = "linux") {
                     "on"
