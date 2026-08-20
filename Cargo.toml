@@ -20,7 +20,6 @@ num_cpus = "1.16"
 [features]
 default = ["gpu-train"]
 gpu-train = []
-nccl-train = ["gpu-train", "candle-core/nccl"]
 profile = []
 
 [target.'cfg(target_os = "macos")'.dependencies]

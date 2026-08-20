@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
+use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
@@ -410,34 +410,6 @@ impl AzCandleModel {
         model.rebuild_value_threat_quantization();
         model.rebuild_policy_tactical();
         model.rebuild_policy_accumulator_quantization();
-        Ok(())
-    }
-
-    pub(super) fn cpu_grads(&self, grads: &GradStore) -> CandleResult<Vec<Option<Vec<f32>>>> {
-        let mut out = Vec::new();
-        for var in self.all_vars() {
-            let grad = grads
-                .get(&var)
-                .map(|grad| grad.flatten_all()?.to_vec1::<f32>())
-                .transpose()?;
-            out.push(grad);
-        }
-        Ok(out)
-    }
-
-    pub(super) fn to_cpu_values(&self) -> CandleResult<Vec<Vec<f32>>> {
-        let mut values = Vec::new();
-        for var in self.all_vars() {
-            values.push(var.as_detached_tensor().flatten_all()?.to_vec1::<f32>()?);
-        }
-        Ok(values)
-    }
-
-    pub(super) fn set_from_cpu_values(&self, values: &[Vec<f32>]) -> CandleResult<()> {
-        for (var, values) in self.all_vars().iter().zip(values.iter()) {
-            let tensor = Tensor::from_vec(values.clone(), var.shape().clone(), var.device())?;
-            var.set(&tensor)?;
-        }
         Ok(())
     }
 }

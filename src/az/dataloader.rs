@@ -28,7 +28,6 @@ pub(super) struct DataLoaderConfig {
     pub drop_last: bool,
     pub num_workers: usize,
     pub prefetch_batches: usize,
-    pub shard_count: usize,
     pub seed: u64,
 }
 
@@ -40,7 +39,6 @@ impl Default for DataLoaderConfig {
             drop_last: false,
             num_workers: 1,
             prefetch_batches: 2,
-            shard_count: 1,
             seed: 0,
         }
     }
@@ -53,8 +51,7 @@ pub(super) struct BatchPlan {
 
 #[derive(Clone, Debug)]
 struct BatchStep {
-    shards: Vec<Vec<usize>>,
-    sample_count: usize,
+    indices: Vec<usize>,
 }
 
 impl BatchPlan {
@@ -65,20 +62,13 @@ impl BatchPlan {
             shuffle_indices(&mut order, config.seed);
         }
 
-        let shard_count = config.shard_count.max(1);
         let mut steps = Vec::with_capacity(sample_count.div_ceil(batch_size));
         for chunk in order.chunks(batch_size) {
             if config.drop_last && chunk.len() < batch_size {
                 break;
             }
-            let shard_size = chunk.len().div_ceil(shard_count);
-            let shards = chunk
-                .chunks(shard_size.max(1))
-                .map(|shard| shard.to_vec())
-                .collect::<Vec<_>>();
             steps.push(BatchStep {
-                shards,
-                sample_count: chunk.len(),
+                indices: chunk.to_vec(),
             });
         }
         Self { steps }
@@ -95,8 +85,7 @@ impl BatchPlan {
 
 #[derive(Clone, Debug)]
 pub(super) struct PackedStepBatch {
-    pub(super) batch_size: usize,
-    pub(super) shards: Vec<PackedBatch>,
+    pub(super) batch: PackedBatch,
     pub(super) pack_seconds: f64,
 }
 
@@ -393,12 +382,7 @@ impl PrefetchDataLoader {
                     let started = Instant::now();
                     let step = &plan[batch_id];
                     let packed = PackedStepBatch {
-                        batch_size: step.sample_count,
-                        shards: step
-                            .shards
-                            .iter()
-                            .map(|shard| PackedBatch::from_indices(&samples, shard))
-                            .collect(),
+                        batch: PackedBatch::from_indices(&samples, &step.indices),
                         pack_seconds: started.elapsed().as_secs_f64(),
                     };
                     if tx.send((batch_id, packed)).is_err() {
@@ -511,24 +495,8 @@ mod tests {
         };
         let plan = BatchPlan::epoch(8, &config);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan.steps[0].shards[0], vec![0, 1, 2]);
-        assert_eq!(plan.steps[1].shards[0], vec![3, 4, 5]);
-    }
-
-    #[test]
-    fn batch_plan_splits_steps_into_shards() {
-        let config = DataLoaderConfig {
-            batch_size: 5,
-            shuffle: false,
-            shard_count: 2,
-            ..DataLoaderConfig::default()
-        };
-        let plan = BatchPlan::epoch(7, &config);
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan.steps[0].sample_count, 5);
-        assert_eq!(plan.steps[0].shards, vec![vec![0, 1, 2], vec![3, 4]]);
-        assert_eq!(plan.steps[1].sample_count, 2);
-        assert_eq!(plan.steps[1].shards, vec![vec![5], vec![6]]);
+        assert_eq!(plan.steps[0].indices, vec![0, 1, 2]);
+        assert_eq!(plan.steps[1].indices, vec![3, 4, 5]);
     }
 
     #[test]
@@ -584,29 +552,9 @@ mod tests {
         let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
         let mut sizes = Vec::new();
         while let Some(batch) = loader.next_packed().unwrap() {
-            sizes.push(batch.batch_size);
-            assert_eq!(batch.shards.len(), 1);
+            sizes.push(batch.batch.batch_size);
         }
         loader.join().unwrap();
         assert_eq!(sizes, vec![2, 2, 2, 1]);
-    }
-
-    #[test]
-    fn prefetch_loader_packs_shards() {
-        let samples = Arc::new((0..5).map(sample).collect::<Vec<_>>());
-        let config = DataLoaderConfig {
-            batch_size: 5,
-            shuffle: false,
-            shard_count: 2,
-            ..DataLoaderConfig::default()
-        };
-        let plan = BatchPlan::epoch(samples.len(), &config);
-        let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
-        let batch = loader.next_packed().unwrap().unwrap();
-        loader.join().unwrap();
-        assert_eq!(batch.batch_size, 5);
-        assert_eq!(batch.shards.len(), 2);
-        assert_eq!(batch.shards[0].batch_size, 3);
-        assert_eq!(batch.shards[1].batch_size, 2);
     }
 }

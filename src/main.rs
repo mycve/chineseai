@@ -15,8 +15,8 @@ use chineseai::{
         AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
         DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
         alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
-        generate_selfplay_data, global_training_step_sample_count, play_arena_games_from_positions,
-        train_samples_weighted, train_samples_weighted_owned,
+        generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
+        train_samples_weighted_owned,
     },
     nnue::{canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
@@ -208,9 +208,9 @@ struct AzTrainBenchArgs {
     /// Passes over generated samples.
     #[arg(default_value_t = 2)]
     epochs: usize,
-    /// Global batch size (total samples per optimizer step across all devices).
+    /// Batch size per optimizer step.
     #[arg(default_value_t = 1024)]
-    batch_size_per_gpu: usize,
+    batch_size: usize,
     /// Learning rate.
     #[arg(default_value_t = 0.0003)]
     lr: f32,
@@ -238,9 +238,9 @@ struct AzReplayFitArgs {
     /// Training passes over the fixed training split.
     #[arg(long, default_value_t = 2)]
     epochs: usize,
-    /// Global batch size (total samples per optimizer step across all devices).
+    /// Batch size per optimizer step.
     #[arg(long, default_value_t = 1024)]
-    batch_size_per_gpu: usize,
+    batch_size: usize,
     /// Learning rate.
     #[arg(long, default_value_t = 0.0007)]
     lr: f32,
@@ -1700,7 +1700,7 @@ fn main() {
             let model_path = cmd.model;
             let sample_count = cmd.samples.max(1);
             let epochs = cmd.epochs.max(1);
-            let batch_size = cmd.batch_size_per_gpu.max(1);
+            let batch_size = cmd.batch_size.max(1);
             let lr = cmd.lr.max(0.0);
             let seed = cmd.seed;
             let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
@@ -1710,14 +1710,11 @@ fn main() {
             let stats = benchmark_training(&mut model, sample_count, epochs, batch_size, lr, seed);
             let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
             let processed = (sample_count * epochs) as f64;
-            let g_step = global_training_step_sample_count(batch_size);
-            let n_gpu = global_training_step_sample_count(1);
             println!("bench        : training");
             println!("model        : {model_path}");
             println!("samples      : {sample_count}");
             println!("epochs       : {epochs}");
-            println!("batch(global)  : {batch_size}");
-            println!("cuda_devices  : {n_gpu}  (global batch {g_step})");
+            println!("batch_size   : {batch_size}");
             println!("lr             : {lr}");
             println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
             println!("processed    : {}", sample_count * epochs);
@@ -1756,7 +1753,7 @@ fn main() {
                 &validation,
                 1,
                 1.0e-12,
-                cmd.batch_size_per_gpu.max(1),
+                cmd.batch_size.max(1),
                 &mut eval_rng,
                 weights,
             )
@@ -1768,7 +1765,7 @@ fn main() {
                 &train,
                 cmd.epochs.max(1),
                 cmd.lr.max(0.0),
-                cmd.batch_size_per_gpu.max(1),
+                cmd.batch_size.max(1),
                 &mut train_rng,
                 weights,
             )
@@ -1781,7 +1778,7 @@ fn main() {
                 &validation,
                 1,
                 1.0e-12,
-                cmd.batch_size_per_gpu.max(1),
+                cmd.batch_size.max(1),
                 &mut final_eval_rng,
                 weights,
             )
@@ -1998,7 +1995,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size(global)={} global_step_samples={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2012,7 +2009,6 @@ fn main() {
                 config.lr_decay_interval,
                 config.lr_decay_factor,
                 config.batch_size,
-                global_training_step_sample_count(config.batch_size),
                 config.train_warmup_samples,
                 config.train_samples_per_update,
                 config.train_epochs_per_update,
@@ -2276,8 +2272,7 @@ fn main() {
                 let mut total_games_generated = 0usize;
                 let mut total_samples_generated = 0usize;
                 let mut train_index = 0usize;
-                let min_train_samples =
-                    global_training_step_sample_count(trainer_config.batch_size);
+                let min_train_samples = trainer_config.batch_size.max(1);
                 'training: while let Ok(mut pending) = ready_rx.recv() {
                     let pending_games = pending.selfplay.games.len();
                     let pending_samples = pending.selfplay.samples.len();

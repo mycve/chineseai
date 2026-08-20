@@ -2,11 +2,6 @@ use std::sync::Arc;
 
 use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
 
-/// ????????????????????? batch size?????????
-pub fn global_training_step_sample_count(global_batch_size: usize) -> usize {
-    global_batch_size.max(1)
-}
-
 pub fn train_samples(
     model: &mut AzNnue,
     samples: &[AzTrainingSample],
