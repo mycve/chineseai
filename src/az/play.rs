@@ -117,10 +117,6 @@ impl AzArenaReport {
         self.score_rate() - z.max(0.0) * self.score_rate_standard_error()
     }
 
-    pub fn promotes_with_lower_bound(&self, threshold: f32, z: f32) -> bool {
-        self.score_rate_lower_bound(z) >= threshold.clamp(0.0, 1.0)
-    }
-
     pub fn anchored_elo(&self, ref_elo: f32) -> f32 {
         ref_elo + self.elo_diff_vs_even()
     }
@@ -1857,20 +1853,6 @@ mod tests {
             }
             assert!((sample.value - (expected[0] - expected[2])).abs() < 1.0e-6);
         }
-    }
-
-    #[test]
-    fn arena_promotion_uses_score_lower_bound() {
-        let report = AzArenaReport {
-            wins: 84,
-            losses: 68,
-            draws: 48,
-            ..AzArenaReport::default()
-        };
-
-        assert!((report.score_rate() - 0.54).abs() < 1e-6);
-        assert!(report.promotes_with_lower_bound(0.50, 1.0));
-        assert!(!report.promotes_with_lower_bound(0.50, 1.64));
     }
 
     #[test]

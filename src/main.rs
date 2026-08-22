@@ -1298,6 +1298,13 @@ fn build_arena_start_positions(
     config: &AzLoopFileConfig,
     update: usize,
 ) -> (Vec<Position>, String) {
+    let seed = config.seed ^ (update as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    let mut positions = Vec::with_capacity(
+        config
+            .arena_opening_positions
+            .saturating_add(config.arena_random_positions),
+    );
+    let mut modes = Vec::with_capacity(2);
     if !config.arena_opening_book.trim().is_empty() {
         let book = ObkBook::load(&config.arena_opening_book).unwrap_or_else(|err| {
             panic!(
@@ -1305,9 +1312,7 @@ fn build_arena_start_positions(
                 config.arena_opening_book
             )
         });
-        let mut rng =
-            SplitMix64::new(config.seed ^ (update as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
-        let mut positions = Vec::with_capacity(config.arena_opening_positions);
+        let mut rng = SplitMix64::new(seed);
         for _ in 0..config.arena_opening_positions {
             positions.push(book.random_prefix_position(
                 config.arena_opening_plies_min,
@@ -1315,17 +1320,40 @@ fn build_arena_start_positions(
                 &mut rng,
             ));
         }
-        let mode = format!(
-            "obk_openings(keys={},moves={},plies={}-{})",
+        modes.push(format!(
+            "obk(count={},keys={},moves={},plies={}-{})",
+            config.arena_opening_positions,
             book.key_count(),
             book.move_count(),
             config.arena_opening_plies_min,
             config.arena_opening_plies_max
-        );
-        return (positions, mode);
+        ));
     }
 
-    (Vec::new(), "startpos_fallback".to_string())
+    if config.arena_random_positions > 0 {
+        let random_fens = generate_random_eval_fens(
+            config.arena_random_positions,
+            config.arena_random_plies_min,
+            config.arena_random_plies_max,
+            seed ^ 0xA076_1D64_78BD_642F,
+        );
+        positions.extend(random_fens.iter().map(|fen| {
+            Position::from_fen(fen)
+                .unwrap_or_else(|err| panic!("generated invalid arena FEN `{fen}`: {err}"))
+        }));
+        modes.push(format!(
+            "random(count={},plies={}-{})",
+            config.arena_random_positions,
+            config.arena_random_plies_min,
+            config.arena_random_plies_max
+        ));
+    }
+
+    if positions.is_empty() {
+        (Vec::new(), "startpos_fallback".to_string())
+    } else {
+        (positions, modes.join("+"))
+    }
 }
 
 fn fixed_az_search_limits(
@@ -2046,7 +2074,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_promotion_z={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2100,7 +2128,6 @@ fn main() {
                 config.arena_cpuct_at_root,
                 config.arena_policy_softmax_temp,
                 config.arena_promotion_rate,
-                config.arena_promotion_confidence_z,
                 config.arena_processes,
                 if config.arena_opening_book.trim().is_empty() {
                     "(none)"
@@ -2110,6 +2137,9 @@ fn main() {
                 config.arena_opening_positions,
                 config.arena_opening_plies_min,
                 config.arena_opening_plies_max,
+                config.arena_random_positions,
+                config.arena_random_plies_min,
+                config.arena_random_plies_max,
                 if config.pikafish_label_eval_sqlite.trim().is_empty() {
                     "(none)"
                 } else {
@@ -3143,13 +3173,7 @@ fn main() {
                         let ref_elo = arena_best_elo;
                         let candidate_elo = arena.anchored_elo(ref_elo);
                         let elo_diff = arena.elo_diff_vs_even();
-                        let arena_se = arena.score_rate_standard_error();
-                        let arena_lcb =
-                            arena.score_rate_lower_bound(config.arena_promotion_confidence_z);
-                        let promoted = arena.promotes_with_lower_bound(
-                            config.arena_promotion_rate,
-                            config.arena_promotion_confidence_z,
-                        );
+                        let promoted = arena.score_rate() >= config.arena_promotion_rate;
                         if promoted {
                             arena_reference_model = deployed_model.clone();
                             let updated_numa_models =
@@ -3180,7 +3204,7 @@ fn main() {
                             shared.version = shared.version.wrapping_add(1);
                         }
                         println!(
-                            "arena {update:04}: mode={} total={} positions={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} se={:.3} lcb={:.3} promote_at={:.3} z={:.2} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
+                            "arena {update:04}: mode={} total={} positions={} W/L/D={}/{}/{} red={}/{} black={}/{} score={:.1} rate={:.3} promote_at={:.3} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
                             arena_mode,
                             arena.total_games(),
                             arena_position_count,
@@ -3193,10 +3217,7 @@ fn main() {
                             arena.losses_as_black,
                             arena.score(),
                             arena.score_rate(),
-                            arena_se,
-                            arena_lcb,
                             config.arena_promotion_rate,
-                            config.arena_promotion_confidence_z,
                             ref_elo,
                             candidate_elo,
                             elo_diff,
@@ -3207,8 +3228,6 @@ fn main() {
                             }
                         );
                         log_scalar(&mut tb, "arena/score_rate", update, arena.score_rate());
-                        log_scalar(&mut tb, "arena/score_rate_se", update, arena_se);
-                        log_scalar(&mut tb, "arena/score_rate_lcb", update, arena_lcb);
                         log_scalar(&mut tb, "arena/ref_elo", update, ref_elo);
                         log_scalar(&mut tb, "arena/elo", update, candidate_elo);
                         log_scalar(&mut tb, "arena/elo_diff", update, elo_diff);
@@ -5023,6 +5042,25 @@ mod reporting_tests {
 
         assert_eq!(stats.value_count(), 1);
         assert!((stats.value_mae_wdl_q() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arena_adds_random_takeover_positions() {
+        let mut config = AzLoopFileConfig::default();
+        config.arena_opening_book.clear();
+        config.arena_random_positions = 8;
+        config.arena_random_plies_min = 4;
+        config.arena_random_plies_max = 12;
+
+        let (positions, mode) = build_arena_start_positions(&config, 7);
+
+        assert_eq!(positions.len(), 8);
+        assert_eq!(mode, "random(count=8,plies=4-12)");
+        assert!(positions.iter().all(|position| {
+            position.has_general(chineseai::xiangqi::Color::Red)
+                && position.has_general(chineseai::xiangqi::Color::Black)
+                && !position.legal_moves().is_empty()
+        }));
     }
 }
 

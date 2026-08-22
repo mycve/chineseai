@@ -82,12 +82,14 @@ pub struct AzLoopFileConfig {
     pub arena_cpuct_at_root: f32,
     pub arena_policy_softmax_temp: f32,
     pub arena_promotion_rate: f32,
-    pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
     pub arena_opening_book: String,
     pub arena_opening_positions: usize,
     pub arena_opening_plies_min: usize,
     pub arena_opening_plies_max: usize,
+    pub arena_random_positions: usize,
+    pub arena_random_plies_min: usize,
+    pub arena_random_plies_max: usize,
     pub pikafish_label_eval_sqlite: String,
     pub pikafish_label_eval_interval: usize,
     pub pikafish_label_eval_limit: usize,
@@ -160,17 +162,19 @@ impl Default for AzLoopFileConfig {
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
             arena_interval: 10,
-            arena_simulations: 4000,
+            arena_simulations: 400,
             arena_cpuct: 0.9,
             arena_cpuct_at_root: 2.0,
             arena_policy_softmax_temp: 1.2,
-            arena_promotion_rate: 0.50,
-            arena_promotion_confidence_z: 1.28,
+            arena_promotion_rate: 0.55,
             arena_processes: 128,
             arena_opening_book: "opening.obk".into(),
-            arena_opening_positions: 300,
+            arena_opening_positions: 800,
             arena_opening_plies_min: 6,
             arena_opening_plies_max: 10,
+            arena_random_positions: 200,
+            arena_random_plies_min: 4,
+            arena_random_plies_max: 12,
             pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
             pikafish_label_eval_interval: 10,
             pikafish_label_eval_limit: 1000,
@@ -302,15 +306,14 @@ impl AzLoopFileConfig {
             f(self.arena_policy_softmax_temp)
         );
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
-        line!(
-            "arena_promotion_confidence_z",
-            f(self.arena_promotion_confidence_z)
-        );
         line!("arena_processes", self.arena_processes);
         line!("arena_opening_book", q(&self.arena_opening_book));
         line!("arena_opening_positions", self.arena_opening_positions);
         line!("arena_opening_plies_min", self.arena_opening_plies_min);
         line!("arena_opening_plies_max", self.arena_opening_plies_max);
+        line!("arena_random_positions", self.arena_random_positions);
+        line!("arena_random_plies_min", self.arena_random_plies_min);
+        line!("arena_random_plies_max", self.arena_random_plies_max);
         line!(
             "pikafish_label_eval_sqlite",
             q(&self.pikafish_label_eval_sqlite)
@@ -414,7 +417,6 @@ impl AzLoopFileConfig {
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
-        self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_simulations = self.arena_simulations.max(1);
         self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
@@ -426,6 +428,12 @@ impl AzLoopFileConfig {
             std::mem::swap(
                 &mut self.arena_opening_plies_min,
                 &mut self.arena_opening_plies_max,
+            );
+        }
+        if self.arena_random_plies_min > self.arena_random_plies_max {
+            std::mem::swap(
+                &mut self.arena_random_plies_min,
+                &mut self.arena_random_plies_max,
             );
         }
         self
@@ -496,11 +504,15 @@ mod tests {
         assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
-        assert!(text.contains("arena_opening_positions = 300\n"));
+        assert!(text.contains("arena_opening_positions = 800\n"));
         assert!(text.contains("arena_opening_plies_min = 6\n"));
         assert!(text.contains("arena_opening_plies_max = 10\n"));
+        assert!(text.contains("arena_random_positions = 200\n"));
+        assert!(text.contains("arena_random_plies_min = 4\n"));
+        assert!(text.contains("arena_random_plies_max = 12\n"));
         assert!(text.contains("arena_interval = 10\n"));
-        assert!(text.contains("arena_simulations = 4000\n"));
+        assert!(text.contains("arena_simulations = 400\n"));
+        assert!(text.contains("arena_promotion_rate = 0.55\n"));
         assert!(text.contains("arena_cpuct = 0.9\n"));
         assert!(text.contains("arena_cpuct_at_root = 2.0\n"));
         assert!(text.contains("arena_policy_softmax_temp = 1.2\n"));
@@ -542,6 +554,7 @@ mod tests {
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
             "value_target_search_q_mix = 0.4\n",
+            "arena_promotion_confidence_z = 1.28\n",
             "arena_pikafish_exe = \"./pikafish\"\n",
             "arena_pikafish_depth = 10\n",
             "arena_pikafish_games = 20\n",
