@@ -8,4 +8,4 @@ pub const REPLAY_FILE_VERSION: u32 = 35;
 /// az-loop ?????TOML??????
 pub const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 12;
 /// az-loop ?????????
-pub const AZ_LOOP_PROGRESS_VERSION: u32 = 4;
+pub const AZ_LOOP_PROGRESS_VERSION: u32 = 5;

@@ -989,8 +989,6 @@ pub struct AzLoopConfig {
 pub struct AzLoopReport {
     pub games: usize,
     pub samples: usize,
-    pub total_games_generated: usize,
-    pub total_samples_generated: usize,
     pub avg_search_simulations: f32,
     pub red_wins: usize,
     pub black_wins: usize,
