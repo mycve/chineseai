@@ -72,6 +72,8 @@ enum CliCommand {
     AzReplayFit(AzReplayFitArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
+    /// Evaluate checkpoint non-transitivity and historical regressions.
+    CheckpointCycles(CheckpointCyclesArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
     /// Generate random positions and label them with Pikafish best moves.
@@ -257,6 +259,55 @@ struct AzLoopArgs {
     /// Stop after completing this absolute update number and save the model/progress.
     #[arg(long)]
     target_update: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+Examples:
+  chineseai checkpoint-cycles checkpoints
+  chineseai checkpoint-cycles checkpoints --contains best --max-models 12 --opening-positions 100
+  chineseai checkpoint-cycles checkpoints --adjacent-only --simulations 400")]
+struct CheckpointCyclesArgs {
+    /// Directory containing checkpoint .safetensors files.
+    directory: String,
+    /// Keep only filenames containing this text; empty keeps every .safetensors file.
+    #[arg(long, default_value = "")]
+    contains: String,
+    /// Evaluate only the latest N checkpoints ordered by the filename's last number; 0 keeps all.
+    #[arg(long, default_value_t = 8)]
+    max_models: usize,
+    /// Minimum numeric update gap between selected checkpoints; 0 disables spacing.
+    #[arg(long, default_value_t = 100)]
+    min_update_gap: u64,
+    /// Test only consecutive checkpoints. This cannot detect three-model cycles.
+    #[arg(long)]
+    adjacent_only: bool,
+    /// MCTS simulations per move.
+    #[arg(short = 's', long, default_value_t = 400)]
+    simulations: usize,
+    /// Random OBK positions; every pair uses the same positions with colors swapped.
+    #[arg(long, default_value_t = 50)]
+    opening_positions: usize,
+    /// OBK opening book. Empty uses startpos.
+    #[arg(long, default_value = "opening.obk")]
+    opening_book: String,
+    #[arg(long, default_value_t = 6)]
+    opening_plies_min: usize,
+    #[arg(long, default_value_t = 10)]
+    opening_plies_max: usize,
+    /// Parallel arena workers for each checkpoint pair.
+    #[arg(long, default_value_t = 8)]
+    threads: usize,
+    #[arg(long, default_value_t = 300)]
+    max_plies: usize,
+    /// Minimum score-rate excess over 50% used to report a directed edge or cycle.
+    #[arg(long, default_value_t = 0.02)]
+    cycle_margin: f32,
+    /// One-sided confidence multiplier used by cycle and regression detection.
+    #[arg(long, default_value_t = 1.28)]
+    confidence_z: f32,
+    #[arg(long, default_value_t = 20260823)]
+    seed: u64,
 }
 
 #[derive(Args, Debug)]
@@ -3595,8 +3646,270 @@ fn main() {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
         }
+        Some(CliCommand::CheckpointCycles(cmd)) => {
+            run_checkpoint_cycles(cmd)
+                .unwrap_or_else(|err| panic!("checkpoint-cycles failed: {err}"));
+        }
     };
     chineseai::profile::print_report();
+}
+
+fn checkpoint_number(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let mut last = None;
+    let mut value = 0u64;
+    let mut active = false;
+    for byte in name.bytes() {
+        if byte.is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(u64::from(byte - b'0'));
+            active = true;
+        } else if active {
+            last = Some(value);
+            value = 0;
+            active = false;
+        }
+    }
+    if active { Some(value) } else { last }
+}
+
+fn checkpoint_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<invalid-name>")
+        .to_string()
+}
+
+fn cycle_edge(lower_bounds: &[Vec<Option<f32>>], from: usize, to: usize, margin: f32) -> bool {
+    lower_bounds[from][to].is_some_and(|score| score > 0.5 + margin)
+}
+
+fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
+    let directory = Path::new(&cmd.directory);
+    let mut paths = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "safetensors")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(&cmd.contains))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        checkpoint_number(left)
+            .cmp(&checkpoint_number(right))
+            .then_with(|| checkpoint_label(left).cmp(&checkpoint_label(right)))
+    });
+    if cmd.min_update_gap > 0 {
+        let mut spaced = Vec::new();
+        let mut newest_selected: Option<u64> = None;
+        for path in paths.into_iter().rev() {
+            let number = checkpoint_number(&path);
+            let keep = match (newest_selected, number) {
+                (Some(newer), Some(current)) => newer.saturating_sub(current) >= cmd.min_update_gap,
+                _ => true,
+            };
+            if keep {
+                if number.is_some() {
+                    newest_selected = number;
+                }
+                spaced.push(path);
+            }
+        }
+        spaced.reverse();
+        paths = spaced;
+    }
+    if cmd.max_models > 0 && paths.len() > cmd.max_models {
+        paths.drain(..paths.len() - cmd.max_models);
+    }
+    if paths.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "need at least two matching checkpoints in {}",
+                directory.display()
+            ),
+        ));
+    }
+
+    let mut rng = SplitMix64::new(cmd.seed);
+    let (positions, opening_mode) = if cmd.opening_book.trim().is_empty() {
+        (vec![Position::startpos()], "startpos".to_string())
+    } else {
+        let book = ObkBook::load(&cmd.opening_book).map_err(sqlite_io_error)?;
+        let count = cmd.opening_positions.max(1);
+        let positions = (0..count)
+            .map(|_| {
+                book.random_prefix_position(cmd.opening_plies_min, cmd.opening_plies_max, &mut rng)
+            })
+            .collect::<Vec<_>>();
+        (
+            positions,
+            format!(
+                "obk:{} positions={} plies={}-{}",
+                cmd.opening_book, count, cmd.opening_plies_min, cmd.opening_plies_max
+            ),
+        )
+    };
+    let positions = Arc::new(positions);
+    println!(
+        "checkpoint-cycles: models={} pairs={} min_update_gap={} sims={} games_per_pair={} threads={} opening={} margin={:.3} z={:.2}",
+        paths.len(),
+        if cmd.adjacent_only {
+            paths.len() - 1
+        } else {
+            paths.len() * (paths.len() - 1) / 2
+        },
+        cmd.min_update_gap,
+        cmd.simulations.max(1),
+        positions.len() * 2,
+        cmd.threads.max(1),
+        opening_mode,
+        cmd.cycle_margin.max(0.0),
+        cmd.confidence_z.max(0.0)
+    );
+    for (index, path) in paths.iter().enumerate() {
+        println!("  model[{index}] {}", path.display());
+    }
+    let models = paths
+        .iter()
+        .map(|path| AzNnue::load(path).map(Arc::new))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut scores = vec![vec![None; models.len()]; models.len()];
+    let mut lower_bounds = vec![vec![None; models.len()]; models.len()];
+    for index in 0..models.len() {
+        scores[index][index] = Some(0.5);
+        lower_bounds[index][index] = Some(0.5);
+    }
+    let started = Instant::now();
+    for newer in 1..models.len() {
+        let older_start = if cmd.adjacent_only { newer - 1 } else { 0 };
+        for older in older_start..newer {
+            let report = run_arena_threads(ArenaThreadConfig {
+                candidate: Arc::clone(&models[newer]),
+                baseline: Arc::clone(&models[older]),
+                eval_positions: Arc::clone(&positions),
+                simulations: cmd.simulations.max(1),
+                max_plies: cmd.max_plies.max(1),
+                rule60_max_ply: Some(120),
+                cpuct: 0.9,
+                cpuct_at_root: 2.0,
+                cpuct_base: 19652.0,
+                cpuct_factor: 1.5,
+                cpuct_base_at_root: 19652.0,
+                cpuct_factor_at_root: 1.5,
+                fpu_value: 0.2,
+                fpu_value_at_root: 0.1,
+                draw_score: 0.0,
+                policy_softmax_temp: 1.2,
+                thread_count: cmd.threads.max(1),
+                seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
+            });
+            let rate = report.score_rate();
+            let se = report.score_rate_standard_error();
+            let z = cmd.confidence_z.max(0.0);
+            scores[newer][older] = Some(rate);
+            scores[older][newer] = Some(1.0 - rate);
+            lower_bounds[newer][older] = Some(rate - z * se);
+            lower_bounds[older][newer] = Some(1.0 - rate - z * se);
+            println!(
+                "pair {} > {}: W/L/D={}/{}/{} rate={:.4} se={:.4} lcb(z={:.2})={:.4} elo={:+.1}",
+                checkpoint_label(&paths[newer]),
+                checkpoint_label(&paths[older]),
+                report.wins,
+                report.losses,
+                report.draws,
+                rate,
+                se,
+                z,
+                report.score_rate_lower_bound(z),
+                report.elo_diff_vs_even()
+            );
+        }
+    }
+
+    println!("\nSCORE MATRIX — row score against column");
+    print!("{:>4}", "row");
+    for column in 0..models.len() {
+        print!(" {:>7}", column);
+    }
+    println!();
+    for row in 0..models.len() {
+        print!("{:>4}", row);
+        for column in 0..models.len() {
+            match scores[row][column] {
+                Some(score) => print!(" {:>7.3}", score),
+                None => print!(" {:>7}", "-"),
+            }
+        }
+        println!("  {}", checkpoint_label(&paths[row]));
+    }
+
+    let margin = cmd.cycle_margin.max(0.0);
+    let mut cycles = 0usize;
+    if !cmd.adjacent_only {
+        println!("\nNON-TRANSITIVE CYCLES — every edge > {:.3}", 0.5 + margin);
+        for a in 0..models.len() {
+            for b in a + 1..models.len() {
+                for c in b + 1..models.len() {
+                    for &(x, y, z) in &[(a, b, c), (a, c, b)] {
+                        if cycle_edge(&lower_bounds, x, y, margin)
+                            && cycle_edge(&lower_bounds, y, z, margin)
+                            && cycle_edge(&lower_bounds, z, x, margin)
+                        {
+                            cycles += 1;
+                            println!(
+                                "  {} > {} > {} > {}",
+                                checkpoint_label(&paths[x]),
+                                checkpoint_label(&paths[y]),
+                                checkpoint_label(&paths[z]),
+                                checkpoint_label(&paths[x])
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if cycles == 0 {
+            println!("  none");
+        }
+    }
+
+    println!("\nHISTORICAL REGRESSIONS — beats predecessor but loses an older model");
+    let mut regressions = 0usize;
+    for current in 2..models.len() {
+        if !cycle_edge(&lower_bounds, current, current - 1, margin) {
+            continue;
+        }
+        for older in 0..current - 1 {
+            if cycle_edge(&lower_bounds, older, current, margin) {
+                regressions += 1;
+                println!(
+                    "  {} beats {}, but loses to {}",
+                    checkpoint_label(&paths[current]),
+                    checkpoint_label(&paths[current - 1]),
+                    checkpoint_label(&paths[older])
+                );
+            }
+        }
+    }
+    if regressions == 0 {
+        println!("  none");
+    }
+    println!(
+        "\nSUMMARY models={} cycles={} regressions={} elapsed={:.1}s",
+        models.len(),
+        cycles,
+        regressions,
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
