@@ -23,7 +23,84 @@ use geom::{
     line_between_squares, rank_of, soldier_crossed_river,
 };
 use hash::{SIDE_TO_MOVE_KEY, color_hash_index, zobrist_piece_key};
+use std::sync::OnceLock;
 use types::{CheckerInfo, MoveGenMode, PositionState};
+
+fn orthogonal_ray_masks() -> &'static [[u128; 4]; BOARD_SIZE] {
+    static RAYS: OnceLock<[[u128; 4]; BOARD_SIZE]> = OnceLock::new();
+    RAYS.get_or_init(|| {
+        let mut rays = [[0u128; 4]; BOARD_SIZE];
+        for source in 0..BOARD_SIZE {
+            let file = file_of(source) as i32;
+            let rank = rank_of(source) as i32;
+            for (direction, (df, dr)) in ORTHOGONAL_STEPS.into_iter().enumerate() {
+                let mut target_file = file + df;
+                let mut target_rank = rank + dr;
+                while inside_board(target_file, target_rank) {
+                    rays[source][direction] |=
+                        1u128 << index(target_file as usize, target_rank as usize);
+                    target_file += df;
+                    target_rank += dr;
+                }
+            }
+        }
+        rays
+    })
+}
+
+fn fixed_attack_masks() -> &'static [[[u128; BOARD_SIZE]; 3]; 2] {
+    static MASKS: OnceLock<[[[u128; BOARD_SIZE]; 3]; 2]> = OnceLock::new();
+    MASKS.get_or_init(|| {
+        let mut masks = [[[0u128; BOARD_SIZE]; 3]; 2];
+        for (color_index, color) in [Color::Red, Color::Black].into_iter().enumerate() {
+            for source in 0..BOARD_SIZE {
+                let file = file_of(source) as i32;
+                let rank = rank_of(source) as i32;
+                let mut add = |kind: usize, df: i32, dr: i32, palace: bool| {
+                    let target_file = file + df;
+                    let target_rank = rank + dr;
+                    if inside_board(target_file, target_rank)
+                        && (!palace
+                            || inside_palace(color, target_file as usize, target_rank as usize))
+                    {
+                        masks[color_index][kind][source] |=
+                            1u128 << index(target_file as usize, target_rank as usize);
+                    }
+                };
+                for (df, dr) in ORTHOGONAL_STEPS {
+                    add(0, df, dr, true);
+                }
+                for (df, dr) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                    add(1, df, dr, true);
+                }
+                add(2, 0, color.forward_step(), false);
+                if soldier_crossed_river(color, rank as usize) {
+                    add(2, -1, 0, false);
+                    add(2, 1, 0, false);
+                }
+            }
+        }
+        masks
+    })
+}
+
+#[inline(always)]
+fn nearest_on_ray(blockers: u128, increasing: bool) -> usize {
+    if increasing {
+        blockers.trailing_zeros() as usize
+    } else {
+        127 - blockers.leading_zeros() as usize
+    }
+}
+
+#[inline(always)]
+fn ray_through(ray: u128, square: usize, increasing: bool) -> u128 {
+    if increasing {
+        ray & ((1u128 << (square + 1)) - 1)
+    } else {
+        ray & (!0u128 << square)
+    }
+}
 
 impl Default for Position {
     fn default() -> Self {
@@ -57,6 +134,7 @@ impl Position {
         }
         let position = Self {
             board,
+            occupied: 0,
             side_to_move: Color::Red,
             hash: 0,
             advisor_counts: [0; 2],
@@ -69,6 +147,7 @@ impl Position {
         let state = position.compute_state();
         Self {
             hash: state.hash,
+            occupied: state.occupied,
             advisor_counts: state.advisor_counts,
             elephant_counts: state.elephant_counts,
             dynamic_material_counts: state.dynamic_material_counts,
@@ -129,6 +208,7 @@ impl Position {
 
         let position = Self {
             board,
+            occupied: 0,
             side_to_move,
             hash: 0,
             advisor_counts: [0; 2],
@@ -141,6 +221,7 @@ impl Position {
         let state = position.compute_state();
         let position = Self {
             hash: state.hash,
+            occupied: state.occupied,
             advisor_counts: state.advisor_counts,
             elephant_counts: state.elephant_counts,
             dynamic_material_counts: state.dynamic_material_counts,
@@ -309,7 +390,11 @@ impl Position {
 
     pub(crate) fn attacked_squares_mask(&self, by: Color) -> u128 {
         let mut mask = 0u128;
-        for source in 0..BOARD_SIZE {
+        let occupancy = self.occupied;
+        let mut pieces = occupancy;
+        while pieces != 0 {
+            let source = pieces.trailing_zeros() as usize;
+            pieces &= pieces - 1;
             let Some(piece) = self.board[source].filter(|piece| piece.color == by) else {
                 continue;
             };
@@ -324,15 +409,7 @@ impl Position {
             };
             match piece.kind {
                 PieceKind::General => {
-                    for (df, dr) in ORTHOGONAL_STEPS {
-                        let target_file = file + df;
-                        let target_rank = rank + dr;
-                        if inside_board(target_file, target_rank)
-                            && inside_palace(by, target_file as usize, target_rank as usize)
-                        {
-                            add_step(df, dr);
-                        }
-                    }
+                    mask |= fixed_attack_masks()[color_hash_index(by)][0][source];
                     if let Some(enemy_general) = self.find_general(by.opposite())
                         && file_of(enemy_general) == file as usize
                         && self.clear_file_between(source, enemy_general)
@@ -341,15 +418,7 @@ impl Position {
                     }
                 }
                 PieceKind::Advisor => {
-                    for (df, dr) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
-                        let target_file = file + df;
-                        let target_rank = rank + dr;
-                        if inside_board(target_file, target_rank)
-                            && inside_palace(by, target_file as usize, target_rank as usize)
-                        {
-                            add_step(df, dr);
-                        }
-                    }
+                    mask |= fixed_attack_masks()[color_hash_index(by)][1][source];
                 }
                 PieceKind::Elephant => {
                     for (df, dr) in [(-2, -2), (-2, 2), (2, -2), (2, 2)] {
@@ -375,33 +444,41 @@ impl Position {
                     }
                 }
                 PieceKind::Rook | PieceKind::Cannon => {
-                    for (df, dr) in ORTHOGONAL_STEPS {
-                        let mut target_file = file + df;
-                        let mut target_rank = rank + dr;
-                        let mut screen = false;
-                        while inside_board(target_file, target_rank) {
-                            let target = index(target_file as usize, target_rank as usize);
-                            let occupied = self.board[target].is_some();
-                            if piece.kind == PieceKind::Rook || screen {
-                                mask |= 1u128 << target;
-                            }
-                            if occupied {
-                                if piece.kind == PieceKind::Rook || screen {
-                                    break;
-                                }
-                                screen = true;
-                            }
-                            target_file += df;
-                            target_rank += dr;
+                    for (direction, (df, dr)) in ORTHOGONAL_STEPS.into_iter().enumerate() {
+                        let ray = orthogonal_ray_masks()[source][direction];
+                        let increasing = dr * BOARD_FILES as i32 + df > 0;
+                        let blockers = ray & occupancy;
+                        if piece.kind == PieceKind::Rook {
+                            mask |= if blockers == 0 {
+                                ray
+                            } else {
+                                ray_through(ray, nearest_on_ray(blockers, increasing), increasing)
+                            };
+                            continue;
                         }
+                        if blockers == 0 {
+                            continue;
+                        }
+                        let screen = nearest_on_ray(blockers, increasing);
+                        let beyond_screen = if increasing {
+                            ray & (!0u128 << (screen + 1))
+                        } else {
+                            ray & ((1u128 << screen) - 1)
+                        };
+                        let second_blockers = beyond_screen & occupancy;
+                        mask |= if second_blockers == 0 {
+                            beyond_screen
+                        } else {
+                            ray_through(
+                                beyond_screen,
+                                nearest_on_ray(second_blockers, increasing),
+                                increasing,
+                            )
+                        };
                     }
                 }
                 PieceKind::Soldier => {
-                    add_step(0, by.forward_step());
-                    if soldier_crossed_river(by, rank as usize) {
-                        add_step(-1, 0);
-                        add_step(1, 0);
-                    }
+                    mask |= fixed_attack_masks()[color_hash_index(by)][2][source];
                 }
             }
         }
@@ -470,6 +547,7 @@ impl Position {
 
         let position = Self {
             board,
+            occupied: 0,
             side_to_move: self.side_to_move,
             hash: 0,
             advisor_counts: [0; 2],
@@ -482,6 +560,7 @@ impl Position {
         let state = position.compute_state();
         Self {
             hash: state.hash,
+            occupied: state.occupied,
             advisor_counts: state.advisor_counts,
             elephant_counts: state.elephant_counts,
             dynamic_material_counts: state.dynamic_material_counts,
@@ -589,6 +668,7 @@ impl Position {
 
         self.board[to] = Some(moving);
         self.board[from] = None;
+        self.occupied = (self.occupied & !(1u128 << from)) | (1u128 << to);
         if moving.kind == PieceKind::General {
             self.general_squares[color_hash_index(moving.color)] = Some(to);
         }
@@ -611,6 +691,10 @@ impl Position {
         self.hash ^= zobrist_piece_key(to, moving);
         self.board[from] = Some(moving);
         self.board[to] = undo.captured;
+        self.occupied |= 1u128 << from;
+        if undo.captured.is_none() {
+            self.occupied &= !(1u128 << to);
+        }
         if moving.kind == PieceKind::General {
             self.general_squares[color_hash_index(moving.color)] = Some(from);
         }
@@ -634,6 +718,7 @@ impl Position {
         let captured = self.board[to];
         self.board[to] = Some(moving);
         self.board[from] = None;
+        self.occupied = (self.occupied & !(1u128 << from)) | (1u128 << to);
         if moving.kind == PieceKind::General {
             self.general_squares[color_hash_index(moving.color)] = Some(to);
         }
@@ -646,6 +731,10 @@ impl Position {
         let moving = self.board[to].expect("move to occupied square");
         self.board[from] = Some(moving);
         self.board[to] = captured;
+        self.occupied |= 1u128 << from;
+        if captured.is_none() {
+            self.occupied &= !(1u128 << to);
+        }
         if moving.kind == PieceKind::General {
             self.general_squares[color_hash_index(moving.color)] = Some(from);
         }
@@ -947,6 +1036,7 @@ impl Position {
 
     fn compute_state(&self) -> PositionState {
         let mut hash = 0u64;
+        let mut occupied = 0u128;
         let mut advisor_counts = [0u8; 2];
         let mut elephant_counts = [0u8; 2];
         let mut dynamic_material_counts = [0u8; 2];
@@ -956,6 +1046,7 @@ impl Position {
                 continue;
             };
             hash ^= zobrist_piece_key(sq, piece);
+            occupied |= 1u128 << sq;
             match piece.kind {
                 PieceKind::Advisor => advisor_counts[color_hash_index(piece.color)] += 1,
                 PieceKind::Elephant => elephant_counts[color_hash_index(piece.color)] += 1,
@@ -972,6 +1063,7 @@ impl Position {
 
         PositionState {
             hash,
+            occupied,
             advisor_counts,
             elephant_counts,
             dynamic_material_counts,
@@ -1021,7 +1113,10 @@ impl Position {
     fn pseudo_legal_moves_with_mode(&self, mode: MoveGenMode) -> Vec<Move> {
         let mut moves = Vec::with_capacity(64);
 
-        for sq in 0..BOARD_SIZE {
+        let mut pieces = self.occupied;
+        while pieces != 0 {
+            let sq = pieces.trailing_zeros() as usize;
+            pieces &= pieces - 1;
             let Some(piece) = self.board[sq] else {
                 continue;
             };
@@ -1098,11 +1193,36 @@ impl Position {
         let mut mask = 0u128;
         let king_file = file_of(king_sq);
         let king_rank = rank_of(king_sq);
-        for rank in 0..BOARD_RANKS {
-            mask |= 1u128 << index(king_file, rank);
+        let enemy = color.opposite();
+        let mut needs_file = false;
+        let mut needs_rank = false;
+        let mut pieces = self.occupied;
+        while pieces != 0 && !(needs_file && needs_rank) {
+            let square = pieces.trailing_zeros() as usize;
+            pieces &= pieces - 1;
+            let Some(piece) = self.board[square] else {
+                continue;
+            };
+            if piece.color != enemy
+                || !matches!(
+                    piece.kind,
+                    PieceKind::Rook | PieceKind::Cannon | PieceKind::General
+                )
+            {
+                continue;
+            }
+            needs_file |= file_of(square) == king_file;
+            needs_rank |= rank_of(square) == king_rank;
         }
-        for file in 0..BOARD_FILES {
-            mask |= 1u128 << index(file, king_rank);
+        if needs_file {
+            for rank in 0..BOARD_RANKS {
+                mask |= 1u128 << index(king_file, rank);
+            }
+        }
+        if needs_rank {
+            for file in 0..BOARD_FILES {
+                mask |= 1u128 << index(file, king_rank);
+            }
         }
 
         self.add_horse_leg_attack_mask(king_sq, color.opposite(), &mut mask);
@@ -1159,7 +1279,10 @@ impl Position {
         }
 
         let mut piece_moves = Vec::with_capacity(16);
-        for sq in 0..BOARD_SIZE {
+        let mut pieces = self.occupied;
+        while pieces != 0 {
+            let sq = pieces.trailing_zeros() as usize;
+            pieces &= pieces - 1;
             let Some(piece) = self.board[sq] else {
                 continue;
             };

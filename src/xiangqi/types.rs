@@ -173,6 +173,7 @@ pub enum RuleOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Position {
     pub(super) board: [Option<Piece>; BOARD_SIZE],
+    pub(super) occupied: u128,
     pub(super) side_to_move: Color,
     pub(super) hash: u64,
     pub(super) advisor_counts: [u8; 2],
@@ -186,6 +187,7 @@ pub struct Position {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PositionState {
     pub(super) hash: u64,
+    pub(super) occupied: u128,
     pub(super) advisor_counts: [u8; 2],
     pub(super) elephant_counts: [u8; 2],
     pub(super) dynamic_material_counts: [u8; 2],

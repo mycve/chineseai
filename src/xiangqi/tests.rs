@@ -946,6 +946,37 @@ fn fast_legal_moves_match_slow_on_vs_pikafish_repetition_game() {
 }
 
 #[test]
+fn fast_legal_moves_match_slow_on_random_games() {
+    let mut rng: u64 = 0xD1B54A32D192ED03;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for game in 0..30u64 {
+        let mut position = Position::startpos();
+        for ply in 0..200usize {
+            let mut fast = position.legal_moves();
+            let mut slow = slow_legal_moves(&position);
+            fast.sort_by_key(|mv| (mv.from, mv.to));
+            slow.sort_by_key(|mv| (mv.from, mv.to));
+            assert_eq!(
+                fast,
+                slow,
+                "fast legal mismatch game {game} ply {ply} at {}",
+                position.to_fen()
+            );
+            if fast.is_empty() {
+                break;
+            }
+            let mv = fast[(next() as usize) % fast.len()];
+            position.make_move(mv);
+        }
+    }
+}
+
+#[test]
 fn gives_check_fast_matches_bruteforce() {
     let mut rng: u64 = 0x9E3779B97F4A7C15;
     let mut next = move || {
