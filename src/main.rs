@@ -859,7 +859,14 @@ fn arena_gate_decision(
         .into_iter()
         .chain(anchor)
         .any(|report| report.score_rate_upper_bound(z) < 0.50);
-    if proven_current_regression || proven_history_regression {
+    let mut combined_history = AzArenaReport::default();
+    for report in previous.into_iter().chain(anchor) {
+        combined_history.add_assign(report);
+    }
+    let proven_combined_history_regression =
+        combined_history.total_games() > 0 && combined_history.score_rate_upper_bound(z) < 0.50;
+    if proven_current_regression || proven_history_regression || proven_combined_history_regression
+    {
         return ArenaGateDecision::Reject;
     }
 
@@ -3528,9 +3535,11 @@ fn main() {
                         }
                         if historical_arena.total_games() > 0 {
                             println!(
-                                "arena {update:04}: history_games={} history_rate={:.3}",
+                                "arena {update:04}: history_games={} history_rate={:.3} history_ucb={:.3}",
                                 historical_arena.total_games(),
-                                historical_arena.score_rate()
+                                historical_arena.score_rate(),
+                                historical_arena
+                                    .score_rate_upper_bound(config.arena_promotion_confidence_z)
                             );
                             log_scalar(
                                 &mut tb,
@@ -5458,6 +5467,33 @@ mod reporting_tests {
                 &regressed_current,
                 Some(&previous),
                 Some(&anchor),
+                0.50,
+                1.28,
+            ),
+            ArenaGateDecision::Reject
+        );
+
+        // Each historical opponent is individually inconclusive, but their
+        // combined 800 games prove the same regression seen at update 3760.
+        let previous_split = AzArenaReport {
+            wins: 141,
+            losses: 163,
+            draws: 96,
+            ..AzArenaReport::default()
+        };
+        let anchor_split = AzArenaReport {
+            wins: 147,
+            losses: 160,
+            draws: 93,
+            ..AzArenaReport::default()
+        };
+        assert!(previous_split.score_rate_upper_bound(1.28) >= 0.50);
+        assert!(anchor_split.score_rate_upper_bound(1.28) >= 0.50);
+        assert_eq!(
+            arena_gate_decision(
+                &current,
+                Some(&previous_split),
+                Some(&anchor_split),
                 0.50,
                 1.28,
             ),
