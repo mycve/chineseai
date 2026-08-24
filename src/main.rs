@@ -934,6 +934,7 @@ struct TrainerEvent {
 
 struct SharedSelfplayModel {
     version: u64,
+    learner_update: u32,
     models_by_numa_node: Vec<Arc<AzNnue>>,
 }
 
@@ -1362,7 +1363,8 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let fpu_value_at_root = config.fpu_value_at_root;
         let draw_score = config.draw_score;
         let policy_softmax_temp = config.policy_softmax_temp;
-        let seed = config.seed ^ index as u64;
+        // 由全局开局索引派生每对随机流；结果不应随线程切分变化。
+        let seed = config.seed;
         let thread_start_index = start_index;
         start_index += red_games;
         handles.push(thread::spawn(move || {
@@ -1406,10 +1408,14 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
 
 fn build_arena_start_positions(
     config: &AzLoopFileConfig,
-    _update: usize,
+    update: usize,
 ) -> (Vec<Position>, String) {
-    // 固定门控局面，确保相邻 update 的评分可直接比较；每个局面仍红黑成对复用。
-    let seed = config.seed ^ 0xD1B5_4A32_D192_ED03;
+    // 每次门控使用新的确定性留出折，避免反复在同一小批局面上选择导致评测过拟合。
+    // 折内每个局面仍严格交换红黑配对。
+    let gate_index = update / config.arena_interval.max(1);
+    let seed = config.seed
+        ^ 0xD1B5_4A32_D192_ED03
+        ^ (gate_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut positions = Vec::with_capacity(
         config
             .arena_opening_positions
@@ -2182,12 +2188,11 @@ fn main() {
                 }
                 reference
             };
-            let initial_selfplay_model = if config.arena_interval == 0 {
-                selfplay_model.clone()
-            } else {
-                println!("selfplay : champion gate active; start from arena best");
-                initial_arena_reference_model.clone()
-            };
+            let initial_selfplay_model = selfplay_model.clone();
+            println!(
+                "selfplay : actor starts from learner; publish every {} updates",
+                config.actor_publish_interval_updates
+            );
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -2252,12 +2257,6 @@ fn main() {
                 midgame_snapshot_path.display()
             );
             let shared_midgame_pool = Arc::new(RwLock::new(midgame_pool));
-            let next_selfplay_generation = replay_pool
-                .as_ref()
-                .map(AzExperiencePool::max_generation_update)
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(1);
             let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
                 * config.train_epochs_per_update as f32)
                 / config.selfplay_samples_per_update.max(1) as f32;
@@ -2345,7 +2344,7 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} raw_selfplay_warmup={}updates",
+                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} actor_publish={}updates",
                 config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
                 config.temperature_start,
@@ -2355,7 +2354,7 @@ fn main() {
                 config.opening_fen_game_fraction * 100.0,
                 config.midgame_start_fraction * 100.0,
                 config.midgame_reservoir_capacity,
-                config.selfplay_update_warmup_updates
+                config.actor_publish_interval_updates
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -2388,6 +2387,7 @@ fn main() {
                 build_numa_model_replicas(&initial_selfplay_model, &numa_nodes);
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: start_update.saturating_sub(1) as u64,
+                learner_update: start_update.saturating_sub(1).min(u32::MAX as usize) as u32,
                 models_by_numa_node: initial_numa_models,
             }));
             let mut arena_reference_model = initial_arena_reference_model;
@@ -2408,10 +2408,6 @@ fn main() {
             }
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
-            println!("generation: next_selfplay={next_selfplay_generation}");
-            let selfplay_generation = Arc::new(std::sync::atomic::AtomicU64::new(
-                next_selfplay_generation as u64,
-            ));
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
             for worker_id in 0..selfplay_worker_count {
                 let placement = cpu_placements[worker_id % cpu_placements.len()];
@@ -2425,7 +2421,6 @@ fn main() {
                 let selfplay_tx = selfplay_tx.clone();
                 let shared_model = Arc::clone(&shared_model);
                 let selfplay_pause = Arc::clone(&selfplay_pause);
-                let selfplay_generation = Arc::clone(&selfplay_generation);
                 let selfplay_midgame_pool = Arc::clone(&shared_midgame_pool);
                 selfplay_handles.push(thread::spawn(move || {
                     if let Err(err) = chineseai::cpu_topology::pin_current_thread(placement.cpu) {
@@ -2436,6 +2431,7 @@ fn main() {
                     }
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
+                    let mut local_learner_update = 0u32;
                     let mut local_model: Option<Arc<AzNnue>> = None;
                     while !selfplay_stop.load(Ordering::SeqCst) {
                         {
@@ -2460,20 +2456,17 @@ fn main() {
                                 local_model =
                                     Some(Arc::clone(&shared.models_by_numa_node[model_slot]));
                                 local_version = shared.version;
+                                local_learner_update = shared.learner_update;
                             }
                         }
                         let batch_seed = selfplay_config.seed
                             ^ ((worker_id as u64).wrapping_add(1) << 32)
                             ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        let generation_update = selfplay_generation
-                            .fetch_add(1, Ordering::SeqCst)
-                            .min(u32::MAX as u64)
-                            as u32;
                         let mut loop_config = build_az_loop_config(
                             &selfplay_config,
                             batch_seed,
                             1,
-                            generation_update,
+                            local_learner_update,
                             &selfplay_opening_positions,
                         );
                         loop_config.games = 4;
@@ -3353,13 +3346,21 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                let updated_numa_models = build_numa_model_replicas(&deployed_model, &numa_nodes);
-                {
-                    let mut shared = shared_model
-                        .write()
-                        .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                    shared.models_by_numa_node = updated_numa_models;
-                    shared.version = shared.version.wrapping_add(1);
+                if update.is_multiple_of(config.actor_publish_interval_updates) {
+                    let updated_numa_models =
+                        build_numa_model_replicas(&deployed_model, &numa_nodes);
+                    let actor_version = {
+                        let mut shared = shared_model
+                            .write()
+                            .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                        shared.models_by_numa_node = updated_numa_models;
+                        shared.version = shared.version.wrapping_add(1);
+                        shared.learner_update = update.min(u32::MAX as usize) as u32;
+                        shared.version
+                    };
+                    println!(
+                        "actor    : published learner update {update} as generation {actor_version}"
+                    );
                 }
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
@@ -3502,14 +3503,16 @@ fn main() {
                             println!("best     : saved {}", best_checkpoint.display());
                         }
                         println!(
-                            "arena {update:04}: mode={} positions={} current_games={} current_W/L/D={}/{}/{} current_rate={:.3} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
+                            "arena {update:04}: mode={} positions={} current_games={} pairs={} current_W/L/D={}/{}/{} current_rate={:.3} paired_se={:.4} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
                             arena_mode,
                             arena_position_count,
                             current_arena.total_games(),
+                            current_arena.paired_openings,
                             current_arena.wins,
                             current_arena.losses,
                             current_arena.draws,
                             current_arena.score_rate(),
+                            current_arena.score_rate_standard_error(),
                             current_arena
                                 .score_rate_lower_bound(config.arena_promotion_confidence_z),
                             current_arena
@@ -5428,6 +5431,12 @@ mod reporting_tests {
                 && position.has_general(chineseai::xiangqi::Color::Black)
                 && !position.legal_moves().is_empty()
         }));
+
+        let (next_fold, _) = build_arena_start_positions(&config, 17);
+        assert_ne!(
+            positions.iter().map(Position::hash).collect::<Vec<_>>(),
+            next_fold.iter().map(Position::hash).collect::<Vec<_>>()
+        );
     }
 
     #[test]

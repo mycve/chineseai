@@ -77,6 +77,10 @@ pub struct AzArenaReport {
     pub losses_as_red: usize,
     pub wins_as_black: usize,
     pub losses_as_black: usize,
+    /// 每个开局交换红黑后的候选平均得分矩，用于消除开局先后手偏置。
+    pub paired_openings: usize,
+    pub paired_score_sum: f32,
+    pub paired_score_sq_sum: f32,
 }
 
 impl AzArenaReport {
@@ -88,6 +92,9 @@ impl AzArenaReport {
         self.losses_as_red += other.losses_as_red;
         self.wins_as_black += other.wins_as_black;
         self.losses_as_black += other.losses_as_black;
+        self.paired_openings += other.paired_openings;
+        self.paired_score_sum += other.paired_score_sum;
+        self.paired_score_sq_sum += other.paired_score_sq_sum;
     }
 
     pub fn total_games(&self) -> usize {
@@ -103,6 +110,13 @@ impl AzArenaReport {
     }
 
     pub fn score_rate_standard_error(&self) -> f32 {
+        if self.paired_openings > 1 && self.paired_openings * 2 == self.total_games() {
+            let count = self.paired_openings as f32;
+            let mean = self.paired_score_sum / count;
+            let sample_variance =
+                ((self.paired_score_sq_sum - count * mean * mean) / (count - 1.0)).max(0.0);
+            return (sample_variance / count).sqrt();
+        }
         let games = self.total_games();
         if games <= 1 {
             return 0.5;
@@ -1430,7 +1444,7 @@ pub fn play_arena_games_from_positions(
     config: AzArenaConfig,
 ) -> AzArenaReport {
     let mut report = AzArenaReport::default();
-    let mut game_seed = config.seed;
+    let mut red_scores = Vec::with_capacity(config.games_as_red);
     for game_index in 0..config.games_as_red {
         let mut position = arena_start_position(positions, config.start_index + game_index);
         position.set_rule60_max_ply(config.rule60_max_ply);
@@ -1440,7 +1454,7 @@ pub fn play_arena_games_from_positions(
             baseline,
             config.simulations,
             config.max_plies,
-            game_seed,
+            config.seed ^ (config.start_index + game_index) as u64,
             config.cpuct,
             config.cpuct_at_root,
             config.cpuct_base,
@@ -1456,14 +1470,18 @@ pub fn play_arena_games_from_positions(
             std::cmp::Ordering::Greater => {
                 report.wins += 1;
                 report.wins_as_red += 1;
+                red_scores.push(1.0);
             }
             std::cmp::Ordering::Less => {
                 report.losses += 1;
                 report.losses_as_red += 1;
+                red_scores.push(0.0);
             }
-            std::cmp::Ordering::Equal => report.draws += 1,
+            std::cmp::Ordering::Equal => {
+                report.draws += 1;
+                red_scores.push(0.5);
+            }
         }
-        game_seed = game_seed.wrapping_add(1);
     }
     for game_index in 0..config.games_as_black {
         let mut position = arena_start_position(positions, config.start_index + game_index);
@@ -1474,7 +1492,7 @@ pub fn play_arena_games_from_positions(
             candidate,
             config.simulations,
             config.max_plies,
-            game_seed,
+            config.seed ^ (config.start_index + game_index) as u64,
             config.cpuct,
             config.cpuct_at_root,
             config.cpuct_base,
@@ -1486,18 +1504,28 @@ pub fn play_arena_games_from_positions(
             config.draw_score,
             config.policy_softmax_temp,
         );
-        match outcome.total_cmp(&0.0) {
+        let black_score = match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
                 report.losses += 1;
                 report.losses_as_black += 1;
+                0.0
             }
             std::cmp::Ordering::Less => {
                 report.wins += 1;
                 report.wins_as_black += 1;
+                1.0
             }
-            std::cmp::Ordering::Equal => report.draws += 1,
+            std::cmp::Ordering::Equal => {
+                report.draws += 1;
+                0.5
+            }
+        };
+        if let Some(&red_score) = red_scores.get(game_index) {
+            let paired_score = 0.5 * (red_score + black_score);
+            report.paired_openings += 1;
+            report.paired_score_sum += paired_score;
+            report.paired_score_sq_sum += paired_score * paired_score;
         }
-        game_seed = game_seed.wrapping_add(1);
     }
     report
 }
@@ -1635,6 +1663,21 @@ mod tests {
             mirror_probability: 0.0,
             record_fens: false,
         }
+    }
+
+    #[test]
+    fn arena_uncertainty_uses_color_swapped_opening_pairs() {
+        let report = AzArenaReport {
+            wins: 2,
+            losses: 2,
+            paired_openings: 2,
+            paired_score_sum: 1.0,
+            paired_score_sq_sum: 0.5,
+            ..AzArenaReport::default()
+        };
+        // 两个开局的配对得分为 0.5/0.5；红黑单盘虽各有胜负，先后手抵消后方差为零。
+        assert_eq!(report.score_rate(), 0.5);
+        assert_eq!(report.score_rate_standard_error(), 0.0);
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub struct AzLoopFileConfig {
     pub midgame_start_fraction: f32,
     pub midgame_reservoir_capacity: usize,
     pub midgame_snapshot_path: String,
-    pub selfplay_update_warmup_updates: usize,
+    pub actor_publish_interval_updates: usize,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub replay_capacity: usize,
@@ -144,7 +144,7 @@ impl Default for AzLoopFileConfig {
             midgame_start_fraction: 0.30,
             midgame_reservoir_capacity: 50_000,
             midgame_snapshot_path: "midgame-pool.lz4".into(),
-            selfplay_update_warmup_updates: 5,
+            actor_publish_interval_updates: 5,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
             replay_capacity: 1000000,
@@ -168,7 +168,7 @@ impl Default for AzLoopFileConfig {
             arena_cpuct_at_root: 2.0,
             arena_policy_softmax_temp: 1.2,
             arena_promotion_rate: 0.50,
-            arena_promotion_confidence_z: 1.28,
+            arena_promotion_confidence_z: 1.96,
             arena_processes: 128,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 800,
@@ -270,8 +270,8 @@ impl AzLoopFileConfig {
         );
         line!("midgame_snapshot_path", q(&self.midgame_snapshot_path));
         line!(
-            "selfplay_update_warmup_updates",
-            self.selfplay_update_warmup_updates
+            "actor_publish_interval_updates",
+            self.actor_publish_interval_updates
         );
         line!("resign_percentage", f(self.resign_percentage));
         line!("resign_playthrough", f(self.resign_playthrough));
@@ -415,6 +415,7 @@ impl AzLoopFileConfig {
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
+        self.actor_publish_interval_updates = self.actor_publish_interval_updates.max(1);
         self.replay_startpos_sample_fraction = self.replay_startpos_sample_fraction.max(0.0);
         self.replay_opening_sample_fraction = self.replay_opening_sample_fraction.max(0.0);
         self.replay_midgame_sample_fraction = self.replay_midgame_sample_fraction.max(0.0);
@@ -472,7 +473,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 15\n"));
+        assert!(text.starts_with("format_version = 16\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00012\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
@@ -503,7 +504,7 @@ mod tests {
         assert!(text.contains("midgame_start_fraction = 0.3\n"));
         assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
         assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
-        assert!(text.contains("selfplay_update_warmup_updates = 5\n"));
+        assert!(text.contains("actor_publish_interval_updates = 5\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));
         assert!(text.contains("simulations = 400\n"));
@@ -537,7 +538,7 @@ mod tests {
         assert!(text.contains("arena_interval = 10\n"));
         assert!(text.contains("arena_simulations = 400\n"));
         assert!(text.contains("arena_promotion_rate = 0.5\n"));
-        assert!(text.contains("arena_promotion_confidence_z = 1.28\n"));
+        assert!(text.contains("arena_promotion_confidence_z = 1.96\n"));
         assert!(text.contains("arena_cpuct = 0.9\n"));
         assert!(text.contains("arena_cpuct_at_root = 2.0\n"));
         assert!(text.contains("arena_policy_softmax_temp = 1.2\n"));
@@ -569,6 +570,7 @@ mod tests {
     #[test]
     fn removed_config_names_are_rejected() {
         for removed in [
+            "selfplay_update_warmup_updates = 5\n",
             "opening_temperature = 1.25\n",
             "replay_recent_window_updates = 5000\n",
             "deblunder_q_gap = 0.05\n",
