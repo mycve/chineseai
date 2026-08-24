@@ -1002,7 +1002,6 @@ fn build_az_loop_config(
         seed,
         workers,
         generation_update,
-        opening_exploration_plies: config.opening_exploration_plies,
         temperature_start: config.temperature_start,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
@@ -1017,12 +1016,10 @@ fn build_az_loop_config(
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
-        opening_root_exploration_fraction: config.opening_root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         draw_score: config.draw_score,
         policy_softmax_temp: config.policy_softmax_temp,
-        opening_policy_softmax_temp: config.opening_policy_softmax_temp,
         value_td_lambda: config.value_td_lambda,
         opening_positions: Arc::clone(opening_positions),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
@@ -2339,11 +2336,8 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : opening={}ply policy_temp={} root_noise(alpha={},fraction={}) move_temp={}..{} normal_policy_temp={} normal_noise_fraction={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} raw_selfplay_warmup={}updates",
-                config.opening_exploration_plies,
-                config.opening_policy_softmax_temp,
+                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} raw_selfplay_warmup={}updates",
                 config.root_dirichlet_alpha,
-                config.opening_root_exploration_fraction,
                 config.temperature_start,
                 config.temperature_endgame,
                 config.policy_softmax_temp,

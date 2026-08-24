@@ -302,8 +302,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
-fn selfplay_search_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSearchLimits {
-    let opening = ply < config.opening_exploration_plies;
+fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
     AzSearchLimits {
         simulations: config.simulations.max(1),
         seed,
@@ -315,18 +314,10 @@ fn selfplay_search_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSea
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         max_depth: 0,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
-        root_exploration_fraction: if opening {
-            config.opening_root_exploration_fraction
-        } else {
-            config.root_exploration_fraction
-        },
+        root_exploration_fraction: config.root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
-        policy_softmax_temp: if opening {
-            config.opening_policy_softmax_temp
-        } else {
-            config.policy_softmax_temp
-        },
+        policy_softmax_temp: config.policy_softmax_temp,
         draw_score: config.draw_score,
         value_scale: 1.0,
     }
@@ -1605,7 +1596,6 @@ mod tests {
             seed: 20260817,
             workers: 1,
             generation_update: 0,
-            opening_exploration_plies: 0,
             temperature_start: 0.0,
             temperature_endgame: 0.0,
             temperature_decay_delay_plies: 0,
@@ -1620,12 +1610,10 @@ mod tests {
             cpuct_factor_at_root: 1.5,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            opening_root_exploration_fraction: 0.0,
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
             draw_score: 0.0,
             policy_softmax_temp: 1.0,
-            opening_policy_softmax_temp: 1.0,
             value_td_lambda: 0.9,
             opening_positions: Default::default(),
             opening_fen_game_fraction: 0.0,
