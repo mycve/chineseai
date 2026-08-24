@@ -106,7 +106,7 @@ pub(super) const VALUE_THREAT_RANK: usize = 64;
 pub(super) const VALUE_THREAT_VOCAB: usize = 57_702;
 pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 96;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
-pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.95;
+pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.9;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -1002,6 +1002,7 @@ pub struct AzLoopReport {
     pub value_corr: f32,
     pub value_calibration: f32,
     pub phase_value: [AzPhaseValueReport; 3],
+    pub source_phase_value: [AzPhaseValueReport; 9],
     pub policy_ce: f32,
     pub policy_target_entropy: f32,
     pub policy_kl: f32,
@@ -1046,6 +1047,7 @@ pub struct AzLoopReport {
     pub train_value_weight_mean: f32,
     pub train_recent_quota_rate: f32,
     pub train_actual_recent_sample_rate: f32,
+    pub train_start_source_rate: [f32; 3],
     pub train_policy_target_top1: f32,
     pub train_policy_target_top2: f32,
     pub terminal_no_legal_moves: usize,
@@ -1245,6 +1247,32 @@ pub fn rule_context_features(
     ]
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AzStartSource {
+    #[default]
+    Startpos = 0,
+    OpeningFen = 1,
+    Midgame = 2,
+}
+
+impl AzStartSource {
+    pub const COUNT: usize = 3;
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Startpos),
+            1 => Some(Self::OpeningFen),
+            2 => Some(Self::Midgame),
+            _ => None,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzSampleMeta {
     pub generation_update: u32,
@@ -1257,6 +1285,7 @@ pub struct AzSampleMeta {
     pub played_visits: u32,
     pub best_index: u16,
     pub played_index: u16,
+    pub start_source: AzStartSource,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1279,6 +1308,7 @@ pub struct AzTrainStats {
     pub value_error_sq_sum: f32,
     pub samples: usize,
     pub phase_value: [AzValueMomentStats; 3],
+    pub source_phase_value: [AzValueMomentStats; 9],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1321,6 +1351,19 @@ impl AzTrainStats {
         self.value_error_sq_sum += other.value_error_sq_sum;
         self.samples += other.samples;
         for (left, right) in self.phase_value.iter_mut().zip(other.phase_value) {
+            left.pred_sum += right.pred_sum;
+            left.pred_sq_sum += right.pred_sq_sum;
+            left.target_sum += right.target_sum;
+            left.target_sq_sum += right.target_sq_sum;
+            left.pred_target_sum += right.pred_target_sum;
+            left.error_sq_sum += right.error_sq_sum;
+            left.samples += right.samples;
+        }
+        for (left, right) in self
+            .source_phase_value
+            .iter_mut()
+            .zip(other.source_phase_value)
+        {
             left.pred_sum += right.pred_sum;
             left.pred_sq_sum += right.pred_sq_sum;
             left.target_sum += right.target_sum;
@@ -3322,6 +3365,7 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
                 played_visits: 13,
                 best_index: 1,
                 played_index: 0,
+                start_source: AzStartSource::Startpos,
             },
         }
     }

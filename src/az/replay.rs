@@ -9,7 +9,7 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 use super::{
-    AzSampleMeta, AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE,
+    AzSampleMeta, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE,
     normalize_wdl_target,
 };
 
@@ -104,6 +104,7 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_u32(out, sample.meta.played_visits);
     replay_push_u32(out, sample.meta.best_index as u32);
     replay_push_u32(out, sample.meta.played_index as u32);
+    out.push(sample.meta.start_source as u8);
     Ok(())
 }
 
@@ -156,6 +157,7 @@ pub struct AzReplaySampleBatch {
     pub recent_samples: usize,
     pub actual_recent_samples: usize,
     pub full_window_samples: usize,
+    pub source_samples: [usize; AzStartSource::COUNT],
 }
 
 fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()> {
@@ -214,6 +216,12 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         played_visits: replay_read_u32(reader)?,
         best_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
         played_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
+        start_source: AzStartSource::from_u8(reader.read_u8()?).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay decode: invalid start source",
+            )
+        })?,
     };
     Ok(AzTrainingSample {
         features,
@@ -328,6 +336,7 @@ impl AzExperiencePool {
                 recent_samples: 0,
                 actual_recent_samples: 0,
                 full_window_samples: count,
+                source_samples: [0; AzStartSource::COUNT],
             };
         };
         let recent_count = self.sample_count - recent_start;
@@ -351,6 +360,120 @@ impl AzExperiencePool {
             recent_samples: recent_target,
             actual_recent_samples,
             full_window_samples: full_count,
+            source_samples: [0; AzStartSource::COUNT],
+        }
+    }
+
+    pub fn sample_stratified_recent(
+        &self,
+        count: usize,
+        source_fractions: [f32; AzStartSource::COUNT],
+        recent_fraction: f32,
+        recent_games: u32,
+        rng: &mut SplitMix64,
+    ) -> AzReplaySampleBatch {
+        if self.sample_count == 0 || count == 0 {
+            return AzReplaySampleBatch::default();
+        }
+        let chunk_ends = self.chunk_ends();
+        let recent_start = self
+            .recent_start_flat(recent_games.max(1))
+            .unwrap_or(self.sample_count);
+        let mut all_by_source: [Vec<usize>; AzStartSource::COUNT] = Default::default();
+        let mut old_by_source: [Vec<usize>; AzStartSource::COUNT] = Default::default();
+        let mut recent_by_source: [Vec<usize>; AzStartSource::COUNT] = Default::default();
+        let mut flat = 0usize;
+        for chunk in &self.chunks {
+            for entry in &chunk.entries {
+                let source = entry.sample.meta.start_source.index();
+                all_by_source[source].push(flat);
+                if flat >= recent_start {
+                    recent_by_source[source].push(flat);
+                } else {
+                    old_by_source[source].push(flat);
+                }
+                flat += 1;
+            }
+        }
+        let mut weights = source_fractions.map(|value| value.max(0.0));
+        for source in 0..AzStartSource::COUNT {
+            if all_by_source[source].is_empty() {
+                weights[source] = 0.0;
+            }
+        }
+        let total_weight = weights.iter().sum::<f32>();
+        if total_weight <= 0.0 {
+            return AzReplaySampleBatch {
+                samples: self.sample_uniform(count, rng),
+                full_window_samples: count,
+                ..AzReplaySampleBatch::default()
+            };
+        }
+        for weight in &mut weights {
+            *weight /= total_weight;
+        }
+        let mut source_targets = [0usize; AzStartSource::COUNT];
+        let mut assigned = 0usize;
+        for source in 0..AzStartSource::COUNT {
+            source_targets[source] = (count as f32 * weights[source]).floor() as usize;
+            assigned += source_targets[source];
+        }
+        let remainder_source = weights
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(source, _)| source)
+            .unwrap_or(0);
+        source_targets[remainder_source] += count - assigned;
+        let mut samples = Vec::with_capacity(count);
+        let mut source_samples = [0usize; AzStartSource::COUNT];
+        let recent_fraction = recent_fraction.clamp(0.0, 1.0);
+        let requested_recent_samples = (count as f32 * recent_fraction).round() as usize;
+        let mut recent_targets =
+            source_targets.map(|target| (target as f32 * recent_fraction).floor() as usize);
+        let mut recent_assigned = recent_targets.iter().sum::<usize>();
+        while recent_assigned < requested_recent_samples {
+            let source = (0..AzStartSource::COUNT)
+                .filter(|&source| recent_targets[source] < source_targets[source])
+                .max_by(|&left, &right| {
+                    let left_remainder =
+                        source_targets[left] as f32 * recent_fraction - recent_targets[left] as f32;
+                    let right_remainder = source_targets[right] as f32 * recent_fraction
+                        - recent_targets[right] as f32;
+                    left_remainder.total_cmp(&right_remainder)
+                })
+                .expect("recent replay quota must fit source quotas");
+            recent_targets[source] += 1;
+            recent_assigned += 1;
+        }
+        let mut actual_recent_samples = 0usize;
+        for source in 0..AzStartSource::COUNT {
+            let target = source_targets[source];
+            let recent_target = recent_targets[source];
+            for index in 0..target {
+                let want_recent = index < recent_target;
+                let preferred = if want_recent {
+                    &recent_by_source[source]
+                } else {
+                    &old_by_source[source]
+                };
+                let choices = if preferred.is_empty() {
+                    &all_by_source[source]
+                } else {
+                    preferred
+                };
+                let flat_index = choices[rng.next_u64() as usize % choices.len()];
+                actual_recent_samples += usize::from(flat_index >= recent_start);
+                samples.push(self.sample_by_flat_index(flat_index, &chunk_ends));
+                source_samples[source] += 1;
+            }
+        }
+        AzReplaySampleBatch {
+            samples,
+            recent_samples: requested_recent_samples,
+            actual_recent_samples,
+            full_window_samples: count.saturating_sub(requested_recent_samples),
+            source_samples,
         }
     }
 
@@ -630,5 +753,88 @@ impl AzExperiencePool {
             ));
         }
         Ok(inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(source: AzStartSource, generation: u32, id: u64) -> AzTrainingSample {
+        AzTrainingSample {
+            features: vec![0],
+            rule_context: [0.0; super::super::RULE_CONTEXT_SIZE],
+            move_indices: vec![0],
+            policy: vec![1.0],
+            value_wdl: [0.0, 1.0, 0.0],
+            value: 0.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 400,
+            meta: AzSampleMeta {
+                generation_update: generation,
+                game_id: id,
+                start_source: source,
+                ..AzSampleMeta::default()
+            },
+        }
+    }
+
+    #[test]
+    fn replay_roundtrip_preserves_start_source() {
+        let mut encoded = Vec::new();
+        let original = sample(AzStartSource::OpeningFen, 7, 11);
+        encode_az_training_sample(&mut encoded, &original).unwrap();
+        let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.meta.start_source, AzStartSource::OpeningFen);
+        assert_eq!(decoded.meta.generation_update, 7);
+        assert_eq!(decoded.meta.game_id, 11);
+    }
+
+    #[test]
+    fn stratified_sampler_enforces_source_and_recency_quotas() {
+        let mut pool = AzExperiencePool::new(1_000);
+        let sources = [
+            AzStartSource::Startpos,
+            AzStartSource::OpeningFen,
+            AzStartSource::Midgame,
+        ];
+        for generation in 0..10 {
+            pool.add_games(
+                sources
+                    .iter()
+                    .enumerate()
+                    .map(|(source_index, &source)| {
+                        (0..10)
+                            .map(|sample_index| {
+                                sample(
+                                    source,
+                                    generation,
+                                    generation as u64 * 1_000
+                                        + source_index as u64 * 100
+                                        + sample_index,
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        let batch =
+            pool.sample_stratified_recent(100, [0.2, 0.5, 0.3], 0.35, 15, &mut SplitMix64::new(42));
+        assert_eq!(batch.source_samples, [20, 50, 30]);
+        assert_eq!(batch.recent_samples, 35);
+        assert_eq!(batch.actual_recent_samples, 35);
+        assert_eq!(batch.full_window_samples, 65);
+        assert_eq!(batch.samples.len(), 100);
+        let observed = batch
+            .samples
+            .iter()
+            .fold([0usize; 3], |mut counts, sample| {
+                counts[sample.meta.start_source.index()] += 1;
+                counts
+            });
+        assert_eq!(observed, [20, 50, 30]);
     }
 }

@@ -14,7 +14,7 @@ use super::alphazero::{
 };
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
-    AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
+    AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
     rule_context_features, scalar_value_to_wdl_target,
 };
 
@@ -335,6 +335,7 @@ struct SelfplayStart {
     rule_history: Vec<RuleHistoryEntry>,
     phase_ply: usize,
     harvest_ply: Option<usize>,
+    source: AzStartSource,
 }
 
 fn choose_harvest_ply(rng: &mut SplitMix64, phase_ply: usize, max_plies: usize) -> Option<usize> {
@@ -367,6 +368,7 @@ fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> Selfpla
             rule_history: snapshot.rule_history.clone(),
             phase_ply: snapshot.phase_ply as usize,
             harvest_ply: None,
+            source: AzStartSource::Midgame,
         };
     }
     let use_opening = use_opening_fen(
@@ -379,14 +381,15 @@ fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> Selfpla
             },
         roll - midgame_fraction,
     );
-    let (position, phase_ply) = if use_opening {
+    let (position, phase_ply, source) = if use_opening {
         let index = rng.next_u64() as usize % config.opening_positions.len();
         (
             config.opening_positions[index].clone(),
             OPENING_FEN_PHASE_PLY,
+            AzStartSource::OpeningFen,
         )
     } else {
-        (Position::startpos(), 0)
+        (Position::startpos(), 0, AzStartSource::Startpos)
     };
     let position = configure_selfplay_rules(position, config);
     let rule_history = position.initial_rule_history();
@@ -395,6 +398,7 @@ fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> Selfpla
         rule_history,
         phase_ply,
         harvest_ply: choose_harvest_ply(rng, phase_ply, config.max_plies),
+        source,
     }
 }
 
@@ -456,6 +460,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         let mut rule_history = start.rule_history;
         let start_phase_ply = start.phase_ply;
         let harvest_ply = start.harvest_ply;
+        let start_source = start.source;
         let mut game_samples = Vec::new();
         let mut game_bootstrap_wdls = Vec::new();
         let mut result = None;
@@ -539,13 +544,14 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 entropy_mid_count += 1;
             }
             if allow_resign && should_resign(search.value_q, config) {
-                let meta = root_search_meta(
+                let mut meta = root_search_meta(
                     &search.candidates,
                     search.value_q,
                     config.generation_update,
                     config.seed ^ game_index as u64,
                     ply,
                 );
+                meta.start_source = start_source;
                 let sample = make_training_sample(
                     &position,
                     &rule_history,
@@ -585,7 +591,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 result = Some(0.0);
                 break;
             };
-            let move_meta = move_search_meta(
+            let mut move_meta = move_search_meta(
                 &search.candidates,
                 mv,
                 search.value_q,
@@ -593,6 +599,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 config.seed ^ game_index as u64,
                 ply,
             );
+            move_meta.start_source = start_source;
             sampled_moves += 1;
             sampled_best_moves += usize::from(move_meta.best_index == move_meta.played_index);
             best_played_q_gap_sum += (move_meta.best_q - move_meta.played_q).max(0.0);
@@ -756,6 +763,7 @@ struct BatchedSelfplayGame {
     harvest_ply: Option<usize>,
     reported_plies: usize,
     allow_resign: bool,
+    start_source: AzStartSource,
     rng: SplitMix64,
 }
 
@@ -776,6 +784,7 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         harvest_ply: start.harvest_ply,
         reported_plies: 0,
         allow_resign,
+        start_source: start.source,
         rng,
     }
 }
@@ -909,13 +918,14 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 data.search_simulations.simulations_sum += search.simulations;
                 record_batched_search_stats(&mut data, search, state.phase_ply, config);
                 if state.allow_resign && should_resign(search.value_q, config) {
-                    let meta = root_search_meta(
+                    let mut meta = root_search_meta(
                         &search.candidates,
                         search.value_q,
                         config.generation_update,
                         config.seed ^ state.game_index as u64,
                         state.phase_ply,
                     );
+                    meta.start_source = state.start_source;
                     state.samples.push(make_training_sample(
                         &state.position,
                         &state.rule_history,
@@ -960,7 +970,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     state.result = Some(0.0);
                     continue;
                 };
-                let meta = move_search_meta(
+                let mut meta = move_search_meta(
                     &search.candidates,
                     mv,
                     search.value_q,
@@ -968,6 +978,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     config.seed ^ state.game_index as u64,
                     state.phase_ply,
                 );
+                meta.start_source = state.start_source;
                 data.sampled_moves += 1;
                 data.sampled_best_moves += usize::from(meta.best_index == meta.played_index);
                 data.best_played_q_gap_sum += (meta.best_q - meta.played_q).max(0.0);
@@ -1645,6 +1656,24 @@ mod tests {
         assert_eq!(start.rule_history, rule_history);
         assert_eq!(start.phase_ply, 57);
         assert_eq!(start.harvest_ply, None);
+        assert_eq!(start.source, AzStartSource::Midgame);
+    }
+
+    #[test]
+    fn start_source_distinguishes_standard_and_opening_positions() {
+        let config = selfplay_test_config(1);
+        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1));
+        assert_eq!(start.source, AzStartSource::Startpos);
+
+        let mut config = selfplay_test_config(1);
+        config.opening_positions = vec![
+            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/4P4/P1P3P1P/1C5C1/9/RNBAKABNR b")
+                .unwrap(),
+        ]
+        .into();
+        config.opening_fen_game_fraction = 1.0;
+        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1));
+        assert_eq!(start.source, AzStartSource::OpeningFen);
     }
 
     #[test]

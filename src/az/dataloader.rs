@@ -108,6 +108,7 @@ pub(super) struct PackedBatch {
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
+    pub value_source_phase_masks: Vec<f32>,
 }
 
 impl PackedBatch {
@@ -161,6 +162,7 @@ impl PackedBatch {
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
             value_phase_masks: vec![0.0f32; batch_size * 3],
+            value_source_phase_masks: vec![0.0f32; batch_size * 9],
         };
 
         for (row, (&sample_index, threats)) in batch.iter().zip(&value_threats).enumerate() {
@@ -185,6 +187,8 @@ impl PackedBatch {
                 2
             };
             packed.value_phase_masks[row * 3 + phase] = 1.0;
+            packed.value_source_phase_masks
+                [row * 9 + sample.meta.start_source.index() * 3 + phase] = 1.0;
         }
         packed
     }
@@ -501,7 +505,9 @@ mod tests {
 
     #[test]
     fn packed_batch_normalizes_policy_and_clamps_targets() {
-        let samples = vec![sample(0), sample(1)];
+        let mut samples = vec![sample(0), sample(1)];
+        samples[1].meta.start_source = crate::az::AzStartSource::Midgame;
+        samples[1].meta.ply = 130;
         let packed = PackedBatch::from_indices(&samples, &[0, 1]);
         assert_eq!(packed.batch_size, 2);
         assert_eq!(packed.max_policy_moves, 2);
@@ -511,6 +517,9 @@ mod tests {
         assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
         assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
         assert_eq!(packed.values, vec![1.0, 1.0]);
+        assert_eq!(packed.value_source_phase_masks[0], 1.0);
+        assert_eq!(packed.value_source_phase_masks[9 + 8], 1.0);
+        assert_eq!(packed.value_source_phase_masks.iter().sum::<f32>(), 2.0);
     }
 
     #[test]

@@ -64,6 +64,9 @@ pub struct AzLoopFileConfig {
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_games: u32,
+    pub replay_startpos_sample_fraction: f32,
+    pub replay_opening_sample_fraction: f32,
+    pub replay_midgame_sample_fraction: f32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
@@ -147,6 +150,9 @@ impl Default for AzLoopFileConfig {
             replay_capacity: 1000000,
             replay_recent_sample_fraction: 0.35,
             replay_recent_games: 5000,
+            replay_startpos_sample_fraction: 0.20,
+            replay_opening_sample_fraction: 0.50,
+            replay_midgame_sample_fraction: 0.30,
             train_warmup_samples: 240000,
             train_samples_per_update: 240000,
             train_epochs_per_update: 1,
@@ -275,6 +281,18 @@ impl AzLoopFileConfig {
             f(self.replay_recent_sample_fraction)
         );
         line!("replay_recent_games", self.replay_recent_games);
+        line!(
+            "replay_startpos_sample_fraction",
+            f(self.replay_startpos_sample_fraction)
+        );
+        line!(
+            "replay_opening_sample_fraction",
+            f(self.replay_opening_sample_fraction)
+        );
+        line!(
+            "replay_midgame_sample_fraction",
+            f(self.replay_midgame_sample_fraction)
+        );
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("train_epochs_per_update", self.train_epochs_per_update);
@@ -397,6 +415,19 @@ impl AzLoopFileConfig {
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
+        self.replay_startpos_sample_fraction = self.replay_startpos_sample_fraction.max(0.0);
+        self.replay_opening_sample_fraction = self.replay_opening_sample_fraction.max(0.0);
+        self.replay_midgame_sample_fraction = self.replay_midgame_sample_fraction.max(0.0);
+        let replay_source_total = self.replay_startpos_sample_fraction
+            + self.replay_opening_sample_fraction
+            + self.replay_midgame_sample_fraction;
+        assert!(
+            replay_source_total > 0.0,
+            "replay source fractions must have positive total"
+        );
+        self.replay_startpos_sample_fraction /= replay_source_total;
+        self.replay_opening_sample_fraction /= replay_source_total;
+        self.replay_midgame_sample_fraction /= replay_source_total;
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
@@ -441,7 +472,7 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 14\n"));
+        assert!(text.starts_with("format_version = 15\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00012\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
@@ -465,7 +496,7 @@ mod tests {
         assert!(text.contains("fpu_value_at_root = 0.1\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("policy_softmax_temp = 1.2\n"));
-        assert!(text.contains("value_td_lambda = 0.95\n"));
+        assert!(text.contains("value_td_lambda = 0.9\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.5\n"));
@@ -491,6 +522,9 @@ mod tests {
         assert!(text.contains("train_samples_per_update = 240000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("replay_recent_games = 5000\n"));
+        assert!(text.contains("replay_startpos_sample_fraction = 0.2\n"));
+        assert!(text.contains("replay_opening_sample_fraction = 0.5\n"));
+        assert!(text.contains("replay_midgame_sample_fraction = 0.3\n"));
         assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));

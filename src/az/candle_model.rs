@@ -167,6 +167,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
     pub(super) value_phase_masks: Tensor,
+    pub(super) value_source_phase_masks: Tensor,
 }
 
 impl BatchTensors {
@@ -229,6 +230,11 @@ impl BatchTensors {
             policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
+            value_source_phase_masks: Tensor::from_vec(
+                packed.value_source_phase_masks,
+                (batch_size, 9),
+                device,
+            )?,
         })
     }
 }

@@ -932,11 +932,6 @@ struct TrainerEvent {
     candidate_model: AzNnue,
 }
 
-enum TrainerGateCommand {
-    Keep,
-    Reset(AzNnue),
-}
-
 struct SharedSelfplayModel {
     version: u64,
     models_by_numa_node: Vec<Arc<AzNnue>>,
@@ -986,6 +981,7 @@ struct TrainBatchSourceStats {
     policy_target_entropy: f32,
     policy_target_top1: f32,
     policy_target_top2: f32,
+    start_source_rate: [f32; 3],
 }
 
 impl PendingTrainingData {
@@ -1122,8 +1118,7 @@ fn build_async_training_report(
     let value_corr =
         value_cov / (value_pred_var.max(1.0e-12).sqrt() * value_target_var.max(1.0e-12).sqrt());
     let value_calibration = value_cov / value_pred_var.max(1.0e-12);
-    let phase_value = std::array::from_fn(|phase| {
-        let phase_stats = stats.phase_value[phase];
+    let value_report = |phase_stats: chineseai::az::AzValueMomentStats| {
         let count = phase_stats.samples.max(1) as f32;
         let pred_mean = phase_stats.pred_sum / count;
         let target_mean = phase_stats.target_sum / count;
@@ -1137,7 +1132,9 @@ fn build_async_training_report(
                 .clamp(-1.0, 1.0),
             calibration: covariance / pred_var.max(1.0e-12),
         }
-    });
+    };
+    let phase_value = stats.phase_value.map(value_report);
+    let source_phase_value = stats.source_phase_value.map(value_report);
     AzLoopReport {
         games: selfplay_games,
         samples: selfplay_samples,
@@ -1166,6 +1163,7 @@ fn build_async_training_report(
         value_corr: value_corr.clamp(-1.0, 1.0),
         value_calibration,
         phase_value,
+        source_phase_value,
         policy_ce: stats.policy_ce,
         policy_target_entropy: train_source.policy_target_entropy,
         policy_kl: stats.policy_ce - train_source.policy_target_entropy,
@@ -1213,6 +1211,7 @@ fn build_async_training_report(
         train_value_weight_mean: train_source.value_weight_mean,
         train_recent_quota_rate: train_source.recent_quota_rate,
         train_actual_recent_sample_rate: train_source.actual_recent_sample_rate,
+        train_start_source_rate: train_source.start_source_rate,
         train_policy_target_top1: train_source.policy_target_top1,
         train_policy_target_top2: train_source.policy_target_top2,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
@@ -1251,7 +1250,9 @@ fn train_batch_source_stats(
     let mut target_entropy_sum = 0.0f32;
     let mut target_top1_sum = 0.0f32;
     let mut target_top2_sum = 0.0f32;
+    let mut start_source_count = [0usize; 3];
     for sample in samples {
+        start_source_count[sample.meta.start_source.index()] += 1;
         fast += usize::from(
             sample.search_simulations > 0 && sample.search_simulations < full_simulations,
         );
@@ -1304,6 +1305,7 @@ fn train_batch_source_stats(
         policy_target_entropy: target_entropy_sum / denom,
         policy_target_top1: target_top1_sum / denom,
         policy_target_top2: target_top2_sum / denom,
+        start_source_rate: start_source_count.map(|count| count as f32 / denom),
     }
 }
 
@@ -2363,7 +2365,6 @@ fn main() {
             let (selfplay_tx, selfplay_rx) =
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
-            let (trainer_gate_tx, trainer_gate_rx) = mpsc::sync_channel::<TrainerGateCommand>(0);
             let llc_domains = cpu_placements
                 .iter()
                 .map(|placement| (placement.node, placement.package, placement.llc))
@@ -2570,8 +2571,13 @@ fn main() {
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
                     );
-                    let sampled_batch = pool.sample_mixed_recent(
+                    let sampled_batch = pool.sample_stratified_recent(
                         trainer_config.train_samples_per_update,
+                        [
+                            trainer_config.replay_startpos_sample_fraction,
+                            trainer_config.replay_opening_sample_fraction,
+                            trainer_config.replay_midgame_sample_fraction,
+                        ],
                         trainer_config.replay_recent_sample_fraction,
                         trainer_config.replay_recent_games,
                         &mut rng,
@@ -2625,15 +2631,6 @@ fn main() {
                         .is_err()
                     {
                         break 'training;
-                    }
-                    if trainer_config.arena_interval > 0
-                        && train_update.is_multiple_of(trainer_config.arena_interval)
-                    {
-                        match trainer_gate_rx.recv() {
-                            Ok(TrainerGateCommand::Keep) => {}
-                            Ok(TrainerGateCommand::Reset(model)) => trainer_model = model,
-                            Err(_) => break 'training,
-                        }
                     }
                     train_index += 1;
                 }
@@ -2857,7 +2854,7 @@ fn main() {
                     .unwrap_or_else(|_| panic!("midgame pool poisoned"))
                     .len();
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent_quota={:.3} actual_recent={:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -2875,8 +2872,10 @@ fn main() {
                     report.replay_newest_update,
                     report.replay_window_games,
                     report.replay_recent_window_fraction,
-                    report.train_recent_quota_rate,
                     report.train_actual_recent_sample_rate,
+                    report.train_start_source_rate[0],
+                    report.train_start_source_rate[1],
+                    report.train_start_source_rate[2],
                     report.train_fast_sample_rate,
                     report.train_policy_weight_mean,
                     report.train_value_weight_mean,
@@ -2939,6 +2938,31 @@ fn main() {
                             path.display()
                         ))
                 );
+                let source_phase =
+                    |source: usize, phase: usize| report.source_phase_value[source * 3 + phase];
+                println!(
+                    "valueSrc {update:04}: startpos(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3}) opening_fen(p0={}/{:.3}/{:.3}/{:.3}) midgame(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3})",
+                    source_phase(0, 0).samples,
+                    source_phase(0, 0).rmse,
+                    source_phase(0, 0).corr,
+                    source_phase(0, 0).calibration,
+                    source_phase(0, 1).samples,
+                    source_phase(0, 1).rmse,
+                    source_phase(0, 1).corr,
+                    source_phase(0, 1).calibration,
+                    source_phase(1, 0).samples,
+                    source_phase(1, 0).rmse,
+                    source_phase(1, 0).corr,
+                    source_phase(1, 0).calibration,
+                    source_phase(2, 0).samples,
+                    source_phase(2, 0).rmse,
+                    source_phase(2, 0).corr,
+                    source_phase(2, 0).calibration,
+                    source_phase(2, 1).samples,
+                    source_phase(2, 1).rmse,
+                    source_phase(2, 1).corr,
+                    source_phase(2, 1).calibration,
+                );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
                 log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
                 log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
@@ -2990,6 +3014,29 @@ fn main() {
                         update,
                         phase_value.calibration,
                     );
+                }
+                for (source, source_name) in ["startpos", "opening_fen", "midgame"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    for (phase, phase_name) in ["ply_0_39", "ply_40_119", "ply_120_plus"]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let value = report.source_phase_value[source * 3 + phase];
+                        log_scalar(
+                            &mut tb,
+                            &format!("value_source/{source_name}_{phase_name}_rmse"),
+                            update,
+                            value.rmse,
+                        );
+                        log_scalar(
+                            &mut tb,
+                            &format!("value_source/{source_name}_{phase_name}_corr"),
+                            update,
+                            value.corr,
+                        );
+                    }
                 }
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
                 log_scalar(&mut tb, "train/policy_kl", update, report.policy_kl);
@@ -3453,28 +3500,7 @@ fn main() {
                             champion_paths.push(best_checkpoint.clone());
                             arena_best_elo = candidate_elo;
                             println!("best     : saved {}", best_checkpoint.display());
-                        } else if gate_decision == ArenaGateDecision::Reject {
-                            let updated_numa_models =
-                                build_numa_model_replicas(&arena_reference_model, &numa_nodes);
-                            {
-                                let mut shared = shared_model
-                                    .write()
-                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                                shared.models_by_numa_node = updated_numa_models;
-                                shared.version = shared.version.wrapping_add(1);
-                            }
-                            interrupt_save_model = Some(arena_reference_model.clone());
                         }
-                        trainer_gate_tx
-                            .send(match gate_decision {
-                                ArenaGateDecision::Reject => {
-                                    TrainerGateCommand::Reset(arena_reference_model.clone())
-                                }
-                                ArenaGateDecision::Promote | ArenaGateDecision::Continue => {
-                                    TrainerGateCommand::Keep
-                                }
-                            })
-                            .unwrap_or_else(|_| panic!("training gate channel closed"));
                         println!(
                             "arena {update:04}: mode={} positions={} current_games={} current_W/L/D={}/{}/{} current_rate={:.3} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
                             arena_mode,
@@ -3789,7 +3815,6 @@ fn main() {
                 }
             }
             stop_requested.store(true, Ordering::SeqCst);
-            drop(trainer_gate_tx);
             {
                 let (pause_lock, pause_cvar) = &*selfplay_pause;
                 let mut pause_state = pause_lock

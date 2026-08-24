@@ -253,7 +253,7 @@ impl GpuReplica {
         let target_sq = batch_tensors.values.sqr()?;
         let pred_target = value.broadcast_mul(&batch_tensors.values)?;
         let error_sq = value_error.sqr()?;
-        let mut metrics = Vec::with_capacity(9 + 3 * 7);
+        let mut metrics = Vec::with_capacity(9 + (3 + 9) * 7);
         metrics.push(loss_sum);
         metrics.push(value_ce);
         metrics.push(policy_ce);
@@ -276,9 +276,35 @@ impl GpuReplica {
             metrics.push((&pred_target * &mask)?.sum_all()?);
             metrics.push((&error_sq * &mask)?.sum_all()?);
         }
+        for source_phase in 0..9 {
+            let mask = batch_tensors
+                .value_source_phase_masks
+                .narrow(1, source_phase, 1)?
+                .squeeze(1)?;
+            metrics.push(mask.sum_all()?);
+            metrics.push((&value * &mask)?.sum_all()?);
+            metrics.push((&value_sq * &mask)?.sum_all()?);
+            metrics.push((&batch_tensors.values * &mask)?.sum_all()?);
+            metrics.push((&target_sq * &mask)?.sum_all()?);
+            metrics.push((&pred_target * &mask)?.sum_all()?);
+            metrics.push((&error_sq * &mask)?.sum_all()?);
+        }
         let metrics = Tensor::stack(&metrics, 0)?.to_vec1::<f32>()?;
         let mut phase_value = [AzValueMomentStats::default(); 3];
-        for (phase_stats, values) in phase_value.iter_mut().zip(metrics[9..].chunks_exact(7)) {
+        for (phase_stats, values) in phase_value.iter_mut().zip(metrics[9..30].chunks_exact(7)) {
+            phase_stats.samples = values[0].round().max(0.0) as usize;
+            phase_stats.pred_sum = values[1];
+            phase_stats.pred_sq_sum = values[2];
+            phase_stats.target_sum = values[3];
+            phase_stats.target_sq_sum = values[4];
+            phase_stats.pred_target_sum = values[5];
+            phase_stats.error_sq_sum = values[6];
+        }
+        let mut source_phase_value = [AzValueMomentStats::default(); 9];
+        for (phase_stats, values) in source_phase_value
+            .iter_mut()
+            .zip(metrics[30..].chunks_exact(7))
+        {
             phase_stats.samples = values[0].round().max(0.0) as usize;
             phase_stats.pred_sum = values[1];
             phase_stats.pred_sq_sum = values[2];
@@ -299,6 +325,7 @@ impl GpuReplica {
             value_error_sq_sum: metrics[8],
             samples: batch_tensors.batch_size,
             phase_value,
+            source_phase_value,
         };
         Ok(BatchLossOutput { loss_tensor, stats })
     }
