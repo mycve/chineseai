@@ -135,24 +135,25 @@ impl AzArenaReport {
         self.score_rate() + z.max(0.0) * self.score_rate_standard_error()
     }
 
-    pub fn anchored_elo(&self, ref_elo: f32) -> f32 {
-        ref_elo + self.elo_diff_vs_even()
-    }
-
     pub fn elo_diff_vs_even(&self) -> f32 {
         let total = self.total_games();
         if total == 0 {
             return 0.0;
         }
-        let score = self.score() / total as f32;
-        if score <= 0.0 {
-            -400.0
-        } else if score >= 1.0 {
-            400.0
-        } else {
-            400.0 * (score / (1.0 - score)).log10()
-        }
+        score_rate_to_elo(self.score() / total as f32)
     }
+
+    pub fn elo_diff_bounds(&self, z: f32) -> (f32, f32) {
+        (
+            score_rate_to_elo(self.score_rate_lower_bound(z)),
+            score_rate_to_elo(self.score_rate_upper_bound(z)),
+        )
+    }
+}
+
+fn score_rate_to_elo(score: f32) -> f32 {
+    let score = score.clamp(0.0001, 0.9999);
+    400.0 * (score / (1.0 - score)).log10()
 }
 
 #[derive(Clone, Default)]

@@ -541,7 +541,6 @@ fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
 struct AzLoopProgressState {
     format_version: u32,
     next_update: usize,
-    best_elo: f32,
     nemesis_update: Option<u64>,
 }
 
@@ -550,7 +549,6 @@ impl Default for AzLoopProgressState {
         Self {
             format_version: AZ_LOOP_PROGRESS_VERSION,
             next_update: 1,
-            best_elo: 1500.0,
             nemesis_update: None,
         }
     }
@@ -565,9 +563,6 @@ impl AzLoopProgressState {
             );
         }
         self.next_update = self.next_update.max(1);
-        if !self.best_elo.is_finite() {
-            self.best_elo = 1500.0;
-        }
         self
     }
 }
@@ -598,17 +593,11 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
-fn save_az_loop_progress_pair(
-    config_path: &str,
-    next_update: usize,
-    best_elo: f32,
-    nemesis_update: Option<u64>,
-) {
+fn save_az_loop_progress_pair(config_path: &str, next_update: usize, nemesis_update: Option<u64>) {
     save_az_loop_progress(
         config_path,
         &AzLoopProgressState {
             next_update,
-            best_elo,
             nemesis_update,
             ..Default::default()
         },
@@ -2102,7 +2091,6 @@ fn main() {
             let target_update = cmd.target_update.map(|update| update.max(1));
             let progress_boot = load_az_loop_progress(&config_path);
             let start_update = progress_boot.next_update.max(1);
-            let mut arena_best_elo = progress_boot.best_elo;
             let mut arena_nemesis_update = progress_boot.nemesis_update;
             if let Some(target_update) = target_update
                 && start_update > target_update
@@ -2115,10 +2103,9 @@ fn main() {
             }
             if start_update > 1 {
                 println!(
-                    "resume   : update starts at {} (from `{}`) arena_ref_elo={:.1}",
+                    "resume   : update starts at {} (from `{}`)",
                     start_update,
-                    az_loop_progress_path(&config_path).display(),
-                    arena_best_elo
+                    az_loop_progress_path(&config_path).display()
                 );
             }
             let best_path = best_model_path(&config.model_path);
@@ -3459,9 +3446,9 @@ fn main() {
                                 0xE703_7ED1_A0B4_28DB,
                             )
                         });
-                        let ref_elo = arena_best_elo;
-                        let candidate_elo = current_arena.anchored_elo(ref_elo);
                         let elo_diff = current_arena.elo_diff_vs_even();
+                        let (elo_lower, elo_upper) =
+                            current_arena.elo_diff_bounds(config.arena_promotion_confidence_z);
                         let gate_decision = arena_gate_decision(
                             &current_arena,
                             previous_arena.as_ref(),
@@ -3499,11 +3486,10 @@ fn main() {
                             );
                             save_model(&deployed_model, &best_path);
                             champion_paths.push(best_checkpoint.clone());
-                            arena_best_elo = candidate_elo;
                             println!("best     : saved {}", best_checkpoint.display());
                         }
                         println!(
-                            "arena {update:04}: mode={} positions={} current_games={} pairs={} current_W/L/D={}/{}/{} current_rate={:.3} paired_se={:.4} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
+                            "arena {update:04}: mode={} positions={} current_games={} pairs={} current_W/L/D={}/{}/{} current_rate={:.3} paired_se={:.4} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} elo_diff={:+.1} elo_ci={:+.1}..{:+.1} best_ref=memory{}",
                             arena_mode,
                             arena_position_count,
                             current_arena.total_games(),
@@ -3520,9 +3506,9 @@ fn main() {
                             config.arena_promotion_rate,
                             config.arena_promotion_confidence_z,
                             gate_decision,
-                            ref_elo,
-                            candidate_elo,
                             elo_diff,
+                            elo_lower,
+                            elo_upper,
                             if promoted {
                                 " promoted=current saved_best"
                             } else {
@@ -3599,9 +3585,9 @@ fn main() {
                                 report.score_rate(),
                             );
                         }
-                        log_scalar(&mut tb, "arena/ref_elo", update, ref_elo);
-                        log_scalar(&mut tb, "arena/elo", update, candidate_elo);
                         log_scalar(&mut tb, "arena/elo_diff", update, elo_diff);
+                        log_scalar(&mut tb, "arena/elo_diff_lower", update, elo_lower);
+                        log_scalar(&mut tb, "arena/elo_diff_upper", update, elo_upper);
                         log_scalar(
                             &mut tb,
                             "arena/wins_as_red",
@@ -3867,7 +3853,6 @@ fn main() {
                     save_az_loop_progress_pair(
                         &config_path,
                         interrupt_save_next_update,
-                        arena_best_elo,
                         arena_nemesis_update,
                     );
                     println!(

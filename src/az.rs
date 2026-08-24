@@ -3719,8 +3719,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_report_anchored_elo_tracks_score_vs_reference() {
-        let reference = 1500.0f32;
+    fn arena_report_relative_elo_tracks_score_and_bounds() {
         let stronger = AzArenaReport {
             wins: 6,
             losses: 3,
@@ -3735,9 +3734,12 @@ mod tests {
         };
 
         assert!(stronger.score_rate() > 0.5);
-        assert!(stronger.anchored_elo(reference) > reference);
+        assert!(stronger.elo_diff_vs_even() > 0.0);
         assert!(weaker.score_rate() < 0.5);
-        assert!(weaker.anchored_elo(reference) < reference);
+        assert!(weaker.elo_diff_vs_even() < 0.0);
+        let (lower, upper) = stronger.elo_diff_bounds(1.96);
+        assert!(lower <= stronger.elo_diff_vs_even());
+        assert!(upper >= stronger.elo_diff_vs_even());
     }
 
     #[cfg(feature = "gpu-train")]
