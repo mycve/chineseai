@@ -82,6 +82,7 @@ pub struct AzLoopFileConfig {
     pub arena_cpuct_at_root: f32,
     pub arena_policy_softmax_temp: f32,
     pub arena_promotion_rate: f32,
+    pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
     pub arena_opening_book: String,
     pub arena_opening_positions: usize,
@@ -120,10 +121,10 @@ impl Default for AzLoopFileConfig {
             seed: 20260420,
             workers: 0,
             opening_exploration_plies: 16,
-            temperature_start: 0.8,
+            temperature_start: 2.0,
             temperature_endgame: 0.10,
-            temperature_decay_delay_plies: 16,
-            temperature_decay_plies: 40,
+            temperature_decay_delay_plies: 0,
+            temperature_decay_plies: 8,
             temperature_value_cutoff: 0.07,
             temperature_visit_offset: -0.8,
             cpuct: 0.9,
@@ -166,7 +167,8 @@ impl Default for AzLoopFileConfig {
             arena_cpuct: 0.9,
             arena_cpuct_at_root: 2.0,
             arena_policy_softmax_temp: 1.2,
-            arena_promotion_rate: 0.55,
+            arena_promotion_rate: 0.50,
+            arena_promotion_confidence_z: 1.28,
             arena_processes: 128,
             arena_opening_book: "opening.obk".into(),
             arena_opening_positions: 800,
@@ -306,6 +308,10 @@ impl AzLoopFileConfig {
             f(self.arena_policy_softmax_temp)
         );
         line!("arena_promotion_rate", f(self.arena_promotion_rate));
+        line!(
+            "arena_promotion_confidence_z",
+            f(self.arena_promotion_confidence_z)
+        );
         line!("arena_processes", self.arena_processes);
         line!("arena_opening_book", q(&self.arena_opening_book));
         line!("arena_opening_positions", self.arena_opening_positions);
@@ -397,9 +403,14 @@ impl AzLoopFileConfig {
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.opening_policy_softmax_temp = self.opening_policy_softmax_temp.max(1e-3);
         self.midgame_start_fraction = self.midgame_start_fraction.clamp(0.0, 1.0);
-        self.opening_fen_game_fraction = self
-            .opening_fen_game_fraction
-            .clamp(0.0, 1.0 - self.midgame_start_fraction);
+        self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
+        let start_fraction = 1.0 - self.opening_fen_game_fraction - self.midgame_start_fraction;
+        assert!(
+            start_fraction >= -1.0e-6,
+            "opening_fen_game_fraction ({}) + midgame_start_fraction ({}) must not exceed 1; the remainder is the start-position share",
+            self.opening_fen_game_fraction,
+            self.midgame_start_fraction
+        );
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
@@ -417,6 +428,7 @@ impl AzLoopFileConfig {
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
+        self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_simulations = self.arena_simulations.max(1);
         self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
@@ -448,15 +460,15 @@ mod tests {
     fn config_writer_uses_short_float_literals() {
         let text = AzLoopFileConfig::default().to_file_text();
 
-        assert!(text.starts_with("format_version = 12\n"));
+        assert!(text.starts_with("format_version = 13\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00012\n"));
-        assert!(text.contains("temperature_start = 0.8\n"));
+        assert!(text.contains("temperature_start = 2.0\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
         assert!(text.contains("temperature_endgame = 0.1\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 16\n"));
-        assert!(text.contains("temperature_decay_plies = 40\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 0\n"));
+        assert!(text.contains("temperature_decay_plies = 8\n"));
         assert!(text.contains("opening_exploration_plies = 16\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.07\n"));
@@ -512,7 +524,8 @@ mod tests {
         assert!(text.contains("arena_random_plies_max = 12\n"));
         assert!(text.contains("arena_interval = 10\n"));
         assert!(text.contains("arena_simulations = 400\n"));
-        assert!(text.contains("arena_promotion_rate = 0.55\n"));
+        assert!(text.contains("arena_promotion_rate = 0.5\n"));
+        assert!(text.contains("arena_promotion_confidence_z = 1.28\n"));
         assert!(text.contains("arena_cpuct = 0.9\n"));
         assert!(text.contains("arena_cpuct_at_root = 2.0\n"));
         assert!(text.contains("arena_policy_softmax_temp = 1.2\n"));
@@ -554,7 +567,6 @@ mod tests {
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
             "value_target_search_q_mix = 0.4\n",
-            "arena_promotion_confidence_z = 1.28\n",
             "arena_pikafish_exe = \"./pikafish\"\n",
             "arena_pikafish_depth = 10\n",
             "arena_pikafish_games = 20\n",

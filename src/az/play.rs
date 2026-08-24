@@ -117,6 +117,10 @@ impl AzArenaReport {
         self.score_rate() - z.max(0.0) * self.score_rate_standard_error()
     }
 
+    pub fn score_rate_upper_bound(&self, z: f32) -> f32 {
+        self.score_rate() + z.max(0.0) * self.score_rate_standard_error()
+    }
+
     pub fn anchored_elo(&self, ref_elo: f32) -> f32 {
         ref_elo + self.elo_diff_vs_even()
     }

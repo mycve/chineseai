@@ -14,7 +14,7 @@ use chineseai::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
         AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
         DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, evaluate_policy_groups,
+        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
         generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
         train_samples_weighted_owned,
     },
@@ -27,7 +27,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -70,6 +70,8 @@ enum CliCommand {
     AzTrainBench(AzTrainBenchArgs),
     /// Fit a model on a fixed replay snapshot and report future-game validation loss.
     AzReplayFit(AzReplayFitArgs),
+    /// Report start-position policy targets, played moves, and outcomes from a replay snapshot.
+    AzReplayOpeningStats(AzReplayOpeningStatsArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
     /// Evaluate checkpoint non-transitivity and historical regressions.
@@ -152,6 +154,9 @@ struct AzSearchArgs {
     /// Draw value in Q = W - L + draw_score * D.
     #[arg(long, default_value_t = 0.0)]
     draw_score: f32,
+    /// Scale non-terminal network values during search; 0 isolates policy priors.
+    #[arg(long, default_value_t = 1.0)]
+    value_scale: f32,
     /// Independently re-search this many top-visited root moves after making each move.
     #[arg(long, default_value_t = 0)]
     verify_top: usize,
@@ -249,6 +254,15 @@ struct AzReplayFitArgs {
     /// Initialization and shuffle seed.
     #[arg(long, default_value_t = 20260802)]
     seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct AzReplayOpeningStatsArgs {
+    /// Replay snapshot produced by az-loop.
+    replay: String,
+    /// Rows to display.
+    #[arg(long, default_value_t = 20)]
+    top: usize,
 }
 
 #[derive(Args, Debug)]
@@ -825,28 +839,35 @@ fn arena_gate_position_counts(
     (total - previous - anchor, previous, anchor)
 }
 
-fn arena_gate_promotes(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArenaGateDecision {
+    Promote,
+    Continue,
+    Reject,
+}
+
+fn arena_gate_decision(
     current: &AzArenaReport,
     previous: Option<&AzArenaReport>,
     anchor: Option<&AzArenaReport>,
     current_threshold: f32,
-) -> bool {
-    if current.score_rate() < current_threshold {
-        return false;
+    confidence_z: f32,
+) -> ArenaGateDecision {
+    let z = confidence_z.max(0.0);
+    let proven_current_regression = current.score_rate_upper_bound(z) < 0.50;
+    let proven_history_regression = previous
+        .into_iter()
+        .chain(anchor)
+        .any(|report| report.score_rate_upper_bound(z) < 0.50);
+    if proven_current_regression || proven_history_regression {
+        return ArenaGateDecision::Reject;
     }
-    if previous.is_some_and(|report| report.score_rate() < 0.50)
-        || anchor.is_some_and(|report| report.score_rate() < 0.50)
-    {
-        return false;
+
+    if current.score_rate_lower_bound(z) >= current_threshold {
+        ArenaGateDecision::Promote
+    } else {
+        ArenaGateDecision::Continue
     }
-    let mut history = AzArenaReport::default();
-    if let Some(report) = previous {
-        history.add_assign(report);
-    }
-    if let Some(report) = anchor {
-        history.add_assign(report);
-    }
-    history.total_games() == 0 || history.score_rate() >= 0.525
 }
 
 fn shuffle_positions(positions: &mut [Position], rng: &mut SplitMix64) {
@@ -902,6 +923,11 @@ struct SelfplayBatch {
 struct TrainerEvent {
     report: AzLoopReport,
     candidate_model: AzNnue,
+}
+
+enum TrainerGateCommand {
+    Keep,
+    Reset(AzNnue),
 }
 
 struct SharedSelfplayModel {
@@ -1374,9 +1400,10 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
 
 fn build_arena_start_positions(
     config: &AzLoopFileConfig,
-    update: usize,
+    _update: usize,
 ) -> (Vec<Position>, String) {
-    let seed = config.seed ^ (update as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    // 固定门控局面，确保相邻 update 的评分可直接比较；每个局面仍红黑成对复用。
+    let seed = config.seed ^ 0xD1B5_4A32_D192_ED03;
     let mut positions = Vec::with_capacity(
         config
             .arena_opening_positions
@@ -1598,7 +1625,7 @@ fn main() {
                 fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
                 policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                value_scale: 1.0,
+                value_scale: cmd.value_scale.clamp(0.0, 1.0),
             };
             let root_moves = if cmd.root_moves.is_empty() {
                 None
@@ -1880,6 +1907,89 @@ fn main() {
             println!("value_ce     : {:.4}", stats.value_loss);
             println!("policy_ce    : {:.4}", stats.policy_ce);
         }
+        Some(CliCommand::AzReplayOpeningStats(cmd)) => {
+            #[derive(Default)]
+            struct MoveStats {
+                target_mass: f64,
+                played: usize,
+                wins: usize,
+                draws: usize,
+                losses: usize,
+                target_q_sum: f64,
+            }
+
+            let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), usize::MAX)
+                .unwrap_or_else(|err| panic!("failed to load replay `{}`: {err}", cmd.replay));
+            let groups = pool.all_sample_groups();
+            let start = Position::startpos();
+            let names = start
+                .legal_moves()
+                .into_iter()
+                .map(|mv| {
+                    (
+                        dense_move_index(canonical_move(start.side_to_move(), mv)),
+                        mv.to_uci(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut stats = HashMap::<usize, MoveStats>::new();
+            let mut start_games = 0usize;
+            for group in &groups {
+                let Some(sample) = group.iter().find(|sample| sample.meta.ply == 0) else {
+                    continue;
+                };
+                start_games += 1;
+                let target_q = sample.value_wdl[0] - sample.value_wdl[2];
+                for (&move_index, &mass) in sample.move_indices.iter().zip(&sample.policy) {
+                    let row = stats.entry(move_index).or_default();
+                    row.target_mass += mass.max(0.0) as f64;
+                    row.target_q_sum += target_q as f64 * mass.max(0.0) as f64;
+                }
+                let played = sample.meta.played_index as usize;
+                let Some(&move_index) = sample.move_indices.get(played) else {
+                    continue;
+                };
+                let row = stats.entry(move_index).or_default();
+                row.played += 1;
+                let result_red = group.last().map_or(0.0, |last| last.value * last.side_sign);
+                if result_red > 0.5 {
+                    row.wins += 1;
+                } else if result_red < -0.5 {
+                    row.losses += 1;
+                } else {
+                    row.draws += 1;
+                }
+            }
+            let mut rows = stats.into_iter().collect::<Vec<_>>();
+            rows.sort_by(|left, right| right.1.target_mass.total_cmp(&left.1.target_mass));
+            println!(
+                "replay-opening: snapshot={} groups={} start_games={}",
+                cmd.replay,
+                groups.len(),
+                start_games
+            );
+            println!("MOVE target% played% games W/D/L score targetQ");
+            for (move_index, row) in rows.into_iter().take(cmd.top.max(1)) {
+                let games = row.wins + row.draws + row.losses;
+                let score = if games == 0 {
+                    0.0
+                } else {
+                    (row.wins as f64 + 0.5 * row.draws as f64) / games as f64
+                };
+                println!(
+                    "{:<5} {:>7.3} {:>7.3} {:>5} {}/{}/{} {:>5.3} {:+.3}",
+                    names.get(&move_index).map_or("?", String::as_str),
+                    100.0 * row.target_mass / start_games.max(1) as f64,
+                    100.0 * row.played as f64 / start_games.max(1) as f64,
+                    games,
+                    row.wins,
+                    row.draws,
+                    row.losses,
+                    score,
+                    row.target_q_sum / row.target_mass.max(f64::EPSILON),
+                );
+            }
+        }
         Some(CliCommand::AzReplayFit(cmd)) => {
             let capacity = cmd.samples.max(2);
             let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), capacity)
@@ -2081,14 +2191,8 @@ fn main() {
                     config.replay_capacity,
                 ) {
                     Ok(pool) => {
-                        fs::remove_file(&replay_snapshot_path).unwrap_or_else(|err| {
-                            panic!(
-                                "failed to remove replay snapshot `{}`: {err}",
-                                replay_snapshot_path.display()
-                            );
-                        });
                         println!(
-                            "replay   : restored {}/{} samples from `{}` (file removed)",
+                            "replay   : restored {}/{} samples from `{}`",
                             pool.sample_count(),
                             pool.capacity(),
                             replay_snapshot_path.display()
@@ -2153,7 +2257,7 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion_rate={} arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2207,6 +2311,7 @@ fn main() {
                 config.arena_cpuct_at_root,
                 config.arena_policy_softmax_temp,
                 config.arena_promotion_rate,
+                config.arena_promotion_confidence_z,
                 config.arena_processes,
                 if config.arena_opening_book.trim().is_empty() {
                     "(none)"
@@ -2257,6 +2362,7 @@ fn main() {
             let (selfplay_tx, selfplay_rx) =
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
+            let (trainer_gate_tx, trainer_gate_rx) = mpsc::sync_channel::<TrainerGateCommand>(0);
             let llc_domains = cpu_placements
                 .iter()
                 .map(|placement| (placement.node, placement.package, placement.llc))
@@ -2437,7 +2543,6 @@ fn main() {
                 }
             });
             let trainer_stop = stop_requested.clone();
-            let trainer_interrupted = interrupted.clone();
             let trainer_config = config.clone();
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
@@ -2520,16 +2625,25 @@ fn main() {
                     {
                         break 'training;
                     }
+                    if trainer_config.arena_interval > 0
+                        && train_update.is_multiple_of(trainer_config.arena_interval)
+                    {
+                        match trainer_gate_rx.recv() {
+                            Ok(TrainerGateCommand::Keep) => {}
+                            Ok(TrainerGateCommand::Reset(model)) => trainer_model = model,
+                            Err(_) => break 'training,
+                        }
+                    }
                     train_index += 1;
                 }
                 if let Some(pool) = trainer_pool.as_mut()
-                    && trainer_interrupted.load(Ordering::SeqCst)
+                    && trainer_stop.load(Ordering::SeqCst)
                 {
                     match pool.save_snapshot_lz4(&trainer_snapshot_path) {
                         Ok(()) => {
                             if pool.sample_count() > 0 {
                                 println!(
-                                    "replay   : interrupt snapshot `{}` ({}/{} samples)",
+                                    "replay   : shutdown snapshot `{}` ({}/{} samples)",
                                     trainer_snapshot_path.display(),
                                     pool.sample_count(),
                                     pool.capacity()
@@ -3191,20 +3305,13 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                if config.arena_interval == 0 || update <= config.selfplay_update_warmup_updates {
-                    let updated_numa_models =
-                        build_numa_model_replicas(&deployed_model, &numa_nodes);
+                let updated_numa_models = build_numa_model_replicas(&deployed_model, &numa_nodes);
+                {
                     let mut shared = shared_model
                         .write()
                         .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
                     shared.models_by_numa_node = updated_numa_models;
                     shared.version = shared.version.wrapping_add(1);
-                    if config.arena_interval > 0 {
-                        println!(
-                            "selfplay : warmup publish raw update {update}/{}",
-                            config.selfplay_update_warmup_updates
-                        );
-                    }
                 }
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
@@ -3306,14 +3413,18 @@ fn main() {
                         let ref_elo = arena_best_elo;
                         let candidate_elo = current_arena.anchored_elo(ref_elo);
                         let elo_diff = current_arena.elo_diff_vs_even();
-                        let promoted = arena_gate_promotes(
+                        let gate_decision = arena_gate_decision(
                             &current_arena,
                             previous_arena.as_ref(),
                             anchor_arena.as_ref(),
                             config.arena_promotion_rate,
+                            config.arena_promotion_confidence_z,
                         );
+                        let promoted = gate_decision == ArenaGateDecision::Promote;
                         if let (Some(index), Some(report)) = (anchor_index, anchor_arena.as_ref()) {
-                            if report.score_rate() < 0.50 {
+                            if report.score_rate_upper_bound(config.arena_promotion_confidence_z)
+                                < 0.50
+                            {
                                 arena_nemesis_update = checkpoint_number(&champion_paths[index]);
                                 println!(
                                     "nemesis  : set {} rate={:.3}",
@@ -3331,15 +3442,6 @@ fn main() {
                         }
                         if promoted {
                             arena_reference_model = deployed_model.clone();
-                            let updated_numa_models =
-                                build_numa_model_replicas(&deployed_model, &numa_nodes);
-                            {
-                                let mut shared = shared_model
-                                    .write()
-                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                                shared.models_by_numa_node = updated_numa_models;
-                                shared.version = shared.version.wrapping_add(1);
-                            }
                             let best_checkpoint = save_best_checkpoint_model(
                                 &deployed_model,
                                 &config.model_path,
@@ -3350,17 +3452,30 @@ fn main() {
                             champion_paths.push(best_checkpoint.clone());
                             arena_best_elo = candidate_elo;
                             println!("best     : saved {}", best_checkpoint.display());
-                        } else if update > config.selfplay_update_warmup_updates {
+                        } else if gate_decision == ArenaGateDecision::Reject {
                             let updated_numa_models =
                                 build_numa_model_replicas(&arena_reference_model, &numa_nodes);
-                            let mut shared = shared_model
-                                .write()
-                                .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                            shared.models_by_numa_node = updated_numa_models;
-                            shared.version = shared.version.wrapping_add(1);
+                            {
+                                let mut shared = shared_model
+                                    .write()
+                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                                shared.models_by_numa_node = updated_numa_models;
+                                shared.version = shared.version.wrapping_add(1);
+                            }
+                            interrupt_save_model = Some(arena_reference_model.clone());
                         }
+                        trainer_gate_tx
+                            .send(match gate_decision {
+                                ArenaGateDecision::Reject => {
+                                    TrainerGateCommand::Reset(arena_reference_model.clone())
+                                }
+                                ArenaGateDecision::Promote | ArenaGateDecision::Continue => {
+                                    TrainerGateCommand::Keep
+                                }
+                            })
+                            .unwrap_or_else(|_| panic!("training gate channel closed"));
                         println!(
-                            "arena {update:04}: mode={} positions={} current_games={} current_W/L/D={}/{}/{} current_rate={:.3} promote_at={:.3} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
+                            "arena {update:04}: mode={} positions={} current_games={} current_W/L/D={}/{}/{} current_rate={:.3} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} ref_elo={:.1} elo={:.1} elo_diff={:+.1} best_ref=memory{}",
                             arena_mode,
                             arena_position_count,
                             current_arena.total_games(),
@@ -3368,7 +3483,13 @@ fn main() {
                             current_arena.losses,
                             current_arena.draws,
                             current_arena.score_rate(),
+                            current_arena
+                                .score_rate_lower_bound(config.arena_promotion_confidence_z),
+                            current_arena
+                                .score_rate_upper_bound(config.arena_promotion_confidence_z),
                             config.arena_promotion_rate,
+                            config.arena_promotion_confidence_z,
+                            gate_decision,
                             ref_elo,
                             candidate_elo,
                             elo_diff,
@@ -3382,24 +3503,26 @@ fn main() {
                             (previous_index, previous_arena.as_ref())
                         {
                             println!(
-                                "arena {update:04}: previous={} games={} W/L/D={}/{}/{} rate={:.3} floor=0.500",
+                                "arena {update:04}: previous={} games={} W/L/D={}/{}/{} rate={:.3} ucb={:.3}",
                                 checkpoint_label(&champion_paths[index]),
                                 report.total_games(),
                                 report.wins,
                                 report.losses,
                                 report.draws,
-                                report.score_rate()
+                                report.score_rate(),
+                                report.score_rate_upper_bound(config.arena_promotion_confidence_z)
                             );
                         }
                         if let (Some(index), Some(report)) = (anchor_index, anchor_arena.as_ref()) {
                             println!(
-                                "arena {update:04}: anchor={} games={} W/L/D={}/{}/{} rate={:.3} floor=0.500",
+                                "arena {update:04}: anchor={} games={} W/L/D={}/{}/{} rate={:.3} ucb={:.3}",
                                 checkpoint_label(&champion_paths[index]),
                                 report.total_games(),
                                 report.wins,
                                 report.losses,
                                 report.draws,
-                                report.score_rate()
+                                report.score_rate(),
+                                report.score_rate_upper_bound(config.arena_promotion_confidence_z)
                             );
                         }
                         let mut historical_arena = AzArenaReport::default();
@@ -3411,7 +3534,7 @@ fn main() {
                         }
                         if historical_arena.total_games() > 0 {
                             println!(
-                                "arena {update:04}: history_games={} history_rate={:.3} floor=0.525",
+                                "arena {update:04}: history_games={} history_rate={:.3}",
                                 historical_arena.total_games(),
                                 historical_arena.score_rate()
                             );
@@ -3663,6 +3786,7 @@ fn main() {
                 }
             }
             stop_requested.store(true, Ordering::SeqCst);
+            drop(trainer_gate_tx);
             {
                 let (pause_lock, pause_cvar) = &*selfplay_pause;
                 let mut pause_state = pause_lock
@@ -3735,9 +3859,6 @@ fn main() {
                         }
                     );
                 }
-            }
-            if !exited_after_ctrl_c {
-                let _ = fs::remove_file(&replay_snapshot_path);
             }
         }
         Some(CliCommand::VsPikafish(cmd)) => {
@@ -5292,7 +5413,7 @@ mod reporting_tests {
     }
 
     #[test]
-    fn arena_gate_keeps_total_games_and_rejects_history_regression() {
+    fn arena_gate_is_three_state_and_uses_confidence_bounds() {
         assert_eq!(
             arena_gate_position_counts(1_000, true, true),
             (600, 200, 200)
@@ -5311,30 +5432,43 @@ mod reporting_tests {
             losses,
             ..AzArenaReport::default()
         };
-        let current = report(110, 90);
+        let current = report(120, 80);
         let previous = report(100, 100);
         let anchor = report(110, 90);
-        assert!(arena_gate_promotes(
-            &current,
-            Some(&previous),
-            Some(&anchor),
-            0.55
-        ));
+        assert_eq!(
+            arena_gate_decision(&current, Some(&previous), Some(&anchor), 0.50, 1.28),
+            ArenaGateDecision::Promote
+        );
 
-        let regressed_anchor = report(98, 102);
-        assert!(!arena_gate_promotes(
-            &current,
-            Some(&previous),
-            Some(&regressed_anchor),
-            0.55
-        ));
-        let flat_anchor = report(100, 100);
-        assert!(!arena_gate_promotes(
-            &current,
-            Some(&previous),
-            Some(&flat_anchor),
-            0.55
-        ));
+        let uncertain = report(102, 98);
+        assert_eq!(
+            arena_gate_decision(&uncertain, None, None, 0.50, 1.28),
+            ArenaGateDecision::Continue
+        );
+
+        let regressed_anchor = report(70, 130);
+        assert_eq!(
+            arena_gate_decision(
+                &current,
+                Some(&previous),
+                Some(&regressed_anchor),
+                0.50,
+                1.28,
+            ),
+            ArenaGateDecision::Reject
+        );
+
+        let regressed_current = report(70, 130);
+        assert_eq!(
+            arena_gate_decision(
+                &regressed_current,
+                Some(&previous),
+                Some(&anchor),
+                0.50,
+                1.28,
+            ),
+            ArenaGateDecision::Reject
+        );
     }
 }
 
