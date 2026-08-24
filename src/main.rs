@@ -2345,10 +2345,10 @@ fn main() {
             println!(
                 "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} raw_selfplay_warmup={}updates",
                 config.root_dirichlet_alpha,
+                config.root_exploration_fraction,
                 config.temperature_start,
                 config.temperature_endgame,
                 config.policy_softmax_temp,
-                config.root_exploration_fraction,
                 (1.0 - config.opening_fen_game_fraction - config.midgame_start_fraction) * 100.0,
                 config.opening_fen_game_fraction * 100.0,
                 config.midgame_start_fraction * 100.0,
