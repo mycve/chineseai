@@ -119,8 +119,8 @@ impl Default for AzLoopFileConfig {
             workers: 0,
             temperature_start: 2.0,
             temperature_endgame: 0.10,
-            temperature_decay_delay_plies: 0,
-            temperature_decay_plies: 8,
+            temperature_decay_delay_plies: 8,
+            temperature_decay_plies: 14,
             temperature_value_cutoff: 0.07,
             temperature_visit_offset: -0.8,
             cpuct: 0.9,
@@ -448,8 +448,8 @@ mod tests {
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
         assert!(text.contains("temperature_endgame = 0.1\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 0\n"));
-        assert!(text.contains("temperature_decay_plies = 8\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 8\n"));
+        assert!(text.contains("temperature_decay_plies = 14\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("temperature_value_cutoff = 0.07\n"));
         assert!(text.contains("temperature_visit_offset = -0.8\n"));
