@@ -859,7 +859,7 @@ fn arena_gate_decision(
         return ArenaGateDecision::Reject;
     }
 
-    if current.score_rate_lower_bound(z) >= current_threshold {
+    if current.score_rate_lower_bound(z) > current_threshold {
         ArenaGateDecision::Promote
     } else {
         ArenaGateDecision::Continue
@@ -2175,11 +2175,16 @@ fn main() {
                 }
                 reference
             };
-            let initial_selfplay_model = selfplay_model.clone();
-            println!(
-                "selfplay : actor starts from learner; publish every {} updates",
-                config.actor_publish_interval_updates
-            );
+            let initial_selfplay_model = if config.arena_interval > 0 {
+                println!("selfplay : actor starts from champion; arena controls publication");
+                initial_arena_reference_model.clone()
+            } else {
+                println!(
+                    "selfplay : ungated actor starts from learner; publish every {} updates",
+                    config.actor_publish_interval_updates
+                );
+                selfplay_model.clone()
+            };
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -2247,6 +2252,30 @@ fn main() {
             let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
                 * config.train_epochs_per_update as f32)
                 / config.selfplay_samples_per_update.max(1) as f32;
+            let replay_update_span =
+                config.replay_capacity as f32 / config.selfplay_samples_per_update.max(1) as f32;
+            let warmup_update_span = config.train_warmup_samples as f32
+                / config.selfplay_samples_per_update.max(1) as f32;
+            let replay_actor_span = if config.arena_interval > 0 {
+                "promotion-dependent".to_string()
+            } else {
+                format!(
+                    "{:.1}",
+                    replay_update_span / config.actor_publish_interval_updates.max(1) as f32
+                )
+            };
+
+            println!(
+                "design   : replay={:.1}updates actor_generations={} warmup={:.1}updates expected_sample_exposures={:.2} optimizer_steps_per_update={}",
+                replay_update_span,
+                replay_actor_span,
+                warmup_update_span,
+                effective_train_to_selfplay_ratio,
+                config
+                    .train_samples_per_update
+                    .div_ceil(config.batch_size.max(1))
+                    .saturating_mul(config.train_epochs_per_update),
+            );
 
             println!(
                 "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
@@ -2331,7 +2360,7 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} actor_publish={}updates",
+                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% midgame_capacity={} actor_publish={}",
                 config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
                 config.temperature_start,
@@ -2341,7 +2370,11 @@ fn main() {
                 config.opening_fen_game_fraction * 100.0,
                 config.midgame_start_fraction * 100.0,
                 config.midgame_reservoir_capacity,
-                config.actor_publish_interval_updates
+                if config.arena_interval > 0 {
+                    "arena-promote".to_string()
+                } else {
+                    format!("{}updates", config.actor_publish_interval_updates)
+                }
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -2482,16 +2515,26 @@ fn main() {
             // GPU训练期间下一批仍可并行生成；只缓存一个完整更新，限制模型滞后。
             let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingTrainingData>(1);
             let collector_config = config.clone();
-            let collector_needs_warmup = !resumed_model;
+            let replay_samples_at_start = replay_pool
+                .as_ref()
+                .map(AzExperiencePool::sample_count)
+                .unwrap_or(0);
+            let collector_warmup_missing = config
+                .train_warmup_samples
+                .saturating_sub(replay_samples_at_start);
             let collector_midgame_pool = Arc::clone(&shared_midgame_pool);
             println!(
-                "warmup   : {} (model={})",
-                if collector_needs_warmup {
-                    format!("{} samples", config.train_warmup_samples)
+                "warmup   : {} (model={} replay_start={})",
+                if collector_warmup_missing > 0 {
+                    format!(
+                        "collect {} missing samples to reach {}",
+                        collector_warmup_missing, config.train_warmup_samples
+                    )
                 } else {
                     "skipped".to_string()
                 },
-                if resumed_model { "resumed" } else { "random" }
+                if resumed_model { "resumed" } else { "random" },
+                replay_samples_at_start,
             );
             let collector_handle = thread::spawn(move || {
                 let mut pending = PendingTrainingData::default();
@@ -2506,10 +2549,8 @@ fn main() {
                             .add_snapshots(snapshots, collector_config.seed ^ batch_index as u64);
                     }
                     pending.push(batch);
-                    let required_samples = if collector_needs_warmup && batch_index == 0 {
-                        collector_config
-                            .train_warmup_samples
-                            .max(collector_config.selfplay_samples_per_update)
+                    let required_samples = if batch_index == 0 {
+                        collector_warmup_missing.max(collector_config.selfplay_samples_per_update)
                     } else {
                         collector_config.selfplay_samples_per_update
                     };
@@ -2834,7 +2875,7 @@ fn main() {
                     .unwrap_or_else(|_| panic!("midgame pool poisoned"))
                     .len();
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} games={}-{} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} actor_updates={}-{} actor_update_span={} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     report.samples,
                     report.train_samples,
@@ -2850,6 +2891,9 @@ fn main() {
                     report.replay_chunks,
                     report.replay_oldest_update,
                     report.replay_newest_update,
+                    report
+                        .replay_newest_update
+                        .saturating_sub(report.replay_oldest_update),
                     report.replay_window_games,
                     report.replay_recent_window_fraction,
                     report.train_actual_recent_sample_rate,
@@ -3333,7 +3377,9 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                if update.is_multiple_of(config.actor_publish_interval_updates) {
+                if config.arena_interval == 0
+                    && update.is_multiple_of(config.actor_publish_interval_updates)
+                {
                     let updated_numa_models =
                         build_numa_model_replicas(&deployed_model, &numa_nodes);
                     let actor_version = {
@@ -3478,6 +3524,20 @@ fn main() {
                         }
                         if promoted {
                             arena_reference_model = deployed_model.clone();
+                            let updated_numa_models =
+                                build_numa_model_replicas(&deployed_model, &numa_nodes);
+                            let actor_version = {
+                                let mut shared = shared_model
+                                    .write()
+                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                                shared.models_by_numa_node = updated_numa_models;
+                                shared.version = shared.version.wrapping_add(1);
+                                shared.learner_update = update.min(u32::MAX as usize) as u32;
+                                shared.version
+                            };
+                            println!(
+                                "actor    : published promoted update {update} as generation {actor_version}"
+                            );
                             let best_checkpoint = save_best_checkpoint_model(
                                 &deployed_model,
                                 &config.model_path,
@@ -5465,6 +5525,15 @@ mod reporting_tests {
         let uncertain = report(102, 98);
         assert_eq!(
             arena_gate_decision(&uncertain, None, None, 0.50, 1.28),
+            ArenaGateDecision::Continue
+        );
+
+        let all_draws = AzArenaReport {
+            draws: 200,
+            ..AzArenaReport::default()
+        };
+        assert_eq!(
+            arena_gate_decision(&all_draws, None, None, 0.50, 1.28),
             ArenaGateDecision::Continue
         );
 

@@ -108,8 +108,8 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 400,
             selfplay_samples_per_update: 120000,
-            lr: 0.0004,
-            lr_min: 0.00012,
+            lr: 0.00004,
+            lr_min: 0.00002,
             lr_decay_start_update: 100,
             lr_decay_interval: 200,
             lr_decay_factor: 0.97,
@@ -147,14 +147,14 @@ impl Default for AzLoopFileConfig {
             actor_publish_interval_updates: 5,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
-            replay_capacity: 1000000,
+            replay_capacity: 2400000,
             replay_recent_sample_fraction: 0.35,
-            replay_recent_games: 5000,
+            replay_recent_games: 7500,
             replay_startpos_sample_fraction: 0.20,
             replay_opening_sample_fraction: 0.50,
             replay_midgame_sample_fraction: 0.30,
-            train_warmup_samples: 240000,
-            train_samples_per_update: 240000,
+            train_warmup_samples: 600000,
+            train_samples_per_update: 120000,
             train_epochs_per_update: 1,
             mirror_probability: 0.5,
             train_value_weight: 1.0,
@@ -471,11 +471,12 @@ mod tests {
 
     #[test]
     fn config_writer_uses_short_float_literals() {
-        let text = AzLoopFileConfig::default().to_file_text();
+        let config = AzLoopFileConfig::default();
+        let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 16\n"));
-        assert!(text.contains("lr = 0.0004\n"));
-        assert!(text.contains("lr_min = 0.00012\n"));
+        assert!(text.starts_with("format_version = 17\n"));
+        assert!(text.contains("lr = 0.00004\n"));
+        assert!(text.contains("lr_min = 0.00002\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
@@ -519,10 +520,23 @@ mod tests {
         assert!(text.contains("batch_size = 1024\n"));
         assert!(text.contains("max_plies = 200\n"));
         assert!(text.contains("hidden_size = 128\n"));
-        assert!(text.contains("replay_capacity = 1000000\n"));
-        assert!(text.contains("train_samples_per_update = 240000\n"));
+        assert!(text.contains("replay_capacity = 2400000\n"));
+        assert!(text.contains("train_samples_per_update = 120000\n"));
+        assert!(text.contains("train_warmup_samples = 600000\n"));
         assert!(text.contains("train_epochs_per_update = 1\n"));
-        assert!(text.contains("replay_recent_games = 5000\n"));
+        assert!(text.contains("replay_recent_games = 7500\n"));
+        assert_eq!(
+            config.replay_capacity / config.selfplay_samples_per_update,
+            20
+        );
+        assert_eq!(
+            config.train_warmup_samples / config.selfplay_samples_per_update,
+            5
+        );
+        assert_eq!(
+            config.train_samples_per_update / config.selfplay_samples_per_update,
+            1
+        );
         assert!(text.contains("replay_startpos_sample_fraction = 0.2\n"));
         assert!(text.contains("replay_opening_sample_fraction = 0.5\n"));
         assert!(text.contains("replay_midgame_sample_fraction = 0.3\n"));
@@ -562,7 +576,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.0004).abs() < 1e-9);
+        assert!((parsed.lr - 0.00004).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 10);
         assert_eq!(parsed.pikafish_label_eval_interval, 10);
     }
