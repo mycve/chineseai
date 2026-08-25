@@ -38,6 +38,8 @@ pub struct AzLoopFileConfig {
     pub temperature_endgame: f32,
     pub persistent_exploration_fraction: f32,
     pub persistent_exploration_temperature: f32,
+    pub persistent_exploration_root_dirichlet_alpha: f32,
+    pub persistent_exploration_root_exploration_fraction: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
     pub temperature_value_cutoff: f32,
@@ -129,6 +131,8 @@ impl Default for AzLoopFileConfig {
             temperature_endgame: 0.10,
             persistent_exploration_fraction: 0.10,
             persistent_exploration_temperature: 0.80,
+            persistent_exploration_root_dirichlet_alpha: 0.15,
+            persistent_exploration_root_exploration_fraction: 0.35,
             temperature_decay_delay_plies: 8,
             temperature_decay_plies: 14,
             temperature_value_cutoff: 0.07,
@@ -252,6 +256,14 @@ impl AzLoopFileConfig {
         line!(
             "persistent_exploration_temperature",
             f(self.persistent_exploration_temperature)
+        );
+        line!(
+            "persistent_exploration_root_dirichlet_alpha",
+            f(self.persistent_exploration_root_dirichlet_alpha)
+        );
+        line!(
+            "persistent_exploration_root_exploration_fraction",
+            f(self.persistent_exploration_root_exploration_fraction)
         );
         line!(
             "temperature_decay_delay_plies",
@@ -417,6 +429,11 @@ impl AzLoopFileConfig {
         self.persistent_exploration_temperature = self
             .persistent_exploration_temperature
             .max(self.temperature_endgame);
+        self.persistent_exploration_root_dirichlet_alpha =
+            self.persistent_exploration_root_dirichlet_alpha.max(0.0);
+        self.persistent_exploration_root_exploration_fraction = self
+            .persistent_exploration_root_exploration_fraction
+            .clamp(0.0, 1.0);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
         self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
         self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
@@ -512,7 +529,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 19\n"));
+        assert!(text.starts_with("format_version = 20\n"));
         assert!(text.contains("lr = 0.00004\n"));
         assert!(text.contains("lr_min = 0.00002\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
@@ -521,6 +538,8 @@ mod tests {
         assert!(text.contains("temperature_endgame = 0.1\n"));
         assert!(text.contains("persistent_exploration_fraction = 0.1\n"));
         assert!(text.contains("persistent_exploration_temperature = 0.8\n"));
+        assert!(text.contains("persistent_exploration_root_dirichlet_alpha = 0.15\n"));
+        assert!(text.contains("persistent_exploration_root_exploration_fraction = 0.35\n"));
         assert!(text.contains("temperature_decay_delay_plies = 8\n"));
         assert!(text.contains("temperature_decay_plies = 14\n"));
         assert!(!text.contains("temperature_cutoff_plies"));

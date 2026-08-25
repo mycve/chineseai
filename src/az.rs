@@ -957,6 +957,8 @@ pub struct AzLoopConfig {
     pub temperature_endgame: f32,
     pub persistent_exploration_fraction: f32,
     pub persistent_exploration_temperature: f32,
+    pub persistent_exploration_root_dirichlet_alpha: f32,
+    pub persistent_exploration_root_exploration_fraction: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
     pub temperature_value_cutoff: f32,

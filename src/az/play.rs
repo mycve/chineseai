@@ -320,7 +320,12 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
-fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
+fn selfplay_search_limits(
+    config: &AzLoopConfig,
+    _ply: usize,
+    seed: u64,
+    exploration_actor: bool,
+) -> AzSearchLimits {
     AzSearchLimits {
         simulations: config.simulations.max(1),
         seed,
@@ -331,8 +336,16 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
         cpuct_base_at_root: config.cpuct_base_at_root,
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         max_depth: 0,
-        root_dirichlet_alpha: config.root_dirichlet_alpha,
-        root_exploration_fraction: config.root_exploration_fraction,
+        root_dirichlet_alpha: if exploration_actor {
+            config.persistent_exploration_root_dirichlet_alpha
+        } else {
+            config.root_dirichlet_alpha
+        },
+        root_exploration_fraction: if exploration_actor {
+            config.persistent_exploration_root_exploration_fraction
+        } else {
+            config.root_exploration_fraction
+        },
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         policy_softmax_temp: config.policy_softmax_temp,
@@ -501,12 +514,13 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         let mut result = None;
         let mut plies = 0usize;
         let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
-        let endgame_temperature =
-            if rng.unit_f32() < config.persistent_exploration_fraction.clamp(0.0, 1.0) {
-                config.persistent_exploration_temperature
-            } else {
-                config.temperature_endgame
-            };
+        let exploration_actor =
+            rng.unit_f32() < config.persistent_exploration_fraction.clamp(0.0, 1.0);
+        let endgame_temperature = if exploration_actor {
+            config.persistent_exploration_temperature
+        } else {
+            config.temperature_endgame
+        };
 
         for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
             let ply = start_phase_ply + local_ply;
@@ -552,6 +566,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 config,
                 ply,
                 rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
+                exploration_actor,
             );
             let search = {
                 crate::scope_profile!("az.selfplay.search");
@@ -815,6 +830,7 @@ struct BatchedSelfplayGame {
     reported_plies: usize,
     allow_resign: bool,
     endgame_temperature: f32,
+    exploration_actor: bool,
     start_source: AzStartSource,
     rng: SplitMix64,
 }
@@ -824,12 +840,12 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         SplitMix64::new(config.seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let start = choose_selfplay_start(config, &mut rng);
     let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
-    let endgame_temperature =
-        if rng.unit_f32() < config.persistent_exploration_fraction.clamp(0.0, 1.0) {
-            config.persistent_exploration_temperature
-        } else {
-            config.temperature_endgame
-        };
+    let exploration_actor = rng.unit_f32() < config.persistent_exploration_fraction.clamp(0.0, 1.0);
+    let endgame_temperature = if exploration_actor {
+        config.persistent_exploration_temperature
+    } else {
+        config.temperature_endgame
+    };
     BatchedSelfplayGame {
         game_index,
         position: start.position,
@@ -844,6 +860,7 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         reported_plies: 0,
         allow_resign,
         endgame_temperature,
+        exploration_actor,
         start_source: start.source,
         rng,
     }
@@ -888,7 +905,7 @@ fn inactive_batch_input(config: &AzLoopConfig) -> AzBatchSearchInput {
     let position = configure_selfplay_rules(Position::startpos(), config);
     let rule_history = position.initial_rule_history();
     let root_moves = position.legal_moves();
-    let mut limits = selfplay_search_limits(config, 0, 0);
+    let mut limits = selfplay_search_limits(config, 0, 0, false);
     limits.simulations = 0;
     AzBatchSearchInput {
         position,
@@ -973,7 +990,12 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     position: state.position.clone(),
                     rule_history: state.rule_history.clone(),
                     root_moves: std::mem::take(&mut legal_moves[index]),
-                    limits: selfplay_search_limits(config, state.phase_ply, seed),
+                    limits: selfplay_search_limits(
+                        config,
+                        state.phase_ply,
+                        seed,
+                        state.exploration_actor,
+                    ),
                 }
             });
             let searches = alphazero_search_batch4_reusing(inputs, model, &mut workspace);
@@ -1691,6 +1713,8 @@ mod tests {
             temperature_endgame: 0.0,
             persistent_exploration_fraction: 0.0,
             persistent_exploration_temperature: 0.8,
+            persistent_exploration_root_dirichlet_alpha: 0.15,
+            persistent_exploration_root_exploration_fraction: 0.35,
             temperature_decay_delay_plies: 0,
             temperature_decay_plies: 0,
             temperature_value_cutoff: 0.0,

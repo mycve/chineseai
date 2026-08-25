@@ -642,7 +642,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_tdl{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_pef{}_pet{}_pera{}_peref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -690,6 +690,10 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_policy_softmax_temp),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
+        f32_slug(config.persistent_exploration_fraction),
+        f32_slug(config.persistent_exploration_temperature),
+        f32_slug(config.persistent_exploration_root_dirichlet_alpha),
+        f32_slug(config.persistent_exploration_root_exploration_fraction),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -993,6 +997,10 @@ fn build_az_loop_config(
         temperature_endgame: config.temperature_endgame,
         persistent_exploration_fraction: config.persistent_exploration_fraction,
         persistent_exploration_temperature: config.persistent_exploration_temperature,
+        persistent_exploration_root_dirichlet_alpha: config
+            .persistent_exploration_root_dirichlet_alpha,
+        persistent_exploration_root_exploration_fraction: config
+            .persistent_exploration_root_exploration_fraction,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
         temperature_value_cutoff: config.temperature_value_cutoff,
@@ -2322,9 +2330,13 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
+                "explore  : root_noise(alpha={},fraction={}) persistent_actor={:.1}% actor_root_noise(alpha={},fraction={}) actor_move_temp={} move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
                 config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
+                config.persistent_exploration_fraction * 100.0,
+                config.persistent_exploration_root_dirichlet_alpha,
+                config.persistent_exploration_root_exploration_fraction,
+                config.persistent_exploration_temperature,
                 config.temperature_start,
                 config.temperature_endgame,
                 config.policy_softmax_temp,
