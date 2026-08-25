@@ -1014,9 +1014,6 @@ fn build_az_loop_config(
         draw_score: config.draw_score,
         policy_softmax_temp: config.policy_softmax_temp,
         value_td_lambda: config.value_td_lambda,
-        reanalyze_fraction: config.reanalyze_fraction,
-        reanalyze_simulations: config.reanalyze_simulations,
-        reanalyze_value_mix: config.reanalyze_value_mix,
         opening_positions: Arc::clone(opening_positions),
         opening_fen_game_fraction: config.opening_fen_game_fraction,
         midgame_positions: Arc::default(),
@@ -1185,14 +1182,6 @@ fn build_async_training_report(
         avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
         avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
-        reanalyze_rate: pending.selfplay.reanalyzed as f32
-            / pending.selfplay.reanalyze_candidates.max(1) as f32,
-        reanalyze_priority: pending.selfplay.reanalyze_priority_sum
-            / pending.selfplay.reanalyze_candidates.max(1) as f32,
-        reanalyze_policy_js: pending.selfplay.reanalyze_policy_js_sum
-            / pending.selfplay.reanalyzed.max(1) as f32,
-        reanalyze_value_delta: pending.selfplay.reanalyze_value_delta_sum
-            / pending.selfplay.reanalyzed.max(1) as f32,
         train_seconds,
         total_seconds,
         games_per_second: selfplay_games as f32 / total_seconds.max(1e-6),
@@ -2287,13 +2276,6 @@ fn main() {
                     .div_ceil(config.batch_size.max(1))
                     .saturating_mul(config.train_epochs_per_update),
             );
-            println!(
-                "teacher  : critical_reanalysis={:.1}% simulations={} baseline_simulations={} value_mix={:.2}",
-                100.0 * config.reanalyze_fraction,
-                config.reanalyze_simulations,
-                config.simulations,
-                config.reanalyze_value_mix
-            );
 
             println!(
                 "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_fens={} opening_count={} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
@@ -2980,15 +2962,6 @@ fn main() {
                             path.display()
                         ))
                 );
-                if config.reanalyze_fraction > 0.0 {
-                    println!(
-                        "teacher  {update:04}: selected={:.2}% priority={:.3} policy_js_400_strong={:.4} value_delta={:.4}",
-                        100.0 * report.reanalyze_rate,
-                        report.reanalyze_priority,
-                        report.reanalyze_policy_js,
-                        report.reanalyze_value_delta,
-                    );
-                }
                 let source_phase =
                     |source: usize, phase: usize| report.source_phase_value[source * 3 + phase];
                 println!(

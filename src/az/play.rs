@@ -13,9 +13,9 @@ use super::alphazero::{
     alphazero_search_with_rules_reusing,
 };
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzSearchResult,
-    AzStartSnapshot, AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules,
-    dense_move_index, rule_context_features, scalar_value_to_wdl_target,
+    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
+    AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
+    rule_context_features, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -196,11 +196,6 @@ pub struct AzSelfplayData {
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
     pub search_simulations: AzSearchSimulationStats,
-    pub reanalyze_candidates: usize,
-    pub reanalyzed: usize,
-    pub reanalyze_priority_sum: f32,
-    pub reanalyze_policy_js_sum: f32,
-    pub reanalyze_value_delta_sum: f32,
 }
 
 impl AzSelfplayData {
@@ -246,11 +241,6 @@ impl AzSelfplayData {
         self.terminal.add_assign(&other.terminal);
         self.search_simulations
             .add_assign(&other.search_simulations);
-        self.reanalyze_candidates += other.reanalyze_candidates;
-        self.reanalyzed += other.reanalyzed;
-        self.reanalyze_priority_sum += other.reanalyze_priority_sum;
-        self.reanalyze_policy_js_sum += other.reanalyze_policy_js_sum;
-        self.reanalyze_value_delta_sum += other.reanalyze_value_delta_sum;
     }
 }
 
@@ -323,11 +313,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged
             .search_simulations
             .add_assign(&chunk.search_simulations);
-        merged.reanalyze_candidates += chunk.reanalyze_candidates;
-        merged.reanalyzed += chunk.reanalyzed;
-        merged.reanalyze_priority_sum += chunk.reanalyze_priority_sum;
-        merged.reanalyze_policy_js_sum += chunk.reanalyze_policy_js_sum;
-        merged.reanalyze_value_delta_sum += chunk.reanalyze_value_delta_sum;
     }
     merged
 }
@@ -351,149 +336,6 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
         draw_score: config.draw_score,
         value_scale: 1.0,
     }
-}
-
-fn normalized_policy(candidates: &[AzCandidate], raw: bool) -> Vec<f32> {
-    let mut values = candidates
-        .iter()
-        .map(|candidate| {
-            if raw {
-                candidate.raw_prior.max(0.0)
-            } else {
-                candidate.policy.max(0.0)
-            }
-        })
-        .collect::<Vec<_>>();
-    let sum = values.iter().sum::<f32>();
-    if sum > 1.0e-12 {
-        for value in &mut values {
-            *value /= sum;
-        }
-    }
-    values
-}
-
-fn policy_js_divergence(candidates: &[AzCandidate]) -> f32 {
-    let raw = normalized_policy(candidates, true);
-    let searched = normalized_policy(candidates, false);
-    raw.iter()
-        .zip(searched)
-        .map(|(&p, q)| {
-            let midpoint = 0.5 * (p + q);
-            let kl_p = if p > 0.0 {
-                p * (p / midpoint).ln()
-            } else {
-                0.0
-            };
-            let kl_q = if q > 0.0 {
-                q * (q / midpoint).ln()
-            } else {
-                0.0
-            };
-            0.5 * (kl_p + kl_q)
-        })
-        .sum::<f32>()
-        .max(0.0)
-}
-
-fn search_policy_js_divergence(left: &[AzCandidate], right: &[AzCandidate]) -> f32 {
-    let left_sum = left
-        .iter()
-        .map(|candidate| candidate.policy.max(0.0))
-        .sum::<f32>();
-    let right_sum = right
-        .iter()
-        .map(|candidate| candidate.policy.max(0.0))
-        .sum::<f32>();
-    if left_sum <= 1.0e-12 || right_sum <= 1.0e-12 {
-        return 0.0;
-    }
-    left.iter()
-        .map(|candidate| {
-            let p = candidate.policy.max(0.0) / left_sum;
-            let q = right
-                .iter()
-                .find(|other| other.mv == candidate.mv)
-                .map_or(0.0, |other| other.policy.max(0.0) / right_sum);
-            let midpoint = 0.5 * (p + q);
-            let kl_p = if p > 0.0 {
-                p * (p / midpoint).ln()
-            } else {
-                0.0
-            };
-            let kl_q = if q > 0.0 {
-                q * (q / midpoint).ln()
-            } else {
-                0.0
-            };
-            0.5 * (kl_p + kl_q)
-        })
-        .sum::<f32>()
-        .max(0.0)
-}
-
-fn reanalysis_priority(search: &AzSearchResult) -> f32 {
-    let js = policy_js_divergence(&search.candidates);
-    let network_q = search.network_value_wdl[0] - search.network_value_wdl[2];
-    let value_delta = (search.value_q - network_q).abs();
-    let raw_best = search
-        .candidates
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.raw_prior.total_cmp(&right.raw_prior))
-        .map(|(index, _)| index);
-    let search_best = search
-        .candidates
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.policy.total_cmp(&right.policy))
-        .map(|(index, _)| index);
-    let disagreement = f32::from(raw_best != search_best);
-    (0.55 * (js / 0.20).min(1.0) + 0.30 * (value_delta / 0.20).min(1.0) + 0.15 * disagreement)
-        .clamp(0.0, 1.0)
-}
-
-fn maybe_reanalyze(
-    position: &Position,
-    rule_history: &[RuleHistoryEntry],
-    baseline: &AzSearchResult,
-    model: &AzNnue,
-    config: &AzLoopConfig,
-    ply: usize,
-    rng: &mut SplitMix64,
-    workspace: &mut AzSearchWorkspace,
-) -> Option<AzSearchResult> {
-    if config.reanalyze_fraction <= 0.0 || config.reanalyze_simulations <= config.simulations {
-        return None;
-    }
-    let priority = reanalysis_priority(baseline);
-    let phase_weight = if ply < 40 {
-        0.75
-    } else if ply < 120 {
-        1.20
-    } else {
-        0.80
-    };
-    let probability = (config.reanalyze_fraction * phase_weight * priority / 0.35).min(1.0);
-    if rng.unit_f32() >= probability {
-        return None;
-    }
-    let mut limits = selfplay_search_limits(config, ply, rng.next_u64());
-    limits.simulations = config.reanalyze_simulations;
-    limits.root_exploration_fraction = 0.0;
-    let legal = baseline
-        .candidates
-        .iter()
-        .map(|candidate| candidate.mv)
-        .collect();
-    Some(alphazero_search_with_rules_reusing(
-        position,
-        rule_history,
-        legal,
-        model,
-        limits,
-        workspace,
-    ))
 }
 
 fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
@@ -921,11 +763,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         played_q_sum,
         terminal,
         search_simulations,
-        reanalyze_candidates: 0,
-        reanalyzed: 0,
-        reanalyze_priority_sum: 0.0,
-        reanalyze_policy_js_sum: 0.0,
-        reanalyze_value_delta_sum: 0.0,
     }
 }
 
@@ -1020,7 +857,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     crate::scope_profile!("az.selfplay.chunk_batch4");
     let mut data = AzSelfplayData::default();
     let mut workspace = AzBatchSearchWorkspace::new(model);
-    let mut reanalyze_workspace = AzSearchWorkspace::new(model);
     for group_start in (0..config.games).step_by(4) {
         let mut states: [Option<BatchedSelfplayGame>; 4] = std::array::from_fn(|slot| {
             let game_index = group_start + slot;
@@ -1149,31 +985,10 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     state.result = Some(0.0);
                     continue;
                 };
-                data.reanalyze_candidates += 1;
-                data.reanalyze_priority_sum += reanalysis_priority(search);
-                let reanalyzed = maybe_reanalyze(
-                    &state.position,
-                    &state.rule_history,
-                    search,
-                    model,
-                    config,
-                    state.phase_ply,
-                    &mut state.rng,
-                    &mut reanalyze_workspace,
-                );
-                if let Some(strong) = &reanalyzed {
-                    data.reanalyzed += 1;
-                    data.reanalyze_policy_js_sum +=
-                        search_policy_js_divergence(&search.candidates, &strong.candidates);
-                    data.reanalyze_value_delta_sum += (search.value_q - strong.value_q).abs();
-                    data.search_simulations.searches += 1;
-                    data.search_simulations.simulations_sum += strong.simulations;
-                }
-                let teacher = reanalyzed.as_ref().unwrap_or(search);
                 let mut meta = move_search_meta(
-                    &teacher.candidates,
+                    &search.candidates,
                     mv,
-                    teacher.value_q,
+                    search.value_q,
                     config.generation_update,
                     config.seed ^ state.game_index as u64,
                     state.phase_ply,
@@ -1182,7 +997,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 data.sampled_moves += 1;
                 data.sampled_best_moves += usize::from(meta.best_index == meta.played_index);
                 data.best_played_q_gap_sum += (meta.best_q - meta.played_q).max(0.0);
-                let top_visits = teacher
+                let top_visits = search
                     .candidates
                     .iter()
                     .map(|candidate| candidate.visits)
@@ -1202,22 +1017,14 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 state.samples.push(make_training_sample(
                     &state.position,
                     &state.rule_history,
-                    &teacher.candidates,
-                    teacher.value_q,
+                    &search.candidates,
+                    search.value_q,
                     state.rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
-                    teacher.simulations,
+                    search.simulations,
                     1.0,
                 ));
-                state.bootstrap_wdls.push(if reanalyzed.is_some() {
-                    let mix = config.reanalyze_value_mix;
-                    std::array::from_fn(|index| {
-                        (1.0 - mix) * search.network_value_wdl[index]
-                            + mix * teacher.value_wdl[index]
-                    })
-                } else {
-                    search.network_value_wdl
-                });
+                state.bootstrap_wdls.push(search.network_value_wdl);
                 let mover = state.position.side_to_move();
                 let captured = state.position.piece_at(mv.to as usize);
                 state.position.make_move(mv);
@@ -1848,9 +1655,6 @@ mod tests {
             draw_score: 0.0,
             policy_softmax_temp: 1.0,
             value_td_lambda: 0.9,
-            reanalyze_fraction: 0.0,
-            reanalyze_simulations: 256,
-            reanalyze_value_mix: 0.25,
             opening_positions: Default::default(),
             opening_fen_game_fraction: 0.0,
             midgame_positions: Default::default(),
@@ -1875,47 +1679,6 @@ mod tests {
         // 两个开局的配对得分为 0.5/0.5；红黑单盘虽各有胜负，先后手抵消后方差为零。
         assert_eq!(report.score_rate(), 0.5);
         assert_eq!(report.score_rate_standard_error(), 0.0);
-    }
-
-    #[test]
-    fn reanalysis_priority_detects_search_correction() {
-        let candidate = |mv, raw_prior, policy| AzCandidate {
-            mv,
-            visits: (policy * 100.0) as u32,
-            q: 0.0,
-            raw_prior,
-            prior: raw_prior,
-            policy,
-        };
-        let result = |candidates, value_q| AzSearchResult {
-            best_move: None,
-            value_q,
-            value_cp: 0,
-            value_wdl: [0.4, 0.3, 0.3],
-            network_value_wdl: [0.4, 0.3, 0.3],
-            simulations: 100,
-            search_depth_avg: 0.0,
-            search_depth_max: 0,
-            search_depth_limit: 0,
-            search_depth_cutoffs: 0,
-            candidates,
-        };
-        let stable = result(
-            vec![
-                candidate(Move::new(0, 1), 0.8, 0.8),
-                candidate(Move::new(0, 2), 0.2, 0.2),
-            ],
-            0.1,
-        );
-        let corrected = result(
-            vec![
-                candidate(Move::new(0, 1), 0.8, 0.1),
-                candidate(Move::new(0, 2), 0.2, 0.9),
-            ],
-            -0.3,
-        );
-        assert!(reanalysis_priority(&corrected) > reanalysis_priority(&stable) + 0.5);
-        assert!(policy_js_divergence(&corrected.candidates) > 0.2);
     }
 
     #[test]

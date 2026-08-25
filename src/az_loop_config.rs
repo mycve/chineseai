@@ -53,9 +53,6 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub value_td_lambda: f32,
-    pub reanalyze_fraction: f32,
-    pub reanalyze_simulations: usize,
-    pub reanalyze_value_mix: f32,
     pub opening_fens_path: String,
     pub opening_fen_game_fraction: f32,
     pub midgame_start_fraction: f32,
@@ -142,9 +139,6 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             policy_softmax_temp: 1.2,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
-            reanalyze_fraction: 0.10,
-            reanalyze_simulations: 1600,
-            reanalyze_value_mix: 0.25,
             opening_fens_path: "opening_fens.txt".into(),
             opening_fen_game_fraction: 0.50,
             midgame_start_fraction: 0.30,
@@ -264,9 +258,6 @@ impl AzLoopFileConfig {
         line!("draw_score", f(self.draw_score));
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!("value_td_lambda", f(self.value_td_lambda));
-        line!("reanalyze_fraction", f(self.reanalyze_fraction));
-        line!("reanalyze_simulations", self.reanalyze_simulations);
-        line!("reanalyze_value_mix", f(self.reanalyze_value_mix));
         line!("opening_fens_path", q(&self.opening_fens_path));
         line!(
             "opening_fen_game_fraction",
@@ -420,9 +411,6 @@ impl AzLoopFileConfig {
             self.midgame_start_fraction
         );
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
-        self.reanalyze_fraction = self.reanalyze_fraction.clamp(0.0, 0.5);
-        self.reanalyze_simulations = self.reanalyze_simulations.max(1);
-        self.reanalyze_value_mix = self.reanalyze_value_mix.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
         self.resign_playthrough = self.resign_playthrough.clamp(0.0, 100.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -486,7 +474,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 18\n"));
+        assert!(text.starts_with("format_version = 17\n"));
         assert!(text.contains("lr = 0.00004\n"));
         assert!(text.contains("lr_min = 0.00002\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
@@ -511,9 +499,6 @@ mod tests {
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("policy_softmax_temp = 1.2\n"));
         assert!(text.contains("value_td_lambda = 0.9\n"));
-        assert!(text.contains("reanalyze_fraction = 0.1\n"));
-        assert!(text.contains("reanalyze_simulations = 1600\n"));
-        assert!(text.contains("reanalyze_value_mix = 0.25\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
         assert!(text.contains("opening_fen_game_fraction = 0.5\n"));
