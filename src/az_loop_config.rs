@@ -36,6 +36,8 @@ pub struct AzLoopFileConfig {
     pub workers: usize,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
+    pub persistent_exploration_fraction: f32,
+    pub persistent_exploration_temperature: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
     pub temperature_value_cutoff: f32,
@@ -53,8 +55,9 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub value_td_lambda: f32,
-    pub opening_fens_path: String,
-    pub opening_fen_game_fraction: f32,
+    pub opening_start_fraction: f32,
+    pub opening_reservoir_capacity: usize,
+    pub opening_snapshot_path: String,
     pub midgame_start_fraction: f32,
     pub midgame_reservoir_capacity: usize,
     pub midgame_snapshot_path: String,
@@ -64,9 +67,11 @@ pub struct AzLoopFileConfig {
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_games: u32,
-    pub replay_startpos_sample_fraction: f32,
-    pub replay_opening_sample_fraction: f32,
-    pub replay_midgame_sample_fraction: f32,
+    pub replay_phase_0_29_fraction: f32,
+    pub replay_phase_30_59_fraction: f32,
+    pub replay_phase_60_99_fraction: f32,
+    pub replay_phase_100_139_fraction: f32,
+    pub replay_phase_140_plus_fraction: f32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub train_epochs_per_update: usize,
@@ -122,6 +127,8 @@ impl Default for AzLoopFileConfig {
             workers: 0,
             temperature_start: 2.0,
             temperature_endgame: 0.10,
+            persistent_exploration_fraction: 0.10,
+            persistent_exploration_temperature: 0.80,
             temperature_decay_delay_plies: 8,
             temperature_decay_plies: 14,
             temperature_value_cutoff: 0.07,
@@ -139,9 +146,10 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             policy_softmax_temp: 1.2,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
-            opening_fens_path: "opening_fens.txt".into(),
-            opening_fen_game_fraction: 0.50,
-            midgame_start_fraction: 0.30,
+            opening_start_fraction: 0.10,
+            opening_reservoir_capacity: 50_000,
+            opening_snapshot_path: "opening-pool.lz4".into(),
+            midgame_start_fraction: 0.20,
             midgame_reservoir_capacity: 50_000,
             midgame_snapshot_path: "midgame-pool.lz4".into(),
             actor_publish_interval_updates: 5,
@@ -150,9 +158,11 @@ impl Default for AzLoopFileConfig {
             replay_capacity: 2400000,
             replay_recent_sample_fraction: 0.35,
             replay_recent_games: 7500,
-            replay_startpos_sample_fraction: 0.20,
-            replay_opening_sample_fraction: 0.50,
-            replay_midgame_sample_fraction: 0.30,
+            replay_phase_0_29_fraction: 0.30,
+            replay_phase_30_59_fraction: 0.25,
+            replay_phase_60_99_fraction: 0.25,
+            replay_phase_100_139_fraction: 0.15,
+            replay_phase_140_plus_fraction: 0.05,
             train_warmup_samples: 600000,
             train_samples_per_update: 120000,
             train_epochs_per_update: 1,
@@ -236,6 +246,14 @@ impl AzLoopFileConfig {
         line!("temperature_start", f(self.temperature_start));
         line!("temperature_endgame", f(self.temperature_endgame));
         line!(
+            "persistent_exploration_fraction",
+            f(self.persistent_exploration_fraction)
+        );
+        line!(
+            "persistent_exploration_temperature",
+            f(self.persistent_exploration_temperature)
+        );
+        line!(
             "temperature_decay_delay_plies",
             self.temperature_decay_delay_plies
         );
@@ -258,11 +276,12 @@ impl AzLoopFileConfig {
         line!("draw_score", f(self.draw_score));
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!("value_td_lambda", f(self.value_td_lambda));
-        line!("opening_fens_path", q(&self.opening_fens_path));
+        line!("opening_start_fraction", f(self.opening_start_fraction));
         line!(
-            "opening_fen_game_fraction",
-            f(self.opening_fen_game_fraction)
+            "opening_reservoir_capacity",
+            self.opening_reservoir_capacity
         );
+        line!("opening_snapshot_path", q(&self.opening_snapshot_path));
         line!("midgame_start_fraction", f(self.midgame_start_fraction));
         line!(
             "midgame_reservoir_capacity",
@@ -282,16 +301,24 @@ impl AzLoopFileConfig {
         );
         line!("replay_recent_games", self.replay_recent_games);
         line!(
-            "replay_startpos_sample_fraction",
-            f(self.replay_startpos_sample_fraction)
+            "replay_phase_0_29_fraction",
+            f(self.replay_phase_0_29_fraction)
         );
         line!(
-            "replay_opening_sample_fraction",
-            f(self.replay_opening_sample_fraction)
+            "replay_phase_30_59_fraction",
+            f(self.replay_phase_30_59_fraction)
         );
         line!(
-            "replay_midgame_sample_fraction",
-            f(self.replay_midgame_sample_fraction)
+            "replay_phase_60_99_fraction",
+            f(self.replay_phase_60_99_fraction)
+        );
+        line!(
+            "replay_phase_100_139_fraction",
+            f(self.replay_phase_100_139_fraction)
+        );
+        line!(
+            "replay_phase_140_plus_fraction",
+            f(self.replay_phase_140_plus_fraction)
         );
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
@@ -386,6 +413,10 @@ impl AzLoopFileConfig {
         }
         self.temperature_start = self.temperature_start.max(0.0);
         self.temperature_endgame = self.temperature_endgame.max(0.0);
+        self.persistent_exploration_fraction = self.persistent_exploration_fraction.clamp(0.0, 1.0);
+        self.persistent_exploration_temperature = self
+            .persistent_exploration_temperature
+            .max(self.temperature_endgame);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
         self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
         self.temperature_value_cutoff = self.temperature_value_cutoff.max(0.0);
@@ -402,12 +433,12 @@ impl AzLoopFileConfig {
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.midgame_start_fraction = self.midgame_start_fraction.clamp(0.0, 1.0);
-        self.opening_fen_game_fraction = self.opening_fen_game_fraction.clamp(0.0, 1.0);
-        let start_fraction = 1.0 - self.opening_fen_game_fraction - self.midgame_start_fraction;
+        self.opening_start_fraction = self.opening_start_fraction.clamp(0.0, 1.0);
+        let start_fraction = 1.0 - self.opening_start_fraction - self.midgame_start_fraction;
         assert!(
             start_fraction >= -1.0e-6,
-            "opening_fen_game_fraction ({}) + midgame_start_fraction ({}) must not exceed 1; the remainder is the start-position share",
-            self.opening_fen_game_fraction,
+            "opening_start_fraction ({}) + midgame_start_fraction ({}) must not exceed 1; the remainder is the start-position share",
+            self.opening_start_fraction,
             self.midgame_start_fraction
         );
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
@@ -416,19 +447,26 @@ impl AzLoopFileConfig {
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
         self.actor_publish_interval_updates = self.actor_publish_interval_updates.max(1);
-        self.replay_startpos_sample_fraction = self.replay_startpos_sample_fraction.max(0.0);
-        self.replay_opening_sample_fraction = self.replay_opening_sample_fraction.max(0.0);
-        self.replay_midgame_sample_fraction = self.replay_midgame_sample_fraction.max(0.0);
-        let replay_source_total = self.replay_startpos_sample_fraction
-            + self.replay_opening_sample_fraction
-            + self.replay_midgame_sample_fraction;
+        let mut replay_phase_fractions = [
+            self.replay_phase_0_29_fraction.max(0.0),
+            self.replay_phase_30_59_fraction.max(0.0),
+            self.replay_phase_60_99_fraction.max(0.0),
+            self.replay_phase_100_139_fraction.max(0.0),
+            self.replay_phase_140_plus_fraction.max(0.0),
+        ];
+        let replay_source_total = replay_phase_fractions.iter().sum::<f32>();
         assert!(
             replay_source_total > 0.0,
-            "replay source fractions must have positive total"
+            "replay phase fractions must have positive total"
         );
-        self.replay_startpos_sample_fraction /= replay_source_total;
-        self.replay_opening_sample_fraction /= replay_source_total;
-        self.replay_midgame_sample_fraction /= replay_source_total;
+        for fraction in &mut replay_phase_fractions {
+            *fraction /= replay_source_total;
+        }
+        self.replay_phase_0_29_fraction = replay_phase_fractions[0];
+        self.replay_phase_30_59_fraction = replay_phase_fractions[1];
+        self.replay_phase_60_99_fraction = replay_phase_fractions[2];
+        self.replay_phase_100_139_fraction = replay_phase_fractions[3];
+        self.replay_phase_140_plus_fraction = replay_phase_fractions[4];
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.train_epochs_per_update = self.train_epochs_per_update.max(1);
@@ -474,13 +512,15 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 17\n"));
+        assert!(text.starts_with("format_version = 19\n"));
         assert!(text.contains("lr = 0.00004\n"));
         assert!(text.contains("lr_min = 0.00002\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
         assert!(text.contains("temperature_endgame = 0.1\n"));
+        assert!(text.contains("persistent_exploration_fraction = 0.1\n"));
+        assert!(text.contains("persistent_exploration_temperature = 0.8\n"));
         assert!(text.contains("temperature_decay_delay_plies = 8\n"));
         assert!(text.contains("temperature_decay_plies = 14\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
@@ -500,9 +540,10 @@ mod tests {
         assert!(text.contains("policy_softmax_temp = 1.2\n"));
         assert!(text.contains("value_td_lambda = 0.9\n"));
         assert!(!text.contains("value_target_search_q_mix"));
-        assert!(text.contains("opening_fens_path = \"opening_fens.txt\"\n"));
-        assert!(text.contains("opening_fen_game_fraction = 0.5\n"));
-        assert!(text.contains("midgame_start_fraction = 0.3\n"));
+        assert!(text.contains("opening_start_fraction = 0.1\n"));
+        assert!(text.contains("opening_reservoir_capacity = 50000\n"));
+        assert!(text.contains("opening_snapshot_path = \"opening-pool.lz4\"\n"));
+        assert!(text.contains("midgame_start_fraction = 0.2\n"));
         assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
         assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
         assert!(text.contains("actor_publish_interval_updates = 5\n"));
@@ -537,9 +578,11 @@ mod tests {
             config.train_samples_per_update / config.selfplay_samples_per_update,
             1
         );
-        assert!(text.contains("replay_startpos_sample_fraction = 0.2\n"));
-        assert!(text.contains("replay_opening_sample_fraction = 0.5\n"));
-        assert!(text.contains("replay_midgame_sample_fraction = 0.3\n"));
+        assert!(text.contains("replay_phase_0_29_fraction = 0.3\n"));
+        assert!(text.contains("replay_phase_30_59_fraction = 0.25\n"));
+        assert!(text.contains("replay_phase_60_99_fraction = 0.25\n"));
+        assert!(text.contains("replay_phase_100_139_fraction = 0.15\n"));
+        assert!(text.contains("replay_phase_140_plus_fraction = 0.05\n"));
         assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));

@@ -955,6 +955,8 @@ pub struct AzLoopConfig {
     pub generation_update: u32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
+    pub persistent_exploration_fraction: f32,
+    pub persistent_exploration_temperature: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
     pub temperature_value_cutoff: f32,
@@ -972,8 +974,8 @@ pub struct AzLoopConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub value_td_lambda: f32,
-    pub opening_positions: Arc<[Position]>,
-    pub opening_fen_game_fraction: f32,
+    pub opening_positions: Arc<[AzStartSnapshot]>,
+    pub opening_start_fraction: f32,
     pub midgame_positions: Arc<[AzStartSnapshot]>,
     pub midgame_start_fraction: f32,
     pub resign_percentage: f32,
@@ -1252,7 +1254,7 @@ pub fn rule_context_features(
 pub enum AzStartSource {
     #[default]
     Startpos = 0,
-    OpeningFen = 1,
+    OpeningPool = 1,
     Midgame = 2,
 }
 
@@ -1262,7 +1264,7 @@ impl AzStartSource {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Startpos),
-            1 => Some(Self::OpeningFen),
+            1 => Some(Self::OpeningPool),
             2 => Some(Self::Midgame),
             _ => None,
         }
@@ -1819,14 +1821,12 @@ impl AzNnue {
         let side = position.side_to_move();
         let king_buckets = canonical_buckets_for_perspective(position, side);
         self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
-        let opponent_attacks = self
+        let attack_masks = self
             .policy_tactical_active
-            .then(|| position.attacked_squares_mask(side.opposite()))
+            .then(|| position.attacked_squares_masks())
             .unwrap_or_default();
-        let own_attacks = self
-            .policy_tactical_active
-            .then(|| position.attacked_squares_mask(side))
-            .unwrap_or_default();
+        let opponent_attacks = attack_masks[color_index(side.opposite())];
+        let own_attacks = attack_masks[color_index(side)];
         {
             crate::scope_profile!("az.eval.policy_logits");
             {

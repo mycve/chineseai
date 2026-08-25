@@ -389,36 +389,42 @@ impl Position {
     }
 
     pub(crate) fn attacked_squares_mask(&self, by: Color) -> u128 {
-        let mut mask = 0u128;
+        self.attacked_squares_masks()[color_hash_index(by)]
+    }
+
+    pub(crate) fn attacked_squares_masks(&self) -> [u128; 2] {
+        let mut masks = [0u128; 2];
         let occupancy = self.occupied;
         let mut pieces = occupancy;
         while pieces != 0 {
             let source = pieces.trailing_zeros() as usize;
             pieces &= pieces - 1;
-            let Some(piece) = self.board[source].filter(|piece| piece.color == by) else {
+            let Some(piece) = self.board[source] else {
                 continue;
             };
+            let by = piece.color;
+            let mask = &mut masks[color_hash_index(by)];
             let file = file_of(source) as i32;
             let rank = rank_of(source) as i32;
             let mut add_step = |df: i32, dr: i32| {
                 let target_file = file + df;
                 let target_rank = rank + dr;
                 if inside_board(target_file, target_rank) {
-                    mask |= 1u128 << index(target_file as usize, target_rank as usize);
+                    *mask |= 1u128 << index(target_file as usize, target_rank as usize);
                 }
             };
             match piece.kind {
                 PieceKind::General => {
-                    mask |= fixed_attack_masks()[color_hash_index(by)][0][source];
+                    *mask |= fixed_attack_masks()[color_hash_index(by)][0][source];
                     if let Some(enemy_general) = self.find_general(by.opposite())
                         && file_of(enemy_general) == file as usize
                         && self.clear_file_between(source, enemy_general)
                     {
-                        mask |= 1u128 << enemy_general;
+                        *mask |= 1u128 << enemy_general;
                     }
                 }
                 PieceKind::Advisor => {
-                    mask |= fixed_attack_masks()[color_hash_index(by)][1][source];
+                    *mask |= fixed_attack_masks()[color_hash_index(by)][1][source];
                 }
                 PieceKind::Elephant => {
                     for (df, dr) in [(-2, -2), (-2, 2), (2, -2), (2, 2)] {
@@ -449,7 +455,7 @@ impl Position {
                         let increasing = dr * BOARD_FILES as i32 + df > 0;
                         let blockers = ray & occupancy;
                         if piece.kind == PieceKind::Rook {
-                            mask |= if blockers == 0 {
+                            *mask |= if blockers == 0 {
                                 ray
                             } else {
                                 ray_through(ray, nearest_on_ray(blockers, increasing), increasing)
@@ -466,7 +472,7 @@ impl Position {
                             ray & ((1u128 << screen) - 1)
                         };
                         let second_blockers = beyond_screen & occupancy;
-                        mask |= if second_blockers == 0 {
+                        *mask |= if second_blockers == 0 {
                             beyond_screen
                         } else {
                             ray_through(
@@ -478,11 +484,11 @@ impl Position {
                     }
                 }
                 PieceKind::Soldier => {
-                    mask |= fixed_attack_masks()[color_hash_index(by)][2][source];
+                    *mask |= fixed_attack_masks()[color_hash_index(by)][2][source];
                 }
             }
         }
-        mask
+        masks
     }
 
     #[inline(always)]
@@ -821,10 +827,14 @@ impl Position {
 
         // Vacating `from` may uncover a friendly horse/elephant whose leg/eye
         // square was `from`.
-        if self.leaper_revealed_horse(g, from, s, &occ)
-            || self.leaper_revealed_elephant(g, from, s, &occ)
-        {
-            return true;
+        let from_file_delta = file_of(g).abs_diff(file_of(from));
+        let from_rank_delta = rank_of(g).abs_diff(rank_of(from));
+        if from_file_delta == 1 && from_rank_delta == 1 {
+            if self.leaper_revealed_horse(g, from, s, &occ)
+                || self.leaper_revealed_elephant(g, from, s, &occ)
+            {
+                return true;
+            }
         }
 
         false

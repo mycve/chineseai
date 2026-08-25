@@ -52,6 +52,7 @@ pub struct VsPikafishConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub policy_softmax_temp: f32,
+    pub report_games: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,7 +442,7 @@ pub fn run_vs_pikafish(
             .join()
             .map_err(|_| std::io::Error::other("vs-pikafish: worker thread panicked"))??;
         for (game_index, chinese_red, end, final_fen, position_command) in worker_games {
-            if should_report_final_position(end.reason()) {
+            if config.report_games || should_report_final_position(end.reason()) {
                 out.abnormal_ends.push(VsPikafishAbnormalEnd {
                     game_index,
                     chinese_plays_red: chinese_red,

@@ -26,6 +26,17 @@ const REPLAY_COMPRESS_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const REPLAY_COMPRESS_CHUNK_BYTES: usize = 512;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
 const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
+const REPLAY_PHASE_COUNT: usize = 5;
+
+fn replay_phase(ply: u16) -> usize {
+    match ply {
+        0..=29 => 0,
+        30..=59 => 1,
+        60..=99 => 2,
+        100..=139 => 3,
+        _ => 4,
+    }
+}
 
 fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
     let mut buf = [0u8; 4];
@@ -364,10 +375,10 @@ impl AzExperiencePool {
         }
     }
 
-    pub fn sample_stratified_recent(
+    pub fn sample_phase_stratified_recent(
         &self,
         count: usize,
-        source_fractions: [f32; AzStartSource::COUNT],
+        phase_fractions: [f32; REPLAY_PHASE_COUNT],
         recent_fraction: f32,
         recent_games: u32,
         rng: &mut SplitMix64,
@@ -379,26 +390,26 @@ impl AzExperiencePool {
         let recent_start = self
             .recent_start_flat(recent_games.max(1))
             .unwrap_or(self.sample_count);
-        let mut all_by_source: [Vec<usize>; AzStartSource::COUNT] = Default::default();
-        let mut old_by_source: [Vec<usize>; AzStartSource::COUNT] = Default::default();
-        let mut recent_by_source: [Vec<usize>; AzStartSource::COUNT] = Default::default();
+        let mut all_by_phase: [Vec<usize>; REPLAY_PHASE_COUNT] = Default::default();
+        let mut old_by_phase: [Vec<usize>; REPLAY_PHASE_COUNT] = Default::default();
+        let mut recent_by_phase: [Vec<usize>; REPLAY_PHASE_COUNT] = Default::default();
         let mut flat = 0usize;
         for chunk in &self.chunks {
             for entry in &chunk.entries {
-                let source = entry.sample.meta.start_source.index();
-                all_by_source[source].push(flat);
+                let phase = replay_phase(entry.sample.meta.ply);
+                all_by_phase[phase].push(flat);
                 if flat >= recent_start {
-                    recent_by_source[source].push(flat);
+                    recent_by_phase[phase].push(flat);
                 } else {
-                    old_by_source[source].push(flat);
+                    old_by_phase[phase].push(flat);
                 }
                 flat += 1;
             }
         }
-        let mut weights = source_fractions.map(|value| value.max(0.0));
-        for source in 0..AzStartSource::COUNT {
-            if all_by_source[source].is_empty() {
-                weights[source] = 0.0;
+        let mut weights = phase_fractions.map(|value| value.max(0.0));
+        for phase in 0..REPLAY_PHASE_COUNT {
+            if all_by_phase[phase].is_empty() {
+                weights[phase] = 0.0;
             }
         }
         let total_weight = weights.iter().sum::<f32>();
@@ -412,60 +423,60 @@ impl AzExperiencePool {
         for weight in &mut weights {
             *weight /= total_weight;
         }
-        let mut source_targets = [0usize; AzStartSource::COUNT];
+        let mut phase_targets = [0usize; REPLAY_PHASE_COUNT];
         let mut assigned = 0usize;
-        for source in 0..AzStartSource::COUNT {
-            source_targets[source] = (count as f32 * weights[source]).floor() as usize;
-            assigned += source_targets[source];
+        for phase in 0..REPLAY_PHASE_COUNT {
+            phase_targets[phase] = (count as f32 * weights[phase]).floor() as usize;
+            assigned += phase_targets[phase];
         }
-        let remainder_source = weights
+        let remainder_phase = weights
             .iter()
             .enumerate()
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(source, _)| source)
+            .map(|(phase, _)| phase)
             .unwrap_or(0);
-        source_targets[remainder_source] += count - assigned;
+        phase_targets[remainder_phase] += count - assigned;
         let mut samples = Vec::with_capacity(count);
         let mut source_samples = [0usize; AzStartSource::COUNT];
         let recent_fraction = recent_fraction.clamp(0.0, 1.0);
         let requested_recent_samples = (count as f32 * recent_fraction).round() as usize;
         let mut recent_targets =
-            source_targets.map(|target| (target as f32 * recent_fraction).floor() as usize);
+            phase_targets.map(|target| (target as f32 * recent_fraction).floor() as usize);
         let mut recent_assigned = recent_targets.iter().sum::<usize>();
         while recent_assigned < requested_recent_samples {
-            let source = (0..AzStartSource::COUNT)
-                .filter(|&source| recent_targets[source] < source_targets[source])
+            let phase = (0..REPLAY_PHASE_COUNT)
+                .filter(|&phase| recent_targets[phase] < phase_targets[phase])
                 .max_by(|&left, &right| {
                     let left_remainder =
-                        source_targets[left] as f32 * recent_fraction - recent_targets[left] as f32;
-                    let right_remainder = source_targets[right] as f32 * recent_fraction
+                        phase_targets[left] as f32 * recent_fraction - recent_targets[left] as f32;
+                    let right_remainder = phase_targets[right] as f32 * recent_fraction
                         - recent_targets[right] as f32;
                     left_remainder.total_cmp(&right_remainder)
                 })
-                .expect("recent replay quota must fit source quotas");
-            recent_targets[source] += 1;
+                .expect("recent replay quota must fit phase quotas");
+            recent_targets[phase] += 1;
             recent_assigned += 1;
         }
         let mut actual_recent_samples = 0usize;
-        for source in 0..AzStartSource::COUNT {
-            let target = source_targets[source];
-            let recent_target = recent_targets[source];
+        for phase in 0..REPLAY_PHASE_COUNT {
+            let target = phase_targets[phase];
+            let recent_target = recent_targets[phase];
             for index in 0..target {
                 let want_recent = index < recent_target;
                 let preferred = if want_recent {
-                    &recent_by_source[source]
+                    &recent_by_phase[phase]
                 } else {
-                    &old_by_source[source]
+                    &old_by_phase[phase]
                 };
                 let choices = if preferred.is_empty() {
-                    &all_by_source[source]
+                    &all_by_phase[phase]
                 } else {
                     preferred
                 };
                 let flat_index = choices[rng.next_u64() as usize % choices.len()];
                 actual_recent_samples += usize::from(flat_index >= recent_start);
                 samples.push(self.sample_by_flat_index(flat_index, &chunk_ends));
-                source_samples[source] += 1;
+                source_samples[samples.last().unwrap().meta.start_source.index()] += 1;
             }
         }
         AzReplaySampleBatch {
@@ -784,20 +795,20 @@ mod tests {
     #[test]
     fn replay_roundtrip_preserves_start_source() {
         let mut encoded = Vec::new();
-        let original = sample(AzStartSource::OpeningFen, 7, 11);
+        let original = sample(AzStartSource::OpeningPool, 7, 11);
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
-        assert_eq!(decoded.meta.start_source, AzStartSource::OpeningFen);
+        assert_eq!(decoded.meta.start_source, AzStartSource::OpeningPool);
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
     }
 
     #[test]
-    fn stratified_sampler_enforces_source_and_recency_quotas() {
+    fn phase_stratified_sampler_enforces_phase_and_recency_quotas() {
         let mut pool = AzExperiencePool::new(1_000);
         let sources = [
             AzStartSource::Startpos,
-            AzStartSource::OpeningFen,
+            AzStartSource::OpeningPool,
             AzStartSource::Midgame,
         ];
         for generation in 0..10 {
@@ -808,33 +819,41 @@ mod tests {
                     .map(|(source_index, &source)| {
                         (0..10)
                             .map(|sample_index| {
-                                sample(
+                                let mut sample = sample(
                                     source,
                                     generation,
                                     generation as u64 * 1_000
                                         + source_index as u64 * 100
                                         + sample_index,
-                                )
+                                );
+                                sample.meta.ply = [10, 40, 80][source_index];
+                                sample
                             })
                             .collect()
                     })
                     .collect(),
             );
         }
-        let batch =
-            pool.sample_stratified_recent(100, [0.2, 0.5, 0.3], 0.35, 15, &mut SplitMix64::new(42));
-        assert_eq!(batch.source_samples, [20, 50, 30]);
+        let batch = pool.sample_phase_stratified_recent(
+            100,
+            [0.2, 0.5, 0.3, 0.0, 0.0],
+            0.35,
+            15,
+            &mut SplitMix64::new(42),
+        );
         assert_eq!(batch.recent_samples, 35);
         assert_eq!(batch.actual_recent_samples, 35);
         assert_eq!(batch.full_window_samples, 65);
         assert_eq!(batch.samples.len(), 100);
-        let observed = batch
-            .samples
-            .iter()
-            .fold([0usize; 3], |mut counts, sample| {
-                counts[sample.meta.start_source.index()] += 1;
-                counts
-            });
-        assert_eq!(observed, [20, 50, 30]);
+        let observed_phases =
+            batch
+                .samples
+                .iter()
+                .fold([0usize; REPLAY_PHASE_COUNT], |mut counts, sample| {
+                    counts[replay_phase(sample.meta.ply)] += 1;
+                    counts
+                });
+        assert_eq!(observed_phases, [20, 50, 30, 0, 0]);
+        assert_eq!(batch.source_samples, [20, 50, 30]);
     }
 }

@@ -309,8 +309,9 @@ fn batched_attack_mask_matches_individual_queries() {
     let mut rng = 0xD1B54A32D192ED03u64;
     let mut position = Position::startpos();
     for ply in 0..1_000 {
+        let masks = position.attacked_squares_masks();
         for color in [Color::Red, Color::Black] {
-            let mask = position.attacked_squares_mask(color);
+            let mask = masks[color_index(color)];
             for square in 0..BOARD_SIZE {
                 assert_eq!(
                     mask & (1u128 << square) != 0,
