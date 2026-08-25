@@ -115,8 +115,8 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 400,
             selfplay_samples_per_update: 120000,
-            lr: 0.00004,
-            lr_min: 0.00002,
+            lr: 0.0004,
+            lr_min: 0.00012,
             lr_decay_start_update: 100,
             lr_decay_interval: 200,
             lr_decay_factor: 0.97,
@@ -529,9 +529,9 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 20\n"));
-        assert!(text.contains("lr = 0.00004\n"));
-        assert!(text.contains("lr_min = 0.00002\n"));
+        assert!(text.starts_with("format_version = 21\n"));
+        assert!(text.contains("lr = 0.0004\n"));
+        assert!(text.contains("lr_min = 0.00012\n"));
         assert!(text.contains("temperature_start = 2.0\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
@@ -638,7 +638,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.00004).abs() < 1e-9);
+        assert!((parsed.lr - 0.0004).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 10);
         assert_eq!(parsed.pikafish_label_eval_interval, 10);
     }
