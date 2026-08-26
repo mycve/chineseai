@@ -400,23 +400,6 @@ fn choose_opening_harvest_ply(rng: &mut SplitMix64, max_plies: usize) -> Option<
 
 fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> SelfplayStart {
     let roll = rng.unit_f32();
-    let hard_fraction = if config.hard_positions.is_empty() {
-        0.0
-    } else {
-        config.hard_start_fraction.clamp(0.0, 1.0)
-    };
-    if roll < hard_fraction {
-        let index = rng.next_u64() as usize % config.hard_positions.len();
-        let snapshot = &config.hard_positions[index];
-        return SelfplayStart {
-            position: configure_selfplay_rules(snapshot.position.clone(), config),
-            rule_history: snapshot.rule_history.clone(),
-            phase_ply: snapshot.phase_ply as usize,
-            opening_harvest_ply: None,
-            midgame_harvest_ply: None,
-            source: AzStartSource::Midgame,
-        };
-    }
     let configured_midgame_fraction = config.midgame_start_fraction.clamp(0.0, 1.0);
     let pool_empty = config.midgame_positions.is_empty();
     let midgame_fraction = if pool_empty {
@@ -424,7 +407,7 @@ fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> Selfpla
     } else {
         configured_midgame_fraction
     };
-    if roll < hard_fraction + midgame_fraction {
+    if roll < midgame_fraction {
         let index = rng.next_u64() as usize % config.midgame_positions.len();
         let snapshot = &config.midgame_positions[index];
         return SelfplayStart {
@@ -441,7 +424,7 @@ fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> Selfpla
     } else {
         config.opening_start_fraction.clamp(0.0, 1.0)
     };
-    if roll < hard_fraction + midgame_fraction + opening_fraction {
+    if roll < midgame_fraction + opening_fraction {
         let index = rng.next_u64() as usize % config.opening_positions.len();
         let snapshot = &config.opening_positions[index];
         return SelfplayStart {
@@ -765,16 +748,11 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 break;
             }
         }
-        let truncated = result.is_none();
-        if truncated {
+        if result.is_none() {
             terminal.max_plies += 1;
         }
 
         let result: f32 = result.unwrap_or(0.0);
-        let truncated_wdl = truncated.then(|| {
-            let legal = position.legal_moves_with_rules(&rule_history);
-            flip_wdl(model.evaluate_value_wdl_with_rules(&position, &rule_history, &legal))
-        });
         match result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => red_wins += 1,
             std::cmp::Ordering::Less => black_wins += 1,
@@ -787,8 +765,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             assign_td_lambda_value_targets(
                 &mut game_samples,
                 &game_bootstrap_wdls,
-                (!truncated).then_some(result),
-                truncated_wdl,
+                result,
                 config.value_td_lambda,
             );
         }
@@ -846,7 +823,6 @@ struct BatchedSelfplayGame {
     samples: Vec<AzTrainingSample>,
     bootstrap_wdls: Vec<[f32; 3]>,
     result: Option<f32>,
-    max_plies_truncated: bool,
     ply: usize,
     phase_ply: usize,
     opening_harvest_ply: Option<usize>,
@@ -877,7 +853,6 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         samples: Vec::new(),
         bootstrap_wdls: Vec::new(),
         result: None,
-        max_plies_truncated: false,
         ply: 0,
         phase_ply: start.phase_ply,
         opening_harvest_ply: start.opening_harvest_ply,
@@ -961,7 +936,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 }
                 if state.phase_ply >= config.max_plies {
                     state.result = Some(0.0);
-                    state.max_plies_truncated = true;
                     data.terminal.max_plies += 1;
                     continue;
                 }
@@ -1193,19 +1167,10 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             }
             data.plies_total += state.reported_plies;
             let mut game_samples = state.samples;
-            let truncated_wdl = state.max_plies_truncated.then(|| {
-                let legal = state.position.legal_moves_with_rules(&state.rule_history);
-                flip_wdl(model.evaluate_value_wdl_with_rules(
-                    &state.position,
-                    &state.rule_history,
-                    &legal,
-                ))
-            });
             assign_td_lambda_value_targets(
                 &mut game_samples,
                 &state.bootstrap_wdls,
-                (!state.max_plies_truncated).then_some(result),
-                truncated_wdl,
+                result,
                 config.value_td_lambda,
             );
             data.samples.extend(game_samples.iter().cloned());
@@ -1373,8 +1338,7 @@ fn move_search_meta(
 fn assign_td_lambda_value_targets(
     samples: &mut [AzTrainingSample],
     bootstrap_wdls: &[[f32; 3]],
-    game_result_red: Option<f32>,
-    truncated_wdl: Option<[f32; 3]>,
+    game_result_red: f32,
     td_lambda: f32,
 ) {
     assert_eq!(samples.len(), bootstrap_wdls.len());
@@ -1382,10 +1346,7 @@ fn assign_td_lambda_value_targets(
         return;
     };
     let lambda = td_lambda.clamp(0.0, 1.0);
-    let terminal = game_result_red.map_or_else(
-        || truncated_wdl.expect("truncated games require a final-position WDL"),
-        |result| scalar_value_to_wdl_target((result * last.side_sign).clamp(-1.0, 1.0)),
-    );
+    let terminal = scalar_value_to_wdl_target((game_result_red * last.side_sign).clamp(-1.0, 1.0));
     last.value_wdl = terminal;
     last.value = terminal[0] - terminal[2];
     let mut next_target = terminal;
@@ -1775,8 +1736,6 @@ mod tests {
             opening_start_fraction: 0.0,
             midgame_positions: Default::default(),
             midgame_start_fraction: 0.0,
-            hard_positions: Default::default(),
-            hard_start_fraction: 0.0,
             resign_percentage: 0.0,
             resign_playthrough: 100.0,
             mirror_probability: 0.0,
@@ -2031,13 +1990,7 @@ mod tests {
         samples[0].meta.root_q = -1.0;
         samples[1].meta.root_q = 1.0;
 
-        assign_td_lambda_value_targets(
-            &mut samples,
-            &[[0.2, 0.3, 0.5], [0.6, 0.2, 0.2]],
-            Some(1.0),
-            None,
-            1.0,
-        );
+        assign_td_lambda_value_targets(&mut samples, &[[0.2, 0.3, 0.5], [0.6, 0.2, 0.2]], 1.0, 1.0);
 
         assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(samples[0].value, 1.0);
@@ -2050,7 +2003,7 @@ mod tests {
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
         let bootstraps = [[0.4, 0.4, 0.2], [0.1, 0.6, 0.3], [0.6, 0.2, 0.2]];
 
-        assign_td_lambda_value_targets(&mut samples, &bootstraps, Some(1.0), None, 0.9);
+        assign_td_lambda_value_targets(&mut samples, &bootstraps, 1.0, 0.9);
 
         let expected = [[0.894, 0.078, 0.028], [0.02, 0.02, 0.96], [1.0, 0.0, 0.0]];
         for (sample, expected) in samples.iter().zip(expected) {
@@ -2059,39 +2012,6 @@ mod tests {
             }
             assert!((sample.value - (expected[0] - expected[2])).abs() < 1.0e-6);
         }
-    }
-
-    #[test]
-    fn hard_position_pool_is_sampled_at_its_configured_share() {
-        let mut config = selfplay_test_config(1);
-        let position =
-            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/4P4/P1P3P1P/1C5C1/9/RNBAKABNR b")
-                .unwrap();
-        config.hard_positions = vec![AzStartSnapshot {
-            rule_history: position.initial_rule_history(),
-            position,
-            phase_ply: 61,
-            generation: 0,
-        }]
-        .into();
-        config.hard_start_fraction = 1.0;
-
-        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1));
-        assert_eq!(start.phase_ply, 61);
-        assert_eq!(start.source, AzStartSource::Midgame);
-        assert_eq!(start.opening_harvest_ply, None);
-        assert_eq!(start.midgame_harvest_ply, None);
-    }
-
-    #[test]
-    fn max_ply_truncation_uses_final_position_wdl_instead_of_forcing_draw() {
-        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
-        let bootstraps = [[0.2, 0.3, 0.5], [0.7, 0.2, 0.1]];
-
-        assign_td_lambda_value_targets(&mut samples, &bootstraps, None, Some([0.7, 0.2, 0.1]), 1.0);
-
-        assert_eq!(samples[1].value_wdl, [0.7, 0.2, 0.1]);
-        assert_eq!(samples[0].value_wdl, [0.1, 0.2, 0.7]);
     }
 
     #[test]

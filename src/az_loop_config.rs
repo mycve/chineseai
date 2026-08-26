@@ -63,10 +63,6 @@ pub struct AzLoopFileConfig {
     pub midgame_start_fraction: f32,
     pub midgame_reservoir_capacity: usize,
     pub midgame_snapshot_path: String,
-    pub hard_position_sqlite: String,
-    pub hard_position_start_fraction: f32,
-    pub hard_position_limit: usize,
-    pub hard_position_min_regret_cp: i32,
     pub actor_publish_interval_updates: usize,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
@@ -160,10 +156,6 @@ impl Default for AzLoopFileConfig {
             midgame_start_fraction: 0.20,
             midgame_reservoir_capacity: 50_000,
             midgame_snapshot_path: "midgame-pool.lz4".into(),
-            hard_position_sqlite: "eval/regret-positions.sqlite".into(),
-            hard_position_start_fraction: 0.10,
-            hard_position_limit: 100_000,
-            hard_position_min_regret_cp: 40,
             actor_publish_interval_updates: 5,
             resign_percentage: 1.0,
             resign_playthrough: 20.0,
@@ -308,16 +300,6 @@ impl AzLoopFileConfig {
             self.midgame_reservoir_capacity
         );
         line!("midgame_snapshot_path", q(&self.midgame_snapshot_path));
-        line!("hard_position_sqlite", q(&self.hard_position_sqlite));
-        line!(
-            "hard_position_start_fraction",
-            f(self.hard_position_start_fraction)
-        );
-        line!("hard_position_limit", self.hard_position_limit);
-        line!(
-            "hard_position_min_regret_cp",
-            self.hard_position_min_regret_cp
-        );
         line!(
             "actor_publish_interval_updates",
             self.actor_publish_interval_updates
@@ -469,18 +451,12 @@ impl AzLoopFileConfig {
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.midgame_start_fraction = self.midgame_start_fraction.clamp(0.0, 1.0);
         self.opening_start_fraction = self.opening_start_fraction.clamp(0.0, 1.0);
-        self.hard_position_start_fraction = self.hard_position_start_fraction.clamp(0.0, 1.0);
-        self.hard_position_min_regret_cp = self.hard_position_min_regret_cp.max(0);
-        let start_fraction = 1.0
-            - self.opening_start_fraction
-            - self.midgame_start_fraction
-            - self.hard_position_start_fraction;
+        let start_fraction = 1.0 - self.opening_start_fraction - self.midgame_start_fraction;
         assert!(
             start_fraction >= -1.0e-6,
-            "opening_start_fraction ({}) + midgame_start_fraction ({}) + hard_position_start_fraction ({}) must not exceed 1; the remainder is the start-position share",
+            "opening_start_fraction ({}) + midgame_start_fraction ({}) must not exceed 1; the remainder is the start-position share",
             self.opening_start_fraction,
-            self.midgame_start_fraction,
-            self.hard_position_start_fraction
+            self.midgame_start_fraction
         );
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
@@ -589,10 +565,6 @@ mod tests {
         assert!(text.contains("midgame_start_fraction = 0.2\n"));
         assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
         assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
-        assert!(text.contains("hard_position_sqlite = \"eval/regret-positions.sqlite\"\n"));
-        assert!(text.contains("hard_position_start_fraction = 0.1\n"));
-        assert!(text.contains("hard_position_limit = 100000\n"));
-        assert!(text.contains("hard_position_min_regret_cp = 40\n"));
         assert!(text.contains("actor_publish_interval_updates = 5\n"));
         assert!(text.contains("resign_percentage = 1.0\n"));
         assert!(text.contains("resign_playthrough = 20.0\n"));

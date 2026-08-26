@@ -24,26 +24,6 @@ pub struct VsPikafishResult {
     pub chinese_win_by_pikafish_invalid_move: usize,
     pub chinese_win_by_pikafish_illegal_move: usize,
     pub abnormal_ends: Vec<VsPikafishAbnormalEnd>,
-    pub regret_positions: Vec<VsPikafishRegretPosition>,
-}
-
-#[derive(Clone, Debug)]
-pub struct VsPikafishRegretPosition {
-    pub game_index: usize,
-    pub ply: usize,
-    pub chinese_plays_red: bool,
-    pub fen: String,
-    pub model_move: String,
-    pub best_move: String,
-    pub before_score_cp: i32,
-    pub after_score_cp: i32,
-    pub regret_cp: i32,
-    pub model_q: f32,
-    pub model_prior_rank: usize,
-    pub model_visit_rank: usize,
-    pub depth: u32,
-    pub nodes: u64,
-    pub best_pv: String,
 }
 
 #[derive(Clone, Debug)]
@@ -73,11 +53,6 @@ pub struct VsPikafishConfig {
     pub fpu_value_at_root: f32,
     pub policy_softmax_temp: f32,
     pub report_games: bool,
-    /// Pikafish depth used to measure model move regret. Zero disables collection.
-    pub regret_depth: u32,
-    pub regret_min_cp: i32,
-    pub regret_max_abs_cp: i32,
-    pub regret_max_per_game: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,19 +90,6 @@ struct GameConfig {
     fpu_value: f32,
     fpu_value_at_root: f32,
     policy_softmax_temp: f32,
-    regret_depth: u32,
-    regret_min_cp: i32,
-    regret_max_abs_cp: i32,
-    regret_max_per_game: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct PikafishAnalysis {
-    bestmove: String,
-    score_cp: Option<i32>,
-    depth: u32,
-    nodes: u64,
-    pv: Vec<String>,
 }
 
 struct ExternalUci {
@@ -186,8 +148,6 @@ impl ExternalUci {
                 break;
             }
         }
-        self.write_line("setoption name Threads value 1")?;
-        self.write_line("setoption name Repetition Rule value ChineseRule")?;
         self.write_line("isready")?;
         loop {
             if self.read_line_into(&mut buf)? == 0 {
@@ -240,91 +200,10 @@ impl ExternalUci {
         self.read_bestmove_token()
     }
 
-    fn query_analysis(
-        &mut self,
-        initial_fen: Option<&str>,
-        moves_uci: &[String],
-        depth: u32,
-    ) -> std::io::Result<PikafishAnalysis> {
-        let mut pos_cmd = if let Some(fen) = initial_fen {
-            format!("position fen {fen}")
-        } else {
-            "position startpos".to_string()
-        };
-        if !moves_uci.is_empty() {
-            pos_cmd.push_str(" moves ");
-            pos_cmd.push_str(&moves_uci.join(" "));
-        }
-        self.write_line(&pos_cmd)?;
-        self.write_line(&format!("go depth {}", depth.max(1)))?;
-        let mut out = PikafishAnalysis::default();
-        let mut buf = String::new();
-        loop {
-            if self.read_line_into(&mut buf)? == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "pikafish: EOF before bestmove",
-                ));
-            }
-            let line = buf.trim();
-            if let Some(rest) = line.strip_prefix("bestmove ") {
-                out.bestmove = rest.split_whitespace().next().unwrap_or("").to_string();
-                return Ok(out);
-            }
-            if let Some(info) = parse_analysis_info(line) {
-                out.score_cp = info.score_cp;
-                out.depth = info.depth;
-                out.nodes = info.nodes;
-                out.pv = info.pv;
-            }
-        }
-    }
-
     fn quit(&mut self) {
         let _ = self.write_line("quit");
         let _ = self.child.wait();
     }
-}
-
-fn parse_analysis_info(line: &str) -> Option<PikafishAnalysis> {
-    if !line.starts_with("info ") || !line.contains(" pv ") {
-        return None;
-    }
-    let parts = line.split_whitespace().collect::<Vec<_>>();
-    let mut out = PikafishAnalysis::default();
-    let mut index = 0usize;
-    while index < parts.len() {
-        match parts[index] {
-            "depth" if index + 1 < parts.len() => {
-                out.depth = parts[index + 1].parse().ok()?;
-                index += 2;
-            }
-            "nodes" if index + 1 < parts.len() => {
-                out.nodes = parts[index + 1].parse().unwrap_or(0);
-                index += 2;
-            }
-            "score" if index + 2 < parts.len() => {
-                out.score_cp = match parts[index + 1] {
-                    "cp" => parts[index + 2].parse().ok(),
-                    "mate" => parts[index + 2]
-                        .parse::<i32>()
-                        .ok()
-                        .map(|mate| if mate > 0 { 100_000 } else { -100_000 }),
-                    _ => None,
-                };
-                index += 3;
-            }
-            "pv" => {
-                out.pv = parts[index + 1..]
-                    .iter()
-                    .map(|mv| (*mv).to_string())
-                    .collect();
-                break;
-            }
-            _ => index += 1,
-        }
-    }
-    out.score_cp.map(|_| out)
 }
 
 impl Drop for ExternalUci {
@@ -383,9 +262,8 @@ fn play_one_game(
     model: &AzNnue,
     external: &mut ExternalUci,
     initial_position: &Position,
-    game_index: usize,
     config: GameConfig,
-) -> std::io::Result<(GameEnd, String, String, Vec<VsPikafishRegretPosition>)> {
+) -> std::io::Result<(GameEnd, String, String)> {
     let _ = external.write_line("ucinewgame");
     let mut position = initial_position.clone();
     let initial_fen = (position != Position::startpos()).then(|| position.to_fen());
@@ -393,7 +271,6 @@ fn play_one_game(
     let mut moves_uci: Vec<String> = Vec::new();
     let mut ply_count = 0usize;
     let mut seed = config.seed;
-    let mut regrets = Vec::new();
 
     loop {
         if let Some(end) =
@@ -403,7 +280,6 @@ fn play_one_game(
                 end,
                 position.to_fen(),
                 position_command(initial_fen.as_deref(), &moves_uci),
-                regrets,
             ));
         }
 
@@ -413,16 +289,6 @@ fn play_one_game(
             || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let before_fen = position.to_fen();
-            let before = if config.regret_depth > 0 && regrets.len() < config.regret_max_per_game {
-                Some(external.query_analysis(
-                    initial_fen.as_deref(),
-                    &moves_uci,
-                    config.regret_depth,
-                )?)
-            } else {
-                None
-            };
             let search = alphazero_search_with_rules(
                 &position,
                 Some(rule_history.clone()),
@@ -456,65 +322,11 @@ fn play_one_game(
                     },
                     position.to_fen(),
                     position_command(initial_fen.as_deref(), &moves_uci),
-                    regrets,
                 ));
             };
             let uci = mv.to_string();
-            let model_q = search
-                .candidates
-                .iter()
-                .find(|candidate| candidate.mv == mv)
-                .map(|candidate| candidate.q)
-                .unwrap_or(search.value_q);
-            let model_visit_rank = search
-                .candidates
-                .iter()
-                .position(|candidate| candidate.mv == mv)
-                .map_or(0, |rank| rank + 1);
-            let mut prior_order = search.candidates.iter().collect::<Vec<_>>();
-            prior_order.sort_by(|a, b| b.raw_prior.total_cmp(&a.raw_prior));
-            let model_prior_rank = prior_order
-                .iter()
-                .position(|candidate| candidate.mv == mv)
-                .map_or(0, |rank| rank + 1);
             apply_move_recorded(&mut position, &mut rule_history, mv);
-            moves_uci.push(uci.clone());
-            if let Some(before) = before
-                && regrets.len() < config.regret_max_per_game
-                && before.bestmove != uci
-                && let Some(before_cp) = before.score_cp
-            {
-                let after = external.query_analysis(
-                    initial_fen.as_deref(),
-                    &moves_uci,
-                    config.regret_depth,
-                )?;
-                if let Some(after_side_cp) = after.score_cp {
-                    let after_cp = -after_side_cp;
-                    let regret_cp = before_cp.saturating_sub(after_cp);
-                    if regret_cp >= config.regret_min_cp
-                        && before_cp.abs() <= config.regret_max_abs_cp
-                    {
-                        regrets.push(VsPikafishRegretPosition {
-                            game_index,
-                            ply: ply_count,
-                            chinese_plays_red: config.chinese_plays_red,
-                            fen: before_fen,
-                            model_move: uci,
-                            best_move: before.bestmove,
-                            before_score_cp: before_cp,
-                            after_score_cp: after_cp,
-                            regret_cp,
-                            model_q,
-                            model_prior_rank,
-                            model_visit_rank,
-                            depth: before.depth,
-                            nodes: before.nodes,
-                            best_pv: before.pv.join(" "),
-                        });
-                    }
-                }
-            }
+            moves_uci.push(uci);
         } else {
             let token =
                 external.query_move(initial_fen.as_deref(), &moves_uci, config.pikafish_depth)?;
@@ -526,7 +338,6 @@ fn play_one_game(
                     },
                     position.to_fen(),
                     position_command(initial_fen.as_deref(), &moves_uci),
-                    regrets,
                 ));
             }
             let Some(mv) = position.parse_uci_move(&token) else {
@@ -537,7 +348,6 @@ fn play_one_game(
                     },
                     position.to_fen(),
                     position_command(initial_fen.as_deref(), &moves_uci),
-                    regrets,
                 ));
             };
             if !legal.contains(&mv) {
@@ -548,7 +358,6 @@ fn play_one_game(
                     },
                     position.to_fen(),
                     position_command(initial_fen.as_deref(), &moves_uci),
-                    regrets,
                 ));
             }
             apply_move_recorded(&mut position, &mut rule_history, mv);
@@ -590,7 +399,7 @@ pub fn run_vs_pikafish(
         let m = Arc::clone(&model);
         let positions = Arc::clone(&start_positions);
         handles.push(thread::spawn(
-            move || -> std::io::Result<Vec<(usize, bool, GameEnd, String, String, Vec<VsPikafishRegretPosition>)>> {
+            move || -> std::io::Result<Vec<(usize, bool, GameEnd, String, String)>> {
                 let mut ext = ExternalUci::spawn(&exe)?;
                 ext.handshake()?;
                 let mut games = Vec::new();
@@ -600,11 +409,10 @@ pub fn run_vs_pikafish(
                         .get((game_index / 2) % positions.len().max(1))
                         .cloned()
                         .unwrap_or_else(Position::startpos);
-                    let (end, final_fen, position_command, regrets) = play_one_game(
+                    let (end, final_fen, position_command) = play_one_game(
                         m.as_ref(),
                         &mut ext,
                         &start_position,
-                        game_index,
                         GameConfig {
                             chinese_plays_red: chinese_red,
                             pikafish_depth: config.pikafish_depth,
@@ -621,13 +429,9 @@ pub fn run_vs_pikafish(
                             fpu_value: config.fpu_value,
                             fpu_value_at_root: config.fpu_value_at_root,
                             policy_softmax_temp: config.policy_softmax_temp,
-                            regret_depth: config.regret_depth,
-                            regret_min_cp: config.regret_min_cp,
-                            regret_max_abs_cp: config.regret_max_abs_cp,
-                            regret_max_per_game: config.regret_max_per_game,
                         },
                     )?;
-                    games.push((game_index, chinese_red, end, final_fen, position_command, regrets));
+                    games.push((game_index, chinese_red, end, final_fen, position_command));
                 }
                 Ok(games)
             },
@@ -637,8 +441,7 @@ pub fn run_vs_pikafish(
         let worker_games = handle
             .join()
             .map_err(|_| std::io::Error::other("vs-pikafish: worker thread panicked"))??;
-        for (game_index, chinese_red, end, final_fen, position_command, regrets) in worker_games {
-            out.regret_positions.extend(regrets);
+        for (game_index, chinese_red, end, final_fen, position_command) in worker_games {
             if config.report_games || should_report_final_position(end.reason()) {
                 out.abnormal_ends.push(VsPikafishAbnormalEnd {
                     game_index,
@@ -666,8 +469,6 @@ pub fn run_vs_pikafish(
         }
     }
     out.abnormal_ends.sort_by_key(|item| item.game_index);
-    out.regret_positions
-        .sort_by_key(|item| (item.game_index, item.ply));
 
     Ok(out)
 }

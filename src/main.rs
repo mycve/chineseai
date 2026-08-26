@@ -12,15 +12,15 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
-        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzStartSnapshot, AzTrainLossWeights,
-        AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, alphazero_search,
-        alphazero_search_trace_with_rules, alphazero_search_with_rules, benchmark_training,
-        dense_move_index, evaluate_policy_groups, generate_selfplay_data,
-        play_arena_games_from_positions, train_samples_weighted, train_samples_weighted_owned,
+        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
+        DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
+        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
+        generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
+        train_samples_weighted_owned,
     },
     nnue::{canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
-    pikafish_match::{VsPikafishConfig, VsPikafishRegretPosition, run_vs_pikafish},
+    pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     xiangqi::{Move, Position, RuleOutcome},
 };
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -384,24 +384,6 @@ struct VsPikafishArgs {
     /// Print the final FEN and complete move list for every game.
     #[arg(long)]
     report_games: bool,
-    /// SQLite file receiving positions immediately before model mistakes. Empty disables it.
-    #[arg(long, default_value = "")]
-    regret_sqlite: String,
-    /// Pikafish depth used to compare the position before and after each model move.
-    #[arg(long, default_value_t = 16)]
-    regret_depth: u32,
-    /// Minimum centipawn loss required for a position to be stored.
-    #[arg(long, default_value_t = 40)]
-    regret_min_cp: i32,
-    /// Ignore already decided positions beyond this absolute Pikafish score.
-    #[arg(long, default_value_t = 500)]
-    regret_max_abs_cp: i32,
-    /// Maximum stored mistakes collected from one game.
-    #[arg(long, default_value_t = 32)]
-    regret_max_per_game: usize,
-    /// Maximum rows retained in the regret SQLite database.
-    #[arg(long, default_value_t = 1_000_000)]
-    regret_capacity: usize,
     /// OBK opening book used to generate random start positions. Empty uses startpos.
     #[arg(long, default_value = "opening.obk")]
     opening_book: String,
@@ -1040,8 +1022,6 @@ fn build_az_loop_config(
         opening_start_fraction: config.opening_start_fraction,
         midgame_positions: Arc::default(),
         midgame_start_fraction: config.midgame_start_fraction,
-        hard_positions: Arc::default(),
-        hard_start_fraction: config.hard_position_start_fraction,
         resign_percentage: config.resign_percentage,
         resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
@@ -2243,35 +2223,6 @@ fn main() {
                 midgame_snapshot_path.display()
             );
             let shared_midgame_pool = Arc::new(RwLock::new(midgame_pool));
-            let hard_positions: Arc<[AzStartSnapshot]> =
-                if config.hard_position_sqlite.trim().is_empty() {
-                    Arc::default()
-                } else {
-                    load_regret_start_positions(
-                        Path::new(&config.hard_position_sqlite),
-                        config.hard_position_limit,
-                        config.hard_position_min_regret_cp,
-                        config.seed ^ start_update as u64,
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "failed to load hard-position SQLite `{}`: {err}",
-                            config.hard_position_sqlite
-                        )
-                    })
-                    .into()
-                };
-            println!(
-                "hardpos  : loaded {} starts from `{}` (fraction={} min_regret_cp={})",
-                hard_positions.len(),
-                if config.hard_position_sqlite.trim().is_empty() {
-                    "(disabled)"
-                } else {
-                    config.hard_position_sqlite.as_str()
-                },
-                config.hard_position_start_fraction,
-                config.hard_position_min_regret_cp,
-            );
             let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
                 * config.train_epochs_per_update as f32)
                 / config.selfplay_samples_per_update.max(1) as f32;
@@ -2466,7 +2417,6 @@ fn main() {
                 let selfplay_pause = Arc::clone(&selfplay_pause);
                 let selfplay_opening_pool = Arc::clone(&shared_opening_pool);
                 let selfplay_midgame_pool = Arc::clone(&shared_midgame_pool);
-                let selfplay_hard_positions = Arc::clone(&hard_positions);
                 selfplay_handles.push(thread::spawn(move || {
                     if let Err(err) = chineseai::cpu_topology::pin_current_thread(placement.cpu) {
                         eprintln!(
@@ -2526,7 +2476,6 @@ fn main() {
                             .unwrap_or_else(|_| panic!("midgame pool poisoned"))
                             .sample(loop_config.games, &mut pool_rng)
                             .into();
-                        loop_config.hard_positions = Arc::clone(&selfplay_hard_positions);
                         let data = generate_selfplay_data(
                             local_model
                                 .as_deref()
@@ -4015,7 +3964,6 @@ fn main() {
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
-            let collect_regret = !cmd.regret_sqlite.trim().is_empty();
             let (opening_plies_min, opening_plies_max) =
                 if cmd.opening_plies_min <= cmd.opening_plies_max {
                     (cmd.opening_plies_min, cmd.opening_plies_max)
@@ -4074,28 +4022,9 @@ fn main() {
                     fpu_value_at_root,
                     policy_softmax_temp,
                     report_games: cmd.report_games,
-                    regret_depth: if collect_regret {
-                        cmd.regret_depth.max(1)
-                    } else {
-                        0
-                    },
-                    regret_min_cp: cmd.regret_min_cp.max(0),
-                    regret_max_abs_cp: cmd.regret_max_abs_cp.max(0),
-                    regret_max_per_game: cmd.regret_max_per_game,
                 },
             )
             .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
-            let regret_rows = if collect_regret {
-                save_regret_positions(
-                    Path::new(&cmd.regret_sqlite),
-                    &model_path,
-                    &summary.regret_positions,
-                    cmd.regret_capacity.max(1),
-                )
-                .unwrap_or_else(|err| panic!("failed to save regret positions: {err}"))
-            } else {
-                0
-            };
             for item in &summary.abnormal_ends {
                 println!(
                     "vs-pikafish-final: game={} chinese={} end={} final_fen=\"{}\" {}",
@@ -4141,18 +4070,6 @@ fn main() {
                 fpu_value_at_root,
                 policy_softmax_temp
             );
-            if collect_regret {
-                println!(
-                    "regret-db : sqlite={} collected={} retained={} depth={} min_cp={} max_abs_cp={} capacity={}",
-                    cmd.regret_sqlite,
-                    summary.regret_positions.len(),
-                    regret_rows,
-                    cmd.regret_depth.max(1),
-                    cmd.regret_min_cp.max(0),
-                    cmd.regret_max_abs_cp.max(0),
-                    cmd.regret_capacity.max(1),
-                );
-            }
         }
         Some(CliCommand::PikafishLabelRandom(cmd)) => {
             run_pikafish_label_random(cmd)
@@ -5478,165 +5395,6 @@ fn run_pikafish_export_torch(cmd: PikafishExportTorchArgs) -> io::Result<()> {
         output.display()
     );
     Ok(())
-}
-
-fn save_regret_positions(
-    path: &Path,
-    model_path: &str,
-    rows: &[VsPikafishRegretPosition],
-    capacity: usize,
-) -> io::Result<usize> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut db = Connection::open(path).map_err(sqlite_io_error)?;
-    db.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         CREATE TABLE IF NOT EXISTS regret_positions (
-             id INTEGER PRIMARY KEY,
-             position_hash INTEGER NOT NULL,
-             fen TEXT NOT NULL UNIQUE,
-             game_index INTEGER NOT NULL,
-             ply INTEGER NOT NULL,
-             chinese_plays_red INTEGER NOT NULL,
-             model_checkpoint TEXT NOT NULL,
-             model_move TEXT NOT NULL,
-             best_move TEXT NOT NULL,
-             before_score_cp INTEGER NOT NULL,
-             after_score_cp INTEGER NOT NULL,
-             regret_cp INTEGER NOT NULL,
-             model_q REAL NOT NULL,
-             model_prior_rank INTEGER NOT NULL,
-             model_visit_rank INTEGER NOT NULL,
-             depth INTEGER NOT NULL,
-             nodes INTEGER NOT NULL,
-             best_pv TEXT NOT NULL,
-             phase_bucket INTEGER NOT NULL,
-             seen_count INTEGER NOT NULL DEFAULT 1,
-             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-         );
-         CREATE INDEX IF NOT EXISTS regret_positions_regret ON regret_positions(regret_cp DESC);
-         CREATE INDEX IF NOT EXISTS regret_positions_phase ON regret_positions(phase_bucket, regret_cp DESC);",
-    )
-    .map_err(sqlite_io_error)?;
-    let tx = db.transaction().map_err(sqlite_io_error)?;
-    {
-        let mut insert = tx.prepare_cached(
-            "INSERT INTO regret_positions (
-                 position_hash,fen,game_index,ply,chinese_plays_red,model_checkpoint,
-                 model_move,best_move,before_score_cp,after_score_cp,regret_cp,model_q,
-                 model_prior_rank,model_visit_rank,depth,nodes,best_pv,phase_bucket
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-             ON CONFLICT(fen) DO UPDATE SET
-                 seen_count=regret_positions.seen_count+1,
-                 updated_at=unixepoch(),
-                 model_checkpoint=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.model_checkpoint ELSE regret_positions.model_checkpoint END,
-                 model_move=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.model_move ELSE regret_positions.model_move END,
-                 best_move=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.best_move ELSE regret_positions.best_move END,
-                 before_score_cp=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.before_score_cp ELSE regret_positions.before_score_cp END,
-                 after_score_cp=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.after_score_cp ELSE regret_positions.after_score_cp END,
-                 regret_cp=MAX(regret_positions.regret_cp,excluded.regret_cp),
-                 model_q=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.model_q ELSE regret_positions.model_q END,
-                 model_prior_rank=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.model_prior_rank ELSE regret_positions.model_prior_rank END,
-                 model_visit_rank=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.model_visit_rank ELSE regret_positions.model_visit_rank END,
-                 depth=MAX(regret_positions.depth,excluded.depth),
-                 nodes=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.nodes ELSE regret_positions.nodes END,
-                 best_pv=CASE WHEN excluded.regret_cp > regret_positions.regret_cp THEN excluded.best_pv ELSE regret_positions.best_pv END",
-        ).map_err(sqlite_io_error)?;
-        for row in rows {
-            let position = Position::from_fen(&row.fen)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            let phase_bucket = if row.ply < 40 {
-                0
-            } else if row.ply < 120 {
-                1
-            } else {
-                2
-            };
-            insert
-                .execute(params![
-                    position.hash() as i64,
-                    row.fen,
-                    row.game_index as i64,
-                    row.ply as i64,
-                    row.chinese_plays_red,
-                    model_path,
-                    row.model_move,
-                    row.best_move,
-                    row.before_score_cp,
-                    row.after_score_cp,
-                    row.regret_cp,
-                    row.model_q,
-                    row.model_prior_rank as i64,
-                    row.model_visit_rank as i64,
-                    row.depth,
-                    row.nodes as i64,
-                    row.best_pv,
-                    phase_bucket,
-                ])
-                .map_err(sqlite_io_error)?;
-        }
-    }
-    let count = tx
-        .query_row("SELECT COUNT(*) FROM regret_positions", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(sqlite_io_error)? as usize;
-    if count > capacity {
-        tx.execute(
-            "DELETE FROM regret_positions WHERE id IN (
-                 SELECT id FROM regret_positions ORDER BY regret_cp ASC,seen_count ASC,updated_at ASC LIMIT ?1
-             )",
-            [count.saturating_sub(capacity) as i64],
-        ).map_err(sqlite_io_error)?;
-    }
-    tx.commit().map_err(sqlite_io_error)?;
-    Ok(count.min(capacity))
-}
-
-fn load_regret_start_positions(
-    path: &Path,
-    limit: usize,
-    min_regret_cp: i32,
-    seed: u64,
-) -> io::Result<Vec<AzStartSnapshot>> {
-    if limit == 0 || !path.exists() {
-        return Ok(Vec::new());
-    }
-    let db = Connection::open(path).map_err(sqlite_io_error)?;
-    let mut query = db
-        .prepare(
-            "SELECT fen,ply FROM regret_positions WHERE regret_cp >= ?1
-         ORDER BY ((id * 1103515245 + ?2) % 2147483647) LIMIT ?3",
-        )
-        .map_err(sqlite_io_error)?;
-    let rows = query
-        .query_map(
-            params![
-                min_regret_cp.max(0),
-                (seed % 2_147_483_647) as i64,
-                limit as i64
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u16>(1)?)),
-        )
-        .map_err(sqlite_io_error)?;
-    let mut snapshots = Vec::with_capacity(limit);
-    for row in rows {
-        let (fen, phase_ply) = row.map_err(sqlite_io_error)?;
-        let position = Position::from_fen(&fen)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        snapshots.push(AzStartSnapshot {
-            rule_history: position.initial_rule_history(),
-            position,
-            phase_ply,
-            generation: 0,
-        });
-    }
-    Ok(snapshots)
 }
 
 fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
