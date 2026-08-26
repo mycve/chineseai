@@ -980,6 +980,8 @@ pub struct AzLoopConfig {
     pub opening_start_fraction: f32,
     pub midgame_positions: Arc<[AzStartSnapshot]>,
     pub midgame_start_fraction: f32,
+    pub hard_positions: Arc<[AzStartSnapshot]>,
+    pub hard_start_fraction: f32,
     pub resign_percentage: f32,
     pub resign_playthrough: f32,
     pub mirror_probability: f32,
@@ -1591,6 +1593,22 @@ impl AzNnue {
             &mut scratch,
         )
         .value
+    }
+
+    pub fn evaluate_value_wdl_with_rules(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        moves: &[Move],
+    ) -> [f32; WDL_HEAD_SIZE] {
+        let mut scratch = AzEvalScratch::new(self.arch);
+        self.evaluate_with_scratch_output(
+            position,
+            moves,
+            &rule_context_features(position, history),
+            &mut scratch,
+        )
+        .value_wdl
     }
 
     pub(super) fn evaluate_with_scratch(
