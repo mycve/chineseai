@@ -326,7 +326,7 @@ fn value_threat_features(sample: &AzTrainingSample) -> Vec<u32> {
         .collect::<Vec<_>>();
     let position = Position::from_canonical_piece_squares(&pieces);
     let mut features = Vec::with_capacity(32);
-    position.visit_occupied_attacks(|source, attacker, target, attacked| {
+    position.visit_occupied_relations(|source, attacker, target, attacked| {
         let feature = value_threat_index(Color::Red, source, attacker, target, attacked);
         if feature != VALUE_THREAT_VOCAB {
             features.push(feature as u32);

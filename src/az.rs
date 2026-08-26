@@ -2132,7 +2132,7 @@ impl AzNnue {
         let perspective = position.side_to_move();
         {
             crate::scope_profile!("az.eval.value_threat.accumulate");
-            position.visit_occupied_attacks(|source, attacker, target, attacked| {
+            position.visit_occupied_relations(|source, attacker, target, attacked| {
                 let feature = value_threat_index(perspective, source, attacker, target, attacked);
                 if feature == VALUE_THREAT_VOCAB {
                     return;

@@ -176,6 +176,23 @@ fn cannon_requires_exactly_one_screen_to_capture() {
 }
 
 #[test]
+fn network_relations_include_cannon_screen_and_target() {
+    let position = Position::from_canonical_piece_squares(&[
+        (5, 40),  // red cannon
+        (6, 41),  // red soldier used as screen
+        (11, 43), // black rook behind the screen
+    ]);
+    let mut targets = Vec::new();
+    position.visit_occupied_relations(|source, attacker, target, _| {
+        if source == 40 && attacker.kind == PieceKind::Cannon {
+            targets.push(target);
+        }
+    });
+    targets.sort_unstable();
+    assert_eq!(targets, vec![41, 43]);
+}
+
+#[test]
 fn facing_generals_exposure_is_illegal() {
     let position = Position::from_fen("4k4/9/9/9/9/9/4R4/9/9/4K4 w").unwrap();
     let moves = position.legal_moves();

@@ -283,14 +283,21 @@ impl Position {
         self.board[sq]
     }
 
-    pub(crate) fn visit_occupied_attacks(
+    /// Visit occupied piece relations used by the network's relation head.
+    ///
+    /// For a cannon the first occupied square is emitted as its screen and the
+    /// second as its capture target.  This gives the network the missing
+    /// cannon-screen relation without another board scan.  Slider rays use the
+    /// position occupancy bitboard, so they jump directly between blockers.
+    pub(crate) fn visit_occupied_relations(
         &self,
         mut visitor: impl FnMut(usize, Piece, usize, Piece),
     ) {
-        for source in 0..BOARD_SIZE {
-            let Some(piece) = self.board[source] else {
-                continue;
-            };
+        let mut pieces = self.occupied;
+        while pieces != 0 {
+            let source = pieces.trailing_zeros() as usize;
+            pieces &= pieces - 1;
+            let piece = self.board[source].expect("occupancy and board must agree");
             let file = file_of(source) as i32;
             let rank = rank_of(source) as i32;
             let mut visit_step = |df: i32, dr: i32| {
@@ -359,21 +366,30 @@ impl Position {
                     }
                 }
                 PieceKind::Rook | PieceKind::Cannon => {
-                    for (df, dr) in ORTHOGONAL_STEPS {
-                        let mut target_file = file + df;
-                        let mut target_rank = rank + dr;
-                        let mut occupied = 0;
-                        while inside_board(target_file, target_rank) {
-                            let target = index(target_file as usize, target_rank as usize);
-                            if let Some(attacked) = self.board[target] {
-                                occupied += 1;
-                                if piece.kind == PieceKind::Rook || occupied == 2 {
-                                    visitor(source, piece, target, attacked);
-                                    break;
-                                }
+                    for direction in 0..4 {
+                        let increasing = direction == 0 || direction == 2;
+                        let blockers = orthogonal_ray_masks()[source][direction] & self.occupied;
+                        if blockers == 0 {
+                            continue;
+                        }
+                        let first = nearest_on_ray(blockers, increasing);
+                        visitor(
+                            source,
+                            piece,
+                            first,
+                            self.board[first].expect("blocker must be occupied"),
+                        );
+                        if piece.kind == PieceKind::Cannon {
+                            let remaining = blockers & !(1u128 << first);
+                            if remaining != 0 {
+                                let second = nearest_on_ray(remaining, increasing);
+                                visitor(
+                                    source,
+                                    piece,
+                                    second,
+                                    self.board[second].expect("blocker must be occupied"),
+                                );
                             }
-                            target_file += df;
-                            target_rank += dr;
                         }
                     }
                 }
