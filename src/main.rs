@@ -641,8 +641,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tvc{}_tvo{}_tdl{}_op{}_rs{}_rp{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_pef{}_pet{}_pera{}_peref{}_sd{}"
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tdl{}_op{}_rc{}_",
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -668,16 +668,12 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.temperature_endgame),
         config.temperature_decay_delay_plies,
         config.temperature_decay_plies,
-        f32_slug(config.temperature_value_cutoff),
-        f32_slug(config.temperature_visit_offset),
         f32_slug(config.value_td_lambda),
         format!(
             "{}x{}",
             f32_slug(config.opening_start_fraction),
             config.opening_reservoir_capacity
         ),
-        f32_slug(config.resign_percentage),
-        f32_slug(config.resign_playthrough),
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
@@ -690,10 +686,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_policy_softmax_temp),
         f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
-        f32_slug(config.persistent_exploration_fraction),
-        f32_slug(config.persistent_exploration_temperature),
-        f32_slug(config.persistent_exploration_root_dirichlet_alpha),
-        f32_slug(config.persistent_exploration_root_exploration_fraction),
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -995,16 +987,8 @@ fn build_az_loop_config(
         generation_update,
         temperature_start: config.temperature_start,
         temperature_endgame: config.temperature_endgame,
-        persistent_exploration_fraction: config.persistent_exploration_fraction,
-        persistent_exploration_temperature: config.persistent_exploration_temperature,
-        persistent_exploration_root_dirichlet_alpha: config
-            .persistent_exploration_root_dirichlet_alpha,
-        persistent_exploration_root_exploration_fraction: config
-            .persistent_exploration_root_exploration_fraction,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
-        temperature_value_cutoff: config.temperature_value_cutoff,
-        temperature_visit_offset: config.temperature_visit_offset,
         cpuct: config.cpuct,
         cpuct_at_root: config.cpuct_at_root,
         cpuct_base: config.cpuct_base,
@@ -1022,8 +1006,6 @@ fn build_az_loop_config(
         opening_start_fraction: config.opening_start_fraction,
         midgame_positions: Arc::default(),
         midgame_start_fraction: config.midgame_start_fraction,
-        resign_percentage: config.resign_percentage,
-        resign_playthrough: config.resign_playthrough,
         mirror_probability: config.mirror_probability,
         record_fens: false,
     }
@@ -1172,8 +1154,6 @@ fn build_async_training_report(
         terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
-        terminal_resign_red: pending.selfplay.terminal.resign_red,
-        terminal_resign_black: pending.selfplay.terminal.resign_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
     }
 }
@@ -2252,7 +2232,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply,value_cutoff={},visit_offset={}) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} resign(percentage={},playthrough={}) replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2277,8 +2257,6 @@ fn main() {
                 config.temperature_endgame,
                 config.temperature_decay_delay_plies,
                 config.temperature_decay_plies,
-                config.temperature_value_cutoff,
-                config.temperature_visit_offset,
                 config.cpuct,
                 config.cpuct_at_root,
                 config.fpu_value,
@@ -2288,8 +2266,6 @@ fn main() {
                 config.root_exploration_fraction,
                 config.opening_snapshot_path,
                 config.opening_reservoir_capacity,
-                config.resign_percentage,
-                config.resign_playthrough,
                 config.replay_capacity,
                 config.mirror_probability,
                 config.train_value_weight,
@@ -2330,13 +2306,9 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(alpha={},fraction={}) persistent_actor={:.1}% actor_root_noise(alpha={},fraction={}) actor_move_temp={} move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
+                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
                 config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
-                config.persistent_exploration_fraction * 100.0,
-                config.persistent_exploration_root_dirichlet_alpha,
-                config.persistent_exploration_root_exploration_fraction,
-                config.persistent_exploration_temperature,
                 config.temperature_start,
                 config.temperature_endgame,
                 config.policy_softmax_temp,
@@ -2747,8 +2719,6 @@ fn main() {
                                         terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
-                                        terminal_resign_red: 0,
-                                        terminal_resign_black: 0,
                                         terminal_max_plies: 0,
                                         ..AzLoopReport::default()
                                     },
@@ -2820,8 +2790,6 @@ fn main() {
                                         terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
-                                        terminal_resign_red: 0,
-                                        terminal_resign_black: 0,
                                         terminal_max_plies: 0,
                                         ..AzLoopReport::default()
                                     },
@@ -3351,18 +3319,6 @@ fn main() {
                     "terminal/rule_win_black",
                     update,
                     report.terminal_rule_win_black as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/resign_red",
-                    update,
-                    report.terminal_resign_red as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/resign_black",
-                    update,
-                    report.terminal_resign_black as f32,
                 );
                 log_scalar(
                     &mut tb,

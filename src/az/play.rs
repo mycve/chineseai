@@ -31,8 +31,6 @@ pub struct AzTerminalStats {
     pub rule_draw_mutual_long_chase: usize,
     pub rule_win_red: usize,
     pub rule_win_black: usize,
-    pub resign_red: usize,
-    pub resign_black: usize,
     pub max_plies: usize,
 }
 
@@ -62,8 +60,6 @@ impl AzTerminalStats {
         self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
         self.rule_win_red += other.rule_win_red;
         self.rule_win_black += other.rule_win_black;
-        self.resign_red += other.resign_red;
-        self.resign_black += other.resign_black;
         self.max_plies += other.max_plies;
     }
 }
@@ -320,12 +316,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
-fn selfplay_search_limits(
-    config: &AzLoopConfig,
-    _ply: usize,
-    seed: u64,
-    exploration_actor: bool,
-) -> AzSearchLimits {
+fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
     AzSearchLimits {
         simulations: config.simulations.max(1),
         seed,
@@ -336,16 +327,8 @@ fn selfplay_search_limits(
         cpuct_base_at_root: config.cpuct_base_at_root,
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         max_depth: 0,
-        root_dirichlet_alpha: if exploration_actor {
-            config.persistent_exploration_root_dirichlet_alpha
-        } else {
-            config.root_dirichlet_alpha
-        },
-        root_exploration_fraction: if exploration_actor {
-            config.persistent_exploration_root_exploration_fraction
-        } else {
-            config.root_exploration_fraction
-        },
+        root_dirichlet_alpha: config.root_dirichlet_alpha,
+        root_exploration_fraction: config.root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         policy_softmax_temp: config.policy_softmax_temp,
@@ -513,14 +496,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         let mut game_bootstrap_wdls = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
-        let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
-        let exploration_actor =
-            rng.unit_f32() < config.persistent_exploration_fraction.clamp(0.0, 1.0);
-        let endgame_temperature = if exploration_actor {
-            config.persistent_exploration_temperature
-        } else {
-            config.temperature_endgame
-        };
 
         for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
             let ply = start_phase_ply + local_ply;
@@ -566,7 +541,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 config,
                 ply,
                 rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
-                exploration_actor,
             );
             let search = {
                 crate::scope_profile!("az.selfplay.search");
@@ -607,49 +581,13 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 entropy_mid_sum += entropy;
                 entropy_mid_count += 1;
             }
-            if allow_resign && should_resign(search.value_q, config) {
-                let mut meta = root_search_meta(
-                    &search.candidates,
-                    search.value_q,
-                    config.generation_update,
-                    config.seed ^ game_index as u64,
-                    ply,
-                );
-                meta.start_source = start_source;
-                let sample = make_training_sample(
-                    &position,
-                    &rule_history,
-                    &search.candidates,
-                    search.value_q,
-                    rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-                    meta,
-                    search_simulation_count,
-                    1.0,
-                );
-                game_samples.push(sample);
-                game_bootstrap_wdls.push(search.network_value_wdl);
-                result = Some(if position.side_to_move() == Color::Red {
-                    terminal.resign_red += 1;
-                    -1.0
-                } else {
-                    terminal.resign_black += 1;
-                    1.0
-                });
-                break;
-            }
-            let temperature = temperature_for_ply(config, ply, endgame_temperature);
+            let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
-                search.best_move.or_else(|| {
-                    choose_selfplay_move(&search.candidates, temperature, 0.0, 0.0, &mut rng)
-                })
+                search
+                    .best_move
+                    .or_else(|| choose_selfplay_move(&search.candidates, temperature, &mut rng))
             } else {
-                choose_selfplay_move(
-                    &search.candidates,
-                    temperature,
-                    config.temperature_value_cutoff,
-                    config.temperature_visit_offset,
-                    &mut rng,
-                )
+                choose_selfplay_move(&search.candidates, temperature, &mut rng)
             };
             let Some(mv) = mv_opt else {
                 result = Some(0.0);
@@ -828,9 +766,6 @@ struct BatchedSelfplayGame {
     opening_harvest_ply: Option<usize>,
     midgame_harvest_ply: Option<usize>,
     reported_plies: usize,
-    allow_resign: bool,
-    endgame_temperature: f32,
-    exploration_actor: bool,
     start_source: AzStartSource,
     rng: SplitMix64,
 }
@@ -839,13 +774,6 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
     let mut rng =
         SplitMix64::new(config.seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let start = choose_selfplay_start(config, &mut rng);
-    let allow_resign = rng.unit_f32() * 100.0 >= config.resign_playthrough;
-    let exploration_actor = rng.unit_f32() < config.persistent_exploration_fraction.clamp(0.0, 1.0);
-    let endgame_temperature = if exploration_actor {
-        config.persistent_exploration_temperature
-    } else {
-        config.temperature_endgame
-    };
     BatchedSelfplayGame {
         game_index,
         position: start.position,
@@ -858,9 +786,6 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         opening_harvest_ply: start.opening_harvest_ply,
         midgame_harvest_ply: start.midgame_harvest_ply,
         reported_plies: 0,
-        allow_resign,
-        endgame_temperature,
-        exploration_actor,
         start_source: start.source,
         rng,
     }
@@ -905,7 +830,7 @@ fn inactive_batch_input(config: &AzLoopConfig) -> AzBatchSearchInput {
     let position = configure_selfplay_rules(Position::startpos(), config);
     let rule_history = position.initial_rule_history();
     let root_moves = position.legal_moves();
-    let mut limits = selfplay_search_limits(config, 0, 0, false);
+    let mut limits = selfplay_search_limits(config, 0, 0);
     limits.simulations = 0;
     AzBatchSearchInput {
         position,
@@ -990,12 +915,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     position: state.position.clone(),
                     rule_history: state.rule_history.clone(),
                     root_moves: std::mem::take(&mut legal_moves[index]),
-                    limits: selfplay_search_limits(
-                        config,
-                        state.phase_ply,
-                        seed,
-                        state.exploration_actor,
-                    ),
+                    limits: selfplay_search_limits(config, state.phase_ply, seed),
                 }
             });
             let searches = alphazero_search_batch4_reusing(inputs, model, &mut workspace);
@@ -1008,55 +928,13 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 data.search_simulations.searches += 1;
                 data.search_simulations.simulations_sum += search.simulations;
                 record_batched_search_stats(&mut data, search, state.phase_ply, config);
-                if state.allow_resign && should_resign(search.value_q, config) {
-                    let mut meta = root_search_meta(
-                        &search.candidates,
-                        search.value_q,
-                        config.generation_update,
-                        config.seed ^ state.game_index as u64,
-                        state.phase_ply,
-                    );
-                    meta.start_source = state.start_source;
-                    state.samples.push(make_training_sample(
-                        &state.position,
-                        &state.rule_history,
-                        &search.candidates,
-                        search.value_q,
-                        state.rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
-                        meta,
-                        search.simulations,
-                        1.0,
-                    ));
-                    state.bootstrap_wdls.push(search.network_value_wdl);
-                    state.result = Some(if state.position.side_to_move() == Color::Red {
-                        data.terminal.resign_red += 1;
-                        -1.0
-                    } else {
-                        data.terminal.resign_black += 1;
-                        1.0
-                    });
-                    continue;
-                }
-                let temperature =
-                    temperature_for_ply(config, state.phase_ply, state.endgame_temperature);
+                let temperature = temperature_for_ply(config, state.phase_ply);
                 let mv = if temperature <= 1e-6 {
                     search.best_move.or_else(|| {
-                        choose_selfplay_move(
-                            &search.candidates,
-                            temperature,
-                            0.0,
-                            0.0,
-                            &mut state.rng,
-                        )
+                        choose_selfplay_move(&search.candidates, temperature, &mut state.rng)
                     })
                 } else {
-                    choose_selfplay_move(
-                        &search.candidates,
-                        temperature,
-                        config.temperature_value_cutoff,
-                        config.temperature_visit_offset,
-                        &mut state.rng,
-                    )
+                    choose_selfplay_move(&search.candidates, temperature, &mut state.rng)
                 };
                 let Some(mv) = mv else {
                     state.result = Some(0.0);
@@ -1366,27 +1244,19 @@ fn flip_wdl(wdl: [f32; 3]) -> [f32; 3] {
     [wdl[2], wdl[1], wdl[0]]
 }
 
-fn should_resign(root_q: f32, config: &AzLoopConfig) -> bool {
-    if config.resign_percentage <= 0.0 {
-        return false;
-    }
-    let threshold = -(1.0 - config.resign_percentage.clamp(0.0, 100.0) / 100.0);
-    root_q <= threshold
-}
-
-fn temperature_for_ply(config: &AzLoopConfig, ply: usize, endgame_temperature: f32) -> f32 {
+fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
     if ply < config.temperature_decay_delay_plies {
         return config.temperature_start;
     }
     if config.temperature_decay_plies == 0 {
-        return endgame_temperature;
+        return config.temperature_endgame;
     }
     let decay_ply = ply.saturating_sub(config.temperature_decay_delay_plies);
     if decay_ply >= config.temperature_decay_plies {
-        return endgame_temperature;
+        return config.temperature_endgame;
     }
     let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
-    config.temperature_start + (endgame_temperature - config.temperature_start) * progress
+    config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
 }
 
 fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
@@ -1398,8 +1268,6 @@ fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
 fn choose_selfplay_move(
     candidates: &[AzCandidate],
     temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
     rng: &mut SplitMix64,
 ) -> Option<Move> {
     if temperature <= 1e-6 {
@@ -1413,7 +1281,7 @@ fn choose_selfplay_move(
             .map(|candidate| candidate.mv);
     }
 
-    let weights = temperature_move_weights(candidates, temperature, value_cutoff, visit_offset);
+    let weights = temperature_move_weights(candidates, temperature);
     let total = candidates
         .iter()
         .zip(&weights)
@@ -1433,43 +1301,12 @@ fn choose_selfplay_move(
     candidates.first().map(|candidate| candidate.mv)
 }
 
-fn temperature_move_weights(
-    candidates: &[AzCandidate],
-    temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
-) -> Vec<f32> {
-    let cutoff_anchor_q = candidates
-        .iter()
-        .max_by(|left, right| {
-            (left.visits as f32 + visit_offset).total_cmp(&(right.visits as f32 + visit_offset))
-        })
-        .map(|candidate| candidate.q);
+fn temperature_move_weights(candidates: &[AzCandidate], temperature: f32) -> Vec<f32> {
     let inv_temperature = 1.0 / temperature.max(1e-3);
-    let mut weights = candidates
+    candidates
         .iter()
-        .map(|candidate| {
-            (candidate.visits as f32 + visit_offset)
-                .max(1e-9)
-                .powf(inv_temperature)
-        })
-        .collect::<Vec<_>>();
-
-    let Some(cutoff_anchor_q) = cutoff_anchor_q else {
-        return weights;
-    };
-    if value_cutoff <= 0.0 || value_cutoff >= 1.0 || !cutoff_anchor_q.is_finite() {
-        return weights;
-    }
-
-    // 配置值表示胜率差；Q=W-L，因此胜率差 value_cutoff 对应 2*value_cutoff 的 Q 差。
-    let min_q = cutoff_anchor_q - 2.0 * value_cutoff;
-    for (weight, candidate) in weights.iter_mut().zip(candidates) {
-        if candidate.q < min_q {
-            *weight = 0.0;
-        }
-    }
-    weights
+        .map(|candidate| (candidate.visits as f32).powf(inv_temperature))
+        .collect()
 }
 
 fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
@@ -1711,14 +1548,8 @@ mod tests {
             generation_update: 0,
             temperature_start: 0.0,
             temperature_endgame: 0.0,
-            persistent_exploration_fraction: 0.0,
-            persistent_exploration_temperature: 0.8,
-            persistent_exploration_root_dirichlet_alpha: 0.15,
-            persistent_exploration_root_exploration_fraction: 0.35,
             temperature_decay_delay_plies: 0,
             temperature_decay_plies: 0,
-            temperature_value_cutoff: 0.0,
-            temperature_visit_offset: 0.0,
             cpuct: 0.65,
             cpuct_at_root: 1.5,
             cpuct_base: 19652.0,
@@ -1736,8 +1567,6 @@ mod tests {
             opening_start_fraction: 0.0,
             midgame_positions: Default::default(),
             midgame_start_fraction: 0.0,
-            resign_percentage: 0.0,
-            resign_playthrough: 100.0,
             mirror_probability: 0.0,
             record_fens: false,
         }
@@ -2085,45 +1914,14 @@ mod tests {
     }
 
     #[test]
-    fn temperature_value_cutoff_uses_win_probability_gap() {
-        let mut candidates = vec![
-            candidate_q(Move::new(0, 1), 100, 0.80),
-            candidate_q(Move::new(0, 2), 1, 0.60),
-        ];
-        for index in 2..10 {
-            candidates.push(candidate_q(Move::new(index, index + 1), 10, 0.40));
-        }
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-
-        assert!(weights[1] > 0.0);
-    }
-
-    #[test]
-    fn negative_visit_offset_is_added_like_lc0() {
+    fn temperature_one_samples_directly_from_visit_counts() {
         let candidates = vec![
             candidate_q(Move::new(0, 1), 1, 0.0),
             candidate_q(Move::new(0, 2), 10, 0.0),
         ];
 
-        let weights = temperature_move_weights(&candidates, 1.0, 0.0, -0.8);
+        let weights = temperature_move_weights(&candidates, 1.0);
 
-        assert!((weights[0] - 0.2).abs() < 1e-6);
-        assert!((weights[1] - 9.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn temperature_value_cutoff_is_anchored_to_most_visited_move() {
-        let candidates = vec![
-            candidate_q(Move::new(0, 1), 100, 0.40),
-            candidate_q(Move::new(0, 2), 5, 0.90),
-            candidate_q(Move::new(0, 3), 10, 0.05),
-        ];
-
-        let weights = temperature_move_weights(&candidates, 1.0, 0.15, 0.0);
-
-        assert!(weights[0] > 0.0);
-        assert!(weights[1] > 0.0);
-        assert_eq!(weights[2], 0.0);
+        assert_eq!(weights, vec![1.0, 10.0]);
     }
 }

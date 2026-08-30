@@ -12,7 +12,7 @@ use crate::xiangqi::{Color, Move, Piece, PieceKind, Position, RuleHistoryEntry};
 
 use super::SplitMix64;
 
-const MIDGAME_MAGIC: &[u8; 5] = b"AZMG1";
+const MIDGAME_MAGIC: &[u8; 5] = b"AZMG2";
 const MAX_SNAPSHOTS: usize = 1_000_000;
 const MAX_HISTORY: usize = 4096;
 const MAX_FEN_BYTES: usize = 1024;

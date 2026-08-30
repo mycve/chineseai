@@ -106,7 +106,7 @@ pub(super) const VALUE_THREAT_RANK: usize = 64;
 pub(super) const VALUE_THREAT_VOCAB: usize = 57_702;
 pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 96;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
-pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.9;
+pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 1.0;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -955,14 +955,8 @@ pub struct AzLoopConfig {
     pub generation_update: u32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
-    pub persistent_exploration_fraction: f32,
-    pub persistent_exploration_temperature: f32,
-    pub persistent_exploration_root_dirichlet_alpha: f32,
-    pub persistent_exploration_root_exploration_fraction: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
     pub cpuct_base: f32,
@@ -980,8 +974,6 @@ pub struct AzLoopConfig {
     pub opening_start_fraction: f32,
     pub midgame_positions: Arc<[AzStartSnapshot]>,
     pub midgame_start_fraction: f32,
-    pub resign_percentage: f32,
-    pub resign_playthrough: f32,
     pub mirror_probability: f32,
     pub record_fens: bool,
 }
@@ -1065,8 +1057,6 @@ pub struct AzLoopReport {
     pub terminal_rule_draw_mutual_long_chase: usize,
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
-    pub terminal_resign_red: usize,
-    pub terminal_resign_black: usize,
     pub terminal_max_plies: usize,
 }
 
