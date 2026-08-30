@@ -545,6 +545,8 @@ struct AzLoopProgressState {
     format_version: u32,
     next_update: usize,
     nemesis_update: Option<u64>,
+    generated_games: u64,
+    generated_samples: u64,
 }
 
 impl Default for AzLoopProgressState {
@@ -553,6 +555,8 @@ impl Default for AzLoopProgressState {
             format_version: AZ_LOOP_PROGRESS_VERSION,
             next_update: 1,
             nemesis_update: None,
+            generated_games: 0,
+            generated_samples: 0,
         }
     }
 }
@@ -596,12 +600,20 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
-fn save_az_loop_progress_pair(config_path: &str, next_update: usize, nemesis_update: Option<u64>) {
+fn save_az_loop_progress_pair(
+    config_path: &str,
+    next_update: usize,
+    nemesis_update: Option<u64>,
+    generated_games: u64,
+    generated_samples: u64,
+) {
     save_az_loop_progress(
         config_path,
         &AzLoopProgressState {
             next_update,
             nemesis_update,
+            generated_games,
+            generated_samples,
             ..Default::default()
         },
     );
@@ -2026,6 +2038,8 @@ fn main() {
             let progress_boot = load_az_loop_progress(&config_path);
             let start_update = progress_boot.next_update.max(1);
             let mut arena_nemesis_update = progress_boot.nemesis_update;
+            let mut generated_games_total = progress_boot.generated_games;
+            let mut generated_samples_total = progress_boot.generated_samples;
             if let Some(target_update) = target_update
                 && start_update > target_update
             {
@@ -2521,10 +2535,10 @@ fn main() {
                         continue;
                     }
                     pending.collection_seconds = window_started.elapsed().as_secs_f32();
-                    window_started = Instant::now();
                     if ready_tx.send(std::mem::take(&mut pending)).is_err() {
                         break;
                     }
+                    window_started = Instant::now();
                     batch_index += 1;
                 }
             });
@@ -2803,6 +2817,9 @@ fn main() {
                 if exited_after_ctrl_c {
                     break;
                 }
+                generated_games_total = generated_games_total.saturating_add(report.games as u64);
+                generated_samples_total =
+                    generated_samples_total.saturating_add(report.samples as u64);
                 let deployed_model = candidate_model.clone();
                 interrupt_save_model = Some(candidate_model.clone());
                 interrupt_save_next_update = update.saturating_add(1);
@@ -2836,9 +2853,11 @@ fn main() {
                     .unwrap_or_else(|_| panic!("midgame pool poisoned"))
                     .len();
                 println!(
-                    "update {update:04}: games={} samples={} train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} actor_updates={}-{} actor_update_span={} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={}(total={}) samples={}(total={}) train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} actor_updates={}-{} actor_update_span={} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
+                    generated_games_total,
                     report.samples,
+                    generated_samples_total,
                     report.train_samples,
                     report.pool_samples,
                     report.pool_capacity,
@@ -3056,6 +3075,18 @@ fn main() {
                 );
                 log_scalar(&mut tb, "selfplay/games", update, report.games as f32);
                 log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
+                log_scalar(
+                    &mut tb,
+                    "selfplay/games_total",
+                    update,
+                    generated_games_total as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "selfplay/samples_total",
+                    update,
+                    generated_samples_total as f32,
+                );
                 log_scalar(
                     &mut tb,
                     "selfplay/avg_search_simulations",
@@ -3868,6 +3899,10 @@ fn main() {
             }
             if exited_after_ctrl_c {
                 while let Ok(event) = trainer_rx.try_recv() {
+                    generated_games_total =
+                        generated_games_total.saturating_add(event.report.games as u64);
+                    generated_samples_total =
+                        generated_samples_total.saturating_add(event.report.samples as u64);
                     interrupt_save_model = Some(event.candidate_model);
                     interrupt_save_next_update = update.saturating_add(1);
                     update = update.saturating_add(1);
@@ -3880,6 +3915,8 @@ fn main() {
                         &config_path,
                         interrupt_save_next_update,
                         arena_nemesis_update,
+                        generated_games_total,
+                        generated_samples_total,
                     );
                     println!(
                         "model    : {} save raw=`{}` next_update={}",
@@ -5361,6 +5398,25 @@ fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
 mod reporting_tests {
     use super::*;
     use chineseai::az::AzSampleMeta;
+
+    #[test]
+    fn progress_roundtrip_preserves_generated_totals() {
+        let state = AzLoopProgressState {
+            next_update: 17,
+            generated_games: 12_345,
+            generated_samples: 678_901,
+            ..Default::default()
+        };
+
+        let text = toml::to_string(&state).unwrap();
+        let loaded = toml::from_str::<AzLoopProgressState>(&text)
+            .unwrap()
+            .normalize();
+
+        assert_eq!(loaded.next_update, 17);
+        assert_eq!(loaded.generated_games, 12_345);
+        assert_eq!(loaded.generated_samples, 678_901);
+    }
 
     #[test]
     fn az_search_defaults_match_selfplay_and_uci_search() {
