@@ -481,7 +481,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 23\n"));
+        assert!(text.starts_with("format_version = 24\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00001\n"));
         assert!(text.contains("temperature_start = 0.9\n"));

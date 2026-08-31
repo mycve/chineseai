@@ -31,7 +31,9 @@ pub(super) struct AzCandleModel {
     hidden_bias: Var,
     pikafish_psq_embedding: Var,
     pikafish_threat_embedding: Var,
+    pikafish_transformer_bias: Var,
     pikafish_psqt: Var,
+    pikafish_threat_psqt: Var,
     pikafish_value_fc0: Var,
     pikafish_value_fc0_bias: Var,
     pikafish_value_rule_fc0: Var,
@@ -92,7 +94,8 @@ impl AzCandleModel {
         )? + sparse_pool(
             self.pikafish_threat_embedding.as_tensor(),
             &batch.pikafish_threat_indices,
-        )?)?;
+        )?)?
+        .broadcast_add(&self.pikafish_transformer_bias)?;
         let left = value_accumulator
             .narrow(1, 0, PIKAFISH_TRANSFORMER_HALF)?
             .clamp(0.0f64, 1.0f64)?;
@@ -144,7 +147,12 @@ impl AzCandleModel {
         let skip = (fc0.narrow(1, PIKAFISH_VALUE_FC0 - 2, 1)?
             - fc0.narrow(1, PIKAFISH_VALUE_FC0 - 1, 1)?)?;
         let signed = Tensor::cat(&[&skip, &Tensor::zeros_like(&skip)?, &skip.neg()?], 1)?;
-        let psqt_views = sparse_pool(self.pikafish_psqt.as_tensor(), &batch.pikafish_psq_indices)?
+        let psqt_views =
+            (sparse_pool(self.pikafish_psqt.as_tensor(), &batch.pikafish_psq_indices)?
+                + sparse_pool(
+                    self.pikafish_threat_psqt.as_tensor(),
+                    &batch.pikafish_threat_indices,
+                )?)?
             .reshape((batch.batch_size, 2, PIKAFISH_PSQT_BUCKETS))?;
         let psqt_diff =
             (psqt_views.narrow(1, 0, 1)?.squeeze(1)? - psqt_views.narrow(1, 1, 1)?.squeeze(1)?)?;
@@ -406,9 +414,19 @@ impl AzCandleModel {
                 ),
                 device,
             )?,
+            pikafish_transformer_bias: var_from_slice(
+                &model.pikafish_transformer_bias,
+                PIKAFISH_TRANSFORMER_DIMENSIONS,
+                device,
+            )?,
             pikafish_psqt: var_from_slice(
                 &model.pikafish_psqt,
                 (PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS),
+                device,
+            )?,
+            pikafish_threat_psqt: var_from_slice(
+                &model.pikafish_threat_psqt,
+                (PIKAFISH_VALUE_THREAT_DIMENSIONS, PIKAFISH_PSQT_BUCKETS),
                 device,
             )?,
             pikafish_value_fc0: var_from_slice(
@@ -529,7 +547,9 @@ impl AzCandleModel {
         vars.push(self.hidden_bias.clone());
         vars.push(self.pikafish_psq_embedding.clone());
         vars.push(self.pikafish_threat_embedding.clone());
+        vars.push(self.pikafish_transformer_bias.clone());
         vars.push(self.pikafish_psqt.clone());
+        vars.push(self.pikafish_threat_psqt.clone());
         vars.push(self.pikafish_value_fc0.clone());
         vars.push(self.pikafish_value_fc0_bias.clone());
         vars.push(self.pikafish_value_rule_fc0.clone());
@@ -572,7 +592,12 @@ impl AzCandleModel {
             &self.pikafish_threat_embedding,
             &mut model.pikafish_threat_embedding,
         )?;
+        copy_var(
+            &self.pikafish_transformer_bias,
+            &mut model.pikafish_transformer_bias,
+        )?;
         copy_var(&self.pikafish_psqt, &mut model.pikafish_psqt)?;
+        copy_var(&self.pikafish_threat_psqt, &mut model.pikafish_threat_psqt)?;
         copy_var(&self.pikafish_value_fc0, &mut model.pikafish_value_fc0)?;
         copy_var(
             &self.pikafish_value_fc0_bias,
@@ -834,7 +859,9 @@ mod tests {
             hidden_bias,
             pikafish_psq_embedding,
             pikafish_threat_embedding,
+            pikafish_transformer_bias,
             pikafish_psqt,
+            pikafish_threat_psqt,
             pikafish_value_fc0,
             pikafish_value_fc1,
             pikafish_value_output,

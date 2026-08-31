@@ -271,9 +271,14 @@ macro_rules! az_weight_tensors {
                 PIKAFISH_TRANSFORMER_DIMENSIONS
             ]
         );
+        $visit!(pikafish_transformer_bias, [PIKAFISH_TRANSFORMER_DIMENSIONS]);
         $visit!(
             pikafish_psqt,
             [PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS]
+        );
+        $visit!(
+            pikafish_threat_psqt,
+            [PIKAFISH_VALUE_THREAT_DIMENSIONS, PIKAFISH_PSQT_BUCKETS]
         );
         $visit!(
             pikafish_value_fc0,
@@ -965,7 +970,9 @@ pub struct AzNnue {
     pub hidden_bias: Vec<f32>,
     pub pikafish_psq_embedding: Vec<f32>,
     pub pikafish_threat_embedding: Vec<f32>,
+    pub pikafish_transformer_bias: Vec<f32>,
     pub pikafish_psqt: Vec<f32>,
+    pub pikafish_threat_psqt: Vec<f32>,
     pub pikafish_value_fc0: Vec<f32>,
     pub pikafish_value_fc0_bias: Vec<f32>,
     pub pikafish_value_rule_fc0: Vec<f32>,
@@ -999,8 +1006,10 @@ pub struct AzNnue {
     policy_threat_active: bool,
     pikafish_psq_embedding_q: Vec<i8>,
     pikafish_threat_embedding_q: Vec<i8>,
+    pikafish_transformer_bias_q: Vec<i16>,
     pikafish_embedding_scale: f32,
-    pikafish_psqt_q: Vec<i16>,
+    pikafish_psqt_q: Vec<i32>,
+    pikafish_threat_psqt_q: Vec<i32>,
     pikafish_psqt_scale: f32,
     pikafish_value_fc0_q: Vec<i8>,
     pikafish_value_fc0_q_interleaved: Vec<AlignedI8x32>,
@@ -1024,7 +1033,9 @@ impl Clone for AzNnue {
             hidden_bias: self.hidden_bias.clone(),
             pikafish_psq_embedding: self.pikafish_psq_embedding.clone(),
             pikafish_threat_embedding: self.pikafish_threat_embedding.clone(),
+            pikafish_transformer_bias: self.pikafish_transformer_bias.clone(),
             pikafish_psqt: self.pikafish_psqt.clone(),
+            pikafish_threat_psqt: self.pikafish_threat_psqt.clone(),
             pikafish_value_fc0: self.pikafish_value_fc0.clone(),
             pikafish_value_fc0_bias: self.pikafish_value_fc0_bias.clone(),
             pikafish_value_rule_fc0: self.pikafish_value_rule_fc0.clone(),
@@ -1058,8 +1069,10 @@ impl Clone for AzNnue {
             policy_threat_active: self.policy_threat_active,
             pikafish_psq_embedding_q: self.pikafish_psq_embedding_q.clone(),
             pikafish_threat_embedding_q: self.pikafish_threat_embedding_q.clone(),
+            pikafish_transformer_bias_q: self.pikafish_transformer_bias_q.clone(),
             pikafish_embedding_scale: self.pikafish_embedding_scale,
             pikafish_psqt_q: self.pikafish_psqt_q.clone(),
+            pikafish_threat_psqt_q: self.pikafish_threat_psqt_q.clone(),
             pikafish_psqt_scale: self.pikafish_psqt_scale,
             pikafish_value_fc0_q: self.pikafish_value_fc0_q.clone(),
             pikafish_value_fc0_q_interleaved: self.pikafish_value_fc0_q_interleaved.clone(),
@@ -1539,7 +1552,10 @@ impl AzNnue {
             * PIKAFISH_TRANSFORMER_DIMENSIONS)
             .map(|_| rng.weight(0.01))
             .collect();
+        let pikafish_transformer_bias = vec![0.0; PIKAFISH_TRANSFORMER_DIMENSIONS];
         let pikafish_psqt = vec![0.0; PIKAFISH_PSQ_DIMENSIONS * PIKAFISH_PSQT_BUCKETS];
+        let pikafish_threat_psqt =
+            vec![0.0; PIKAFISH_VALUE_THREAT_DIMENSIONS * PIKAFISH_PSQT_BUCKETS];
         let mut pikafish_value_fc0: Vec<f32> =
             (0..PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0 * PIKAFISH_TRANSFORMED_DIMENSIONS)
                 .map(|_| rng.weight((2.0 / PIKAFISH_TRANSFORMED_DIMENSIONS as f32).sqrt()))
@@ -1601,7 +1617,9 @@ impl AzNnue {
             hidden_bias,
             pikafish_psq_embedding,
             pikafish_threat_embedding,
+            pikafish_transformer_bias,
             pikafish_psqt,
+            pikafish_threat_psqt,
             pikafish_value_fc0,
             pikafish_value_fc0_bias,
             pikafish_value_rule_fc0,
@@ -1635,8 +1653,10 @@ impl AzNnue {
             policy_threat_active: false,
             pikafish_psq_embedding_q: Vec::new(),
             pikafish_threat_embedding_q: Vec::new(),
+            pikafish_transformer_bias_q: Vec::new(),
             pikafish_embedding_scale: 1.0,
             pikafish_psqt_q: Vec::new(),
+            pikafish_threat_psqt_q: Vec::new(),
             pikafish_psqt_scale: 1.0,
             pikafish_value_fc0_q: Vec::new(),
             pikafish_value_fc0_q_interleaved: Vec::new(),
@@ -1710,7 +1730,12 @@ impl AzNnue {
                 &tensors,
                 "pikafish_threat_embedding",
             )?,
+            pikafish_transformer_bias: load_candle_f32_tensor(
+                &tensors,
+                "pikafish_transformer_bias",
+            )?,
             pikafish_psqt: load_candle_f32_tensor(&tensors, "pikafish_psqt")?,
+            pikafish_threat_psqt: load_candle_f32_tensor(&tensors, "pikafish_threat_psqt")?,
             pikafish_value_fc0: load_candle_f32_tensor(&tensors, "pikafish_value_fc0")?,
             pikafish_value_fc0_bias: load_candle_f32_tensor(&tensors, "pikafish_value_fc0_bias")?,
             pikafish_value_rule_fc0: load_candle_f32_tensor(&tensors, "pikafish_value_rule_fc0")?,
@@ -1759,8 +1784,10 @@ impl AzNnue {
             policy_threat_active: false,
             pikafish_psq_embedding_q: Vec::new(),
             pikafish_threat_embedding_q: Vec::new(),
+            pikafish_transformer_bias_q: Vec::new(),
             pikafish_embedding_scale: 1.0,
             pikafish_psqt_q: Vec::new(),
+            pikafish_threat_psqt_q: Vec::new(),
             pikafish_psqt_scale: 1.0,
             pikafish_value_fc0_q: Vec::new(),
             pikafish_value_fc0_q_interleaved: Vec::new(),
@@ -2418,6 +2445,7 @@ impl AzNnue {
         for (view, features) in active.iter().enumerate() {
             let acc = &mut accumulator[view * PIKAFISH_TRANSFORMER_DIMENSIONS
                 ..(view + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+            acc.copy_from_slice(&self.pikafish_transformer_bias_q);
             for &feature in &features.psq {
                 let row = &self.pikafish_psq_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
                     ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
@@ -2432,6 +2460,10 @@ impl AzNnue {
                     * PIKAFISH_TRANSFORMER_DIMENSIONS
                     ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
                 add_i8_row_to_i16(acc, row);
+                for bucket in 0..PIKAFISH_PSQT_BUCKETS {
+                    psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS + bucket] +=
+                        self.pikafish_threat_psqt_q[feature * PIKAFISH_PSQT_BUCKETS + bucket];
+                }
             }
         }
     }
@@ -2474,7 +2506,7 @@ impl AzNnue {
             // index, so refresh that perspective. Otherwise update exact set deltas.
             if requires_refresh[view] {
                 let refreshed = &refreshed.as_ref().unwrap()[view];
-                acc.fill(0);
+                acc.copy_from_slice(&self.pikafish_transformer_bias_q);
                 psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS..(view + 1) * PIKAFISH_PSQT_BUCKETS]
                     .fill(0);
                 for &feature in &refreshed.psq {
@@ -2495,6 +2527,10 @@ impl AzNnue {
                         &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
                             ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
                     );
+                    for bucket in 0..PIKAFISH_PSQT_BUCKETS {
+                        psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS + bucket] +=
+                            self.pikafish_threat_psqt_q[feature * PIKAFISH_PSQT_BUCKETS + bucket];
+                    }
                 }
                 continue;
             }
@@ -2541,6 +2577,10 @@ impl AzNnue {
                         &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
                             ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
                     );
+                    for bucket in 0..PIKAFISH_PSQT_BUCKETS {
+                        psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS + bucket] -=
+                            self.pikafish_threat_psqt_q[feature * PIKAFISH_PSQT_BUCKETS + bucket];
+                    }
                 }
                 for &feature in added {
                     add_i8_row_to_i16(
@@ -2548,6 +2588,10 @@ impl AzNnue {
                         &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
                             ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
                     );
+                    for bucket in 0..PIKAFISH_PSQT_BUCKETS {
+                        psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS + bucket] +=
+                            self.pikafish_threat_psqt_q[feature * PIKAFISH_PSQT_BUCKETS + bucket];
+                    }
                 }
             }
         }
@@ -2681,12 +2725,18 @@ impl AzNnue {
                     .clamp(-127.0, 127.0) as i8
             })
             .collect();
-        let maximum = self
+        let embedding_maximum = self
             .pikafish_psq_embedding
             .iter()
             .chain(&self.pikafish_threat_embedding)
             .fold(0.0f32, |current, value| current.max(value.abs()));
-        self.pikafish_embedding_scale = (maximum / 127.0).max(1.0e-12);
+        let bias_maximum = self
+            .pikafish_transformer_bias
+            .iter()
+            .fold(0.0f32, |current, value| current.max(value.abs()));
+        self.pikafish_embedding_scale = (embedding_maximum / 127.0)
+            .max(bias_maximum / 32767.0)
+            .max(1.0e-12);
         self.pikafish_psq_embedding_q = self
             .pikafish_psq_embedding
             .iter()
@@ -2705,18 +2755,38 @@ impl AzNnue {
                     .clamp(-127.0, 127.0) as i8
             })
             .collect();
+        self.pikafish_transformer_bias_q = self
+            .pikafish_transformer_bias
+            .iter()
+            .map(|value| {
+                (*value / self.pikafish_embedding_scale)
+                    .round()
+                    .clamp(-32767.0, 32767.0) as i16
+            })
+            .collect();
         let maximum = self
             .pikafish_psqt
             .iter()
+            .chain(&self.pikafish_threat_psqt)
             .fold(0.0f32, |current, value| current.max(value.abs()));
-        self.pikafish_psqt_scale = (maximum / 32767.0).max(1.0e-12);
+        const PSQT_QUANT_MAX: f32 = 8_388_607.0;
+        self.pikafish_psqt_scale = (maximum / PSQT_QUANT_MAX).max(1.0e-12);
         self.pikafish_psqt_q = self
             .pikafish_psqt
             .iter()
             .map(|value| {
                 (*value / self.pikafish_psqt_scale)
                     .round()
-                    .clamp(-32767.0, 32767.0) as i16
+                    .clamp(-PSQT_QUANT_MAX, PSQT_QUANT_MAX) as i32
+            })
+            .collect();
+        self.pikafish_threat_psqt_q = self
+            .pikafish_threat_psqt
+            .iter()
+            .map(|value| {
+                (*value / self.pikafish_psqt_scale)
+                    .round()
+                    .clamp(-PSQT_QUANT_MAX, PSQT_QUANT_MAX) as i32
             })
             .collect();
         let maximum = self
@@ -3037,6 +3107,26 @@ impl AzNnue {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "az model derived quantized policy accumulator cache length mismatch",
+            ));
+        }
+        if self.pikafish_psq_embedding_q.len()
+            != PIKAFISH_PSQ_DIMENSIONS * PIKAFISH_TRANSFORMER_DIMENSIONS
+            || self.pikafish_threat_embedding_q.len()
+                != PIKAFISH_VALUE_THREAT_DIMENSIONS * PIKAFISH_TRANSFORMER_DIMENSIONS
+            || self.pikafish_transformer_bias_q.len() != PIKAFISH_TRANSFORMER_DIMENSIONS
+            || self.pikafish_psqt_q.len() != PIKAFISH_PSQ_DIMENSIONS * PIKAFISH_PSQT_BUCKETS
+            || self.pikafish_threat_psqt_q.len()
+                != PIKAFISH_VALUE_THREAT_DIMENSIONS * PIKAFISH_PSQT_BUCKETS
+            || self.pikafish_value_fc0_q.len()
+                != PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0 * PIKAFISH_TRANSFORMED_DIMENSIONS
+            || self.pikafish_value_fc0_q_interleaved.len()
+                != PIKAFISH_LAYER_STACKS
+                    * (PIKAFISH_TRANSFORMED_DIMENSIONS / 4)
+                    * (PIKAFISH_VALUE_FC0 / 8)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "az model derived quantized Pikafish value cache length mismatch",
             ));
         }
         Ok(())
@@ -4169,6 +4259,9 @@ mod tests {
         for (index, weight) in model.pikafish_psqt.iter_mut().enumerate() {
             *weight = (((index * 104729 + 17) % 20001) as f32 - 10000.0) * 1.0e-6;
         }
+        for (index, weight) in model.pikafish_threat_psqt.iter_mut().enumerate() {
+            *weight = (((index * 65537 + 29) % 20001) as f32 - 10000.0) * 1.0e-6;
+        }
         model.rebuild_value_quantization();
         let mut position = Position::startpos();
         let mut maximum_error = 0.0f32;
@@ -4183,7 +4276,14 @@ mod tests {
                         .map(|&feature| {
                             model.pikafish_psqt[feature * PIKAFISH_PSQT_BUCKETS + stack]
                         })
-                        .sum();
+                        .sum::<f32>()
+                        + active[view]
+                            .threats
+                            .iter()
+                            .map(|&feature| {
+                                model.pikafish_threat_psqt[feature * PIKAFISH_PSQT_BUCKETS + stack]
+                            })
+                            .sum::<f32>();
                     let quantized = psqt[view * PIKAFISH_PSQT_BUCKETS + stack] as f32
                         * model.pikafish_psqt_scale;
                     maximum_error = maximum_error.max((scalar - quantized).abs());
@@ -4258,7 +4358,14 @@ mod tests {
                 .psq
                 .iter()
                 .map(|&feature| model.pikafish_psqt[feature * PIKAFISH_PSQT_BUCKETS + stack])
-                .sum();
+                .sum::<f32>()
+                + active[absolute]
+                    .threats
+                    .iter()
+                    .map(|&feature| {
+                        model.pikafish_threat_psqt[feature * PIKAFISH_PSQT_BUCKETS + stack]
+                    })
+                    .sum::<f32>();
         }
         let signed = psqt[0] - psqt[1];
         let skip = fc0[PIKAFISH_VALUE_FC0 - 2] - fc0[PIKAFISH_VALUE_FC0 - 1];
@@ -4279,6 +4386,12 @@ mod tests {
         let mut model = AzNnue::random(128, 0x51D0);
         for (index, weight) in model.pikafish_psqt.iter_mut().enumerate() {
             *weight = (((index * 8191 + 31) % 20001) as f32 - 10000.0) * 1.0e-6;
+        }
+        for (index, weight) in model.pikafish_transformer_bias.iter_mut().enumerate() {
+            *weight = (((index * 257 + 13) % 2001) as f32 - 1000.0) * 1.0e-5;
+        }
+        for (index, weight) in model.pikafish_threat_psqt.iter_mut().enumerate() {
+            *weight = (((index * 12289 + 43) % 20001) as f32 - 10000.0) * 1.0e-6;
         }
         model.rebuild_value_quantization();
         let mut position = Position::startpos();
@@ -4483,7 +4596,14 @@ mod tests {
 
     #[test]
     fn pikafish_value_accumulator_delta_matches_full_refresh() {
-        let model = AzNnue::random(128, 0x45547);
+        let mut model = AzNnue::random(128, 0x45547);
+        for (index, weight) in model.pikafish_transformer_bias.iter_mut().enumerate() {
+            *weight = (((index * 127 + 7) % 2001) as f32 - 1000.0) * 1.0e-5;
+        }
+        for (index, weight) in model.pikafish_threat_psqt.iter_mut().enumerate() {
+            *weight = (((index * 4099 + 17) % 20001) as f32 - 10000.0) * 1.0e-6;
+        }
+        model.rebuild_value_quantization();
         let mut position = Position::startpos();
         let (_, mut incremental, mut psqt_incremental) =
             AzEvalAccumulator::new(&model, &position).into_sums();
@@ -4771,14 +4891,17 @@ mod tests {
         let _ = fs::remove_file(&path);
         model.save(&path).unwrap();
         let file_bytes = fs::metadata(&path).unwrap().len();
-        let quantized_bytes = model.pikafish_psq_embedding_q.len()
+        let quantized_core_bytes = model.pikafish_psq_embedding_q.len()
             + model.pikafish_threat_embedding_q.len()
-            + model.pikafish_value_fc0_q.len();
+            + model.pikafish_value_fc0_q.len()
+            + model.pikafish_transformer_bias_q.len() * size_of::<i16>()
+            + model.pikafish_psqt_q.len() * size_of::<i32>()
+            + model.pikafish_threat_psqt_q.len() * size_of::<i32>();
         let _ = fs::remove_file(&path);
         eprintln!(
-            "Pikafish model footprint: safetensors={:.2}MiB derived_i8={:.2}MiB",
+            "Pikafish model footprint: safetensors={:.2}MiB quantized_core={:.2}MiB",
             file_bytes as f64 / (1024.0 * 1024.0),
-            quantized_bytes as f64 / (1024.0 * 1024.0),
+            quantized_core_bytes as f64 / (1024.0 * 1024.0),
         );
     }
 
@@ -5095,6 +5218,8 @@ mod tests {
         model.hidden_bias.fill(0.1);
         let before_psq = model.pikafish_psq_embedding.clone();
         let before_threat = model.pikafish_threat_embedding.clone();
+        let before_bias = model.pikafish_transformer_bias.clone();
+        let before_threat_psqt = model.pikafish_threat_psqt.clone();
 
         let mut rng = SplitMix64::new(32);
         let weights = AzTrainLossWeights {
@@ -5112,9 +5237,25 @@ mod tests {
             .iter()
             .zip(&model.pikafish_threat_embedding)
             .any(|(left, right)| (*left - *right).abs() > 1e-7);
+        let bias_changed = before_bias
+            .iter()
+            .zip(&model.pikafish_transformer_bias)
+            .any(|(left, right)| (*left - *right).abs() > 1e-7);
+        let threat_psqt_changed = before_threat_psqt
+            .iter()
+            .zip(&model.pikafish_threat_psqt)
+            .any(|(left, right)| (*left - *right).abs() > 1e-7);
         assert!(
             psq_changed || threat_changed,
             "value-only training should update the Pikafish value transformer"
+        );
+        assert!(
+            bias_changed,
+            "value-only training should update transformer bias"
+        );
+        assert!(
+            threat_psqt_changed,
+            "value-only training should update FullThreats PSQT"
         );
     }
 
@@ -5141,6 +5282,12 @@ mod tests {
             model.pikafish_threat_embedding,
             loaded.pikafish_threat_embedding
         );
+        assert_eq!(
+            model.pikafish_transformer_bias,
+            loaded.pikafish_transformer_bias
+        );
+        assert_eq!(model.pikafish_psqt, loaded.pikafish_psqt);
+        assert_eq!(model.pikafish_threat_psqt, loaded.pikafish_threat_psqt);
         assert_eq!(model.pikafish_value_output, loaded.pikafish_value_output);
         assert_eq!(
             model.pikafish_short_value_output,
