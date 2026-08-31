@@ -120,6 +120,21 @@ pub(super) fn active_value_features(
 }
 
 pub(super) fn active_value_features_pair(position: &Position) -> [ActiveValueFeatures; 2] {
+    active_value_features_pair_impl(position, None)
+}
+
+pub(super) fn active_value_features_pair_with_policy_threats(
+    position: &Position,
+) -> ([ActiveValueFeatures; 2], Vec<u32>) {
+    let mut policy_threats = Vec::with_capacity(32);
+    let active = active_value_features_pair_impl(position, Some(&mut policy_threats));
+    (active, policy_threats)
+}
+
+fn active_value_features_pair_impl(
+    position: &Position,
+    mut policy_threats: Option<&mut Vec<u32>>,
+) -> [ActiveValueFeatures; 2] {
     let perspectives = [Color::Red, Color::Black];
     let mids = perspectives.map(|perspective| mid_encoding(position, perspective));
     let buckets: [(usize, bool); 2] = std::array::from_fn(|view| {
@@ -147,20 +162,35 @@ pub(super) fn active_value_features_pair(position: &Position) -> [ActiveValueFea
             }
         }
     }
-    visit_official_occupied_relations(position, |source, attacker, target, attacked| {
-        for view in 0..2 {
-            let index = threat_index(
-                perspectives[view],
-                source,
-                attacker,
-                target,
-                attacked,
-                active[view].mirror,
-            );
-            if index < PIKAFISH_VALUE_THREAT_DIMENSIONS {
-                active[view].threats.push(index);
+    position.visit_occupied_relations(|source, attacker, target, attacked| {
+        if let Some(policy_threats) = policy_threats.as_deref_mut() {
+            let index = super::value_threat_index(Color::Red, source, attacker, target, attacked);
+            if index != super::VALUE_THREAT_VOCAB {
+                policy_threats.push(index as u32);
             }
         }
+        visit_official_relation(
+            position,
+            source,
+            attacker,
+            target,
+            attacked,
+            &mut |source, attacker, target, attacked| {
+                for view in 0..2 {
+                    let index = threat_index(
+                        perspectives[view],
+                        source,
+                        attacker,
+                        target,
+                        attacked,
+                        active[view].mirror,
+                    );
+                    if index < PIKAFISH_VALUE_THREAT_DIMENSIONS {
+                        active[view].threats.push(index);
+                    }
+                }
+            },
+        );
     });
     for features in &mut active {
         features.psq.sort_unstable();
@@ -693,15 +723,6 @@ fn pseudo_targets(piece: usize, from: usize) -> Vec<usize> {
     targets
 }
 
-fn visit_official_occupied_relations(
-    position: &Position,
-    mut visitor: impl FnMut(usize, Piece, usize, Piece),
-) {
-    position.visit_occupied_relations(|source, attacker, target, attacked| {
-        visit_official_relation(position, source, attacker, target, attacked, &mut visitor);
-    });
-}
-
 fn visit_official_occupied_relations_from(
     position: &Position,
     source: usize,
@@ -958,6 +979,36 @@ mod tests {
     #[test]
     fn start_position_uses_official_material_stack() {
         assert_eq!(layer_stack_bucket(&Position::startpos()), 11);
+    }
+
+    #[test]
+    fn combined_relation_extraction_matches_independent_outputs() {
+        let mut position = Position::startpos();
+        for ply in 0..32 {
+            let expected_value = active_value_features_pair(&position);
+            let mut expected_policy = Vec::new();
+            position.visit_occupied_relations(|source, attacker, target, attacked| {
+                let index = super::super::value_threat_index(
+                    Color::Red,
+                    source,
+                    attacker,
+                    target,
+                    attacked,
+                );
+                if index != super::super::VALUE_THREAT_VOCAB {
+                    expected_policy.push(index as u32);
+                }
+            });
+            let (value, policy) = active_value_features_pair_with_policy_threats(&position);
+            assert_eq!(value, expected_value, "value mismatch at ply {ply}");
+            assert_eq!(policy, expected_policy, "policy mismatch at ply {ply}");
+
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            position.make_move(legal[(ply * 17 + 3) % legal.len()]);
+        }
     }
 
     #[test]

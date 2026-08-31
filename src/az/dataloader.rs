@@ -6,18 +6,17 @@ use std::thread;
 use std::time::Instant;
 
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::{BOARD_SIZE, Color, Position};
+use crate::xiangqi::{BOARD_SIZE, Position};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_TACTICAL_SIZE,
-    RULE_CONTEXT_SIZE, VALUE_THREAT_MAX_ACTIVE, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
-    active_value_features_pair, canonical_general_buckets_from_features,
+    RULE_CONTEXT_SIZE, VALUE_THREAT_MAX_ACTIVE, WDL_HEAD_SIZE,
+    active_value_features_pair_with_policy_threats, canonical_general_buckets_from_features,
     decode_current_piece_square_feature, dense_move_squares,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     layer_stack_bucket, normalize_wdl_target, policy_sparse_capture_index,
     policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
-    value_threat_index,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -139,28 +138,26 @@ impl PackedBatch {
             .max()
             .unwrap_or(0)
             .max(1);
-        let value_threats = batch
-            .iter()
-            .map(|&sample_index| value_threat_features(&samples[sample_index]))
-            .collect::<Vec<_>>();
-        let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let pikafish = batch
+        let (pikafish, value_threats): (Vec<_>, Vec<_>) = batch
             .iter()
             .map(|&sample_index| {
-                let sample = &samples[sample_index];
-                let pieces = sample
+                let pieces = samples[sample_index]
                     .features
                     .iter()
                     .filter_map(|&feature| decode_current_piece_square_feature(feature))
                     .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
                     .collect::<Vec<_>>();
                 let position = Position::from_canonical_piece_squares(&pieces);
-                (
-                    active_value_features_pair(&position),
-                    layer_stack_bucket(&position),
-                )
+                let (features, policy_threats) =
+                    active_value_features_pair_with_policy_threats(&position);
+                assert!(
+                    policy_threats.len() <= VALUE_THREAT_MAX_ACTIVE,
+                    "too many active value threats"
+                );
+                ((features, layer_stack_bucket(&position)), policy_threats)
             })
-            .collect::<Vec<_>>();
+            .unzip();
+        let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
         let max_pikafish_psq = pikafish
             .iter()
             .flat_map(|(views, _)| views.iter().map(|view| view.psq.len()))
@@ -380,28 +377,6 @@ impl PackedBatch {
             policy_offset,
         );
     }
-}
-
-fn value_threat_features(sample: &AzTrainingSample) -> Vec<u32> {
-    let pieces = sample
-        .features
-        .iter()
-        .filter_map(|&feature| decode_current_piece_square_feature(feature))
-        .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
-        .collect::<Vec<_>>();
-    let position = Position::from_canonical_piece_squares(&pieces);
-    let mut features = Vec::with_capacity(32);
-    position.visit_occupied_relations(|source, attacker, target, attacked| {
-        let feature = value_threat_index(Color::Red, source, attacker, target, attacked);
-        if feature != VALUE_THREAT_VOCAB {
-            features.push(feature as u32);
-        }
-    });
-    assert!(
-        features.len() <= VALUE_THREAT_MAX_ACTIVE,
-        "too many active value threats"
-    );
-    features
 }
 
 #[derive(Debug)]

@@ -118,8 +118,8 @@ use pikafish_value::{
     PIKAFISH_LAYER_STACKS, PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS,
     PIKAFISH_TRANSFORMED_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS, PIKAFISH_TRANSFORMER_HALF,
     PIKAFISH_VALUE_THREAT_DIMENSIONS, ValueFeatureState, active_value_features_pair,
-    changed_threat_indices_for_move, layer_stack_bucket, psq_index, transitioned_psq_features_pair,
-    value_feature_states_pair,
+    active_value_features_pair_with_policy_threats, changed_threat_indices_for_move,
+    layer_stack_bucket, psq_index, transitioned_psq_features_pair, value_feature_states_pair,
 };
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
