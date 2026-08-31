@@ -97,6 +97,14 @@ pub(super) struct ActiveValueFeatures {
     pub threats: Vec<usize>,
     pub feature_bucket: usize,
     pub mirror: bool,
+    pub mid_encoding: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ValueFeatureState {
+    pub feature_bucket: usize,
+    pub mirror: bool,
+    pub mid_encoding: u64,
 }
 
 #[cfg(test)]
@@ -113,12 +121,16 @@ pub(super) fn active_value_features(
 
 pub(super) fn active_value_features_pair(position: &Position) -> [ActiveValueFeatures; 2] {
     let perspectives = [Color::Red, Color::Black];
-    let buckets = perspectives.map(|perspective| feature_bucket(position, perspective));
-    let mut active = buckets.map(|(feature_bucket, mirror)| ActiveValueFeatures {
+    let mids = perspectives.map(|perspective| mid_encoding(position, perspective));
+    let buckets: [(usize, bool); 2] = std::array::from_fn(|view| {
+        feature_bucket_from_mid(position, perspectives[view], mids[view], mids[1 - view])
+    });
+    let mut active = std::array::from_fn(|view| ActiveValueFeatures {
         psq: Vec::with_capacity(32),
         threats: Vec::with_capacity(64),
-        feature_bucket,
-        mirror,
+        feature_bucket: buckets[view].0,
+        mirror: buckets[view].1,
+        mid_encoding: mids[view],
     });
     for square in 0..BOARD_SIZE {
         if let Some(piece) = position.piece_at(square) {
@@ -158,44 +170,88 @@ pub(super) fn active_value_features_pair(position: &Position) -> [ActiveValueFea
     active
 }
 
-pub(super) fn active_psq_indices(position: &Position, perspective: Color) -> Vec<usize> {
-    let (feature_bucket, mirror) = feature_bucket(position, perspective);
-    let mut psq = Vec::with_capacity(32);
-    for square in 0..BOARD_SIZE {
-        if let Some(piece) = position.piece_at(square) {
-            psq.push(psq_index(
-                perspective,
-                square,
-                piece,
-                feature_bucket,
-                mirror,
-            ));
-        }
-    }
-    psq
-}
-
-pub(super) fn active_psq_features_pair(position: &Position) -> [ActiveValueFeatures; 2] {
-    [Color::Red, Color::Black].map(|perspective| {
-        let (feature_bucket, mirror) = feature_bucket(position, perspective);
-        let mut psq = active_psq_indices(position, perspective);
-        psq.sort_unstable();
-        ActiveValueFeatures {
-            psq,
-            threats: Vec::new(),
+pub(super) fn value_feature_states_pair(position: &Position) -> [ValueFeatureState; 2] {
+    let perspectives = [Color::Red, Color::Black];
+    let mids = perspectives.map(|perspective| mid_encoding(position, perspective));
+    std::array::from_fn(|view| {
+        let perspective = perspectives[view];
+        let (feature_bucket, mirror) =
+            feature_bucket_from_mid(position, perspective, mids[view], mids[1 - view]);
+        ValueFeatureState {
             feature_bucket,
             mirror,
+            mid_encoding: mids[view],
         }
     })
 }
 
-type ThreatRelation = (usize, usize, usize, usize);
+pub(super) fn transitioned_psq_features_pair(
+    after: &Position,
+    before: &[ValueFeatureState; 2],
+    from: usize,
+    to: usize,
+    moved: Piece,
+    captured: Option<Piece>,
+) -> [ValueFeatureState; 2] {
+    let perspectives = [Color::Red, Color::Black];
+    let mut mids = [before[0].mid_encoding, before[1].mid_encoding];
+    let moved_view = match moved.color {
+        Color::Red => 0,
+        Color::Black => 1,
+    };
+    mids[moved_view] = mids[moved_view]
+        .wrapping_sub(piece_mid_encoding(moved, from))
+        .wrapping_add(piece_mid_encoding(moved, to));
+    if let Some(captured) = captured {
+        let captured_view = match captured.color {
+            Color::Red => 0,
+            Color::Black => 1,
+        };
+        mids[captured_view] = mids[captured_view].wrapping_sub(piece_mid_encoding(captured, to));
+    }
+
+    std::array::from_fn(|view| {
+        let perspective = perspectives[view];
+        let mut attack_bucket = before[view].feature_bucket % PIKAFISH_ATTACK_BUCKETS;
+        if let Some(piece) = captured.filter(|piece| piece.color == perspective) {
+            match piece.kind {
+                PieceKind::Rook => {
+                    attack_bucket = (attack_bucket & 1)
+                        | usize::from(piece_count(after, perspective, PieceKind::Rook) > 0) * 2;
+                }
+                PieceKind::Horse | PieceKind::Cannon => {
+                    attack_bucket = (attack_bucket & 2)
+                        | usize::from(
+                            piece_count(after, perspective, PieceKind::Horse)
+                                + piece_count(after, perspective, PieceKind::Cannon)
+                                > 0,
+                        );
+                }
+                _ => {}
+            }
+        }
+        let (feature_bucket, mirror) = feature_bucket_with_attack_from_mid(
+            after,
+            perspective,
+            mids[view],
+            mids[1 - view],
+            attack_bucket,
+        );
+        ValueFeatureState {
+            feature_bucket,
+            mirror,
+            mid_encoding: mids[view],
+        }
+    })
+}
+
 pub(super) type ThreatIndexList = SmallVec<[usize; 16]>;
 
 /// Exact changed FullThreats indices for a normal move. This mirrors the official
-/// `DirtyThreats`/`append_changed_indices_both` semantics, while using the cached parent feature
-/// set as the accumulator oracle. Only attackers whose relation can be affected by occupancy at
-/// a changed square are visited; the randomized oracle test below proves equality to full refresh.
+/// `DirtyThreats`/`append_changed_indices_both` semantics. Only attackers whose relation can be
+/// affected by occupancy at a changed square are visited; the randomized oracle test below proves
+/// equality to full refresh.
+#[cfg(test)]
 pub(super) fn changed_threat_indices(
     before: &Position,
     after: &Position,
@@ -211,45 +267,31 @@ pub(super) fn changed_threat_indices(
     }
     debug_assert!((1..=2).contains(&changed_len));
 
-    let before_relations = affected_relations(before, &changed[..changed_len]);
-    let after_relations = affected_relations(after, &changed[..changed_len]);
-    let (removed, added) = sorted_relation_diff(&before_relations, &after_relations);
-
-    [Color::Red, Color::Black].map(|perspective| {
-        let view = match perspective {
-            Color::Red => 0,
-            Color::Black => 1,
-        };
-        let map = |relations: &[ThreatRelation]| {
-            let mut indices = relations
-                .iter()
-                .filter_map(|&(attacker, source, target, attacked)| {
-                    let index = threat_index_structural(
-                        perspective,
-                        source,
-                        attacker,
-                        target,
-                        attacked,
-                        mirrors[view],
-                    );
-                    (index < PIKAFISH_VALUE_THREAT_DIMENSIONS).then_some(index)
-                })
-                .collect::<ThreatIndexList>();
-            indices.sort_unstable();
-            indices.dedup();
-            indices
-        };
-        (map(&removed), map(&added))
-    })
+    changed_threat_indices_for_squares(before, after, mirrors, &changed[..changed_len])
 }
 
-fn sorted_relation_diff(
-    before: &[ThreatRelation],
-    after: &[ThreatRelation],
-) -> (
-    SmallVec<[ThreatRelation; 16]>,
-    SmallVec<[ThreatRelation; 16]>,
-) {
+pub(super) fn changed_threat_indices_for_move(
+    before: &Position,
+    after: &Position,
+    mirrors: [bool; 2],
+    from: usize,
+    to: usize,
+) -> [(ThreatIndexList, ThreatIndexList); 2] {
+    changed_threat_indices_for_squares(before, after, mirrors, &[from, to])
+}
+
+fn changed_threat_indices_for_squares(
+    before: &Position,
+    after: &Position,
+    mirrors: [bool; 2],
+    changed: &[usize],
+) -> [(ThreatIndexList, ThreatIndexList); 2] {
+    let before_indices = affected_threat_indices(before, changed, mirrors);
+    let after_indices = affected_threat_indices(after, changed, mirrors);
+    std::array::from_fn(|view| sorted_index_diff(&before_indices[view], &after_indices[view]))
+}
+
+fn sorted_index_diff(before: &[usize], after: &[usize]) -> (ThreatIndexList, ThreatIndexList) {
     let mut removed = SmallVec::new();
     let mut added = SmallVec::new();
     let (mut left, mut right) = (0, 0);
@@ -268,12 +310,17 @@ fn sorted_relation_diff(
     (removed, added)
 }
 
-fn affected_relations(position: &Position, changed: &[usize]) -> SmallVec<[ThreatRelation; 64]> {
-    let mut relations = SmallVec::new();
-    for source in 0..BOARD_SIZE {
-        let Some(piece) = position.piece_at(source) else {
-            continue;
-        };
+fn affected_threat_indices(
+    position: &Position,
+    changed: &[usize],
+    mirrors: [bool; 2],
+) -> [SmallVec<[usize; 64]>; 2] {
+    let mut indices: [SmallVec<[usize; 64]>; 2] = std::array::from_fn(|_| SmallVec::new());
+    let mut occupied = position.occupied_squares();
+    while occupied != 0 {
+        let source = occupied.trailing_zeros() as usize;
+        occupied &= occupied - 1;
+        let piece = position.piece_at(source).unwrap();
         if !changed
             .iter()
             .any(|&square| relation_source_affected(source, piece, square))
@@ -284,18 +331,29 @@ fn affected_relations(position: &Position, changed: &[usize]) -> SmallVec<[Threa
             position,
             source,
             |source, attacker, target, attacked| {
-                relations.push((
-                    structural_piece(attacker, Color::Red),
-                    source,
-                    target,
-                    structural_piece(attacked, Color::Red),
-                ));
+                let attacker = structural_piece(attacker, Color::Red);
+                let attacked = structural_piece(attacked, Color::Red);
+                for (view, perspective) in [Color::Red, Color::Black].into_iter().enumerate() {
+                    let index = threat_index_structural(
+                        perspective,
+                        source,
+                        attacker,
+                        target,
+                        attacked,
+                        mirrors[view],
+                    );
+                    if index < PIKAFISH_VALUE_THREAT_DIMENSIONS {
+                        indices[view].push(index);
+                    }
+                }
             },
         );
     }
-    relations.sort_unstable();
-    relations.dedup();
-    relations
+    for view in &mut indices {
+        view.sort_unstable();
+        view.dedup();
+    }
+    indices
 }
 
 fn relation_source_affected(source: usize, piece: Piece, changed: usize) -> bool {
@@ -325,7 +383,28 @@ fn relation_source_affected(source: usize, piece: Piece, changed: usize) -> bool
     }
 }
 
-pub(super) fn feature_bucket(position: &Position, perspective: Color) -> (usize, bool) {
+fn feature_bucket_from_mid(
+    position: &Position,
+    perspective: Color,
+    ours_mid: u64,
+    theirs_mid: u64,
+) -> (usize, bool) {
+    let attack_bucket = usize::from(piece_count(position, perspective, PieceKind::Rook) > 0) * 2
+        + usize::from(
+            piece_count(position, perspective, PieceKind::Horse)
+                + piece_count(position, perspective, PieceKind::Cannon)
+                > 0,
+        );
+    feature_bucket_with_attack_from_mid(position, perspective, ours_mid, theirs_mid, attack_bucket)
+}
+
+fn feature_bucket_with_attack_from_mid(
+    position: &Position,
+    perspective: Color,
+    ours_mid: u64,
+    theirs_mid: u64,
+    attack_bucket: usize,
+) -> (usize, bool) {
     let king = position
         .general_square(perspective)
         .unwrap_or(match perspective {
@@ -343,16 +422,10 @@ pub(super) fn feature_bucket(position: &Position, perspective: Color) -> (usize,
     let opponent_code = king_bucket_code(opponent_king);
     let king_bucket = usize::from(king_code & 7);
     let opponent_bucket = opponent_code & 7;
-    let mid_mirror = requires_mid_mirror(position, perspective);
+    let mid_mirror = requires_mid_mirror_from_encodings(ours_mid, theirs_mid);
     let mirror = king_code >> 3 != 0
         || (king_bucket & 1 != 0
             && (opponent_code >> 3 != 0 || (opponent_bucket & 1 != 0 && mid_mirror)));
-    let attack_bucket = usize::from(piece_count(position, perspective, PieceKind::Rook) > 0) * 2
-        + usize::from(
-            piece_count(position, perspective, PieceKind::Horse)
-                + piece_count(position, perspective, PieceKind::Cannon)
-                > 0,
-        );
     (
         king_bucket * PIKAFISH_ATTACK_BUCKETS + attack_bucket,
         mirror,
@@ -385,7 +458,7 @@ pub(super) fn layer_stack_bucket(position: &Position) -> usize {
     }
 }
 
-fn psq_index(
+pub(super) fn psq_index(
     perspective: Color,
     square: usize,
     piece: Piece,
@@ -733,9 +806,7 @@ fn king_bucket_code(square: usize) -> u8 {
     }
 }
 
-fn requires_mid_mirror(position: &Position, perspective: Color) -> bool {
-    let ours = mid_encoding(position, perspective);
-    let theirs = mid_encoding(position, perspective.opposite());
+fn requires_mid_mirror_from_encodings(ours: u64, theirs: u64) -> bool {
     (ours & (1u64 << 63) != 0)
         && (theirs & (1u64 << 63) != 0)
         && (ours < BALANCE_ENCODING || (ours == BALANCE_ENCODING && theirs < BALANCE_ENCODING))
@@ -940,7 +1011,7 @@ mod tests {
             }
             let before = position.clone();
             position.make_move(legal[(ply * 17 + 3) % legal.len()]);
-            let active = active_psq_features_pair(&before);
+            let active = value_feature_states_pair(&before);
             positions.push((
                 before,
                 position.clone(),
@@ -966,6 +1037,37 @@ mod tests {
             dirty.as_secs_f64() * 1.0e6 / (positions.len() * 100) as f64,
             refresh.as_secs_f64() * 1.0e6 / (positions.len() * 100) as f64,
         );
+    }
+
+    #[test]
+    fn incremental_feature_state_matches_full_refresh_on_random_moves() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20 {
+            let mut position = Position::startpos();
+            let mut state = value_feature_states_pair(&position);
+            for _ in 0..100 {
+                let legal = position.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let mv = legal[seed as usize % legal.len()];
+                let moved = position.piece_at(mv.from as usize).unwrap();
+                let captured = position.piece_at(mv.to as usize);
+                position.make_move(mv);
+                state = transitioned_psq_features_pair(
+                    &position,
+                    &state,
+                    mv.from as usize,
+                    mv.to as usize,
+                    moved,
+                    captured,
+                );
+                assert_eq!(state, value_feature_states_pair(&position));
+            }
+        }
     }
 
     #[test]

@@ -114,10 +114,11 @@ const PIKAFISH_VALUE_FC0: usize = 32;
 const PIKAFISH_VALUE_FC1: usize = 32;
 const PIKAFISH_VALUE_TAIL: usize = (PIKAFISH_VALUE_FC0 + PIKAFISH_VALUE_FC1) * 2;
 use pikafish_value::{
-    ActiveValueFeatures, PIKAFISH_LAYER_STACKS, PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS,
+    PIKAFISH_LAYER_STACKS, PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS,
     PIKAFISH_TRANSFORMED_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS, PIKAFISH_TRANSFORMER_HALF,
-    PIKAFISH_VALUE_THREAT_DIMENSIONS, active_psq_features_pair, active_value_features_pair,
-    changed_threat_indices, layer_stack_bucket,
+    PIKAFISH_VALUE_THREAT_DIMENSIONS, ValueFeatureState, active_value_features_pair,
+    changed_threat_indices_for_move, layer_stack_bucket, psq_index, transitioned_psq_features_pair,
+    value_feature_states_pair,
 };
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -2438,35 +2439,44 @@ impl AzNnue {
         &self,
         before_position: &Position,
         after_position: &Position,
-        before: &[ActiveValueFeatures; 2],
+        before: &[ValueFeatureState; 2],
+        transition: (usize, usize, Piece, Option<Piece>),
         accumulator: &mut [i16],
         psqt_accumulator: &mut [i32],
-    ) -> [ActiveValueFeatures; 2] {
+    ) -> [ValueFeatureState; 2] {
         debug_assert_eq!(accumulator.len(), PIKAFISH_TRANSFORMER_DIMENSIONS * 2);
-        let mut after = active_psq_features_pair(after_position);
+        let after = {
+            crate::scope_profile!("az.value.delta.active_psq");
+            let (from, to, moved, captured) = transition;
+            transitioned_psq_features_pair(after_position, before, from, to, moved, captured)
+        };
         let requires_refresh: [bool; 2] = std::array::from_fn(|view| {
             before[view].feature_bucket != after[view].feature_bucket
                 || before[view].mirror != after[view].mirror
         });
         let changed_threats = (!requires_refresh[0] || !requires_refresh[1]).then(|| {
-            changed_threat_indices(
+            crate::scope_profile!("az.value.delta.threat_indices");
+            changed_threat_indices_for_move(
                 before_position,
                 after_position,
                 [before[0].mirror, before[1].mirror],
+                transition.0,
+                transition.1,
             )
         });
+        let refreshed = (requires_refresh[0] || requires_refresh[1])
+            .then(|| active_value_features_pair(after_position));
         for view in 0..2 {
-            let before_features = &before[view];
             let acc = &mut accumulator[view * PIKAFISH_TRANSFORMER_DIMENSIONS
                 ..(view + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
             // A feature-bucket or mirror change remaps every HalfKA and threat
             // index, so refresh that perspective. Otherwise update exact set deltas.
             if requires_refresh[view] {
-                after[view] = active_value_features_pair(after_position)[view].clone();
+                let refreshed = &refreshed.as_ref().unwrap()[view];
                 acc.fill(0);
                 psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS..(view + 1) * PIKAFISH_PSQT_BUCKETS]
                     .fill(0);
-                for &feature in &after[view].psq {
+                for &feature in &refreshed.psq {
                     add_i8_row_to_i16(
                         acc,
                         &self.pikafish_psq_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
@@ -2478,7 +2488,7 @@ impl AzNnue {
                         );
                     }
                 }
-                for &feature in &after[view].threats {
+                for &feature in &refreshed.threats {
                     add_i8_row_to_i16(
                         acc,
                         &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
@@ -2488,32 +2498,56 @@ impl AzNnue {
                 continue;
             }
             let (removed, added) = &changed_threats.as_ref().unwrap()[view];
-            apply_sorted_feature_delta(
-                acc,
-                &before_features.psq,
-                &after[view].psq,
-                &self.pikafish_psq_embedding_q,
-            );
-            apply_sorted_psqt_delta(
-                &mut psqt_accumulator
-                    [view * PIKAFISH_PSQT_BUCKETS..(view + 1) * PIKAFISH_PSQT_BUCKETS],
-                &before_features.psq,
-                &after[view].psq,
-                &self.pikafish_psqt_q,
-            );
-            for &feature in removed {
-                subtract_i8_row_from_i16(
-                    acc,
-                    &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
-                        ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
-                );
+            {
+                crate::scope_profile!("az.value.delta.psq_rows");
+                {
+                    let (from, to, moved, captured) = transition;
+                    let perspective = if view == 0 { Color::Red } else { Color::Black };
+                    let bucket = before[view].feature_bucket;
+                    let mirror = before[view].mirror;
+                    let mut update = |feature: usize, add: bool| {
+                        let row = &self.pikafish_psq_embedding_q[feature
+                            * PIKAFISH_TRANSFORMER_DIMENSIONS
+                            ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+                        let psqt_row = &self.pikafish_psqt_q[feature * PIKAFISH_PSQT_BUCKETS
+                            ..(feature + 1) * PIKAFISH_PSQT_BUCKETS];
+                        if add {
+                            add_i8_row_to_i16(acc, row);
+                            for index in 0..PIKAFISH_PSQT_BUCKETS {
+                                psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS + index] +=
+                                    i32::from(psqt_row[index]);
+                            }
+                        } else {
+                            subtract_i8_row_from_i16(acc, row);
+                            for index in 0..PIKAFISH_PSQT_BUCKETS {
+                                psqt_accumulator[view * PIKAFISH_PSQT_BUCKETS + index] -=
+                                    i32::from(psqt_row[index]);
+                            }
+                        }
+                    };
+                    update(psq_index(perspective, from, moved, bucket, mirror), false);
+                    if let Some(captured) = captured {
+                        update(psq_index(perspective, to, captured, bucket, mirror), false);
+                    }
+                    update(psq_index(perspective, to, moved, bucket, mirror), true);
+                }
             }
-            for &feature in added {
-                add_i8_row_to_i16(
-                    acc,
-                    &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
-                        ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
-                );
+            {
+                crate::scope_profile!("az.value.delta.threat_rows");
+                for &feature in removed {
+                    subtract_i8_row_from_i16(
+                        acc,
+                        &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                            ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
+                    );
+                }
+                for &feature in added {
+                    add_i8_row_to_i16(
+                        acc,
+                        &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                            ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
+                    );
+                }
             }
         }
         after
@@ -3194,65 +3228,6 @@ fn subtract_i8_row_from_i16(accumulator: &mut [i16], row: &[i8]) {
     }
     for (sum, &weight) in accumulator.iter_mut().zip(row) {
         *sum -= i16::from(weight);
-    }
-}
-
-fn apply_sorted_feature_delta(
-    accumulator: &mut [i16],
-    before: &[usize],
-    after: &[usize],
-    table: &[i8],
-) {
-    let mut left = 0usize;
-    let mut right = 0usize;
-    while left < before.len() || right < after.len() {
-        if right == after.len() || (left < before.len() && before[left] < after[right]) {
-            let feature = before[left];
-            let row = &table[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
-                ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
-            subtract_i8_row_from_i16(accumulator, row);
-            left += 1;
-        } else if left == before.len() || after[right] < before[left] {
-            let feature = after[right];
-            let row = &table[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
-                ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
-            add_i8_row_to_i16(accumulator, row);
-            right += 1;
-        } else {
-            left += 1;
-            right += 1;
-        }
-    }
-}
-
-fn apply_sorted_psqt_delta(
-    accumulator: &mut [i32],
-    before: &[usize],
-    after: &[usize],
-    table: &[i16],
-) {
-    debug_assert_eq!(accumulator.len(), PIKAFISH_PSQT_BUCKETS);
-    let mut left = 0;
-    let mut right = 0;
-    while left < before.len() || right < after.len() {
-        if right == after.len() || (left < before.len() && before[left] < after[right]) {
-            let row = &table
-                [before[left] * PIKAFISH_PSQT_BUCKETS..(before[left] + 1) * PIKAFISH_PSQT_BUCKETS];
-            for bucket in 0..PIKAFISH_PSQT_BUCKETS {
-                accumulator[bucket] -= i32::from(row[bucket]);
-            }
-            left += 1;
-        } else if left == before.len() || after[right] < before[left] {
-            let row = &table
-                [after[right] * PIKAFISH_PSQT_BUCKETS..(after[right] + 1) * PIKAFISH_PSQT_BUCKETS];
-            for bucket in 0..PIKAFISH_PSQT_BUCKETS {
-                accumulator[bucket] += i32::from(row[bucket]);
-            }
-            right += 1;
-        } else {
-            left += 1;
-            right += 1;
-        }
     }
 }
 
@@ -4512,19 +4487,22 @@ mod tests {
         let mut position = Position::startpos();
         let (_, mut incremental, mut psqt_incremental) =
             AzEvalAccumulator::new(&model, &position).into_sums();
-        let mut value_features = active_value_features_pair(&position);
+        let mut value_features = value_feature_states_pair(&position);
         for ply in 0..40 {
             let legal = position.legal_moves();
             if legal.is_empty() {
                 break;
             }
             let mv = legal[(ply * 17 + 3) % legal.len()];
+            let moved = position.piece_at(mv.from as usize).unwrap();
+            let captured = position.piece_at(mv.to as usize);
             let before = position.clone();
             position.make_move(mv);
             value_features = model.apply_pikafish_transition(
                 &before,
                 &position,
                 &value_features,
+                (mv.from as usize, mv.to as usize, moved, captured),
                 &mut incremental,
                 &mut psqt_incremental,
             );

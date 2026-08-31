@@ -283,6 +283,11 @@ impl Position {
         self.board[sq]
     }
 
+    #[inline(always)]
+    pub(crate) fn occupied_squares(&self) -> u128 {
+        self.occupied
+    }
+
     /// Visit occupied piece relations used by the network's relation head.
     ///
     /// For a cannon the first occupied square is emitted as its screen and the
