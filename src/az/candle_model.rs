@@ -1,5 +1,6 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 
+use super::fused_bucket_linear::bucket_affine;
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIKAFISH_LAYER_STACKS, PIKAFISH_PSQ_DIMENSIONS,
     PIKAFISH_PSQT_BUCKETS, PIKAFISH_TRANSFORMED_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS,
@@ -107,47 +108,41 @@ impl AzCandleModel {
             ],
             1,
         )?;
-        let fc0 = value_input
-            .matmul(&self.pikafish_value_fc0.t()?)?
-            .broadcast_add(&self.pikafish_value_fc0_bias)?
-            .broadcast_add(
-                &batch
-                    .rule_context
-                    .matmul(&self.pikafish_value_rule_fc0.t()?)?,
-            )?
-            .reshape((batch.batch_size, PIKAFISH_LAYER_STACKS, PIKAFISH_VALUE_FC0))?;
+        let value_rule_input = Tensor::cat(&[&value_input, &batch.rule_context], 1)?;
+        let fc0_weight = Tensor::cat(
+            &[
+                self.pikafish_value_fc0.as_tensor(),
+                self.pikafish_value_rule_fc0.as_tensor(),
+            ],
+            1,
+        )?;
+        let fc0 = bucket_affine(
+            &value_rule_input,
+            &fc0_weight,
+            self.pikafish_value_fc0_bias.as_tensor(),
+            &batch.layer_stack_indices,
+            PIKAFISH_LAYER_STACKS,
+        )?;
         let fc0_clip = fc0.clamp(0.0f64, 1.0f64)?;
-        let fc0_pair = Tensor::cat(&[&fc0_clip.sqr()?, &fc0_clip], 2)?;
-        let fc1_weight = self
-            .pikafish_value_fc1
-            .reshape((
-                1,
-                PIKAFISH_LAYER_STACKS,
-                PIKAFISH_VALUE_FC1,
-                PIKAFISH_VALUE_FC0 * 2,
-            ))?
-            .transpose(2, 3)?;
-        let fc1_all = fc0_pair
-            .unsqueeze(2)?
-            .broadcast_matmul(&fc1_weight)?
-            .squeeze(2)?
-            .broadcast_add(
-                &self
-                    .pikafish_value_fc1_bias
-                    .reshape((PIKAFISH_LAYER_STACKS, PIKAFISH_VALUE_FC1))?,
-            )?;
-        let fc1_clip = fc1_all.clamp(0.0f64, 1.0f64)?;
-        let tail = Tensor::cat(&[&fc0_pair, &fc1_clip.sqr()?, &fc1_clip], 2)?;
-        let stack_mask = batch.layer_stack_one_hot.unsqueeze(2)?;
-        let selected_tail = tail.broadcast_mul(&stack_mask)?.sum(1)?;
-        let selected_fc0 = fc0.broadcast_mul(&stack_mask)?.sum(1)?;
-        let output_all = selected_tail
-            .matmul(&self.pikafish_value_output.t()?)?
-            .broadcast_add(&self.pikafish_value_output_bias)?
-            .reshape((batch.batch_size, PIKAFISH_LAYER_STACKS, WDL_HEAD_SIZE))?;
-        let mut value_logits = output_all.broadcast_mul(&stack_mask)?.sum(1)?;
-        let skip = (selected_fc0.narrow(1, PIKAFISH_VALUE_FC0 - 2, 1)?
-            - selected_fc0.narrow(1, PIKAFISH_VALUE_FC0 - 1, 1)?)?;
+        let fc0_pair = Tensor::cat(&[&fc0_clip.sqr()?, &fc0_clip], 1)?;
+        let fc1 = bucket_affine(
+            &fc0_pair,
+            self.pikafish_value_fc1.as_tensor(),
+            self.pikafish_value_fc1_bias.as_tensor(),
+            &batch.layer_stack_indices,
+            PIKAFISH_LAYER_STACKS,
+        )?;
+        let fc1_clip = fc1.clamp(0.0f64, 1.0f64)?;
+        let selected_tail = Tensor::cat(&[&fc0_pair, &fc1_clip.sqr()?, &fc1_clip], 1)?;
+        let mut value_logits = bucket_affine(
+            &selected_tail,
+            self.pikafish_value_output.as_tensor(),
+            self.pikafish_value_output_bias.as_tensor(),
+            &batch.layer_stack_indices,
+            PIKAFISH_LAYER_STACKS,
+        )?;
+        let skip = (fc0.narrow(1, PIKAFISH_VALUE_FC0 - 2, 1)?
+            - fc0.narrow(1, PIKAFISH_VALUE_FC0 - 1, 1)?)?;
         let signed = Tensor::cat(&[&skip, &Tensor::zeros_like(&skip)?, &skip.neg()?], 1)?;
         let psqt_views = sparse_pool(self.pikafish_psqt.as_tensor(), &batch.pikafish_psq_indices)?
             .reshape((batch.batch_size, 2, PIKAFISH_PSQT_BUCKETS))?;
@@ -156,18 +151,14 @@ impl AzCandleModel {
         let psqt = (psqt_diff * batch.layer_stack_one_hot.clone())?.sum_keepdim(1)?;
         let psqt_signed = Tensor::cat(&[&psqt, &Tensor::zeros_like(&psqt)?, &psqt.neg()?], 1)?;
         value_logits = (value_logits + signed + psqt_signed)?;
-        let short_all = selected_tail
-            .matmul(&self.pikafish_short_value_output.t()?)?
-            .broadcast_add(&self.pikafish_short_value_bias)?
-            .reshape((
-                batch.batch_size,
-                PIKAFISH_LAYER_STACKS,
-                super::SHORT_VALUE_HEADS,
-                WDL_HEAD_SIZE,
-            ))?;
-        let short_value_logits = short_all
-            .broadcast_mul(&batch.layer_stack_one_hot.unsqueeze(2)?.unsqueeze(3)?)?
-            .sum(1)?;
+        let short_value_logits = bucket_affine(
+            &selected_tail,
+            self.pikafish_short_value_output.as_tensor(),
+            self.pikafish_short_value_bias.as_tensor(),
+            &batch.layer_stack_indices,
+            PIKAFISH_LAYER_STACKS,
+        )?
+        .reshape((batch.batch_size, super::SHORT_VALUE_HEADS, WDL_HEAD_SIZE))?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
@@ -248,6 +239,7 @@ pub(super) struct BatchTensors {
     pub(super) value_threat_indices: Tensor,
     pub(super) pikafish_psq_indices: Tensor,
     pub(super) pikafish_threat_indices: Tensor,
+    pub(super) layer_stack_indices: Tensor,
     pub(super) layer_stack_one_hot: Tensor,
     pub(super) policy_items: Tensor,
     pub(super) policy_sparse_indices: Tensor,
@@ -303,6 +295,11 @@ impl BatchTensors {
             pikafish_threat_indices: Tensor::from_vec(
                 packed.pikafish_threat_indices,
                 (batch_size * 2, max_pikafish_threats),
+                device,
+            )?,
+            layer_stack_indices: Tensor::from_vec(
+                packed.pikafish_layer_stacks,
+                batch_size,
                 device,
             )?,
             layer_stack_one_hot: Tensor::from_vec(

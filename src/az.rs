@@ -15,6 +15,7 @@ mod alphazero;
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
 mod dataloader;
+mod fused_bucket_linear;
 mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
@@ -3052,25 +3053,24 @@ pub fn benchmark_training(
 ) -> AzTrainBenchmark {
     let mut rng = SplitMix64::new(seed);
     let mut samples = Vec::with_capacity(sample_count);
-    for index in 0..sample_count {
-        let feature_count = 24 + (rng.next_u64() as usize % 16);
-        let mut features = Vec::with_capacity(feature_count);
-        for _ in 0..feature_count {
-            features.push((rng.next_u64() as usize) % AZ_NNUE_INPUT_SIZE);
+    let mut position = Position::startpos();
+    let mut game_ply = 0usize;
+    for _ in 0..sample_count {
+        let mut moves = position.legal_moves();
+        if moves.is_empty() || game_ply >= 120 {
+            position = Position::startpos();
+            game_ply = 0;
+            moves = position.legal_moves();
         }
-        features.sort_unstable();
-        features.dedup();
-
+        let side = position.side_to_move();
+        let mut features = Vec::with_capacity(32);
+        fill_sparse_features_az(&position, &mut features);
         let value = rng.unit_f32() * 2.0 - 1.0;
-        let move_count = 12 + (rng.next_u64() as usize % 24);
-        let mut move_indices = Vec::with_capacity(move_count);
-        while move_indices.len() < move_count {
-            let candidate = (rng.next_u64() as usize) % DENSE_MOVE_SPACE;
-            if !move_indices.contains(&candidate) {
-                move_indices.push(candidate);
-            }
-        }
-        let mut policy = (0..move_count)
+        let move_indices = moves
+            .iter()
+            .map(|&mv| dense_move_index(canonical_move(side, mv)))
+            .collect::<Vec<_>>();
+        let mut policy = (0..moves.len())
             .map(|_| rng.unit_f32().max(1e-6))
             .collect::<Vec<_>>();
         let policy_sum = policy.iter().sum::<f32>().max(1e-6);
@@ -3092,9 +3092,9 @@ pub fn benchmark_training(
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         });
-        if index + 1 == sample_count {
-            break;
-        }
+        let played = moves[rng.next_u64() as usize % moves.len()];
+        position.make_move(played);
+        game_ply += 1;
     }
     let stats = train_samples(model, &samples, epochs, lr, batch_size, &mut rng)
         .unwrap_or_else(|err| panic!("training failed: {err}"));

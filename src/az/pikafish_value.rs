@@ -316,10 +316,14 @@ fn affected_threat_indices(
     mirrors: [bool; 2],
 ) -> [SmallVec<[usize; 64]>; 2] {
     let mut indices: [SmallVec<[usize; 64]>; 2] = std::array::from_fn(|_| SmallVec::new());
-    let mut occupied = position.occupied_squares();
-    while occupied != 0 {
-        let source = occupied.trailing_zeros() as usize;
-        occupied &= occupied - 1;
+    let mut candidates = 0u128;
+    for &square in changed {
+        candidates |= relation_candidate_source_masks()[square];
+    }
+    candidates &= position.occupied_squares();
+    while candidates != 0 {
+        let source = candidates.trailing_zeros() as usize;
+        candidates &= candidates - 1;
         let piece = position.piece_at(source).unwrap();
         if !changed
             .iter()
@@ -354,6 +358,29 @@ fn affected_threat_indices(
         view.dedup();
     }
     indices
+}
+
+fn relation_candidate_source_masks() -> &'static [u128; BOARD_SIZE] {
+    static MASKS: OnceLock<[u128; BOARD_SIZE]> = OnceLock::new();
+    MASKS.get_or_init(|| {
+        std::array::from_fn(|changed| {
+            let cf = changed % BOARD_FILES;
+            let cr = changed / BOARD_FILES;
+            let mut mask = 0u128;
+            for source in 0..BOARD_SIZE {
+                let sf = source % BOARD_FILES;
+                let sr = source / BOARD_FILES;
+                let df = sf.abs_diff(cf);
+                let dr = sr.abs_diff(cr);
+                // Union of every piece kind's occupancy-sensitive source geometry.
+                // The exact kind-specific predicate below removes false positives.
+                if source == changed || sf == cf || sr == cr || (df <= 2 && dr <= 2) {
+                    mask |= 1u128 << source;
+                }
+            }
+            mask
+        })
+    })
 }
 
 fn relation_source_affected(source: usize, piece: Piece, changed: usize) -> bool {
