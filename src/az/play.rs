@@ -687,7 +687,8 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 break;
             }
         }
-        if result.is_none() {
+        let truncated = result.is_none();
+        if truncated {
             terminal.max_plies += 1;
         }
 
@@ -701,13 +702,16 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
+            let truncated_tail =
+                truncated.then(|| truncated_terminal_wdl(model, &position, &rule_history));
+            let terminal_wdl = game_terminal_wdl(&game_samples, result, truncated_tail);
             assign_td_lambda_value_targets(
                 &mut game_samples,
                 &game_bootstrap_wdls,
-                result,
+                terminal_wdl,
                 config.value_td_lambda,
             );
-            assign_short_value_targets(&mut game_samples, result);
+            assign_short_value_targets(&mut game_samples, terminal_wdl);
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -763,6 +767,7 @@ struct BatchedSelfplayGame {
     samples: Vec<AzTrainingSample>,
     bootstrap_wdls: Vec<[f32; 3]>,
     result: Option<f32>,
+    truncated: bool,
     ply: usize,
     phase_ply: usize,
     opening_harvest_ply: Option<usize>,
@@ -783,6 +788,7 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         samples: Vec::new(),
         bootstrap_wdls: Vec::new(),
         result: None,
+        truncated: false,
         ply: 0,
         phase_ply: start.phase_ply,
         opening_harvest_ply: start.opening_harvest_ply,
@@ -863,6 +869,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 }
                 if state.phase_ply >= config.max_plies {
                     state.result = Some(0.0);
+                    state.truncated = true;
                     data.terminal.max_plies += 1;
                     continue;
                 }
@@ -1047,14 +1054,18 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 std::cmp::Ordering::Equal => data.draws += 1,
             }
             data.plies_total += state.reported_plies;
+            let truncated_tail = state
+                .truncated
+                .then(|| truncated_terminal_wdl(model, &state.position, &state.rule_history));
             let mut game_samples = state.samples;
+            let terminal_wdl = game_terminal_wdl(&game_samples, result, truncated_tail);
             assign_td_lambda_value_targets(
                 &mut game_samples,
                 &state.bootstrap_wdls,
-                result,
+                terminal_wdl,
                 config.value_td_lambda,
             );
-            assign_short_value_targets(&mut game_samples, result);
+            assign_short_value_targets(&mut game_samples, terminal_wdl);
             data.samples.extend(game_samples.iter().cloned());
             data.games.push(game_samples);
         }
@@ -1171,19 +1182,12 @@ fn make_training_sample(
     }
 }
 
-fn assign_short_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
+fn assign_short_value_targets(samples: &mut [AzTrainingSample], terminal_wdl: [f32; 3]) {
     for (head, horizon) in crate::az::SHORT_VALUE_HORIZONS.into_iter().enumerate() {
         let now_factor = 1.0 / (horizon as f32 + 1.0);
         let mut next_target = None;
         for index in (0..samples.len()).rev() {
-            let continuation = next_target.map_or_else(
-                || {
-                    scalar_value_to_wdl_target(
-                        (game_result_red * samples[index].side_sign).clamp(-1.0, 1.0),
-                    )
-                },
-                flip_wdl,
-            );
+            let continuation = next_target.map_or_else(|| terminal_wdl, flip_wdl);
             let search = normalize_wdl_target(samples[index].root_search_wdl);
             let target = std::array::from_fn(|part| {
                 now_factor * search[part] + (1.0 - now_factor) * continuation[part]
@@ -1246,7 +1250,7 @@ fn move_search_meta(
 fn assign_td_lambda_value_targets(
     samples: &mut [AzTrainingSample],
     bootstrap_wdls: &[[f32; 3]],
-    game_result_red: f32,
+    terminal_wdl: [f32; 3],
     td_lambda: f32,
 ) {
     assert_eq!(samples.len(), bootstrap_wdls.len());
@@ -1254,7 +1258,7 @@ fn assign_td_lambda_value_targets(
         return;
     };
     let lambda = td_lambda.clamp(0.0, 1.0);
-    let terminal = scalar_value_to_wdl_target((game_result_red * last.side_sign).clamp(-1.0, 1.0));
+    let terminal = normalize_wdl_target(terminal_wdl);
     last.value_wdl = terminal;
     last.value = terminal[0] - terminal[2];
     let mut next_target = terminal;
@@ -1268,6 +1272,36 @@ fn assign_td_lambda_value_targets(
         samples[index].value = target[0] - target[2];
         next_target = target;
     }
+}
+
+fn game_terminal_wdl(
+    samples: &[AzTrainingSample],
+    game_result_red: f32,
+    truncated_tail: Option<[f32; 3]>,
+) -> [f32; 3] {
+    let Some(last) = samples.last() else {
+        return [0.0, 1.0, 0.0];
+    };
+    if let Some(terminal) = truncated_tail {
+        normalize_wdl_target(terminal)
+    } else {
+        scalar_value_to_wdl_target((game_result_red * last.side_sign).clamp(-1.0, 1.0))
+    }
+}
+
+fn truncated_terminal_wdl(
+    model: &AzNnue,
+    position: &Position,
+    rule_history: &[RuleHistoryEntry],
+) -> [f32; 3] {
+    let legal_moves = position
+        .legal_moves_with_rules_and_repetition(rule_history)
+        .into_iter()
+        .map(|(mv, _)| mv)
+        .collect::<Vec<_>>();
+    // The final position is one ply after the last recorded sample, so its
+    // side-to-move WDL must be flipped back into the last sample's perspective.
+    flip_wdl(model.evaluate_wdl_with_rules(position, rule_history, &legal_moves))
 }
 
 fn flip_wdl(wdl: [f32; 3]) -> [f32; 3] {
@@ -1851,7 +1885,12 @@ mod tests {
         samples[0].meta.root_q = -1.0;
         samples[1].meta.root_q = 1.0;
 
-        assign_td_lambda_value_targets(&mut samples, &[[0.2, 0.3, 0.5], [0.6, 0.2, 0.2]], 1.0, 1.0);
+        assign_td_lambda_value_targets(
+            &mut samples,
+            &[[0.2, 0.3, 0.5], [0.6, 0.2, 0.2]],
+            [0.0, 0.0, 1.0],
+            1.0,
+        );
 
         assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(samples[0].value, 1.0);
@@ -1864,7 +1903,7 @@ mod tests {
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
         let bootstraps = [[0.4, 0.4, 0.2], [0.1, 0.6, 0.3], [0.6, 0.2, 0.2]];
 
-        assign_td_lambda_value_targets(&mut samples, &bootstraps, 1.0, 0.9);
+        assign_td_lambda_value_targets(&mut samples, &bootstraps, [1.0, 0.0, 0.0], 0.9);
 
         let expected = [[0.894, 0.078, 0.028], [0.02, 0.02, 0.96], [1.0, 0.0, 0.0]];
         for (sample, expected) in samples.iter().zip(expected) {
@@ -1881,7 +1920,7 @@ mod tests {
         samples[0].root_search_wdl = [0.6, 0.3, 0.1];
         samples[1].root_search_wdl = [0.2, 0.5, 0.3];
         samples[2].root_search_wdl = [0.1, 0.2, 0.7];
-        assign_short_value_targets(&mut samples, 1.0);
+        assign_short_value_targets(&mut samples, [1.0, 0.0, 0.0]);
 
         let expected_short = [
             [0.6928, 0.1656, 0.1416],
@@ -1897,6 +1936,62 @@ mod tests {
         assert!((long_last[0] - (0.1 / 33.0 + 32.0 / 33.0)).abs() < 1.0e-6);
         assert!((long_last[1] - 0.2 / 33.0).abs() < 1.0e-6);
         assert!((long_last[2] - 0.7 / 33.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn truncated_game_uses_soft_root_wdl_for_all_value_tails() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        samples[0].root_search_wdl = [0.4, 0.3, 0.3];
+        samples[1].root_search_wdl = [0.65, 0.25, 0.10];
+        let terminal = game_terminal_wdl(&samples, 0.0, Some([0.65, 0.25, 0.10]));
+        assert_eq!(terminal, [0.65, 0.25, 0.10]);
+
+        assign_td_lambda_value_targets(
+            &mut samples,
+            &[[0.3, 0.4, 0.3], [0.65, 0.25, 0.10]],
+            terminal,
+            1.0,
+        );
+        assert_eq!(samples[1].value_wdl, [0.65, 0.25, 0.10]);
+        assert_eq!(samples[0].value_wdl, [0.10, 0.25, 0.65]);
+
+        assign_short_value_targets(&mut samples, terminal);
+        for (head, horizon) in crate::az::SHORT_VALUE_HORIZONS.into_iter().enumerate() {
+            for (actual, expected) in samples[1].short_value_wdl[head].iter().zip(terminal) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+            let p = 1.0 / (horizon as f32 + 1.0);
+            let expected = [
+                p * 0.4 + (1.0 - p) * 0.10,
+                p * 0.3 + (1.0 - p) * 0.25,
+                p * 0.3 + (1.0 - p) * 0.65,
+            ];
+            for (actual, expected) in samples[0].short_value_wdl[head].iter().zip(expected) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn real_terminal_result_stays_one_hot_in_last_side_perspective() {
+        let samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        assert_eq!(game_terminal_wdl(&samples, 1.0, None), [0.0, 0.0, 1.0]);
+        assert_eq!(game_terminal_wdl(&samples, -1.0, None), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn truncated_tail_evaluates_final_position_and_flips_to_last_sample_view() {
+        let mut model = AzNnue::random(128, 0x51ea);
+        model.value_head_bias[0] = 1.0;
+        model.value_head_output[0] = 1.0;
+        model.value_head_output[2 * crate::az::VALUE_HEAD_SIZE] = -0.5;
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let legal = position.legal_moves();
+        let raw_final = model.evaluate_wdl_with_rules(&position, &history, &legal);
+        assert!(raw_final[0] > raw_final[2]);
+        let last_sample_tail = truncated_terminal_wdl(&model, &position, &history);
+        assert_eq!(last_sample_tail, flip_wdl(raw_final));
     }
 
     #[test]
