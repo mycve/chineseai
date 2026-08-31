@@ -28,6 +28,8 @@ pub(super) struct AzCandleModel {
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_output: Var,
+    short_value_head_output: Var,
+    short_value_head_bias: Var,
     value_threat_embedding: Var,
     value_threat_output: Var,
     policy_threat_context: Var,
@@ -73,6 +75,10 @@ impl AzCandleModel {
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
+        let short_value_logits = value_head
+            .matmul(&self.short_value_head_output.t()?)?
+            .broadcast_add(&self.short_value_head_bias)?
+            .reshape((batch.batch_size, super::SHORT_VALUE_HEADS, WDL_HEAD_SIZE))?;
         let threat_accumulator = sparse_pool(
             self.value_threat_embedding.as_tensor(),
             &batch.value_threat_indices,
@@ -142,6 +148,7 @@ impl AzCandleModel {
 
         Ok(ForwardOutput {
             value_logits,
+            short_value_logits,
             policy_logits,
         })
     }
@@ -149,6 +156,7 @@ impl AzCandleModel {
 
 pub(super) struct ForwardOutput {
     pub(super) value_logits: Tensor,
+    pub(super) short_value_logits: Tensor,
     pub(super) policy_logits: Tensor,
 }
 
@@ -162,6 +170,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) value_wdl: Tensor,
+    pub(super) short_value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) rule_context: Tensor,
     pub(super) policy_weights: Tensor,
@@ -221,6 +230,11 @@ impl BatchTensors {
                 device,
             )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
+            short_value_wdl: Tensor::from_vec(
+                packed.short_value_wdl,
+                (batch_size, super::SHORT_VALUE_HEADS, WDL_HEAD_SIZE),
+                device,
+            )?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             rule_context: Tensor::from_vec(
                 packed.rule_context,
@@ -285,6 +299,16 @@ impl AzCandleModel {
             value_head_output: var_from_slice(
                 &model.value_head_output,
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            short_value_head_output: var_from_slice(
+                &model.short_value_head_output,
+                (super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            short_value_head_bias: var_from_slice(
+                &model.short_value_head_bias,
+                super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE,
                 device,
             )?,
             value_threat_embedding: var_from_slice(
@@ -354,6 +378,8 @@ impl AzCandleModel {
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_output.clone());
+        vars.push(self.short_value_head_output.clone());
+        vars.push(self.short_value_head_bias.clone());
         vars.push(self.value_threat_embedding.clone());
         vars.push(self.value_threat_output.clone());
         vars.push(self.policy_threat_context.clone());
@@ -383,6 +409,14 @@ impl AzCandleModel {
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
+        copy_var(
+            &self.short_value_head_output,
+            &mut model.short_value_head_output,
+        )?;
+        copy_var(
+            &self.short_value_head_bias,
+            &mut model.short_value_head_bias,
+        )?;
         copy_var(
             &self.value_threat_embedding,
             &mut model.value_threat_embedding,
@@ -495,6 +529,8 @@ mod tests {
             move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
             policy: vec![1.0; moves.len()],
             value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            short_value_wdl: [[0.0, 1.0, 0.0]; crate::az::SHORT_VALUE_HEADS],
             value: 0.0,
             side_sign: 1.0,
             policy_weight: 1.0,

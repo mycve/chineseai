@@ -100,6 +100,14 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     for &value in &normalize_wdl_target(sample.value_wdl) {
         replay_push_f32(out, value);
     }
+    for &value in &normalize_wdl_target(sample.root_search_wdl) {
+        replay_push_f32(out, value);
+    }
+    for target in sample.short_value_wdl {
+        for value in normalize_wdl_target(target) {
+            replay_push_f32(out, value);
+        }
+    }
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
     replay_push_f32(out, sample.policy_weight);
@@ -211,6 +219,18 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         *value = replay_read_f32(reader)?;
     }
     value_wdl = normalize_wdl_target(value_wdl);
+    let mut root_search_wdl = [0.0f32; WDL_HEAD_SIZE];
+    for value in &mut root_search_wdl {
+        *value = replay_read_f32(reader)?;
+    }
+    root_search_wdl = normalize_wdl_target(root_search_wdl);
+    let mut short_value_wdl = [[0.0f32; WDL_HEAD_SIZE]; super::SHORT_VALUE_HEADS];
+    for target in &mut short_value_wdl {
+        for value in target.iter_mut() {
+            *value = replay_read_f32(reader)?;
+        }
+        *target = normalize_wdl_target(*target);
+    }
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
     let policy_weight = replay_read_f32(reader)?;
@@ -240,6 +260,8 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         move_indices,
         policy,
         value_wdl,
+        root_search_wdl,
+        short_value_wdl,
         value,
         side_sign,
         policy_weight,
@@ -778,6 +800,8 @@ mod tests {
             move_indices: vec![0],
             policy: vec![1.0],
             value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            short_value_wdl: [[0.0, 1.0, 0.0]; super::super::SHORT_VALUE_HEADS],
             value: 0.0,
             side_sign: 1.0,
             policy_weight: 1.0,
@@ -795,12 +819,16 @@ mod tests {
     #[test]
     fn replay_roundtrip_preserves_start_source() {
         let mut encoded = Vec::new();
-        let original = sample(AzStartSource::OpeningPool, 7, 11);
+        let mut original = sample(AzStartSource::OpeningPool, 7, 11);
+        original.root_search_wdl = [0.6, 0.3, 0.1];
+        original.short_value_wdl = [[0.5, 0.3, 0.2], [0.4, 0.4, 0.2], [0.3, 0.5, 0.2]];
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
         assert_eq!(decoded.meta.start_source, AzStartSource::OpeningPool);
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
+        assert_eq!(decoded.root_search_wdl, original.root_search_wdl);
+        assert_eq!(decoded.short_value_wdl, original.short_value_wdl);
     }
 
     #[test]

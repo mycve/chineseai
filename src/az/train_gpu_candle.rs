@@ -88,6 +88,9 @@ pub(super) fn train_samples_gpu(
         stats.loss /= denom;
         stats.value_loss /= denom;
         stats.policy_ce /= denom;
+        for value in &mut stats.short_value_ce {
+            *value /= denom;
+        }
     }
     let trainer = model
         .gpu_trainer
@@ -198,6 +201,7 @@ impl GpuReplica {
             batch_len,
             loss_weights.value,
             loss_weights.policy,
+            loss_weights.short_value,
         )?;
         profile_sync(&self.device)?;
         let loss_seconds = loss_started.elapsed().as_secs_f64();
@@ -224,6 +228,7 @@ impl GpuReplica {
         batch_len: usize,
         value_weight: f32,
         policy_weight: f32,
+        short_value_weight: f32,
     ) -> CandleResult<BatchLossOutput> {
         let forward = self.model.forward(batch_tensors)?;
         let value_log_probs = log_softmax(&forward.value_logits, 1)?;
@@ -233,6 +238,11 @@ impl GpuReplica {
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
         let value_ce = value_ce_per_sample.sum_all()?;
+        let short_value_log_probs = log_softmax(&forward.short_value_logits, 2)?;
+        let short_value_probs = short_value_log_probs.exp()?;
+        let short_value_ce_per_sample =
+            ((&batch_tensors.short_value_wdl * &short_value_log_probs)? * -1.0)?.sum(2)?;
+        let short_value_ce_by_head = short_value_ce_per_sample.sum(0)?.to_vec1::<f32>()?;
         let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -246,13 +256,48 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
-        let loss_sum = (weighted_value_loss + weighted_policy_ce)?;
+        let weighted_short_value_ce = short_value_ce_per_sample
+            .broadcast_mul(&batch_tensors.value_weights.unsqueeze(1)?)?
+            .sum_all()?
+            .affine(short_value_weight.max(0.0) as f64, 0.0)?;
+        let loss_sum = ((weighted_value_loss + weighted_policy_ce)? + weighted_short_value_ce)?;
         let loss_tensor = (&loss_sum / batch_len as f64)?;
 
         let value_sq = value.sqr()?;
         let target_sq = batch_tensors.values.sqr()?;
         let pred_target = value.broadcast_mul(&batch_tensors.values)?;
         let error_sq = value_error.sqr()?;
+        let short_q_weights = Tensor::from_vec(
+            vec![1.0f32, 0.0, -1.0],
+            (WDL_HEAD_SIZE, 1),
+            short_value_probs.device(),
+        )?;
+        let short_pred = short_value_probs
+            .reshape((
+                batch_tensors.batch_size * super::SHORT_VALUE_HEADS,
+                WDL_HEAD_SIZE,
+            ))?
+            .matmul(&short_q_weights)?
+            .reshape((batch_tensors.batch_size, super::SHORT_VALUE_HEADS))?;
+        let short_target = batch_tensors
+            .short_value_wdl
+            .reshape((
+                batch_tensors.batch_size * super::SHORT_VALUE_HEADS,
+                WDL_HEAD_SIZE,
+            ))?
+            .matmul(&short_q_weights)?
+            .reshape((batch_tensors.batch_size, super::SHORT_VALUE_HEADS))?;
+        let short_error = (&short_pred - &short_target)?;
+        let short_pred_sq = short_pred.sqr()?;
+        let short_target_sq = short_target.sqr()?;
+        let short_pred_target = (&short_pred * &short_target)?;
+        let short_error_sq = short_error.sqr()?;
+        let short_pred_sum = short_pred.sum(0)?.to_vec1::<f32>()?;
+        let short_pred_sq_sum = short_pred_sq.sum(0)?.to_vec1::<f32>()?;
+        let short_target_sum = short_target.sum(0)?.to_vec1::<f32>()?;
+        let short_target_sq_sum = short_target_sq.sum(0)?.to_vec1::<f32>()?;
+        let short_pred_target_sum = short_pred_target.sum(0)?.to_vec1::<f32>()?;
+        let short_error_sq_sum = short_error_sq.sum(0)?.to_vec1::<f32>()?;
         let mut metrics = Vec::with_capacity(9 + (3 + 9) * 7);
         metrics.push(loss_sum);
         metrics.push(value_ce);
@@ -317,6 +362,16 @@ impl GpuReplica {
             loss: metrics[0],
             value_loss: metrics[1],
             policy_ce: metrics[2],
+            short_value_ce: std::array::from_fn(|head| short_value_ce_by_head[head]),
+            short_value: std::array::from_fn(|head| AzValueMomentStats {
+                pred_sum: short_pred_sum[head],
+                pred_sq_sum: short_pred_sq_sum[head],
+                target_sum: short_target_sum[head],
+                target_sq_sum: short_target_sq_sum[head],
+                pred_target_sum: short_pred_target_sum[head],
+                error_sq_sum: short_error_sq_sum[head],
+                samples: batch_tensors.batch_size,
+            }),
             value_pred_sum: metrics[3],
             value_pred_sq_sum: metrics[4],
             value_target_sum: metrics[5],

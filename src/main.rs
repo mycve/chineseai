@@ -5203,6 +5203,8 @@ fn load_pikafish_training_samples(path: &str) -> io::Result<Vec<AzTrainingSample
             move_indices,
             policy,
             value_wdl: wdl,
+            root_search_wdl: wdl,
+            short_value_wdl: [wdl; chineseai::az::SHORT_VALUE_HEADS],
             value: wdl[0] - wdl[2],
             side_sign: if side == chineseai::xiangqi::Color::Red {
                 1.0
@@ -5441,6 +5443,8 @@ mod reporting_tests {
             move_indices: (0..policy.len()).collect(),
             policy,
             value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            short_value_wdl: [[0.0, 1.0, 0.0]; chineseai::az::SHORT_VALUE_HEADS],
             value: 0.0,
             side_sign: 1.0,
             policy_weight: 1.0,

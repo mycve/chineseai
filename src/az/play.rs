@@ -15,7 +15,7 @@ use super::alphazero::{
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
     AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
-    rule_context_features, scalar_value_to_wdl_target,
+    normalize_wdl_target, rule_context_features, scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -628,6 +628,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     &rule_history,
                     &search.candidates,
                     search.value_q,
+                    search.value_wdl,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
                     search_simulation_count,
@@ -706,6 +707,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 result,
                 config.value_td_lambda,
             );
+            assign_short_value_targets(&mut game_samples, result);
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -974,6 +976,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     &state.rule_history,
                     &search.candidates,
                     search.value_q,
+                    search.value_wdl,
                     state.rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
                     search.simulations,
@@ -1051,6 +1054,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 result,
                 config.value_td_lambda,
             );
+            assign_short_value_targets(&mut game_samples, result);
             data.samples.extend(game_samples.iter().cloned());
             data.games.push(game_samples);
         }
@@ -1117,6 +1121,7 @@ fn make_training_sample(
     rule_history: &[RuleHistoryEntry],
     candidates: &[AzCandidate],
     value: f32,
+    root_search_wdl: [f32; 3],
     mirror_file: bool,
     meta: AzSampleMeta,
     search_simulations: usize,
@@ -1155,12 +1160,37 @@ fn make_training_sample(
         move_indices,
         policy,
         value_wdl: scalar_value_to_wdl_target(value),
+        root_search_wdl: normalize_wdl_target(root_search_wdl),
+        short_value_wdl: [normalize_wdl_target(root_search_wdl); crate::az::SHORT_VALUE_HEADS],
         value: value.clamp(-1.0, 1.0),
         side_sign,
         policy_weight: policy_weight.max(0.0),
         value_weight: 1.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
+    }
+}
+
+fn assign_short_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
+    for (head, horizon) in crate::az::SHORT_VALUE_HORIZONS.into_iter().enumerate() {
+        let now_factor = 1.0 / (horizon as f32 + 1.0);
+        let mut next_target = None;
+        for index in (0..samples.len()).rev() {
+            let continuation = next_target.map_or_else(
+                || {
+                    scalar_value_to_wdl_target(
+                        (game_result_red * samples[index].side_sign).clamp(-1.0, 1.0),
+                    )
+                },
+                flip_wdl,
+            );
+            let search = normalize_wdl_target(samples[index].root_search_wdl);
+            let target = std::array::from_fn(|part| {
+                now_factor * search[part] + (1.0 - now_factor) * continuation[part]
+            });
+            samples[index].short_value_wdl[head] = normalize_wdl_target(target);
+            next_target = Some(target);
+        }
     }
 }
 
@@ -1804,6 +1834,8 @@ mod tests {
             move_indices: Vec::new(),
             policy: Vec::new(),
             value_wdl: scalar_value_to_wdl_target(value),
+            root_search_wdl: scalar_value_to_wdl_target(value),
+            short_value_wdl: [scalar_value_to_wdl_target(value); crate::az::SHORT_VALUE_HEADS],
             value,
             side_sign,
             policy_weight: 1.0,
@@ -1844,6 +1876,30 @@ mod tests {
     }
 
     #[test]
+    fn short_value_targets_use_geometric_search_values_and_terminal_tail() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
+        samples[0].root_search_wdl = [0.6, 0.3, 0.1];
+        samples[1].root_search_wdl = [0.2, 0.5, 0.3];
+        samples[2].root_search_wdl = [0.1, 0.2, 0.7];
+        assign_short_value_targets(&mut samples, 1.0);
+
+        let expected_short = [
+            [0.6928, 0.1656, 0.1416],
+            [0.152, 0.132, 0.716],
+            [0.82, 0.04, 0.14],
+        ];
+        for (sample, expected) in samples.iter().zip(expected_short) {
+            for (actual, expected) in sample.short_value_wdl[0].iter().zip(expected) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+        }
+        let long_last = samples[2].short_value_wdl[2];
+        assert!((long_last[0] - (0.1 / 33.0 + 32.0 / 33.0)).abs() < 1.0e-6);
+        assert!((long_last[1] - 0.2 / 33.0).abs() < 1.0e-6);
+        assert!((long_last[2] - 0.7 / 33.0).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn mirrored_training_sample_mirrors_move_indices() {
         let position =
             Position::from_fen("3ak4/9/2n1b4/p3p3p/4R4/2P6/P3P3P/2N1C4/4A4/2BAK3c b").unwrap();
@@ -1859,6 +1915,7 @@ mod tests {
             &position.initial_rule_history(),
             &candidates,
             0.0,
+            [0.6, 0.3, 0.1],
             true,
             AzSampleMeta::default(),
             1,
@@ -1885,6 +1942,8 @@ mod tests {
         for (actual, expected) in sample.policy.iter().zip(expected_policy) {
             assert!((actual - expected / expected_total).abs() < 1e-6);
         }
+        assert_eq!(sample.root_search_wdl, [0.6, 0.3, 0.1]);
+        assert_eq!(sample.short_value_wdl, [[0.6, 0.3, 0.1]; 3]);
     }
 
     #[test]

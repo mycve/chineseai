@@ -108,6 +108,8 @@ pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 96;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
 pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 1.0;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
+pub const SHORT_VALUE_HEADS: usize = 3;
+pub const SHORT_VALUE_HORIZONS: [usize; SHORT_VALUE_HEADS] = [4, 12, 32];
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -250,6 +252,11 @@ macro_rules! az_weight_tensors {
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(
+            short_value_head_output,
+            [SHORT_VALUE_HEADS * WDL_HEAD_SIZE, VALUE_HEAD_SIZE]
+        );
+        $visit!(short_value_head_bias, [SHORT_VALUE_HEADS * WDL_HEAD_SIZE]);
         $visit!(
             value_threat_embedding,
             [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK]
@@ -872,6 +879,8 @@ pub struct AzNnue {
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_output: Vec<f32>,
+    pub short_value_head_output: Vec<f32>,
+    pub short_value_head_bias: Vec<f32>,
     pub value_threat_embedding: Vec<f32>,
     pub value_threat_output: Vec<f32>,
     pub policy_threat_context: Vec<f32>,
@@ -915,6 +924,8 @@ impl Clone for AzNnue {
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_output: self.value_head_output.clone(),
+            short_value_head_output: self.short_value_head_output.clone(),
+            short_value_head_bias: self.short_value_head_bias.clone(),
             value_threat_embedding: self.value_threat_embedding.clone(),
             value_threat_output: self.value_threat_output.clone(),
             policy_threat_context: self.policy_threat_context.clone(),
@@ -1082,6 +1093,8 @@ pub struct AzTrainingSample {
     pub move_indices: Vec<usize>,
     pub policy: Vec<f32>,
     pub value_wdl: [f32; WDL_HEAD_SIZE],
+    pub root_search_wdl: [f32; WDL_HEAD_SIZE],
+    pub short_value_wdl: [[f32; WDL_HEAD_SIZE]; SHORT_VALUE_HEADS],
     pub value: f32,
     pub side_sign: f32,
     pub policy_weight: f32,
@@ -1294,6 +1307,8 @@ pub struct AzTrainStats {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
+    pub short_value_ce: [f32; SHORT_VALUE_HEADS],
+    pub short_value: [AzValueMomentStats; SHORT_VALUE_HEADS],
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -1320,6 +1335,7 @@ pub struct AzValueMomentStats {
 pub struct AzTrainLossWeights {
     pub value: f32,
     pub policy: f32,
+    pub short_value: f32,
 }
 
 impl Default for AzTrainLossWeights {
@@ -1327,6 +1343,7 @@ impl Default for AzTrainLossWeights {
         Self {
             value: 1.0,
             policy: 1.0,
+            short_value: 0.0,
         }
     }
 }
@@ -1337,6 +1354,18 @@ impl AzTrainStats {
         self.loss += other.loss;
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
+        for index in 0..SHORT_VALUE_HEADS {
+            self.short_value_ce[index] += other.short_value_ce[index];
+            let left = &mut self.short_value[index];
+            let right = other.short_value[index];
+            left.pred_sum += right.pred_sum;
+            left.pred_sq_sum += right.pred_sq_sum;
+            left.target_sum += right.target_sum;
+            left.target_sq_sum += right.target_sq_sum;
+            left.pred_target_sum += right.pred_target_sum;
+            left.error_sq_sum += right.error_sq_sum;
+            left.samples += right.samples;
+        }
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;
@@ -1398,6 +1427,9 @@ impl AzNnue {
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
+        let short_value_head_output =
+            vec![0.0; SHORT_VALUE_HEADS * WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
+        let short_value_head_bias = vec![0.0; SHORT_VALUE_HEADS * WDL_HEAD_SIZE];
         let value_threat_embedding = (0..VALUE_THREAT_VOCAB * VALUE_THREAT_RANK)
             .map(|_| rng.weight(0.02))
             .collect();
@@ -1433,6 +1465,8 @@ impl AzNnue {
             value_head_hidden,
             value_head_bias,
             value_head_output,
+            short_value_head_output,
+            short_value_head_bias,
             value_threat_embedding,
             value_threat_output,
             policy_threat_context,
@@ -1523,6 +1557,8 @@ impl AzNnue {
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
+            short_value_head_output: load_candle_f32_tensor(&tensors, "short_value_head_output")?,
+            short_value_head_bias: load_candle_f32_tensor(&tensors, "short_value_head_bias")?,
             value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
             value_threat_output: load_candle_f32_tensor(&tensors, "value_threat_output")?,
             policy_threat_context: load_candle_f32_tensor(&tensors, "policy_threat_context")?,
@@ -1581,6 +1617,22 @@ impl AzNnue {
             &mut scratch,
         )
         .value
+    }
+
+    pub fn evaluate_wdl_with_rules(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        moves: &[Move],
+    ) -> [f32; WDL_HEAD_SIZE] {
+        let mut scratch = AzEvalScratch::new(self.arch);
+        self.evaluate_with_scratch_output(
+            position,
+            moves,
+            &rule_context_features(position, history),
+            &mut scratch,
+        )
+        .value_wdl
     }
 
     pub(super) fn evaluate_with_scratch(
@@ -2572,6 +2624,8 @@ pub fn benchmark_training(
             move_indices,
             policy,
             value_wdl: scalar_value_to_wdl_target(value),
+            root_search_wdl: scalar_value_to_wdl_target(value),
+            short_value_wdl: [scalar_value_to_wdl_target(value); SHORT_VALUE_HEADS],
             value,
             side_sign: 1.0,
             policy_weight: 1.0,
@@ -2604,6 +2658,52 @@ fn softmax_fixed3(logits: [f32; 3]) -> [f32; 3] {
     out[1] /= sum;
     out[2] /= sum;
     out
+}
+
+pub fn outputs_for_training_sample(
+    model: &AzNnue,
+    sample: &AzTrainingSample,
+) -> Option<(
+    [f32; WDL_HEAD_SIZE],
+    [[f32; WDL_HEAD_SIZE]; SHORT_VALUE_HEADS],
+    Vec<f32>,
+)> {
+    let position = position_for_training_sample(sample)?;
+    let moves = sample
+        .move_indices
+        .iter()
+        .filter_map(|&index| dense_move_squares(index))
+        .map(|(from, to)| Move::new(from, to))
+        .collect::<Vec<_>>();
+    if moves.len() != sample.move_indices.len() {
+        return None;
+    }
+    let mut scratch = AzEvalScratch::new(model.arch);
+    let evaluated =
+        model.evaluate_with_scratch_output(&position, &moves, &sample.rule_context, &mut scratch);
+    let short = std::array::from_fn(|head| {
+        let base = head * WDL_HEAD_SIZE * VALUE_HEAD_SIZE;
+        let bias = head * WDL_HEAD_SIZE;
+        softmax_fixed3(std::array::from_fn(|part| {
+            dot_product(
+                &scratch.value_head,
+                &model.short_value_head_output
+                    [base + part * VALUE_HEAD_SIZE..base + (part + 1) * VALUE_HEAD_SIZE],
+            ) + model.short_value_head_bias[bias + part]
+        }))
+    });
+    Some((evaluated.value_wdl, short, scratch.logits))
+}
+
+pub fn position_for_training_sample(sample: &AzTrainingSample) -> Option<Position> {
+    let pieces = sample
+        .features
+        .iter()
+        .filter_map(|&feature| decode_current_piece_square_feature(feature))
+        .map(|piece| (piece.piece_index, piece.rank * BOARD_FILES + piece.file))
+        .collect::<Vec<_>>();
+    let position = Position::from_canonical_piece_squares(&pieces);
+    (position.has_general(Color::Red) && position.has_general(Color::Black)).then_some(position)
 }
 
 pub(super) fn scalar_value_to_wdl_target(value: f32) -> [f32; 3] {
@@ -3341,6 +3441,8 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             move_indices: vec![0, 1],
             policy: vec![0.6, 0.4],
             value_wdl: scalar_value_to_wdl_target(0.1),
+            root_search_wdl: scalar_value_to_wdl_target(0.1),
+            short_value_wdl: [scalar_value_to_wdl_target(0.1); SHORT_VALUE_HEADS],
             value: 0.1,
             side_sign: 1.0,
             policy_weight: 1.0,
@@ -3748,6 +3850,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(1.0),
+                root_search_wdl: scalar_value_to_wdl_target(1.0),
+                short_value_wdl: [scalar_value_to_wdl_target(1.0); SHORT_VALUE_HEADS],
                 value: 1.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3761,6 +3865,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-1.0),
+                root_search_wdl: scalar_value_to_wdl_target(-1.0),
+                short_value_wdl: [scalar_value_to_wdl_target(-1.0); SHORT_VALUE_HEADS],
                 value: -1.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3774,6 +3880,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(0.75),
+                root_search_wdl: scalar_value_to_wdl_target(0.75),
+                short_value_wdl: [scalar_value_to_wdl_target(0.75); SHORT_VALUE_HEADS],
                 value: 0.75,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3787,6 +3895,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-0.75),
+                root_search_wdl: scalar_value_to_wdl_target(-0.75),
+                short_value_wdl: [scalar_value_to_wdl_target(-0.75); SHORT_VALUE_HEADS],
                 value: -0.75,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3810,6 +3920,54 @@ mod tests {
 
     #[cfg(feature = "gpu-train")]
     #[test]
+    fn short_value_heads_can_overfit_tiny_fixed_dataset() {
+        let make_sample = |feature: usize, value: f32| AzTrainingSample {
+            features: vec![feature],
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            move_indices: Vec::new(),
+            policy: Vec::new(),
+            value_wdl: scalar_value_to_wdl_target(value),
+            root_search_wdl: scalar_value_to_wdl_target(value),
+            short_value_wdl: [scalar_value_to_wdl_target(value); SHORT_VALUE_HEADS],
+            value,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
+            meta: AzSampleMeta::default(),
+        };
+        let samples = vec![
+            make_sample(0, 1.0),
+            make_sample(1, -1.0),
+            make_sample(2, 0.75),
+            make_sample(3, -0.75),
+        ];
+        let mut model = AzNnue::random(16, 7007);
+        model.hidden_bias.fill(0.1);
+        let weights = AzTrainLossWeights {
+            value: 0.0,
+            policy: 0.0,
+            short_value: 1.0,
+        };
+        let mut rng = SplitMix64::new(7008);
+        let before = train_samples_weighted(&mut model, &samples, 1, 0.003, 4, &mut rng, weights)
+            .unwrap()
+            .short_value_ce;
+        let after = train_samples_weighted(&mut model, &samples, 200, 0.003, 4, &mut rng, weights)
+            .unwrap()
+            .short_value_ce;
+        for head in 0..SHORT_VALUE_HEADS {
+            assert!(
+                after[head] < before[head] * 0.6,
+                "head={head} before={} after={}",
+                before[head],
+                after[head]
+            );
+        }
+    }
+
+    #[cfg(feature = "gpu-train")]
+    #[test]
     fn batched_training_is_deterministic() {
         let samples = vec![
             AzTrainingSample {
@@ -3818,6 +3976,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(1.0),
+                root_search_wdl: scalar_value_to_wdl_target(1.0),
+                short_value_wdl: [scalar_value_to_wdl_target(1.0); SHORT_VALUE_HEADS],
                 value: 1.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3831,6 +3991,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-1.0),
+                root_search_wdl: scalar_value_to_wdl_target(-1.0),
+                short_value_wdl: [scalar_value_to_wdl_target(-1.0); SHORT_VALUE_HEADS],
                 value: -1.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3844,6 +4006,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(0.5),
+                root_search_wdl: scalar_value_to_wdl_target(0.5),
+                short_value_wdl: [scalar_value_to_wdl_target(0.5); SHORT_VALUE_HEADS],
                 value: 0.5,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3857,6 +4021,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-0.5),
+                root_search_wdl: scalar_value_to_wdl_target(-0.5),
+                short_value_wdl: [scalar_value_to_wdl_target(-0.5); SHORT_VALUE_HEADS],
                 value: -0.5,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3900,6 +4066,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(1.0),
+                root_search_wdl: scalar_value_to_wdl_target(1.0),
+                short_value_wdl: [scalar_value_to_wdl_target(1.0); SHORT_VALUE_HEADS],
                 value: 1.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3913,6 +4081,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-1.0),
+                root_search_wdl: scalar_value_to_wdl_target(-1.0),
+                short_value_wdl: [scalar_value_to_wdl_target(-1.0); SHORT_VALUE_HEADS],
                 value: -1.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3926,6 +4096,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(0.75),
+                root_search_wdl: scalar_value_to_wdl_target(0.75),
+                short_value_wdl: [scalar_value_to_wdl_target(0.75); SHORT_VALUE_HEADS],
                 value: 0.75,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3939,6 +4111,8 @@ mod tests {
                 move_indices: Vec::new(),
                 policy: Vec::new(),
                 value_wdl: scalar_value_to_wdl_target(-0.75),
+                root_search_wdl: scalar_value_to_wdl_target(-0.75),
+                short_value_wdl: [scalar_value_to_wdl_target(-0.75); SHORT_VALUE_HEADS],
                 value: -0.75,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -3956,6 +4130,7 @@ mod tests {
         let weights = AzTrainLossWeights {
             value: 1.0,
             policy: 0.0,
+            short_value: 0.0,
         };
         train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights).unwrap();
 
@@ -3994,6 +4169,11 @@ mod tests {
         assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
         assert_eq!(model.value_head_bias, loaded.value_head_bias);
         assert_eq!(model.value_head_output, loaded.value_head_output);
+        assert_eq!(
+            model.short_value_head_output,
+            loaded.short_value_head_output
+        );
+        assert_eq!(model.short_value_head_bias, loaded.short_value_head_bias);
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
         assert_eq!(
             model.policy_consequence_output,
@@ -4008,6 +4188,22 @@ mod tests {
         assert_eq!(
             model.policy_accumulator_move,
             loaded.policy_accumulator_move
+        );
+    }
+
+    #[test]
+    fn short_value_auxiliary_weights_do_not_change_inference() {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let baseline = AzNnue::random(32, 20260831);
+        let mut changed = baseline.clone();
+        for (index, weight) in changed.short_value_head_output.iter_mut().enumerate() {
+            *weight = index as f32 * 0.001 - 1.0;
+        }
+        changed.short_value_head_bias.fill(7.0);
+        assert_eq!(
+            baseline.evaluate_value(&position, &moves).to_bits(),
+            changed.evaluate_value(&position, &moves).to_bits()
         );
     }
 
@@ -4030,6 +4226,14 @@ mod tests {
         assert_eq!(loaded_samples[0].meta.ply, 9);
         assert!((loaded_samples[0].meta.best_q - 0.33).abs() < 1e-6);
         assert_eq!(loaded_samples[0].meta.played_visits, 13);
+        assert_eq!(
+            loaded_samples[0].root_search_wdl,
+            pool.all_samples()[0].root_search_wdl
+        );
+        assert_eq!(
+            loaded_samples[0].short_value_wdl,
+            pool.all_samples()[0].short_value_wdl
+        );
     }
 
     #[test]
@@ -4041,6 +4245,8 @@ mod tests {
                 move_indices: vec![0],
                 policy: vec![1.0],
                 value_wdl: scalar_value_to_wdl_target(0.0),
+                root_search_wdl: scalar_value_to_wdl_target(0.0),
+                short_value_wdl: [scalar_value_to_wdl_target(0.0); SHORT_VALUE_HEADS],
                 value: 0.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -4081,6 +4287,8 @@ mod tests {
                 move_indices: vec![0],
                 policy: vec![1.0],
                 value_wdl: scalar_value_to_wdl_target(0.0),
+                root_search_wdl: scalar_value_to_wdl_target(0.0),
+                short_value_wdl: [scalar_value_to_wdl_target(0.0); SHORT_VALUE_HEADS],
                 value: 0.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
@@ -4121,6 +4329,8 @@ mod tests {
                 move_indices: vec![0],
                 policy: vec![1.0],
                 value_wdl: scalar_value_to_wdl_target(0.0),
+                root_search_wdl: scalar_value_to_wdl_target(0.0),
+                short_value_wdl: [scalar_value_to_wdl_target(0.0); SHORT_VALUE_HEADS],
                 value: 0.0,
                 side_sign: 1.0,
                 policy_weight: 1.0,
