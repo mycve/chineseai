@@ -1,11 +1,14 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
+    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, PIKAFISH_LAYER_STACKS, PIKAFISH_PSQ_DIMENSIONS,
+    PIKAFISH_PSQT_BUCKETS, PIKAFISH_TRANSFORMED_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS,
+    PIKAFISH_TRANSFORMER_HALF, PIKAFISH_VALUE_FC0, PIKAFISH_VALUE_FC1, PIKAFISH_VALUE_TAIL,
+    PIKAFISH_VALUE_THREAT_DIMENSIONS, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
     POLICY_TACTICAL_SIZE, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
-    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
-    VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_THREAT_RANK,
+    VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
@@ -25,13 +28,19 @@ pub(super) struct AzCandleModel {
     input_king_piece_hidden: Var,
     rule_context_hidden: Var,
     hidden_bias: Var,
-    value_head_hidden: Var,
-    value_head_bias: Var,
-    value_head_output: Var,
-    short_value_head_output: Var,
-    short_value_head_bias: Var,
-    value_threat_embedding: Var,
-    value_threat_output: Var,
+    pikafish_psq_embedding: Var,
+    pikafish_threat_embedding: Var,
+    pikafish_psqt: Var,
+    pikafish_value_fc0: Var,
+    pikafish_value_fc0_bias: Var,
+    pikafish_value_rule_fc0: Var,
+    pikafish_value_fc1: Var,
+    pikafish_value_fc1_bias: Var,
+    pikafish_value_output: Var,
+    pikafish_value_output_bias: Var,
+    pikafish_short_value_output: Var,
+    pikafish_short_value_bias: Var,
+    policy_threat_embedding: Var,
     policy_threat_context: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
@@ -70,22 +79,95 @@ impl AzCandleModel {
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
-        let value_head = hidden
-            .matmul(&self.value_head_hidden.t()?)?
-            .broadcast_add(&self.value_head_bias)?
-            .relu()?;
-        let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
-        let short_value_logits = value_head
-            .matmul(&self.short_value_head_output.t()?)?
-            .broadcast_add(&self.short_value_head_bias)?
-            .reshape((batch.batch_size, super::SHORT_VALUE_HEADS, WDL_HEAD_SIZE))?;
         let threat_accumulator = sparse_pool(
-            self.value_threat_embedding.as_tensor(),
+            self.policy_threat_embedding.as_tensor(),
             &batch.value_threat_indices,
         )?;
         let threat_activation = threat_accumulator.clamp(0.0f64, 1.0f64)?;
         let threat_pair = Tensor::cat(&[&threat_activation, &threat_activation.sqr()?], 1)?;
-        let value_logits = (value_logits + threat_pair.matmul(&self.value_threat_output.t()?)?)?;
+        let value_accumulator = (sparse_pool(
+            self.pikafish_psq_embedding.as_tensor(),
+            &batch.pikafish_psq_indices,
+        )? + sparse_pool(
+            self.pikafish_threat_embedding.as_tensor(),
+            &batch.pikafish_threat_indices,
+        )?)?;
+        let left = value_accumulator
+            .narrow(1, 0, PIKAFISH_TRANSFORMER_HALF)?
+            .clamp(0.0f64, 1.0f64)?;
+        let right = value_accumulator
+            .narrow(1, PIKAFISH_TRANSFORMER_HALF, PIKAFISH_TRANSFORMER_HALF)?
+            .clamp(0.0f64, 1.0f64)?;
+        let value_views =
+            (left * right)?.reshape((batch.batch_size, 2, PIKAFISH_TRANSFORMER_HALF))?;
+        let value_input = Tensor::cat(
+            &[
+                &value_views.narrow(1, 0, 1)?.squeeze(1)?,
+                &value_views.narrow(1, 1, 1)?.squeeze(1)?,
+            ],
+            1,
+        )?;
+        let fc0 = value_input
+            .matmul(&self.pikafish_value_fc0.t()?)?
+            .broadcast_add(&self.pikafish_value_fc0_bias)?
+            .broadcast_add(
+                &batch
+                    .rule_context
+                    .matmul(&self.pikafish_value_rule_fc0.t()?)?,
+            )?
+            .reshape((batch.batch_size, PIKAFISH_LAYER_STACKS, PIKAFISH_VALUE_FC0))?;
+        let fc0_clip = fc0.clamp(0.0f64, 1.0f64)?;
+        let fc0_pair = Tensor::cat(&[&fc0_clip.sqr()?, &fc0_clip], 2)?;
+        let fc1_weight = self
+            .pikafish_value_fc1
+            .reshape((
+                1,
+                PIKAFISH_LAYER_STACKS,
+                PIKAFISH_VALUE_FC1,
+                PIKAFISH_VALUE_FC0 * 2,
+            ))?
+            .transpose(2, 3)?;
+        let fc1_all = fc0_pair
+            .unsqueeze(2)?
+            .broadcast_matmul(&fc1_weight)?
+            .squeeze(2)?
+            .broadcast_add(
+                &self
+                    .pikafish_value_fc1_bias
+                    .reshape((PIKAFISH_LAYER_STACKS, PIKAFISH_VALUE_FC1))?,
+            )?;
+        let fc1_clip = fc1_all.clamp(0.0f64, 1.0f64)?;
+        let tail = Tensor::cat(&[&fc0_pair, &fc1_clip.sqr()?, &fc1_clip], 2)?;
+        let stack_mask = batch.layer_stack_one_hot.unsqueeze(2)?;
+        let selected_tail = tail.broadcast_mul(&stack_mask)?.sum(1)?;
+        let selected_fc0 = fc0.broadcast_mul(&stack_mask)?.sum(1)?;
+        let output_all = selected_tail
+            .matmul(&self.pikafish_value_output.t()?)?
+            .broadcast_add(&self.pikafish_value_output_bias)?
+            .reshape((batch.batch_size, PIKAFISH_LAYER_STACKS, WDL_HEAD_SIZE))?;
+        let mut value_logits = output_all.broadcast_mul(&stack_mask)?.sum(1)?;
+        let skip = (selected_fc0.narrow(1, PIKAFISH_VALUE_FC0 - 2, 1)?
+            - selected_fc0.narrow(1, PIKAFISH_VALUE_FC0 - 1, 1)?)?;
+        let signed = Tensor::cat(&[&skip, &Tensor::zeros_like(&skip)?, &skip.neg()?], 1)?;
+        let psqt_views = sparse_pool(self.pikafish_psqt.as_tensor(), &batch.pikafish_psq_indices)?
+            .reshape((batch.batch_size, 2, PIKAFISH_PSQT_BUCKETS))?;
+        let psqt_diff =
+            (psqt_views.narrow(1, 0, 1)?.squeeze(1)? - psqt_views.narrow(1, 1, 1)?.squeeze(1)?)?;
+        let psqt = (psqt_diff * batch.layer_stack_one_hot.clone())?.sum_keepdim(1)?;
+        let psqt_signed = Tensor::cat(&[&psqt, &Tensor::zeros_like(&psqt)?, &psqt.neg()?], 1)?;
+        value_logits = (value_logits + signed + psqt_signed)?;
+        let short_all = selected_tail
+            .matmul(&self.pikafish_short_value_output.t()?)?
+            .broadcast_add(&self.pikafish_short_value_bias)?
+            .reshape((
+                batch.batch_size,
+                PIKAFISH_LAYER_STACKS,
+                super::SHORT_VALUE_HEADS,
+                WDL_HEAD_SIZE,
+            ))?;
+        let short_value_logits = short_all
+            .broadcast_mul(&batch.layer_stack_one_hot.unsqueeze(2)?.unsqueeze(3)?)?
+            .sum(1)?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
@@ -164,6 +246,9 @@ pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
     pub(super) feature_items: Tensor,
     pub(super) value_threat_indices: Tensor,
+    pub(super) pikafish_psq_indices: Tensor,
+    pub(super) pikafish_threat_indices: Tensor,
+    pub(super) layer_stack_one_hot: Tensor,
     pub(super) policy_items: Tensor,
     pub(super) policy_sparse_indices: Tensor,
     pub(super) policy_tactical_indices: Tensor,
@@ -185,6 +270,12 @@ impl BatchTensors {
         let max_features = packed.max_features;
         let max_policy_moves = packed.max_policy_moves;
         let max_value_threats = packed.max_value_threats;
+        let max_pikafish_psq = packed.max_pikafish_psq;
+        let max_pikafish_threats = packed.max_pikafish_threats;
+        let mut layer_stack_one_hot = vec![0.0f32; batch_size * PIKAFISH_LAYER_STACKS];
+        for (row, &stack) in packed.pikafish_layer_stacks.iter().enumerate() {
+            layer_stack_one_hot[row * PIKAFISH_LAYER_STACKS + stack as usize] = 1.0;
+        }
         assert!(
             packed
                 .value_threat_indices
@@ -202,6 +293,21 @@ impl BatchTensors {
             value_threat_indices: Tensor::from_vec(
                 packed.value_threat_indices,
                 (batch_size, max_value_threats),
+                device,
+            )?,
+            pikafish_psq_indices: Tensor::from_vec(
+                packed.pikafish_psq_indices,
+                (batch_size * 2, max_pikafish_psq),
+                device,
+            )?,
+            pikafish_threat_indices: Tensor::from_vec(
+                packed.pikafish_threat_indices,
+                (batch_size * 2, max_pikafish_threats),
+                device,
+            )?,
+            layer_stack_one_hot: Tensor::from_vec(
+                layer_stack_one_hot,
+                (batch_size, PIKAFISH_LAYER_STACKS),
                 device,
             )?,
             policy_items: Tensor::from_vec(
@@ -290,35 +396,84 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            value_head_hidden: var_from_slice(
-                &model.value_head_hidden,
-                (VALUE_HEAD_SIZE, hidden),
+            pikafish_psq_embedding: var_from_slice(
+                &model.pikafish_psq_embedding,
+                (PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS),
                 device,
             )?,
-            value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
-            value_head_output: var_from_slice(
-                &model.value_head_output,
-                (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+            pikafish_threat_embedding: var_from_slice(
+                &model.pikafish_threat_embedding,
+                (
+                    PIKAFISH_VALUE_THREAT_DIMENSIONS,
+                    PIKAFISH_TRANSFORMER_DIMENSIONS,
+                ),
                 device,
             )?,
-            short_value_head_output: var_from_slice(
-                &model.short_value_head_output,
-                (super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+            pikafish_psqt: var_from_slice(
+                &model.pikafish_psqt,
+                (PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS),
                 device,
             )?,
-            short_value_head_bias: var_from_slice(
-                &model.short_value_head_bias,
-                super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE,
+            pikafish_value_fc0: var_from_slice(
+                &model.pikafish_value_fc0,
+                (
+                    PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0,
+                    PIKAFISH_TRANSFORMED_DIMENSIONS,
+                ),
                 device,
             )?,
-            value_threat_embedding: var_from_slice(
-                &model.value_threat_embedding,
+            pikafish_value_fc0_bias: var_from_slice(
+                &model.pikafish_value_fc0_bias,
+                PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0,
+                device,
+            )?,
+            pikafish_value_rule_fc0: var_from_slice(
+                &model.pikafish_value_rule_fc0,
+                (
+                    PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0,
+                    RULE_CONTEXT_SIZE,
+                ),
+                device,
+            )?,
+            pikafish_value_fc1: var_from_slice(
+                &model.pikafish_value_fc1,
+                (
+                    PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC1,
+                    PIKAFISH_VALUE_FC0 * 2,
+                ),
+                device,
+            )?,
+            pikafish_value_fc1_bias: var_from_slice(
+                &model.pikafish_value_fc1_bias,
+                PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC1,
+                device,
+            )?,
+            pikafish_value_output: var_from_slice(
+                &model.pikafish_value_output,
+                (PIKAFISH_LAYER_STACKS * WDL_HEAD_SIZE, PIKAFISH_VALUE_TAIL),
+                device,
+            )?,
+            pikafish_value_output_bias: var_from_slice(
+                &model.pikafish_value_output_bias,
+                PIKAFISH_LAYER_STACKS * WDL_HEAD_SIZE,
+                device,
+            )?,
+            pikafish_short_value_output: var_from_slice(
+                &model.pikafish_short_value_output,
+                (
+                    PIKAFISH_LAYER_STACKS * super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE,
+                    PIKAFISH_VALUE_TAIL,
+                ),
+                device,
+            )?,
+            pikafish_short_value_bias: var_from_slice(
+                &model.pikafish_short_value_bias,
+                PIKAFISH_LAYER_STACKS * super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE,
+                device,
+            )?,
+            policy_threat_embedding: var_from_slice(
+                &model.policy_threat_embedding,
                 (VALUE_THREAT_VOCAB, VALUE_THREAT_RANK),
-                device,
-            )?,
-            value_threat_output: var_from_slice(
-                &model.value_threat_output,
-                (WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2),
                 device,
             )?,
             policy_threat_context: var_from_slice(
@@ -375,13 +530,19 @@ impl AzCandleModel {
         vars.push(self.input_king_piece_hidden.clone());
         vars.push(self.rule_context_hidden.clone());
         vars.push(self.hidden_bias.clone());
-        vars.push(self.value_head_hidden.clone());
-        vars.push(self.value_head_bias.clone());
-        vars.push(self.value_head_output.clone());
-        vars.push(self.short_value_head_output.clone());
-        vars.push(self.short_value_head_bias.clone());
-        vars.push(self.value_threat_embedding.clone());
-        vars.push(self.value_threat_output.clone());
+        vars.push(self.pikafish_psq_embedding.clone());
+        vars.push(self.pikafish_threat_embedding.clone());
+        vars.push(self.pikafish_psqt.clone());
+        vars.push(self.pikafish_value_fc0.clone());
+        vars.push(self.pikafish_value_fc0_bias.clone());
+        vars.push(self.pikafish_value_rule_fc0.clone());
+        vars.push(self.pikafish_value_fc1.clone());
+        vars.push(self.pikafish_value_fc1_bias.clone());
+        vars.push(self.pikafish_value_output.clone());
+        vars.push(self.pikafish_value_output_bias.clone());
+        vars.push(self.pikafish_short_value_output.clone());
+        vars.push(self.pikafish_short_value_bias.clone());
+        vars.push(self.policy_threat_embedding.clone());
         vars.push(self.policy_threat_context.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
@@ -406,22 +567,49 @@ impl AzCandleModel {
         )?;
         copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
-        copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
-        copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
-        copy_var(&self.value_head_output, &mut model.value_head_output)?;
         copy_var(
-            &self.short_value_head_output,
-            &mut model.short_value_head_output,
+            &self.pikafish_psq_embedding,
+            &mut model.pikafish_psq_embedding,
         )?;
         copy_var(
-            &self.short_value_head_bias,
-            &mut model.short_value_head_bias,
+            &self.pikafish_threat_embedding,
+            &mut model.pikafish_threat_embedding,
+        )?;
+        copy_var(&self.pikafish_psqt, &mut model.pikafish_psqt)?;
+        copy_var(&self.pikafish_value_fc0, &mut model.pikafish_value_fc0)?;
+        copy_var(
+            &self.pikafish_value_fc0_bias,
+            &mut model.pikafish_value_fc0_bias,
         )?;
         copy_var(
-            &self.value_threat_embedding,
-            &mut model.value_threat_embedding,
+            &self.pikafish_value_rule_fc0,
+            &mut model.pikafish_value_rule_fc0,
         )?;
-        copy_var(&self.value_threat_output, &mut model.value_threat_output)?;
+        copy_var(&self.pikafish_value_fc1, &mut model.pikafish_value_fc1)?;
+        copy_var(
+            &self.pikafish_value_fc1_bias,
+            &mut model.pikafish_value_fc1_bias,
+        )?;
+        copy_var(
+            &self.pikafish_value_output,
+            &mut model.pikafish_value_output,
+        )?;
+        copy_var(
+            &self.pikafish_value_output_bias,
+            &mut model.pikafish_value_output_bias,
+        )?;
+        copy_var(
+            &self.pikafish_short_value_output,
+            &mut model.pikafish_short_value_output,
+        )?;
+        copy_var(
+            &self.pikafish_short_value_bias,
+            &mut model.pikafish_short_value_bias,
+        )?;
+        copy_var(
+            &self.policy_threat_embedding,
+            &mut model.policy_threat_embedding,
+        )?;
         copy_var(
             &self.policy_threat_context,
             &mut model.policy_threat_context,
@@ -447,7 +635,7 @@ impl AzCandleModel {
         copy_var(&self.policy_sparse_table, &mut model.policy_sparse_table)?;
         copy_var(&self.policy_sparse_factor, &mut model.policy_sparse_factor)?;
         copy_var(&self.policy_tactical, &mut model.policy_tactical)?;
-        model.rebuild_value_threat_quantization();
+        model.rebuild_value_quantization();
         model.rebuild_policy_tactical();
         model.rebuild_policy_accumulator_quantization();
         Ok(())
@@ -499,6 +687,12 @@ mod tests {
             *weight = ((index % POLICY_ACCUMULATOR_RANK) as f32 + 1.0) * 0.0002;
         }
         model.policy_sparse_table[POLICY_SPARSE_TABLE_SIZE - 1] = 0.127;
+        for (index, weight) in model.pikafish_value_output.iter_mut().enumerate() {
+            *weight = ((index % 29) as f32 - 14.0) * 0.0002;
+        }
+        for (index, bias) in model.pikafish_value_output_bias.iter_mut().enumerate() {
+            *bias = ((index % 3) as f32 - 1.0) * 0.03;
+        }
         let side = position.side_to_move();
         let buckets = canonical_buckets_for_perspective(&position, side);
         for (index, &mv) in moves.iter().enumerate() {
@@ -521,7 +715,12 @@ mod tests {
         model.rebuild_policy_accumulator_quantization();
 
         let mut cpu = AzEvalScratch::new(model.arch);
-        model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
+        let cpu_output = model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &mut cpu,
+        );
 
         let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
@@ -543,6 +742,14 @@ mod tests {
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
         let forward = candle.forward(&batch).unwrap();
         let legal = forward.policy_logits.to_vec2::<f32>().unwrap();
+        let value_logits = forward.value_logits.to_vec2::<f32>().unwrap();
+        let candle_wdl = crate::az::softmax_fixed3(value_logits[0].as_slice().try_into().unwrap());
+        for (left, right) in candle_wdl.iter().zip(cpu_output.value_wdl) {
+            assert!(
+                (left - right).abs() < 3.0e-3,
+                "Candle/CPU value drift: {left} vs {right}"
+            );
+        }
 
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
@@ -628,9 +835,13 @@ mod tests {
             input_king_piece_hidden,
             rule_context_hidden,
             hidden_bias,
-            value_head_hidden,
-            value_head_bias,
-            value_head_output,
+            pikafish_psq_embedding,
+            pikafish_threat_embedding,
+            pikafish_psqt,
+            pikafish_value_fc0,
+            pikafish_value_fc1,
+            pikafish_value_output,
+            pikafish_short_value_output,
             policy_threat_context,
             policy_move_bias,
             policy_consequence_output,

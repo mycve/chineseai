@@ -1982,9 +1982,8 @@ mod tests {
     #[test]
     fn truncated_tail_evaluates_final_position_and_flips_to_last_sample_view() {
         let mut model = AzNnue::random(128, 0x51ea);
-        model.value_head_bias[0] = 1.0;
-        model.value_head_output[0] = 1.0;
-        model.value_head_output[2 * crate::az::VALUE_HEAD_SIZE] = -0.5;
+        model.pikafish_value_output_bias[11 * 3] = 1.0;
+        model.pikafish_value_output_bias[11 * 3 + 2] = -0.5;
         let position = Position::startpos();
         let history = position.initial_rule_history();
         let legal = position.legal_moves();

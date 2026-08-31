@@ -19,6 +19,7 @@ mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
 mod midgame;
+mod pikafish_value;
 mod play;
 mod replay;
 mod train;
@@ -101,7 +102,6 @@ const POLICY_ACCUMULATOR_KING_PIECE_OFFSET: usize =
 const POLICY_ACCUMULATOR_BIAS_ROW: usize =
     POLICY_ACCUMULATOR_KING_PIECE_OFFSET + STRUCTURAL_KING_PIECE_SIZE;
 const POLICY_ACCUMULATOR_QUANT_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
-pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const VALUE_THREAT_RANK: usize = 64;
 pub(super) const VALUE_THREAT_VOCAB: usize = 57_702;
 pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 96;
@@ -110,6 +110,15 @@ pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 1.0;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 pub const SHORT_VALUE_HEADS: usize = 3;
 pub const SHORT_VALUE_HORIZONS: [usize; SHORT_VALUE_HEADS] = [4, 12, 32];
+const PIKAFISH_VALUE_FC0: usize = 32;
+const PIKAFISH_VALUE_FC1: usize = 32;
+const PIKAFISH_VALUE_TAIL: usize = (PIKAFISH_VALUE_FC0 + PIKAFISH_VALUE_FC1) * 2;
+use pikafish_value::{
+    ActiveValueFeatures, PIKAFISH_LAYER_STACKS, PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS,
+    PIKAFISH_TRANSFORMED_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS, PIKAFISH_TRANSFORMER_HALF,
+    PIKAFISH_VALUE_THREAT_DIMENSIONS, active_psq_features_pair, active_psq_indices,
+    active_value_features_pair, changed_threat_indices, layer_stack_bucket,
+};
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -249,19 +258,73 @@ macro_rules! az_weight_tensors {
         $visit!(input_king_piece_hidden, [STRUCTURAL_KING_PIECE_SIZE, $h]);
         $visit!(rule_context_hidden, [RULE_CONTEXT_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
-        $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
-        $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
-        $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
         $visit!(
-            short_value_head_output,
-            [SHORT_VALUE_HEADS * WDL_HEAD_SIZE, VALUE_HEAD_SIZE]
+            pikafish_psq_embedding,
+            [PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_TRANSFORMER_DIMENSIONS]
         );
-        $visit!(short_value_head_bias, [SHORT_VALUE_HEADS * WDL_HEAD_SIZE]);
         $visit!(
-            value_threat_embedding,
+            pikafish_threat_embedding,
+            [
+                PIKAFISH_VALUE_THREAT_DIMENSIONS,
+                PIKAFISH_TRANSFORMER_DIMENSIONS
+            ]
+        );
+        $visit!(
+            pikafish_psqt,
+            [PIKAFISH_PSQ_DIMENSIONS, PIKAFISH_PSQT_BUCKETS]
+        );
+        $visit!(
+            pikafish_value_fc0,
+            [
+                PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0,
+                PIKAFISH_TRANSFORMED_DIMENSIONS
+            ]
+        );
+        $visit!(
+            pikafish_value_fc0_bias,
+            [PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0]
+        );
+        $visit!(
+            pikafish_value_rule_fc0,
+            [
+                PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0,
+                RULE_CONTEXT_SIZE
+            ]
+        );
+        $visit!(
+            pikafish_value_fc1,
+            [
+                PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC1,
+                PIKAFISH_VALUE_FC0 * 2
+            ]
+        );
+        $visit!(
+            pikafish_value_fc1_bias,
+            [PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC1]
+        );
+        $visit!(
+            pikafish_value_output,
+            [PIKAFISH_LAYER_STACKS * WDL_HEAD_SIZE, PIKAFISH_VALUE_TAIL]
+        );
+        $visit!(
+            pikafish_value_output_bias,
+            [PIKAFISH_LAYER_STACKS * WDL_HEAD_SIZE]
+        );
+        $visit!(
+            pikafish_short_value_output,
+            [
+                PIKAFISH_LAYER_STACKS * SHORT_VALUE_HEADS * WDL_HEAD_SIZE,
+                PIKAFISH_VALUE_TAIL
+            ]
+        );
+        $visit!(
+            pikafish_short_value_bias,
+            [PIKAFISH_LAYER_STACKS * SHORT_VALUE_HEADS * WDL_HEAD_SIZE]
+        );
+        $visit!(
+            policy_threat_embedding,
             [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK]
         );
-        $visit!(value_threat_output, [WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2]);
         $visit!(
             policy_threat_context,
             [POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2]
@@ -320,9 +383,12 @@ pub(super) struct AzEvalScratch {
     policy_context: Vec<f32>,
     policy_accumulator_context: [i16; POLICY_ACCUMULATOR_RANK],
     policy_piece_square_scores: Vec<f32>,
-    value_head: Vec<f32>,
-    value_threat_accumulator: Vec<i16>,
-    value_threat_activation: Vec<f32>,
+    pikafish_accumulator: Vec<i16>,
+    pikafish_transformed: Vec<f32>,
+    pikafish_transformed_q: Vec<i8>,
+    pikafish_tail: Vec<f32>,
+    policy_threat_accumulator: Vec<i16>,
+    policy_threat_activation: Vec<f32>,
     policy_gives_check: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
@@ -332,6 +398,7 @@ pub(super) struct AzEvalScratch {
 pub(super) struct AzIncrementalEvalRequest<'a> {
     pub position: &'a Position,
     pub accumulator_hidden: &'a [f32],
+    pub value_accumulator: &'a [i16],
     pub policy_accumulator: &'a [i16; POLICY_ACCUMULATOR_RANK],
     pub moves: &'a [Move],
     pub rule_context: &'a [f32; RULE_CONTEXT_SIZE],
@@ -347,9 +414,12 @@ impl AzEvalScratch {
             policy_context: vec![0.0; POLICY_MOVE_CONTEXT_SIZE],
             policy_accumulator_context: [0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
-            value_head: vec![0.0; VALUE_HEAD_SIZE],
-            value_threat_accumulator: vec![0; VALUE_THREAT_RANK],
-            value_threat_activation: vec![0.0; VALUE_THREAT_RANK * 2],
+            pikafish_accumulator: vec![0; PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
+            pikafish_transformed: vec![0.0; PIKAFISH_TRANSFORMED_DIMENSIONS],
+            pikafish_transformed_q: vec![0; PIKAFISH_TRANSFORMED_DIMENSIONS],
+            pikafish_tail: vec![0.0; PIKAFISH_VALUE_TAIL],
+            policy_threat_accumulator: vec![0; VALUE_THREAT_RANK],
+            policy_threat_activation: vec![0.0; VALUE_THREAT_RANK * 2],
             policy_gives_check: Vec::with_capacity(192),
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
@@ -363,9 +433,12 @@ impl AzEvalScratch {
             policy_context: Vec::new(),
             policy_accumulator_context: [0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
-            value_head: Vec::new(),
-            value_threat_accumulator: Vec::new(),
-            value_threat_activation: Vec::new(),
+            pikafish_accumulator: Vec::new(),
+            pikafish_transformed: Vec::new(),
+            pikafish_transformed_q: Vec::new(),
+            pikafish_tail: Vec::new(),
+            policy_threat_accumulator: Vec::new(),
+            policy_threat_activation: Vec::new(),
             policy_gives_check: Vec::new(),
             logits: Vec::new(),
             priors: Vec::new(),
@@ -377,18 +450,21 @@ impl AzEvalScratch {
 #[derive(Clone, Debug)]
 pub(super) struct AzEvalAccumulator {
     hidden_sum: Vec<f32>,
+    value_sum: Vec<i16>,
 }
 
 impl AzEvalAccumulator {
     pub(super) fn new(model: &AzNnue, position: &Position) -> Self {
         let mut accumulator = Self {
             hidden_sum: vec![0.0; model.hidden_size * 2],
+            value_sum: vec![0; PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
         };
         accumulator.refresh(model, position);
         accumulator
     }
 
     fn refresh(&mut self, model: &AzNnue, position: &Position) {
+        model.refresh_pikafish_accumulator(position, &mut self.value_sum);
         for perspective in [Color::Red, Color::Black] {
             let index = color_index(perspective);
             let start = index * model.hidden_size;
@@ -496,8 +572,13 @@ impl AzEvalAccumulator {
         &hidden_sum[start..start + hidden_size]
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn into_hidden_sum(self) -> Vec<f32> {
         self.hidden_sum
+    }
+
+    pub(super) fn into_sums(self) -> (Vec<f32>, Vec<i16>) {
+        (self.hidden_sum, self.value_sum)
     }
 }
 
@@ -876,13 +957,19 @@ pub struct AzNnue {
     pub input_king_piece_hidden: Vec<f32>,
     pub rule_context_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
-    pub value_head_hidden: Vec<f32>,
-    pub value_head_bias: Vec<f32>,
-    pub value_head_output: Vec<f32>,
-    pub short_value_head_output: Vec<f32>,
-    pub short_value_head_bias: Vec<f32>,
-    pub value_threat_embedding: Vec<f32>,
-    pub value_threat_output: Vec<f32>,
+    pub pikafish_psq_embedding: Vec<f32>,
+    pub pikafish_threat_embedding: Vec<f32>,
+    pub pikafish_psqt: Vec<f32>,
+    pub pikafish_value_fc0: Vec<f32>,
+    pub pikafish_value_fc0_bias: Vec<f32>,
+    pub pikafish_value_rule_fc0: Vec<f32>,
+    pub pikafish_value_fc1: Vec<f32>,
+    pub pikafish_value_fc1_bias: Vec<f32>,
+    pub pikafish_value_output: Vec<f32>,
+    pub pikafish_value_output_bias: Vec<f32>,
+    pub pikafish_short_value_output: Vec<f32>,
+    pub pikafish_short_value_bias: Vec<f32>,
+    pub policy_threat_embedding: Vec<f32>,
     pub policy_threat_context: Vec<f32>,
     pub policy_move_bias: Vec<f32>,
     pub policy_consequence_output: Vec<f32>,
@@ -901,9 +988,14 @@ pub struct AzNnue {
     policy_accumulator_move_scale: f32,
     policy_sparse_table_q: Vec<i8>,
     policy_sparse_table_scale: f32,
-    value_threat_embedding_q: Vec<i8>,
-    value_threat_embedding_scale: f32,
-    value_threat_active: bool,
+    policy_threat_embedding_q: Vec<i8>,
+    policy_threat_embedding_scale: f32,
+    policy_threat_active: bool,
+    pikafish_psq_embedding_q: Vec<i8>,
+    pikafish_threat_embedding_q: Vec<i8>,
+    pikafish_embedding_scale: f32,
+    pikafish_value_fc0_q: Vec<i8>,
+    pikafish_value_fc0_scale: f32,
     policy_tactical_active: bool,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
@@ -921,13 +1013,19 @@ impl Clone for AzNnue {
             input_king_piece_hidden: self.input_king_piece_hidden.clone(),
             rule_context_hidden: self.rule_context_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
-            value_head_hidden: self.value_head_hidden.clone(),
-            value_head_bias: self.value_head_bias.clone(),
-            value_head_output: self.value_head_output.clone(),
-            short_value_head_output: self.short_value_head_output.clone(),
-            short_value_head_bias: self.short_value_head_bias.clone(),
-            value_threat_embedding: self.value_threat_embedding.clone(),
-            value_threat_output: self.value_threat_output.clone(),
+            pikafish_psq_embedding: self.pikafish_psq_embedding.clone(),
+            pikafish_threat_embedding: self.pikafish_threat_embedding.clone(),
+            pikafish_psqt: self.pikafish_psqt.clone(),
+            pikafish_value_fc0: self.pikafish_value_fc0.clone(),
+            pikafish_value_fc0_bias: self.pikafish_value_fc0_bias.clone(),
+            pikafish_value_rule_fc0: self.pikafish_value_rule_fc0.clone(),
+            pikafish_value_fc1: self.pikafish_value_fc1.clone(),
+            pikafish_value_fc1_bias: self.pikafish_value_fc1_bias.clone(),
+            pikafish_value_output: self.pikafish_value_output.clone(),
+            pikafish_value_output_bias: self.pikafish_value_output_bias.clone(),
+            pikafish_short_value_output: self.pikafish_short_value_output.clone(),
+            pikafish_short_value_bias: self.pikafish_short_value_bias.clone(),
+            policy_threat_embedding: self.policy_threat_embedding.clone(),
             policy_threat_context: self.policy_threat_context.clone(),
             policy_move_bias: self.policy_move_bias.clone(),
             policy_consequence_output: self.policy_consequence_output.clone(),
@@ -946,9 +1044,14 @@ impl Clone for AzNnue {
             policy_accumulator_move_scale: self.policy_accumulator_move_scale,
             policy_sparse_table_q: self.policy_sparse_table_q.clone(),
             policy_sparse_table_scale: self.policy_sparse_table_scale,
-            value_threat_embedding_q: self.value_threat_embedding_q.clone(),
-            value_threat_embedding_scale: self.value_threat_embedding_scale,
-            value_threat_active: self.value_threat_active,
+            policy_threat_embedding_q: self.policy_threat_embedding_q.clone(),
+            policy_threat_embedding_scale: self.policy_threat_embedding_scale,
+            policy_threat_active: self.policy_threat_active,
+            pikafish_psq_embedding_q: self.pikafish_psq_embedding_q.clone(),
+            pikafish_threat_embedding_q: self.pikafish_threat_embedding_q.clone(),
+            pikafish_embedding_scale: self.pikafish_embedding_scale,
+            pikafish_value_fc0_q: self.pikafish_value_fc0_q.clone(),
+            pikafish_value_fc0_scale: self.pikafish_value_fc0_scale,
             policy_tactical_active: self.policy_tactical_active,
             gpu_trainer: None,
         }
@@ -1343,7 +1446,7 @@ impl Default for AzTrainLossWeights {
         Self {
             value: 1.0,
             policy: 1.0,
-            short_value: 0.0,
+            short_value: 0.15,
         }
     }
 }
@@ -1417,23 +1520,45 @@ impl AzNnue {
         // Start history-neutral; rule context is learned from self-play.
         let rule_context_hidden = vec![0.0; RULE_CONTEXT_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
-        // Start value-neutral. A random value head can evaluate startpos as a
-        // large red/black advantage before any training, and MCTS amplifies
-        // that noise into the first self-play dataset.
-        let value_head_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
+        let pikafish_psq_embedding = (0..PIKAFISH_PSQ_DIMENSIONS * PIKAFISH_TRANSFORMER_DIMENSIONS)
+            .map(|_| rng.weight(0.01))
             .collect();
-        let value_head_bias = vec![0.0; VALUE_HEAD_SIZE];
-        // Keep the value head output-neutral at initialization. This preserves
-        // stable first self-play while giving value its own nonlinear capacity.
-        let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
-        let short_value_head_output =
-            vec![0.0; SHORT_VALUE_HEADS * WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
-        let short_value_head_bias = vec![0.0; SHORT_VALUE_HEADS * WDL_HEAD_SIZE];
-        let value_threat_embedding = (0..VALUE_THREAT_VOCAB * VALUE_THREAT_RANK)
+        let pikafish_threat_embedding = (0..PIKAFISH_VALUE_THREAT_DIMENSIONS
+            * PIKAFISH_TRANSFORMER_DIMENSIONS)
+            .map(|_| rng.weight(0.01))
+            .collect();
+        let pikafish_psqt = vec![0.0; PIKAFISH_PSQ_DIMENSIONS * PIKAFISH_PSQT_BUCKETS];
+        let mut pikafish_value_fc0: Vec<f32> =
+            (0..PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0 * PIKAFISH_TRANSFORMED_DIMENSIONS)
+                .map(|_| rng.weight((2.0 / PIKAFISH_TRANSFORMED_DIMENSIONS as f32).sqrt()))
+                .collect();
+        for stack in 0..PIKAFISH_LAYER_STACKS {
+            let start = (stack * PIKAFISH_VALUE_FC0 + PIKAFISH_VALUE_FC0 - 2)
+                * PIKAFISH_TRANSFORMED_DIMENSIONS;
+            pikafish_value_fc0[start..start + 2 * PIKAFISH_TRANSFORMED_DIMENSIONS].fill(0.0);
+        }
+        let pikafish_value_fc0_bias = vec![0.0; PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0];
+        let pikafish_value_rule_fc0 =
+            vec![0.0; PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC0 * RULE_CONTEXT_SIZE];
+        let pikafish_value_fc1 =
+            (0..PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC1 * PIKAFISH_VALUE_FC0 * 2)
+                .map(|_| rng.weight((1.0 / PIKAFISH_VALUE_FC0 as f32).sqrt()))
+                .collect();
+        let pikafish_value_fc1_bias = vec![0.0; PIKAFISH_LAYER_STACKS * PIKAFISH_VALUE_FC1];
+        // Final and short heads start at zero, so initial MCTS remains neutral.
+        let pikafish_value_output =
+            vec![0.0; PIKAFISH_LAYER_STACKS * WDL_HEAD_SIZE * PIKAFISH_VALUE_TAIL];
+        let pikafish_value_output_bias = vec![0.0; PIKAFISH_LAYER_STACKS * WDL_HEAD_SIZE];
+        let pikafish_short_value_output =
+            vec![
+                0.0;
+                PIKAFISH_LAYER_STACKS * SHORT_VALUE_HEADS * WDL_HEAD_SIZE * PIKAFISH_VALUE_TAIL
+            ];
+        let pikafish_short_value_bias =
+            vec![0.0; PIKAFISH_LAYER_STACKS * SHORT_VALUE_HEADS * WDL_HEAD_SIZE];
+        let policy_threat_embedding = (0..VALUE_THREAT_VOCAB * VALUE_THREAT_RANK)
             .map(|_| rng.weight(0.02))
             .collect();
-        let value_threat_output = vec![0.0; WDL_HEAD_SIZE * VALUE_THREAT_RANK * 2];
         let policy_threat_context = vec![0.0; POLICY_THREAT_CONTEXT_SIZE * VALUE_THREAT_RANK * 2];
         let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
@@ -1462,13 +1587,19 @@ impl AzNnue {
             input_king_piece_hidden,
             rule_context_hidden,
             hidden_bias,
-            value_head_hidden,
-            value_head_bias,
-            value_head_output,
-            short_value_head_output,
-            short_value_head_bias,
-            value_threat_embedding,
-            value_threat_output,
+            pikafish_psq_embedding,
+            pikafish_threat_embedding,
+            pikafish_psqt,
+            pikafish_value_fc0,
+            pikafish_value_fc0_bias,
+            pikafish_value_rule_fc0,
+            pikafish_value_fc1,
+            pikafish_value_fc1_bias,
+            pikafish_value_output,
+            pikafish_value_output_bias,
+            pikafish_short_value_output,
+            pikafish_short_value_bias,
+            policy_threat_embedding,
             policy_threat_context,
             policy_move_bias,
             policy_consequence_output,
@@ -1487,14 +1618,19 @@ impl AzNnue {
             policy_accumulator_move_scale: 1.0,
             policy_sparse_table_q: Vec::new(),
             policy_sparse_table_scale: 1.0,
-            value_threat_embedding_q: Vec::new(),
-            value_threat_embedding_scale: 1.0,
-            value_threat_active: false,
+            policy_threat_embedding_q: Vec::new(),
+            policy_threat_embedding_scale: 1.0,
+            policy_threat_active: false,
+            pikafish_psq_embedding_q: Vec::new(),
+            pikafish_threat_embedding_q: Vec::new(),
+            pikafish_embedding_scale: 1.0,
+            pikafish_value_fc0_q: Vec::new(),
+            pikafish_value_fc0_scale: 1.0,
             policy_tactical_active: false,
             gpu_trainer: None,
         };
         model.rebuild_policy_accumulator_quantization();
-        model.rebuild_value_threat_quantization();
+        model.rebuild_value_quantization();
         model
     }
 
@@ -1554,13 +1690,31 @@ impl AzNnue {
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             rule_context_hidden: load_candle_f32_tensor(&tensors, "rule_context_hidden")?,
             hidden_bias,
-            value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
-            value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
-            value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
-            short_value_head_output: load_candle_f32_tensor(&tensors, "short_value_head_output")?,
-            short_value_head_bias: load_candle_f32_tensor(&tensors, "short_value_head_bias")?,
-            value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
-            value_threat_output: load_candle_f32_tensor(&tensors, "value_threat_output")?,
+            pikafish_psq_embedding: load_candle_f32_tensor(&tensors, "pikafish_psq_embedding")?,
+            pikafish_threat_embedding: load_candle_f32_tensor(
+                &tensors,
+                "pikafish_threat_embedding",
+            )?,
+            pikafish_psqt: load_candle_f32_tensor(&tensors, "pikafish_psqt")?,
+            pikafish_value_fc0: load_candle_f32_tensor(&tensors, "pikafish_value_fc0")?,
+            pikafish_value_fc0_bias: load_candle_f32_tensor(&tensors, "pikafish_value_fc0_bias")?,
+            pikafish_value_rule_fc0: load_candle_f32_tensor(&tensors, "pikafish_value_rule_fc0")?,
+            pikafish_value_fc1: load_candle_f32_tensor(&tensors, "pikafish_value_fc1")?,
+            pikafish_value_fc1_bias: load_candle_f32_tensor(&tensors, "pikafish_value_fc1_bias")?,
+            pikafish_value_output: load_candle_f32_tensor(&tensors, "pikafish_value_output")?,
+            pikafish_value_output_bias: load_candle_f32_tensor(
+                &tensors,
+                "pikafish_value_output_bias",
+            )?,
+            pikafish_short_value_output: load_candle_f32_tensor(
+                &tensors,
+                "pikafish_short_value_output",
+            )?,
+            pikafish_short_value_bias: load_candle_f32_tensor(
+                &tensors,
+                "pikafish_short_value_bias",
+            )?,
+            policy_threat_embedding: load_candle_f32_tensor(&tensors, "policy_threat_embedding")?,
             policy_threat_context: load_candle_f32_tensor(&tensors, "policy_threat_context")?,
             policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_consequence_output: load_candle_f32_tensor(
@@ -1585,14 +1739,19 @@ impl AzNnue {
             policy_accumulator_move_scale: 1.0,
             policy_sparse_table_q: Vec::new(),
             policy_sparse_table_scale: 1.0,
-            value_threat_embedding_q: Vec::new(),
-            value_threat_embedding_scale: 1.0,
-            value_threat_active: false,
+            policy_threat_embedding_q: Vec::new(),
+            policy_threat_embedding_scale: 1.0,
+            policy_threat_active: false,
+            pikafish_psq_embedding_q: Vec::new(),
+            pikafish_threat_embedding_q: Vec::new(),
+            pikafish_embedding_scale: 1.0,
+            pikafish_value_fc0_q: Vec::new(),
+            pikafish_value_fc0_scale: 1.0,
             policy_tactical_active: false,
             gpu_trainer: None,
         };
         model.rebuild_policy_accumulator_quantization();
-        model.rebuild_value_threat_quantization();
+        model.rebuild_value_quantization();
         model.rebuild_policy_tactical();
         model.validate()?;
         Ok(model)
@@ -1672,16 +1831,18 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            let threat_logits = self.value_threat_logits(
+            self.policy_threat_activation(
                 position,
-                &mut scratch.value_threat_accumulator,
-                &mut scratch.value_threat_activation,
+                &mut scratch.policy_threat_accumulator,
+                &mut scratch.policy_threat_activation,
             );
-            self.value_wdl_from_hidden_into(
-                &scratch.hidden,
-                &features,
-                &mut scratch.value_head,
-                threat_logits,
+            self.pikafish_value_wdl(
+                position,
+                rule_context,
+                &mut scratch.pikafish_accumulator,
+                &mut scratch.pikafish_transformed,
+                &mut scratch.pikafish_transformed_q,
+                &mut scratch.pikafish_tail,
             )
         };
         self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
@@ -1693,6 +1854,7 @@ impl AzNnue {
         &self,
         position: &Position,
         accumulator_hidden: &[f32],
+        value_accumulator: &[i16],
         policy_accumulator: &[i16; POLICY_ACCUMULATOR_RANK],
         moves: &[Move],
         rule_context: &[f32; RULE_CONTEXT_SIZE],
@@ -1721,16 +1883,18 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            let threat_logits = self.value_threat_logits(
+            self.policy_threat_activation(
                 position,
-                &mut scratch.value_threat_accumulator,
-                &mut scratch.value_threat_activation,
+                &mut scratch.policy_threat_accumulator,
+                &mut scratch.policy_threat_activation,
             );
-            self.value_wdl_from_hidden_into(
-                &scratch.hidden,
-                &[],
-                &mut scratch.value_head,
-                threat_logits,
+            self.pikafish_value_wdl_from_accumulator(
+                position,
+                rule_context,
+                value_accumulator,
+                &mut scratch.pikafish_transformed,
+                &mut scratch.pikafish_transformed_q,
+                &mut scratch.pikafish_tail,
             )
         };
         self.evaluate_prepared_hidden_with_scratch(position, &[], value, moves, scratch);
@@ -1763,20 +1927,31 @@ impl AzNnue {
             rms_norm_in_place(&mut request.scratch.hidden);
         }
 
-        let threat_logits = std::array::from_fn(|index| {
-            self.value_threat_logits(
+        for index in 0..4 {
+            self.policy_threat_activation(
                 requests[index].position,
-                &mut requests[index].scratch.value_threat_accumulator,
-                &mut requests[index].scratch.value_threat_activation,
+                &mut requests[index].scratch.policy_threat_accumulator,
+                &mut requests[index].scratch.policy_threat_activation,
+            );
+        }
+        let outputs: [([f32; WDL_HEAD_SIZE], f32); 4] = std::array::from_fn(|index| {
+            self.pikafish_value_wdl_from_accumulator(
+                requests[index].position,
+                requests[index].rule_context,
+                requests[index].value_accumulator,
+                &mut requests[index].scratch.pikafish_transformed,
+                &mut requests[index].scratch.pikafish_transformed_q,
+                &mut requests[index].scratch.pikafish_tail,
             )
         });
+        let value_wdls: [[f32; WDL_HEAD_SIZE]; 4] = std::array::from_fn(|index| outputs[index].0);
+        let values: [f32; 4] = std::array::from_fn(|index| outputs[index].1);
         let hiddens = [
             requests[0].scratch.hidden.as_slice(),
             requests[1].scratch.hidden.as_slice(),
             requests[2].scratch.hidden.as_slice(),
             requests[3].scratch.hidden.as_slice(),
         ];
-        let (value_wdls, values) = self.value_wdl_batch4(hiddens, threat_logits);
         let mut contexts = [[0.0f32; POLICY_MOVE_CONTEXT_SIZE]; 4];
         for context_index in 0..POLICY_MOVE_CONTEXT_SIZE {
             let start = context_index * self.hidden_size;
@@ -1785,7 +1960,7 @@ impl AzNnue {
                 &self.policy_context_hidden[start..start + self.hidden_size],
             );
             for batch in 0..4 {
-                let threat = &requests[batch].scratch.value_threat_activation;
+                let threat = &requests[batch].scratch.policy_threat_activation;
                 let threat_logit = if context_index < POLICY_THREAT_CONTEXT_SIZE
                     && threat.len() == VALUE_THREAT_RANK * 2
                 {
@@ -1837,11 +2012,11 @@ impl AzNnue {
                 &self.policy_context_hidden[start..start + self.hidden_size],
             );
             if context_index < POLICY_THREAT_CONTEXT_SIZE
-                && scratch.value_threat_activation.len() == VALUE_THREAT_RANK * 2
+                && scratch.policy_threat_activation.len() == VALUE_THREAT_RANK * 2
             {
                 let threat_start = context_index * VALUE_THREAT_RANK * 2;
                 *context += dot_product(
-                    &scratch.value_threat_activation,
+                    &scratch.policy_threat_activation,
                     &self.policy_threat_context[threat_start..threat_start + VALUE_THREAT_RANK * 2],
                 );
             }
@@ -2159,115 +2334,226 @@ impl AzNnue {
         self.add_factorized_structure_into(features, hidden);
     }
 
-    fn value_threat_logits(
+    fn policy_threat_activation(
         &self,
         position: &Position,
         accumulator: &mut Vec<i16>,
         activation: &mut Vec<f32>,
-    ) -> [f32; WDL_HEAD_SIZE] {
-        if !self.value_threat_active {
-            return [0.0; WDL_HEAD_SIZE];
+    ) {
+        if !self.policy_threat_active {
+            activation.resize(VALUE_THREAT_RANK * 2, 0.0);
+            activation.fill(0.0);
+            return;
         }
-        crate::scope_profile!("az.eval.value_threat");
+        crate::scope_profile!("az.eval.policy_threat");
         accumulator.resize(VALUE_THREAT_RANK, 0);
         accumulator.fill(0);
         let perspective = position.side_to_move();
-        {
-            crate::scope_profile!("az.eval.value_threat.accumulate");
-            position.visit_occupied_relations(|source, attacker, target, attacked| {
-                let feature = value_threat_index(perspective, source, attacker, target, attacked);
-                if feature == VALUE_THREAT_VOCAB {
-                    return;
-                }
-                let row = &self.value_threat_embedding_q
+        position.visit_occupied_relations(|source, attacker, target, attacked| {
+            let feature = value_threat_index(perspective, source, attacker, target, attacked);
+            if feature != VALUE_THREAT_VOCAB {
+                let row = &self.policy_threat_embedding_q
                     [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
                 add_i8_row_to_i16(accumulator, row);
-            });
-        }
-        let mut logits = [0.0; WDL_HEAD_SIZE];
-        {
-            crate::scope_profile!("az.eval.value_threat.output");
-            activation.resize(VALUE_THREAT_RANK * 2, 0.0);
-            for rank in 0..VALUE_THREAT_RANK {
-                let value = (f32::from(accumulator[rank]) * self.value_threat_embedding_scale)
-                    .clamp(0.0, 1.0);
-                activation[rank] = value;
-                activation[VALUE_THREAT_RANK + rank] = value * value;
             }
-            for (output, logit) in logits.iter_mut().enumerate() {
-                let row = &self.value_threat_output
-                    [output * VALUE_THREAT_RANK * 2..(output + 1) * VALUE_THREAT_RANK * 2];
-                *logit = dot_product(activation, row);
-            }
+        });
+        activation.resize(VALUE_THREAT_RANK * 2, 0.0);
+        for rank in 0..VALUE_THREAT_RANK {
+            let value =
+                (f32::from(accumulator[rank]) * self.policy_threat_embedding_scale).clamp(0.0, 1.0);
+            activation[rank] = value;
+            activation[VALUE_THREAT_RANK + rank] = value * value;
         }
-        logits
     }
 
-    #[allow(dead_code)]
-    fn value_from_hidden_into(
+    fn pikafish_value_wdl(
         &self,
-        hidden: &[f32],
-        features: &[usize],
-        value_head: &mut Vec<f32>,
-    ) -> f32 {
-        let probs = self.value_wdl_from_hidden_into(hidden, features, value_head, [0.0; 3]);
-        probs.1
-    }
-
-    fn value_wdl_from_hidden_into(
-        &self,
-        hidden: &[f32],
-        features: &[usize],
-        value_head: &mut Vec<f32>,
-        threat_logits: [f32; WDL_HEAD_SIZE],
+        position: &Position,
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        accumulator: &mut Vec<i16>,
+        transformed: &mut Vec<f32>,
+        transformed_q: &mut Vec<i8>,
+        tail: &mut Vec<f32>,
     ) -> ([f32; WDL_HEAD_SIZE], f32) {
-        value_head.resize(VALUE_HEAD_SIZE, 0.0);
-        value_head.copy_from_slice(&self.value_head_bias);
-        for (feature, value) in value_head.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
-            let hidden_row = &self.value_head_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            *value += dot_product(hidden, hidden_row);
-            *value = (*value).max(0.0);
+        self.refresh_pikafish_accumulator(position, accumulator);
+        self.pikafish_value_wdl_from_accumulator(
+            position,
+            rule_context,
+            accumulator,
+            transformed,
+            transformed_q,
+            tail,
+        )
+    }
+
+    fn refresh_pikafish_accumulator(&self, position: &Position, accumulator: &mut Vec<i16>) {
+        accumulator.resize(PIKAFISH_TRANSFORMER_DIMENSIONS * 2, 0);
+        accumulator.fill(0);
+        let active = active_value_features_pair(position);
+        for (view, features) in active.iter().enumerate() {
+            let acc = &mut accumulator[view * PIKAFISH_TRANSFORMER_DIMENSIONS
+                ..(view + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+            for &feature in &features.psq {
+                let row = &self.pikafish_psq_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                    ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+                add_i8_row_to_i16(acc, row);
+            }
+            for &feature in &features.threats {
+                let row = &self.pikafish_threat_embedding_q[feature
+                    * PIKAFISH_TRANSFORMER_DIMENSIONS
+                    ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+                add_i8_row_to_i16(acc, row);
+            }
         }
-        let _ = features;
-        let mut logits = [0.0f32; WDL_HEAD_SIZE];
-        for (out, logit) in logits.iter_mut().enumerate() {
-            let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-            *logit = dot_product(value_head, row) + threat_logits[out];
+    }
+
+    fn apply_pikafish_transition(
+        &self,
+        before_position: &Position,
+        after_position: &Position,
+        before: &[ActiveValueFeatures; 2],
+        accumulator: &mut [i16],
+    ) -> [ActiveValueFeatures; 2] {
+        debug_assert_eq!(accumulator.len(), PIKAFISH_TRANSFORMER_DIMENSIONS * 2);
+        let mut after = active_psq_features_pair(after_position);
+        let requires_refresh: [bool; 2] = std::array::from_fn(|view| {
+            before[view].feature_bucket != after[view].feature_bucket
+                || before[view].mirror != after[view].mirror
+        });
+        let changed_threats = (!requires_refresh[0] || !requires_refresh[1]).then(|| {
+            changed_threat_indices(
+                before_position,
+                after_position,
+                [before[0].mirror, before[1].mirror],
+            )
+        });
+        for view in 0..2 {
+            let before_features = &before[view];
+            let acc = &mut accumulator[view * PIKAFISH_TRANSFORMER_DIMENSIONS
+                ..(view + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+            // A feature-bucket or mirror change remaps every HalfKA and threat
+            // index, so refresh that perspective. Otherwise update exact set deltas.
+            if requires_refresh[view] {
+                after[view] = active_value_features_pair(after_position)[view].clone();
+                acc.fill(0);
+                for &feature in &after[view].psq {
+                    add_i8_row_to_i16(
+                        acc,
+                        &self.pikafish_psq_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                            ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
+                    );
+                }
+                for &feature in &after[view].threats {
+                    add_i8_row_to_i16(
+                        acc,
+                        &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                            ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
+                    );
+                }
+                continue;
+            }
+            let (removed, added) = &changed_threats.as_ref().unwrap()[view];
+            apply_sorted_feature_delta(
+                acc,
+                &before_features.psq,
+                &after[view].psq,
+                &self.pikafish_psq_embedding_q,
+            );
+            for &feature in removed {
+                subtract_i8_row_from_i16(
+                    acc,
+                    &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                        ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
+                );
+            }
+            for &feature in added {
+                add_i8_row_to_i16(
+                    acc,
+                    &self.pikafish_threat_embedding_q[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                        ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS],
+                );
+            }
+        }
+        after
+    }
+
+    fn pikafish_value_wdl_from_accumulator(
+        &self,
+        position: &Position,
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        accumulator: &[i16],
+        transformed: &mut Vec<f32>,
+        transformed_q: &mut Vec<i8>,
+        tail: &mut Vec<f32>,
+    ) -> ([f32; WDL_HEAD_SIZE], f32) {
+        transformed.resize(PIKAFISH_TRANSFORMED_DIMENSIONS, 0.0);
+        transformed_q.resize(PIKAFISH_TRANSFORMED_DIMENSIONS, 0);
+        let side = position.side_to_move();
+        for view in 0..2 {
+            let absolute_view = color_index(if view == 0 { side } else { side.opposite() });
+            let acc = &accumulator[absolute_view * PIKAFISH_TRANSFORMER_DIMENSIONS
+                ..(absolute_view + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+            for feature in 0..PIKAFISH_TRANSFORMER_HALF {
+                let a = (f32::from(acc[feature]) * self.pikafish_embedding_scale).clamp(0.0, 1.0);
+                let b = (f32::from(acc[PIKAFISH_TRANSFORMER_HALF + feature])
+                    * self.pikafish_embedding_scale)
+                    .clamp(0.0, 1.0);
+                transformed[view * PIKAFISH_TRANSFORMER_HALF + feature] = a * b;
+                transformed_q[view * PIKAFISH_TRANSFORMER_HALF + feature] =
+                    (a * b * 127.0).round() as i8;
+            }
+        }
+        let stack = layer_stack_bucket(position);
+        let fc0_base = stack * PIKAFISH_VALUE_FC0;
+        let mut fc0 = [0.0f32; PIKAFISH_VALUE_FC0];
+        for (out, value) in fc0.iter_mut().enumerate() {
+            let rule = &self.pikafish_value_rule_fc0
+                [(fc0_base + out) * RULE_CONTEXT_SIZE..(fc0_base + out + 1) * RULE_CONTEXT_SIZE];
+            let row_q = &self.pikafish_value_fc0_q[(fc0_base + out)
+                * PIKAFISH_TRANSFORMED_DIMENSIONS
+                ..(fc0_base + out + 1) * PIKAFISH_TRANSFORMED_DIMENSIONS];
+            *value = self.pikafish_value_fc0_bias[fc0_base + out]
+                + dot_product_i8_i8(transformed_q, row_q) * (self.pikafish_value_fc0_scale / 127.0)
+                + dot_product(rule_context, rule);
+        }
+        let mut fc0_pair = [0.0f32; PIKAFISH_VALUE_FC0 * 2];
+        for out in 0..PIKAFISH_VALUE_FC0 {
+            let value = fc0[out].clamp(0.0, 1.0);
+            fc0_pair[out] = value * value;
+            fc0_pair[PIKAFISH_VALUE_FC0 + out] = value;
+        }
+        let fc1_base = stack * PIKAFISH_VALUE_FC1;
+        let mut fc1 = [0.0f32; PIKAFISH_VALUE_FC1];
+        for (out, value) in fc1.iter_mut().enumerate() {
+            let row = &self.pikafish_value_fc1[(fc1_base + out) * PIKAFISH_VALUE_FC0 * 2
+                ..(fc1_base + out + 1) * PIKAFISH_VALUE_FC0 * 2];
+            *value = self.pikafish_value_fc1_bias[fc1_base + out] + dot_product(&fc0_pair, row);
+        }
+        tail.resize(PIKAFISH_VALUE_TAIL, 0.0);
+        tail[..PIKAFISH_VALUE_FC0 * 2].copy_from_slice(&fc0_pair);
+        for out in 0..PIKAFISH_VALUE_FC1 {
+            let value = fc1[out].clamp(0.0, 1.0);
+            tail[PIKAFISH_VALUE_FC0 * 2 + out] = value * value;
+            tail[PIKAFISH_VALUE_FC0 * 2 + PIKAFISH_VALUE_FC1 + out] = value;
+        }
+        let mut psqt = [0.0f32; 2];
+        for (view, perspective) in [side, side.opposite()].into_iter().enumerate() {
+            for feature in active_psq_indices(position, perspective) {
+                psqt[view] += self.pikafish_psqt[feature * PIKAFISH_PSQT_BUCKETS + stack];
+            }
+        }
+        let signed = psqt[0] - psqt[1];
+        let skip = fc0[PIKAFISH_VALUE_FC0 - 2] - fc0[PIKAFISH_VALUE_FC0 - 1];
+        let mut logits = [signed + skip, 0.0, -signed - skip];
+        let output_base = stack * WDL_HEAD_SIZE;
+        for out in 0..WDL_HEAD_SIZE {
+            let row = &self.pikafish_value_output[(output_base + out) * PIKAFISH_VALUE_TAIL
+                ..(output_base + out + 1) * PIKAFISH_VALUE_TAIL];
+            logits[out] +=
+                self.pikafish_value_output_bias[output_base + out] + dot_product(tail, row);
         }
         let wdl = softmax_fixed3(logits);
-        let q = wdl[0] - wdl[2];
-        (wdl, q)
-    }
-
-    #[allow(dead_code)]
-    fn value_wdl_batch4(
-        &self,
-        hiddens: [&[f32]; 4],
-        threat_logits: [[f32; WDL_HEAD_SIZE]; 4],
-    ) -> ([[f32; WDL_HEAD_SIZE]; 4], [f32; 4]) {
-        let mut heads = [[0.0f32; VALUE_HEAD_SIZE]; 4];
-        for feature in 0..VALUE_HEAD_SIZE {
-            let row = &self.value_head_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            let dots = dot_product_f32_batch4(hiddens, row);
-            for batch in 0..4 {
-                heads[batch][feature] = (self.value_head_bias[feature] + dots[batch]).max(0.0);
-            }
-        }
-        let mut wdls = [[0.0; WDL_HEAD_SIZE]; 4];
-        let mut values = [0.0; 4];
-        for batch in 0..4 {
-            let mut logits = [0.0; WDL_HEAD_SIZE];
-            for (out, logit) in logits.iter_mut().enumerate() {
-                let row =
-                    &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-                *logit = dot_product(&heads[batch], row) + threat_logits[batch][out];
-            }
-            wdls[batch] = softmax_fixed3(logits);
-            values[batch] = wdls[batch][0] - wdls[batch][2];
-        }
-        (wdls, values)
+        (wdl, wdl[0] - wdl[2])
     }
 
     fn fill_policy_piece_square_scores(&self, scores: &mut Vec<f32>) {
@@ -2282,22 +2568,59 @@ impl AzNnue {
         }
     }
 
-    fn rebuild_value_threat_quantization(&mut self) {
-        self.value_threat_active = self.value_threat_output.iter().any(|&weight| weight != 0.0)
-            || self
-                .policy_threat_context
-                .iter()
-                .any(|&weight| weight != 0.0);
+    fn rebuild_value_quantization(&mut self) {
+        self.policy_threat_active = self
+            .policy_threat_context
+            .iter()
+            .any(|&weight| weight != 0.0);
         let maximum = self
-            .value_threat_embedding
+            .policy_threat_embedding
             .iter()
             .fold(0.0f32, |current, value| current.max(value.abs()));
-        self.value_threat_embedding_scale = (maximum / 127.0).max(1.0e-12);
-        self.value_threat_embedding_q = self
-            .value_threat_embedding
+        self.policy_threat_embedding_scale = (maximum / 127.0).max(1.0e-12);
+        self.policy_threat_embedding_q = self
+            .policy_threat_embedding
             .iter()
             .map(|value| {
-                (*value / self.value_threat_embedding_scale)
+                (*value / self.policy_threat_embedding_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+        let maximum = self
+            .pikafish_psq_embedding
+            .iter()
+            .chain(&self.pikafish_threat_embedding)
+            .fold(0.0f32, |current, value| current.max(value.abs()));
+        self.pikafish_embedding_scale = (maximum / 127.0).max(1.0e-12);
+        self.pikafish_psq_embedding_q = self
+            .pikafish_psq_embedding
+            .iter()
+            .map(|value| {
+                (*value / self.pikafish_embedding_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+        self.pikafish_threat_embedding_q = self
+            .pikafish_threat_embedding
+            .iter()
+            .map(|value| {
+                (*value / self.pikafish_embedding_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8
+            })
+            .collect();
+        let maximum = self
+            .pikafish_value_fc0
+            .iter()
+            .fold(0.0f32, |current, value| current.max(value.abs()));
+        self.pikafish_value_fc0_scale = (maximum / 127.0).max(1.0e-12);
+        self.pikafish_value_fc0_q = self
+            .pikafish_value_fc0
+            .iter()
+            .map(|value| {
+                (*value / self.pikafish_value_fc0_scale)
                     .round()
                     .clamp(-127.0, 127.0) as i8
             })
@@ -2681,15 +3004,15 @@ pub fn outputs_for_training_sample(
     let mut scratch = AzEvalScratch::new(model.arch);
     let evaluated =
         model.evaluate_with_scratch_output(&position, &moves, &sample.rule_context, &mut scratch);
+    let stack = layer_stack_bucket(&position);
     let short = std::array::from_fn(|head| {
-        let base = head * WDL_HEAD_SIZE * VALUE_HEAD_SIZE;
-        let bias = head * WDL_HEAD_SIZE;
+        let output = (stack * SHORT_VALUE_HEADS + head) * WDL_HEAD_SIZE;
         softmax_fixed3(std::array::from_fn(|part| {
             dot_product(
-                &scratch.value_head,
-                &model.short_value_head_output
-                    [base + part * VALUE_HEAD_SIZE..base + (part + 1) * VALUE_HEAD_SIZE],
-            ) + model.short_value_head_bias[bias + part]
+                &scratch.pikafish_tail,
+                &model.pikafish_short_value_output[(output + part) * PIKAFISH_VALUE_TAIL
+                    ..(output + part + 1) * PIKAFISH_VALUE_TAIL],
+            ) + model.pikafish_short_value_bias[output + part]
         }))
     });
     Some((evaluated.value_wdl, short, scratch.logits))
@@ -2758,6 +3081,48 @@ fn add_i8_row_to_i16(accumulator: &mut [i16], row: &[i8]) {
     }
 }
 
+#[inline]
+fn subtract_i8_row_from_i16(accumulator: &mut [i16], row: &[i8]) {
+    debug_assert_eq!(accumulator.len(), row.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if accumulator.len().is_multiple_of(32) && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was checked at runtime and both slices have equal 32-byte chunks.
+        unsafe { subtract_i8_row_from_i16_avx2(accumulator, row) };
+        return;
+    }
+    for (sum, &weight) in accumulator.iter_mut().zip(row) {
+        *sum -= i16::from(weight);
+    }
+}
+
+fn apply_sorted_feature_delta(
+    accumulator: &mut [i16],
+    before: &[usize],
+    after: &[usize],
+    table: &[i8],
+) {
+    let mut left = 0usize;
+    let mut right = 0usize;
+    while left < before.len() || right < after.len() {
+        if right == after.len() || (left < before.len() && before[left] < after[right]) {
+            let feature = before[left];
+            let row = &table[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+            subtract_i8_row_from_i16(accumulator, row);
+            left += 1;
+        } else if left == before.len() || after[right] < before[left] {
+            let feature = after[right];
+            let row = &table[feature * PIKAFISH_TRANSFORMER_DIMENSIONS
+                ..(feature + 1) * PIKAFISH_TRANSFORMER_DIMENSIONS];
+            add_i8_row_to_i16(accumulator, row);
+            right += 1;
+        } else {
+            left += 1;
+            right += 1;
+        }
+    }
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn add_i8_row_to_i16_avx2(accumulator: &mut [i16], row: &[i8]) {
@@ -2780,6 +3145,33 @@ unsafe fn add_i8_row_to_i16_avx2(accumulator: &mut [i16], row: &[i8]) {
             _mm256_storeu_si256(
                 accumulator.as_mut_ptr().add(offset + 16).cast(),
                 _mm256_add_epi16(high_sum, high),
+            );
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn subtract_i8_row_from_i16_avx2(accumulator: &mut [i16], row: &[i8]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    for offset in (0..row.len()).step_by(32) {
+        let packed = unsafe { _mm256_loadu_si256(row.as_ptr().add(offset).cast()) };
+        let low = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(packed));
+        let high = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(packed));
+        unsafe {
+            let low_sum = _mm256_loadu_si256(accumulator.as_ptr().add(offset).cast());
+            let high_sum = _mm256_loadu_si256(accumulator.as_ptr().add(offset + 16).cast());
+            _mm256_storeu_si256(
+                accumulator.as_mut_ptr().add(offset).cast(),
+                _mm256_sub_epi16(low_sum, low),
+            );
+            _mm256_storeu_si256(
+                accumulator.as_mut_ptr().add(offset + 16).cast(),
+                _mm256_sub_epi16(high_sum, high),
             );
         }
     }
@@ -2856,6 +3248,41 @@ unsafe fn dot_product_i16_i8_32_avx2(left: &[i16; POLICY_ACCUMULATOR_RANK], righ
     }
     let mut lanes = [0i32; 8];
     unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), sums) };
+    lanes.into_iter().sum()
+}
+
+fn dot_product_i8_i8(left: &[i8], right: &[i8]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if left.len().is_multiple_of(32) && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was checked at runtime; left is deliberately quantized to [0, 127],
+        // satisfying the unsigned input contract of `maddubs`.
+        return unsafe { dot_product_i8_i8_avx2(left, right) as f32 };
+    }
+    left.iter()
+        .zip(right)
+        .map(|(&a, &b)| i32::from(a) * i32::from(b))
+        .sum::<i32>() as f32
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_product_i8_i8_avx2(left: &[i8], right: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let ones = _mm256_set1_epi16(1);
+    let mut sum = _mm256_setzero_si256();
+    for offset in (0..left.len()).step_by(32) {
+        let lhs = unsafe { _mm256_loadu_si256(left.as_ptr().add(offset).cast()) };
+        let rhs = unsafe { _mm256_loadu_si256(right.as_ptr().add(offset).cast()) };
+        let pairs = _mm256_maddubs_epi16(lhs, rhs);
+        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(pairs, ones));
+    }
+    let mut lanes = [0i32; 8];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), sum) };
     lanes.into_iter().sum()
 }
 
@@ -3476,6 +3903,18 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn valid_test_features(plies: usize) -> Vec<usize> {
+        let mut position = Position::startpos();
+        for ply in 0..plies {
+            let legal = position.legal_moves();
+            let mv = legal[(plies * 13 + ply * 7) % legal.len()];
+            position.make_move(mv);
+        }
+        let mut features = Vec::new();
+        fill_sparse_features_az(&position, &mut features);
+        features
+    }
+
     #[test]
     fn dense_move_space_matches_enumeration() {
         let map = move_map();
@@ -3489,7 +3928,12 @@ mod tests {
     #[test]
     fn random_initial_value_head_is_neutral() {
         let model = AzNnue::random_with_arch(AzNnueArch::with_hidden_size(512), 20260409);
-        assert!(model.value_head_output.iter().all(|&weight| weight == 0.0));
+        assert!(
+            model
+                .pikafish_value_output
+                .iter()
+                .all(|&weight| weight == 0.0)
+        );
 
         let position = Position::startpos();
         let moves = position.legal_moves();
@@ -3596,8 +4040,8 @@ mod tests {
     #[test]
     fn scalar_value_head_starts_neutral() {
         let model = AzNnue::random(16, 7);
-        let mut scratch = AzEvalScratch::new(model.arch);
-        let value = model.value_from_hidden_into(&scratch.hidden, &[], &mut scratch.value_head);
+        let position = Position::startpos();
+        let value = model.evaluate_value(&position, &position.legal_moves());
 
         assert!(value.abs() < 1e-6);
     }
@@ -3627,6 +4071,74 @@ mod tests {
                 assert!((incremental - full).abs() < 2.0e-5);
             }
         }
+    }
+
+    #[test]
+    fn pikafish_value_accumulator_delta_matches_full_refresh() {
+        let model = AzNnue::random(128, 0x45547);
+        let mut position = Position::startpos();
+        let (_, mut incremental) = AzEvalAccumulator::new(&model, &position).into_sums();
+        let mut value_features = active_value_features_pair(&position);
+        for ply in 0..40 {
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            let mv = legal[(ply * 17 + 3) % legal.len()];
+            let before = position.clone();
+            position.make_move(mv);
+            value_features = model.apply_pikafish_transition(
+                &before,
+                &position,
+                &value_features,
+                &mut incremental,
+            );
+            let (_, refreshed) = AzEvalAccumulator::new(&model, &position).into_sums();
+            assert_eq!(
+                incremental, refreshed,
+                "value accumulator drift at ply {ply}"
+            );
+        }
+    }
+
+    #[cfg(feature = "gpu-train")]
+    #[test]
+    fn pikafish_value_gpu_one_step_smoke() {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let mut features = Vec::new();
+        fill_sparse_features_az(&position, &mut features);
+        let sample = AzTrainingSample {
+            features,
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            root_search_wdl: [1.0, 0.0, 0.0],
+            short_value_wdl: [[1.0, 0.0, 0.0]; SHORT_VALUE_HEADS],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 400,
+            meta: AzSampleMeta::default(),
+        };
+        let mut model = AzNnue::random(128, 0x231024);
+        let mut rng = SplitMix64::new(9);
+        let stats = train_samples(&mut model, &[sample], 1, 0.001, 1, &mut rng).unwrap();
+        assert!(stats.loss.is_finite());
+        assert!(
+            model
+                .pikafish_value_output
+                .iter()
+                .any(|&weight| weight != 0.0)
+        );
+        assert!(
+            model
+                .pikafish_short_value_output
+                .iter()
+                .any(|&weight| weight != 0.0)
+        );
     }
 
     #[test]
@@ -3666,7 +4178,7 @@ mod tests {
         let model = AzNnue::random(128, 20260819);
         let position = Position::startpos();
         let moves = position.legal_moves();
-        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let (hidden, value_accumulator) = AzEvalAccumulator::new(&model, &position).into_sums();
         let policy = model.quantized_policy_accumulator(&position, position.side_to_move());
         let rule_context = [0.0; RULE_CONTEXT_SIZE];
 
@@ -3676,6 +4188,7 @@ mod tests {
             model.evaluate_incremental_with_scratch_output(
                 &position,
                 &hidden,
+                &value_accumulator,
                 &policy,
                 &moves,
                 &rule_context,
@@ -3689,6 +4202,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3697,6 +4211,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3705,6 +4220,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3713,6 +4229,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3741,7 +4258,7 @@ mod tests {
         let model = AzNnue::random(128, 20260820);
         let position = Position::startpos();
         let moves = position.legal_moves();
-        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let (hidden, value_accumulator) = AzEvalAccumulator::new(&model, &position).into_sums();
         let policy = model.quantized_policy_accumulator(&position, position.side_to_move());
         let rule_context = [0.0; RULE_CONTEXT_SIZE];
         let repeats = 5_000;
@@ -3754,6 +4271,7 @@ mod tests {
                 black_box(model.evaluate_incremental_with_scratch_output(
                     &position,
                     &hidden,
+                    &value_accumulator,
                     &policy,
                     &moves,
                     &rule_context,
@@ -3769,6 +4287,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3777,6 +4296,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3785,6 +4305,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3793,6 +4314,7 @@ mod tests {
             AzIncrementalEvalRequest {
                 position: &position,
                 accumulator_hidden: &hidden,
+                value_accumulator: &value_accumulator,
                 policy_accumulator: &policy,
                 moves: &moves,
                 rule_context: &rule_context,
@@ -3809,6 +4331,25 @@ mod tests {
             scalar.as_secs_f64() * 1e3,
             batch.as_secs_f64() * 1e3,
             scalar.as_secs_f64() / batch.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual Pikafish model footprint benchmark"]
+    fn benchmark_pikafish_model_footprint() {
+        let model = AzNnue::random(128, 0x45547);
+        let path = std::env::temp_dir().join("chineseai_pikafish_value_footprint.safetensors");
+        let _ = fs::remove_file(&path);
+        model.save(&path).unwrap();
+        let file_bytes = fs::metadata(&path).unwrap().len();
+        let quantized_bytes = model.pikafish_psq_embedding_q.len()
+            + model.pikafish_threat_embedding_q.len()
+            + model.pikafish_value_fc0_q.len();
+        let _ = fs::remove_file(&path);
+        eprintln!(
+            "Pikafish model footprint: safetensors={:.2}MiB derived_i8={:.2}MiB",
+            file_bytes as f64 / (1024.0 * 1024.0),
+            quantized_bytes as f64 / (1024.0 * 1024.0),
         );
     }
 
@@ -3845,7 +4386,7 @@ mod tests {
 
         let samples = vec![
             AzTrainingSample {
-                features: vec![0],
+                features: valid_test_features(0),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -3860,7 +4401,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![1],
+                features: valid_test_features(1),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -3875,7 +4416,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![2],
+                features: valid_test_features(2),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -3890,7 +4431,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![3],
+                features: valid_test_features(3),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -3922,7 +4463,7 @@ mod tests {
     #[test]
     fn short_value_heads_can_overfit_tiny_fixed_dataset() {
         let make_sample = |feature: usize, value: f32| AzTrainingSample {
-            features: vec![feature],
+            features: valid_test_features(feature),
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: Vec::new(),
             policy: Vec::new(),
@@ -3971,7 +4512,7 @@ mod tests {
     fn batched_training_is_deterministic() {
         let samples = vec![
             AzTrainingSample {
-                features: vec![0, 4, 8],
+                features: valid_test_features(0),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -3986,7 +4527,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![1, 5, 9],
+                features: valid_test_features(1),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4001,7 +4542,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![2, 6, 10],
+                features: valid_test_features(2),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4016,7 +4557,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![3, 7, 11],
+                features: valid_test_features(3),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4049,9 +4590,9 @@ mod tests {
         assert!((single_stats.value_target_sum - repeated_stats.value_target_sum).abs() < 1e-6);
         assert!(
             single
-                .value_head_output
+                .pikafish_value_output
                 .iter()
-                .zip(&repeated.value_head_output)
+                .zip(&repeated.pikafish_value_output)
                 .all(|(left, right)| (*left - *right).abs() < 1e-5)
         );
     }
@@ -4061,7 +4602,7 @@ mod tests {
     fn value_only_training_updates_trunk_when_trunk_training_enabled() {
         let samples = vec![
             AzTrainingSample {
-                features: vec![0, 4, 8],
+                features: valid_test_features(0),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4076,7 +4617,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![1, 5, 9],
+                features: valid_test_features(1),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4091,7 +4632,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![2, 6, 10],
+                features: valid_test_features(2),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4106,7 +4647,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
-                features: vec![3, 7, 11],
+                features: valid_test_features(3),
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
                 policy: Vec::new(),
@@ -4123,8 +4664,8 @@ mod tests {
         ];
         let mut model = AzNnue::random(8, 31);
         model.hidden_bias.fill(0.1);
-        let before_input = model.input_hidden.clone();
-        let before_bias = model.hidden_bias.clone();
+        let before_psq = model.pikafish_psq_embedding.clone();
+        let before_threat = model.pikafish_threat_embedding.clone();
 
         let mut rng = SplitMix64::new(32);
         let weights = AzTrainLossWeights {
@@ -4134,17 +4675,17 @@ mod tests {
         };
         train_samples_weighted(&mut model, &samples, 20, 0.01, 4, &mut rng, weights).unwrap();
 
-        let input_changed = before_input
+        let psq_changed = before_psq
             .iter()
-            .zip(&model.input_hidden)
+            .zip(&model.pikafish_psq_embedding)
             .any(|(left, right)| (*left - *right).abs() > 1e-7);
-        let bias_changed = before_bias
+        let threat_changed = before_threat
             .iter()
-            .zip(&model.hidden_bias)
+            .zip(&model.pikafish_threat_embedding)
             .any(|(left, right)| (*left - *right).abs() > 1e-7);
         assert!(
-            input_changed || bias_changed,
-            "value-only training should update trunk"
+            psq_changed || threat_changed,
+            "value-only training should update the Pikafish value transformer"
         );
     }
 
@@ -4166,14 +4707,20 @@ mod tests {
             loaded.input_king_piece_hidden
         );
         assert_eq!(model.hidden_bias, loaded.hidden_bias);
-        assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
-        assert_eq!(model.value_head_bias, loaded.value_head_bias);
-        assert_eq!(model.value_head_output, loaded.value_head_output);
+        assert_eq!(model.pikafish_psq_embedding, loaded.pikafish_psq_embedding);
         assert_eq!(
-            model.short_value_head_output,
-            loaded.short_value_head_output
+            model.pikafish_threat_embedding,
+            loaded.pikafish_threat_embedding
         );
-        assert_eq!(model.short_value_head_bias, loaded.short_value_head_bias);
+        assert_eq!(model.pikafish_value_output, loaded.pikafish_value_output);
+        assert_eq!(
+            model.pikafish_short_value_output,
+            loaded.pikafish_short_value_output
+        );
+        assert_eq!(
+            model.pikafish_short_value_bias,
+            loaded.pikafish_short_value_bias
+        );
         assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
         assert_eq!(
             model.policy_consequence_output,
@@ -4197,10 +4744,10 @@ mod tests {
         let moves = position.legal_moves();
         let baseline = AzNnue::random(32, 20260831);
         let mut changed = baseline.clone();
-        for (index, weight) in changed.short_value_head_output.iter_mut().enumerate() {
+        for (index, weight) in changed.pikafish_short_value_output.iter_mut().enumerate() {
             *weight = index as f32 * 0.001 - 1.0;
         }
-        changed.short_value_head_bias.fill(7.0);
+        changed.pikafish_short_value_bias.fill(7.0);
         assert_eq!(
             baseline.evaluate_value(&position, &moves).to_bits(),
             changed.evaluate_value(&position, &moves).to_bits()

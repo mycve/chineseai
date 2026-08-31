@@ -11,12 +11,13 @@ use crate::xiangqi::{BOARD_SIZE, Color, Position};
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_TACTICAL_SIZE,
     RULE_CONTEXT_SIZE, VALUE_THREAT_MAX_ACTIVE, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
-    canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    dense_move_squares,
+    active_value_features_pair, canonical_general_buckets_from_features,
+    decode_current_piece_square_feature, dense_move_squares,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
-    normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
-    policy_sparse_main_index, policy_tactical_indices, value_threat_index,
+    layer_stack_bucket, normalize_wdl_target, policy_sparse_capture_index,
+    policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
+    value_threat_index,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -95,8 +96,13 @@ pub(super) struct PackedBatch {
     pub max_features: usize,
     pub max_policy_moves: usize,
     pub max_value_threats: usize,
+    pub max_pikafish_psq: usize,
+    pub max_pikafish_threats: usize,
     pub feature_items: Vec<u32>,
     pub value_threat_indices: Vec<u32>,
+    pub pikafish_psq_indices: Vec<u32>,
+    pub pikafish_threat_indices: Vec<u32>,
+    pub pikafish_layer_stacks: Vec<u32>,
     pub policy_items: Vec<i64>,
     pub policy_sparse_indices: Vec<i64>,
     pub policy_tactical_indices: Vec<i64>,
@@ -138,14 +144,48 @@ impl PackedBatch {
             .map(|&sample_index| value_threat_features(&samples[sample_index]))
             .collect::<Vec<_>>();
         let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let pikafish = batch
+            .iter()
+            .map(|&sample_index| {
+                let sample = &samples[sample_index];
+                let pieces = sample
+                    .features
+                    .iter()
+                    .filter_map(|&feature| decode_current_piece_square_feature(feature))
+                    .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
+                    .collect::<Vec<_>>();
+                let position = Position::from_canonical_piece_squares(&pieces);
+                (
+                    active_value_features_pair(&position),
+                    layer_stack_bucket(&position),
+                )
+            })
+            .collect::<Vec<_>>();
+        let max_pikafish_psq = pikafish
+            .iter()
+            .flat_map(|(views, _)| views.iter().map(|view| view.psq.len()))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let max_pikafish_threats = pikafish
+            .iter()
+            .flat_map(|(views, _)| views.iter().map(|view| view.threats.len()))
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
         let mut packed = Self {
             batch_size,
             max_features,
             max_policy_moves,
             max_value_threats,
+            max_pikafish_psq,
+            max_pikafish_threats,
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
             value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
+            pikafish_psq_indices: vec![PADDING_ITEM; batch_size * 2 * max_pikafish_psq],
+            pikafish_threat_indices: vec![PADDING_ITEM; batch_size * 2 * max_pikafish_threats],
+            pikafish_layer_stacks: vec![0; batch_size],
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
             policy_sparse_indices: vec![
                 (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
@@ -173,6 +213,24 @@ impl PackedBatch {
             let threat_base = row * max_value_threats;
             packed.value_threat_indices[threat_base..threat_base + threats.len()]
                 .copy_from_slice(threats);
+            for view in 0..2 {
+                let psq_base = (row * 2 + view) * max_pikafish_psq;
+                let threat_base = (row * 2 + view) * max_pikafish_threats;
+                let psq = pikafish[row].0[view]
+                    .psq
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect::<Vec<_>>();
+                let rel = pikafish[row].0[view]
+                    .threats
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect::<Vec<_>>();
+                packed.pikafish_psq_indices[psq_base..psq_base + psq.len()].copy_from_slice(&psq);
+                packed.pikafish_threat_indices[threat_base..threat_base + rel.len()]
+                    .copy_from_slice(&rel);
+            }
+            packed.pikafish_layer_stacks[row] = pikafish[row].1 as u32;
             packed.pack_policy(row, sample);
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
@@ -476,13 +534,15 @@ fn splitmix_next(state: &mut u64) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{az::AzSampleMeta, xiangqi::Move};
+    use crate::{az::AzSampleMeta, nnue::extract_sparse_features_az, xiangqi::Move};
 
     use super::*;
 
     fn sample(index: usize) -> AzTrainingSample {
         AzTrainingSample {
-            features: vec![index % AZ_NNUE_INPUT_SIZE],
+            // Packed value features reconstruct a canonical Position, so the fixture must be
+            // a legal complete board rather than the old isolated synthetic feature.
+            features: extract_sparse_features_az(&Position::startpos()),
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: vec![0, 1],
             policy: vec![1.0 + index as f32, 1.0],

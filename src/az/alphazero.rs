@@ -6,8 +6,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzIncrementalEvalRequest, AzNnue,
-    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, rule_context_features,
+    ActiveValueFeatures, AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzIncrementalEvalRequest,
+    AzNnue, PIKAFISH_TRANSFORMER_DIMENSIONS, POLICY_ACCUMULATOR_RANK, SplitMix64,
+    active_psq_features_pair, color_index, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;
@@ -302,6 +303,7 @@ pub(super) struct AzSearchWorkspace {
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
+    value_accumulator_arena: Vec<i16>,
     root_raw_priors: Vec<f32>,
     eval_scratch: Option<AzEvalScratch>,
     rule_history_scratch: Vec<RuleHistoryEntry>,
@@ -314,6 +316,7 @@ impl AzSearchWorkspace {
             nodes: Vec::new(),
             children: Vec::new(),
             accumulator_arena: Vec::new(),
+            value_accumulator_arena: Vec::new(),
             root_raw_priors: Vec::new(),
             eval_scratch: Some(AzEvalScratch::new(model.arch)),
             rule_history_scratch: Vec::new(),
@@ -495,9 +498,12 @@ pub(super) fn alphazero_search_batch4_reusing(
                 let node_index = leaf.simulation.node_index;
                 let start = trees[index].nodes[node_index].accumulator_offset as usize;
                 let end = start + model.hidden_size;
+                let value_start = trees[index].nodes[node_index].value_accumulator_offset as usize;
                 let eval = model.evaluate_incremental_with_scratch_output(
                     &trees[index].nodes[node_index].position,
                     &trees[index].accumulator_arena[start..end],
+                    &trees[index].value_accumulator_arena
+                        [value_start..value_start + PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
                     &trees[index].nodes[node_index].policy_accumulator,
                     &leaf.moves,
                     &leaf.rule_context,
@@ -528,6 +534,7 @@ struct AzTree<'a> {
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
+    value_accumulator_arena: Vec<i16>,
     root_policy_accumulators: [[i16; POLICY_ACCUMULATOR_RANK]; 2],
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
@@ -561,6 +568,8 @@ struct AzTree<'a> {
 struct AzNode {
     position: Position,
     accumulator_offset: u32,
+    value_accumulator_offset: u32,
+    value_features: [ActiveValueFeatures; 2],
     policy_accumulator: [i16; POLICY_ACCUMULATOR_RANK],
     parent: u32,
     incoming_move: Option<Move>,
@@ -610,9 +619,12 @@ fn pending_leaf_request<'a>(
 ) -> AzIncrementalEvalRequest<'a> {
     let node = &tree.nodes[leaf.simulation.node_index];
     let start = node.accumulator_offset as usize;
+    let value_start = node.value_accumulator_offset as usize;
     AzIncrementalEvalRequest {
         position: &node.position,
         accumulator_hidden: &tree.accumulator_arena[start..start + hidden_size],
+        value_accumulator: &tree.value_accumulator_arena
+            [value_start..value_start + PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
         policy_accumulator: &node.policy_accumulator,
         moves: &leaf.moves,
         rule_context: &leaf.rule_context,
@@ -774,6 +786,11 @@ impl<'a> AzTree<'a> {
                     .saturating_add(1)
                     .saturating_mul(model.hidden_size),
             ),
+            Vec::with_capacity(
+                initial_nodes
+                    .saturating_add(1)
+                    .saturating_mul(PIKAFISH_TRANSFORMER_DIMENSIONS * 2),
+            ),
             Vec::new(),
             AzEvalScratch::new(model.arch),
             Vec::new(),
@@ -798,6 +815,7 @@ impl<'a> AzTree<'a> {
             std::mem::take(&mut workspace.nodes),
             std::mem::take(&mut workspace.children),
             std::mem::take(&mut workspace.accumulator_arena),
+            std::mem::take(&mut workspace.value_accumulator_arena),
             std::mem::take(&mut workspace.root_raw_priors),
             workspace
                 .eval_scratch
@@ -818,6 +836,7 @@ impl<'a> AzTree<'a> {
         mut nodes: Vec<AzNode>,
         mut children: Vec<AzChild>,
         mut accumulator_arena: Vec<f32>,
+        mut value_accumulator_arena: Vec<i16>,
         mut root_raw_priors: Vec<f32>,
         eval_scratch: AzEvalScratch,
         mut rule_history_scratch: Vec<RuleHistoryEntry>,
@@ -826,12 +845,15 @@ impl<'a> AzTree<'a> {
         nodes.clear();
         children.clear();
         accumulator_arena.clear();
+        value_accumulator_arena.clear();
         root_raw_priors.clear();
         rule_history_scratch.clear();
         rule_history_scratch.extend_from_slice(rule_history);
         batch_path_scratch.clear();
         let accumulator = AzEvalAccumulator::new(model, &position);
-        accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
+        let (hidden_sum, value_sum) = accumulator.into_sums();
+        accumulator_arena.extend_from_slice(&hidden_sum);
+        value_accumulator_arena.extend_from_slice(&value_sum);
         let root_policy_accumulators = [
             model.quantized_policy_accumulator(&position, Color::Red),
             model.quantized_policy_accumulator(&position, Color::Black),
@@ -842,9 +864,12 @@ impl<'a> AzTree<'a> {
         };
         let root_policy_accumulator =
             root_policy_accumulators[color_index(position.side_to_move())];
+        let root_value_features = active_psq_features_pair(&position);
         nodes.push(AzNode {
             position,
             accumulator_offset: root_accumulator_offset as u32,
+            value_accumulator_offset: 0,
+            value_features: root_value_features,
             policy_accumulator: root_policy_accumulator,
             parent: NO_CHILD,
             incoming_move: None,
@@ -861,6 +886,7 @@ impl<'a> AzTree<'a> {
             nodes,
             children,
             accumulator_arena,
+            value_accumulator_arena,
             root_policy_accumulators,
             model,
             root_moves,
@@ -918,6 +944,7 @@ impl<'a> AzTree<'a> {
         workspace.nodes = std::mem::take(&mut self.nodes);
         workspace.children = std::mem::take(&mut self.children);
         workspace.accumulator_arena = std::mem::take(&mut self.accumulator_arena);
+        workspace.value_accumulator_arena = std::mem::take(&mut self.value_accumulator_arena);
         workspace.root_raw_priors = std::mem::take(&mut self.root_raw_priors);
         workspace.eval_scratch = Some(std::mem::replace(
             &mut self.eval_scratch,
@@ -1011,9 +1038,12 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
             let accumulator_end = accumulator_start + self.model.hidden_size;
+            let value_start = self.nodes[node_index].value_accumulator_offset as usize;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
+                &self.value_accumulator_arena
+                    [value_start..value_start + PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
                 &rule_context_features(
@@ -1212,6 +1242,18 @@ impl<'a> AzTree<'a> {
                     perspective,
                     &mut child_policy_accumulator,
                 );
+                let child_value_accumulator_offset = self.value_accumulator_arena.len();
+                let parent_value_start = self.nodes[node_index].value_accumulator_offset as usize;
+                self.value_accumulator_arena.extend_from_within(
+                    parent_value_start..parent_value_start + PIKAFISH_TRANSFORMER_DIMENSIONS * 2,
+                );
+                let child_value_features = self.model.apply_pikafish_transition(
+                    &self.nodes[node_index].position,
+                    &child_position,
+                    &self.nodes[node_index].value_features,
+                    &mut self.value_accumulator_arena[child_value_accumulator_offset
+                        ..child_value_accumulator_offset + PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
+                );
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv, captured);
                 let child_node = self.nodes.len();
@@ -1219,6 +1261,9 @@ impl<'a> AzTree<'a> {
                     position: child_position,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
+                    value_accumulator_offset: u32::try_from(child_value_accumulator_offset)
+                        .expect("MCTS value accumulator arena exceeds compact offset range"),
+                    value_features: child_value_features,
                     policy_accumulator: child_policy_accumulator,
                     parent: u32::try_from(node_index)
                         .expect("MCTS node index exceeds compact parent range"),
@@ -1334,12 +1379,27 @@ impl<'a> AzTree<'a> {
             perspective,
             &mut child_policy_accumulator,
         );
+        let child_value_accumulator_offset = self.value_accumulator_arena.len();
+        let parent_value_start = self.nodes[node_index].value_accumulator_offset as usize;
+        self.value_accumulator_arena.extend_from_within(
+            parent_value_start..parent_value_start + PIKAFISH_TRANSFORMER_DIMENSIONS * 2,
+        );
+        let child_value_features = self.model.apply_pikafish_transition(
+            &self.nodes[node_index].position,
+            &child_position,
+            &self.nodes[node_index].value_features,
+            &mut self.value_accumulator_arena[child_value_accumulator_offset
+                ..child_value_accumulator_offset + PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
+        );
         let child_rule_entry = child_position.rule_history_entry_after_moved(mover, mv, captured);
         let child_node = self.nodes.len();
         self.nodes.push(AzNode {
             position: child_position,
             accumulator_offset: u32::try_from(child_accumulator_offset)
                 .expect("MCTS accumulator arena exceeds compact offset range"),
+            value_accumulator_offset: u32::try_from(child_value_accumulator_offset)
+                .expect("MCTS value accumulator arena exceeds compact offset range"),
+            value_features: child_value_features,
             policy_accumulator: child_policy_accumulator,
             parent: u32::try_from(node_index)
                 .expect("MCTS node index exceeds compact parent range"),
@@ -1605,9 +1665,12 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
             let accumulator_end = accumulator_start + self.model.hidden_size;
+            let value_start = self.nodes[node_index].value_accumulator_offset as usize;
             self.model.evaluate_incremental_with_scratch_output(
                 &self.nodes[node_index].position,
                 &self.accumulator_arena[accumulator_start..accumulator_end],
+                &self.value_accumulator_arena
+                    [value_start..value_start + PIKAFISH_TRANSFORMER_DIMENSIONS * 2],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
                 &rule_context_features(
@@ -2058,7 +2121,7 @@ mod tests {
             None,
             &AzNnue::random(4, 19),
             AzSearchLimits {
-                simulations: 128,
+                simulations: 400,
                 ..AzSearchLimits::default()
             },
             Some(&control),
@@ -2113,7 +2176,7 @@ mod tests {
             &Position::startpos(),
             &model,
             AzSearchLimits {
-                simulations: 128,
+                simulations: 400,
                 seed: 11,
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
@@ -2133,7 +2196,7 @@ mod tests {
             .map(|candidate| candidate.policy)
             .sum::<f32>();
 
-        assert_eq!(result.simulations, 128);
+        assert_eq!(result.simulations, 400);
         assert!(result.best_move.is_some());
         assert!(
             result
@@ -2459,8 +2522,9 @@ mod tests {
         std::hint::black_box(alphazero_search_batch4(inputs, &model));
         let batched = started.elapsed();
         eprintln!(
-            "four-tree search: scalar={scalar:?} batch4={batched:?} speedup={:.3}x",
-            scalar.as_secs_f64() / batched.as_secs_f64()
+            "four-tree search: scalar={scalar:?} batch4={batched:?} speedup={:.3}x node={}B",
+            scalar.as_secs_f64() / batched.as_secs_f64(),
+            std::mem::size_of::<AzNode>(),
         );
     }
 
@@ -2511,8 +2575,7 @@ mod tests {
     fn search_value_scale_reduces_non_terminal_network_value() {
         let position = Position::startpos();
         let mut model = AzNnue::random(4, 7);
-        model.value_head_bias[0] = 2.0;
-        model.value_head_output[0] = 1.0;
+        model.pikafish_value_output_bias[11 * 3] = 2.0;
 
         let full = alphazero_search(
             &position,

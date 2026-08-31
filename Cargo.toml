@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 num_cpus = "1.16"
+smallvec = "1.15"
 
 [features]
 default = ["gpu-train"]
