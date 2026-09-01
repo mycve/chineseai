@@ -61,7 +61,37 @@ pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
-pub(super) const POLICY_ACCUMULATOR_RANK: usize = 32;
+pub(super) const POLICY_ACCUMULATOR_RANK: usize = 64;
+const LEGACY_POLICY_ACCUMULATOR_RANK: usize = 32;
+
+fn expand_legacy_policy_accumulator(
+    hidden_size: usize,
+    policy_accumulator_hidden: Vec<f32>,
+    policy_accumulator_move: Vec<f32>,
+) -> io::Result<(Vec<f32>, Vec<f32>)> {
+    if policy_accumulator_hidden.len() != LEGACY_POLICY_ACCUMULATOR_RANK * hidden_size
+        || policy_accumulator_move.len() != DENSE_MOVE_SPACE * LEGACY_POLICY_ACCUMULATOR_RANK
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid v22 policy accumulator dimensions",
+        ));
+    }
+    let mut expanded_hidden = vec![0.0; POLICY_ACCUMULATOR_RANK * hidden_size];
+    expanded_hidden[..policy_accumulator_hidden.len()].copy_from_slice(&policy_accumulator_hidden);
+    let mut rng = SplitMix64::new(0xA076_1D64_78BD_642F);
+    for value in &mut expanded_hidden[policy_accumulator_hidden.len()..] {
+        *value = rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5);
+    }
+    let mut expanded_move = vec![0.0; DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK];
+    for (source, target) in policy_accumulator_move
+        .chunks_exact(LEGACY_POLICY_ACCUMULATOR_RANK)
+        .zip(expanded_move.chunks_exact_mut(POLICY_ACCUMULATOR_RANK))
+    {
+        target[..LEGACY_POLICY_ACCUMULATOR_RANK].copy_from_slice(source);
+    }
+    Ok((expanded_hidden, expanded_move))
+}
 pub(super) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
 pub(super) const POLICY_TACTICAL_EXACT_SIZE: usize =
     DENSE_MOVE_SPACE * (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
@@ -110,6 +140,7 @@ pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 1.0;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 pub const SHORT_VALUE_HEADS: usize = 3;
 pub const SHORT_VALUE_HORIZONS: [usize; SHORT_VALUE_HEADS] = [4, 12, 32];
+pub const SHORT_VALUE_LOSS_WEIGHT: f32 = 0.05;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
@@ -1532,7 +1563,7 @@ impl AzNnue {
                 "missing AZ model format",
             ));
         };
-        if format_version != MODEL_FORMAT_VERSION {
+        if format_version != MODEL_FORMAT_VERSION && format_version != 22.0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1544,6 +1575,18 @@ impl AzNnue {
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
+        let mut policy_accumulator_hidden =
+            load_candle_f32_tensor(&tensors, "policy_accumulator_hidden")?;
+        let mut policy_accumulator_move =
+            load_candle_f32_tensor(&tensors, "policy_accumulator_move")?;
+        if format_version == 22.0 {
+            (policy_accumulator_hidden, policy_accumulator_move) =
+                expand_legacy_policy_accumulator(
+                    hidden_size,
+                    policy_accumulator_hidden,
+                    policy_accumulator_move,
+                )?;
+        }
         let mut model = Self {
             hidden_size,
             arch,
@@ -1569,11 +1612,8 @@ impl AzNnue {
             )?,
             policy_context_hidden: load_candle_f32_tensor(&tensors, "policy_context_hidden")?,
             policy_move_context: load_candle_f32_tensor(&tensors, "policy_move_context")?,
-            policy_accumulator_hidden: load_candle_f32_tensor(
-                &tensors,
-                "policy_accumulator_hidden",
-            )?,
-            policy_accumulator_move: load_candle_f32_tensor(&tensors, "policy_accumulator_move")?,
+            policy_accumulator_hidden,
+            policy_accumulator_move,
             policy_sparse_table: load_candle_f32_tensor(&tensors, "policy_sparse_table")?,
             policy_sparse_factor: load_candle_f32_tensor(&tensors, "policy_sparse_factor")?,
             policy_tactical: load_candle_f32_tensor(&tensors, "policy_tactical")?,
@@ -2735,7 +2775,7 @@ fn dot_product_i16_i8_32(left: &[i16; POLICY_ACCUMULATOR_RANK], right: &[i8]) ->
     debug_assert_eq!(right.len(), POLICY_ACCUMULATOR_RANK);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 was checked at runtime and both inputs contain exactly 32 elements.
+        // SAFETY: AVX2 was checked at runtime and both inputs contain complete 16-element chunks.
         return unsafe { dot_product_i16_i8_32_avx2(left, right) };
     }
     left.iter()
@@ -2848,7 +2888,7 @@ unsafe fn dot_product_i16_i8_32_avx2(left: &[i16; POLICY_ACCUMULATOR_RANK], righ
     use std::arch::x86_64::*;
 
     let mut sums = _mm256_setzero_si256();
-    for offset in [0, 16] {
+    for offset in (0..POLICY_ACCUMULATOR_RANK).step_by(16) {
         let a = unsafe { _mm256_loadu_si256(left.as_ptr().add(offset).cast()) };
         let b8 = unsafe { _mm_loadu_si128(right.as_ptr().add(offset).cast()) };
         let b = _mm256_cvtepi8_epi16(b8);
@@ -4189,6 +4229,62 @@ mod tests {
             model.policy_accumulator_move,
             loaded.policy_accumulator_move
         );
+    }
+
+    #[test]
+    fn v22_policy_accumulator_expansion_preserves_existing_logits() {
+        let hidden_size = 3;
+        let legacy_hidden: Vec<f32> = (0..LEGACY_POLICY_ACCUMULATOR_RANK * hidden_size)
+            .map(|index| index as f32 * 0.01 - 0.2)
+            .collect();
+        let legacy_move: Vec<f32> = (0..DENSE_MOVE_SPACE * LEGACY_POLICY_ACCUMULATOR_RANK)
+            .map(|index| index as f32 * 0.0001 - 0.3)
+            .collect();
+        let (expanded_hidden, expanded_move) = expand_legacy_policy_accumulator(
+            hidden_size,
+            legacy_hidden.clone(),
+            legacy_move.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            &expanded_hidden[..legacy_hidden.len()],
+            legacy_hidden.as_slice()
+        );
+        assert!(
+            expanded_hidden[legacy_hidden.len()..]
+                .iter()
+                .any(|&weight| weight != 0.0)
+        );
+        let old_activation: Vec<f32> = (0..LEGACY_POLICY_ACCUMULATOR_RANK)
+            .map(|index| index as f32 * 0.02 - 0.1)
+            .collect();
+        let mut new_activation = vec![0.75; POLICY_ACCUMULATOR_RANK];
+        new_activation[..LEGACY_POLICY_ACCUMULATOR_RANK].copy_from_slice(&old_activation);
+        for move_index in [0, 1, DENSE_MOVE_SPACE - 1] {
+            let old = &legacy_move[move_index * LEGACY_POLICY_ACCUMULATOR_RANK
+                ..(move_index + 1) * LEGACY_POLICY_ACCUMULATOR_RANK];
+            let new = &expanded_move
+                [move_index * POLICY_ACCUMULATOR_RANK..(move_index + 1) * POLICY_ACCUMULATOR_RANK];
+            assert_eq!(&new[..LEGACY_POLICY_ACCUMULATOR_RANK], old);
+            assert!(
+                new[LEGACY_POLICY_ACCUMULATOR_RANK..]
+                    .iter()
+                    .all(|&weight| weight == 0.0)
+            );
+
+            let old_logit: f32 = old
+                .iter()
+                .zip(&old_activation)
+                .map(|(left, right)| left * right)
+                .sum();
+            let new_logit: f32 = new
+                .iter()
+                .zip(&new_activation)
+                .map(|(left, right)| left * right)
+                .sum();
+            assert_eq!(old_logit, new_logit);
+        }
     }
 
     #[test]

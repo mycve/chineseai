@@ -2246,7 +2246,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2284,6 +2284,7 @@ fn main() {
                 config.mirror_probability,
                 config.train_value_weight,
                 config.train_policy_weight,
+                chineseai::az::SHORT_VALUE_LOSS_WEIGHT,
                 config.checkpoint_interval,
                 config.max_checkpoints,
                 config.arena_interval,
@@ -2366,11 +2367,6 @@ fn main() {
             );
             let initial_numa_models =
                 build_numa_model_replicas(&initial_selfplay_model, &numa_nodes);
-            let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
-                version: start_update.saturating_sub(1) as u64,
-                learner_update: start_update.saturating_sub(1).min(u32::MAX as usize) as u32,
-                models_by_numa_node: initial_numa_models,
-            }));
             let mut arena_reference_model = initial_arena_reference_model;
             let mut champion_paths =
                 champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
@@ -2387,6 +2383,20 @@ fn main() {
             } else {
                 println!("champion : loaded history={}", champion_paths.len());
             }
+            let initial_actor_update = if config.arena_interval > 0 {
+                champion_paths
+                    .last()
+                    .and_then(|path| checkpoint_number(path))
+                    .unwrap_or(start_update.saturating_sub(1) as u64)
+            } else {
+                start_update.saturating_sub(1) as u64
+            }
+            .min(u32::MAX as u64) as u32;
+            let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
+                version: start_update.saturating_sub(1) as u64,
+                learner_update: initial_actor_update,
+                models_by_numa_node: initial_numa_models,
+            }));
             let selfplay_pause =
                 Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
@@ -2606,7 +2616,7 @@ fn main() {
                         AzTrainLossWeights {
                             value: trainer_config.train_value_weight,
                             policy: trainer_config.train_policy_weight,
-                            ..AzTrainLossWeights::default()
+                            short_value: chineseai::az::SHORT_VALUE_LOSS_WEIGHT,
                         },
                     )
                     .unwrap_or_else(|err| panic!("training update {} failed: {err}", train_update));
@@ -3686,9 +3696,12 @@ fn main() {
                         let started = Instant::now();
                         let eval_result = (|| -> io::Result<LabelEvalStats> {
                             let conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
-                            let rows =
-                                load_pikafish_label_rows(&conn, config.pikafish_label_eval_limit)
-                                    .map_err(sqlite_io_error)?;
+                            let rows = load_pikafish_label_rows(
+                                &conn,
+                                config.pikafish_label_eval_limit,
+                                config.seed,
+                            )
+                            .map_err(sqlite_io_error)?;
                             evaluate_pikafish_labels_parallel(
                                 Arc::new(deployed_model.clone()),
                                 rows,
@@ -4512,7 +4525,7 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         )
     })?;
     let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
-    let rows = load_pikafish_label_rows(&conn, cmd.limit).map_err(sqlite_io_error)?;
+    let rows = load_pikafish_label_rows(&conn, cmd.limit, cmd.seed).map_err(sqlite_io_error)?;
     if rows.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4676,14 +4689,13 @@ fn evaluate_pikafish_labels_parallel(
 fn load_pikafish_label_rows(
     conn: &Connection,
     limit: usize,
+    seed: u64,
 ) -> rusqlite::Result<Vec<PikafishLabelRow>> {
-    let mut query =
-        "SELECT id, fen, bestmove, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id"
-            .to_string();
-    if limit > 0 {
-        query.push_str(" LIMIT ?1");
-        let mut stmt = conn.prepare(&query)?;
-        stmt.query_map(params![limit as i64], |row| {
+    let mut stmt = conn.prepare(
+        "SELECT id, fen, bestmove, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id",
+    )?;
+    let mut rows: Vec<_> = stmt
+        .query_map([], |row| {
             Ok(PikafishLabelRow {
                 id: row.get(0)?,
                 fen: row.get(1)?,
@@ -4691,19 +4703,15 @@ fn load_pikafish_label_rows(
                 best_wdl: [row.get(3)?, row.get(4)?, row.get(5)?],
             })
         })?
-        .collect()
-    } else {
-        let mut stmt = conn.prepare(&query)?;
-        stmt.query_map([], |row| {
-            Ok(PikafishLabelRow {
-                id: row.get(0)?,
-                fen: row.get(1)?,
-                bestmove: row.get(2)?,
-                best_wdl: [row.get(3)?, row.get(4)?, row.get(5)?],
-            })
-        })?
-        .collect()
+        .collect::<rusqlite::Result<_>>()?;
+    if limit > 0 && limit < rows.len() {
+        let mut rng = SplitMix64::new(seed ^ 0xA076_1D64_78BD_642F);
+        for index in (1..rows.len()).rev() {
+            rows.swap(index, rng.next_u64() as usize % (index + 1));
+        }
+        rows.truncate(limit);
     }
+    Ok(rows)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5484,6 +5492,42 @@ mod reporting_tests {
 
         assert_eq!(stats.value_count(), 1);
         assert!((stats.value_mae_wdl_q() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pikafish_label_limit_is_seeded_uniform_sample() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pikafish_labels (
+                id INTEGER PRIMARY KEY,
+                fen TEXT NOT NULL,
+                bestmove TEXT NOT NULL,
+                wdl_win INTEGER NOT NULL,
+                wdl_draw INTEGER NOT NULL,
+                wdl_loss INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for id in 1..=20 {
+            conn.execute(
+                "INSERT INTO pikafish_labels VALUES (?1, '', '', 0, 1000, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let first = load_pikafish_label_rows(&conn, 5, 42).unwrap();
+        let repeated = load_pikafish_label_rows(&conn, 5, 42).unwrap();
+        let different = load_pikafish_label_rows(&conn, 5, 43).unwrap();
+        let ids = |rows: &[PikafishLabelRow]| rows.iter().map(|row| row.id).collect::<Vec<_>>();
+
+        assert_eq!(ids(&first), ids(&repeated));
+        assert_ne!(ids(&first), vec![1, 2, 3, 4, 5]);
+        assert_ne!(ids(&first), ids(&different));
+        assert_eq!(
+            ids(&load_pikafish_label_rows(&conn, 0, 42).unwrap()),
+            (1..=20).collect::<Vec<_>>()
+        );
     }
 
     #[test]
