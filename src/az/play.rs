@@ -180,7 +180,6 @@ pub struct AzSelfplayData {
     pub raw_top1_blunder_005: usize,
     pub raw_top1_blunder_010: usize,
     pub raw_top1_blunder_020: usize,
-    pub policy_reanalyses: usize,
     pub visited_actions_sum: usize,
     pub shape_count: usize,
     pub opening_raw_prior_top1_sum: f32,
@@ -232,7 +231,6 @@ impl AzSelfplayData {
         self.raw_top1_blunder_005 += other.raw_top1_blunder_005;
         self.raw_top1_blunder_010 += other.raw_top1_blunder_010;
         self.raw_top1_blunder_020 += other.raw_top1_blunder_020;
-        self.policy_reanalyses += other.policy_reanalyses;
         self.visited_actions_sum += other.visited_actions_sum;
         self.shape_count += other.shape_count;
         self.opening_raw_prior_top1_sum += other.opening_raw_prior_top1_sum;
@@ -309,7 +307,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.raw_top1_blunder_005 += chunk.raw_top1_blunder_005;
         merged.raw_top1_blunder_010 += chunk.raw_top1_blunder_010;
         merged.raw_top1_blunder_020 += chunk.raw_top1_blunder_020;
-        merged.policy_reanalyses += chunk.policy_reanalyses;
         merged.visited_actions_sum += chunk.visited_actions_sum;
         merged.shape_count += chunk.shape_count;
         merged.opening_raw_prior_top1_sum += chunk.opening_raw_prior_top1_sum;
@@ -353,20 +350,6 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
         draw_score: config.draw_score,
         value_scale: 1.0,
     }
-}
-
-const POLICY_REANALYSIS_REGRET_THRESHOLD: f32 = 0.10;
-
-fn should_reanalyze_policy(config: &AzLoopConfig, raw_top1_regret: f32) -> bool {
-    config.policy_reanalysis_simulations > config.simulations
-        && raw_top1_regret > POLICY_REANALYSIS_REGRET_THRESHOLD
-}
-
-fn policy_reanalysis_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSearchLimits {
-    let mut limits = selfplay_search_limits(config, ply, seed);
-    limits.simulations = config.policy_reanalysis_simulations;
-    limits.root_exploration_fraction = 0.0;
-    limits
 }
 
 fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
@@ -501,7 +484,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     let mut raw_top1_blunder_005 = 0usize;
     let mut raw_top1_blunder_010 = 0usize;
     let mut raw_top1_blunder_020 = 0usize;
-    let mut policy_reanalyses = 0usize;
     let mut visited_actions_sum = 0usize;
     let mut shape_count = 0usize;
     let mut opening_raw_prior_top1_sum = 0.0f32;
@@ -636,33 +618,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 result = Some(0.0);
                 break;
             };
-            let policy_reanalysis = if should_reanalyze_policy(config, shape.raw_top1_regret) {
-                let limits = policy_reanalysis_limits(
-                    config,
-                    ply,
-                    config.seed
-                        ^ (game_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
-                        ^ (ply as u64).wrapping_mul(0x94D0_49BB_1331_11EB),
-                );
-                let result = alphazero_search_with_rules_reusing(
-                    &position,
-                    &rule_history,
-                    search
-                        .candidates
-                        .iter()
-                        .map(|candidate| candidate.mv)
-                        .collect(),
-                    model,
-                    limits,
-                    &mut search_workspace,
-                );
-                policy_reanalyses += 1;
-                search_simulations.simulations_sum += result.simulations;
-                Some(result)
-            } else {
-                None
-            };
-            let policy_search = policy_reanalysis.as_ref().unwrap_or(&search);
             let mut move_meta = move_search_meta(
                 &search.candidates,
                 mv,
@@ -696,12 +651,12 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 let sample = make_training_sample(
                     &position,
                     &rule_history,
-                    &policy_search.candidates,
+                    &search.candidates,
                     search.value_q,
                     search.value_wdl,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
-                    policy_search.simulations,
+                    search_simulation_count,
                     1.0,
                 );
                 game_samples.push(sample);
@@ -810,7 +765,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         raw_top1_blunder_005,
         raw_top1_blunder_010,
         raw_top1_blunder_020,
-        policy_reanalyses,
         visited_actions_sum,
         shape_count,
         opening_raw_prior_top1_sum,
@@ -927,7 +881,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     crate::scope_profile!("az.selfplay.chunk_batch4");
     let mut data = AzSelfplayData::default();
     let mut workspace = AzBatchSearchWorkspace::new(model);
-    let mut reanalysis_workspace = AzSearchWorkspace::new(model);
     for group_start in (0..config.games).step_by(4) {
         let mut states: [Option<BatchedSelfplayGame>; 4] = std::array::from_fn(|slot| {
             let game_index = group_start + slot;
@@ -1024,34 +977,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     state.result = Some(0.0);
                     continue;
                 };
-                let shape = policy_shape_stats(&search.candidates);
-                let policy_reanalysis = if should_reanalyze_policy(config, shape.raw_top1_regret) {
-                    let limits = policy_reanalysis_limits(
-                        config,
-                        state.phase_ply,
-                        config.seed
-                            ^ (state.game_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
-                            ^ (state.phase_ply as u64).wrapping_mul(0x94D0_49BB_1331_11EB),
-                    );
-                    let result = alphazero_search_with_rules_reusing(
-                        &state.position,
-                        &state.rule_history,
-                        search
-                            .candidates
-                            .iter()
-                            .map(|candidate| candidate.mv)
-                            .collect(),
-                        model,
-                        limits,
-                        &mut reanalysis_workspace,
-                    );
-                    data.policy_reanalyses += 1;
-                    data.search_simulations.simulations_sum += result.simulations;
-                    Some(result)
-                } else {
-                    None
-                };
-                let policy_search = policy_reanalysis.as_ref().unwrap_or(search);
                 let mut meta = move_search_meta(
                     &search.candidates,
                     mv,
@@ -1084,12 +1009,12 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 state.samples.push(make_training_sample(
                     &state.position,
                     &state.rule_history,
-                    &policy_search.candidates,
+                    &search.candidates,
                     search.value_q,
                     search.value_wdl,
                     state.rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     meta,
-                    policy_search.simulations,
+                    search.simulations,
                     1.0,
                 ));
                 state.bootstrap_wdls.push(search.network_value_wdl);
@@ -1708,7 +1633,6 @@ mod tests {
             max_plies: 12,
             rule60_max_ply: Some(120),
             simulations: 64,
-            policy_reanalysis_simulations: 0,
             seed: 20260817,
             workers: 1,
             generation_update: 0,
@@ -1978,20 +1902,6 @@ mod tests {
 
         assert!((stats.raw_top1_regret - 0.3).abs() < 1.0e-6);
         assert!((stats.raw_policy_regret - 0.24).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn policy_reanalysis_requires_deeper_search_and_large_regret() {
-        let mut config = selfplay_test_config(1);
-        assert!(!should_reanalyze_policy(&config, 0.20));
-        config.policy_reanalysis_simulations = config.simulations;
-        assert!(!should_reanalyze_policy(&config, 0.20));
-        config.policy_reanalysis_simulations = 256;
-        assert!(!should_reanalyze_policy(&config, 0.10));
-        assert!(should_reanalyze_policy(&config, 0.1001));
-        let limits = policy_reanalysis_limits(&config, 0, 7);
-        assert_eq!(limits.simulations, 256);
-        assert_eq!(limits.root_exploration_fraction, 0.0);
     }
 
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {

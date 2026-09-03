@@ -21,7 +21,6 @@ pub struct AzLoopFileConfig {
     pub format_version: u32,
     pub model_path: String,
     pub simulations: usize,
-    pub policy_reanalysis_simulations: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub lr_min: f32,
@@ -107,7 +106,6 @@ impl Default for AzLoopFileConfig {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
             simulations: 400,
-            policy_reanalysis_simulations: 0,
             selfplay_samples_per_update: 120000,
             lr: 0.0004,
             lr_min: 0.00001,
@@ -217,10 +215,6 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("simulations", self.simulations);
-        line!(
-            "policy_reanalysis_simulations",
-            self.policy_reanalysis_simulations
-        );
         line!(
             "selfplay_samples_per_update",
             self.selfplay_samples_per_update
@@ -381,9 +375,6 @@ impl AzLoopFileConfig {
 
     fn normalize(mut self) -> Self {
         self.simulations = self.simulations.max(1);
-        if self.policy_reanalysis_simulations <= self.simulations {
-            self.policy_reanalysis_simulations = 0;
-        }
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
         self.lr_min = self.lr_min.max(0.0).min(self.lr);
@@ -522,7 +513,6 @@ mod tests {
         assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
         assert!(text.contains("actor_publish_interval_updates = 5\n"));
         assert!(text.contains("simulations = 400\n"));
-        assert!(text.contains("policy_reanalysis_simulations = 0\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));

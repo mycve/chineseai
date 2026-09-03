@@ -997,7 +997,6 @@ fn build_az_loop_config(
         max_plies: config.max_plies,
         rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
         simulations: config.simulations,
-        policy_reanalysis_simulations: config.policy_reanalysis_simulations,
         seed,
         workers,
         generation_update,
@@ -1082,7 +1081,6 @@ fn build_async_training_report(
         samples: selfplay_samples,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
-        policy_reanalysis_rate: pending.selfplay.policy_reanalyses as f32 / shape_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -3112,12 +3110,6 @@ fn main() {
                     "selfplay/avg_search_simulations",
                     update,
                     report.avg_search_simulations,
-                );
-                log_scalar(
-                    &mut tb,
-                    "policy_regret/reanalysis_rate",
-                    update,
-                    report.policy_reanalysis_rate,
                 );
                 log_scalar(
                     &mut tb,
