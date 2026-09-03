@@ -182,3 +182,13 @@ Arena 配对差 `B-A=-0.11pp`，配对标准误 0.374pp，`t=-0.29`，没有可�
 评估还存在两个统计缺陷。第一，同一 Arena update 的置信区间只计入该批配对对局的条件方差，没有计入每个 update 更换开局集合和搜索随机种子的外层批次方差；A/B 同一 update 的得分相关系数为 0.39，且两组在 21500 同时跌至 47.9%/48.4%，可见批次效应。第二，平台期每 10 update 重复一次 `z=1.96` 的单次准入检验；若真实等强，单次误晋级约 2.5%，独立近似下连续 100 次至少一次误晋级概率约 92%，即使相关性会降低该数值，重复检验与冠军选择偏差仍不可忽略。
 
 当前结论：这是“固定冠军自博弈闭环 + 代理目标不再转化为棋力 + 准入评估过度频繁且低估外层方差”的系统平台，不是模型文件损坏、经验池污染、优化器偶发坏状态或已证实的结构容量上限。下一实验必须先修正测量：减少 Arena 频率、增加每次独立开局批次规模并提高准入置信门槛；在可靠测量建立前，不再改模型结构、policy loss、value loss 或搜索算法。
+
+## 14. Policy regret 与权重平均探针（2026-09-03）
+
+新增零训练影响的自博弈诊断：`raw_top1_regret`、按 raw prior 加权的 `raw_policy_regret`，以及 top1 regret 超过 0.05/0.10/0.20 的比例。regret 只在已访问子节点上按 MCTS child Q 计算，避免用未访问节点的默认 Q。全量 154 项测试通过，服务器 fast profile 编译及实际一轮自博弈写入 TensorBoard 均通过。
+
+在隔离 current 轨迹的 update 21548，平均 raw top1/policy regret 为 0.0503/0.0954；top1 regret 超过 0.05/0.10/0.20 的比例为 23.96%/12.98%/5.90%。随后继续隔离运行 100 update，在 10 个 Arena 点上检验这些指标能否预测棋力。该段 Arena 均值仅 48.52%；raw top1 regret、raw policy regret、blunder>0.05 与 Arena 的同期相关分别为 +0.24/+0.31/+0.43，方向没有支持“regret 越低棋力越强”，且样本点不足以建立稳定关系。结论：保留 regret 作为诊断，不据此进行 replay 重采样或 loss 加权。
+
+同时测试 stochastic weight averaging：将 20460–21440 的 50 个 checkpoint 等权平均，再沿 best-20450→平均权重插值 25%/50%/75%/100%。使用生产一致的 400 simulations、policy temperature 1.55、1000 个 OBK 开局交换红黑，共 2000 局/配对。各插值模型对 best-20450 的得分为 49.90%/49.33%/48.88%/49.18%，没有候选超过 best；完整矩阵还出现 50% SWA 胜 25% SWA 51.95%、但对 best 仍只有 49.33% 的局部非传递。SWA 否决，不替换 champion。
+
+生产仍暂停并保留 best-20450。服务器 Arena 配置已备份到 `eval/chineseai.azloop.pre-gate-v2.toml`，待恢复时采用单变量的 gate-v2：interval 10→100、OBK/random positions 各 1000→8000、promotion z 1.96→3.09。每 1000 update 由约 100 次、单次 2.5% 的重复假阳性暴露，降为约 10 次、单次约 0.1%；Arena 总对局预算约为原来的 80%，不会增加长期评估成本。
