@@ -1012,6 +1012,7 @@ fn build_az_loop_config(
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
+        blind_spot_game_fraction: config.blind_spot_game_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         draw_score: config.draw_score,
@@ -1124,6 +1125,8 @@ fn build_async_training_report(
         raw_top1_blunder_005: pending.selfplay.raw_top1_blunder_005 as f32 / shape_count,
         raw_top1_blunder_010: pending.selfplay.raw_top1_blunder_010 as f32 / shape_count,
         raw_top1_blunder_020: pending.selfplay.raw_top1_blunder_020 as f32 / shape_count,
+        blind_spot_forced_game_rate: pending.selfplay.blind_spot_forced_games as f32
+            / selfplay_games.max(1) as f32,
         visited_actions: pending.selfplay.visited_actions_sum as f32 / shape_count,
         opening_raw_prior_top1: pending.selfplay.opening_raw_prior_top1_sum / opening_shape_count,
         opening_raw_prior_top2: pending.selfplay.opening_raw_prior_top2_sum / opening_shape_count,
@@ -3258,6 +3261,12 @@ fn main() {
                     "policy_regret/raw_top1_gt_0p20",
                     update,
                     report.raw_top1_blunder_020,
+                );
+                log_scalar(
+                    &mut tb,
+                    "policy_regret/blind_spot_forced_game_rate",
+                    update,
+                    report.blind_spot_forced_game_rate,
                 );
                 log_scalar(
                     &mut tb,

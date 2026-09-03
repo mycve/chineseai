@@ -46,6 +46,7 @@ pub struct AzLoopFileConfig {
     pub cpuct_factor_at_root: f32,
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
+    pub blind_spot_game_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
@@ -131,6 +132,7 @@ impl Default for AzLoopFileConfig {
             cpuct_factor_at_root: 1.5,
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.08,
+            blind_spot_game_fraction: 0.0,
             fpu_value: 0.20,
             fpu_value_at_root: 0.10,
             draw_score: 0.0,
@@ -249,6 +251,7 @@ impl AzLoopFileConfig {
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
         );
+        line!("blind_spot_game_fraction", f(self.blind_spot_game_fraction));
         line!("fpu_value", f(self.fpu_value));
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
@@ -399,6 +402,7 @@ impl AzLoopFileConfig {
         self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
         self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
+        self.blind_spot_game_fraction = self.blind_spot_game_fraction.clamp(0.0, 1.0);
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
@@ -485,6 +489,7 @@ mod tests {
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00001\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
+        assert!(text.contains("blind_spot_game_fraction = 0.0\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
         assert!(text.contains("temperature_endgame = 0.1\n"));
