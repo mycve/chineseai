@@ -1444,28 +1444,29 @@ pub fn play_arena_games_from_positions(
     positions: &[Position],
     config: AzArenaConfig,
 ) -> AzArenaReport {
+    play_arena_search_configs_from_positions(candidate, baseline, positions, config, config)
+}
+
+pub fn play_arena_search_configs_from_positions(
+    candidate: &AzNnue,
+    baseline: &AzNnue,
+    positions: &[Position],
+    candidate_config: AzArenaConfig,
+    baseline_config: AzArenaConfig,
+) -> AzArenaReport {
     let mut report = AzArenaReport::default();
-    let mut red_scores = Vec::with_capacity(config.games_as_red);
-    for game_index in 0..config.games_as_red {
-        let mut position = arena_start_position(positions, config.start_index + game_index);
-        position.set_rule60_max_ply(config.rule60_max_ply);
+    let mut red_scores = Vec::with_capacity(candidate_config.games_as_red);
+    for game_index in 0..candidate_config.games_as_red {
+        let mut position =
+            arena_start_position(positions, candidate_config.start_index + game_index);
+        position.set_rule60_max_ply(candidate_config.rule60_max_ply);
         let outcome = play_arena_game(
             &position,
             candidate,
             baseline,
-            config.simulations,
-            config.max_plies,
-            config.seed ^ (config.start_index + game_index) as u64,
-            config.cpuct,
-            config.cpuct_at_root,
-            config.cpuct_base,
-            config.cpuct_factor,
-            config.cpuct_base_at_root,
-            config.cpuct_factor_at_root,
-            config.fpu_value,
-            config.fpu_value_at_root,
-            config.draw_score,
-            config.policy_softmax_temp,
+            candidate_config.seed ^ (candidate_config.start_index + game_index) as u64,
+            &candidate_config,
+            &baseline_config,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1484,26 +1485,17 @@ pub fn play_arena_games_from_positions(
             }
         }
     }
-    for game_index in 0..config.games_as_black {
-        let mut position = arena_start_position(positions, config.start_index + game_index);
-        position.set_rule60_max_ply(config.rule60_max_ply);
+    for game_index in 0..candidate_config.games_as_black {
+        let mut position =
+            arena_start_position(positions, candidate_config.start_index + game_index);
+        position.set_rule60_max_ply(candidate_config.rule60_max_ply);
         let outcome = play_arena_game(
             &position,
             baseline,
             candidate,
-            config.simulations,
-            config.max_plies,
-            config.seed ^ (config.start_index + game_index) as u64,
-            config.cpuct,
-            config.cpuct_at_root,
-            config.cpuct_base,
-            config.cpuct_factor,
-            config.cpuct_base_at_root,
-            config.cpuct_factor_at_root,
-            config.fpu_value,
-            config.fpu_value_at_root,
-            config.draw_score,
-            config.policy_softmax_temp,
+            candidate_config.seed ^ (candidate_config.start_index + game_index) as u64,
+            &baseline_config,
+            &candidate_config,
         );
         let black_score = match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1544,23 +1536,13 @@ fn play_arena_game(
     initial_position: &Position,
     red_model: &AzNnue,
     black_model: &AzNnue,
-    simulations: usize,
-    max_plies: usize,
     seed: u64,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    cpuct_base: f32,
-    cpuct_factor: f32,
-    cpuct_base_at_root: f32,
-    cpuct_factor_at_root: f32,
-    fpu_value: f32,
-    fpu_value_at_root: f32,
-    draw_score: f32,
-    policy_softmax_temp: f32,
+    red_config: &AzArenaConfig,
+    black_config: &AzArenaConfig,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut rule_history = position.initial_rule_history();
-    for ply in 0..max_plies {
+    for ply in 0..red_config.max_plies.min(black_config.max_plies) {
         let legal = position.legal_moves_with_rules(&rule_history);
         if legal.is_empty() {
             return if position.side_to_move() == Color::Red {
@@ -1569,10 +1551,10 @@ fn play_arena_game(
                 1.0
             };
         }
-        let model = if position.side_to_move() == Color::Red {
-            red_model
+        let (model, config) = if position.side_to_move() == Color::Red {
+            (red_model, red_config)
         } else {
-            black_model
+            (black_model, black_config)
         };
         let result = alphazero_search_with_rules(
             &position,
@@ -1580,21 +1562,21 @@ fn play_arena_game(
             Some(legal),
             model,
             AzSearchLimits {
-                simulations,
+                simulations: config.simulations,
                 seed: seed ^ ((ply as u64) << 32),
-                cpuct,
-                cpuct_at_root,
-                cpuct_base,
-                cpuct_factor,
-                cpuct_base_at_root,
-                cpuct_factor_at_root,
+                cpuct: config.cpuct,
+                cpuct_at_root: config.cpuct_at_root,
+                cpuct_base: config.cpuct_base,
+                cpuct_factor: config.cpuct_factor,
+                cpuct_base_at_root: config.cpuct_base_at_root,
+                cpuct_factor_at_root: config.cpuct_factor_at_root,
                 max_depth: 0,
                 root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
-                fpu_value,
-                fpu_value_at_root,
-                policy_softmax_temp,
-                draw_score,
+                fpu_value: config.fpu_value,
+                fpu_value_at_root: config.fpu_value_at_root,
+                policy_softmax_temp: config.policy_softmax_temp,
+                draw_score: config.draw_score,
                 value_scale: 1.0,
             },
         );

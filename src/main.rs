@@ -15,7 +15,8 @@ use chineseai::{
         AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
         DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
         alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
-        generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
+        generate_selfplay_data, play_arena_games_from_positions,
+        play_arena_search_configs_from_positions, train_samples_weighted,
         train_samples_weighted_owned,
     },
     nnue::{canonical_move, extract_sparse_features_az},
@@ -76,6 +77,8 @@ enum CliCommand {
     AzLoop(AzLoopArgs),
     /// Evaluate checkpoint non-transitivity and historical regressions.
     CheckpointCycles(CheckpointCyclesArgs),
+    /// Compare two search configurations using the same model and paired openings.
+    SearchConfigArena(SearchConfigArenaArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
     /// Generate random positions and label them with Pikafish best moves.
@@ -324,6 +327,39 @@ struct CheckpointCyclesArgs {
     #[arg(long, default_value_t = 1.28)]
     confidence_z: f32,
     #[arg(long, default_value_t = 20260823)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct SearchConfigArenaArgs {
+    model: String,
+    #[arg(long, default_value_t = 400)]
+    simulations: usize,
+    #[arg(long, default_value_t = 1000)]
+    opening_positions: usize,
+    #[arg(long, default_value = "opening.obk")]
+    opening_book: String,
+    #[arg(long, default_value_t = 8)]
+    opening_plies_min: usize,
+    #[arg(long, default_value_t = 10)]
+    opening_plies_max: usize,
+    #[arg(long, default_value_t = 128)]
+    threads: usize,
+    #[arg(long, default_value_t = 300)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 1.1)]
+    candidate_cpuct: f32,
+    #[arg(long, default_value_t = 1.2)]
+    candidate_cpuct_at_root: f32,
+    #[arg(long, default_value_t = 1.8)]
+    candidate_policy_temp: f32,
+    #[arg(long, default_value_t = 0.9)]
+    baseline_cpuct: f32,
+    #[arg(long, default_value_t = 2.0)]
+    baseline_cpuct_at_root: f32,
+    #[arg(long, default_value_t = 1.55)]
+    baseline_policy_temp: f32,
+    #[arg(long, default_value_t = 20260903)]
     seed: u64,
 }
 
@@ -4139,8 +4175,109 @@ fn main() {
             run_checkpoint_cycles(cmd)
                 .unwrap_or_else(|err| panic!("checkpoint-cycles failed: {err}"));
         }
+        Some(CliCommand::SearchConfigArena(cmd)) => run_search_config_arena(cmd),
     };
     chineseai::profile::print_report();
+}
+
+fn run_search_config_arena(cmd: SearchConfigArenaArgs) {
+    let model = Arc::new(
+        AzNnue::load(&cmd.model)
+            .unwrap_or_else(|err| panic!("failed to load model `{}`: {err}", cmd.model)),
+    );
+    let book = ObkBook::load(&cmd.opening_book)
+        .unwrap_or_else(|err| panic!("failed to load opening book `{}`: {err}", cmd.opening_book));
+    let mut rng = SplitMix64::new(cmd.seed);
+    let positions = Arc::new(
+        (0..cmd.opening_positions.max(1))
+            .map(|_| {
+                book.random_prefix_position(
+                    cmd.opening_plies_min.min(cmd.opening_plies_max),
+                    cmd.opening_plies_min.max(cmd.opening_plies_max),
+                    &mut rng,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let thread_count = cmd.threads.max(1).min(positions.len());
+    let mut handles = Vec::with_capacity(thread_count);
+    let mut start_index = 0usize;
+    let started = Instant::now();
+    for index in 0..thread_count {
+        let games =
+            positions.len() / thread_count + usize::from(index < positions.len() % thread_count);
+        let thread_start = start_index;
+        start_index += games;
+        let model = Arc::clone(&model);
+        let positions = Arc::clone(&positions);
+        let common = |cpuct, cpuct_at_root, policy_softmax_temp| AzArenaConfig {
+            simulations: cmd.simulations.max(1),
+            max_plies: cmd.max_plies.max(1),
+            rule60_max_ply: Some(120),
+            games_as_red: games,
+            games_as_black: games,
+            start_index: thread_start,
+            seed: cmd.seed,
+            cpuct,
+            cpuct_at_root,
+            cpuct_base: 19652.0,
+            cpuct_factor: 1.5,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 1.5,
+            fpu_value: 0.2,
+            fpu_value_at_root: 0.1,
+            draw_score: 0.0,
+            policy_softmax_temp,
+        };
+        let candidate = common(
+            cmd.candidate_cpuct,
+            cmd.candidate_cpuct_at_root,
+            cmd.candidate_policy_temp,
+        );
+        let baseline = common(
+            cmd.baseline_cpuct,
+            cmd.baseline_cpuct_at_root,
+            cmd.baseline_policy_temp,
+        );
+        handles.push(thread::spawn(move || {
+            play_arena_search_configs_from_positions(
+                model.as_ref(),
+                model.as_ref(),
+                positions.as_slice(),
+                candidate,
+                baseline,
+            )
+        }));
+    }
+    let mut report = AzArenaReport::default();
+    for handle in handles {
+        report.add_assign(&handle.join().expect("search config arena thread panicked"));
+    }
+    let (elo_low, elo_high) = report.elo_diff_bounds(1.96);
+    println!(
+        "search-config-arena: model={} positions={} games={} sims={} candidate={}/{}/{} baseline={}/{}/{} W/L/D={}/{}/{} score={:.3}% se={:.3}% ci95={:.3}-{:.3}% elo={:+.2} [{:+.2},{:+.2}] elapsed={:.1}s",
+        cmd.model,
+        positions.len(),
+        report.total_games(),
+        cmd.simulations.max(1),
+        cmd.candidate_cpuct,
+        cmd.candidate_cpuct_at_root,
+        cmd.candidate_policy_temp,
+        cmd.baseline_cpuct,
+        cmd.baseline_cpuct_at_root,
+        cmd.baseline_policy_temp,
+        report.wins,
+        report.losses,
+        report.draws,
+        report.score_rate() * 100.0,
+        report.score_rate_standard_error() * 100.0,
+        report.score_rate_lower_bound(1.96) * 100.0,
+        report.score_rate_upper_bound(1.96) * 100.0,
+        report.elo_diff_vs_even(),
+        elo_low,
+        elo_high,
+        started.elapsed().as_secs_f32(),
+    );
 }
 
 fn checkpoint_number(path: &Path) -> Option<u64> {

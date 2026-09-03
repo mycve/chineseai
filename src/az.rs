@@ -51,7 +51,7 @@ pub use alphazero::{
 pub use midgame::{AzMidgamePool, AzStartSnapshot};
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
-    play_arena_games_from_positions,
+    play_arena_games_from_positions, play_arena_search_configs_from_positions,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
 pub use train::{train_samples, train_samples_weighted, train_samples_weighted_owned};
