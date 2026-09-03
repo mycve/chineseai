@@ -3910,8 +3910,19 @@ mod tests {
         let pairs = vec![(preferred.clone(), rejected.clone())];
         let mut model = AzNnue::random(16, 7701);
         let mut rng = SplitMix64::new(7702);
-        let stats = train_value_ranking_pairs(&mut model, &pairs, 100, 0.003, 1, 4.0, &mut rng)
-            .expect("ranking training failed");
+        let stats = train_value_ranking_pairs(
+            &mut model,
+            &pairs,
+            &[],
+            0,
+            0.0,
+            100,
+            0.003,
+            1,
+            4.0,
+            &mut rng,
+        )
+        .expect("ranking training failed");
         let q = |sample: &AzTrainingSample| {
             let wdl = outputs_for_training_sample(&model, sample).unwrap().0;
             wdl[0] - wdl[2]

@@ -39,14 +39,28 @@ pub(super) fn train_samples_gpu(
 pub(super) fn train_value_ranking_pairs_gpu(
     model: &mut super::AzNnue,
     pairs: &[(super::AzTrainingSample, super::AzTrainingSample)],
+    anchors: &[super::AzTrainingSample],
+    anchors_per_pair: usize,
+    anchor_weight: f32,
     epochs: usize,
     lr: f32,
     batch_size: usize,
     scale: f32,
     rng: &mut super::SplitMix64,
 ) -> Result<super::train::AzValueRankingStats, String> {
-    candle::train_value_ranking_pairs_gpu(model, pairs, epochs, lr, batch_size, scale, rng)
-        .map_err(|err| err.to_string())
+    candle::train_value_ranking_pairs_gpu(
+        model,
+        pairs,
+        anchors,
+        anchors_per_pair,
+        anchor_weight,
+        epochs,
+        lr,
+        batch_size,
+        scale,
+        rng,
+    )
+    .map_err(|err| err.to_string())
 }
 
 #[cfg(not(any(
@@ -82,6 +96,9 @@ pub(super) fn train_samples_gpu(
 pub(super) fn train_value_ranking_pairs_gpu(
     _model: &mut super::AzNnue,
     _pairs: &[(super::AzTrainingSample, super::AzTrainingSample)],
+    _anchors: &[super::AzTrainingSample],
+    _anchors_per_pair: usize,
+    _anchor_weight: f32,
     _epochs: usize,
     _lr: f32,
     _batch_size: usize,

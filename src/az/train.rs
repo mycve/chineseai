@@ -6,6 +6,7 @@ use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix
 pub struct AzValueRankingStats {
     pub pairs: usize,
     pub loss: f32,
+    pub anchor_value_ce: f32,
     pub accuracy: f32,
     pub mean_margin: f32,
 }
@@ -87,6 +88,9 @@ fn train_samples_weighted_shared(
 pub fn train_value_ranking_pairs(
     model: &mut AzNnue,
     pairs: &[(AzTrainingSample, AzTrainingSample)],
+    anchors: &[AzTrainingSample],
+    anchors_per_pair: usize,
+    anchor_weight: f32,
     epochs: usize,
     lr: f32,
     batch_size: usize,
@@ -94,6 +98,15 @@ pub fn train_value_ranking_pairs(
     rng: &mut SplitMix64,
 ) -> Result<AzValueRankingStats, String> {
     super::train_gpu::train_value_ranking_pairs_gpu(
-        model, pairs, epochs, lr, batch_size, scale, rng,
+        model,
+        pairs,
+        anchors,
+        anchors_per_pair,
+        anchor_weight,
+        epochs,
+        lr,
+        batch_size,
+        scale,
+        rng,
     )
 }
