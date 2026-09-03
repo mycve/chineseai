@@ -180,7 +180,6 @@ pub struct AzSelfplayData {
     pub raw_top1_blunder_005: usize,
     pub raw_top1_blunder_010: usize,
     pub raw_top1_blunder_020: usize,
-    pub blind_spot_forced_games: usize,
     pub visited_actions_sum: usize,
     pub shape_count: usize,
     pub opening_raw_prior_top1_sum: f32,
@@ -232,7 +231,6 @@ impl AzSelfplayData {
         self.raw_top1_blunder_005 += other.raw_top1_blunder_005;
         self.raw_top1_blunder_010 += other.raw_top1_blunder_010;
         self.raw_top1_blunder_020 += other.raw_top1_blunder_020;
-        self.blind_spot_forced_games += other.blind_spot_forced_games;
         self.visited_actions_sum += other.visited_actions_sum;
         self.shape_count += other.shape_count;
         self.opening_raw_prior_top1_sum += other.opening_raw_prior_top1_sum;
@@ -309,7 +307,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.raw_top1_blunder_005 += chunk.raw_top1_blunder_005;
         merged.raw_top1_blunder_010 += chunk.raw_top1_blunder_010;
         merged.raw_top1_blunder_020 += chunk.raw_top1_blunder_020;
-        merged.blind_spot_forced_games += chunk.blind_spot_forced_games;
         merged.visited_actions_sum += chunk.visited_actions_sum;
         merged.shape_count += chunk.shape_count;
         merged.opening_raw_prior_top1_sum += chunk.opening_raw_prior_top1_sum;
@@ -487,7 +484,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     let mut raw_top1_blunder_005 = 0usize;
     let mut raw_top1_blunder_010 = 0usize;
     let mut raw_top1_blunder_020 = 0usize;
-    let mut blind_spot_forced_games = 0usize;
     let mut visited_actions_sum = 0usize;
     let mut shape_count = 0usize;
     let mut opening_raw_prior_top1_sum = 0.0f32;
@@ -520,8 +516,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         let mut game_bootstrap_wdls = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
-        let mut blind_spot_pending = blind_spot_game_enabled(config, game_index);
-        let mut blind_spot_forced = false;
 
         for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
             let ply = start_phase_ply + local_ply;
@@ -613,12 +607,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 entropy_mid_count += 1;
             }
             let temperature = temperature_for_ply(config, ply);
-            let force_blind_spot = blind_spot_pending && shape.raw_top1_regret > 0.10;
-            let mv_opt = if force_blind_spot {
-                blind_spot_pending = false;
-                blind_spot_forced = shape.raw_top1_move.is_some();
-                shape.raw_top1_move
-            } else if temperature <= 1e-6 {
+            let mv_opt = if temperature <= 1e-6 {
                 search
                     .best_move
                     .or_else(|| choose_selfplay_move(&search.candidates, temperature, &mut rng))
@@ -669,7 +658,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     move_meta,
                     search_simulation_count,
                     1.0,
-                    if force_blind_spot { 0.0 } else { 1.0 },
                 );
                 game_samples.push(sample);
                 game_bootstrap_wdls.push(search.network_value_wdl);
@@ -735,7 +723,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             std::cmp::Ordering::Equal => draws += 1,
         }
         plies_total += plies;
-        blind_spot_forced_games += usize::from(blind_spot_forced);
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
@@ -778,7 +765,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         raw_top1_blunder_005,
         raw_top1_blunder_010,
         raw_top1_blunder_020,
-        blind_spot_forced_games,
         visited_actions_sum,
         shape_count,
         opening_raw_prior_top1_sum,
@@ -813,8 +799,6 @@ struct BatchedSelfplayGame {
     midgame_harvest_ply: Option<usize>,
     reported_plies: usize,
     start_source: AzStartSource,
-    blind_spot_pending: bool,
-    blind_spot_forced: bool,
     rng: SplitMix64,
 }
 
@@ -835,8 +819,6 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         midgame_harvest_ply: start.midgame_harvest_ply,
         reported_plies: 0,
         start_source: start.source,
-        blind_spot_pending: blind_spot_game_enabled(config, game_index),
-        blind_spot_forced: false,
         rng,
     }
 }
@@ -846,7 +828,7 @@ fn record_batched_search_stats(
     search: &super::AzSearchResult,
     ply: usize,
     config: &AzLoopConfig,
-) -> PolicyShapeStats {
+) {
     let entropy = policy_entropy(&search.candidates);
     let shape = policy_shape_stats(&search.candidates);
     data.raw_prior_top1_sum += shape.raw_prior_top1;
@@ -879,7 +861,6 @@ fn record_batched_search_stats(
         data.entropy_mid_sum += entropy;
         data.entropy_mid_count += 1;
     }
-    shape
 }
 
 fn inactive_batch_input(config: &AzLoopConfig) -> AzBatchSearchInput {
@@ -983,14 +964,9 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 let search = &searches[index];
                 data.search_simulations.searches += 1;
                 data.search_simulations.simulations_sum += search.simulations;
-                let shape = record_batched_search_stats(&mut data, search, state.phase_ply, config);
+                record_batched_search_stats(&mut data, search, state.phase_ply, config);
                 let temperature = temperature_for_ply(config, state.phase_ply);
-                let force_blind_spot = state.blind_spot_pending && shape.raw_top1_regret > 0.10;
-                let mv = if force_blind_spot {
-                    state.blind_spot_pending = false;
-                    state.blind_spot_forced = shape.raw_top1_move.is_some();
-                    shape.raw_top1_move
-                } else if temperature <= 1e-6 {
+                let mv = if temperature <= 1e-6 {
                     search.best_move.or_else(|| {
                         choose_selfplay_move(&search.candidates, temperature, &mut state.rng)
                     })
@@ -1040,7 +1016,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     meta,
                     search.simulations,
                     1.0,
-                    if force_blind_spot { 0.0 } else { 1.0 },
                 ));
                 state.bootstrap_wdls.push(search.network_value_wdl);
                 let mover = state.position.side_to_move();
@@ -1107,7 +1082,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 std::cmp::Ordering::Equal => data.draws += 1,
             }
             data.plies_total += state.reported_plies;
-            data.blind_spot_forced_games += usize::from(state.blind_spot_forced);
             let mut game_samples = state.samples;
             assign_td_lambda_value_targets(
                 &mut game_samples,
@@ -1133,21 +1107,7 @@ struct PolicyShapeStats {
     q_top1_abs: f32,
     raw_top1_regret: f32,
     raw_policy_regret: f32,
-    raw_top1_move: Option<Move>,
     visited_actions: usize,
-}
-
-fn blind_spot_game_enabled(config: &AzLoopConfig, game_index: usize) -> bool {
-    let fraction = config.blind_spot_game_fraction.clamp(0.0, 1.0);
-    if fraction <= 0.0 {
-        return false;
-    }
-    let mut gate_rng = SplitMix64::new(
-        config.seed
-            ^ (game_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
-            ^ 0xA076_1D64_78BD_642F,
-    );
-    gate_rng.unit_f32() < fraction
 }
 
 fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
@@ -1155,7 +1115,6 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
     let mut policy_top = [0.0f32; 2];
     let mut q_top = [f32::NEG_INFINITY; 2];
     let mut raw_top_q = 0.0f32;
-    let mut raw_top1_move = None;
     let mut raw_top_prior = f32::NEG_INFINITY;
     let mut raw_q_sum = 0.0f32;
     let mut visited_raw_prior_sum = 0.0f32;
@@ -1171,7 +1130,6 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
             if raw_prior > raw_top_prior {
                 raw_top_prior = raw_prior;
                 raw_top_q = candidate.q;
-                raw_top1_move = Some(candidate.mv);
             }
             visited_actions += 1;
         }
@@ -1205,7 +1163,6 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
         q_top1_abs,
         raw_top1_regret,
         raw_policy_regret,
-        raw_top1_move,
         visited_actions,
     }
 }
@@ -1229,7 +1186,6 @@ fn make_training_sample(
     meta: AzSampleMeta,
     search_simulations: usize,
     policy_weight: f32,
-    value_weight: f32,
 ) -> AzTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
@@ -1269,7 +1225,7 @@ fn make_training_sample(
         value: value.clamp(-1.0, 1.0),
         side_sign,
         policy_weight: policy_weight.max(0.0),
-        value_weight: value_weight.max(0.0),
+        value_weight: 1.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
     }
@@ -1692,7 +1648,6 @@ mod tests {
             cpuct_factor_at_root: 1.5,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            blind_spot_game_fraction: 0.0,
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
             draw_score: 0.0,
@@ -1947,16 +1902,6 @@ mod tests {
 
         assert!((stats.raw_top1_regret - 0.3).abs() < 1.0e-6);
         assert!((stats.raw_policy_regret - 0.24).abs() < 1.0e-6);
-        assert_eq!(stats.raw_top1_move, Some(Move::new(0, 1)));
-    }
-
-    #[test]
-    fn blind_spot_game_gate_respects_extremes() {
-        let mut config = selfplay_test_config(1);
-        config.blind_spot_game_fraction = 0.0;
-        assert!(!blind_spot_game_enabled(&config, 0));
-        config.blind_spot_game_fraction = 1.0;
-        assert!(blind_spot_game_enabled(&config, 0));
     }
 
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
@@ -2051,7 +1996,6 @@ mod tests {
             true,
             AzSampleMeta::default(),
             1,
-            1.0,
             1.0,
         );
 
