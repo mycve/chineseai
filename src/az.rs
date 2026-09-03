@@ -54,7 +54,10 @@ pub use play::{
     play_arena_games_from_positions,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
-pub use train::{train_samples, train_samples_weighted, train_samples_weighted_owned};
+pub use train::{
+    AzValueRankingStats, train_samples, train_samples_weighted, train_samples_weighted_owned,
+    train_value_ranking_pairs,
+};
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
@@ -3879,6 +3882,43 @@ mod tests {
         let (lower, upper) = stronger.elo_diff_bounds(1.96);
         assert!(lower <= stronger.elo_diff_vs_even());
         assert!(upper >= stronger.elo_diff_vs_even());
+    }
+
+    #[cfg(feature = "gpu-train")]
+    #[test]
+    fn value_ranking_loss_learns_requested_pair_direction() {
+        let preferred_position = Position::startpos();
+        let mut rejected_position = preferred_position.clone();
+        rejected_position.make_move(rejected_position.legal_moves()[0]);
+        let make_sample = |position: &Position| AzTrainingSample {
+            features: crate::nnue::extract_sparse_features_az(position),
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            move_indices: Vec::new(),
+            policy: Vec::new(),
+            value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
+            value: 0.0,
+            side_sign: 1.0,
+            policy_weight: 0.0,
+            value_weight: 0.0,
+            search_simulations: 0,
+            meta: AzSampleMeta::default(),
+        };
+        let preferred = make_sample(&preferred_position);
+        let rejected = make_sample(&rejected_position);
+        let pairs = vec![(preferred.clone(), rejected.clone())];
+        let mut model = AzNnue::random(16, 7701);
+        let mut rng = SplitMix64::new(7702);
+        let stats = train_value_ranking_pairs(&mut model, &pairs, 100, 0.003, 1, 4.0, &mut rng)
+            .expect("ranking training failed");
+        let q = |sample: &AzTrainingSample| {
+            let wdl = outputs_for_training_sample(&model, sample).unwrap().0;
+            wdl[0] - wdl[2]
+        };
+        let margin = q(&rejected) - q(&preferred);
+        assert!(stats.accuracy > 0.99, "stats={stats:?}");
+        assert!(margin > 0.05, "margin={margin} stats={stats:?}");
     }
 
     #[cfg(feature = "gpu-train")]

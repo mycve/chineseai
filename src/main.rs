@@ -12,16 +12,17 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
-        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
-        generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
-        train_samples_weighted_owned,
+        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzStartSource, AzTrainLossWeights,
+        AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, alphazero_search,
+        alphazero_search_trace_with_rules, alphazero_search_with_rules, benchmark_training,
+        dense_move_index, evaluate_policy_groups, generate_selfplay_data,
+        play_arena_games_from_positions, rule_context_features, train_samples_weighted,
+        train_samples_weighted_owned, train_value_ranking_pairs,
     },
     nnue::{canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
-    xiangqi::{Move, Position, RuleOutcome},
+    xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome},
 };
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use rusqlite::{Connection, params};
@@ -70,6 +71,8 @@ enum CliCommand {
     AzTrainBench(AzTrainBenchArgs),
     /// Fit a model on a fixed replay snapshot and report future-game validation loss.
     AzReplayFit(AzReplayFitArgs),
+    /// Probe whether the value head can learn stable deep-search sibling rankings.
+    AzValueRankingProbe(AzValueRankingProbeArgs),
     /// Report start-position policy targets, played moves, and outcomes from a replay snapshot.
     AzReplayOpeningStats(AzReplayOpeningStatsArgs),
     /// Run self-play training from a TOML config.
@@ -253,6 +256,40 @@ struct AzReplayFitArgs {
     lr: f32,
     /// Initialization and shuffle seed.
     #[arg(long, default_value_t = 20260802)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct AzValueRankingProbeArgs {
+    /// Input model; this command never modifies it.
+    model: String,
+    /// Existing self-play opening or midgame pool snapshot.
+    pool: String,
+    /// Trained probe output model.
+    #[arg(long, default_value = "value-ranking-probe.safetensors")]
+    output: String,
+    /// Pool positions sampled before stable-pair filtering.
+    #[arg(long, default_value_t = 5000)]
+    positions: usize,
+    #[arg(long, default_value_t = 400)]
+    shallow_sims: usize,
+    #[arg(long, default_value_t = 1600)]
+    deep_sims: usize,
+    #[arg(long, default_value_t = 6400)]
+    confirm_sims: usize,
+    /// Newest fraction of distinct generations held out from optimization.
+    #[arg(long, default_value_t = 0.20)]
+    validation_fraction: f32,
+    #[arg(long, default_value_t = 2)]
+    epochs: usize,
+    #[arg(long, default_value_t = 256)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 0.00001)]
+    lr: f32,
+    /// Logistic ranking sharpness.
+    #[arg(long, default_value_t = 4.0)]
+    scale: f32,
+    #[arg(long, default_value_t = 20260903)]
     seed: u64,
 }
 
@@ -1416,6 +1453,326 @@ fn build_arena_start_positions(
     }
 }
 
+#[derive(Clone)]
+struct ValueRankingPairRecord {
+    generation: u32,
+    root: Position,
+    root_history: Vec<RuleHistoryEntry>,
+    preferred: AzTrainingSample,
+    preferred_position: Position,
+    preferred_history: Vec<RuleHistoryEntry>,
+    rejected: AzTrainingSample,
+    rejected_position: Position,
+    rejected_history: Vec<RuleHistoryEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ValueRankingEval {
+    accuracy: f32,
+    mean_margin: f32,
+    mean_preferred_q: f32,
+    mean_rejected_q: f32,
+}
+
+fn run_value_ranking_probe(cmd: AzValueRankingProbeArgs) {
+    assert!(cmd.shallow_sims < cmd.deep_sims && cmd.deep_sims < cmd.confirm_sims);
+    let mut model = AzNnue::load(&cmd.model)
+        .unwrap_or_else(|err| panic!("failed to load model `{}`: {err}", cmd.model));
+    let pool = AzMidgamePool::load_lz4(Path::new(&cmd.pool), cmd.positions.max(1))
+        .unwrap_or_else(|err| panic!("failed to load pool `{}`: {err}", cmd.pool));
+    let mut sample_rng = SplitMix64::new(cmd.seed);
+    let snapshots = pool.sample(cmd.positions.max(1), &mut sample_rng);
+    let started = Instant::now();
+    let mut pairs = Vec::new();
+    let mut disagreements = 0usize;
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let limits = |simulations, salt| AzSearchLimits {
+            simulations,
+            seed: cmd.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt,
+            cpuct: 0.9,
+            cpuct_at_root: 2.0,
+            cpuct_base: 19652.0,
+            cpuct_factor: 1.5,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 1.5,
+            max_depth: 0,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            fpu_value: 0.20,
+            fpu_value_at_root: 0.10,
+            policy_softmax_temp: 1.2,
+            draw_score: 0.0,
+            value_scale: 1.0,
+        };
+        let shallow = alphazero_search_with_rules(
+            &snapshot.position,
+            Some(snapshot.rule_history.clone()),
+            None,
+            &model,
+            limits(cmd.shallow_sims, 0),
+        );
+        let deep = alphazero_search_with_rules(
+            &snapshot.position,
+            Some(snapshot.rule_history.clone()),
+            None,
+            &model,
+            limits(cmd.deep_sims, 0),
+        );
+        let (Some(shallow_move), Some(deep_move)) = (shallow.best_move, deep.best_move) else {
+            continue;
+        };
+        if shallow_move == deep_move {
+            continue;
+        }
+        disagreements += 1;
+        let confirm = alphazero_search_with_rules(
+            &snapshot.position,
+            Some(snapshot.rule_history.clone()),
+            None,
+            &model,
+            limits(cmd.confirm_sims, 0),
+        );
+        if confirm.best_move != Some(deep_move) {
+            continue;
+        }
+        let (preferred_position, preferred_history) =
+            ranking_child(&snapshot.position, &snapshot.rule_history, deep_move);
+        let (rejected_position, rejected_history) =
+            ranking_child(&snapshot.position, &snapshot.rule_history, shallow_move);
+        pairs.push(ValueRankingPairRecord {
+            generation: snapshot.generation,
+            root: snapshot.position.clone(),
+            root_history: snapshot.rule_history.clone(),
+            preferred: ranking_sample(
+                &preferred_position,
+                &preferred_history,
+                snapshot.generation,
+                snapshot.phase_ply.saturating_add(1),
+            ),
+            preferred_position,
+            preferred_history,
+            rejected: ranking_sample(
+                &rejected_position,
+                &rejected_history,
+                snapshot.generation,
+                snapshot.phase_ply.saturating_add(1),
+            ),
+            rejected_position,
+            rejected_history,
+        });
+        if (index + 1).is_multiple_of(250) {
+            eprintln!(
+                "ranking-mine: scanned={} disagreements={} stable={} elapsed={:.1}s",
+                index + 1,
+                disagreements,
+                pairs.len(),
+                started.elapsed().as_secs_f32()
+            );
+        }
+    }
+    let mut generations = pairs.iter().map(|pair| pair.generation).collect::<Vec<_>>();
+    generations.sort_unstable();
+    generations.dedup();
+    assert!(
+        generations.len() >= 2,
+        "ranking probe needs stable pairs from at least two generations"
+    );
+    let validation_generations =
+        ((generations.len() as f32) * cmd.validation_fraction.clamp(0.05, 0.5)).ceil() as usize;
+    let split_generation = generations[generations.len() - validation_generations.max(1)];
+    let mut train = Vec::new();
+    let mut validation = Vec::new();
+    for pair in pairs {
+        if pair.generation < split_generation {
+            train.push(pair);
+        } else {
+            validation.push(pair);
+        }
+    }
+    assert!(!train.is_empty() && !validation.is_empty());
+    let train_before = evaluate_value_ranking(&model, &train);
+    let validation_before = evaluate_value_ranking(&model, &validation);
+    let validation_q_before = validation
+        .iter()
+        .map(|pair| ranking_pair_q(&model, pair))
+        .collect::<Vec<_>>();
+    let validation_policy_before = validation
+        .iter()
+        .map(|pair| raw_policy_top1(&model, &pair.root, &pair.root_history, cmd.seed))
+        .collect::<Vec<_>>();
+    let training_pairs = train
+        .iter()
+        .map(|pair| (pair.preferred.clone(), pair.rejected.clone()))
+        .collect::<Vec<_>>();
+    let mut train_rng = SplitMix64::new(cmd.seed ^ 0xD1B5_4A32_D192_ED03);
+    let train_stats = train_value_ranking_pairs(
+        &mut model,
+        &training_pairs,
+        cmd.epochs.max(1),
+        cmd.lr.max(0.0),
+        cmd.batch_size.max(1),
+        cmd.scale.max(1.0e-3),
+        &mut train_rng,
+    )
+    .expect("value ranking training failed");
+    let train_after = evaluate_value_ranking(&model, &train);
+    let validation_after = evaluate_value_ranking(&model, &validation);
+    let mut q_abs_shift = 0.0f32;
+    let mut policy_top1_changed = 0usize;
+    for (index, pair) in validation.iter().enumerate() {
+        let after = ranking_pair_q(&model, pair);
+        let before = validation_q_before[index];
+        q_abs_shift += (after.0 - before.0).abs() + (after.1 - before.1).abs();
+        let policy_after = raw_policy_top1(&model, &pair.root, &pair.root_history, cmd.seed);
+        policy_top1_changed += usize::from(policy_after != validation_policy_before[index]);
+    }
+    q_abs_shift /= (validation.len() * 2).max(1) as f32;
+    model
+        .save(&cmd.output)
+        .unwrap_or_else(|err| panic!("failed to save ranking probe `{}`: {err}", cmd.output));
+    println!("value-ranking-probe");
+    println!("model      : {}", cmd.model);
+    println!("pool       : {}", cmd.pool);
+    println!(
+        "mining     : scanned={} disagreements={} stable={} ({:.2}% of scanned) seconds={:.1}",
+        snapshots.len(),
+        disagreements,
+        train.len() + validation.len(),
+        100.0 * (train.len() + validation.len()) as f32 / snapshots.len().max(1) as f32,
+        started.elapsed().as_secs_f32()
+    );
+    println!(
+        "split      : generation<{} train={} validation={} distinct_generations={}",
+        split_generation,
+        train.len(),
+        validation.len(),
+        generations.len()
+    );
+    println!("train pre  : {train_before:?}");
+    println!("valid pre  : {validation_before:?}");
+    println!("optimizer  : {train_stats:?}");
+    println!("train post : {train_after:?}");
+    println!("valid post : {validation_after:?}");
+    println!(
+        "sideeffect : valid_child_mean_abs_q_shift={:.6} raw_policy_top1_changed={}/{} ({:.2}%)",
+        q_abs_shift,
+        policy_top1_changed,
+        validation.len(),
+        100.0 * policy_top1_changed as f32 / validation.len().max(1) as f32
+    );
+    println!("output     : {}", cmd.output);
+}
+
+fn ranking_child(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    mv: Move,
+) -> (Position, Vec<RuleHistoryEntry>) {
+    let mut child = position.clone();
+    let mut child_history = history.to_vec();
+    child_history.push(position.rule_history_entry_after_move(mv));
+    child.make_move(mv);
+    (child, child_history)
+}
+
+fn ranking_sample(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    generation: u32,
+    ply: u16,
+) -> AzTrainingSample {
+    let legal = position.legal_moves_with_rules(history);
+    let side = position.side_to_move();
+    let move_indices = legal
+        .first()
+        .map(|&mv| vec![dense_move_index(canonical_move(side, mv))])
+        .unwrap_or_default();
+    let policy = vec![1.0; move_indices.len()];
+    AzTrainingSample {
+        features: extract_sparse_features_az(position),
+        rule_context: rule_context_features(position, history),
+        move_indices,
+        policy,
+        value_wdl: [0.0, 1.0, 0.0],
+        root_search_wdl: [0.0, 1.0, 0.0],
+        short_value_wdl: [[0.0, 1.0, 0.0]; 3],
+        value: 0.0,
+        side_sign: if side == Color::Red { 1.0 } else { -1.0 },
+        policy_weight: 0.0,
+        value_weight: 0.0,
+        search_simulations: 0,
+        meta: AzSampleMeta {
+            generation_update: generation,
+            ply,
+            start_source: AzStartSource::Midgame,
+            ..AzSampleMeta::default()
+        },
+    }
+}
+
+fn ranking_pair_q(model: &AzNnue, pair: &ValueRankingPairRecord) -> (f32, f32) {
+    let preferred_legal = pair
+        .preferred_position
+        .legal_moves_with_rules(&pair.preferred_history);
+    let rejected_legal = pair
+        .rejected_position
+        .legal_moves_with_rules(&pair.rejected_history);
+    (
+        model.evaluate_value_with_rules(
+            &pair.preferred_position,
+            &pair.preferred_history,
+            &preferred_legal,
+        ),
+        model.evaluate_value_with_rules(
+            &pair.rejected_position,
+            &pair.rejected_history,
+            &rejected_legal,
+        ),
+    )
+}
+
+fn evaluate_value_ranking(model: &AzNnue, pairs: &[ValueRankingPairRecord]) -> ValueRankingEval {
+    let mut output = ValueRankingEval::default();
+    for pair in pairs {
+        let (preferred, rejected) = ranking_pair_q(model, pair);
+        let margin = rejected - preferred;
+        output.accuracy += f32::from(margin > 0.0);
+        output.mean_margin += margin;
+        output.mean_preferred_q += preferred;
+        output.mean_rejected_q += rejected;
+    }
+    let denom = pairs.len().max(1) as f32;
+    output.accuracy /= denom;
+    output.mean_margin /= denom;
+    output.mean_preferred_q /= denom;
+    output.mean_rejected_q /= denom;
+    output
+}
+
+fn raw_policy_top1(
+    model: &AzNnue,
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    seed: u64,
+) -> Option<Move> {
+    let result = alphazero_search_with_rules(
+        position,
+        Some(history.to_vec()),
+        None,
+        model,
+        AzSearchLimits {
+            simulations: 1,
+            seed,
+            ..AzSearchLimits::default()
+        },
+    );
+    result
+        .candidates
+        .iter()
+        .max_by(|left, right| left.raw_prior.total_cmp(&right.raw_prior))
+        .map(|candidate| candidate.mv)
+}
+
 fn fixed_az_search_limits(
     simulations: usize,
     seed: u64,
@@ -2037,6 +2394,7 @@ fn main() {
             println!("no-delta   : {ablated_groups:?}");
             println!("output     : {}", cmd.output);
         }
+        Some(CliCommand::AzValueRankingProbe(cmd)) => run_value_ranking_probe(cmd),
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
             let Some(config) = load_or_create_az_loop_config(&config_path) else {

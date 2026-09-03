@@ -3,6 +3,7 @@ use candle_nn::ops::log_softmax;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use std::{sync::Arc, thread, time::Instant};
 
+use super::train::AzValueRankingStats;
 use super::{
     AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, AzValueMomentStats,
     WDL_HEAD_SIZE,
@@ -104,6 +105,54 @@ pub(super) fn train_samples_gpu(
     Ok(stats)
 }
 
+pub(super) fn train_value_ranking_pairs_gpu(
+    model: &mut AzNnue,
+    pairs: &[(AzTrainingSample, AzTrainingSample)],
+    epochs: usize,
+    lr: f32,
+    batch_size: usize,
+    scale: f32,
+    rng: &mut super::SplitMix64,
+) -> CandleResult<AzValueRankingStats> {
+    if pairs.is_empty() || epochs == 0 || lr <= 0.0 {
+        return Ok(AzValueRankingStats::default());
+    }
+    let mut trainer = GpuTrainer::new(model, lr)?;
+    let mut order = (0..pairs.len()).collect::<Vec<_>>();
+    let mut stats = AzValueRankingStats::default();
+    for _ in 0..epochs {
+        for index in (1..order.len()).rev() {
+            let swap = (rng.next_u64() as usize) % (index + 1);
+            order.swap(index, swap);
+        }
+        stats = AzValueRankingStats::default();
+        for chunk in order.chunks(batch_size.max(1)) {
+            let mut samples = Vec::with_capacity(chunk.len() * 2);
+            for &index in chunk {
+                samples.push(pairs[index].0.clone());
+            }
+            for &index in chunk {
+                samples.push(pairs[index].1.clone());
+            }
+            let indices = (0..samples.len()).collect::<Vec<_>>();
+            let packed = PackedBatch::from_indices(&samples, &indices);
+            let batch_stats = trainer.train_ranking_batch(packed, chunk.len(), scale)?;
+            stats.pairs += batch_stats.pairs;
+            stats.loss += batch_stats.loss * batch_stats.pairs as f32;
+            stats.accuracy += batch_stats.accuracy * batch_stats.pairs as f32;
+            stats.mean_margin += batch_stats.mean_margin * batch_stats.pairs as f32;
+        }
+        if stats.pairs > 0 {
+            let denom = stats.pairs as f32;
+            stats.loss /= denom;
+            stats.accuracy /= denom;
+            stats.mean_margin /= denom;
+        }
+    }
+    trainer.copy_to_model(model)?;
+    Ok(stats)
+}
+
 impl GpuTrainer {
     fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
         let replica = match GpuReplica::new(model, 0) {
@@ -163,6 +212,35 @@ impl GpuTrainer {
         profile_sync(&self.replica.device)?;
         profile.optimizer_seconds += optimizer_started.elapsed().as_secs_f64();
         Ok((output.stats, profile))
+    }
+
+    fn train_ranking_batch(
+        &mut self,
+        batch: PackedBatch,
+        pair_count: usize,
+        scale: f32,
+    ) -> CandleResult<AzValueRankingStats> {
+        let batch_tensors = BatchTensors::from_packed(batch, &self.replica.device)?;
+        let forward = self.replica.model.forward(&batch_tensors)?;
+        let probs = log_softmax(&forward.value_logits, 1)?.exp()?;
+        let q = wdl_probs_to_q(&probs)?.squeeze(1)?;
+        let preferred = q.narrow(0, 0, pair_count)?;
+        let rejected = q.narrow(0, pair_count, pair_count)?;
+        let margin = (&rejected - &preferred)?;
+        let scaled_negative = margin.affine(-(scale.max(1.0e-3) as f64), 0.0)?;
+        let loss_per_pair = (scaled_negative.exp()? + 1.0)?.log()?;
+        let loss_tensor = loss_per_pair.mean_all()?;
+        let margins = margin.to_vec1::<f32>()?;
+        let loss = loss_per_pair.mean_all()?.to_scalar::<f32>()?;
+        let grads = loss_tensor.backward()?;
+        self.optimizer.step(&grads)?;
+        let correct = margins.iter().filter(|&&value| value > 0.0).count();
+        Ok(AzValueRankingStats {
+            pairs: pair_count,
+            loss,
+            accuracy: correct as f32 / pair_count.max(1) as f32,
+            mean_margin: margins.iter().sum::<f32>() / pair_count.max(1) as f32,
+        })
     }
 
     fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
