@@ -175,6 +175,11 @@ pub struct AzSelfplayData {
     pub policy_top2_sum: f32,
     pub q_gap_sum: f32,
     pub q_top1_abs_sum: f32,
+    pub raw_top1_regret_sum: f32,
+    pub raw_policy_regret_sum: f32,
+    pub raw_top1_blunder_005: usize,
+    pub raw_top1_blunder_010: usize,
+    pub raw_top1_blunder_020: usize,
     pub visited_actions_sum: usize,
     pub shape_count: usize,
     pub opening_raw_prior_top1_sum: f32,
@@ -221,6 +226,11 @@ impl AzSelfplayData {
         self.policy_top2_sum += other.policy_top2_sum;
         self.q_gap_sum += other.q_gap_sum;
         self.q_top1_abs_sum += other.q_top1_abs_sum;
+        self.raw_top1_regret_sum += other.raw_top1_regret_sum;
+        self.raw_policy_regret_sum += other.raw_policy_regret_sum;
+        self.raw_top1_blunder_005 += other.raw_top1_blunder_005;
+        self.raw_top1_blunder_010 += other.raw_top1_blunder_010;
+        self.raw_top1_blunder_020 += other.raw_top1_blunder_020;
         self.visited_actions_sum += other.visited_actions_sum;
         self.shape_count += other.shape_count;
         self.opening_raw_prior_top1_sum += other.opening_raw_prior_top1_sum;
@@ -292,6 +302,11 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         merged.policy_top2_sum += chunk.policy_top2_sum;
         merged.q_gap_sum += chunk.q_gap_sum;
         merged.q_top1_abs_sum += chunk.q_top1_abs_sum;
+        merged.raw_top1_regret_sum += chunk.raw_top1_regret_sum;
+        merged.raw_policy_regret_sum += chunk.raw_policy_regret_sum;
+        merged.raw_top1_blunder_005 += chunk.raw_top1_blunder_005;
+        merged.raw_top1_blunder_010 += chunk.raw_top1_blunder_010;
+        merged.raw_top1_blunder_020 += chunk.raw_top1_blunder_020;
         merged.visited_actions_sum += chunk.visited_actions_sum;
         merged.shape_count += chunk.shape_count;
         merged.opening_raw_prior_top1_sum += chunk.opening_raw_prior_top1_sum;
@@ -464,6 +479,11 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
     let mut policy_top2_sum = 0.0f32;
     let mut q_gap_sum = 0.0f32;
     let mut q_top1_abs_sum = 0.0f32;
+    let mut raw_top1_regret_sum = 0.0f32;
+    let mut raw_policy_regret_sum = 0.0f32;
+    let mut raw_top1_blunder_005 = 0usize;
+    let mut raw_top1_blunder_010 = 0usize;
+    let mut raw_top1_blunder_020 = 0usize;
     let mut visited_actions_sum = 0usize;
     let mut shape_count = 0usize;
     let mut opening_raw_prior_top1_sum = 0.0f32;
@@ -562,6 +582,11 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             policy_top2_sum += shape.policy_top2;
             q_gap_sum += shape.q_gap;
             q_top1_abs_sum += shape.q_top1_abs;
+            raw_top1_regret_sum += shape.raw_top1_regret;
+            raw_policy_regret_sum += shape.raw_policy_regret;
+            raw_top1_blunder_005 += usize::from(shape.raw_top1_regret > 0.05);
+            raw_top1_blunder_010 += usize::from(shape.raw_top1_regret > 0.10);
+            raw_top1_blunder_020 += usize::from(shape.raw_top1_regret > 0.20);
             visited_actions_sum += shape.visited_actions;
             shape_count += 1;
             entropy_all_sum += entropy;
@@ -735,6 +760,11 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         policy_top2_sum,
         q_gap_sum,
         q_top1_abs_sum,
+        raw_top1_regret_sum,
+        raw_policy_regret_sum,
+        raw_top1_blunder_005,
+        raw_top1_blunder_010,
+        raw_top1_blunder_020,
         visited_actions_sum,
         shape_count,
         opening_raw_prior_top1_sum,
@@ -807,6 +837,11 @@ fn record_batched_search_stats(
     data.policy_top2_sum += shape.policy_top2;
     data.q_gap_sum += shape.q_gap;
     data.q_top1_abs_sum += shape.q_top1_abs;
+    data.raw_top1_regret_sum += shape.raw_top1_regret;
+    data.raw_policy_regret_sum += shape.raw_policy_regret;
+    data.raw_top1_blunder_005 += usize::from(shape.raw_top1_regret > 0.05);
+    data.raw_top1_blunder_010 += usize::from(shape.raw_top1_regret > 0.10);
+    data.raw_top1_blunder_020 += usize::from(shape.raw_top1_regret > 0.20);
     data.visited_actions_sum += shape.visited_actions;
     data.shape_count += 1;
     data.entropy_all_sum += entropy;
@@ -1070,6 +1105,8 @@ struct PolicyShapeStats {
     policy_top2: f32,
     q_gap: f32,
     q_top1_abs: f32,
+    raw_top1_regret: f32,
+    raw_policy_regret: f32,
     visited_actions: usize,
 }
 
@@ -1077,12 +1114,23 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
     let mut raw_top = [0.0f32; 2];
     let mut policy_top = [0.0f32; 2];
     let mut q_top = [f32::NEG_INFINITY; 2];
+    let mut raw_top_q = 0.0f32;
+    let mut raw_top_prior = f32::NEG_INFINITY;
+    let mut raw_q_sum = 0.0f32;
+    let mut visited_raw_prior_sum = 0.0f32;
     let mut visited_actions = 0usize;
     for candidate in candidates {
         insert_top2(candidate.raw_prior.max(0.0), &mut raw_top);
         insert_top2(candidate.policy.max(0.0), &mut policy_top);
         if candidate.visits > 0 {
             insert_top2(candidate.q, &mut q_top);
+            let raw_prior = candidate.raw_prior.max(0.0);
+            raw_q_sum += raw_prior * candidate.q;
+            visited_raw_prior_sum += raw_prior;
+            if raw_prior > raw_top_prior {
+                raw_top_prior = raw_prior;
+                raw_top_q = candidate.q;
+            }
             visited_actions += 1;
         }
     }
@@ -1096,6 +1144,16 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
     } else {
         0.0
     };
+    let raw_top1_regret = if q_top[0].is_finite() && raw_top_prior.is_finite() {
+        (q_top[0] - raw_top_q).max(0.0)
+    } else {
+        0.0
+    };
+    let raw_policy_regret = if q_top[0].is_finite() && visited_raw_prior_sum > 0.0 {
+        (q_top[0] - raw_q_sum / visited_raw_prior_sum).max(0.0)
+    } else {
+        0.0
+    };
     PolicyShapeStats {
         raw_prior_top1: raw_top[0],
         raw_prior_top2: raw_top[0] + raw_top[1],
@@ -1103,6 +1161,8 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
         policy_top2: policy_top[0] + policy_top[1],
         q_gap,
         q_top1_abs,
+        raw_top1_regret,
+        raw_policy_regret,
         visited_actions,
     }
 }
@@ -1825,6 +1885,23 @@ mod tests {
             prior: 0.0,
             policy: 0.0,
         }
+    }
+
+    #[test]
+    fn policy_regret_uses_visited_child_q() {
+        let mut candidates = [
+            candidate(Move::new(0, 1), 0.6),
+            candidate(Move::new(0, 2), 0.3),
+            candidate(Move::new(0, 3), 0.1),
+        ];
+        candidates[0].q = 0.2;
+        candidates[1].q = 0.5;
+        candidates[2].q = -0.1;
+
+        let stats = policy_shape_stats(&candidates);
+
+        assert!((stats.raw_top1_regret - 0.3).abs() < 1.0e-6);
+        assert!((stats.raw_policy_regret - 0.24).abs() < 1.0e-6);
     }
 
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {

@@ -1116,6 +1116,11 @@ fn build_async_training_report(
         policy_top2: pending.selfplay.policy_top2_sum / shape_count,
         root_q_gap: pending.selfplay.q_gap_sum / shape_count,
         root_q_top1_abs: pending.selfplay.q_top1_abs_sum / shape_count,
+        raw_top1_regret: pending.selfplay.raw_top1_regret_sum / shape_count,
+        raw_policy_regret: pending.selfplay.raw_policy_regret_sum / shape_count,
+        raw_top1_blunder_005: pending.selfplay.raw_top1_blunder_005 as f32 / shape_count,
+        raw_top1_blunder_010: pending.selfplay.raw_top1_blunder_010 as f32 / shape_count,
+        raw_top1_blunder_020: pending.selfplay.raw_top1_blunder_020 as f32 / shape_count,
         visited_actions: pending.selfplay.visited_actions_sum as f32 / shape_count,
         opening_raw_prior_top1: pending.selfplay.opening_raw_prior_top1_sum / opening_shape_count,
         opening_raw_prior_top2: pending.selfplay.opening_raw_prior_top2_sum / opening_shape_count,
@@ -3221,6 +3226,36 @@ fn main() {
                     report.policy_top2,
                 );
                 log_scalar(&mut tb, "stats/top_q_gap", update, report.root_q_gap);
+                log_scalar(
+                    &mut tb,
+                    "policy_regret/raw_top1_mean",
+                    update,
+                    report.raw_top1_regret,
+                );
+                log_scalar(
+                    &mut tb,
+                    "policy_regret/raw_policy_mean",
+                    update,
+                    report.raw_policy_regret,
+                );
+                log_scalar(
+                    &mut tb,
+                    "policy_regret/raw_top1_gt_0p05",
+                    update,
+                    report.raw_top1_blunder_005,
+                );
+                log_scalar(
+                    &mut tb,
+                    "policy_regret/raw_top1_gt_0p10",
+                    update,
+                    report.raw_top1_blunder_010,
+                );
+                log_scalar(
+                    &mut tb,
+                    "policy_regret/raw_top1_gt_0p20",
+                    update,
+                    report.raw_top1_blunder_020,
+                );
                 log_scalar(
                     &mut tb,
                     "stats/max_child_q_abs",
