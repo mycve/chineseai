@@ -299,6 +299,9 @@ struct CheckpointCyclesArgs {
     /// MCTS simulations per move.
     #[arg(short = 's', long, default_value_t = 400)]
     simulations: usize,
+    /// Network-policy softmax temperature used by MCTS.
+    #[arg(long, default_value_t = 1.2)]
+    policy_softmax_temp: f32,
     /// Random OBK positions; every pair uses the same positions with colors swapped.
     #[arg(long, default_value_t = 50)]
     opening_positions: usize,
@@ -4245,7 +4248,7 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
     };
     let positions = Arc::new(positions);
     println!(
-        "checkpoint-cycles: models={} pairs={} min_update_gap={} sims={} games_per_pair={} threads={} opening={} margin={:.3} z={:.2}",
+        "checkpoint-cycles: models={} pairs={} min_update_gap={} sims={} policy_temp={} games_per_pair={} threads={} opening={} margin={:.3} z={:.2}",
         paths.len(),
         if cmd.adjacent_only {
             paths.len() - 1
@@ -4254,6 +4257,7 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
         },
         cmd.min_update_gap,
         cmd.simulations.max(1),
+        cmd.policy_softmax_temp.max(1.0e-3),
         positions.len() * 2,
         cmd.threads.max(1),
         opening_mode,
@@ -4293,7 +4297,7 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
                 fpu_value: 0.2,
                 fpu_value_at_root: 0.1,
                 draw_score: 0.0,
-                policy_softmax_temp: 1.2,
+                policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
                 thread_count: cmd.threads.max(1),
                 seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
             });
