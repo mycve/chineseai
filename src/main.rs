@@ -289,14 +289,6 @@ struct AzValueRankingProbeArgs {
     /// Logistic ranking sharpness.
     #[arg(long, default_value_t = 4.0)]
     scale: f32,
-    /// Existing self-play replay used to preserve absolute WDL calibration.
-    #[arg(long, default_value = "")]
-    anchor_replay: String,
-    /// Replay WDL samples per ranking pair; zero disables anchoring.
-    #[arg(long, default_value_t = 0)]
-    anchors_per_pair: usize,
-    #[arg(long, default_value_t = 1.0)]
-    anchor_weight: f32,
     #[arg(long, default_value_t = 20260903)]
     seed: u64,
 }
@@ -1613,32 +1605,9 @@ fn run_value_ranking_probe(cmd: AzValueRankingProbeArgs) {
         .map(|pair| (pair.preferred.clone(), pair.rejected.clone()))
         .collect::<Vec<_>>();
     let mut train_rng = SplitMix64::new(cmd.seed ^ 0xD1B5_4A32_D192_ED03);
-    let anchor_count = training_pairs.len() * cmd.anchors_per_pair;
-    let anchors = if anchor_count == 0 {
-        Vec::new()
-    } else {
-        assert!(
-            !cmd.anchor_replay.is_empty(),
-            "--anchor-replay is required when --anchors-per-pair is nonzero"
-        );
-        let pool = AzExperiencePool::load_snapshot_lz4(
-            Path::new(&cmd.anchor_replay),
-            anchor_count.max(100_000),
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to load anchor replay `{}`: {err}",
-                cmd.anchor_replay
-            )
-        });
-        pool.sample_uniform(anchor_count, &mut train_rng)
-    };
     let train_stats = train_value_ranking_pairs(
         &mut model,
         &training_pairs,
-        &anchors,
-        cmd.anchors_per_pair,
-        cmd.anchor_weight,
         cmd.epochs.max(1),
         cmd.lr.max(0.0),
         cmd.batch_size.max(1),
@@ -1682,17 +1651,6 @@ fn run_value_ranking_probe(cmd: AzValueRankingProbeArgs) {
     println!("train pre  : {train_before:?}");
     println!("valid pre  : {validation_before:?}");
     println!("optimizer  : {train_stats:?}");
-    println!(
-        "anchor     : replay={} samples={} per_pair={} weight={:.3}",
-        if cmd.anchor_replay.is_empty() {
-            "(none)"
-        } else {
-            &cmd.anchor_replay
-        },
-        anchors.len(),
-        cmd.anchors_per_pair,
-        cmd.anchor_weight
-    );
     println!("train post : {train_after:?}");
     println!("valid post : {validation_after:?}");
     println!(

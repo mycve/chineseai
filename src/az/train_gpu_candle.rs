@@ -108,9 +108,6 @@ pub(super) fn train_samples_gpu(
 pub(super) fn train_value_ranking_pairs_gpu(
     model: &mut AzNnue,
     pairs: &[(AzTrainingSample, AzTrainingSample)],
-    anchors: &[AzTrainingSample],
-    anchors_per_pair: usize,
-    anchor_weight: f32,
     epochs: usize,
     lr: f32,
     batch_size: usize,
@@ -122,52 +119,32 @@ pub(super) fn train_value_ranking_pairs_gpu(
     }
     let mut trainer = GpuTrainer::new(model, lr)?;
     let mut order = (0..pairs.len()).collect::<Vec<_>>();
-    let mut anchor_order = (0..anchors.len()).collect::<Vec<_>>();
     let mut stats = AzValueRankingStats::default();
     for _ in 0..epochs {
         for index in (1..order.len()).rev() {
             let swap = (rng.next_u64() as usize) % (index + 1);
             order.swap(index, swap);
         }
-        for index in (1..anchor_order.len()).rev() {
-            let swap = (rng.next_u64() as usize) % (index + 1);
-            anchor_order.swap(index, swap);
-        }
         stats = AzValueRankingStats::default();
-        let mut anchor_cursor = 0usize;
         for chunk in order.chunks(batch_size.max(1)) {
-            let anchor_count = (chunk.len() * anchors_per_pair).min(anchors.len());
-            let mut samples = Vec::with_capacity(chunk.len() * 2 + anchor_count);
+            let mut samples = Vec::with_capacity(chunk.len() * 2);
             for &index in chunk {
                 samples.push(pairs[index].0.clone());
             }
             for &index in chunk {
                 samples.push(pairs[index].1.clone());
             }
-            for offset in 0..anchor_count {
-                let index = anchor_order[(anchor_cursor + offset) % anchor_order.len()];
-                samples.push(anchors[index].clone());
-            }
-            anchor_cursor += anchor_count;
             let indices = (0..samples.len()).collect::<Vec<_>>();
             let packed = PackedBatch::from_indices(&samples, &indices);
-            let batch_stats = trainer.train_ranking_batch(
-                packed,
-                chunk.len(),
-                anchor_count,
-                scale,
-                anchor_weight,
-            )?;
+            let batch_stats = trainer.train_ranking_batch(packed, chunk.len(), scale)?;
             stats.pairs += batch_stats.pairs;
             stats.loss += batch_stats.loss * batch_stats.pairs as f32;
-            stats.anchor_value_ce += batch_stats.anchor_value_ce * batch_stats.pairs as f32;
             stats.accuracy += batch_stats.accuracy * batch_stats.pairs as f32;
             stats.mean_margin += batch_stats.mean_margin * batch_stats.pairs as f32;
         }
         if stats.pairs > 0 {
             let denom = stats.pairs as f32;
             stats.loss /= denom;
-            stats.anchor_value_ce /= denom;
             stats.accuracy /= denom;
             stats.mean_margin /= denom;
         }
@@ -241,9 +218,7 @@ impl GpuTrainer {
         &mut self,
         batch: PackedBatch,
         pair_count: usize,
-        anchor_count: usize,
         scale: f32,
-        anchor_weight: f32,
     ) -> CandleResult<AzValueRankingStats> {
         let batch_tensors = BatchTensors::from_packed(batch, &self.replica.device)?;
         let forward = self.replica.model.forward(&batch_tensors)?;
@@ -254,36 +229,15 @@ impl GpuTrainer {
         let margin = (&rejected - &preferred)?;
         let scaled_negative = margin.affine(-(scale.max(1.0e-3) as f64), 0.0)?;
         let loss_per_pair = (scaled_negative.exp()? + 1.0)?.log()?;
-        let ranking_loss = loss_per_pair.mean_all()?;
-        let anchor_value_ce = if anchor_count > 0 {
-            let anchor_logits = forward
-                .value_logits
-                .narrow(0, pair_count * 2, anchor_count)?;
-            let anchor_targets = batch_tensors
-                .value_wdl
-                .narrow(0, pair_count * 2, anchor_count)?;
-            let anchor_weights =
-                batch_tensors
-                    .value_weights
-                    .narrow(0, pair_count * 2, anchor_count)?;
-            let per_sample =
-                ((anchor_targets * log_softmax(&anchor_logits, 1)?)? * -1.0)?.sum(1)?;
-            (per_sample * anchor_weights)?.mean_all()?
-        } else {
-            Tensor::zeros((), candle_core::DType::F32, &self.replica.device)?
-        };
-        let loss_tensor =
-            (&ranking_loss + anchor_value_ce.affine(anchor_weight.max(0.0) as f64, 0.0)?)?;
+        let loss_tensor = loss_per_pair.mean_all()?;
         let margins = margin.to_vec1::<f32>()?;
-        let loss = ranking_loss.to_scalar::<f32>()?;
-        let anchor_value_ce_scalar = anchor_value_ce.to_scalar::<f32>()?;
+        let loss = loss_per_pair.mean_all()?.to_scalar::<f32>()?;
         let grads = loss_tensor.backward()?;
         self.optimizer.step(&grads)?;
         let correct = margins.iter().filter(|&&value| value > 0.0).count();
         Ok(AzValueRankingStats {
             pairs: pair_count,
             loss,
-            anchor_value_ce: anchor_value_ce_scalar,
             accuracy: correct as f32 / pair_count.max(1) as f32,
             mean_margin: margins.iter().sum::<f32>() / pair_count.max(1) as f32,
         })
