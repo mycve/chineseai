@@ -10,6 +10,40 @@ enum RuleViolation {
 }
 
 impl Position {
+    /// 对当前局面裁决一次；进行中的局面直接复用返回的走法。
+    pub fn adjudicate_with_history(&self, history: &[RuleHistoryEntry]) -> super::Adjudication {
+        let raw_moves = self.legal_moves();
+        if raw_moves.is_empty() {
+            return super::Adjudication {
+                outcome: Some(RuleOutcome::Win(self.side_to_move.opposite())),
+                moves: Vec::new(),
+                no_move_reason: Some(if self.in_check(self.side_to_move) {
+                    super::NoMoveReason::Checkmate
+                } else {
+                    super::NoMoveReason::Stalemate
+                }),
+            };
+        }
+        if let Some(outcome) = self.history_rule_outcome(history) {
+            return super::Adjudication {
+                outcome: Some(outcome),
+                moves: Vec::new(),
+                no_move_reason: None,
+            };
+        }
+        let moves: Vec<_> = self
+            .filter_rule_moves(history, raw_moves)
+            .into_iter()
+            .map(|(mv, _)| mv)
+            .collect();
+        let blocked = moves.is_empty();
+        super::Adjudication {
+            outcome: blocked.then_some(RuleOutcome::Win(self.side_to_move.opposite())),
+            moves,
+            no_move_reason: blocked.then_some(super::NoMoveReason::RuleBlocked),
+        }
+    }
+
     pub fn initial_rule_history(&self) -> Vec<RuleHistoryEntry> {
         vec![self.rule_history_entry(None)]
     }
@@ -70,13 +104,36 @@ impl Position {
         }
     }
 
+    /// 训练仅保留违规裁决与明确的无进攻子力和棋；计算截断由调用者处理。
+    pub fn use_training_rules(&mut self) {
+        self.training_rules = true;
+        self.rule60_max_ply = None;
+    }
+
+    pub fn repeated_position_count(&self, history: &[RuleHistoryEntry]) -> usize {
+        history
+            .iter()
+            .filter(|entry| entry.hash == self.hash && entry.side_to_move == self.side_to_move)
+            .count()
+    }
+
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
+        let outcome = self.history_rule_outcome(history)?;
+        // 仅在规则准备结束棋局时检查，避免搜索每个节点重复生成走法。
+        if self.legal_moves().is_empty() {
+            return Some(RuleOutcome::Win(self.side_to_move.opposite()));
+        }
+        Some(outcome)
+    }
+
+    fn history_rule_outcome(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome_with_history");
         if let Some(entries) = repetition_cycle(history) {
             let exact_entries = self.recompute_cycle_chases(entries);
-            return Some(adjudicate_repetition(
-                exact_entries.as_deref().unwrap_or(entries),
-            ));
+            let outcome = adjudicate_repetition(exact_entries.as_deref().unwrap_or(entries));
+            if !self.training_rules || matches!(outcome, RuleOutcome::Win(_)) {
+                return Some(outcome);
+            }
         }
         if self
             .rule60_max_ply
@@ -145,6 +202,14 @@ impl Position {
     ) -> Vec<(Move, bool)> {
         crate::scope_profile!("xiangqi.legal_moves_with_rules_and_repetition");
         let legal = self.legal_moves();
+        self.filter_rule_moves(history, legal)
+    }
+
+    fn filter_rule_moves(
+        &self,
+        history: &[RuleHistoryEntry],
+        legal: Vec<Move>,
+    ) -> Vec<(Move, bool)> {
         if legal.is_empty() {
             return Vec::new();
         }
@@ -175,8 +240,10 @@ impl Position {
                     next_history.push(entry);
                 }
                 next_history.push(self.rule_history_entry_after_move(mv));
+                let entries = repetition_cycle(&next_history).unwrap();
+                let exact = next.recompute_cycle_chases(entries);
                 (!rule_outcome_forbidden_for_mover(
-                    next.rule_outcome_with_history(&next_history),
+                    Some(adjudicate_repetition(exact.as_deref().unwrap_or(entries))),
                     mover,
                 ))
                 .then_some((mv, true))
@@ -358,6 +425,12 @@ impl Position {
         let total = |kind: PieceKind| count(0, kind) + count(1, kind);
         if total(PieceKind::Soldier) != 0 {
             return None;
+        }
+
+        if self.training_rules {
+            return (total(PieceKind::Rook) + total(PieceKind::Horse) + total(PieceKind::Cannon)
+                == 0)
+                .then_some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial));
         }
 
         let attacking = |color: usize| {

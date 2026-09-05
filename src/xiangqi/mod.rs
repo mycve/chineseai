@@ -12,7 +12,8 @@ mod types;
 pub use env::{AppliedMove, IllegalMove, StepOutcome, XiangqiEnv};
 pub use geom::{parse_square, square_name};
 pub use types::{
-    Color, Move, Piece, PieceKind, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome, Undo,
+    Adjudication, Color, Move, NoMoveReason, Piece, PieceKind, Position, RuleDrawReason,
+    RuleHistoryEntry, RuleOutcome, Undo,
 };
 pub(crate) use types::{color_index, piece_kind_index};
 
@@ -143,6 +144,7 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock: 0,
             rule60_max_ply: Some(120),
+            training_rules: false,
         };
         let state = position.compute_state();
         Self {
@@ -217,6 +219,7 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock,
             rule60_max_ply: Some(120),
+            training_rules: false,
         };
         let state = position.compute_state();
         let position = Self {
@@ -578,6 +581,7 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock: self.halfmove_clock,
             rule60_max_ply: self.rule60_max_ply,
+            training_rules: self.training_rules,
         };
         let state = position.compute_state();
         Self {

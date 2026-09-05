@@ -536,7 +536,10 @@ fn az_loop_progress_path(config_path: &str) -> PathBuf {
 }
 
 fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
-    PathBuf::from(format!("{config_path}.replay.lz4"))
+    PathBuf::from(format!(
+        "{config_path}.replay.v{}.lz4",
+        chineseai::version::REPLAY_FILE_VERSION
+    ))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1037,7 +1040,7 @@ fn build_async_training_report(
 ) -> AzLoopReport {
     let selfplay_samples = pending.selfplay.samples.len();
     let total_seconds = pending.collection_seconds.max(1.0e-6);
-    let train_stat_samples = stats.samples.max(1) as f32;
+    let train_stat_samples = stats.value_samples.max(1) as f32;
     let root_visit_entropy =
         pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
@@ -1153,20 +1156,17 @@ fn build_async_training_report(
         train_policy_target_top1: train_source.policy_target_top1,
         train_policy_target_top2: train_source.policy_target_top2,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
-        terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
-        terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
-        terminal_rule_draw: pending.selfplay.terminal.rule_draw,
-        terminal_rule_draw_natural_limit: pending.selfplay.terminal.rule_draw_natural_limit,
+        train_value_samples: stats.value_samples,
+        terminal_stalemate: pending.selfplay.terminal.stalemate,
+        terminal_rule_blocked: pending.selfplay.terminal.rule_blocked,
         terminal_rule_draw_insufficient_material: pending
             .selfplay
             .terminal
             .rule_draw_insufficient_material,
-        terminal_rule_draw_repetition: pending.selfplay.terminal.rule_draw_repetition,
-        terminal_rule_draw_mutual_long_check: pending.selfplay.terminal.rule_draw_mutual_long_check,
-        terminal_rule_draw_mutual_long_chase: pending.selfplay.terminal.rule_draw_mutual_long_chase,
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
+        terminal_cycle_cutoff: pending.selfplay.terminal.cycle_cutoff,
     }
 }
 
@@ -2246,7 +2246,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} training_rules(cycle_cutoff=3,no_natural_draw) arena_rules(sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2723,17 +2723,13 @@ fn main() {
                                         pool_samples: 0,
                                         pool_capacity: config.replay_capacity,
                                         terminal_no_legal_moves: 0,
-                                        terminal_red_general_missing: 0,
-                                        terminal_black_general_missing: 0,
-                                        terminal_rule_draw: 0,
-                                        terminal_rule_draw_natural_limit: 0,
+                                        terminal_stalemate: 0,
+                                        terminal_rule_blocked: 0,
                                         terminal_rule_draw_insufficient_material: 0,
-                                        terminal_rule_draw_repetition: 0,
-                                        terminal_rule_draw_mutual_long_check: 0,
-                                        terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
                                         terminal_max_plies: 0,
+                                        terminal_cycle_cutoff: 0,
                                         ..AzLoopReport::default()
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
@@ -2794,17 +2790,13 @@ fn main() {
                                         pool_samples: 0,
                                         pool_capacity: config.replay_capacity,
                                         terminal_no_legal_moves: 0,
-                                        terminal_red_general_missing: 0,
-                                        terminal_black_general_missing: 0,
-                                        terminal_rule_draw: 0,
-                                        terminal_rule_draw_natural_limit: 0,
+                                        terminal_stalemate: 0,
+                                        terminal_rule_blocked: 0,
                                         terminal_rule_draw_insufficient_material: 0,
-                                        terminal_rule_draw_repetition: 0,
-                                        terminal_rule_draw_mutual_long_check: 0,
-                                        terminal_rule_draw_mutual_long_chase: 0,
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
                                         terminal_max_plies: 0,
+                                        terminal_cycle_cutoff: 0,
                                         ..AzLoopReport::default()
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
@@ -2968,32 +2960,37 @@ fn main() {
                     source_phase(2, 1).calibration,
                 );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
-                log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
-                log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
-                log_scalar(
-                    &mut tb,
-                    "train/value_pred_mean",
-                    update,
-                    report.value_pred_mean,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/value_target_mean",
-                    update,
-                    report.value_target_mean,
-                );
-                log_scalar(&mut tb, "train/value_corr", update, report.value_corr);
-                log_scalar(
-                    &mut tb,
-                    "train/value_calibration",
-                    update,
-                    report.value_calibration,
-                );
+                if report.train_value_samples > 0 {
+                    log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
+                    log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
+                    log_scalar(
+                        &mut tb,
+                        "train/value_pred_mean",
+                        update,
+                        report.value_pred_mean,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "train/value_target_mean",
+                        update,
+                        report.value_target_mean,
+                    );
+                    log_scalar(&mut tb, "train/value_corr", update, report.value_corr);
+                    log_scalar(
+                        &mut tb,
+                        "train/value_calibration",
+                        update,
+                        report.value_calibration,
+                    );
+                }
                 for (phase, name) in ["ply_0_39", "ply_40_119", "ply_120_plus"]
                     .into_iter()
                     .enumerate()
                 {
                     let phase_value = report.phase_value[phase];
+                    if phase_value.samples == 0 {
+                        continue;
+                    }
                     log_scalar(
                         &mut tb,
                         &format!("train/value_{name}_samples"),
@@ -3028,6 +3025,9 @@ fn main() {
                         .enumerate()
                     {
                         let value = report.source_phase_value[source * 3 + phase];
+                        if value.samples == 0 {
+                            continue;
+                        }
                         log_scalar(
                             &mut tb,
                             &format!("value_source/{source_name}_{phase_name}_rmse"),
@@ -3072,6 +3072,41 @@ fn main() {
                     } else {
                         report.pool_samples as f32 / report.pool_capacity as f32
                     },
+                );
+                log_scalar(
+                    &mut tb,
+                    "truncation/repetition",
+                    update,
+                    report.terminal_cycle_cutoff as f32,
+                );
+                let truncated = report.terminal_cycle_cutoff + report.terminal_max_plies;
+                let completed = report.red_wins + report.black_wins + report.draws;
+                debug_assert_eq!(completed + truncated, report.games);
+                log_scalar(
+                    &mut tb,
+                    "selfplay/completed_games",
+                    update,
+                    completed as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "truncation/rate",
+                    update,
+                    truncated as f32 / report.games.max(1) as f32,
+                );
+                if completed > 0 {
+                    log_scalar(
+                        &mut tb,
+                        "selfplay/draw_rate_completed",
+                        update,
+                        report.draws as f32 / completed as f32,
+                    );
+                }
+                log_scalar(
+                    &mut tb,
+                    "train/value_samples",
+                    update,
+                    report.train_value_samples as f32,
                 );
                 log_scalar(&mut tb, "selfplay/games", update, report.games as f32);
                 log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
@@ -3287,57 +3322,27 @@ fn main() {
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
                 log_scalar(
                     &mut tb,
-                    "terminal/checkmate_no_legal_moves",
+                    "terminal/checkmate",
                     update,
                     report.terminal_no_legal_moves as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/red_general_missing",
+                    "terminal/stalemate",
                     update,
-                    report.terminal_red_general_missing as f32,
+                    report.terminal_stalemate as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/black_general_missing",
+                    "terminal/rule_blocked",
                     update,
-                    report.terminal_black_general_missing as f32,
+                    report.terminal_rule_blocked as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw",
-                    update,
-                    report.terminal_rule_draw as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_natural_limit",
-                    update,
-                    report.terminal_rule_draw_natural_limit as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_insufficient_material",
+                    "terminal/draw_insufficient_material",
                     update,
                     report.terminal_rule_draw_insufficient_material as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_repetition",
-                    update,
-                    report.terminal_rule_draw_repetition as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_mutual_long_check",
-                    update,
-                    report.terminal_rule_draw_mutual_long_check as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw_mutual_long_chase",
-                    update,
-                    report.terminal_rule_draw_mutual_long_chase as f32,
                 );
                 log_scalar(
                     &mut tb,
@@ -3353,7 +3358,7 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/max_plies",
+                    "truncation/max_plies",
                     update,
                     report.terminal_max_plies as f32,
                 );
@@ -4033,7 +4038,7 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}/{} base={}/{} factor={}/{} fpu={}/{} policy_temp={}",
+                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}/{} base={}/{} factor={}/{} fpu={}/{} policy_temp={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),

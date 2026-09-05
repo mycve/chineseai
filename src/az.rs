@@ -1041,23 +1041,20 @@ pub struct AzLoopReport {
     pub train_fast_sample_rate: f32,
     pub train_policy_weight_mean: f32,
     pub train_value_weight_mean: f32,
+    pub train_value_samples: usize,
     pub train_recent_quota_rate: f32,
     pub train_actual_recent_sample_rate: f32,
     pub train_start_source_rate: [f32; 3],
     pub train_policy_target_top1: f32,
     pub train_policy_target_top2: f32,
     pub terminal_no_legal_moves: usize,
-    pub terminal_red_general_missing: usize,
-    pub terminal_black_general_missing: usize,
-    pub terminal_rule_draw: usize,
-    pub terminal_rule_draw_natural_limit: usize,
+    pub terminal_stalemate: usize,
+    pub terminal_rule_blocked: usize,
     pub terminal_rule_draw_insufficient_material: usize,
-    pub terminal_rule_draw_repetition: usize,
-    pub terminal_rule_draw_mutual_long_check: usize,
-    pub terminal_rule_draw_mutual_long_chase: usize,
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
+    pub terminal_cycle_cutoff: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1300,6 +1297,7 @@ pub struct AzTrainStats {
     pub value_target_sq_sum: f32,
     pub value_pred_target_sum: f32,
     pub value_error_sq_sum: f32,
+    pub value_samples: usize,
     pub samples: usize,
     pub phase_value: [AzValueMomentStats; 3],
     pub source_phase_value: [AzValueMomentStats; 9],
@@ -1343,6 +1341,7 @@ impl AzTrainStats {
         self.value_target_sq_sum += other.value_target_sq_sum;
         self.value_pred_target_sum += other.value_pred_target_sum;
         self.value_error_sq_sum += other.value_error_sq_sum;
+        self.value_samples += other.value_samples;
         self.samples += other.samples;
         for (left, right) in self.phase_value.iter_mut().zip(other.phase_value) {
             left.pred_sum += right.pred_sum;

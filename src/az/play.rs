@@ -21,17 +21,13 @@ use super::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
     pub no_legal_moves: usize,
-    pub red_general_missing: usize,
-    pub black_general_missing: usize,
-    pub rule_draw: usize,
-    pub rule_draw_natural_limit: usize,
+    pub stalemate: usize,
+    pub rule_blocked: usize,
     pub rule_draw_insufficient_material: usize,
-    pub rule_draw_repetition: usize,
-    pub rule_draw_mutual_long_check: usize,
-    pub rule_draw_mutual_long_chase: usize,
     pub rule_win_red: usize,
     pub rule_win_black: usize,
     pub max_plies: usize,
+    pub cycle_cutoff: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -50,17 +46,13 @@ impl AzSearchSimulationStats {
 impl AzTerminalStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.no_legal_moves += other.no_legal_moves;
-        self.red_general_missing += other.red_general_missing;
-        self.black_general_missing += other.black_general_missing;
-        self.rule_draw += other.rule_draw;
-        self.rule_draw_natural_limit += other.rule_draw_natural_limit;
+        self.stalemate += other.stalemate;
+        self.rule_blocked += other.rule_blocked;
         self.rule_draw_insufficient_material += other.rule_draw_insufficient_material;
-        self.rule_draw_repetition += other.rule_draw_repetition;
-        self.rule_draw_mutual_long_check += other.rule_draw_mutual_long_check;
-        self.rule_draw_mutual_long_chase += other.rule_draw_mutual_long_chase;
         self.rule_win_red += other.rule_win_red;
         self.rule_win_black += other.rule_win_black;
         self.max_plies += other.max_plies;
+        self.cycle_cutoff += other.cycle_cutoff;
     }
 }
 
@@ -337,8 +329,8 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
     }
 }
 
-fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
-    position.set_rule60_max_ply(config.rule60_max_ply);
+fn configure_selfplay_rules(mut position: Position, _config: &AzLoopConfig) -> Position {
+    position.use_training_rules();
     position
 }
 
@@ -494,12 +486,27 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         let start_source = start.source;
         let mut game_samples = Vec::new();
         let mut game_bootstrap_wdls = Vec::new();
-        let mut result = None;
+        let mut result: Option<f32> = None;
+        let cycle_cutoffs_before = terminal.cycle_cutoff;
         let mut plies = 0usize;
 
-        for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
+        for local_ply in 0..=config.max_plies.saturating_sub(start_phase_ply) {
             let ply = start_phase_ply + local_ply;
-            plies = local_ply + 1;
+            plies = local_ply;
+            let decision = position.adjudicate_with_history(&rule_history);
+            if let Some(outcome) = decision.outcome {
+                record_terminal(&decision, &mut terminal);
+                result = Some(outcome_value(outcome));
+                break;
+            }
+            if position.repeated_position_count(&rule_history) >= 3 {
+                terminal.cycle_cutoff += 1;
+                break;
+            }
+            if ply >= config.max_plies {
+                break;
+            }
+            let legal = decision.moves;
             if opening_harvest_ply == Some(ply) {
                 opening_snapshots.push(AzStartSnapshot {
                     position: position.clone(),
@@ -516,24 +523,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     generation: config.generation_update,
                 });
             }
-            let legal = {
-                crate::scope_profile!("az.selfplay.root_legal_moves");
-                position
-                    .legal_moves_with_rules_and_repetition(&rule_history)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect::<Vec<_>>()
-            };
-            if legal.is_empty() {
-                result = Some(if position.side_to_move() == Color::Red {
-                    -1.0
-                } else {
-                    1.0
-                });
-                terminal.no_legal_moves += 1;
-                break;
-            }
-
             let search_simulation_count = config.simulations.max(1);
             search_simulations.searches += 1;
             search_simulations.simulations_sum += search_simulation_count;
@@ -589,10 +578,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             } else {
                 choose_selfplay_move(&search.candidates, temperature, &mut rng)
             };
-            let Some(mv) = mv_opt else {
-                result = Some(0.0);
-                break;
-            };
+            let mv = mv_opt.expect("search must return a move for an ongoing selfplay position");
             let mut move_meta = move_search_meta(
                 &search.candidates,
                 mv,
@@ -640,67 +626,23 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             let captured = position.piece_at(mv.to as usize);
             position.make_move(mv);
             rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
-
-            if !position.has_general(Color::Red) {
-                result = Some(-1.0);
-                terminal.red_general_missing += 1;
-                break;
-            }
-            if !position.has_general(Color::Black) {
-                result = Some(1.0);
-                terminal.black_general_missing += 1;
-                break;
-            }
-            let rule_outcome = {
-                crate::scope_profile!("az.selfplay.rule_outcome");
-                position.rule_outcome_with_history(&rule_history)
-            };
-            if let Some(rule_outcome) = rule_outcome {
-                result = Some(match rule_outcome {
-                    RuleOutcome::Draw(_) => 0.0,
-                    RuleOutcome::Win(Color::Red) => 1.0,
-                    RuleOutcome::Win(Color::Black) => -1.0,
-                });
-                match rule_outcome {
-                    RuleOutcome::Draw(reason) => {
-                        terminal.rule_draw += 1;
-                        match reason {
-                            RuleDrawReason::NaturalMoveLimit => {
-                                terminal.rule_draw_natural_limit += 1
-                            }
-                            RuleDrawReason::InsufficientMaterial => {
-                                terminal.rule_draw_insufficient_material += 1
-                            }
-                            RuleDrawReason::Repetition => terminal.rule_draw_repetition += 1,
-                            RuleDrawReason::MutualLongCheck => {
-                                terminal.rule_draw_mutual_long_check += 1
-                            }
-                            RuleDrawReason::MutualLongChase => {
-                                terminal.rule_draw_mutual_long_chase += 1
-                            }
-                        }
-                    }
-                    RuleOutcome::Win(Color::Red) => terminal.rule_win_red += 1,
-                    RuleOutcome::Win(Color::Black) => terminal.rule_win_black += 1,
-                }
-                break;
-            }
         }
-        if result.is_none() {
+        if result.is_none() && terminal.cycle_cutoff == cycle_cutoffs_before {
             terminal.max_plies += 1;
         }
 
-        let result: f32 = result.unwrap_or(0.0);
-        match result.total_cmp(&0.0) {
-            std::cmp::Ordering::Greater => red_wins += 1,
-            std::cmp::Ordering::Less => black_wins += 1,
-            std::cmp::Ordering::Equal => draws += 1,
+        if let Some(result) = result {
+            match result.total_cmp(&0.0) {
+                std::cmp::Ordering::Greater => red_wins += 1,
+                std::cmp::Ordering::Less => black_wins += 1,
+                std::cmp::Ordering::Equal => draws += 1,
+            }
         }
         plies_total += plies;
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            assign_td_lambda_value_targets(
+            finalize_selfplay_targets(
                 &mut game_samples,
                 &game_bootstrap_wdls,
                 result,
@@ -761,6 +703,7 @@ struct BatchedSelfplayGame {
     samples: Vec<AzTrainingSample>,
     bootstrap_wdls: Vec<[f32; 3]>,
     result: Option<f32>,
+    truncated: bool,
     ply: usize,
     phase_ply: usize,
     opening_harvest_ply: Option<usize>,
@@ -781,6 +724,7 @@ fn new_batched_selfplay_game(game_index: usize, config: &AzLoopConfig) -> Batche
         samples: Vec::new(),
         bootstrap_wdls: Vec::new(),
         result: None,
+        truncated: false,
         ply: 0,
         phase_ply: start.phase_ply,
         opening_harvest_ply: start.opening_harvest_ply,
@@ -856,15 +800,28 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 let Some(state) = states[index].as_mut() else {
                     continue;
                 };
-                if state.result.is_some() {
+                if state.result.is_some() || state.truncated {
+                    continue;
+                }
+                state.reported_plies = state.ply;
+                let decision = state.position.adjudicate_with_history(&state.rule_history);
+                if let Some(outcome) = decision.outcome {
+                    record_terminal(&decision, &mut data.terminal);
+                    state.result = Some(outcome_value(outcome));
+                    continue;
+                }
+                if state.position.repeated_position_count(&state.rule_history) >= 3 {
+                    state.truncated = true;
+                    data.terminal.cycle_cutoff += 1;
                     continue;
                 }
                 if state.phase_ply >= config.max_plies {
-                    state.result = Some(0.0);
+                    state.truncated = true;
                     data.terminal.max_plies += 1;
                     continue;
                 }
-                state.reported_plies = state.ply + 1;
+                legal_moves[index] = decision.moves;
+                searched[index] = true;
                 if state.opening_harvest_ply == Some(state.phase_ply) {
                     data.opening_snapshots.push(AzStartSnapshot {
                         position: state.position.clone(),
@@ -882,22 +839,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                         generation: config.generation_update,
                     });
                     state.midgame_harvest_ply = None;
-                }
-                legal_moves[index] = state
-                    .position
-                    .legal_moves_with_rules_and_repetition(&state.rule_history)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect();
-                if legal_moves[index].is_empty() {
-                    state.result = Some(if state.position.side_to_move() == Color::Red {
-                        -1.0
-                    } else {
-                        1.0
-                    });
-                    data.terminal.no_legal_moves += 1;
-                } else {
-                    searched[index] = true;
                 }
             }
             if !searched.iter().any(|&active| active) {
@@ -936,10 +877,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 } else {
                     choose_selfplay_move(&search.candidates, temperature, &mut state.rng)
                 };
-                let Some(mv) = mv else {
-                    state.result = Some(0.0);
-                    continue;
-                };
+                let mv = mv.expect("search must return a move for an ongoing selfplay position");
                 let mut meta = move_search_meta(
                     &search.candidates,
                     mv,
@@ -990,62 +928,20 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 );
                 state.ply += 1;
                 state.phase_ply += 1;
-                if !state.position.has_general(Color::Red) {
-                    state.result = Some(-1.0);
-                    data.terminal.red_general_missing += 1;
-                    continue;
-                }
-                if !state.position.has_general(Color::Black) {
-                    state.result = Some(1.0);
-                    data.terminal.black_general_missing += 1;
-                    continue;
-                }
-                if let Some(outcome) = state
-                    .position
-                    .rule_outcome_with_history(&state.rule_history)
-                {
-                    state.result = Some(match outcome {
-                        RuleOutcome::Draw(_) => 0.0,
-                        RuleOutcome::Win(Color::Red) => 1.0,
-                        RuleOutcome::Win(Color::Black) => -1.0,
-                    });
-                    match outcome {
-                        RuleOutcome::Draw(reason) => {
-                            data.terminal.rule_draw += 1;
-                            match reason {
-                                RuleDrawReason::NaturalMoveLimit => {
-                                    data.terminal.rule_draw_natural_limit += 1
-                                }
-                                RuleDrawReason::InsufficientMaterial => {
-                                    data.terminal.rule_draw_insufficient_material += 1
-                                }
-                                RuleDrawReason::Repetition => {
-                                    data.terminal.rule_draw_repetition += 1
-                                }
-                                RuleDrawReason::MutualLongCheck => {
-                                    data.terminal.rule_draw_mutual_long_check += 1
-                                }
-                                RuleDrawReason::MutualLongChase => {
-                                    data.terminal.rule_draw_mutual_long_chase += 1
-                                }
-                            }
-                        }
-                        RuleOutcome::Win(Color::Red) => data.terminal.rule_win_red += 1,
-                        RuleOutcome::Win(Color::Black) => data.terminal.rule_win_black += 1,
-                    }
-                }
             }
         }
         for state in states.into_iter().flatten() {
-            let result = state.result.unwrap_or(0.0);
-            match result.total_cmp(&0.0) {
-                std::cmp::Ordering::Greater => data.red_wins += 1,
-                std::cmp::Ordering::Less => data.black_wins += 1,
-                std::cmp::Ordering::Equal => data.draws += 1,
+            let result = state.result;
+            if let Some(result) = result {
+                match result.total_cmp(&0.0) {
+                    std::cmp::Ordering::Greater => data.red_wins += 1,
+                    std::cmp::Ordering::Less => data.black_wins += 1,
+                    std::cmp::Ordering::Equal => data.draws += 1,
+                }
             }
             data.plies_total += state.reported_plies;
             let mut game_samples = state.samples;
-            assign_td_lambda_value_targets(
+            finalize_selfplay_targets(
                 &mut game_samples,
                 &state.bootstrap_wdls,
                 result,
@@ -1211,6 +1107,52 @@ fn move_search_meta(
         meta.played_index = played_index.min(u16::MAX as usize) as u16;
     }
     meta
+}
+
+fn outcome_value(outcome: RuleOutcome) -> f32 {
+    match outcome {
+        RuleOutcome::Win(Color::Red) => 1.0,
+        RuleOutcome::Win(Color::Black) => -1.0,
+        RuleOutcome::Draw(_) => 0.0,
+    }
+}
+
+fn record_terminal(decision: &crate::xiangqi::Adjudication, stats: &mut AzTerminalStats) {
+    use crate::xiangqi::NoMoveReason;
+    if let Some(reason) = decision.no_move_reason {
+        match reason {
+            NoMoveReason::Checkmate => stats.no_legal_moves += 1,
+            NoMoveReason::Stalemate => stats.stalemate += 1,
+            NoMoveReason::RuleBlocked => stats.rule_blocked += 1,
+        }
+        return;
+    }
+    match decision.outcome.expect("terminal decision") {
+        RuleOutcome::Win(Color::Red) => stats.rule_win_red += 1,
+        RuleOutcome::Win(Color::Black) => stats.rule_win_black += 1,
+        RuleOutcome::Draw(reason) => {
+            assert_eq!(reason, RuleDrawReason::InsufficientMaterial);
+            stats.rule_draw_insufficient_material += 1;
+        }
+    }
+}
+
+fn finalize_selfplay_targets(
+    samples: &mut [AzTrainingSample],
+    bootstrap_wdls: &[[f32; 3]],
+    result: Option<f32>,
+    td_lambda: f32,
+) {
+    if let Some(result) = result {
+        assign_td_lambda_value_targets(samples, bootstrap_wdls, result, td_lambda);
+    } else {
+        for sample in samples {
+            sample.value_weight = 0.0;
+            // 未知标签使用有限占位值，不能被任何价值损失或指标读取。
+            sample.value_wdl = [0.0; 3];
+            sample.value = 0.0;
+        }
+    }
 }
 
 fn assign_td_lambda_value_targets(
@@ -1516,11 +1458,12 @@ fn play_arena_game(
         position.make_move(mv);
         rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
 
-        if !position.has_general(Color::Red) {
-            return -1.0;
-        }
-        if !position.has_general(Color::Black) {
-            return 1.0;
+        if position.legal_moves_with_rules(&rule_history).is_empty() {
+            return if position.side_to_move() == Color::Red {
+                -1.0
+            } else {
+                1.0
+            };
         }
         if let Some(rule_outcome) = position.rule_outcome_with_history(&rule_history) {
             return match rule_outcome {
@@ -1680,7 +1623,14 @@ mod tests {
         let config = selfplay_test_config(5);
         let data = generate_selfplay_chunk_batch4(&model, &config);
         assert_eq!(data.games.len(), 5);
-        assert_eq!(data.red_wins + data.black_wins + data.draws, 5);
+        assert_eq!(
+            data.red_wins
+                + data.black_wins
+                + data.draws
+                + data.terminal.max_plies
+                + data.terminal.cycle_cutoff,
+            5
+        );
         assert_eq!(
             data.samples.len(),
             data.games.iter().map(Vec::len).sum::<usize>()
@@ -1825,6 +1775,78 @@ mod tests {
         assert_eq!(samples[0].value, 1.0);
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
+    }
+
+    #[test]
+    fn cutoff_keeps_policy_but_masks_every_value_target() {
+        let mut samples = vec![sample(0.5, 1.0), sample(-0.5, -1.0)];
+        let policy = samples[0].policy.clone();
+        finalize_selfplay_targets(&mut samples, &[[0.2, 0.3, 0.5]; 2], None, 1.0);
+        assert!(samples.iter().all(|sample| sample.value_weight == 0.0));
+        assert_eq!(samples[0].policy, policy);
+        assert_eq!(samples[0].policy_weight, 1.0);
+    }
+
+    #[test]
+    fn scalar_and_batch_adjudicate_mate_before_budget_cutoff() {
+        let model = AzNnue::random(32, 41);
+        let mut config = selfplay_test_config(1);
+        let position = Position::from_fen("4k4/3R1R3/4R4/9/9/9/9/9/9/4K4 b").unwrap();
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: config.max_plies as u16,
+            generation: 1,
+        }]
+        .into();
+        config.opening_start_fraction = 1.0;
+        for data in [
+            generate_selfplay_chunk_scalar(&model, &config),
+            generate_selfplay_chunk_batch4(&model, &config),
+        ] {
+            assert_eq!(data.red_wins, 1);
+            assert_eq!(data.draws, 0);
+            assert_eq!(data.terminal.no_legal_moves, 1);
+            assert_eq!(data.terminal.max_plies, 0);
+        }
+    }
+
+    #[test]
+    fn cycle_and_budget_cutoffs_are_not_draws_in_either_selfplay_path() {
+        let model = AzNnue::random(32, 41);
+        for cycle in [false, true] {
+            let mut config = selfplay_test_config(1);
+            config.max_plies = 1;
+            if cycle {
+                let mut position = Position::startpos();
+                let mut history = position.initial_rule_history();
+                for text in ["b0c2", "b9c7", "c2b0", "c7b9"].repeat(2) {
+                    let mv = position.parse_uci_move(text).unwrap();
+                    history.push(position.rule_history_entry_after_move(mv));
+                    position.make_move(mv);
+                }
+                config.opening_positions = vec![AzStartSnapshot {
+                    position,
+                    rule_history: history,
+                    phase_ply: 8,
+                    generation: 1,
+                }]
+                .into();
+                config.opening_start_fraction = 1.0;
+            }
+            for data in [
+                generate_selfplay_chunk_scalar(&model, &config),
+                generate_selfplay_chunk_batch4(&model, &config),
+            ] {
+                assert_eq!(data.red_wins + data.black_wins + data.draws, 0);
+                assert_eq!(data.terminal.cycle_cutoff, usize::from(cycle));
+                assert_eq!(data.terminal.max_plies, usize::from(!cycle));
+                assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
+                if !cycle {
+                    assert_eq!(data.samples.len(), 1);
+                }
+            }
+        }
     }
 
     #[test]

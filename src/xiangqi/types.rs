@@ -170,6 +170,19 @@ pub enum RuleOutcome {
     Win(Color),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoMoveReason {
+    Checkmate,
+    Stalemate,
+    RuleBlocked,
+}
+
+pub struct Adjudication {
+    pub outcome: Option<RuleOutcome>,
+    pub moves: Vec<Move>,
+    pub no_move_reason: Option<NoMoveReason>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Position {
     pub(super) board: [Option<Piece>; BOARD_SIZE],
@@ -182,6 +195,7 @@ pub struct Position {
     pub(super) general_squares: [Option<usize>; 2],
     pub(super) halfmove_clock: u16,
     pub(super) rule60_max_ply: Option<u16>,
+    pub(super) training_rules: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

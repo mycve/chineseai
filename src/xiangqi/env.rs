@@ -116,12 +116,13 @@ impl XiangqiEnv {
     }
 
     pub fn current_outcome(&self) -> StepOutcome {
-        match self.position.rule_outcome_with_history(&self.rule_history) {
+        match self
+            .position
+            .adjudicate_with_history(&self.rule_history)
+            .outcome
+        {
             Some(RuleOutcome::Draw(reason)) => StepOutcome::Draw(reason),
             Some(RuleOutcome::Win(color)) => StepOutcome::Win(color),
-            None if self.legal_moves().is_empty() => {
-                StepOutcome::Win(self.position.side_to_move().opposite())
-            }
             None => StepOutcome::Ongoing,
         }
     }

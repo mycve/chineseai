@@ -1846,20 +1846,6 @@ fn scale_wdl_value(wdl: [f32; 3], scale: f32) -> [f32; 3] {
 }
 
 fn terminal_value(position: &Position, rule_history: &[RuleHistoryEntry]) -> Option<f32> {
-    if !position.has_general(Color::Red) {
-        return Some(if position.side_to_move() == Color::Red {
-            -1.0
-        } else {
-            1.0
-        });
-    }
-    if !position.has_general(Color::Black) {
-        return Some(if position.side_to_move() == Color::Black {
-            -1.0
-        } else {
-            1.0
-        });
-    }
     if let Some(outcome) = position.rule_outcome_with_history(rule_history) {
         return Some(match outcome {
             RuleOutcome::Draw(_) => 0.0,

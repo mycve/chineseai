@@ -1,6 +1,63 @@
 use super::*;
 
 #[test]
+fn training_rules_allow_repetition_and_ignore_natural_limit() {
+    let mut position = Position::startpos();
+    let entry = position.rule_history_entry(None);
+    let history = [entry, entry];
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+    );
+    position.use_training_rules();
+    assert_eq!(position.rule_outcome_with_history(&history), None);
+    assert_eq!(position.repeated_position_count(&history), 2);
+    position.halfmove_clock = 500;
+    assert_eq!(
+        position.rule_outcome_with_history(&position.initial_rule_history()),
+        None
+    );
+    assert_eq!(position.mirror_files().rule60_max_ply(), None);
+}
+
+#[test]
+fn training_only_adjudicates_defenders_as_insufficient_material() {
+    let mut position = Position::from_fen("3k5/9/9/9/9/9/9/4C4/9/4K4 w").unwrap();
+    position.use_training_rules();
+    assert_eq!(
+        position
+            .adjudicate_with_history(&position.initial_rule_history())
+            .outcome,
+        None
+    );
+    let mut position = Position::from_fen("3k5/9/9/9/9/9/9/9/9/4K4 w").unwrap();
+    position.use_training_rules();
+    assert_eq!(
+        position
+            .adjudicate_with_history(&position.initial_rule_history())
+            .outcome,
+        Some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial))
+    );
+}
+
+#[test]
+fn mate_precedes_natural_limit_and_stalemate_has_its_own_reason() {
+    let position = Position::from_fen("4k4/3R1R3/4R4/9/9/9/9/9/9/4K4 b - - 120 1").unwrap();
+    let history = position.initial_rule_history();
+    let decision = position.adjudicate_with_history(&history);
+    assert_eq!(decision.outcome, Some(RuleOutcome::Win(Color::Red)));
+    assert_eq!(decision.no_move_reason, Some(NoMoveReason::Checkmate));
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        decision.outcome
+    );
+    let position = Position::from_fen("4k4/3R1R3/9/4P4/9/9/9/9/9/4K4 b").unwrap();
+    let decision = position.adjudicate_with_history(&position.initial_rule_history());
+    assert_eq!(decision.outcome, Some(RuleOutcome::Win(Color::Red)));
+    assert_eq!(decision.no_move_reason, Some(NoMoveReason::Stalemate));
+}
+
+#[test]
 fn startpos_roundtrip_fen() {
     let position = Position::startpos();
     assert_eq!(position.to_fen(), format!("{STARTPOS_FEN} - - 0 1"));

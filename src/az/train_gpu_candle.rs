@@ -86,7 +86,7 @@ pub(super) fn train_samples_gpu(
     if stats.samples > 0 {
         let denom = stats.samples as f32;
         stats.loss /= denom;
-        stats.value_loss /= denom;
+        stats.value_loss /= stats.value_samples.max(1) as f32;
         stats.policy_ce /= denom;
     }
     let trainer = model
@@ -232,7 +232,11 @@ impl GpuReplica {
         let value_error = (&value - &batch_tensors.values)?;
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
-        let value_ce = value_ce_per_sample.sum_all()?;
+        let valid_value = batch_tensors
+            .value_weights
+            .gt(0.0)?
+            .to_dtype(candle_core::DType::F32)?;
+        let value_ce = (&value_ce_per_sample * &valid_value)?.sum_all()?;
         let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -246,8 +250,17 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
-        let loss_sum = (weighted_value_loss + weighted_policy_ce)?;
-        let loss_tensor = (&loss_sum / batch_len as f64)?;
+        let value_denom = batch_tensors
+            .value_weights
+            .sum_all()?
+            .clamp(1.0, f32::MAX)?;
+        let policy_denom = batch_tensors
+            .policy_weights
+            .sum_all()?
+            .clamp(1.0, f32::MAX)?;
+        let loss_tensor =
+            ((weighted_value_loss / value_denom)? + (weighted_policy_ce / policy_denom)?)?;
+        let loss_sum = (&loss_tensor * batch_len as f64)?;
 
         let value_sq = value.sqr()?;
         let target_sq = batch_tensors.values.sqr()?;
@@ -257,17 +270,18 @@ impl GpuReplica {
         metrics.push(loss_sum);
         metrics.push(value_ce);
         metrics.push(policy_ce);
-        metrics.push(value.sum_all()?);
-        metrics.push(value_sq.sum_all()?);
-        metrics.push(batch_tensors.values.sum_all()?);
-        metrics.push(target_sq.sum_all()?);
-        metrics.push(pred_target.sum_all()?);
-        metrics.push(error_sq.sum_all()?);
+        metrics.push((&value * &valid_value)?.sum_all()?);
+        metrics.push((&value_sq * &valid_value)?.sum_all()?);
+        metrics.push((&batch_tensors.values * &valid_value)?.sum_all()?);
+        metrics.push((&target_sq * &valid_value)?.sum_all()?);
+        metrics.push((&pred_target * &valid_value)?.sum_all()?);
+        metrics.push((&error_sq * &valid_value)?.sum_all()?);
         for phase in 0..3 {
             let mask = batch_tensors
                 .value_phase_masks
                 .narrow(1, phase, 1)?
                 .squeeze(1)?;
+            let mask = (&mask * &valid_value)?;
             metrics.push(mask.sum_all()?);
             metrics.push((&value * &mask)?.sum_all()?);
             metrics.push((&value_sq * &mask)?.sum_all()?);
@@ -281,6 +295,7 @@ impl GpuReplica {
                 .value_source_phase_masks
                 .narrow(1, source_phase, 1)?
                 .squeeze(1)?;
+            let mask = (&mask * &valid_value)?;
             metrics.push(mask.sum_all()?);
             metrics.push((&value * &mask)?.sum_all()?);
             metrics.push((&value_sq * &mask)?.sum_all()?);
@@ -323,6 +338,7 @@ impl GpuReplica {
             value_target_sq_sum: metrics[6],
             value_pred_target_sum: metrics[7],
             value_error_sq_sum: metrics[8],
+            value_samples: phase_value.iter().map(|phase| phase.samples).sum(),
             samples: batch_tensors.batch_size,
             phase_value,
             source_phase_value,
@@ -416,4 +432,65 @@ fn profile_sync(device: &Device) -> CandleResult<()> {
 
 fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::Error {
     candle_core::Error::Msg(format!("dataloader failed: {error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_value_targets_do_not_change_loss_or_metrics() {
+        let position = crate::xiangqi::Position::startpos();
+        let moves = position.legal_moves();
+        let sample = AzTrainingSample {
+            features: crate::nnue::extract_sparse_features_az(&position),
+            rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
+            move_indices: moves
+                .iter()
+                .map(|&mv| crate::az::dense_move_index(mv))
+                .collect(),
+            policy: vec![1.0; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 1,
+            meta: crate::az::AzSampleMeta::default(),
+        };
+        let model = AzNnue::random(32, 41);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let evaluate = |samples: &[AzTrainingSample]| {
+            let indices: Vec<_> = (0..samples.len()).collect();
+            let batch = BatchTensors::from_packed(
+                PackedBatch::from_indices(samples, &indices),
+                &Device::Cpu,
+            )
+            .unwrap();
+            replica
+                .compute_batch_loss(&batch, samples.len(), 1.0, 1.0)
+                .unwrap()
+        };
+        let baseline = evaluate(std::slice::from_ref(&sample));
+        let mut masked = sample.clone();
+        masked.value_weight = 0.0;
+        masked.policy_weight = 0.0;
+        masked.value = -1.0;
+        masked.value_wdl = [0.0, 0.0, 1.0];
+        let mixed = evaluate(&[sample, masked.clone()]);
+        assert!(
+            (baseline.loss_tensor.to_scalar::<f32>().unwrap()
+                - mixed.loss_tensor.to_scalar::<f32>().unwrap())
+            .abs()
+                < 1e-5
+        );
+        assert_eq!(mixed.stats.value_samples, 1);
+        assert!((baseline.stats.value_error_sq_sum - mixed.stats.value_error_sq_sum).abs() < 1e-5);
+        let unknown = evaluate(&[masked]);
+        assert_eq!(unknown.stats.value_samples, 0);
+        assert_eq!(unknown.stats.value_loss, 0.0);
+        assert_eq!(unknown.stats.value_error_sq_sum, 0.0);
+        assert_eq!(unknown.loss_tensor.to_scalar::<f32>().unwrap(), 0.0);
+        unknown.loss_tensor.backward().unwrap();
+    }
 }
