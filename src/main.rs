@@ -12,11 +12,11 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
-        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
-        generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
-        train_samples_weighted_owned,
+        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzSelfplayWorker, AzTrainLossWeights,
+        AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, alphazero_search,
+        alphazero_search_trace_with_rules, alphazero_search_with_rules, benchmark_training,
+        dense_move_index, evaluate_policy_groups, generate_selfplay_data,
+        play_arena_games_from_positions, train_samples_weighted, train_samples_weighted_owned,
     },
     nnue::{canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
@@ -923,10 +923,6 @@ fn prune_old_checkpoints(
     Ok(())
 }
 
-struct SelfplayBatch {
-    data: AzSelfplayData,
-}
-
 struct TrainerEvent {
     report: AzLoopReport,
     candidate_model: AzNnue,
@@ -938,14 +934,20 @@ struct SharedSelfplayModel {
     models_by_numa_node: Vec<Arc<AzNnue>>,
 }
 
-fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> Vec<Arc<AzNnue>> {
+fn build_numa_model_replicas(
+    model: &Arc<AzNnue>,
+    numa_nodes: &[(usize, usize)],
+) -> Vec<Arc<AzNnue>> {
+    if numa_nodes.len() == 1 {
+        return vec![Arc::clone(model)];
+    }
     thread::scope(|scope| {
         numa_nodes
             .iter()
             .map(|&(_node, cpu)| {
                 scope.spawn(move || {
                     let _ = chineseai::cpu_topology::pin_current_thread(cpu);
-                    Arc::new(model.clone())
+                    Arc::new(model.as_ref().clone())
                 })
             })
             .collect::<Vec<_>>()
@@ -983,12 +985,6 @@ struct TrainBatchSourceStats {
     policy_target_top1: f32,
     policy_target_top2: f32,
     start_source_rate: [f32; 3],
-}
-
-impl PendingTrainingData {
-    fn push(&mut self, batch: SelfplayBatch) {
-        self.selfplay.add_assign(&batch.data);
-    }
 }
 
 fn build_az_loop_config(
@@ -1044,7 +1040,7 @@ fn build_async_training_report(
     replay_window: chineseai::az::AzReplayWindowStats,
     train_source: TrainBatchSourceStats,
 ) -> AzLoopReport {
-    let selfplay_samples = pending.selfplay.samples.len();
+    let selfplay_samples = pending.selfplay.sampled_moves;
     let total_seconds = pending.collection_seconds.max(1.0e-6);
     let train_stat_samples = stats.value_samples.max(1) as f32;
     let root_visit_entropy =
@@ -2357,7 +2353,7 @@ fn main() {
             // 覆盖一次GPU更新期间完成的批次，同时限制旧模型样本和内存积压。
             let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(2).max(32);
             let (selfplay_tx, selfplay_rx) =
-                mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
+                mpsc::sync_channel::<AzSelfplayData>(selfplay_queue_capacity);
             let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
             let llc_domains = cpu_placements
                 .iter()
@@ -2378,6 +2374,7 @@ fn main() {
                 },
                 numa_nodes.len(),
             );
+            let initial_selfplay_model = Arc::new(initial_selfplay_model);
             let initial_numa_models =
                 build_numa_model_replicas(&initial_selfplay_model, &numa_nodes);
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
@@ -2385,7 +2382,7 @@ fn main() {
                 learner_update: start_update.saturating_sub(1).min(u32::MAX as usize) as u32,
                 models_by_numa_node: initial_numa_models,
             }));
-            let mut arena_reference_model = initial_arena_reference_model;
+            let mut arena_reference_model = Arc::new(initial_arena_reference_model);
             let mut champion_paths =
                 champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
                     .unwrap_or_else(|err| panic!("failed to load champion history: {err}"));
@@ -2428,6 +2425,7 @@ fn main() {
                     let mut local_version = u64::MAX;
                     let mut local_learner_update = 0u32;
                     let mut local_model: Option<Arc<AzNnue>> = None;
+                    let mut search_worker: Option<AzSelfplayWorker> = None;
                     while !selfplay_stop.load(Ordering::SeqCst) {
                         {
                             let (pause_lock, pause_cvar) = &*selfplay_pause;
@@ -2476,14 +2474,13 @@ fn main() {
                             .unwrap_or_else(|_| panic!("midgame pool poisoned"))
                             .sample(loop_config.games, &mut pool_rng)
                             .into();
-                        let data = generate_selfplay_data(
-                            local_model
-                                .as_deref()
-                                .expect("selfplay model not initialized"),
-                            &loop_config,
-                        );
-                        let batch = SelfplayBatch { data };
-                        if selfplay_tx.send(batch).is_err() {
+                        let model = local_model
+                            .as_deref()
+                            .expect("selfplay model not initialized");
+                        let data = search_worker
+                            .get_or_insert_with(|| AzSelfplayWorker::new(model))
+                            .generate(model, &loop_config);
+                        if selfplay_tx.send(data).is_err() {
                             break;
                         }
                         batch_index += 1;
@@ -2526,7 +2523,7 @@ fn main() {
                 let mut batch_index = 0usize;
                 let mut window_started = Instant::now();
                 while let Ok(mut batch) = selfplay_rx.recv() {
-                    let opening_snapshots = std::mem::take(&mut batch.data.opening_snapshots);
+                    let opening_snapshots = std::mem::take(&mut batch.opening_snapshots);
                     if !opening_snapshots.is_empty() {
                         collector_opening_pool
                             .write()
@@ -2536,20 +2533,20 @@ fn main() {
                                 collector_config.seed ^ !(batch_index as u64),
                             );
                     }
-                    let snapshots = std::mem::take(&mut batch.data.midgame_snapshots);
+                    let snapshots = std::mem::take(&mut batch.midgame_snapshots);
                     if !snapshots.is_empty() {
                         collector_midgame_pool
                             .write()
                             .unwrap_or_else(|_| panic!("midgame pool poisoned"))
                             .add_snapshots(snapshots, collector_config.seed ^ batch_index as u64);
                     }
-                    pending.push(batch);
+                    pending.selfplay.append(batch);
                     let required_samples = if batch_index == 0 {
                         collector_warmup_missing.max(collector_config.selfplay_samples_per_update)
                     } else {
                         collector_config.selfplay_samples_per_update
                     };
-                    if pending.selfplay.samples.len() < required_samples {
+                    if pending.selfplay.sampled_moves < required_samples {
                         continue;
                     }
                     pending.collection_seconds = window_started.elapsed().as_secs_f32();
@@ -2673,7 +2670,7 @@ fn main() {
             let mut exited_after_ctrl_c = false;
             let mut exited_after_target_update = false;
             let mut update = start_update;
-            let mut interrupt_save_model: Option<AzNnue> = None;
+            let mut interrupt_save_model: Option<Arc<AzNnue>> = None;
             let mut interrupt_save_next_update = start_update;
             loop {
                 if interrupted.load(Ordering::SeqCst) {
@@ -2832,14 +2829,14 @@ fn main() {
                 generated_games_total = generated_games_total.saturating_add(report.games as u64);
                 generated_samples_total =
                     generated_samples_total.saturating_add(report.samples as u64);
-                let deployed_model = candidate_model.clone();
-                interrupt_save_model = Some(candidate_model.clone());
+                let deployed_model = Arc::new(candidate_model);
+                interrupt_save_model = Some(Arc::clone(&deployed_model));
                 interrupt_save_next_update = update.saturating_add(1);
                 let checkpoint_saved = if config.checkpoint_interval > 0
                     && update.is_multiple_of(config.checkpoint_interval)
                 {
                     let path = save_checkpoint_model(
-                        &candidate_model,
+                        &deployed_model,
                         &config.model_path,
                         &config.checkpoint_dir,
                         update,
@@ -3443,7 +3440,7 @@ fn main() {
                             .split_off(current_count.saturating_add(previous_count));
                         let previous_positions = arena_start_positions.split_off(current_count);
                         let current_positions = arena_start_positions;
-                        let candidate = Arc::new(deployed_model.clone());
+                        let candidate = Arc::clone(&deployed_model);
                         let run_gate_match =
                             |baseline: Arc<AzNnue>, positions: Vec<Position>, seed_salt: u64| {
                                 run_arena_threads(ArenaThreadConfig {
@@ -3472,7 +3469,7 @@ fn main() {
                                 })
                             };
                         let current_arena = run_gate_match(
-                            Arc::new(arena_reference_model.clone()),
+                            Arc::clone(&arena_reference_model),
                             current_positions,
                             0,
                         );
@@ -3534,7 +3531,7 @@ fn main() {
                             }
                         }
                         if promoted {
-                            arena_reference_model = deployed_model.clone();
+                            arena_reference_model = Arc::clone(&deployed_model);
                             let updated_numa_models =
                                 build_numa_model_replicas(&deployed_model, &numa_nodes);
                             let actor_version = {
@@ -3721,7 +3718,7 @@ fn main() {
                                 load_pikafish_label_rows(&conn, config.pikafish_label_eval_limit)
                                     .map_err(sqlite_io_error)?;
                             evaluate_pikafish_labels_parallel(
-                                Arc::new(deployed_model.clone()),
+                                Arc::clone(&deployed_model),
                                 rows,
                                 AzSearchLimits {
                                     simulations: config.pikafish_label_eval_simulations,
@@ -3934,7 +3931,7 @@ fn main() {
                         generated_games_total.saturating_add(event.report.games as u64);
                     generated_samples_total =
                         generated_samples_total.saturating_add(event.report.samples as u64);
-                    interrupt_save_model = Some(event.candidate_model);
+                    interrupt_save_model = Some(Arc::new(event.candidate_model));
                     interrupt_save_next_update = update.saturating_add(1);
                     update = update.saturating_add(1);
                 }
@@ -5429,6 +5426,14 @@ fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
 mod reporting_tests {
     use super::*;
     use chineseai::az::AzSampleMeta;
+
+    #[test]
+    fn single_numa_publication_shares_immutable_snapshot() {
+        let model = Arc::new(AzNnue::random(8, 41));
+        let replicas = build_numa_model_replicas(&model, &[(0, 0)]);
+        assert_eq!(replicas.len(), 1);
+        assert!(Arc::ptr_eq(&model, &replicas[0]));
+    }
 
     #[test]
     fn resumed_model_does_not_repeat_random_model_warmup() {

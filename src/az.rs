@@ -50,8 +50,8 @@ pub use alphazero::{
 };
 pub use midgame::{AzMidgamePool, AzStartSnapshot};
 pub use play::{
-    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
-    play_arena_games_from_positions,
+    AzArenaConfig, AzArenaReport, AzSelfplayData, AzSelfplayWorker, AzTerminalStats,
+    generate_selfplay_data, play_arena_games_from_positions,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
 pub use train::{train_samples, train_samples_weighted, train_samples_weighted_owned};
@@ -3981,8 +3981,11 @@ mod tests {
         let mut rng_repeated = SplitMix64::new(99);
         let single_stats =
             train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single).unwrap();
-        let repeated_stats =
-            train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated).unwrap();
+        let mut repeated_stats = AzTrainStats::default();
+        for _ in 0..5 {
+            repeated_stats =
+                train_samples(&mut repeated, &samples, 1, 0.003, 4, &mut rng_repeated).unwrap();
+        }
 
         assert!((single_stats.loss - repeated_stats.loss).abs() < 1e-5);
         assert!((single_stats.value_loss - repeated_stats.value_loss).abs() < 1e-5);

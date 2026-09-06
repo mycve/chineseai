@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::Instant;
 
 use crate::nnue::AZ_NNUE_INPUT_SIZE;
@@ -350,8 +353,7 @@ pub(super) enum DataLoaderError {
 }
 
 pub(super) struct PrefetchDataLoader {
-    rx: mpsc::Receiver<(usize, PackedStepBatch)>,
-    workers: Vec<thread::JoinHandle<()>>,
+    rx: mpsc::Receiver<Result<(usize, PackedStepBatch), DataLoaderError>>,
     next_batch_id: usize,
     total_batches: usize,
     pending: BTreeMap<usize, PackedStepBatch>,
@@ -362,48 +364,47 @@ impl PrefetchDataLoader {
         samples: Arc<Vec<AzTrainingSample>>,
         plan: BatchPlan,
         config: &DataLoaderConfig,
+        pool: &rayon::ThreadPool,
     ) -> Self {
         let total_batches = plan.len();
-        let workers = config.num_workers.max(1);
+        let workers = config.num_workers.max(1).min(pool.current_num_threads());
         let channel_depth = config.prefetch_batches.max(1) * workers;
         let (tx, rx) = mpsc::sync_channel(channel_depth);
         let plan = Arc::new(plan.steps);
-        let cursor = Arc::new(Mutex::new(0usize));
-        let mut handles = Vec::with_capacity(workers);
+        let cursor = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..workers {
             let tx = tx.clone();
             let samples = Arc::clone(&samples);
             let plan = Arc::clone(&plan);
             let cursor = Arc::clone(&cursor);
-            handles.push(thread::spawn(move || {
-                loop {
-                    let batch_id = {
-                        let mut cursor = cursor.lock().expect("dataloader cursor poisoned");
-                        if *cursor >= plan.len() {
+            pool.spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        let batch_id = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(step) = plan.get(batch_id) else {
+                            return;
+                        };
+                        let started = Instant::now();
+                        let packed = PackedStepBatch {
+                            batch: PackedBatch::from_indices(&samples, &step.indices),
+                            pack_seconds: started.elapsed().as_secs_f64(),
+                        };
+                        if tx.send(Ok((batch_id, packed))).is_err() {
                             return;
                         }
-                        let batch_id = *cursor;
-                        *cursor += 1;
-                        batch_id
-                    };
-                    let started = Instant::now();
-                    let step = &plan[batch_id];
-                    let packed = PackedStepBatch {
-                        batch: PackedBatch::from_indices(&samples, &step.indices),
-                        pack_seconds: started.elapsed().as_secs_f64(),
-                    };
-                    if tx.send((batch_id, packed)).is_err() {
-                        return;
                     }
+                }));
+                if result.is_err() {
+                    let _ = tx.send(Err(DataLoaderError::WorkerPanic));
                 }
-            }));
+            });
         }
+
         drop(tx);
 
         Self {
             rx,
-            workers: handles,
             next_batch_id: 0,
             total_batches,
             pending: BTreeMap::new(),
@@ -419,7 +420,8 @@ impl PrefetchDataLoader {
             return Ok(Some(batch));
         }
 
-        while let Ok((batch_id, batch)) = self.rx.recv() {
+        while let Ok(message) = self.rx.recv() {
+            let (batch_id, batch) = message?;
             if batch_id == self.next_batch_id {
                 self.next_batch_id += 1;
                 return Ok(Some(batch));
@@ -427,13 +429,6 @@ impl PrefetchDataLoader {
             self.pending.insert(batch_id, batch);
         }
         Err(DataLoaderError::Closed)
-    }
-
-    pub(super) fn join(self) -> Result<(), DataLoaderError> {
-        for worker in self.workers {
-            worker.join().map_err(|_| DataLoaderError::WorkerPanic)?;
-        }
-        Ok(())
     }
 }
 
@@ -551,6 +546,64 @@ mod tests {
     }
 
     #[test]
+    fn shared_pack_pool_survives_cancellation_and_failed_job() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let samples = Arc::new((0..32).map(sample).collect::<Vec<_>>());
+        let config = DataLoaderConfig {
+            batch_size: 2,
+            num_workers: 2,
+            prefetch_batches: 1,
+            ..Default::default()
+        };
+        let original_threads = pool.broadcast(|_| std::thread::current().id());
+        // 未消费预取结果就取消，不能堵死池中的工作线程。
+        drop(PrefetchDataLoader::new(
+            Arc::clone(&samples),
+            BatchPlan::epoch(samples.len(), &config),
+            &config,
+            &pool,
+        ));
+        let invalid = BatchPlan {
+            steps: vec![BatchStep {
+                indices: vec![samples.len()],
+            }],
+        };
+        let mut failed = PrefetchDataLoader::new(Arc::clone(&samples), invalid, &config, &pool);
+        assert!(matches!(
+            failed.next_packed(),
+            Err(DataLoaderError::WorkerPanic)
+        ));
+        drop(failed);
+        for seed in [1, 2, 3] {
+            let config = DataLoaderConfig {
+                seed,
+                ..config.clone()
+            };
+            let plan = BatchPlan::epoch(samples.len(), &config);
+            let expected = plan
+                .steps
+                .iter()
+                .map(|s| PackedBatch::from_indices(&samples, &s.indices))
+                .collect::<Vec<_>>();
+            let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config, &pool);
+            for expected in expected {
+                let actual = loader.next_packed().unwrap().unwrap().batch;
+                assert_eq!(actual.feature_items, expected.feature_items);
+                assert_eq!(actual.policy_targets, expected.policy_targets);
+                assert_eq!(actual.policy_sparse_indices, expected.policy_sparse_indices);
+            }
+            assert!(loader.next_packed().unwrap().is_none());
+        }
+        assert_eq!(
+            pool.broadcast(|_| std::thread::current().id()),
+            original_threads
+        );
+    }
+
+    #[test]
     fn prefetch_loader_preserves_batch_order() {
         let samples = Arc::new((0..7).map(sample).collect::<Vec<_>>());
         let config = DataLoaderConfig {
@@ -562,12 +615,15 @@ mod tests {
             ..DataLoaderConfig::default()
         };
         let plan = BatchPlan::epoch(samples.len(), &config);
-        let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config, &pool);
         let mut sizes = Vec::new();
         while let Some(batch) = loader.next_packed().unwrap() {
             sizes.push(batch.batch.batch_size);
         }
-        loader.join().unwrap();
         assert_eq!(sizes, vec![2, 2, 2, 1]);
     }
 }

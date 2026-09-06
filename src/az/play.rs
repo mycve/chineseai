@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use rayon::prelude::*;
 
 use crate::nnue::{
@@ -148,7 +146,6 @@ fn score_rate_to_elo(score: f32) -> f32 {
 
 #[derive(Clone, Default)]
 pub struct AzSelfplayData {
-    pub samples: Vec<AzTrainingSample>,
     pub games: Vec<Vec<AzTrainingSample>>,
     pub position_fens: Vec<String>,
     pub opening_snapshots: Vec<AzStartSnapshot>,
@@ -190,15 +187,11 @@ pub struct AzSelfplayData {
 }
 
 impl AzSelfplayData {
-    pub fn add_assign(&mut self, other: &Self) {
-        self.samples.extend(other.samples.iter().cloned());
-        self.games.extend(other.games.iter().cloned());
-        self.position_fens
-            .extend(other.position_fens.iter().cloned());
-        self.opening_snapshots
-            .extend(other.opening_snapshots.iter().cloned());
-        self.midgame_snapshots
-            .extend(other.midgame_snapshots.iter().cloned());
+    pub fn append(&mut self, other: Self) {
+        self.games.extend(other.games);
+        self.position_fens.extend(other.position_fens);
+        self.opening_snapshots.extend(other.opening_snapshots);
+        self.midgame_snapshots.extend(other.midgame_snapshots);
         self.red_wins += other.red_wins;
         self.black_wins += other.black_wins;
         self.draws += other.draws;
@@ -244,7 +237,6 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
         return generate_selfplay_chunk(model, config);
     }
 
-    let shared_model = Arc::new(model.clone());
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .build()
@@ -258,7 +250,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
                 worker_config.games = games;
                 worker_config.workers = 1;
                 worker_config.seed ^= (worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                let chunk = generate_selfplay_chunk(&shared_model, &worker_config);
+                let chunk = generate_selfplay_chunk(model, &worker_config);
                 crate::profile::flush_thread();
                 chunk
             })
@@ -266,46 +258,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     });
     let mut merged = AzSelfplayData::default();
     for chunk in chunks {
-        merged.samples.extend(chunk.samples);
-        merged.games.extend(chunk.games);
-        merged.position_fens.extend(chunk.position_fens);
-        merged.midgame_snapshots.extend(chunk.midgame_snapshots);
-        merged.red_wins += chunk.red_wins;
-        merged.black_wins += chunk.black_wins;
-        merged.draws += chunk.draws;
-        merged.plies_total += chunk.plies_total;
-        merged.entropy_all_sum += chunk.entropy_all_sum;
-        merged.entropy_all_count += chunk.entropy_all_count;
-        merged.entropy_opening_sum += chunk.entropy_opening_sum;
-        merged.entropy_opening_count += chunk.entropy_opening_count;
-        merged.entropy_mid_sum += chunk.entropy_mid_sum;
-        merged.entropy_mid_count += chunk.entropy_mid_count;
-        merged.raw_prior_top1_sum += chunk.raw_prior_top1_sum;
-        merged.raw_prior_top2_sum += chunk.raw_prior_top2_sum;
-        merged.policy_top1_sum += chunk.policy_top1_sum;
-        merged.policy_top2_sum += chunk.policy_top2_sum;
-        merged.q_gap_sum += chunk.q_gap_sum;
-        merged.q_top1_abs_sum += chunk.q_top1_abs_sum;
-        merged.visited_actions_sum += chunk.visited_actions_sum;
-        merged.shape_count += chunk.shape_count;
-        merged.opening_raw_prior_top1_sum += chunk.opening_raw_prior_top1_sum;
-        merged.opening_raw_prior_top2_sum += chunk.opening_raw_prior_top2_sum;
-        merged.opening_policy_top1_sum += chunk.opening_policy_top1_sum;
-        merged.opening_policy_top2_sum += chunk.opening_policy_top2_sum;
-        merged.opening_q_gap_sum += chunk.opening_q_gap_sum;
-        merged.opening_q_top1_abs_sum += chunk.opening_q_top1_abs_sum;
-        merged.opening_visited_actions_sum += chunk.opening_visited_actions_sum;
-        merged.opening_shape_count += chunk.opening_shape_count;
-        merged.sampled_moves += chunk.sampled_moves;
-        merged.sampled_best_moves += chunk.sampled_best_moves;
-        merged.best_played_q_gap_sum += chunk.best_played_q_gap_sum;
-        merged.played_top_visit_ratio_sum += chunk.played_top_visit_ratio_sum;
-        merged.best_q_sum += chunk.best_q_sum;
-        merged.played_q_sum += chunk.played_q_sum;
-        merged.terminal.add_assign(&chunk.terminal);
-        merged
-            .search_simulations
-            .add_assign(&chunk.search_simulations);
+        merged.append(chunk);
     }
     merged
 }
@@ -437,7 +390,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.chunk_scalar");
     let mut rng = SplitMix64::new(config.seed);
-    let mut samples = Vec::new();
     let mut position_fens = Vec::new();
     let mut opening_snapshots = Vec::new();
     let mut midgame_snapshots = Vec::new();
@@ -646,12 +598,10 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 config.value_td_lambda,
             );
         }
-        samples.extend(game_samples.clone());
         games.push(game_samples);
     }
 
     AzSelfplayData {
-        samples,
         games,
         position_fens,
         opening_snapshots,
@@ -781,10 +731,40 @@ fn inactive_batch_input(config: &AzLoopConfig) -> AzBatchSearchInput {
     }
 }
 
+/// 每个 actor 持有一个工作区，暂停、发布新权重后继续复用；不缓存模型权重。
+pub struct AzSelfplayWorker {
+    arch: super::AzNnueArch,
+    workspace: AzBatchSearchWorkspace,
+}
+
+impl AzSelfplayWorker {
+    pub fn new(model: &AzNnue) -> Self {
+        Self {
+            arch: model.arch,
+            workspace: AzBatchSearchWorkspace::new(model),
+        }
+    }
+
+    /// 当前线程内四路生成，线程调度由调用方负责。
+    pub fn generate(&mut self, model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+        if self.arch != model.arch {
+            *self = Self::new(model);
+        }
+        generate_selfplay_batch_reusing(model, config, &mut self.workspace)
+    }
+}
+
 fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
+    AzSelfplayWorker::new(model).generate(model, config)
+}
+
+fn generate_selfplay_batch_reusing(
+    model: &AzNnue,
+    config: &AzLoopConfig,
+    workspace: &mut AzBatchSearchWorkspace,
+) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.chunk_batch4");
     let mut data = AzSelfplayData::default();
-    let mut workspace = AzBatchSearchWorkspace::new(model);
     for group_start in (0..config.games).step_by(4) {
         let mut states: [Option<BatchedSelfplayGame>; 4] = std::array::from_fn(|slot| {
             let game_index = group_start + slot;
@@ -851,7 +831,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     limits: selfplay_search_limits(config, state.phase_ply, seed),
                 }
             });
-            let searches = alphazero_search_batch4_reusing(inputs, model, &mut workspace);
+            let searches = alphazero_search_batch4_reusing(inputs, model, workspace);
             for index in 0..4 {
                 if !searched[index] {
                     continue;
@@ -939,7 +919,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 result,
                 config.value_td_lambda,
             );
-            data.samples.extend(game_samples.iter().cloned());
             data.games.push(game_samples);
         }
     }
@@ -1520,6 +1499,32 @@ mod tests {
     }
 
     #[test]
+    fn actor_workspace_reuses_memory_without_stale_model_state() {
+        let first = AzNnue::random(8, 41);
+        let mut worker = AzSelfplayWorker::new(&first);
+        for model in [first, AzNnue::random(8, 42), AzNnue::random(16, 43)] {
+            for games in [0, 1, 4, 5] {
+                let mut config = selfplay_test_config(games);
+                config.record_fens = true;
+                config.temperature_start = 1.0;
+                config.mirror_probability = 0.5;
+                let actual = worker.generate(&model, &config);
+                let expected = generate_selfplay_chunk_batch4(&model, &config);
+                assert_eq!(actual.position_fens, expected.position_fens);
+                assert_eq!(
+                    format!("{:?}", actual.games),
+                    format!("{:?}", expected.games)
+                );
+                assert_eq!(actual.games.len(), games);
+                assert_eq!(
+                    actual.sampled_moves,
+                    actual.games.iter().map(Vec::len).sum::<usize>()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn arena_uncertainty_uses_color_swapped_opening_pairs() {
         let report = AzArenaReport {
             wins: 2,
@@ -1632,10 +1637,10 @@ mod tests {
             5
         );
         assert_eq!(
-            data.samples.len(),
+            data.sampled_moves,
             data.games.iter().map(Vec::len).sum::<usize>()
         );
-        assert_eq!(data.search_simulations.searches, data.samples.len());
+        assert_eq!(data.search_simulations.searches, data.sampled_moves);
         assert!(
             data.games
                 .iter()
@@ -1872,9 +1877,14 @@ mod tests {
                 assert_eq!(data.draws, usize::from(cycle));
                 assert_eq!(data.terminal.rule_draw_repetition, usize::from(cycle));
                 assert_eq!(data.terminal.max_plies, usize::from(!cycle));
-                assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
+                assert!(
+                    data.games
+                        .iter()
+                        .flatten()
+                        .all(|sample| sample.value_weight == 0.0)
+                );
                 if !cycle {
-                    assert_eq!(data.samples.len(), 1);
+                    assert_eq!(data.sampled_moves, 1);
                 }
             }
         }
