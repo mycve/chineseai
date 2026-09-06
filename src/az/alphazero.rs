@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzIncrementalEvalRequest, AzNnue,
-    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, rule_context_for_moves,
+    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, legal_moves_and_rule_context,
+    rule_context_for_moves,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;
@@ -975,26 +976,16 @@ impl<'a> AzTree<'a> {
             return AzEvalOutput { value_wdl, value };
         }
 
-        let moves = {
+        let (moves, rule_context) = {
             crate::scope_profile!("az.search.expand_legal_moves");
-            if node_index == self.root {
-                if let Some(moves) = self.root_moves.take() {
-                    moves
-                } else {
-                    self.nodes[node_index]
-                        .position
-                        .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                        .into_iter()
-                        .map(|(mv, _)| mv)
-                        .collect()
-                }
+            let position = &self.nodes[node_index].position;
+            if node_index == self.root
+                && let Some(moves) = self.root_moves.take()
+            {
+                let context = rule_context_for_moves(position, &self.rule_history_scratch, &moves);
+                (moves, context)
             } else {
-                self.nodes[node_index]
-                    .position
-                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect()
+                legal_moves_and_rule_context(position, &self.rule_history_scratch)
             }
         };
         if moves.is_empty() {
@@ -1016,11 +1007,7 @@ impl<'a> AzTree<'a> {
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
-                &rule_context_for_moves(
-                    &self.nodes[node_index].position,
-                    &self.rule_history_scratch,
-                    &moves,
-                ),
+                &rule_context,
                 &mut self.eval_scratch,
             )
         };
@@ -1403,12 +1390,10 @@ impl<'a> AzTree<'a> {
                     self.finish_batch_simulation(simulation, eval, true);
                     return BatchPrepare::Complete;
                 }
-                let moves = self.nodes[node_index]
-                    .position
-                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect::<Vec<_>>();
+                let (moves, rule_context) = legal_moves_and_rule_context(
+                    &self.nodes[node_index].position,
+                    &self.rule_history_scratch,
+                );
                 if moves.is_empty() {
                     let eval = AzEvalOutput {
                         value_wdl: [0.0, 0.0, 1.0],
@@ -1419,11 +1404,6 @@ impl<'a> AzTree<'a> {
                     self.finish_batch_simulation(simulation, eval, true);
                     return BatchPrepare::Complete;
                 }
-                let rule_context = rule_context_for_moves(
-                    &self.nodes[node_index].position,
-                    &self.rule_history_scratch,
-                    &moves,
-                );
                 return BatchPrepare::Pending(PendingLeaf {
                     simulation,
                     moves,
@@ -1447,12 +1427,10 @@ impl<'a> AzTree<'a> {
                     self.finish_batch_simulation(simulation, eval, false);
                     return BatchPrepare::Complete;
                 }
-                let moves = self.nodes[node_index]
-                    .position
-                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect::<Vec<_>>();
+                let (moves, rule_context) = legal_moves_and_rule_context(
+                    &self.nodes[node_index].position,
+                    &self.rule_history_scratch,
+                );
                 if moves.is_empty() {
                     let eval = AzEvalOutput {
                         value_wdl: [0.0, 0.0, 1.0],
@@ -1467,11 +1445,6 @@ impl<'a> AzTree<'a> {
                 let was_in_check = self.nodes[node_index]
                     .position
                     .in_check(self.nodes[node_index].position.side_to_move());
-                let rule_context = rule_context_for_moves(
-                    &self.nodes[node_index].position,
-                    &self.rule_history_scratch,
-                    &moves,
-                );
                 return BatchPrepare::Pending(PendingLeaf {
                     simulation,
                     moves,
@@ -1587,14 +1560,12 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value_wdl = value_wdl;
             return AzEvalOutput { value_wdl, value };
         }
-        let moves: Vec<_> = {
+        let (moves, rule_context) = {
             crate::scope_profile!("az.search.expand_legal_moves");
-            self.nodes[node_index]
-                .position
-                .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                .into_iter()
-                .map(|(mv, _)| mv)
-                .collect()
+            legal_moves_and_rule_context(
+                &self.nodes[node_index].position,
+                &self.rule_history_scratch,
+            )
         };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
@@ -1613,11 +1584,7 @@ impl<'a> AzTree<'a> {
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
-                &rule_context_for_moves(
-                    &self.nodes[node_index].position,
-                    &self.rule_history_scratch,
-                    &moves,
-                ),
+                &rule_context,
                 &mut self.eval_scratch,
             )
         };

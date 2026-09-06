@@ -1748,7 +1748,8 @@ fn main() {
                 let mut child = position.clone();
                 child.make_move(mv);
                 let child_legal = child.legal_moves_with_rules(&child_rule_history);
-                let child_nn_q = model.evaluate_value(&child, &child_legal);
+                let child_nn_q =
+                    model.evaluate_value_with_rules(&child, &child_rule_history, &child_legal);
                 let mut verify_limits = search_limits;
                 verify_limits.simulations = verify_sims.max(1);
                 verify_limits.seed = 0;

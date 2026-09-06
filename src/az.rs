@@ -1232,6 +1232,33 @@ pub fn rule_context_for_moves(
     history: &[crate::xiangqi::RuleHistoryEntry],
     moves: &[Move],
 ) -> RuleContext {
+    rule_context_for_candidates(position, history, moves.len(), moves)
+}
+
+fn legal_moves_and_rule_context(
+    position: &Position,
+    history: &[crate::xiangqi::RuleHistoryEntry],
+) -> (Vec<Move>, RuleContext) {
+    let tagged = position.legal_moves_with_rules_and_repetition(history);
+    let mut moves = Vec::with_capacity(tagged.len());
+    let mut candidates = Vec::new();
+    for (mv, repeats) in tagged {
+        moves.push(mv);
+        if repeats {
+            candidates.push(mv);
+        }
+    }
+    // 复用合法着过滤时的历史命中结果；命中不等于和棋，仍做精确裁决。
+    let context = rule_context_for_candidates(position, history, moves.len(), &candidates);
+    (moves, context)
+}
+
+fn rule_context_for_candidates(
+    position: &Position,
+    history: &[crate::xiangqi::RuleHistoryEntry],
+    move_count: usize,
+    candidates: &[Move],
+) -> RuleContext {
     let current = history.last();
     let (prior_matches, cycle_start) = current.map_or((0usize, history.len()), |entry| {
         let mut matches = 0usize;
@@ -1262,7 +1289,7 @@ pub fn rule_context_for_moves(
     });
     let repetition_moves = if history_known {
         position
-            .repetition_draw_moves(history, moves)
+            .repetition_draw_moves(history, candidates)
             .into_iter()
             .map(|mv| dense_move_index(canonical_move(side, mv)))
             .collect::<Vec<_>>()
@@ -1270,7 +1297,7 @@ pub fn rule_context_for_moves(
         Vec::new()
     };
     let available = !repetition_moves.is_empty();
-    let fraction = repetition_moves.len() as f32 / moves.len().max(1) as f32;
+    let fraction = repetition_moves.len() as f32 / move_count.max(1) as f32;
     RuleContext {
         repetition_moves,
         features: [
@@ -4278,6 +4305,37 @@ mod tests {
             position.make_move(mv);
         }
         (position, history)
+    }
+
+    #[test]
+    fn shared_rule_move_context_matches_independent_computation() {
+        fn check(position: &Position, history: &[crate::xiangqi::RuleHistoryEntry]) {
+            let moves = position.legal_moves_with_rules(history);
+            let expected = rule_context_for_moves(position, history, &moves);
+            let (actual_moves, actual) = legal_moves_and_rule_context(position, history);
+            assert_eq!(actual_moves, moves);
+            assert_eq!(actual.features, expected.features);
+            assert_eq!(actual.repetition_moves, expected.repetition_moves);
+        }
+        let (position, history) = repetition_fixture();
+        check(&position, &history);
+        check(&position, &history[..history.len() - 1]);
+        check(&position, &[]);
+        for seed in 0..8 {
+            let mut rng = SplitMix64::new(seed);
+            let mut position = Position::startpos();
+            let mut history = position.initial_rule_history();
+            for _ in 0..160 {
+                check(&position, &history);
+                let adjudication = position.adjudicate_with_history(&history);
+                if adjudication.outcome.is_some() || adjudication.moves.is_empty() {
+                    break;
+                }
+                let mv = adjudication.moves[rng.next_u64() as usize % adjudication.moves.len()];
+                history.push(position.rule_history_entry_after_move(mv));
+                position.make_move(mv);
+            }
+        }
     }
 
     #[test]
