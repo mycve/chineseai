@@ -1054,7 +1054,8 @@ pub struct AzLoopReport {
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
-    pub terminal_cycle_cutoff: usize,
+    pub terminal_rule_draw_repetition: usize,
+    pub terminal_rule_draw_natural_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

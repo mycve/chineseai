@@ -104,19 +104,6 @@ impl Position {
         }
     }
 
-    /// 训练仅保留违规裁决与明确的无进攻子力和棋；计算截断由调用者处理。
-    pub fn use_training_rules(&mut self) {
-        self.training_rules = true;
-        self.rule60_max_ply = None;
-    }
-
-    pub fn repeated_position_count(&self, history: &[RuleHistoryEntry]) -> usize {
-        history
-            .iter()
-            .filter(|entry| entry.hash == self.hash && entry.side_to_move == self.side_to_move)
-            .count()
-    }
-
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         let outcome = self.history_rule_outcome(history)?;
         // 仅在规则准备结束棋局时检查，避免搜索每个节点重复生成走法。
@@ -130,10 +117,9 @@ impl Position {
         crate::scope_profile!("xiangqi.rule_outcome_with_history");
         if let Some(entries) = repetition_cycle(history) {
             let exact_entries = self.recompute_cycle_chases(entries);
-            let outcome = adjudicate_repetition(exact_entries.as_deref().unwrap_or(entries));
-            if !self.training_rules || matches!(outcome, RuleOutcome::Win(_)) {
-                return Some(outcome);
-            }
+            return Some(adjudicate_repetition(
+                exact_entries.as_deref().unwrap_or(entries),
+            ));
         }
         if self
             .rule60_max_ply
@@ -425,12 +411,6 @@ impl Position {
         let total = |kind: PieceKind| count(0, kind) + count(1, kind);
         if total(PieceKind::Soldier) != 0 {
             return None;
-        }
-
-        if self.training_rules {
-            return (total(PieceKind::Rook) + total(PieceKind::Horse) + total(PieceKind::Cannon)
-                == 0)
-                .then_some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial));
         }
 
         let attacking = |color: usize| {

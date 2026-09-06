@@ -27,7 +27,8 @@ pub struct AzTerminalStats {
     pub rule_win_red: usize,
     pub rule_win_black: usize,
     pub max_plies: usize,
-    pub cycle_cutoff: usize,
+    pub rule_draw_repetition: usize,
+    pub rule_draw_natural_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,7 +53,8 @@ impl AzTerminalStats {
         self.rule_win_red += other.rule_win_red;
         self.rule_win_black += other.rule_win_black;
         self.max_plies += other.max_plies;
-        self.cycle_cutoff += other.cycle_cutoff;
+        self.rule_draw_repetition += other.rule_draw_repetition;
+        self.rule_draw_natural_limit += other.rule_draw_natural_limit;
     }
 }
 
@@ -329,8 +331,8 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
     }
 }
 
-fn configure_selfplay_rules(mut position: Position, _config: &AzLoopConfig) -> Position {
-    position.use_training_rules();
+fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
+    position.set_rule60_max_ply(config.rule60_max_ply);
     position
 }
 
@@ -487,7 +489,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
         let mut game_samples = Vec::new();
         let mut game_bootstrap_wdls = Vec::new();
         let mut result: Option<f32> = None;
-        let cycle_cutoffs_before = terminal.cycle_cutoff;
         let mut plies = 0usize;
 
         for local_ply in 0..=config.max_plies.saturating_sub(start_phase_ply) {
@@ -497,10 +498,6 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             if let Some(outcome) = decision.outcome {
                 record_terminal(&decision, &mut terminal);
                 result = Some(outcome_value(outcome));
-                break;
-            }
-            if position.repeated_position_count(&rule_history) >= 3 {
-                terminal.cycle_cutoff += 1;
                 break;
             }
             if ply >= config.max_plies {
@@ -627,7 +624,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
             position.make_move(mv);
             rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
         }
-        if result.is_none() && terminal.cycle_cutoff == cycle_cutoffs_before {
+        if result.is_none() {
             terminal.max_plies += 1;
         }
 
@@ -808,11 +805,6 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 if let Some(outcome) = decision.outcome {
                     record_terminal(&decision, &mut data.terminal);
                     state.result = Some(outcome_value(outcome));
-                    continue;
-                }
-                if state.position.repeated_position_count(&state.rule_history) >= 3 {
-                    state.truncated = true;
-                    data.terminal.cycle_cutoff += 1;
                     continue;
                 }
                 if state.phase_ply >= config.max_plies {
@@ -1130,10 +1122,13 @@ fn record_terminal(decision: &crate::xiangqi::Adjudication, stats: &mut AzTermin
     match decision.outcome.expect("terminal decision") {
         RuleOutcome::Win(Color::Red) => stats.rule_win_red += 1,
         RuleOutcome::Win(Color::Black) => stats.rule_win_black += 1,
-        RuleOutcome::Draw(reason) => {
-            assert_eq!(reason, RuleDrawReason::InsufficientMaterial);
-            stats.rule_draw_insufficient_material += 1;
-        }
+        RuleOutcome::Draw(reason) => match reason {
+            RuleDrawReason::InsufficientMaterial => stats.rule_draw_insufficient_material += 1,
+            RuleDrawReason::NaturalMoveLimit => stats.rule_draw_natural_limit += 1,
+            RuleDrawReason::Repetition
+            | RuleDrawReason::MutualLongCheck
+            | RuleDrawReason::MutualLongChase => stats.rule_draw_repetition += 1,
+        },
     }
 }
 
@@ -1624,11 +1619,7 @@ mod tests {
         let data = generate_selfplay_chunk_batch4(&model, &config);
         assert_eq!(data.games.len(), 5);
         assert_eq!(
-            data.red_wins
-                + data.black_wins
-                + data.draws
-                + data.terminal.max_plies
-                + data.terminal.cycle_cutoff,
+            data.red_wins + data.black_wins + data.draws + data.terminal.max_plies,
             5
         );
         assert_eq!(
@@ -1788,6 +1779,36 @@ mod tests {
     }
 
     #[test]
+    fn real_draw_keeps_value_supervision_for_the_whole_game() {
+        let mut samples = vec![sample(0.5, 1.0), sample(-0.5, -1.0)];
+        finalize_selfplay_targets(&mut samples, &[[0.2, 0.3, 0.5]; 2], Some(0.0), 1.0);
+        for sample in samples {
+            assert_eq!(sample.value_weight, 1.0);
+            assert_eq!(sample.value_wdl, [0.0, 1.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn selfplay_and_default_rules_agree_on_natural_and_material_draws() {
+        let config = selfplay_test_config(1);
+        for fen in [
+            "4k4/9/9/9/9/9/9/4R4/9/3K5 w - - 120 1",
+            "3k5/9/9/9/9/9/9/4C4/9/4K4 w",
+        ] {
+            let position = Position::from_fen(fen).unwrap();
+            let history = position.initial_rule_history();
+            let expected = position.adjudicate_with_history(&history).outcome;
+            assert!(matches!(expected, Some(RuleOutcome::Draw(_))));
+            assert_eq!(
+                configure_selfplay_rules(position, &config)
+                    .adjudicate_with_history(&history)
+                    .outcome,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn scalar_and_batch_adjudicate_mate_before_budget_cutoff() {
         let model = AzNnue::random(32, 41);
         let mut config = selfplay_test_config(1);
@@ -1812,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_and_budget_cutoffs_are_not_draws_in_either_selfplay_path() {
+    fn repetition_is_a_real_draw_but_budget_cutoff_has_no_value_label() {
         let model = AzNnue::random(32, 41);
         for cycle in [false, true] {
             let mut config = selfplay_test_config(1);
@@ -1838,8 +1859,9 @@ mod tests {
                 generate_selfplay_chunk_scalar(&model, &config),
                 generate_selfplay_chunk_batch4(&model, &config),
             ] {
-                assert_eq!(data.red_wins + data.black_wins + data.draws, 0);
-                assert_eq!(data.terminal.cycle_cutoff, usize::from(cycle));
+                assert_eq!(data.red_wins + data.black_wins, 0);
+                assert_eq!(data.draws, usize::from(cycle));
+                assert_eq!(data.terminal.rule_draw_repetition, usize::from(cycle));
                 assert_eq!(data.terminal.max_plies, usize::from(!cycle));
                 assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
                 if !cycle {

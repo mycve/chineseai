@@ -195,7 +195,6 @@ pub struct Position {
     pub(super) general_squares: [Option<usize>; 2],
     pub(super) halfmove_clock: u16,
     pub(super) rule60_max_ply: Option<u16>,
-    pub(super) training_rules: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

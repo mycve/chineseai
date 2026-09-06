@@ -536,10 +536,16 @@ fn az_loop_progress_path(config_path: &str) -> PathBuf {
 }
 
 fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "{config_path}.replay.v{}.lz4",
-        chineseai::version::REPLAY_FILE_VERSION
-    ))
+    // 保持已部署的快照路径稳定，内容版本由文件头识别。
+    PathBuf::from(format!("{config_path}.replay.v38.lz4"))
+}
+
+fn warmup_missing_samples(resumed_model: bool, replay_samples: usize, target: usize) -> usize {
+    if resumed_model {
+        0
+    } else {
+        target.saturating_sub(replay_samples)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1166,7 +1172,8 @@ fn build_async_training_report(
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
-        terminal_cycle_cutoff: pending.selfplay.terminal.cycle_cutoff,
+        terminal_rule_draw_repetition: pending.selfplay.terminal.rule_draw_repetition,
+        terminal_rule_draw_natural_limit: pending.selfplay.terminal.rule_draw_natural_limit,
     }
 }
 
@@ -2222,7 +2229,14 @@ fn main() {
                 / config.selfplay_samples_per_update.max(1) as f32;
             let replay_update_span =
                 config.replay_capacity as f32 / config.selfplay_samples_per_update.max(1) as f32;
-            let warmup_update_span = config.train_warmup_samples as f32
+            let warmup_update_span = warmup_missing_samples(
+                resumed_model,
+                replay_pool
+                    .as_ref()
+                    .map(AzExperiencePool::sample_count)
+                    .unwrap_or(0),
+                config.train_warmup_samples,
+            ) as f32
                 / config.selfplay_samples_per_update.max(1) as f32;
             let replay_actor_span = if config.arena_interval > 0 {
                 "promotion-dependent".to_string()
@@ -2246,7 +2260,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} training_rules(cycle_cutoff=3,no_natural_draw) arena_rules(sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(shared_selfplay_arena,repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2485,9 +2499,11 @@ fn main() {
                 .as_ref()
                 .map(AzExperiencePool::sample_count)
                 .unwrap_or(0);
-            let collector_warmup_missing = config
-                .train_warmup_samples
-                .saturating_sub(replay_samples_at_start);
+            let collector_warmup_missing = warmup_missing_samples(
+                resumed_model,
+                replay_samples_at_start,
+                config.train_warmup_samples,
+            );
             let collector_midgame_pool = Arc::clone(&shared_midgame_pool);
             let collector_opening_pool = Arc::clone(&shared_opening_pool);
             println!(
@@ -2497,6 +2513,8 @@ fn main() {
                         "collect {} missing samples to reach {}",
                         collector_warmup_missing, config.train_warmup_samples
                     )
+                } else if resumed_model {
+                    "skipped for resumed model; collect normal selfplay batch".to_string()
                 } else {
                     "skipped".to_string()
                 },
@@ -2729,7 +2747,8 @@ fn main() {
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
                                         terminal_max_plies: 0,
-                                        terminal_cycle_cutoff: 0,
+                                        terminal_rule_draw_repetition: 0,
+                                        terminal_rule_draw_natural_limit: 0,
                                         ..AzLoopReport::default()
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
@@ -2796,7 +2815,8 @@ fn main() {
                                         terminal_rule_win_red: 0,
                                         terminal_rule_win_black: 0,
                                         terminal_max_plies: 0,
-                                        terminal_cycle_cutoff: 0,
+                                        terminal_rule_draw_repetition: 0,
+                                        terminal_rule_draw_natural_limit: 0,
                                         ..AzLoopReport::default()
                                     },
                                     AzNnue::random_with_arch(config.arch(), config.seed),
@@ -3075,11 +3095,11 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "truncation/repetition",
+                    "terminal/draw_repetition",
                     update,
-                    report.terminal_cycle_cutoff as f32,
+                    report.terminal_rule_draw_repetition as f32,
                 );
-                let truncated = report.terminal_cycle_cutoff + report.terminal_max_plies;
+                let truncated = report.terminal_max_plies;
                 let completed = report.red_wins + report.black_wins + report.draws;
                 debug_assert_eq!(completed + truncated, report.games);
                 log_scalar(
@@ -3337,6 +3357,12 @@ fn main() {
                     "terminal/rule_blocked",
                     update,
                     report.terminal_rule_blocked as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/draw_natural_limit",
+                    update,
+                    report.terminal_rule_draw_natural_limit as f32,
                 );
                 log_scalar(
                     &mut tb,
@@ -5403,6 +5429,15 @@ fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
 mod reporting_tests {
     use super::*;
     use chineseai::az::AzSampleMeta;
+
+    #[test]
+    fn resumed_model_does_not_repeat_random_model_warmup() {
+        assert_eq!(warmup_missing_samples(true, 0, 600_000), 0);
+        assert_eq!(warmup_missing_samples(true, 100_000, 600_000), 0);
+        assert_eq!(warmup_missing_samples(false, 0, 600_000), 600_000);
+        assert_eq!(warmup_missing_samples(false, 100_000, 600_000), 500_000);
+        assert_eq!(warmup_missing_samples(false, 700_000, 600_000), 0);
+    }
 
     #[test]
     fn progress_roundtrip_preserves_generated_totals() {

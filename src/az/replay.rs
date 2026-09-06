@@ -687,7 +687,9 @@ impl AzExperiencePool {
             ));
         }
         let ver = LittleEndian::read_u32(&file_blob[4..8]);
-        if ver != REPLAY_FILE_VERSION {
+        // v38 使用训练专用规则。保留策略经验，但不能沿用其价值标签。
+        let migrate_training_rules = ver == 38;
+        if ver != REPLAY_FILE_VERSION && !migrate_training_rules {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("replay unsupported version {ver} (expected v{REPLAY_FILE_VERSION})"),
@@ -700,7 +702,19 @@ impl AzExperiencePool {
             ));
         }
         let inner = Self::decompress_chunked_snapshot(&file_blob[12..])?;
-        Self::decode_replay_payload(&inner, capacity)
+        let mut pool = Self::decode_replay_payload(&inner, capacity)?;
+        if migrate_training_rules {
+            for chunk in &mut pool.chunks {
+                for entry in &mut chunk.entries {
+                    entry.sample.value_weight = 0.0;
+                }
+            }
+            eprintln!(
+                "replay   : migrated v38: retained {} policy samples; disabled old-rule value targets",
+                pool.sample_count
+            );
+        }
+        Ok(pool)
     }
 
     fn decompress_chunked_snapshot(data: &[u8]) -> io::Result<Vec<u8>> {
@@ -770,6 +784,33 @@ impl AzExperiencePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrating_v38_preserves_replay_without_old_rule_value_targets() {
+        let path = std::env::temp_dir().join(format!(
+            "chineseai_replay_rules_migration_{}.lz4",
+            std::process::id()
+        ));
+        let mut pool = AzExperiencePool::new(20);
+        pool.add_games(vec![vec![sample(AzStartSource::Startpos, 5, 42)]]);
+        pool.save_snapshot_lz4(&path).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        LittleEndian::write_u32(&mut bytes[4..8], 38);
+        fs::write(&path, bytes).unwrap();
+        let mut migrated = AzExperiencePool::load_snapshot_lz4(&path, 20).unwrap();
+        assert_eq!(migrated.sample_count(), 1);
+        let old = &migrated.chunks[0].entries[0].sample;
+        assert_eq!(old.value_weight, 0.0);
+        assert_eq!(old.policy_weight, 1.0);
+        assert_eq!(old.meta.game_id, 42);
+        migrated.add_games(vec![vec![sample(AzStartSource::Startpos, 6, 43)]]);
+        migrated.save_snapshot_lz4(&path).unwrap();
+        let restored = AzExperiencePool::load_snapshot_lz4(&path, 20).unwrap();
+        assert_eq!(restored.sample_count(), 2);
+        assert_eq!(restored.chunks[0].entries[0].sample.value_weight, 0.0);
+        assert_eq!(restored.chunks[1].entries[0].sample.value_weight, 1.0);
+        fs::remove_file(path).unwrap();
+    }
 
     fn sample(source: AzStartSource, generation: u32, id: u64) -> AzTrainingSample {
         AzTrainingSample {
