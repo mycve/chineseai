@@ -102,6 +102,7 @@ pub(super) struct PackedBatch {
     pub policy_tactical_indices: Vec<i64>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
+    pub policy_repetition_mask: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
@@ -156,6 +157,7 @@ impl PackedBatch {
             ],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
+            policy_repetition_mask: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
@@ -176,7 +178,7 @@ impl PackedBatch {
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
-                .copy_from_slice(&sample.rule_context);
+                .copy_from_slice(&sample.rule_context.features);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
             let phase = if sample.meta.ply < 40 {
@@ -249,6 +251,8 @@ impl PackedBatch {
                     }
                 }
                 let item_index = policy_base + policy_offset;
+                self.policy_repetition_mask[item_index] =
+                    f32::from(sample.rule_context.repetition_moves.contains(&move_index));
                 self.policy_items[item_index] = pack_policy_item(
                     move_index,
                     consequence_from,
@@ -476,7 +480,7 @@ mod tests {
     fn sample(index: usize) -> AzTrainingSample {
         AzTrainingSample {
             features: vec![index % AZ_NNUE_INPUT_SIZE],
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            rule_context: crate::az::RuleContext::default(),
             move_indices: vec![0, 1],
             policy: vec![1.0 + index as f32, 1.0],
             value_wdl: [1.0, 0.0, 0.0],

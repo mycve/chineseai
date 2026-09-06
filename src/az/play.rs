@@ -15,7 +15,7 @@ use super::alphazero::{
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
     AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
-    rule_context_features, scalar_value_to_wdl_target,
+    scalar_value_to_wdl_target,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1017,7 +1017,16 @@ fn make_training_sample(
         .iter()
         .map(|candidate| candidate.mv)
         .collect::<Vec<_>>();
+    let mut rule_context = super::rule_context_for_moves(position, rule_history, &moves);
     if mirror_file {
+        rule_context.repetition_moves = rule_context
+            .repetition_moves
+            .iter()
+            .map(|&index| {
+                let (from, to) = super::dense_move_squares(index).unwrap();
+                dense_move_index(mirror_file_move(Move::new(from, to)))
+            })
+            .collect();
         mirror_sparse_features_az_canonical_file(&mut features);
         for mv in &mut moves {
             *mv = mirror_file_move(*mv);
@@ -1039,7 +1048,7 @@ fn make_training_sample(
 
     AzTrainingSample {
         features,
-        rule_context: rule_context_features(position, rule_history),
+        rule_context,
         move_indices,
         policy,
         value_wdl: scalar_value_to_wdl_target(value),
@@ -1741,7 +1750,7 @@ mod tests {
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
         AzTrainingSample {
             features: Vec::new(),
-            rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
+            rule_context: crate::az::RuleContext::default(),
             move_indices: Vec::new(),
             policy: Vec::new(),
             value_wdl: scalar_value_to_wdl_target(value),
@@ -1885,6 +1894,29 @@ mod tests {
             }
             assert!((sample.value - (expected[0] - expected[2])).abs() < 1.0e-6);
         }
+    }
+
+    #[test]
+    fn mirrored_repetition_candidate_keeps_history_label() {
+        let (position, history) = crate::az::tests::repetition_fixture();
+        let mv = position.parse_uci_move("c7b9").unwrap();
+        let sample = make_training_sample(
+            &position,
+            &history,
+            &[candidate(mv, 1.0)],
+            0.0,
+            true,
+            AzSampleMeta::default(),
+            1,
+            1.0,
+        );
+        let expected = dense_move_index(canonical_move(
+            position.side_to_move(),
+            mirror_file_move(mv),
+        ));
+        assert_eq!(sample.move_indices, vec![expected]);
+        assert_eq!(sample.rule_context.repetition_moves, vec![expected]);
+        assert_eq!(sample.rule_context[7..], [1.0, 1.0, 1.0]);
     }
 
     #[test]

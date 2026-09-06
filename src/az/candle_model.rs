@@ -33,6 +33,7 @@ pub(super) struct AzCandleModel {
     policy_threat_context: Var,
     policy_move_bias: Var,
     policy_consequence_output: Var,
+    policy_repetition_output: Var,
     policy_context_hidden: Var,
     policy_move_context: Var,
     policy_accumulator_hidden: Var,
@@ -138,7 +139,18 @@ impl AzCandleModel {
             0,
         )?;
         let tactical_logits = tactical_policy(&tactical_table, &batch.policy_tactical_indices)?;
-        let policy_logits = (policy_logits + sparse_logits + tactical_logits)?;
+        let repetition_bonus = hidden
+            .matmul(
+                &self
+                    .policy_repetition_output
+                    .narrow(0, 0, hidden.dim(1)?)?
+                    .reshape((hidden.dim(1)?, 1))?,
+            )?
+            .broadcast_add(&self.policy_repetition_output.narrow(0, hidden.dim(1)?, 1)?)?;
+        let repetition_logits = batch
+            .policy_repetition_mask
+            .broadcast_mul(&repetition_bonus)?;
+        let policy_logits = (policy_logits + sparse_logits + tactical_logits + repetition_logits)?;
 
         Ok(ForwardOutput {
             value_logits,
@@ -161,6 +173,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_tactical_indices: Tensor,
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
+    pub(super) policy_repetition_mask: Tensor,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) rule_context: Tensor,
@@ -222,6 +235,11 @@ impl BatchTensors {
             )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
+            policy_repetition_mask: Tensor::from_vec(
+                packed.policy_repetition_mask,
+                (batch_size, max_policy_moves),
+                device,
+            )?,
             rule_context: Tensor::from_vec(
                 packed.rule_context,
                 (batch_size, RULE_CONTEXT_SIZE),
@@ -302,6 +320,11 @@ impl AzCandleModel {
                 (POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2),
                 device,
             )?,
+            policy_repetition_output: var_from_slice(
+                &model.policy_repetition_output,
+                hidden + 1,
+                device,
+            )?,
             policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_consequence_output: var_from_slice(
                 &model.policy_consequence_output,
@@ -359,6 +382,7 @@ impl AzCandleModel {
         vars.push(self.policy_threat_context.clone());
         vars.push(self.policy_move_bias.clone());
         vars.push(self.policy_consequence_output.clone());
+        vars.push(self.policy_repetition_output.clone());
         vars.push(self.policy_context_hidden.clone());
         vars.push(self.policy_move_context.clone());
         vars.push(self.policy_accumulator_hidden.clone());
@@ -379,6 +403,10 @@ impl AzCandleModel {
             &mut model.input_king_piece_hidden,
         )?;
         copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
+        copy_var(
+            &self.policy_repetition_output,
+            &mut model.policy_repetition_output,
+        )?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
@@ -440,13 +468,64 @@ mod tests {
     use crate::{
         az::{
             AzEvalScratch, AzSampleMeta, AzTrainingSample, POLICY_SPARSE_TABLE_SIZE,
-            RULE_CONTEXT_SIZE, canonical_buckets_for_perspective, dense_move_index,
-            policy_consequence_features, policy_sparse_capture_index, policy_sparse_factor_indices,
-            policy_sparse_main_index,
+            canonical_buckets_for_perspective, dense_move_index, policy_consequence_features,
+            policy_sparse_capture_index, policy_sparse_factor_indices, policy_sparse_main_index,
         },
         nnue::extract_sparse_features_az,
         xiangqi::Position,
     };
+
+    #[test]
+    fn repetition_policy_matches_cpu_and_receives_gradient() {
+        let (position, history) = crate::az::tests::repetition_fixture();
+        let moves = position.legal_moves_with_rules(&history);
+        let context = crate::az::rule_context_for_moves(&position, &history, &moves);
+        let mut model = AzNnue::random(16, 91);
+        model.policy_repetition_output.fill(0.03);
+        let mut cpu = AzEvalScratch::new(model.arch);
+        model.evaluate_with_scratch_output(&position, &moves, &context, &mut cpu);
+        let sample = AzTrainingSample {
+            features: extract_sparse_features_az(&position),
+            rule_context: context,
+            move_indices: moves
+                .iter()
+                .map(|&mv| dense_move_index(crate::az::canonical_move(position.side_to_move(), mv)))
+                .collect(),
+            policy: vec![1.0; moves.len()],
+            value_wdl: [0.0, 1.0, 0.0],
+            value: 0.0,
+            side_sign: -1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 1,
+            meta: AzSampleMeta::default(),
+        };
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&[sample], &[0]), &Device::Cpu)
+                .unwrap();
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let forward = candle.forward(&batch).unwrap();
+        let logits = forward.policy_logits.to_vec2::<f32>().unwrap();
+        for (actual, expected) in logits[0].iter().zip(&cpu.logits) {
+            assert!((actual - expected).abs() < 2e-3, "{actual} vs {expected}");
+        }
+        model.policy_repetition_output.fill(0.0);
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let gradients = candle
+            .forward(&batch)
+            .unwrap()
+            .policy_logits
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let gradient = gradients
+            .get(&candle.policy_repetition_output)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!((gradient[model.hidden_size] - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn candle_and_cpu_policy_consequence_logits_match() {
@@ -487,11 +566,16 @@ mod tests {
         model.rebuild_policy_accumulator_quantization();
 
         let mut cpu = AzEvalScratch::new(model.arch);
-        model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
+        model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &crate::az::RuleContext::default(),
+            &mut cpu,
+        );
 
         let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            rule_context: crate::az::RuleContext::default(),
             move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
             policy: vec![1.0; moves.len()],
             value_wdl: [0.0, 1.0, 0.0],
@@ -598,6 +682,7 @@ mod tests {
             policy_threat_context,
             policy_move_bias,
             policy_consequence_output,
+            policy_repetition_output,
             policy_context_hidden,
             policy_move_context,
             policy_accumulator_hidden,

@@ -10,6 +10,40 @@ enum RuleViolation {
 }
 
 impl Position {
+    /// 调用者提供合法着；仅对命中历史局面的候选着进行精确规则裁决。
+    pub fn repetition_draw_moves(&self, history: &[RuleHistoryEntry], moves: &[Move]) -> Vec<Move> {
+        if history.len() < 4 {
+            return Vec::new();
+        }
+        let mover = self.side_to_move;
+        moves
+            .iter()
+            .copied()
+            .filter(|&mv| {
+                let hash = self.hash_after_move(mv);
+                if !history
+                    .iter()
+                    .any(|entry| entry.hash == hash && entry.side_to_move == mover.opposite())
+                {
+                    return false;
+                }
+                let mut next = self.clone();
+                let captured = self.piece_at(mv.to as usize);
+                next.make_move(mv);
+                let mut next_history = history.to_vec();
+                next_history.push(next.rule_history_entry_after_moved(mover, mv, captured));
+                matches!(
+                    next.rule_outcome_with_history(&next_history),
+                    Some(RuleOutcome::Draw(
+                        RuleDrawReason::Repetition
+                            | RuleDrawReason::MutualLongCheck
+                            | RuleDrawReason::MutualLongChase
+                    ))
+                )
+            })
+            .collect()
+    }
+
     /// 对当前局面裁决一次；进行中的局面直接复用返回的走法。
     pub fn adjudicate_with_history(&self, history: &[RuleHistoryEntry]) -> super::Adjudication {
         let raw_moves = self.legal_moves();

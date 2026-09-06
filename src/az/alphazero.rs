@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzIncrementalEvalRequest, AzNnue,
-    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, rule_context_features,
+    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, rule_context_for_moves,
 };
 
 const DEFAULT_CPUCT: f32 = 1.5;
@@ -593,7 +593,7 @@ struct BatchSimulation {
 struct PendingLeaf {
     simulation: BatchSimulation,
     moves: Vec<Move>,
-    rule_context: [f32; super::RULE_CONTEXT_SIZE],
+    rule_context: crate::az::RuleContext,
     was_in_check: bool,
     cutoff: bool,
 }
@@ -1016,9 +1016,10 @@ impl<'a> AzTree<'a> {
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
-                &rule_context_features(
+                &rule_context_for_moves(
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
+                    &moves,
                 ),
                 &mut self.eval_scratch,
             )
@@ -1418,9 +1419,10 @@ impl<'a> AzTree<'a> {
                     self.finish_batch_simulation(simulation, eval, true);
                     return BatchPrepare::Complete;
                 }
-                let rule_context = rule_context_features(
+                let rule_context = rule_context_for_moves(
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
+                    &moves,
                 );
                 return BatchPrepare::Pending(PendingLeaf {
                     simulation,
@@ -1465,9 +1467,10 @@ impl<'a> AzTree<'a> {
                 let was_in_check = self.nodes[node_index]
                     .position
                     .in_check(self.nodes[node_index].position.side_to_move());
-                let rule_context = rule_context_features(
+                let rule_context = rule_context_for_moves(
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
+                    &moves,
                 );
                 return BatchPrepare::Pending(PendingLeaf {
                     simulation,
@@ -1610,9 +1613,10 @@ impl<'a> AzTree<'a> {
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
-                &rule_context_features(
+                &rule_context_for_moves(
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
+                    &moves,
                 ),
                 &mut self.eval_scratch,
             )

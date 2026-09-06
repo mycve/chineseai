@@ -444,7 +444,7 @@ mod tests {
         let moves = position.legal_moves();
         let sample = AzTrainingSample {
             features: crate::nnue::extract_sparse_features_az(&position),
-            rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
+            rule_context: crate::az::RuleContext::default(),
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))

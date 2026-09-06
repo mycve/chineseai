@@ -83,12 +83,28 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
             "replay encode: move_indices/policy mismatch or too long",
         ));
     }
+    if sample.rule_context.repetition_moves.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
+        || sample
+            .rule_context
+            .repetition_moves
+            .iter()
+            .any(|&index| index >= super::DENSE_MOVE_SPACE)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay encode: invalid repetition moves",
+        ));
+    }
     replay_push_u32(out, sample.features.len() as u32);
     for &f in &sample.features {
         replay_push_u32(out, f as u32);
     }
-    for &value in &sample.rule_context {
+    for &value in &sample.rule_context.features {
         replay_push_f32(out, value);
+    }
+    replay_push_u32(out, sample.rule_context.repetition_moves.len() as u32);
+    for &mv in &sample.rule_context.repetition_moves {
+        replay_push_u32(out, mv as u32);
     }
     replay_push_u32(out, sample.move_indices.len() as u32);
     for &m in &sample.move_indices {
@@ -175,7 +191,12 @@ fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()>
     encode_az_training_sample(out, &entry.sample)
 }
 
+#[cfg(test)]
 fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
+    decode_sample_version(reader, REPLAY_FILE_VERSION)
+}
+
+fn decode_sample_version<R: Read>(reader: &mut R, version: u32) -> io::Result<AzTrainingSample> {
     let nf = replay_read_u32(reader)?;
     if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
         return Err(io::Error::new(
@@ -187,9 +208,33 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     for _ in 0..nf {
         features.push(replay_read_u32(reader)? as usize);
     }
-    let mut rule_context = [0.0; super::RULE_CONTEXT_SIZE];
-    for value in &mut rule_context {
+    let mut rule_context = crate::az::RuleContext::default();
+    let context_size = if version < 40 {
+        7
+    } else {
+        super::RULE_CONTEXT_SIZE
+    };
+    for value in &mut rule_context.features[..context_size] {
         *value = replay_read_f32(reader)?;
+    }
+    if version >= 40 {
+        let count = replay_read_u32(reader)?;
+        if count > REPLAY_MAX_MOVES_PER_SAMPLE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many repetition moves",
+            ));
+        }
+        for _ in 0..count {
+            let mv = replay_read_u32(reader)? as usize;
+            if mv >= DENSE_MOVE_SPACE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid repetition move",
+                ));
+            }
+            rule_context.repetition_moves.push(mv);
+        }
     }
     let nm = replay_read_u32(reader)?;
     if nm > REPLAY_MAX_MOVES_PER_SAMPLE {
@@ -249,8 +294,8 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     })
 }
 
-fn decode_replay_entry<R: Read>(reader: &mut R) -> io::Result<ReplayEntry> {
-    let sample = decode_az_training_sample(reader)?;
+fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
+    let sample = decode_sample_version(reader, version)?;
     Ok(ReplayEntry { sample })
 }
 
@@ -603,7 +648,7 @@ impl AzExperiencePool {
         Ok(out)
     }
 
-    fn decode_replay_payload(data: &[u8], capacity: usize) -> io::Result<Self> {
+    fn decode_replay_payload(data: &[u8], capacity: usize, version: u32) -> io::Result<Self> {
         let mut reader = Cursor::new(data);
         let _stored_capacity = replay_read_u64(&mut reader)? as usize;
         let n_chunks = replay_read_u64(&mut reader)? as usize;
@@ -626,7 +671,7 @@ impl AzExperiencePool {
             }
             let mut entries = Vec::with_capacity(n_entries.min(capacity));
             for _ in 0..n_entries {
-                let entry = decode_replay_entry(&mut reader)?;
+                let entry = decode_replay_entry(&mut reader, version)?;
                 if capacity > 0 {
                     entries.push(entry);
                 }
@@ -689,7 +734,7 @@ impl AzExperiencePool {
         let ver = LittleEndian::read_u32(&file_blob[4..8]);
         // v38 使用训练专用规则。保留策略经验，但不能沿用其价值标签。
         let migrate_training_rules = ver == 38;
-        if ver != REPLAY_FILE_VERSION && !migrate_training_rules {
+        if ver != REPLAY_FILE_VERSION && ver != 39 && !migrate_training_rules {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("replay unsupported version {ver} (expected v{REPLAY_FILE_VERSION})"),
@@ -702,7 +747,7 @@ impl AzExperiencePool {
             ));
         }
         let inner = Self::decompress_chunked_snapshot(&file_blob[12..])?;
-        let mut pool = Self::decode_replay_payload(&inner, capacity)?;
+        let mut pool = Self::decode_replay_payload(&inner, capacity, ver)?;
         if migrate_training_rules {
             for chunk in &mut pool.chunks {
                 for entry in &mut chunk.entries {
@@ -794,9 +839,7 @@ mod tests {
         let mut pool = AzExperiencePool::new(20);
         pool.add_games(vec![vec![sample(AzStartSource::Startpos, 5, 42)]]);
         pool.save_snapshot_lz4(&path).unwrap();
-        let mut bytes = fs::read(&path).unwrap();
-        LittleEndian::write_u32(&mut bytes[4..8], 38);
-        fs::write(&path, bytes).unwrap();
+        write_legacy_snapshot(&path, 38, &sample(AzStartSource::Startpos, 5, 42));
         let mut migrated = AzExperiencePool::load_snapshot_lz4(&path, 20).unwrap();
         assert_eq!(migrated.sample_count(), 1);
         let old = &migrated.chunks[0].entries[0].sample;
@@ -812,10 +855,49 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    fn write_legacy_snapshot(path: &Path, version: u32, sample: &AzTrainingSample) {
+        let mut record = Vec::new();
+        encode_az_training_sample(&mut record, sample).unwrap();
+        assert!(sample.rule_context.repetition_moves.is_empty());
+        let context = 4 + sample.features.len() * 4;
+        record.drain(context + 7 * 4..context + super::super::RULE_CONTEXT_SIZE * 4 + 4);
+        let mut inner = Vec::new();
+        replay_push_u64(&mut inner, 20);
+        replay_push_u64(&mut inner, 1);
+        replay_push_u32(&mut inner, sample.meta.generation_update);
+        replay_push_u64(&mut inner, 1);
+        inner.extend(record);
+        let compressed = compress_prepend_size(&inner);
+        let mut bytes = REPLAY_MAGIC.to_vec();
+        replay_push_u32(&mut bytes, version);
+        bytes.extend(REPLAY_CHUNKED_MARKER);
+        replay_push_u64(&mut bytes, inner.len() as u64);
+        replay_push_u64(&mut bytes, 1);
+        replay_push_u32(&mut bytes, inner.len() as u32);
+        replay_push_u64(&mut bytes, compressed.len() as u64);
+        bytes.extend(compressed);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn v39_value_targets_survive_history_input_upgrade() {
+        let path = std::env::temp_dir().join(format!(
+            "chineseai_replay_history_{}.lz4",
+            std::process::id()
+        ));
+        write_legacy_snapshot(&path, 39, &sample(AzStartSource::Startpos, 5, 42));
+        let pool = AzExperiencePool::load_snapshot_lz4(&path, 20).unwrap();
+        let restored = &pool.chunks[0].entries[0].sample;
+        assert_eq!(restored.value_weight, 1.0);
+        assert_eq!(restored.rule_context[9], 0.0);
+        assert!(restored.rule_context.repetition_moves.is_empty());
+        fs::remove_file(path).unwrap();
+    }
+
     fn sample(source: AzStartSource, generation: u32, id: u64) -> AzTrainingSample {
         AzTrainingSample {
             features: vec![0],
-            rule_context: [0.0; super::super::RULE_CONTEXT_SIZE],
+            rule_context: crate::az::RuleContext::default(),
             move_indices: vec![0],
             policy: vec![1.0],
             value_wdl: [0.0, 1.0, 0.0],
@@ -836,12 +918,22 @@ mod tests {
     #[test]
     fn replay_roundtrip_preserves_start_source() {
         let mut encoded = Vec::new();
-        let original = sample(AzStartSource::OpeningPool, 7, 11);
+        let mut original = sample(AzStartSource::OpeningPool, 7, 11);
+        original.rule_context.features[7..].copy_from_slice(&[1.0, 0.5, 1.0]);
+        original.rule_context.repetition_moves = vec![original.move_indices[0]];
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
         assert_eq!(decoded.meta.start_source, AzStartSource::OpeningPool);
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
+        assert_eq!(
+            decoded.rule_context.features,
+            original.rule_context.features
+        );
+        assert_eq!(
+            decoded.rule_context.repetition_moves,
+            original.rule_context.repetition_moves
+        );
     }
 
     #[test]
