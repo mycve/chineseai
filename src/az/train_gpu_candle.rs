@@ -86,10 +86,16 @@ pub(super) fn train_samples_gpu(
     if stats.samples > 0 {
         let denom = stats.samples as f32;
         stats.loss /= denom;
-        stats.value_loss /= denom;
+        let valid = stats
+            .phase_value
+            .iter()
+            .map(|p| p.samples)
+            .sum::<usize>()
+            .max(1) as f32;
+        stats.value_loss /= valid;
         stats.policy_ce /= denom;
         for value in &mut stats.short_value_ce {
-            *value /= denom;
+            *value /= valid;
         }
     }
     let trainer = model
@@ -237,12 +243,19 @@ impl GpuReplica {
         let value_error = (&value - &batch_tensors.values)?;
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
-        let value_ce = value_ce_per_sample.sum_all()?;
+        let valid_value = batch_tensors
+            .value_weights
+            .gt(0.0)?
+            .to_dtype(candle_core::DType::F32)?;
+        let value_ce = (&value_ce_per_sample * &valid_value)?.sum_all()?;
         let short_value_log_probs = log_softmax(&forward.short_value_logits, 2)?;
         let short_value_probs = short_value_log_probs.exp()?;
         let short_value_ce_per_sample =
             ((&batch_tensors.short_value_wdl * &short_value_log_probs)? * -1.0)?.sum(2)?;
-        let short_value_ce_by_head = short_value_ce_per_sample.sum(0)?.to_vec1::<f32>()?;
+        let short_value_ce_by_head = short_value_ce_per_sample
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
         let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
@@ -292,27 +305,46 @@ impl GpuReplica {
         let short_target_sq = short_target.sqr()?;
         let short_pred_target = (&short_pred * &short_target)?;
         let short_error_sq = short_error.sqr()?;
-        let short_pred_sum = short_pred.sum(0)?.to_vec1::<f32>()?;
-        let short_pred_sq_sum = short_pred_sq.sum(0)?.to_vec1::<f32>()?;
-        let short_target_sum = short_target.sum(0)?.to_vec1::<f32>()?;
-        let short_target_sq_sum = short_target_sq.sum(0)?.to_vec1::<f32>()?;
-        let short_pred_target_sum = short_pred_target.sum(0)?.to_vec1::<f32>()?;
-        let short_error_sq_sum = short_error_sq.sum(0)?.to_vec1::<f32>()?;
+        let short_pred_sum = short_pred
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
+        let short_pred_sq_sum = short_pred_sq
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
+        let short_target_sum = short_target
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
+        let short_target_sq_sum = short_target_sq
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
+        let short_pred_target_sum = short_pred_target
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
+        let short_error_sq_sum = short_error_sq
+            .broadcast_mul(&valid_value.unsqueeze(1)?)?
+            .sum(0)?
+            .to_vec1::<f32>()?;
         let mut metrics = Vec::with_capacity(9 + (3 + 9) * 7);
         metrics.push(loss_sum);
         metrics.push(value_ce);
         metrics.push(policy_ce);
-        metrics.push(value.sum_all()?);
-        metrics.push(value_sq.sum_all()?);
-        metrics.push(batch_tensors.values.sum_all()?);
-        metrics.push(target_sq.sum_all()?);
-        metrics.push(pred_target.sum_all()?);
-        metrics.push(error_sq.sum_all()?);
+        metrics.push((&value * &valid_value)?.sum_all()?);
+        metrics.push((&value_sq * &valid_value)?.sum_all()?);
+        metrics.push((&batch_tensors.values * &valid_value)?.sum_all()?);
+        metrics.push((&target_sq * &valid_value)?.sum_all()?);
+        metrics.push((&pred_target * &valid_value)?.sum_all()?);
+        metrics.push((&error_sq * &valid_value)?.sum_all()?);
         for phase in 0..3 {
             let mask = batch_tensors
                 .value_phase_masks
                 .narrow(1, phase, 1)?
                 .squeeze(1)?;
+            let mask = (&mask * &valid_value)?;
             metrics.push(mask.sum_all()?);
             metrics.push((&value * &mask)?.sum_all()?);
             metrics.push((&value_sq * &mask)?.sum_all()?);
@@ -326,6 +358,7 @@ impl GpuReplica {
                 .value_source_phase_masks
                 .narrow(1, source_phase, 1)?
                 .squeeze(1)?;
+            let mask = (&mask * &valid_value)?;
             metrics.push(mask.sum_all()?);
             metrics.push((&value * &mask)?.sum_all()?);
             metrics.push((&value_sq * &mask)?.sum_all()?);
@@ -370,7 +403,7 @@ impl GpuReplica {
                 target_sq_sum: short_target_sq_sum[head],
                 pred_target_sum: short_pred_target_sum[head],
                 error_sq_sum: short_error_sq_sum[head],
-                samples: batch_tensors.batch_size,
+                samples: phase_value.iter().map(|phase| phase.samples).sum(),
             }),
             value_pred_sum: metrics[3],
             value_pred_sq_sum: metrics[4],
@@ -471,4 +504,96 @@ fn profile_sync(device: &Device) -> CandleResult<()> {
 
 fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::Error {
     candle_core::Error::Msg(format!("dataloader failed: {error:?}"))
+}
+
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[test]
+    fn masked_samples_do_not_pollute_value_monitoring() {
+        let position = crate::xiangqi::Position::startpos();
+        let moves = position.legal_moves();
+        let sample = AzTrainingSample {
+            features: crate::nnue::extract_sparse_features_az(&position),
+            rule_context: Default::default(),
+            move_indices: moves
+                .iter()
+                .map(|&mv| crate::az::dense_move_index(mv))
+                .collect(),
+            policy: vec![1.0; moves.len()],
+            value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            short_value_wdl: [[0.0, 1.0, 0.0]; crate::az::SHORT_VALUE_HEADS],
+            value: 0.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        };
+        let mut masked = sample.clone();
+        masked.value = 1.0;
+        masked.value_wdl = [1.0, 0.0, 0.0];
+        masked.short_value_wdl = [[1.0, 0.0, 0.0]; crate::az::SHORT_VALUE_HEADS];
+        masked.value_weight = 0.0;
+        masked.policy_weight = 0.0;
+        let replica = GpuReplica::new_cpu(&AzNnue::random(16, 20260907)).unwrap();
+        let evaluate = |samples: &[AzTrainingSample]| {
+            let ids: Vec<_> = (0..samples.len()).collect();
+            let batch =
+                BatchTensors::from_packed(PackedBatch::from_indices(samples, &ids), &Device::Cpu)
+                    .unwrap();
+            replica
+                .compute_batch_loss(&batch, samples.len(), 1.0, 1.0, 0.05)
+                .unwrap()
+        };
+        let baseline = evaluate(&[sample.clone()]);
+        let mixed = evaluate(&[sample, masked.clone()]);
+        assert_eq!(
+            mixed
+                .stats
+                .phase_value
+                .iter()
+                .map(|p| p.samples)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            mixed.stats.value_target_sum,
+            baseline.stats.value_target_sum
+        );
+        assert_eq!(
+            mixed.stats.value_error_sq_sum,
+            baseline.stats.value_error_sq_sum
+        );
+        assert_eq!(mixed.stats.short_value[0].samples, 1);
+        assert_eq!(
+            mixed.stats.short_value[0].error_sq_sum,
+            baseline.stats.short_value[0].error_sq_sum
+        );
+        assert!((mixed.stats.value_loss - baseline.stats.value_loss).abs() < 1e-5);
+        assert!(
+            (mixed.loss_tensor.to_scalar::<f32>().unwrap() * 2.0
+                - baseline.loss_tensor.to_scalar::<f32>().unwrap())
+            .abs()
+                < 1e-5
+        );
+        let empty = evaluate(&[masked]);
+        assert_eq!(
+            empty
+                .stats
+                .phase_value
+                .iter()
+                .map(|p| p.samples)
+                .sum::<usize>(),
+            0
+        );
+        assert_eq!(empty.stats.short_value[0].samples, 0);
+        assert_eq!(empty.stats.value_loss, 0.0);
+        assert_eq!(
+            empty.stats.short_value_ce,
+            [0.0; crate::az::SHORT_VALUE_HEADS]
+        );
+    }
 }

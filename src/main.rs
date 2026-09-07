@@ -1037,7 +1037,12 @@ fn build_async_training_report(
 ) -> AzLoopReport {
     let selfplay_samples = pending.selfplay.samples.len();
     let total_seconds = pending.collection_seconds.max(1.0e-6);
-    let train_stat_samples = stats.samples.max(1) as f32;
+    let train_stat_samples = stats
+        .phase_value
+        .iter()
+        .map(|p| p.samples)
+        .sum::<usize>()
+        .max(1) as f32;
     let root_visit_entropy =
         pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
@@ -1102,6 +1107,8 @@ fn build_async_training_report(
         value_calibration,
         phase_value,
         source_phase_value,
+        short_value_ce: stats.short_value_ce,
+        short_value: stats.short_value.map(value_report),
         policy_ce: stats.policy_ce,
         policy_target_entropy: train_source.policy_target_entropy,
         policy_kl: stats.policy_ce - train_source.policy_target_entropy,
@@ -1745,7 +1752,8 @@ fn main() {
                 let mut child = position.clone();
                 child.make_move(mv);
                 let child_legal = child.legal_moves_with_rules(&child_rule_history);
-                let child_nn_q = model.evaluate_value(&child, &child_legal);
+                let child_nn_q =
+                    model.evaluate_value_with_rules(&child, &child_rule_history, &child_legal);
                 let mut verify_limits = search_limits;
                 verify_limits.simulations = verify_sims.max(1);
                 verify_limits.seed = 0;
@@ -2978,32 +2986,37 @@ fn main() {
                     source_phase(2, 1).calibration,
                 );
                 log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
-                log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
-                log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
-                log_scalar(
-                    &mut tb,
-                    "train/value_pred_mean",
-                    update,
-                    report.value_pred_mean,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/value_target_mean",
-                    update,
-                    report.value_target_mean,
-                );
-                log_scalar(&mut tb, "train/value_corr", update, report.value_corr);
-                log_scalar(
-                    &mut tb,
-                    "train/value_calibration",
-                    update,
-                    report.value_calibration,
-                );
+                if report.phase_value.iter().map(|p| p.samples).sum::<usize>() > 0 {
+                    log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
+                    log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
+                    log_scalar(
+                        &mut tb,
+                        "train/value_pred_mean",
+                        update,
+                        report.value_pred_mean,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        "train/value_target_mean",
+                        update,
+                        report.value_target_mean,
+                    );
+                    log_scalar(&mut tb, "train/value_corr", update, report.value_corr);
+                    log_scalar(
+                        &mut tb,
+                        "train/value_calibration",
+                        update,
+                        report.value_calibration,
+                    );
+                }
                 for (phase, name) in ["ply_0_39", "ply_40_119", "ply_120_plus"]
                     .into_iter()
                     .enumerate()
                 {
                     let phase_value = report.phase_value[phase];
+                    if phase_value.samples == 0 {
+                        continue;
+                    }
                     log_scalar(
                         &mut tb,
                         &format!("train/value_{name}_samples"),
@@ -3038,6 +3051,9 @@ fn main() {
                         .enumerate()
                     {
                         let value = report.source_phase_value[source * 3 + phase];
+                        if value.samples == 0 {
+                            continue;
+                        }
                         log_scalar(
                             &mut tb,
                             &format!("value_source/{source_name}_{phase_name}_rmse"),
@@ -3053,6 +3069,35 @@ fn main() {
                     }
                 }
                 log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
+                for (head, horizon) in chineseai::az::SHORT_VALUE_HORIZONS.into_iter().enumerate() {
+                    let value = report.short_value[head];
+                    log_scalar(
+                        &mut tb,
+                        &format!("train/short_value_{horizon}_samples"),
+                        update,
+                        value.samples as f32,
+                    );
+                    if value.samples > 0 {
+                        log_scalar(
+                            &mut tb,
+                            &format!("train/short_value_{horizon}_ce"),
+                            update,
+                            report.short_value_ce[head],
+                        );
+                        log_scalar(
+                            &mut tb,
+                            &format!("train/short_value_{horizon}_rmse"),
+                            update,
+                            value.rmse,
+                        );
+                        log_scalar(
+                            &mut tb,
+                            &format!("train/short_value_{horizon}_corr"),
+                            update,
+                            value.corr,
+                        );
+                    }
+                }
                 log_scalar(&mut tb, "train/policy_kl", update, report.policy_kl);
                 log_scalar(
                     &mut tb,

@@ -1041,6 +1041,8 @@ pub struct AzLoopReport {
     pub value_calibration: f32,
     pub phase_value: [AzPhaseValueReport; 3],
     pub source_phase_value: [AzPhaseValueReport; 9],
+    pub short_value_ce: [f32; SHORT_VALUE_HEADS],
+    pub short_value: [AzPhaseValueReport; SHORT_VALUE_HEADS],
     pub policy_ce: f32,
     pub policy_target_entropy: f32,
     pub policy_kl: f32,
