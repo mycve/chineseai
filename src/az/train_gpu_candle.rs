@@ -240,7 +240,6 @@ impl GpuReplica {
         let value_log_probs = log_softmax(&forward.value_logits, 1)?;
         let value_probs = value_log_probs.exp()?;
         let value = wdl_probs_to_q(&value_probs)?.squeeze(1)?;
-        let value_error = (&value - &batch_tensors.values)?;
         let value_ce_per_sample = ((&batch_tensors.value_wdl * &value_log_probs)? * -1.0)?;
         let value_ce_per_sample = value_ce_per_sample.sum(1)?;
         let valid_value = batch_tensors
@@ -276,16 +275,13 @@ impl GpuReplica {
         let loss_sum = ((weighted_value_loss + weighted_policy_ce)? + weighted_short_value_ce)?;
         let loss_tensor = (&loss_sum / batch_len as f64)?;
 
-        let value_sq = value.sqr()?;
-        let target_sq = batch_tensors.values.sqr()?;
-        let pred_target = value.broadcast_mul(&batch_tensors.values)?;
-        let error_sq = value_error.sqr()?;
         let short_q_weights = Tensor::from_vec(
             vec![1.0f32, 0.0, -1.0],
             (WDL_HEAD_SIZE, 1),
             short_value_probs.device(),
         )?;
         let short_pred = short_value_probs
+            .detach()
             .reshape((
                 batch_tensors.batch_size * super::SHORT_VALUE_HEADS,
                 WDL_HEAD_SIZE,
@@ -329,68 +325,24 @@ impl GpuReplica {
             .broadcast_mul(&valid_value.unsqueeze(1)?)?
             .sum(0)?
             .to_vec1::<f32>()?;
-        let mut metrics = Vec::with_capacity(9 + (3 + 9) * 7);
-        metrics.push(loss_sum);
-        metrics.push(value_ce);
-        metrics.push(policy_ce);
-        metrics.push((&value * &valid_value)?.sum_all()?);
-        metrics.push((&value_sq * &valid_value)?.sum_all()?);
-        metrics.push((&batch_tensors.values * &valid_value)?.sum_all()?);
-        metrics.push((&target_sq * &valid_value)?.sum_all()?);
-        metrics.push((&pred_target * &valid_value)?.sum_all()?);
-        metrics.push((&error_sq * &valid_value)?.sum_all()?);
-        for phase in 0..3 {
-            let mask = batch_tensors
-                .value_phase_masks
-                .narrow(1, phase, 1)?
-                .squeeze(1)?;
-            let mask = (&mask * &valid_value)?;
-            metrics.push(mask.sum_all()?);
-            metrics.push((&value * &mask)?.sum_all()?);
-            metrics.push((&value_sq * &mask)?.sum_all()?);
-            metrics.push((&batch_tensors.values * &mask)?.sum_all()?);
-            metrics.push((&target_sq * &mask)?.sum_all()?);
-            metrics.push((&pred_target * &mask)?.sum_all()?);
-            metrics.push((&error_sq * &mask)?.sum_all()?);
-        }
-        for source_phase in 0..9 {
-            let mask = batch_tensors
-                .value_source_phase_masks
-                .narrow(1, source_phase, 1)?
-                .squeeze(1)?;
-            let mask = (&mask * &valid_value)?;
-            metrics.push(mask.sum_all()?);
-            metrics.push((&value * &mask)?.sum_all()?);
-            metrics.push((&value_sq * &mask)?.sum_all()?);
-            metrics.push((&batch_tensors.values * &mask)?.sum_all()?);
-            metrics.push((&target_sq * &mask)?.sum_all()?);
-            metrics.push((&pred_target * &mask)?.sum_all()?);
-            metrics.push((&error_sq * &mask)?.sum_all()?);
-        }
-        let metrics = Tensor::stack(&metrics, 0)?.to_vec1::<f32>()?;
-        let mut phase_value = [AzValueMomentStats::default(); 3];
-        for (phase_stats, values) in phase_value.iter_mut().zip(metrics[9..30].chunks_exact(7)) {
-            phase_stats.samples = values[0].round().max(0.0) as usize;
-            phase_stats.pred_sum = values[1];
-            phase_stats.pred_sq_sum = values[2];
-            phase_stats.target_sum = values[3];
-            phase_stats.target_sq_sum = values[4];
-            phase_stats.pred_target_sum = values[5];
-            phase_stats.error_sq_sum = values[6];
-        }
-        let mut source_phase_value = [AzValueMomentStats::default(); 9];
-        for (phase_stats, values) in source_phase_value
-            .iter_mut()
-            .zip(metrics[30..].chunks_exact(7))
-        {
-            phase_stats.samples = values[0].round().max(0.0) as usize;
-            phase_stats.pred_sum = values[1];
-            phase_stats.pred_sq_sum = values[2];
-            phase_stats.target_sum = values[3];
-            phase_stats.target_sq_sum = values[4];
-            phase_stats.pred_target_sum = values[5];
-            phase_stats.error_sq_sum = values[6];
-        }
+        let moments = masked_value_moments(
+            &value,
+            &batch_tensors.values,
+            &valid_value,
+            &batch_tensors.value_phase_masks,
+            &batch_tensors.value_source_phase_masks,
+        )?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        let global = moment_stats(&moments[..7]);
+        let phase_value = std::array::from_fn(|i| moment_stats(&moments[(i + 1) * 7..(i + 2) * 7]));
+        let source_phase_value =
+            std::array::from_fn(|i| moment_stats(&moments[(i + 4) * 7..(i + 5) * 7]));
+        let metrics = Tensor::stack(
+            &[loss_sum.detach(), value_ce.detach(), policy_ce.detach()],
+            0,
+        )?
+        .to_vec1::<f32>()?;
         let stats = AzTrainStats {
             loss: metrics[0],
             value_loss: metrics[1],
@@ -405,17 +357,58 @@ impl GpuReplica {
                 error_sq_sum: short_error_sq_sum[head],
                 samples: phase_value.iter().map(|phase| phase.samples).sum(),
             }),
-            value_pred_sum: metrics[3],
-            value_pred_sq_sum: metrics[4],
-            value_target_sum: metrics[5],
-            value_target_sq_sum: metrics[6],
-            value_pred_target_sum: metrics[7],
-            value_error_sq_sum: metrics[8],
+            value_pred_sum: global.pred_sum,
+            value_pred_sq_sum: global.pred_sq_sum,
+            value_target_sum: global.target_sum,
+            value_target_sq_sum: global.target_sq_sum,
+            value_pred_target_sum: global.pred_target_sum,
+            value_error_sq_sum: global.error_sq_sum,
             samples: batch_tensors.batch_size,
             phase_value,
             source_phase_value,
         };
         Ok(BatchLossOutput { loss_tensor, stats })
+    }
+}
+
+fn masked_value_moments(
+    value: &Tensor,
+    target: &Tensor,
+    valid: &Tensor,
+    phases: &Tensor,
+    source_phases: &Tensor,
+) -> CandleResult<Tensor> {
+    let value = value.detach();
+    let target = target.detach();
+    let moments = Tensor::stack(
+        &[
+            value.ones_like()?,
+            value.clone(),
+            value.sqr()?,
+            target.clone(),
+            target.sqr()?,
+            (&value * &target)?,
+            (&value - &target)?.sqr()?,
+        ],
+        1,
+    )?;
+    let valid = valid.unsqueeze(1)?;
+    let masks = Tensor::cat(&[&valid, phases, source_phases], 1)?.broadcast_mul(&valid)?;
+    masks
+        .unsqueeze(2)?
+        .broadcast_mul(&moments.unsqueeze(1)?)?
+        .sum(0)
+}
+
+fn moment_stats(values: &[f32]) -> AzValueMomentStats {
+    AzValueMomentStats {
+        samples: values[0].round().max(0.0) as usize,
+        pred_sum: values[1],
+        pred_sq_sum: values[2],
+        target_sum: values[3],
+        target_sq_sum: values[4],
+        pred_target_sum: values[5],
+        error_sq_sum: values[6],
     }
 }
 
@@ -595,5 +588,64 @@ mod monitoring_tests {
             empty.stats.short_value_ce,
             [0.0; crate::az::SHORT_VALUE_HEADS]
         );
+    }
+    #[test]
+    fn fused_moments_match_scalar_reference_on_cpu_and_cuda() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(cuda) = Device::new_cuda(0) {
+            devices.push(cuda);
+        }
+        for device in devices {
+            for n in [1, 7, 257] {
+                let values = (0..n)
+                    .map(|i| (i % 13) as f32 / 6.0 - 1.0)
+                    .collect::<Vec<_>>();
+                let targets = (0..n)
+                    .map(|i| (i % 17) as f32 / 8.0 - 1.0)
+                    .collect::<Vec<_>>();
+                let valid = (0..n).map(|i| f32::from(i % 4 != 0)).collect::<Vec<_>>();
+                let mut phases = vec![0.0f32; n * 3];
+                let mut sources = vec![0.0f32; n * 9];
+                let mut expected = vec![0.0f64; 13 * 7];
+                for i in 0..n {
+                    let phase = (i / 3) % 3;
+                    let source_phase = (i % 3) * 3 + phase;
+                    phases[i * 3 + phase] = 1.0;
+                    sources[i * 9 + source_phase] = 1.0;
+                    if valid[i] == 0.0 {
+                        continue;
+                    }
+                    let v = values[i];
+                    let t = targets[i];
+                    let moments = [1.0, v, v * v, t, t * t, v * t, (v - t) * (v - t)];
+                    for group in [0, 1 + phase, 4 + source_phase] {
+                        for (column, value) in moments.into_iter().enumerate() {
+                            expected[group * 7 + column] += value as f64;
+                        }
+                    }
+                }
+                let actual = masked_value_moments(
+                    &Tensor::from_vec(values, n, &device).unwrap(),
+                    &Tensor::from_vec(targets, n, &device).unwrap(),
+                    &Tensor::from_vec(valid, n, &device).unwrap(),
+                    &Tensor::from_vec(phases, (n, 3), &device).unwrap(),
+                    &Tensor::from_vec(sources, (n, 9), &device).unwrap(),
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+                for (i, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    if i % 7 == 0 {
+                        assert_eq!(*actual as f64, expected);
+                    }
+                    assert!(
+                        (*actual as f64 - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                        "moment {i}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
     }
 }

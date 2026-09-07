@@ -1160,6 +1160,10 @@ fn build_async_training_report(
         train_policy_target_top1: train_source.policy_target_top1,
         train_policy_target_top2: train_source.policy_target_top2,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
+        terminal_checkmate: pending.selfplay.terminal.checkmate,
+        terminal_stalemate: pending.selfplay.terminal.stalemate,
+        terminal_rule_blocked: pending.selfplay.terminal.rule_blocked,
+        terminal_search_no_move: pending.selfplay.terminal.search_no_move,
         terminal_red_general_missing: pending.selfplay.terminal.red_general_missing,
         terminal_black_general_missing: pending.selfplay.terminal.black_general_missing,
         terminal_rule_draw: pending.selfplay.terminal.rule_draw,
@@ -3340,11 +3344,64 @@ fn main() {
                 );
                 log_scalar(&mut tb, "stats/avg_max_child_q", update, report.avg_best_q);
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
+                // Unknown outcomes remain legacy draw labels; exclude them from completed-game statistics.
+                let truncated = report.terminal_max_plies + report.terminal_search_no_move;
+                let completed = report.games.saturating_sub(truncated);
                 log_scalar(
                     &mut tb,
-                    "terminal/checkmate_no_legal_moves",
+                    "selfplay/completed_games",
                     update,
-                    report.terminal_no_legal_moves as f32,
+                    completed as f32,
+                );
+                if completed > 0 {
+                    log_scalar(
+                        &mut tb,
+                        "selfplay/draw_rate_completed",
+                        update,
+                        report.draws.saturating_sub(truncated) as f32 / completed as f32,
+                    );
+                }
+                if report.games > 0 {
+                    log_scalar(
+                        &mut tb,
+                        "truncation/rate",
+                        update,
+                        truncated as f32 / report.games as f32,
+                    );
+                }
+                log_scalar(
+                    &mut tb,
+                    "train/value_samples",
+                    update,
+                    report
+                        .phase_value
+                        .iter()
+                        .map(|phase| phase.samples)
+                        .sum::<usize>() as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/stalemate",
+                    update,
+                    report.terminal_stalemate as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/rule_blocked",
+                    update,
+                    report.terminal_rule_blocked as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "truncation/search_no_move",
+                    update,
+                    report.terminal_search_no_move as f32,
+                );
+                log_scalar(
+                    &mut tb,
+                    "terminal/checkmate",
+                    update,
+                    report.terminal_checkmate as f32,
                 );
                 log_scalar(
                     &mut tb,
@@ -3366,31 +3423,31 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw_natural_limit",
+                    "terminal/draw_natural_limit",
                     update,
                     report.terminal_rule_draw_natural_limit as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw_insufficient_material",
+                    "terminal/draw_insufficient_material",
                     update,
                     report.terminal_rule_draw_insufficient_material as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw_repetition",
+                    "terminal/draw_repetition",
                     update,
                     report.terminal_rule_draw_repetition as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw_mutual_long_check",
+                    "terminal/draw_mutual_long_check",
                     update,
                     report.terminal_rule_draw_mutual_long_check as f32,
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/rule_draw_mutual_long_chase",
+                    "terminal/draw_mutual_long_chase",
                     update,
                     report.terminal_rule_draw_mutual_long_chase as f32,
                 );
@@ -3408,7 +3465,7 @@ fn main() {
                 );
                 log_scalar(
                     &mut tb,
-                    "terminal/max_plies",
+                    "truncation/max_plies",
                     update,
                     report.terminal_max_plies as f32,
                 );

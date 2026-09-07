@@ -21,6 +21,10 @@ use super::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
     pub no_legal_moves: usize,
+    pub checkmate: usize,
+    pub stalemate: usize,
+    pub rule_blocked: usize,
+    pub search_no_move: usize,
     pub red_general_missing: usize,
     pub black_general_missing: usize,
     pub rule_draw: usize,
@@ -48,8 +52,23 @@ impl AzSearchSimulationStats {
 }
 
 impl AzTerminalStats {
+    fn record_no_legal_moves(&mut self, position: &Position) {
+        self.no_legal_moves += 1;
+        if !position.legal_moves().is_empty() {
+            self.rule_blocked += 1;
+        } else if position.in_check(position.side_to_move()) {
+            self.checkmate += 1;
+        } else {
+            self.stalemate += 1;
+        }
+    }
+
     pub fn add_assign(&mut self, other: &Self) {
         self.no_legal_moves += other.no_legal_moves;
+        self.checkmate += other.checkmate;
+        self.stalemate += other.stalemate;
+        self.rule_blocked += other.rule_blocked;
+        self.search_no_move += other.search_no_move;
         self.red_general_missing += other.red_general_missing;
         self.black_general_missing += other.black_general_missing;
         self.rule_draw += other.rule_draw;
@@ -530,7 +549,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 } else {
                     1.0
                 });
-                terminal.no_legal_moves += 1;
+                terminal.record_no_legal_moves(&position);
                 break;
             }
 
@@ -590,6 +609,7 @@ fn generate_selfplay_chunk_scalar(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                 choose_selfplay_move(&search.candidates, temperature, &mut rng)
             };
             let Some(mv) = mv_opt else {
+                terminal.search_no_move += 1;
                 result = Some(0.0);
                 break;
             };
@@ -897,7 +917,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     } else {
                         1.0
                     });
-                    data.terminal.no_legal_moves += 1;
+                    data.terminal.record_no_legal_moves(&state.position);
                 } else {
                     searched[index] = true;
                 }
@@ -939,6 +959,7 @@ fn generate_selfplay_chunk_batch4(model: &AzNnue, config: &AzLoopConfig) -> AzSe
                     choose_selfplay_move(&search.candidates, temperature, &mut state.rng)
                 };
                 let Some(mv) = mv else {
+                    data.terminal.search_no_move += 1;
                     state.result = Some(0.0);
                     continue;
                 };
@@ -1599,6 +1620,45 @@ mod tests {
             midgame_start_fraction: 0.0,
             mirror_probability: 0.0,
             record_fens: false,
+        }
+    }
+
+    #[test]
+    fn terminal_monitoring_distinguishes_checkmate_stalemate_and_rule_blocking() {
+        let mut stats = AzTerminalStats::default();
+        for (fen, checked) in [
+            ("4k4/3R1R3/9/9/4P4/9/9/9/9/4K4 b - - 0 1", false),
+            ("4k4/3RRR3/9/9/4P4/9/9/9/9/4K4 b - - 0 1", true),
+        ] {
+            let position = Position::from_fen(fen).unwrap();
+            assert!(position.legal_moves().is_empty());
+            assert_eq!(position.in_check(Color::Black), checked);
+            stats.record_no_legal_moves(&position);
+        }
+        stats.record_no_legal_moves(&Position::startpos());
+        let mut merged = AzTerminalStats::default();
+        merged.add_assign(&stats);
+        assert_eq!(merged.no_legal_moves, 3);
+        assert_eq!(merged.checkmate, 1);
+        assert_eq!(merged.stalemate, 1);
+        assert_eq!(merged.rule_blocked, 1);
+    }
+
+    #[test]
+    fn terminal_monitoring_tracks_cutoffs_without_changing_legacy_labels() {
+        let model = AzNnue::random(16, 20260907);
+        let mut config = selfplay_test_config(4);
+        config.max_plies = 1;
+        config.simulations = 2;
+        for data in [
+            generate_selfplay_chunk_scalar(&model, &config),
+            generate_selfplay_chunk_batch4(&model, &config),
+        ] {
+            assert_eq!(data.terminal.max_plies, 4);
+            assert_eq!(data.terminal.search_no_move, 0);
+            assert_eq!(data.draws, 4);
+            assert!(!data.samples.is_empty());
+            assert!(data.samples.iter().all(|sample| sample.value_weight == 1.0));
         }
     }
 
