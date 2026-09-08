@@ -304,7 +304,7 @@ fn play_one_game(
                     cpuct_base_at_root: config.cpuct_base_at_root,
                     cpuct_factor_at_root: config.cpuct_factor_at_root,
                     max_depth: 0,
-                    root_dirichlet_alpha: 0.0,
+                    root_dirichlet_total_concentration: 0.0,
                     root_exploration_fraction: 0.0,
                     fpu_value: config.fpu_value,
                     fpu_value_at_root: config.fpu_value_at_root,

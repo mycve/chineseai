@@ -1005,7 +1005,8 @@ pub struct AzLoopConfig {
     pub cpuct_factor: f32,
     pub cpuct_base_at_root: f32,
     pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
+    /// 动态 Dirichlet 总浓度；alpha = 总浓度 / 根合法走法数，0 关闭噪声。
+    pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,

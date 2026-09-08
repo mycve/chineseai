@@ -494,7 +494,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             cpuct_base_at_root: state.cpuct_base_at_root,
             cpuct_factor_at_root: state.cpuct_factor_at_root,
             max_depth: params.depth.unwrap_or(0),
-            root_dirichlet_alpha: 0.0,
+            root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             fpu_value: state.fpu_value,
             fpu_value_at_root: state.fpu_value_at_root,

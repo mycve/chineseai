@@ -696,7 +696,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.arena_cpuct_at_root),
         f32_slug(config.arena_policy_softmax_temp),
-        f32_slug(config.root_dirichlet_alpha),
+        f32_slug(config.root_dirichlet_total_concentration),
         f32_slug(config.root_exploration_fraction),
         config.seed,
     );
@@ -1007,7 +1007,7 @@ fn build_az_loop_config(
         cpuct_factor: config.cpuct_factor,
         cpuct_base_at_root: config.cpuct_base_at_root,
         cpuct_factor_at_root: config.cpuct_factor_at_root,
-        root_dirichlet_alpha: config.root_dirichlet_alpha,
+        root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
         root_exploration_fraction: config.root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
@@ -1437,7 +1437,7 @@ fn fixed_az_search_limits(
         cpuct_base_at_root: 19652.0,
         cpuct_factor_at_root: 1.5,
         max_depth,
-        root_dirichlet_alpha: 0.0,
+        root_dirichlet_total_concentration: 0.0,
         root_exploration_fraction: 0.0,
         fpu_value: 0.30,
         fpu_value_at_root: 0.20,
@@ -1577,7 +1577,7 @@ fn main() {
                 cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
                 cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
                 max_depth: cmd.max_depth,
-                root_dirichlet_alpha: 0.0,
+                root_dirichlet_total_concentration: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: cmd.fpu_value.max(0.0),
                 fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
@@ -2258,7 +2258,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2288,7 +2288,7 @@ fn main() {
                 config.fpu_value,
                 config.fpu_value_at_root,
                 config.policy_softmax_temp,
-                config.root_dirichlet_alpha,
+                config.root_dirichlet_total_concentration,
                 config.root_exploration_fraction,
                 config.opening_snapshot_path,
                 config.opening_reservoir_capacity,
@@ -2333,8 +2333,8 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(alpha={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
-                config.root_dirichlet_alpha,
+                "explore  : root_noise(total_concentration={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
+                config.root_dirichlet_total_concentration,
                 config.root_exploration_fraction,
                 config.temperature_start,
                 config.temperature_endgame,
@@ -3818,7 +3818,7 @@ fn main() {
                                     cpuct_base_at_root: config.cpuct_base_at_root,
                                     cpuct_factor_at_root: config.cpuct_factor_at_root,
                                     max_depth: config.max_plies,
-                                    root_dirichlet_alpha: 0.0,
+                                    root_dirichlet_total_concentration: 0.0,
                                     root_exploration_fraction: 0.0,
                                     fpu_value: config.fpu_value,
                                     fpu_value_at_root: config.fpu_value_at_root,

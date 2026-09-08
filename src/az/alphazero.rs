@@ -31,7 +31,8 @@ pub struct AzSearchLimits {
     /// Maximum search depth in plies below root. 0 keeps the default:
     /// max_depth = num_simulations.
     pub max_depth: usize,
-    pub root_dirichlet_alpha: f32,
+    /// 动态 Dirichlet 总浓度；alpha = 总浓度 / 根合法走法数，0 关闭噪声。
+    pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
@@ -53,7 +54,7 @@ impl Default for AzSearchLimits {
             cpuct_base_at_root: DEFAULT_CPUCT_BASE,
             cpuct_factor_at_root: DEFAULT_CPUCT_FACTOR,
             max_depth: 0,
-            root_dirichlet_alpha: 0.0,
+            root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
@@ -540,7 +541,7 @@ struct AzTree<'a> {
     cpuct_factor: f32,
     cpuct_base_at_root: f32,
     cpuct_factor_at_root: f32,
-    root_dirichlet_alpha: f32,
+    root_dirichlet_total_concentration: f32,
     root_exploration_fraction: f32,
     root_noise_seed: u64,
     fpu_value: f32,
@@ -891,7 +892,7 @@ impl<'a> AzTree<'a> {
             } else {
                 limits.cpuct_factor.max(0.0)
             },
-            root_dirichlet_alpha: limits.root_dirichlet_alpha.max(0.0),
+            root_dirichlet_total_concentration: limits.root_dirichlet_total_concentration.max(0.0),
             root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
             root_noise_seed: limits.seed,
             fpu_value: limits.fpu_value.max(0.0),
@@ -1041,12 +1042,13 @@ impl<'a> AzTree<'a> {
             )
         };
         if node_index == self.root
-            && self.root_dirichlet_alpha > 0.0
+            && self.root_dirichlet_total_concentration > 0.0
             && self.root_exploration_fraction > 0.0
         {
+            let alpha = self.root_dirichlet_total_concentration / priors.len() as f32;
             apply_root_dirichlet_noise(
                 priors,
-                self.root_dirichlet_alpha,
+                alpha,
                 self.root_exploration_fraction,
                 self.root_noise_seed,
             );
@@ -1522,12 +1524,13 @@ impl<'a> AzTree<'a> {
             &mut self.eval_scratch.priors,
         );
         if node_index == self.root
-            && self.root_dirichlet_alpha > 0.0
+            && self.root_dirichlet_total_concentration > 0.0
             && self.root_exploration_fraction > 0.0
         {
+            let alpha = self.root_dirichlet_total_concentration / priors.len() as f32;
             apply_root_dirichlet_noise(
                 priors,
-                self.root_dirichlet_alpha,
+                alpha,
                 self.root_exploration_fraction,
                 self.root_noise_seed,
             );
@@ -1967,6 +1970,60 @@ mod tests {
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
 
     #[test]
+    fn dynamic_noise_uses_actual_root_move_count() {
+        let position = Position::startpos();
+        let model = AzNnue::random(4, 31);
+        for count in [1, 7, position.legal_moves().len()] {
+            let moves = position.legal_moves()[..count].to_vec();
+            let limits = AzSearchLimits {
+                simulations: 32,
+                root_dirichlet_total_concentration: 8.0,
+                root_exploration_fraction: 0.15,
+                ..AzSearchLimits::default()
+            };
+            let dynamic =
+                alphazero_search_with_rules(&position, None, Some(moves.clone()), &model, limits);
+            let plain = alphazero_search_with_rules(
+                &position,
+                None,
+                Some(moves.clone()),
+                &model,
+                AzSearchLimits {
+                    root_dirichlet_total_concentration: 0.0,
+                    ..limits
+                },
+            );
+            let mut expected: Vec<_> = moves
+                .iter()
+                .map(|mv| {
+                    plain
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.mv == *mv)
+                        .unwrap()
+                        .prior
+                })
+                .collect();
+            apply_root_dirichlet_noise(
+                &mut expected,
+                8.0 / count as f32,
+                limits.root_exploration_fraction,
+                limits.seed,
+            );
+            assert_eq!(dynamic.candidates.len(), count);
+            assert!((dynamic.candidates.iter().map(|c| c.prior).sum::<f32>() - 1.0).abs() < 1e-6);
+            for (mv, expected) in moves.iter().zip(expected) {
+                let actual = dynamic
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.mv == *mv)
+                    .unwrap();
+                assert_eq!(actual.prior, expected);
+            }
+        }
+    }
+
+    #[test]
     fn policy_softmax_temperature_flattens_network_priors() {
         let logits = [2.0, 0.0];
         let mut normal = Vec::new();
@@ -2118,7 +2175,7 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
+                root_dirichlet_total_concentration: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
@@ -2153,7 +2210,7 @@ mod tests {
         let limits = AzSearchLimits {
             simulations: 128,
             seed: 91,
-            root_dirichlet_alpha: 0.12,
+            root_dirichlet_total_concentration: 8.0,
             root_exploration_fraction: 0.1,
             ..AzSearchLimits::default()
         };
@@ -2203,7 +2260,7 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 1,
-                root_dirichlet_alpha: 0.0,
+                root_dirichlet_total_concentration: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
@@ -2232,7 +2289,7 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
+                root_dirichlet_total_concentration: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
@@ -2249,7 +2306,7 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.3,
+                root_dirichlet_total_concentration: 8.0,
                 root_exploration_fraction: 0.25,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
@@ -2286,7 +2343,7 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_alpha: 0.0,
+                root_dirichlet_total_concentration: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
@@ -2320,66 +2377,70 @@ mod tests {
 
     #[test]
     fn four_tree_batch_search_matches_scalar_search() {
-        let model = AzNnue::random(32, 73);
-        let positions = std::array::from_fn(|index| {
-            let mut position = Position::startpos();
-            for ply in 0..index {
-                let legal = position.legal_moves();
-                position.make_move(legal[(index + ply) % legal.len()]);
-            }
-            position
-        });
-        let limits = AzSearchLimits {
-            simulations: 24,
-            seed: 20260817,
-            root_dirichlet_alpha: 0.12,
-            root_exploration_fraction: 0.30,
-            policy_softmax_temp: 3.0,
-            ..AzSearchLimits::default()
-        };
-        let scalar = positions
-            .each_ref()
-            .map(|position| alphazero_search_with_rules(position, None, None, &model, limits));
-        let inputs = positions.map(|position| AzBatchSearchInput {
-            root_moves: position.legal_moves(),
-            rule_history: position.initial_rule_history(),
-            position,
-            limits,
-        });
-        let batched = alphazero_search_batch4(inputs, &model);
+        for total in [0.0, 8.0] {
+            let model = AzNnue::random(32, 73);
+            let positions = std::array::from_fn(|index| {
+                let mut position = Position::startpos();
+                for ply in 0..index {
+                    let legal = position.legal_moves();
+                    position.make_move(legal[(index + ply) % legal.len()]);
+                }
+                position
+            });
+            let limits = AzSearchLimits {
+                simulations: 24,
+                seed: 20260817,
+                root_dirichlet_total_concentration: total,
+                root_exploration_fraction: 0.30,
+                policy_softmax_temp: 3.0,
+                ..AzSearchLimits::default()
+            };
+            let scalar = positions
+                .each_ref()
+                .map(|position| alphazero_search_with_rules(position, None, None, &model, limits));
+            let inputs = positions.map(|position| AzBatchSearchInput {
+                root_moves: position.legal_moves(),
+                rule_history: position.initial_rule_history(),
+                position,
+                limits,
+            });
+            let batched = alphazero_search_batch4(inputs, &model);
 
-        for (scalar, batched) in scalar.iter().zip(&batched) {
-            assert_eq!(scalar.best_move, batched.best_move);
-            assert_eq!(scalar.simulations, batched.simulations);
-            assert_eq!(scalar.candidates.len(), batched.candidates.len());
-            assert_eq!(
-                scalar
-                    .candidates
-                    .iter()
-                    .map(|child| child.visits)
-                    .sum::<u32>(),
-                batched
-                    .candidates
-                    .iter()
-                    .map(|child| child.visits)
-                    .sum::<u32>()
-            );
-            assert!((scalar.value_q - batched.value_q).abs() < 1.0e-5);
-            for candidate in &scalar.candidates {
-                let other = batched
-                    .candidates
-                    .iter()
-                    .find(|other| other.mv == candidate.mv)
-                    .unwrap();
-                assert!((candidate.raw_prior - other.raw_prior).abs() < 1.0e-6);
-                assert!((candidate.prior - other.prior).abs() < 1.0e-6);
+            for (scalar, batched) in scalar.iter().zip(&batched) {
+                assert_eq!(scalar.best_move, batched.best_move);
+                assert_eq!(scalar.simulations, batched.simulations);
+                assert_eq!(scalar.candidates.len(), batched.candidates.len());
+                assert_eq!(
+                    scalar
+                        .candidates
+                        .iter()
+                        .map(|child| child.visits)
+                        .sum::<u32>(),
+                    batched
+                        .candidates
+                        .iter()
+                        .map(|child| child.visits)
+                        .sum::<u32>()
+                );
+                assert!((scalar.value_q - batched.value_q).abs() < 1.0e-5);
+                for candidate in &scalar.candidates {
+                    let other = batched
+                        .candidates
+                        .iter()
+                        .find(|other| other.mv == candidate.mv)
+                        .unwrap();
+                    assert!((candidate.raw_prior - other.raw_prior).abs() < 1.0e-6);
+                    assert!((candidate.prior - other.prior).abs() < 1.0e-6);
+                }
+                if total > 0.0 {
+                    assert!(
+                        scalar
+                            .candidates
+                            .iter()
+                            .any(|candidate| (candidate.raw_prior - candidate.prior).abs() > 1.0e-5)
+                    );
+                }
             }
-            assert!(
-                scalar
-                    .candidates
-                    .iter()
-                    .any(|candidate| (candidate.raw_prior - candidate.prior).abs() > 1.0e-5)
-            );
         }
     }
 
@@ -2438,7 +2499,7 @@ mod tests {
         });
         let limits = AzSearchLimits {
             simulations: 512,
-            root_dirichlet_alpha: 0.0,
+            root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             ..AzSearchLimits::default()
         };

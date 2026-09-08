@@ -44,7 +44,8 @@ pub struct AzLoopFileConfig {
     pub cpuct_factor: f32,
     pub cpuct_base_at_root: f32,
     pub cpuct_factor_at_root: f32,
-    pub root_dirichlet_alpha: f32,
+    /// 动态 Dirichlet 总浓度；alpha = 总浓度 / 根合法走法数，0 关闭噪声。
+    pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
@@ -129,12 +130,12 @@ impl Default for AzLoopFileConfig {
             cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
             cpuct_factor_at_root: 1.5,
-            root_dirichlet_alpha: 0.12,
+            root_dirichlet_total_concentration: 8.0,
             root_exploration_fraction: 0.08,
-            fpu_value: 0.20,
-            fpu_value_at_root: 0.10,
+            fpu_value: 0.15,
+            fpu_value_at_root: 0.05,
             draw_score: 0.0,
-            policy_softmax_temp: 1.15,
+            policy_softmax_temp: 1.30,
             value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
             opening_start_fraction: 0.30,
             opening_reservoir_capacity: 50_000,
@@ -244,7 +245,10 @@ impl AzLoopFileConfig {
         line!("cpuct_factor", f(self.cpuct_factor));
         line!("cpuct_base_at_root", f(self.cpuct_base_at_root));
         line!("cpuct_factor_at_root", f(self.cpuct_factor_at_root));
-        line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
+        line!(
+            "root_dirichlet_total_concentration",
+            f(self.root_dirichlet_total_concentration)
+        );
         line!(
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
@@ -397,7 +401,7 @@ impl AzLoopFileConfig {
         self.cpuct_factor = self.cpuct_factor.max(0.0);
         self.cpuct_base_at_root = self.cpuct_base_at_root.max(1.0);
         self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
-        self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
+        self.root_dirichlet_total_concentration = self.root_dirichlet_total_concentration.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
@@ -477,6 +481,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dynamic_dirichlet_config_roundtrips() {
+        let config = AzLoopFileConfig {
+            root_dirichlet_total_concentration: 8.0,
+            ..AzLoopFileConfig::default()
+        };
+        let restored: AzLoopFileConfig = toml::from_str(&config.to_file_text()).unwrap();
+        assert_eq!(restored.root_dirichlet_total_concentration, 8.0);
+    }
+
+    #[test]
     fn config_writer_uses_short_float_literals() {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
@@ -497,12 +511,12 @@ mod tests {
         assert!(text.contains("cpuct_factor = 1.5\n"));
         assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
         assert!(text.contains("cpuct_factor_at_root = 1.5\n"));
-        assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
+        assert!(text.contains("root_dirichlet_total_concentration = 8.0\n"));
         assert!(text.contains("root_exploration_fraction = 0.08\n"));
-        assert!(text.contains("fpu_value = 0.2\n"));
-        assert!(text.contains("fpu_value_at_root = 0.1\n"));
+        assert!(text.contains("fpu_value = 0.15\n"));
+        assert!(text.contains("fpu_value_at_root = 0.05\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("policy_softmax_temp = 1.15\n"));
+        assert!(text.contains("policy_softmax_temp = 1.3\n"));
         assert!(text.contains("value_td_lambda = 1.0\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_start_fraction = 0.3\n"));
@@ -590,6 +604,8 @@ mod tests {
     #[test]
     fn removed_config_names_are_rejected() {
         for removed in [
+            "root_dirichlet_alpha = 0.2\n",
+            "persistent_exploration_root_dirichlet_alpha = 0.15\n",
             "selfplay_update_warmup_updates = 5\n",
             "opening_temperature = 1.25\n",
             "replay_recent_window_updates = 5000\n",
@@ -606,7 +622,6 @@ mod tests {
             "arena_pikafish_games = 20\n",
             "persistent_exploration_fraction = 0.1\n",
             "persistent_exploration_temperature = 0.8\n",
-            "persistent_exploration_root_dirichlet_alpha = 0.15\n",
             "persistent_exploration_root_exploration_fraction = 0.35\n",
             "resign_percentage = 1.0\n",
             "resign_playthrough = 20.0\n",
