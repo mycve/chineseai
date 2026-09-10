@@ -7,6 +7,9 @@
 ```powershell
 cargo run --profile fast --bin az-discover -- --threads 16 mine best.safetensors eval/discovery-run --games 1024 --rollouts 16
 cargo run --profile fast --bin az-discover -- fit eval/discovery-run eval/discovery-fit --samples 100000 --hard-fraction 0.05 --max-repeats 32
+cargo run --profile fast --bin az-discover -- expand eval/discovery-run eval/discovery-value --games-per-branch 8
+cargo run --profile fast --bin az-discover -- fit eval/discovery-value eval/discovery-value-fit
+cargo run --profile fast --bin az-discover -- check eval/discovery-value eval/discovery-value-fit/joint.safetensors
 ```
 
 输出目录必须不存在，避免覆盖数据。采集目录保存源权重副本、SQLite 审计记录以及普通和困难样本的训练、验证快照。只有完整采集结束的数据集可以补训；缺少任意训练或验证分组时，补训会拒绝运行。
@@ -29,10 +32,18 @@ cargo run --profile fast --bin az-discover -- fit eval/discovery-run eval/discov
 
 两组从同一源权重开始，使用相同样本数、学习率和随机种子。实验组替换至多 5% 普通样本，且每个困难样本最多重复 32 次；实际比例可能小于 5%。两组都从新优化器状态开始，不是原线上训练的完整恢复。
 
+`expand` 从接受位置的原选招和候选招分别重新续弈，每步 1,600 次模拟，保存完整历史和实际终局。两侧使用配对种子；同一位置的同一分支只生成一次，每个分支默认八盘。不筛除失败分支，每四步记录一个价值样本；未结束对局不生成价值标签。标签随当前执棋方转换胜负方向，策略权重为零。整盘分组继承来源局面，训练数据中与任何验证样本相同的棋盘特征再次剔除。
+
+含有轨迹数据时，`fit` 增加第三组 `joint`，在策略组的相同样本基础上，用价值样本填充剩余替换配额。每个轨迹棋盘最多保留八条终局观测，价值样本不重复抽取，总替换比例仍不超过 5%。`control`、`experiment`、`joint` 分别隔离普通训练、策略补训和增加价值补训的效果。续弈价值误差报告是对实际终局 Q 的平均绝对误差，同盘观测相关，不能当作独立样本量或客观棋力真值。
+
+`check` 默认只检查预留组。只有确认整批数据从未被待测模型用于训练时，才能用 `--independent-all --exclude-training 补训数据目录` 检查全部接受位置并剔除与普通、困难、价值训练池重合的棋盘；该选项不改变筛选阈值。位置可能对应多个候选，候选选择计数的分母是候选对数，不是独立局面数。
+
 `report.txt` 报告未参与训练的策略交叉熵，并从数据库重放完整历史，统计 400/1,600 次搜索对未见困难候选的选择数量。该指标下降不等于棋力提升；后续必须做固定旧基线对局、未见局面搜索测试，并检查普通局面退步。不能依据困难训练集拟合程度直接上线。
 
 ## 数据溯源
 
 SQLite 的 `positions` 保存来源盘号、训练/验证分组、FEN 和从标准初始局面走到该位置的完整着法序列。复核应重放序列并设置相同规则，不能只用 FEN 丢弃历史。`pairs` 保存搜索差值、终局配对下界与接受状态；`rollouts` 保存逐局得分，空值表示未结束。
+
+扩展数据另存于新目录，`trajectories` 保存来源位置、分支、种子、取样起点、完整着法和实际终局（红胜 1、黑胜 -1、和棋 0、未结束为空）。`value.lz4` 和 `value-validation.lz4` 保存对应价值样本。
 
 采集用额外预算；本工具不声称与主搜索等预算。默认应在独立资源或离线运行，先验证收益再安排线上计算份额。
