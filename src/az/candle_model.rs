@@ -447,9 +447,9 @@ impl AzCandleModel {
         copy_var(&self.policy_sparse_table, &mut model.policy_sparse_table)?;
         copy_var(&self.policy_sparse_factor, &mut model.policy_sparse_factor)?;
         copy_var(&self.policy_tactical, &mut model.policy_tactical)?;
-        model.rebuild_value_threat_quantization();
+        model.rebuild_value_threat();
         model.rebuild_policy_tactical();
-        model.rebuild_policy_accumulator_quantization();
+        model.rebuild_policy_cache();
         Ok(())
     }
 }
@@ -481,6 +481,99 @@ mod tests {
         nnue::extract_sparse_features_az,
         xiangqi::Position,
     };
+
+    #[test]
+    #[ignore = "需要 AZ_AUDIT_MODEL 与 AZ_AUDIT_SQLITE，检查实训权重的量化误差"]
+    fn trained_model_inference_audit() {
+        let path = std::env::var("AZ_AUDIT_MODEL").unwrap();
+        let model = AzNnue::load(&path).unwrap();
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let conn = rusqlite::Connection::open(std::env::var("AZ_AUDIT_SQLITE").unwrap()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT fen FROM pikafish_labels ORDER BY id")
+            .unwrap();
+        let fens = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        let (mut count, mut changed, mut kl, mut q_mae, mut max_q) = (0, 0, 0.0f32, 0.0f32, 0.0f32);
+        let (mut total, mut terminal) = (0, 0);
+        for fen in fens {
+            let position = Position::from_fen(&fen.unwrap()).unwrap();
+            let history = position.initial_rule_history();
+            total += 1;
+            if position.rule_outcome_with_history(&history).is_some() {
+                terminal += 1;
+                continue;
+            }
+            if count >= 256 {
+                continue;
+            }
+            let moves = position.legal_moves_with_rules(&history);
+            if moves.is_empty() {
+                continue;
+            }
+            let context = crate::az::rule_context_features(&position, &history);
+            let mut cpu = AzEvalScratch::new(model.arch);
+            let output = model.evaluate_with_scratch_output(&position, &moves, &context, &mut cpu);
+            let sample = AzTrainingSample {
+                features: extract_sparse_features_az(&position),
+                rule_context: context,
+                move_indices: moves
+                    .iter()
+                    .map(|&mv| {
+                        dense_move_index(crate::nnue::canonical_move(position.side_to_move(), mv))
+                    })
+                    .collect(),
+                policy: vec![1.0 / moves.len() as f32; moves.len()],
+                value_wdl: [0.0, 1.0, 0.0],
+                root_search_wdl: [0.0, 1.0, 0.0],
+                short_value_wdl: [[0.0, 1.0, 0.0]; crate::az::SHORT_VALUE_HEADS],
+                value: 0.0,
+                side_sign: 1.0,
+                policy_weight: 1.0,
+                value_weight: 1.0,
+                search_simulations: 1,
+                meta: AzSampleMeta::default(),
+            };
+            let packed = PackedBatch::from_indices(&[sample], &[0]);
+            let batch = BatchTensors::from_packed(packed, &Device::Cpu).unwrap();
+            let forward = candle.forward(&batch).unwrap();
+            let policy = candle_nn::ops::softmax(&forward.policy_logits, 1)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let cpu_logits =
+                Tensor::from_vec(cpu.logits.clone(), (1, cpu.logits.len()), &Device::Cpu).unwrap();
+            let cpu_policy = candle_nn::ops::softmax(&cpu_logits, 1)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0
+            };
+            changed += usize::from(argmax(&policy[0]) != argmax(&cpu_policy[0]));
+            for (&p, &q) in policy[0].iter().zip(&cpu_policy[0]) {
+                kl += p * (p.max(1e-30) / q.max(1e-30)).ln();
+            }
+            let err = (wdl[0][0] - wdl[0][2] - output.value).abs();
+            assert!(err.is_finite());
+            q_mae += err;
+            max_q = max_q.max(err);
+            count += 1;
+        }
+        assert!(count > 0);
+        println!(
+            "AUDIT model={path} total={total} terminal={terminal} count={count} top1_changed={changed} policy_kl={} q_mae={} q_max={max_q}",
+            kl / count as f32,
+            q_mae / count as f32
+        );
+    }
 
     #[test]
     fn candle_and_cpu_policy_consequence_logits_match() {
@@ -518,7 +611,7 @@ mod tests {
                     ((index + factor_offset) as f32 % 37.0) * 0.001;
             }
         }
-        model.rebuild_policy_accumulator_quantization();
+        model.rebuild_policy_cache();
 
         let mut cpu = AzEvalScratch::new(model.arch);
         model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);

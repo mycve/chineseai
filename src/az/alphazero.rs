@@ -529,7 +529,7 @@ struct AzTree<'a> {
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
-    root_policy_accumulators: [[i16; POLICY_ACCUMULATOR_RANK]; 2],
+    root_policy_accumulators: [[f32; POLICY_ACCUMULATOR_RANK]; 2],
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
     root_raw_priors: Vec<f32>,
@@ -562,7 +562,7 @@ struct AzTree<'a> {
 struct AzNode {
     position: Position,
     accumulator_offset: u32,
-    policy_accumulator: [i16; POLICY_ACCUMULATOR_RANK],
+    policy_accumulator: [f32; POLICY_ACCUMULATOR_RANK],
     parent: u32,
     incoming_move: Option<Move>,
     rule_entry: Option<RuleHistoryEntry>,
@@ -834,8 +834,8 @@ impl<'a> AzTree<'a> {
         let accumulator = AzEvalAccumulator::new(model, &position);
         accumulator_arena.extend_from_slice(&accumulator.into_hidden_sum());
         let root_policy_accumulators = [
-            model.quantized_policy_accumulator(&position, Color::Red),
-            model.quantized_policy_accumulator(&position, Color::Black),
+            model.policy_accumulator(&position, Color::Red),
+            model.policy_accumulator(&position, Color::Black),
         ];
         let root_accumulator_offset = match position.side_to_move() {
             Color::Red => 0,
@@ -1185,7 +1185,7 @@ impl<'a> AzTree<'a> {
                         perspective,
                         accumulator,
                     );
-                    self.model.apply_quantized_policy_transition(
+                    self.model.apply_policy_transition(
                         &self.nodes[grandparent].position,
                         &self.nodes[node_index].position,
                         parent_move,
@@ -1205,7 +1205,7 @@ impl<'a> AzTree<'a> {
                     perspective,
                     accumulator,
                 );
-                self.model.apply_quantized_policy_transition(
+                self.model.apply_policy_transition(
                     &self.nodes[node_index].position,
                     &child_position,
                     mv,
@@ -1307,7 +1307,7 @@ impl<'a> AzTree<'a> {
                 perspective,
                 accumulator,
             );
-            self.model.apply_quantized_policy_transition(
+            self.model.apply_policy_transition(
                 &self.nodes[grandparent].position,
                 &self.nodes[node_index].position,
                 parent_move,
@@ -1327,7 +1327,7 @@ impl<'a> AzTree<'a> {
             perspective,
             accumulator,
         );
-        self.model.apply_quantized_policy_transition(
+        self.model.apply_policy_transition(
             &self.nodes[node_index].position,
             &child_position,
             mv,
