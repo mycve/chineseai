@@ -58,10 +58,6 @@ pub struct AzLoopFileConfig {
     pub midgame_start_fraction: f32,
     pub midgame_reservoir_capacity: usize,
     pub midgame_snapshot_path: String,
-    pub actor_publish_interval_updates: usize,
-    /// actor 得分率允许的非劣界限；同时对当前 actor、best 和历史对手检查。
-    pub actor_noninferiority_margin: f32,
-    pub actor_gate_min_games: usize,
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_games: u32,
@@ -146,9 +142,6 @@ impl Default for AzLoopFileConfig {
             midgame_start_fraction: 0.40,
             midgame_reservoir_capacity: 50_000,
             midgame_snapshot_path: "midgame-pool.lz4".into(),
-            actor_publish_interval_updates: 5,
-            actor_noninferiority_margin: 0.02,
-            actor_gate_min_games: 400,
             replay_capacity: 2400000,
             replay_recent_sample_fraction: 0.35,
             replay_recent_games: 7500,
@@ -275,15 +268,6 @@ impl AzLoopFileConfig {
             self.midgame_reservoir_capacity
         );
         line!("midgame_snapshot_path", q(&self.midgame_snapshot_path));
-        line!(
-            "actor_publish_interval_updates",
-            self.actor_publish_interval_updates
-        );
-        line!(
-            "actor_noninferiority_margin",
-            f(self.actor_noninferiority_margin)
-        );
-        line!("actor_gate_min_games", self.actor_gate_min_games);
         line!("replay_capacity", self.replay_capacity);
         line!(
             "replay_recent_sample_fraction",
@@ -429,10 +413,6 @@ impl AzLoopFileConfig {
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
-        self.actor_publish_interval_updates = self.actor_publish_interval_updates.max(1);
-        assert!(self.actor_noninferiority_margin.is_finite());
-        self.actor_noninferiority_margin = self.actor_noninferiority_margin.clamp(0.0, 0.05);
-        self.actor_gate_min_games = self.actor_gate_min_games.max(2);
         let mut replay_phase_fractions = [
             self.replay_phase_0_29_fraction.max(0.0),
             self.replay_phase_30_59_fraction.max(0.0),
@@ -538,7 +518,6 @@ mod tests {
         assert!(text.contains("midgame_start_fraction = 0.4\n"));
         assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
         assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
-        assert!(text.contains("actor_publish_interval_updates = 5\n"));
         assert!(text.contains("simulations = 400\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
@@ -617,6 +596,9 @@ mod tests {
     #[test]
     fn removed_config_names_are_rejected() {
         for removed in [
+            "actor_publish_interval_updates = 5\n",
+            "actor_noninferiority_margin = 0.02\n",
+            "actor_gate_min_games = 400\n",
             "root_dirichlet_alpha = 0.2\n",
             "persistent_exploration_root_dirichlet_alpha = 0.15\n",
             "selfplay_update_warmup_updates = 5\n",

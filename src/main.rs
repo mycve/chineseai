@@ -880,44 +880,6 @@ fn shuffle_positions(positions: &mut [Position], rng: &mut SplitMix64) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActorGateDecision {
-    Publish,
-    Hold,
-    Reject,
-}
-
-fn actor_gate_decision(
-    champion_decision: ArenaGateDecision,
-    reports: &[&AzArenaReport],
-    margin: f32,
-    confidence_z: f32,
-    min_games: usize,
-) -> ActorGateDecision {
-    if champion_decision == ArenaGateDecision::Reject {
-        return ActorGateDecision::Reject;
-    }
-    let floor = 0.5 - margin;
-    if reports.is_empty() || !floor.is_finite() || !confidence_z.is_finite() || confidence_z <= 0.0
-    {
-        return ActorGateDecision::Hold;
-    }
-    if reports
-        .iter()
-        .any(|r| r.total_games() >= min_games && r.score_rate_upper_bound(confidence_z) < floor)
-    {
-        return ActorGateDecision::Reject;
-    }
-    // 不能把“尚未证实退步”当成非劣：样本不足或下界未过线都保留原 actor。
-    if reports
-        .iter()
-        .any(|r| r.total_games() < min_games || !(r.score_rate_lower_bound(confidence_z) >= floor))
-    {
-        return ActorGateDecision::Hold;
-    }
-    ActorGateDecision::Publish
-}
-
 fn prune_old_checkpoints(
     model_path: &str,
     checkpoint_dir: &str,
@@ -2160,9 +2122,7 @@ fn main() {
             };
             let selfplay_model = model.clone();
             println!("selfplay : start from raw model");
-            let initial_arena_reference_model = if config.arena_interval == 0 {
-                selfplay_model.clone()
-            } else {
+            let initial_arena_reference_model = {
                 if !best_path.exists() {
                     save_model(&selfplay_model, &best_path);
                 }
@@ -2179,22 +2139,11 @@ fn main() {
                 }
                 reference
             };
-            let initial_selfplay_model = if config.arena_interval > 0 {
-                println!(
-                    "selfplay : actor starts from champion; gate every {} updates floor={:.3} z={} min_games={} per baseline",
-                    config.arena_interval,
-                    0.5 - config.actor_noninferiority_margin,
-                    config.arena_promotion_confidence_z,
-                    config.actor_gate_min_games
-                );
-                initial_arena_reference_model.clone()
-            } else {
-                println!(
-                    "selfplay : ungated actor (arena disabled); publish every {} updates",
-                    config.actor_publish_interval_updates
-                );
-                selfplay_model.clone()
-            };
+            let initial_selfplay_model = initial_arena_reference_model.clone();
+            println!("selfplay : starts from best; publish only after promotion");
+            if config.arena_interval == 0 {
+                println!("selfplay : arena disabled; best remains fixed");
+            }
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -2287,12 +2236,9 @@ fn main() {
             let warmup_update_span = config.train_warmup_samples as f32
                 / config.selfplay_samples_per_update.max(1) as f32;
             let replay_actor_span = if config.arena_interval > 0 {
-                "gate-dependent".to_string()
+                "promotion-dependent"
             } else {
-                format!(
-                    "{:.1}",
-                    replay_update_span / config.actor_publish_interval_updates.max(1) as f32
-                )
+                "fixed-best"
             };
 
             println!(
@@ -2395,9 +2341,9 @@ fn main() {
                 config.opening_reservoir_capacity,
                 config.midgame_reservoir_capacity,
                 if config.arena_interval > 0 {
-                    format!("noninferiority/{}updates", config.arena_interval)
+                    "promotion-only"
                 } else {
-                    format!("{}updates", config.actor_publish_interval_updates)
+                    "fixed-best"
                 }
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
@@ -2445,18 +2391,11 @@ fn main() {
             } else {
                 println!("champion : loaded history={}", champion_paths.len());
             }
-            let initial_actor_update = if config.arena_interval > 0 {
-                champion_paths
-                    .last()
-                    .and_then(|path| checkpoint_number(path))
-                    .unwrap_or(start_update.saturating_sub(1) as u64)
-            } else {
-                start_update.saturating_sub(1) as u64
-            }
-            .min(u32::MAX as u64) as u32;
-            let mut actor_published_update = initial_actor_update as usize;
-            let mut actor_reference_model = initial_selfplay_model.clone();
-            let mut actor_is_champion = config.arena_interval > 0;
+            let initial_actor_update = champion_paths
+                .last()
+                .and_then(|path| checkpoint_number(path))
+                .unwrap_or(start_update.saturating_sub(1) as u64)
+                .min(u32::MAX as u64) as u32;
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: start_update.saturating_sub(1) as u64,
                 learner_update: initial_actor_update,
@@ -3522,8 +3461,6 @@ fn main() {
                     update,
                     report.terminal_max_plies as f32,
                 );
-                let mut publish_actor = config.arena_interval == 0
-                    && update.is_multiple_of(config.actor_publish_interval_updates);
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
                         let (pause_lock, _) = &*selfplay_pause;
@@ -3561,9 +3498,6 @@ fn main() {
                             .split_off(current_count.saturating_add(previous_count));
                         let previous_positions = arena_start_positions.split_off(current_count);
                         let current_positions = arena_start_positions;
-                        let actor_due = update.saturating_sub(actor_published_update)
-                            >= config.actor_publish_interval_updates;
-                        let actor_positions = current_positions.clone();
                         let candidate = Arc::new(deployed_model.clone());
                         let run_gate_match =
                             |baseline: Arc<AzNnue>, positions: Vec<Position>, seed_salt: u64| {
@@ -3635,71 +3569,6 @@ fn main() {
                             config.arena_promotion_confidence_z,
                         );
                         let promoted = gate_decision == ArenaGateDecision::Promote;
-                        if actor_due {
-                            let actor_arena = if !actor_is_champion
-                                && gate_decision != ArenaGateDecision::Reject
-                            {
-                                Some(run_gate_match(
-                                    Arc::new(actor_reference_model.clone()),
-                                    actor_positions,
-                                    0xC6BC_2796_92B5_CC83,
-                                ))
-                            } else {
-                                None
-                            };
-                            let mut baselines = vec![&current_arena];
-                            baselines.extend(previous_arena.as_ref());
-                            baselines.extend(anchor_arena.as_ref());
-                            baselines.extend(actor_arena.as_ref());
-                            let decision = actor_gate_decision(
-                                gate_decision,
-                                &baselines,
-                                config.actor_noninferiority_margin,
-                                config.arena_promotion_confidence_z,
-                                config.actor_gate_min_games,
-                            );
-                            publish_actor = decision == ActorGateDecision::Publish;
-                            let worst_lower = baselines
-                                .iter()
-                                .map(|r| {
-                                    r.score_rate_lower_bound(config.arena_promotion_confidence_z)
-                                })
-                                .fold(1.0f32, f32::min);
-                            println!(
-                                "actor-gate {update}: actor_update={} baselines={} worst_lcb={:.3} floor={:.3} z={} min_games={} decision={:?}",
-                                actor_published_update,
-                                baselines.len(),
-                                worst_lower,
-                                0.5 - config.actor_noninferiority_margin,
-                                config.arena_promotion_confidence_z,
-                                config.actor_gate_min_games,
-                                decision
-                            );
-                            if let Some(report) = actor_arena {
-                                println!(
-                                    "actor-match {update}: games={} rate={:.3} ci={:.3}..{:.3}",
-                                    report.total_games(),
-                                    report.score_rate(),
-                                    report.score_rate_lower_bound(
-                                        config.arena_promotion_confidence_z
-                                    ),
-                                    report.score_rate_upper_bound(
-                                        config.arena_promotion_confidence_z
-                                    )
-                                );
-                            }
-                            log_scalar(
-                                &mut tb,
-                                "actor/published",
-                                update,
-                                if publish_actor { 1.0 } else { 0.0 },
-                            );
-                            log_scalar(&mut tb, "actor/worst_score_lower", update, worst_lower);
-                        }
-                        if publish_actor || promoted {
-                            actor_is_champion = publish_actor && promoted;
-                        }
-
                         if let (Some(index), Some(report)) = (anchor_index, anchor_arena.as_ref()) {
                             if report.score_rate_upper_bound(config.arena_promotion_confidence_z)
                                 < 0.50
@@ -3730,6 +3599,20 @@ fn main() {
                             save_model(&deployed_model, &best_path);
                             champion_paths.push(best_checkpoint.clone());
                             println!("best     : saved {}", best_checkpoint.display());
+                            let updated_numa_models =
+                                build_numa_model_replicas(&deployed_model, &numa_nodes);
+                            let actor_version = {
+                                let mut shared = shared_model
+                                    .write()
+                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+                                shared.models_by_numa_node = updated_numa_models;
+                                shared.version = shared.version.wrapping_add(1);
+                                shared.learner_update = update.min(u32::MAX as usize) as u32;
+                                shared.version
+                            };
+                            println!(
+                                "actor    : published champion update {update} as generation {actor_version}"
+                            );
                         }
                         println!(
                             "arena {update:04}: mode={} positions={} current_games={} pairs={} current_W/L/D={}/{}/{} current_rate={:.3} paired_se={:.4} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} elo_diff={:+.1} elo_ci={:+.1}..{:+.1} best_ref=memory{}",
@@ -3871,24 +3754,6 @@ fn main() {
                         pause_cvar.notify_all();
                     }
                     println!("resume   : selfplay resumed after arena");
-                }
-                if publish_actor {
-                    let updated_numa_models =
-                        build_numa_model_replicas(&deployed_model, &numa_nodes);
-                    let actor_version = {
-                        let mut shared = shared_model
-                            .write()
-                            .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                        shared.models_by_numa_node = updated_numa_models;
-                        shared.version = shared.version.wrapping_add(1);
-                        shared.learner_update = update.min(u32::MAX as usize) as u32;
-                        shared.version
-                    };
-                    actor_reference_model = deployed_model.clone();
-                    actor_published_update = update;
-                    println!(
-                        "actor    : published learner update {update} as generation {actor_version}"
-                    );
                 }
                 if config.pikafish_label_eval_interval > 0
                     && update.is_multiple_of(config.pikafish_label_eval_interval)
@@ -4076,6 +3941,18 @@ fn main() {
                 pause_state.arena_paused = false;
                 pause_cvar.notify_all();
             }
+            // 等待线程前持续排空结果队列，避免满队列让训练及产数线程相互等待。
+            for event in trainer_rx {
+                if exited_after_ctrl_c {
+                    generated_games_total =
+                        generated_games_total.saturating_add(event.report.games as u64);
+                    generated_samples_total =
+                        generated_samples_total.saturating_add(event.report.samples as u64);
+                    interrupt_save_model = Some(event.candidate_model);
+                    interrupt_save_next_update = update.saturating_add(1);
+                    update = update.saturating_add(1);
+                }
+            }
             for handle in selfplay_handles {
                 handle
                     .join()
@@ -4120,17 +3997,6 @@ fn main() {
                     pool.capacity(),
                     midgame_snapshot_path.display()
                 );
-            }
-            if exited_after_ctrl_c {
-                while let Ok(event) = trainer_rx.try_recv() {
-                    generated_games_total =
-                        generated_games_total.saturating_add(event.report.games as u64);
-                    generated_samples_total =
-                        generated_samples_total.saturating_add(event.report.samples as u64);
-                    interrupt_save_model = Some(event.candidate_model);
-                    interrupt_save_next_update = update.saturating_add(1);
-                    update = update.saturating_add(1);
-                }
             }
             if exited_after_ctrl_c || exited_after_target_update {
                 if let Some(model) = interrupt_save_model.as_ref() {
@@ -5736,78 +5602,6 @@ mod reporting_tests {
         assert_eq!(stats.count, 1);
         assert_eq!(stats.legal_bestmove, 1);
         assert_eq!(stats.value_count(), 1);
-    }
-
-    #[test]
-    fn actor_gate_requires_evidence_of_noninferiority() {
-        let equal = AzArenaReport {
-            wins: 2000,
-            losses: 2000,
-            ..AzArenaReport::default()
-        };
-        assert_eq!(
-            actor_gate_decision(ArenaGateDecision::Continue, &[&equal], 0.02, 1.96, 400),
-            ActorGateDecision::Publish
-        );
-        let uncertain = AzArenaReport {
-            wins: 200,
-            losses: 200,
-            ..AzArenaReport::default()
-        };
-        assert_eq!(
-            actor_gate_decision(ArenaGateDecision::Continue, &[&uncertain], 0.02, 1.96, 400),
-            ActorGateDecision::Hold
-        );
-        let too_small = AzArenaReport {
-            draws: 20,
-            ..AzArenaReport::default()
-        };
-        assert_eq!(
-            actor_gate_decision(ArenaGateDecision::Continue, &[&too_small], 0.02, 1.96, 400),
-            ActorGateDecision::Hold
-        );
-        assert_eq!(
-            actor_gate_decision(ArenaGateDecision::Continue, &[], 0.02, 1.96, 400),
-            ActorGateDecision::Hold
-        );
-    }
-
-    #[test]
-    fn actor_gate_checks_every_baseline_even_when_best_promotes() {
-        let improved = AzArenaReport {
-            wins: 2400,
-            losses: 1600,
-            ..AzArenaReport::default()
-        };
-        let regressed = AzArenaReport {
-            wins: 1800,
-            losses: 2200,
-            ..AzArenaReport::default()
-        };
-        for baselines in [&[&improved, &regressed][..], &[&regressed, &improved][..]] {
-            assert_eq!(
-                actor_gate_decision(ArenaGateDecision::Promote, baselines, 0.02, 1.96, 400),
-                ActorGateDecision::Reject
-            );
-        }
-        assert_eq!(
-            actor_gate_decision(ArenaGateDecision::Reject, &[&improved], 0.02, 1.96, 400),
-            ActorGateDecision::Reject
-        );
-    }
-
-    #[test]
-    fn actor_gate_does_not_disable_confidence_checks() {
-        let report = AzArenaReport {
-            wins: 400,
-            ..AzArenaReport::default()
-        };
-        for z in [0.0, f32::NAN, f32::INFINITY] {
-            assert_eq!(
-                actor_gate_decision(ArenaGateDecision::Continue, &[&report], 0.02, z, 400),
-                ActorGateDecision::Hold
-            );
-        }
     }
 
     #[test]

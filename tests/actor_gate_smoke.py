@@ -1,4 +1,4 @@
-"""使用已编译的 fast 主程序验证 actor 发布、拒绝及重启行为。"""
+"""使用已编译的 fast 主程序验证仅晋级发布、保留 best 及重启行为。"""
 
 import hashlib
 import pathlib
@@ -19,8 +19,6 @@ batch_size = 32
 max_plies = 8
 opening_start_fraction = 0.0
 midgame_start_fraction = 0.0
-actor_publish_interval_updates = 1
-actor_noninferiority_margin = 0.02
 arena_interval = 1
 arena_simulations = 8
 arena_promotion_rate = 1.0
@@ -40,31 +38,35 @@ def run(executable, directory, target):
         stderr=subprocess.STDOUT, timeout=90,
     )
     assert result.returncode == 0, result.stdout
-    assert 'promoted=current' not in result.stdout, result.stdout
     return result.stdout
 
 
 def main():
     executable = pathlib.Path(sys.argv[1]).resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix='chineseai-actor-gate-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='chineseai-promotion-only-') as temporary:
         directory = pathlib.Path(temporary)
-        (directory / 'loop.toml').write_text(CONFIG + 'actor_gate_min_games = 4\n', encoding='utf-8')
+        (directory / 'loop.toml').write_text(CONFIG, encoding='utf-8')
         log = run(executable, directory, 2)
-        assert 'published learner update 1' in log, log
-        assert 'published learner update 2' in log, log
-        assert 'actor-match 2:' in log, log
+        assert 'promoted=current' not in log and 'published champion' not in log, log
         best_hash = hashlib.sha256((directory / 'best.safetensors').read_bytes()).digest()
         log = run(executable, directory, 3)
-        assert 'actor starts from champion' in log, log
-        assert 'actor-gate 3: actor_update=0' in log, log
+        assert 'starts from best; publish only after promotion' in log, log
+        assert 'published champion' not in log, log
         assert best_hash == hashlib.sha256((directory / 'best.safetensors').read_bytes()).digest()
-    with tempfile.TemporaryDirectory(prefix='chineseai-actor-hold-') as temporary:
+        config = (directory / 'loop.toml').read_text(encoding='utf-8')
+        (directory / 'loop.toml').write_text(config.replace('arena_interval = 1', 'arena_interval = 0'), encoding='utf-8')
+        log = run(executable, directory, 4)
+        assert 'arena disabled; best remains fixed' in log, log
+        assert 'published champion' not in log, log
+        assert best_hash == hashlib.sha256((directory / 'best.safetensors').read_bytes()).digest()
+    with tempfile.TemporaryDirectory(prefix='chineseai-promotion-publish-') as temporary:
         directory = pathlib.Path(temporary)
-        (directory / 'loop.toml').write_text(CONFIG + 'actor_gate_min_games = 400\n', encoding='utf-8')
+        (directory / 'loop.toml').write_text(CONFIG.replace('arena_promotion_rate = 1.0', 'arena_promotion_rate = 0.0'), encoding='utf-8')
         log = run(executable, directory, 2)
-        assert 'decision=Hold' in log, log
-        assert 'published learner' not in log, log
-    print('actor gate smoke: publish without promotion, current-actor match, safe restart, and insufficient-evidence hold passed')
+        assert 'promoted=current' in log, log
+        assert 'published champion update 1' in log, log
+        assert 'published champion update 2' in log, log
+    print('promotion-only smoke: hold, restart from best, disabled arena, and champion publication passed')
 
 
 if __name__ == '__main__':
