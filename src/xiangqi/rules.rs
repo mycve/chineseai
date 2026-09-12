@@ -184,6 +184,22 @@ impl Position {
             .collect()
     }
 
+    /// Search should not spend simulations rediscovering a cycle when at least
+    /// one rule-legal continuation reaches a new position. Keep repetitions
+    /// only when every legal continuation repeats, so pruning cannot invent a
+    /// loss in a position whose only escape is a legal draw.
+    pub fn search_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
+        let moves = self.legal_moves_with_rules_and_repetition(history);
+        if moves.iter().any(|(_, repeats)| !repeats) {
+            moves
+                .into_iter()
+                .filter_map(|(mv, repeats)| (!repeats).then_some(mv))
+                .collect()
+        } else {
+            moves.into_iter().map(|(mv, _)| mv).collect()
+        }
+    }
+
     fn chased_masks_by(&self, color: Color) -> u128 {
         crate::scope_profile!("xiangqi.chased_mask_by");
         let mut work = self.clone();

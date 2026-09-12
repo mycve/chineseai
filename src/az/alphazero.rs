@@ -984,18 +984,12 @@ impl<'a> AzTree<'a> {
                 } else {
                     self.nodes[node_index]
                         .position
-                        .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                        .into_iter()
-                        .map(|(mv, _)| mv)
-                        .collect()
+                        .search_moves_with_rules(&self.rule_history_scratch)
                 }
             } else {
                 self.nodes[node_index]
                     .position
-                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect()
+                    .search_moves_with_rules(&self.rule_history_scratch)
             }
         };
         if moves.is_empty() {
@@ -1406,10 +1400,7 @@ impl<'a> AzTree<'a> {
                 }
                 let moves = self.nodes[node_index]
                     .position
-                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect::<Vec<_>>();
+                    .search_moves_with_rules(&self.rule_history_scratch);
                 if moves.is_empty() {
                     let eval = AzEvalOutput {
                         value_wdl: [0.0, 0.0, 1.0],
@@ -1449,10 +1440,7 @@ impl<'a> AzTree<'a> {
                 }
                 let moves = self.nodes[node_index]
                     .position
-                    .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect::<Vec<_>>();
+                    .search_moves_with_rules(&self.rule_history_scratch);
                 if moves.is_empty() {
                     let eval = AzEvalOutput {
                         value_wdl: [0.0, 0.0, 1.0],
@@ -1591,10 +1579,7 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.expand_legal_moves");
             self.nodes[node_index]
                 .position
-                .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-                .into_iter()
-                .map(|(mv, _)| mv)
-                .collect()
+                .search_moves_with_rules(&self.rule_history_scratch)
         };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
