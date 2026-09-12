@@ -29,10 +29,8 @@ extern "C" __global__ void tactical_policy_fwd(
 ) {
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= outputs) return;
-    float sum = 0.0f;
-    #pragma unroll
-    for (unsigned int i = 0; i < 5u; ++i) sum += tables[(unsigned long long)indices[index * 5u + i]];
-    output[index] = sum;
+    output[index] = tables[(unsigned long long)indices[index * 2u]]
+                  + tables[(unsigned long long)indices[index * 2u + 1u]];
 }
 
 extern "C" __global__ void tactical_policy_grad(
@@ -40,7 +38,7 @@ extern "C" __global__ void tactical_policy_grad(
 ) {
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= entries) return;
-    atomicAdd(grad_tables + (unsigned long long)indices[index], grad_output[index / 5u]);
+    atomicAdd(grad_tables + (unsigned long long)indices[index], grad_output[index / 2u]);
 }
 "#;
 
@@ -332,11 +330,7 @@ mod tests {
 
     fn tactical_output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
         let tables = Var::from_slice(&[0.5f32, -1.0, 2.0, 3.0, -0.25], 5, device)?;
-        let indices = Tensor::from_slice(
-            &[0i64, 2, 3, 4, 1, 4, 3, 2, 1, 0],
-            (1, 2, TACTICAL_TERMS),
-            device,
-        )?;
+        let indices = Tensor::from_slice(&[0i64, 2, 3, 4], (1, 2, TACTICAL_TERMS), device)?;
         let output = tactical_policy(&tables, &indices)?;
         let weights = Tensor::from_slice(&[2.0f32, -0.5], (1, 2), device)?;
         let grads = output.broadcast_mul(&weights)?.sum_all()?.backward()?;
@@ -362,8 +356,8 @@ mod tests {
     #[test]
     fn fused_tactical_policy_matches_expected_and_cuda() -> Result<()> {
         let cpu = tactical_output_and_grad(&Device::Cpu)?;
-        assert_close(&cpu.0, &[4.25, 4.25]);
-        assert_close(&cpu.1, &[1.5; 5]);
+        assert_close(&cpu.0, &[2.5, 2.75]);
+        assert_close(&cpu.1, &[2.0, 0.0, 2.0, -0.5, -0.5]);
         if let Ok(device) = Device::new_cuda(0) {
             let cuda = tactical_output_and_grad(&device)?;
             assert_close(&cpu.0, &cuda.0);

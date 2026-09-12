@@ -42,11 +42,11 @@ use crate::xiangqi::{
 };
 
 pub use alphazero::{
-    AzBatchSearchInput, AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult,
-    AzSearchTraceStep, alphazero_search, alphazero_search_batch4,
-    alphazero_search_external_root_controlled_with_progress, alphazero_search_trace_with_rules,
-    alphazero_search_with_rules, alphazero_search_with_rules_controlled,
-    alphazero_search_with_rules_controlled_with_progress, cp_from_q,
+    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,
+    alphazero_search, alphazero_search_external_root_controlled_with_progress,
+    alphazero_search_trace_with_rules, alphazero_search_with_rules,
+    alphazero_search_with_rules_controlled, alphazero_search_with_rules_controlled_with_progress,
+    cp_from_q,
 };
 pub use midgame::{AzMidgamePool, AzStartSnapshot};
 pub use play::{
@@ -63,16 +63,13 @@ pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 64;
 pub(super) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
-pub(super) const POLICY_TACTICAL_TERMS: usize = 5;
+pub(super) const POLICY_TACTICAL_TERMS: usize = 2;
 pub(super) const POLICY_TACTICAL_EXACT_SIZE: usize =
     DENSE_MOVE_SPACE * (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
 pub(super) const POLICY_TACTICAL_FACTOR_SIZE: usize =
     (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-const POLICY_TACTICAL_ATTACKER_OFFSET: usize =
+pub(super) const POLICY_TACTICAL_SIZE: usize =
     POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
-const POLICY_TACTICAL_DEFENDER_OFFSET: usize = POLICY_TACTICAL_ATTACKER_OFFSET + 8 * 8;
-const POLICY_TACTICAL_EXCHANGE_OFFSET: usize = POLICY_TACTICAL_DEFENDER_OFFSET + 8 * 8;
-pub(super) const POLICY_TACTICAL_SIZE: usize = POLICY_TACTICAL_EXCHANGE_OFFSET + 7 * 8 * 5;
 pub(super) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
 pub(super) const POLICY_SPARSE_MAIN_SIZE: usize =
     DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
@@ -335,16 +332,6 @@ pub(super) struct AzEvalScratch {
     policy_gives_check: Vec<f32>,
     logits: Vec<f32>,
     priors: Vec<f32>,
-}
-
-#[allow(dead_code)]
-pub(super) struct AzIncrementalEvalRequest<'a> {
-    pub position: &'a Position,
-    pub accumulator_hidden: &'a [f32],
-    pub policy_accumulator: &'a [f32; POLICY_ACCUMULATOR_RANK],
-    pub moves: &'a [Move],
-    pub rule_context: &'a [f32; RULE_CONTEXT_SIZE],
-    pub scratch: &'a mut AzEvalScratch,
 }
 
 impl AzEvalScratch {
@@ -956,10 +943,6 @@ pub(super) fn policy_tactical_indices(
     destination_defended: bool,
     capture: bool,
     check: bool,
-    attacker_kind: usize,
-    defender_kind: usize,
-    captured_kind: usize,
-    exchange_bucket: usize,
 ) -> [usize; POLICY_TACTICAL_TERMS] {
     debug_assert!(moved_piece < STRUCTURAL_PIECE_SIZE / 2);
     let signature = usize::from(source_attacked)
@@ -973,66 +956,7 @@ pub(super) fn policy_tactical_indices(
         + signature;
     let factor =
         POLICY_TACTICAL_EXACT_SIZE + moved_piece * POLICY_TACTICAL_SIGNATURE_BUCKETS + signature;
-    [
-        exact,
-        factor,
-        POLICY_TACTICAL_ATTACKER_OFFSET + (moved_piece % 7) * 8 + attacker_kind,
-        POLICY_TACTICAL_DEFENDER_OFFSET + (moved_piece % 7) * 8 + defender_kind,
-        POLICY_TACTICAL_EXCHANGE_OFFSET
-            + ((moved_piece % 7) * 8 + captured_kind) * 5
-            + exchange_bucket,
-    ]
-}
-
-fn policy_tactical_types(
-    position: &Position,
-    side: Color,
-    mv: Move,
-    destination_attacked: bool,
-) -> (bool, bool, usize, usize, usize, usize) {
-    let moved = position
-        .piece_at(mv.from as usize)
-        .expect("legal move must have a piece");
-    let captured = position.piece_at(mv.to as usize);
-    if captured.is_none() {
-        let exchange = if destination_attacked {
-            if matches!(moved.kind, PieceKind::Rook | PieceKind::Cannon) {
-                0
-            } else {
-                1
-            }
-        } else {
-            2
-        };
-        return (destination_attacked, false, 0, 0, 7, exchange);
-    }
-    let mut after = position.clone();
-    after.make_move(mv);
-    let attacker_kind = after.least_valuable_legal_attacker_kind(mv.to as usize, side.opposite());
-    let defender_kind = after.least_valuable_legal_attacker_kind(mv.to as usize, side);
-    let attacker = attacker_kind.map_or(0, |kind| piece_kind_index(kind) + 1);
-    let defender = defender_kind.map_or(0, |kind| piece_kind_index(kind) + 1);
-    let captured_kind = captured.map_or(7, |piece| piece_kind_index(piece.kind));
-    let net = position.static_exchange_eval(mv);
-    let exchange = if net <= -50 {
-        0
-    } else if net < 0 {
-        1
-    } else if net == 0 {
-        2
-    } else if net < 50 {
-        3
-    } else {
-        4
-    };
-    (
-        attacker != 0,
-        defender != 0,
-        attacker,
-        defender,
-        captured_kind,
-        exchange,
-    )
+    [exact, factor]
 }
 
 fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
@@ -1910,90 +1834,6 @@ impl AzNnue {
         AzEvalOutput { value_wdl, value }
     }
 
-    #[allow(dead_code)]
-    pub(super) fn evaluate_incremental_batch4(
-        &self,
-        requests: &mut [AzIncrementalEvalRequest<'_>; 4],
-    ) -> [AzEvalOutput; 4] {
-        for request in requests.iter_mut() {
-            request.scratch.hidden.resize(self.hidden_size, 0.0);
-            let hidden = if request.accumulator_hidden.len() == self.hidden_size {
-                request.accumulator_hidden
-            } else {
-                AzEvalAccumulator::hidden_for_slice(
-                    request.accumulator_hidden,
-                    self.hidden_size,
-                    request.position.side_to_move(),
-                )
-            };
-            request.scratch.hidden.copy_from_slice(hidden);
-            self.add_rule_context_to_hidden(request.rule_context, &mut request.scratch.hidden);
-            request
-                .scratch
-                .policy_accumulator_context
-                .copy_from_slice(request.policy_accumulator);
-            relu_in_place(&mut request.scratch.hidden);
-            rms_norm_in_place(&mut request.scratch.hidden);
-        }
-
-        let threat_logits = std::array::from_fn(|index| {
-            self.value_threat_logits(
-                requests[index].position,
-                &mut requests[index].scratch.value_threat_accumulator,
-                &mut requests[index].scratch.value_threat_activation,
-            )
-        });
-        let hiddens = [
-            requests[0].scratch.hidden.as_slice(),
-            requests[1].scratch.hidden.as_slice(),
-            requests[2].scratch.hidden.as_slice(),
-            requests[3].scratch.hidden.as_slice(),
-        ];
-        let (value_wdls, values) = self.value_wdl_batch4(hiddens, threat_logits);
-        let mut contexts = [[0.0f32; POLICY_MOVE_CONTEXT_SIZE]; 4];
-        for context_index in 0..POLICY_MOVE_CONTEXT_SIZE {
-            let start = context_index * self.hidden_size;
-            let dots = dot_product_f32_batch4(
-                hiddens,
-                &self.policy_context_hidden[start..start + self.hidden_size],
-            );
-            for batch in 0..4 {
-                let threat = &requests[batch].scratch.value_threat_activation;
-                let threat_logit = if context_index < POLICY_THREAT_CONTEXT_SIZE
-                    && threat.len() == VALUE_THREAT_RANK * 2
-                {
-                    let start = context_index * VALUE_THREAT_RANK * 2;
-                    dot_product(
-                        threat,
-                        &self.policy_threat_context[start..start + VALUE_THREAT_RANK * 2],
-                    )
-                } else {
-                    0.0
-                };
-                contexts[batch][context_index] = dots[batch] + threat_logit;
-            }
-        }
-        for index in 0..4 {
-            let request = &mut requests[index];
-            request.scratch.policy_context.clear();
-            request
-                .scratch
-                .policy_context
-                .extend_from_slice(&contexts[index]);
-            self.evaluate_prepared_hidden_with_context(
-                request.position,
-                &[],
-                values[index],
-                request.moves,
-                request.scratch,
-            );
-        }
-        std::array::from_fn(|index| AzEvalOutput {
-            value_wdl: value_wdls[index],
-            value: values[index],
-        })
-    }
-
     fn evaluate_prepared_hidden_with_scratch(
         &self,
         position: &Position,
@@ -2105,22 +1945,10 @@ impl AzNnue {
                             let check = scratch.policy_gives_check[index];
                             let source_attacked =
                                 opponent_attacks & (1u128 << mv.from as usize) != 0;
-                            let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
-                            let destination_attacked_before =
+                            let destination_attacked =
                                 opponent_attacks & (1u128 << mv.to as usize) != 0;
-                            let (
-                                destination_attacked,
-                                destination_defended,
-                                attacker_kind,
-                                defender_kind,
-                                captured_kind,
-                                exchange_bucket,
-                            ) = policy_tactical_types(
-                                position,
-                                side,
-                                *mv,
-                                destination_attacked_before,
-                            );
+                            let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
+                            let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
                             policy_tactical_indices(
                                 move_index,
                                 moved_piece,
@@ -2130,10 +1958,6 @@ impl AzNnue {
                                 destination_defended,
                                 captured.is_some(),
                                 check != 0.0,
-                                attacker_kind,
-                                defender_kind,
-                                captured_kind,
-                                exchange_bucket,
                             )
                             .into_iter()
                             .map(|tactical| self.policy_tactical[tactical])
@@ -2425,36 +2249,6 @@ impl AzNnue {
         let wdl = softmax_fixed3(logits);
         let q = wdl[0] - wdl[2];
         (wdl, q)
-    }
-
-    #[allow(dead_code)]
-    fn value_wdl_batch4(
-        &self,
-        hiddens: [&[f32]; 4],
-        threat_logits: [[f32; WDL_HEAD_SIZE]; 4],
-    ) -> ([[f32; WDL_HEAD_SIZE]; 4], [f32; 4]) {
-        let mut heads = [[0.0f32; VALUE_HEAD_SIZE]; 4];
-        for feature in 0..VALUE_HEAD_SIZE {
-            let row = &self.value_head_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            let dots = dot_product_f32_batch4(hiddens, row);
-            for batch in 0..4 {
-                heads[batch][feature] = (self.value_head_bias[feature] + dots[batch]).max(0.0);
-            }
-        }
-        let mut wdls = [[0.0; WDL_HEAD_SIZE]; 4];
-        let mut values = [0.0; 4];
-        for batch in 0..4 {
-            let mut logits = [0.0; WDL_HEAD_SIZE];
-            for (out, logit) in logits.iter_mut().enumerate() {
-                let row =
-                    &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-                *logit = dot_product(&heads[batch], row) + threat_logits[batch][out];
-            }
-            wdls[batch] = softmax_fixed3(logits);
-            values[batch] = wdls[batch][0] - wdls[batch][2];
-        }
-        (wdls, values)
     }
 
     fn fill_policy_piece_square_scores(&self, scores: &mut Vec<f32>) {
@@ -2854,60 +2648,6 @@ pub(super) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_H
     } else {
         [0.0, 1.0, 0.0]
     }
-}
-
-#[allow(dead_code)]
-#[inline]
-fn dot_product_f32_batch4(inputs: [&[f32]; 4], weights: &[f32]) -> [f32; 4] {
-    debug_assert!(inputs.iter().all(|input| input.len() == weights.len()));
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if weights.len() >= 32
-        && std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("fma")
-    {
-        // SAFETY: AVX2/FMA were checked at runtime and all slices have equal lengths.
-        return unsafe { dot_product_f32_batch4_avx2_fma(inputs, weights) };
-    }
-    let mut sums = [0.0f32; 4];
-    for index in 0..weights.len() {
-        for batch in 0..4 {
-            sums[batch] += inputs[batch][index] * weights[index];
-        }
-    }
-    sums
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
-#[allow(dead_code)]
-unsafe fn dot_product_f32_batch4_avx2_fma(inputs: [&[f32]; 4], weights: &[f32]) -> [f32; 4] {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let chunks = weights.len() / 8;
-    let mut accumulators = [_mm256_setzero_ps(); 4];
-    for chunk in 0..chunks {
-        let offset = chunk * 8;
-        let weight = unsafe { _mm256_loadu_ps(weights.as_ptr().add(offset)) };
-        for batch in 0..4 {
-            let input = unsafe { _mm256_loadu_ps(inputs[batch].as_ptr().add(offset)) };
-            accumulators[batch] = _mm256_fmadd_ps(input, weight, accumulators[batch]);
-        }
-    }
-    let mut sums = [0.0f32; 4];
-    for batch in 0..4 {
-        let mut lanes = [0.0f32; 8];
-        unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), accumulators[batch]) };
-        sums[batch] = lanes.into_iter().sum();
-    }
-    for index in (chunks * 8)..weights.len() {
-        for batch in 0..4 {
-            sums[batch] += inputs[batch][index] * weights[index];
-        }
-    }
-    sums
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {
@@ -3543,12 +3283,10 @@ mod tests {
     }
 
     #[test]
-    fn generalized_policy_terms_distinguish_piece_roles_and_exchange() {
-        let base = policy_tactical_indices(0, 4, true, true, false, true, true, false, 1, 2, 4, 0);
-        let changed =
-            policy_tactical_indices(0, 4, true, true, false, true, true, false, 6, 3, 5, 4);
-        assert_eq!(base[..2], changed[..2]);
-        assert_ne!(base[2..], changed[2..]);
+    fn tactical_policy_terms_distinguish_move_state() {
+        let base = policy_tactical_indices(0, 4, true, true, false, true, true, false);
+        let changed = policy_tactical_indices(0, 4, false, true, false, true, true, false);
+        assert_ne!(base, changed);
         assert!(base.into_iter().all(|index| index < POLICY_TACTICAL_SIZE));
         assert!(
             changed
@@ -3747,157 +3485,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn incremental_batch4_matches_scalar_evaluation() {
-        let model = AzNnue::random(128, 20260819);
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
-        let policy = model.policy_accumulator(&position, position.side_to_move());
-        let rule_context = [0.0; RULE_CONTEXT_SIZE];
-
-        let mut scalar_scratch: [AzEvalScratch; 4] =
-            std::array::from_fn(|_| AzEvalScratch::new(model.arch));
-        let scalar: [AzEvalOutput; 4] = std::array::from_fn(|index| {
-            model.evaluate_incremental_with_scratch_output(
-                &position,
-                &hidden,
-                &policy,
-                &moves,
-                &rule_context,
-                &mut scalar_scratch[index],
-            )
-        });
-
-        let mut batch_scratch = std::array::from_fn(|_| AzEvalScratch::new(model.arch));
-        let [scratch0, scratch1, scratch2, scratch3] = &mut batch_scratch;
-        let mut requests = [
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch0,
-            },
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch1,
-            },
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch2,
-            },
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch3,
-            },
-        ];
-        let batch = model.evaluate_incremental_batch4(&mut requests);
-        for index in 0..4 {
-            assert!((scalar[index].value - batch[index].value).abs() < 1.0e-5);
-            for (left, right) in scalar_scratch[index]
-                .logits
-                .iter()
-                .zip(&batch_scratch[index].logits)
-            {
-                assert!((left - right).abs() < 1.0e-5);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "manual fast-profile batch evaluator benchmark"]
-    fn benchmark_incremental_batch4() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        let model = AzNnue::random(128, 20260820);
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
-        let policy = model.policy_accumulator(&position, position.side_to_move());
-        let rule_context = [0.0; RULE_CONTEXT_SIZE];
-        let repeats = 5_000;
-
-        let mut scalar_scratch: [AzEvalScratch; 4] =
-            std::array::from_fn(|_| AzEvalScratch::new(model.arch));
-        let scalar_started = Instant::now();
-        for _ in 0..repeats {
-            for scratch in &mut scalar_scratch {
-                black_box(model.evaluate_incremental_with_scratch_output(
-                    &position,
-                    &hidden,
-                    &policy,
-                    &moves,
-                    &rule_context,
-                    scratch,
-                ));
-            }
-        }
-        let scalar = scalar_started.elapsed();
-
-        let mut batch_scratch = std::array::from_fn(|_| AzEvalScratch::new(model.arch));
-        let [scratch0, scratch1, scratch2, scratch3] = &mut batch_scratch;
-        let mut requests = [
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch0,
-            },
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch1,
-            },
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch2,
-            },
-            AzIncrementalEvalRequest {
-                position: &position,
-                accumulator_hidden: &hidden,
-                policy_accumulator: &policy,
-                moves: &moves,
-                rule_context: &rule_context,
-                scratch: scratch3,
-            },
-        ];
-        let batch_started = Instant::now();
-        for _ in 0..repeats {
-            black_box(model.evaluate_incremental_batch4(&mut requests));
-        }
-        let batch = batch_started.elapsed();
-        eprintln!(
-            "scalar={:.3}ms batch4={:.3}ms speedup={:.3}x",
-            scalar.as_secs_f64() * 1e3,
-            batch.as_secs_f64() * 1e3,
-            scalar.as_secs_f64() / batch.as_secs_f64()
-        );
     }
 
     #[test]

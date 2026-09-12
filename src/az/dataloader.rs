@@ -16,8 +16,7 @@ use super::{
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
-    policy_sparse_main_index, policy_tactical_indices, policy_tactical_types,
-    visit_value_threat_features,
+    policy_sparse_main_index, policy_tactical_indices, visit_value_threat_features,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -298,23 +297,10 @@ impl PackedBatch {
                     );
                     let check = position.gives_check_after_move_fast(mv);
                     let source_attacked = opponent_attacks & (1u128 << mv.from as usize) != 0;
-                    let destination_attacked_before =
-                        opponent_attacks & (1u128 << mv.to as usize) != 0;
+                    let destination_attacked = opponent_attacks & (1u128 << mv.to as usize) != 0;
                     let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
+                    let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
                     let tactical_base = item_index * POLICY_TACTICAL_TERMS;
-                    let (
-                        destination_attacked,
-                        destination_defended,
-                        attacker_kind,
-                        defender_kind,
-                        captured_kind,
-                        exchange_bucket,
-                    ) = policy_tactical_types(
-                        &position,
-                        Color::Red,
-                        mv,
-                        destination_attacked_before,
-                    );
                     for (offset, tactical) in policy_tactical_indices(
                         move_index,
                         moved_piece,
@@ -324,10 +310,6 @@ impl PackedBatch {
                         destination_defended,
                         capture_valid,
                         check,
-                        attacker_kind,
-                        defender_kind,
-                        captured_kind,
-                        exchange_bucket,
                     )
                     .into_iter()
                     .enumerate()

@@ -26,10 +26,6 @@ use hash::{SIDE_TO_MOVE_KEY, color_hash_index, zobrist_piece_key};
 use std::sync::OnceLock;
 use types::{CheckerInfo, MoveGenMode, PositionState};
 
-fn material_value(kind: PieceKind) -> i32 {
-    [10_000, 20, 20, 40, 90, 45, 10][piece_kind_index(kind)]
-}
-
 fn orthogonal_ray_masks() -> &'static [[u128; 4]; BOARD_SIZE] {
     static RAYS: OnceLock<[[u128; 4]; BOARD_SIZE]> = OnceLock::new();
     RAYS.get_or_init(|| {
@@ -597,55 +593,6 @@ impl Position {
 
     pub fn is_piece_protected(&self, sq: usize, color: Color) -> bool {
         self.visit_attacker_origins_to(sq, color, |from| from != sq)
-    }
-
-    pub(crate) fn least_valuable_legal_attacker_kind(
-        &self,
-        target: usize,
-        by: Color,
-    ) -> Option<PieceKind> {
-        let mut best = None;
-        let mut work = self.clone();
-        self.visit_attacker_origins_to(target, by, |from| {
-            if let Some(piece) = self.board[from] {
-                let captured = work.make_move_board_only(Move::new(from, target));
-                let legal = !work.in_check(by);
-                work.unmake_move_board_only(Move::new(from, target), captured);
-                let value = material_value(piece.kind);
-                if legal && best.is_none_or(|(best_value, _)| value < best_value) {
-                    best = Some((value, piece.kind));
-                }
-            }
-            false
-        });
-        best.map(|(_, kind)| kind)
-    }
-
-    pub(crate) fn static_exchange_eval(&self, mv: Move) -> i32 {
-        let captured_value =
-            self.board[mv.to as usize].map_or(0, |piece| material_value(piece.kind));
-        let mut after = self.clone();
-        after.make_move_board_only(mv);
-        captured_value - after.best_exchange_gain(mv.to as usize, self.side_to_move.opposite())
-    }
-
-    fn best_exchange_gain(&self, target: usize, side: Color) -> i32 {
-        let Some(occupant) = self.board[target] else {
-            return 0;
-        };
-        let captured_value = material_value(occupant.kind);
-        let mut best = 0;
-        let mut work = self.clone();
-        self.visit_attacker_origins_to(target, side, |from| {
-            let mv = Move::new(from, target);
-            let captured = work.make_move_board_only(mv);
-            if !work.in_check(side) {
-                best = best.max(captured_value - work.best_exchange_gain(target, side.opposite()));
-            }
-            work.unmake_move_board_only(mv, captured);
-            false
-        });
-        best
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
