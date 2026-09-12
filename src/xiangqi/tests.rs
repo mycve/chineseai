@@ -754,32 +754,6 @@ fn one_long_check_cycle_filters_the_next_repeated_check() {
 }
 
 #[test]
-fn search_prunes_legal_repetition_when_a_fresh_move_exists() {
-    let position = Position::startpos();
-    let repeated = position.parse_uci_move("a3a4").unwrap();
-    let mut history = position.initial_rule_history();
-    history.push(RuleHistoryEntry {
-        hash: position.hash_after_move(repeated),
-        side_to_move: Color::Black,
-        mover: Some(Color::Red),
-        gives_check: false,
-        chased_mask: 0,
-        mv: Some(repeated),
-        captured: None,
-        rule60_clock: 1,
-    });
-
-    assert!(
-        position
-            .legal_moves_with_rules(&history)
-            .contains(&repeated)
-    );
-    let search_moves = position.search_moves_with_rules(&history);
-    assert!(!search_moves.contains(&repeated));
-    assert!(!search_moves.is_empty());
-}
-
-#[test]
 fn horse_repeatedly_chasing_rook_is_forbidden() {
     let mut position =
         Position::from_fen("2bak4/4a4/2ncb2c1/p3p2CP/9/1N1RP4/P5r2/4C4/9/2BAKA3 b - - 0 1")

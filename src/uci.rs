@@ -332,7 +332,7 @@ fn apply_uci_moves(
 }
 
 fn uci_root_moves(position: &Position, rule_history: &[RuleHistoryEntry]) -> Vec<Move> {
-    let filtered = position.search_moves_with_rules(rule_history);
+    let filtered = position.legal_moves_with_rules(rule_history);
     if filtered.is_empty() {
         position.legal_moves()
     } else {
