@@ -298,6 +298,8 @@ impl PackedBatch {
                     );
                     let check = position.gives_check_after_move_fast(mv);
                     let source_attacked = opponent_attacks & (1u128 << mv.from as usize) != 0;
+                    let destination_attacked_before =
+                        opponent_attacks & (1u128 << mv.to as usize) != 0;
                     let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
                     let tactical_base = item_index * POLICY_TACTICAL_TERMS;
                     let (
@@ -307,7 +309,12 @@ impl PackedBatch {
                         defender_kind,
                         captured_kind,
                         exchange_bucket,
-                    ) = policy_tactical_types(&position, Color::Red, mv);
+                    ) = policy_tactical_types(
+                        &position,
+                        Color::Red,
+                        mv,
+                        destination_attacked_before,
+                    );
                     for (offset, tactical) in policy_tactical_indices(
                         move_index,
                         moved_piece,

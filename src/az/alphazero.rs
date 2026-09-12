@@ -2488,7 +2488,11 @@ mod tests {
     #[test]
     #[ignore = "manual fast-profile four-tree search benchmark"]
     fn benchmark_four_tree_batch_search() {
-        let model = AzNnue::random(128, 79);
+        let mut model = AzNnue::random(128, 79);
+        model.policy_tactical[0] = 1.0e-6;
+        model.value_threat_output[0] = 1.0e-6;
+        model.rebuild_policy_tactical();
+        model.rebuild_value_threat();
         let positions = std::array::from_fn(|index| {
             let mut position = Position::startpos();
             for ply in 0..index {

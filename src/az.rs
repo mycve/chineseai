@@ -988,16 +988,30 @@ fn policy_tactical_types(
     position: &Position,
     side: Color,
     mv: Move,
+    destination_attacked: bool,
 ) -> (bool, bool, usize, usize, usize, usize) {
+    let moved = position
+        .piece_at(mv.from as usize)
+        .expect("legal move must have a piece");
     let captured = position.piece_at(mv.to as usize);
+    if captured.is_none() {
+        let exchange = if destination_attacked {
+            if matches!(moved.kind, PieceKind::Rook | PieceKind::Cannon) {
+                0
+            } else {
+                1
+            }
+        } else {
+            2
+        };
+        return (destination_attacked, false, 0, 0, 7, exchange);
+    }
     let mut after = position.clone();
     after.make_move(mv);
-    let attacker = after
-        .least_valuable_legal_attacker_kind(mv.to as usize, side.opposite())
-        .map_or(0, |kind| piece_kind_index(kind) + 1);
-    let defender = after
-        .least_valuable_legal_attacker_kind(mv.to as usize, side)
-        .map_or(0, |kind| piece_kind_index(kind) + 1);
+    let attacker_kind = after.least_valuable_legal_attacker_kind(mv.to as usize, side.opposite());
+    let defender_kind = after.least_valuable_legal_attacker_kind(mv.to as usize, side);
+    let attacker = attacker_kind.map_or(0, |kind| piece_kind_index(kind) + 1);
+    let defender = defender_kind.map_or(0, |kind| piece_kind_index(kind) + 1);
     let captured_kind = captured.map_or(7, |piece| piece_kind_index(piece.kind));
     let net = position.static_exchange_eval(mv);
     let exchange = if net <= -50 {
@@ -2092,6 +2106,8 @@ impl AzNnue {
                             let source_attacked =
                                 opponent_attacks & (1u128 << mv.from as usize) != 0;
                             let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
+                            let destination_attacked_before =
+                                opponent_attacks & (1u128 << mv.to as usize) != 0;
                             let (
                                 destination_attacked,
                                 destination_defended,
@@ -2099,7 +2115,12 @@ impl AzNnue {
                                 defender_kind,
                                 captured_kind,
                                 exchange_bucket,
-                            ) = policy_tactical_types(position, side, *mv);
+                            ) = policy_tactical_types(
+                                position,
+                                side,
+                                *mv,
+                                destination_attacked_before,
+                            );
                             policy_tactical_indices(
                                 move_index,
                                 moved_piece,
@@ -3564,9 +3585,13 @@ mod tests {
     fn manual_profile_policy_head() {
         let position = Position::startpos();
         let moves = position.legal_moves();
-        let model = AzNnue::random(128, 999);
+        let mut model = AzNnue::random(128, 999);
+        model.policy_tactical[0] = 1.0e-6;
+        model.value_threat_output[0] = 1.0e-6;
+        model.rebuild_policy_tactical();
+        model.rebuild_value_threat();
         let mut scratch = AzEvalScratch::new(model.arch);
-        for _ in 0..50_000 {
+        for _ in 0..2_000 {
             model.evaluate_with_scratch_output(
                 &position,
                 &moves,
