@@ -417,6 +417,30 @@ fn pinned_recapture_does_not_protect_chase_target() {
 }
 
 #[test]
+fn legal_attacker_type_excludes_pinned_defender() {
+    let position = Position::from_fen("4k4/9/3nr4/9/9/9/3RR4/9/9/K8 b").unwrap();
+    assert_eq!(
+        position.least_valuable_legal_attacker_kind(index(3, 2), Color::Black),
+        None
+    );
+}
+
+#[test]
+fn static_exchange_eval_accounts_for_legal_recapture_sequence() {
+    let free = Position::from_fen("4k4/9/9/9/4n4/4R4/9/9/9/3K5 w").unwrap();
+    assert_eq!(
+        free.static_exchange_eval(Move::new(index(4, 5), index(4, 4))),
+        40
+    );
+
+    let recaptured = Position::from_fen("4k4/9/9/4r4/4n4/4R4/9/9/9/3K5 w").unwrap();
+    assert_eq!(
+        recaptured.static_exchange_eval(Move::new(index(4, 5), index(4, 4))),
+        -50
+    );
+}
+
+#[test]
 fn rule_entry_ignores_protected_chase_target() {
     let protected = Position::from_fen("4k4/9/9/4r4/4P4/4R4/9/9/9/4K4 b").unwrap();
     let protected_chased = protected.rule_history_entry(Some(Color::Black)).chased_mask;

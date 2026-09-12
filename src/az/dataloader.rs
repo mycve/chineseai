@@ -10,13 +10,14 @@ use crate::xiangqi::{BOARD_SIZE, Color, Position};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_TACTICAL_SIZE,
-    RULE_CONTEXT_SIZE, VALUE_THREAT_MAX_ACTIVE, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_THREAT_MAX_ACTIVE, WDL_HEAD_SIZE,
     canonical_general_buckets_from_features, decode_current_piece_square_feature,
     dense_move_squares,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
-    policy_sparse_main_index, policy_tactical_indices, value_threat_index,
+    policy_sparse_main_index, policy_tactical_indices, policy_tactical_types,
+    visit_value_threat_features,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -97,6 +98,7 @@ pub(super) struct PackedBatch {
     pub max_value_threats: usize,
     pub feature_items: Vec<u32>,
     pub value_threat_indices: Vec<u32>,
+    pub value_threat_scales: Vec<f32>,
     pub policy_items: Vec<i64>,
     pub policy_sparse_indices: Vec<i64>,
     pub policy_tactical_indices: Vec<i64>,
@@ -146,6 +148,7 @@ impl PackedBatch {
             max_value_threats,
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
             value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
+            value_threat_scales: vec![1.0; batch_size],
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
             policy_sparse_indices: vec![
                 (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
@@ -153,7 +156,7 @@ impl PackedBatch {
             ],
             policy_tactical_indices: vec![
                 POLICY_TACTICAL_SIZE as i64;
-                batch_size * max_policy_moves * 2
+                batch_size * max_policy_moves * POLICY_TACTICAL_TERMS
             ],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
@@ -173,6 +176,7 @@ impl PackedBatch {
             let threat_base = row * max_value_threats;
             packed.value_threat_indices[threat_base..threat_base + threats.len()]
                 .copy_from_slice(threats);
+            packed.value_threat_scales[row] = 1.0 / (threats.len().max(1) as f32).sqrt();
             packed.pack_policy(row, sample);
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
@@ -294,10 +298,16 @@ impl PackedBatch {
                     );
                     let check = position.gives_check_after_move_fast(mv);
                     let source_attacked = opponent_attacks & (1u128 << mv.from as usize) != 0;
-                    let destination_attacked = opponent_attacks & (1u128 << mv.to as usize) != 0;
                     let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
-                    let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
-                    let tactical_base = item_index * 2;
+                    let tactical_base = item_index * POLICY_TACTICAL_TERMS;
+                    let (
+                        destination_attacked,
+                        destination_defended,
+                        attacker_kind,
+                        defender_kind,
+                        captured_kind,
+                        exchange_bucket,
+                    ) = policy_tactical_types(&position, Color::Red, mv);
                     for (offset, tactical) in policy_tactical_indices(
                         move_index,
                         moved_piece,
@@ -307,6 +317,10 @@ impl PackedBatch {
                         destination_defended,
                         capture_valid,
                         check,
+                        attacker_kind,
+                        defender_kind,
+                        captured_kind,
+                        exchange_bucket,
                     )
                     .into_iter()
                     .enumerate()
@@ -333,11 +347,8 @@ fn value_threat_features(sample: &AzTrainingSample) -> Vec<u32> {
         .collect::<Vec<_>>();
     let position = Position::from_canonical_piece_squares(&pieces);
     let mut features = Vec::with_capacity(32);
-    position.visit_occupied_relations(|source, attacker, target, attacked| {
-        let feature = value_threat_index(Color::Red, source, attacker, target, attacked);
-        if feature != VALUE_THREAT_VOCAB {
-            features.push(feature as u32);
-        }
+    visit_value_threat_features(&position, Color::Red, |feature| {
+        features.push(feature as u32);
     });
     assert!(
         features.len() <= VALUE_THREAT_MAX_ACTIVE,

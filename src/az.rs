@@ -37,7 +37,7 @@ use crate::nnue::{
 };
 use crate::version::MODEL_FORMAT_VERSION;
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, Position, color_index,
+    BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, color_index,
     piece_kind_index,
 };
 
@@ -62,43 +62,17 @@ pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 64;
-const LEGACY_POLICY_ACCUMULATOR_RANK: usize = 32;
-
-fn expand_legacy_policy_accumulator(
-    hidden_size: usize,
-    policy_accumulator_hidden: Vec<f32>,
-    policy_accumulator_move: Vec<f32>,
-) -> io::Result<(Vec<f32>, Vec<f32>)> {
-    if policy_accumulator_hidden.len() != LEGACY_POLICY_ACCUMULATOR_RANK * hidden_size
-        || policy_accumulator_move.len() != DENSE_MOVE_SPACE * LEGACY_POLICY_ACCUMULATOR_RANK
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid v22 policy accumulator dimensions",
-        ));
-    }
-    let mut expanded_hidden = vec![0.0; POLICY_ACCUMULATOR_RANK * hidden_size];
-    expanded_hidden[..policy_accumulator_hidden.len()].copy_from_slice(&policy_accumulator_hidden);
-    let mut rng = SplitMix64::new(0xA076_1D64_78BD_642F);
-    for value in &mut expanded_hidden[policy_accumulator_hidden.len()..] {
-        *value = rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5);
-    }
-    let mut expanded_move = vec![0.0; DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK];
-    for (source, target) in policy_accumulator_move
-        .chunks_exact(LEGACY_POLICY_ACCUMULATOR_RANK)
-        .zip(expanded_move.chunks_exact_mut(POLICY_ACCUMULATOR_RANK))
-    {
-        target[..LEGACY_POLICY_ACCUMULATOR_RANK].copy_from_slice(source);
-    }
-    Ok((expanded_hidden, expanded_move))
-}
 pub(super) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
+pub(super) const POLICY_TACTICAL_TERMS: usize = 5;
 pub(super) const POLICY_TACTICAL_EXACT_SIZE: usize =
     DENSE_MOVE_SPACE * (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
 pub(super) const POLICY_TACTICAL_FACTOR_SIZE: usize =
     (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-pub(super) const POLICY_TACTICAL_SIZE: usize =
+const POLICY_TACTICAL_ATTACKER_OFFSET: usize =
     POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
+const POLICY_TACTICAL_DEFENDER_OFFSET: usize = POLICY_TACTICAL_ATTACKER_OFFSET + 8 * 8;
+const POLICY_TACTICAL_EXCHANGE_OFFSET: usize = POLICY_TACTICAL_DEFENDER_OFFSET + 8 * 8;
+pub(super) const POLICY_TACTICAL_SIZE: usize = POLICY_TACTICAL_EXCHANGE_OFFSET + 7 * 8 * 5;
 pub(super) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
 pub(super) const POLICY_SPARSE_MAIN_SIZE: usize =
     DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
@@ -133,8 +107,12 @@ const POLICY_ACCUMULATOR_BIAS_ROW: usize =
 const POLICY_ACCUMULATOR_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
 pub(super) const VALUE_HEAD_SIZE: usize = 96;
 pub(super) const VALUE_THREAT_RANK: usize = 64;
-pub(super) const VALUE_THREAT_VOCAB: usize = 57_702;
-pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 96;
+const VALUE_THREAT_PAIR_VOCAB: usize = 57_702;
+const VALUE_RAY_VOCAB: usize = 4 * 2 * 4 * 9 * 15 * 4;
+const VALUE_CANNON_TRIPLE_VOCAB: usize = 32_768;
+pub(super) const VALUE_THREAT_VOCAB: usize =
+    VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + VALUE_CANNON_TRIPLE_VOCAB;
+pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 192;
 /// 自对弈 WDL TD(λ) 的默认迹衰减系数。
 pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 1.0;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
@@ -693,7 +671,7 @@ fn threat_relation_map() -> &'static [u32] {
                 }
             }
         }
-        assert_eq!(next as usize, VALUE_THREAT_VOCAB);
+        assert_eq!(next as usize, VALUE_THREAT_PAIR_VOCAB);
         map
     })
 }
@@ -770,13 +748,131 @@ fn value_threat_index(
     let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
     let base = threat_relation_map()[relation];
     if base == u32::MAX {
-        return VALUE_THREAT_VOCAB;
+        return VALUE_THREAT_PAIR_VOCAB;
     }
     let offset = threat_attacked_offsets()[target * STRUCTURAL_PIECE_SIZE + attacked];
     if offset == u8::MAX {
-        return VALUE_THREAT_VOCAB;
+        return VALUE_THREAT_PAIR_VOCAB;
     }
     base as usize + usize::from(offset)
+}
+
+fn visit_value_threat_features(
+    position: &Position,
+    perspective: Color,
+    mut visitor: impl FnMut(usize),
+) {
+    position.visit_occupied_relations(|source, attacker, target, attacked| {
+        if matches!(attacker.kind, PieceKind::Rook | PieceKind::Cannon) {
+            return;
+        }
+        let feature = value_threat_index(perspective, source, attacker, target, attacked);
+        if feature != VALUE_THREAT_PAIR_VOCAB {
+            visitor(feature);
+        }
+    });
+
+    for source in 0..BOARD_SIZE {
+        let Some(attacker) = position.piece_at(source) else {
+            continue;
+        };
+        if !matches!(attacker.kind, PieceKind::Rook | PieceKind::Cannon) {
+            continue;
+        }
+        let source_file = (source % BOARD_FILES) as i32;
+        let source_rank = (source / BOARD_FILES) as i32;
+        for (df, dr) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
+            let mut first = None;
+            let mut second = None;
+            let mut blocker_count = 0usize;
+            let (mut file, mut rank) = (source_file + df, source_rank + dr);
+            while (0..BOARD_FILES as i32).contains(&file) && (0..BOARD_RANKS as i32).contains(&rank)
+            {
+                let square = rank as usize * BOARD_FILES + file as usize;
+                if let Some(piece) = position.piece_at(square) {
+                    blocker_count += 1;
+                    if first.is_none() {
+                        first = Some((square, piece));
+                    } else if second.is_none() {
+                        second = Some((square, piece));
+                    }
+                }
+                file += df;
+                rank += dr;
+            }
+            let owner = usize::from(attacker.color != perspective);
+            let slider = usize::from(attacker.kind == PieceKind::Cannon);
+            let attacker_class = owner * 2 + slider;
+            if blocker_count == 0 {
+                let (canonical_df, canonical_dr) = if perspective == Color::Red {
+                    (df, dr)
+                } else {
+                    (-df, -dr)
+                };
+                let direction = if canonical_df == 0 {
+                    usize::from(canonical_dr > 0)
+                } else {
+                    2 + usize::from(canonical_df > 0)
+                };
+                let ray = ((((attacker_class * 2) * 4 + direction) * 9) * 15 + 14) * 4;
+                visitor(VALUE_THREAT_PAIR_VOCAB + ray);
+                continue;
+            }
+            let ray_state = blocker_count.min(3);
+            let canonical_source = canonical_square(perspective, source);
+            for (ordinal, (square, blocked)) in [first, second].into_iter().flatten().enumerate() {
+                let canonical_target = canonical_square(perspective, square);
+                let sf = canonical_source % BOARD_FILES;
+                let sr = canonical_source / BOARD_FILES;
+                let tf = canonical_target % BOARD_FILES;
+                let tr = canonical_target / BOARD_FILES;
+                let direction = if tf == sf {
+                    usize::from(tr > sr)
+                } else {
+                    2 + usize::from(tf > sf)
+                };
+                let distance = sf.abs_diff(tf).max(sr.abs_diff(tr)) - 1;
+                let blocked_class = (if blocked.color == perspective { 0 } else { 7 })
+                    + piece_kind_index(blocked.kind);
+                let ray = (((((attacker_class * 2 + ordinal) * 4 + direction) * 9 + distance)
+                    * 15
+                    + blocked_class)
+                    * 4)
+                    + ray_state;
+                visitor(VALUE_THREAT_PAIR_VOCAB + ray);
+
+                if attacker.kind == PieceKind::Cannon && ordinal == 1 {
+                    let (screen_source, screen) = first.expect("second blocker requires first");
+                    let screen_square = canonical_square(perspective, screen_source);
+                    let screen_distance = (canonical_source % BOARD_FILES)
+                        .abs_diff(screen_square % BOARD_FILES)
+                        .max(
+                            (canonical_source / BOARD_FILES).abs_diff(screen_square / BOARD_FILES),
+                        )
+                        - 1;
+                    let screen_class = (if screen.color == perspective { 0 } else { 7 })
+                        + piece_kind_index(screen.kind);
+                    let target_class = blocked_class;
+                    let mut triple = canonical_source as u64;
+                    for field in [
+                        owner,
+                        direction,
+                        screen_class,
+                        screen_distance,
+                        target_class,
+                        distance,
+                    ] {
+                        triple = triple
+                            .wrapping_mul(0x9E37_79B1_85EB_CA87)
+                            .wrapping_add(field as u64 + 0xC2B2_AE3D_27D4_EB4F);
+                        triple ^= triple >> 29;
+                    }
+                    let triple = triple as usize & (VALUE_CANNON_TRIPLE_VOCAB - 1);
+                    visitor(VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + triple);
+                }
+            }
+        }
+    }
 }
 
 #[inline]
@@ -860,7 +956,11 @@ pub(super) fn policy_tactical_indices(
     destination_defended: bool,
     capture: bool,
     check: bool,
-) -> [usize; 2] {
+    attacker_kind: usize,
+    defender_kind: usize,
+    captured_kind: usize,
+    exchange_bucket: usize,
+) -> [usize; POLICY_TACTICAL_TERMS] {
     debug_assert!(moved_piece < STRUCTURAL_PIECE_SIZE / 2);
     let signature = usize::from(source_attacked)
         | usize::from(destination_attacked) << 1
@@ -873,7 +973,52 @@ pub(super) fn policy_tactical_indices(
         + signature;
     let factor =
         POLICY_TACTICAL_EXACT_SIZE + moved_piece * POLICY_TACTICAL_SIGNATURE_BUCKETS + signature;
-    [exact, factor]
+    [
+        exact,
+        factor,
+        POLICY_TACTICAL_ATTACKER_OFFSET + (moved_piece % 7) * 8 + attacker_kind,
+        POLICY_TACTICAL_DEFENDER_OFFSET + (moved_piece % 7) * 8 + defender_kind,
+        POLICY_TACTICAL_EXCHANGE_OFFSET
+            + ((moved_piece % 7) * 8 + captured_kind) * 5
+            + exchange_bucket,
+    ]
+}
+
+fn policy_tactical_types(
+    position: &Position,
+    side: Color,
+    mv: Move,
+) -> (bool, bool, usize, usize, usize, usize) {
+    let captured = position.piece_at(mv.to as usize);
+    let mut after = position.clone();
+    after.make_move(mv);
+    let attacker = after
+        .least_valuable_legal_attacker_kind(mv.to as usize, side.opposite())
+        .map_or(0, |kind| piece_kind_index(kind) + 1);
+    let defender = after
+        .least_valuable_legal_attacker_kind(mv.to as usize, side)
+        .map_or(0, |kind| piece_kind_index(kind) + 1);
+    let captured_kind = captured.map_or(7, |piece| piece_kind_index(piece.kind));
+    let net = position.static_exchange_eval(mv);
+    let exchange = if net <= -50 {
+        0
+    } else if net < 0 {
+        1
+    } else if net == 0 {
+        2
+    } else if net < 50 {
+        3
+    } else {
+        4
+    };
+    (
+        attacker != 0,
+        defender != 0,
+        attacker,
+        defender,
+        captured_kind,
+        exchange,
+    )
 }
 
 fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
@@ -1552,7 +1697,7 @@ impl AzNnue {
                 "missing AZ model format",
             ));
         };
-        if format_version != MODEL_FORMAT_VERSION && format_version != 22.0 {
+        if format_version != MODEL_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1564,18 +1709,9 @@ impl AzNnue {
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
         let arch = AzNnueArch { hidden_size };
-        let mut policy_accumulator_hidden =
+        let policy_accumulator_hidden =
             load_candle_f32_tensor(&tensors, "policy_accumulator_hidden")?;
-        let mut policy_accumulator_move =
-            load_candle_f32_tensor(&tensors, "policy_accumulator_move")?;
-        if format_version == 22.0 {
-            (policy_accumulator_hidden, policy_accumulator_move) =
-                expand_legacy_policy_accumulator(
-                    hidden_size,
-                    policy_accumulator_hidden,
-                    policy_accumulator_move,
-                )?;
-        }
+        let policy_accumulator_move = load_candle_f32_tensor(&tensors, "policy_accumulator_move")?;
         let mut model = Self {
             hidden_size,
             arch,
@@ -1955,10 +2091,15 @@ impl AzNnue {
                             let check = scratch.policy_gives_check[index];
                             let source_attacked =
                                 opponent_attacks & (1u128 << mv.from as usize) != 0;
-                            let destination_attacked =
-                                opponent_attacks & (1u128 << mv.to as usize) != 0;
                             let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
-                            let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
+                            let (
+                                destination_attacked,
+                                destination_defended,
+                                attacker_kind,
+                                defender_kind,
+                                captured_kind,
+                                exchange_bucket,
+                            ) = policy_tactical_types(position, side, *mv);
                             policy_tactical_indices(
                                 move_index,
                                 moved_piece,
@@ -1968,6 +2109,10 @@ impl AzNnue {
                                 destination_defended,
                                 captured.is_some(),
                                 check != 0.0,
+                                attacker_kind,
+                                defender_kind,
+                                captured_kind,
+                                exchange_bucket,
                             )
                             .into_iter()
                             .map(|tactical| self.policy_tactical[tactical])
@@ -2192,24 +2337,26 @@ impl AzNnue {
         let perspective = position.side_to_move();
         {
             crate::scope_profile!("az.eval.value_threat.accumulate");
-            position.visit_occupied_relations(|source, attacker, target, attacked| {
-                let feature = value_threat_index(perspective, source, attacker, target, attacked);
-                if feature == VALUE_THREAT_VOCAB {
-                    return;
-                }
+            let mut active = 0usize;
+            visit_value_threat_features(position, perspective, |feature| {
+                active += 1;
                 let row = &self.value_threat_embedding
                     [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
                 for (sum, weight) in accumulator.iter_mut().zip(row) {
                     *sum += weight;
                 }
             });
+            let scale = 1.0 / (active.max(1) as f32).sqrt();
+            for value in accumulator.iter_mut() {
+                *value *= scale;
+            }
         }
         let mut logits = [0.0; WDL_HEAD_SIZE];
         {
             crate::scope_profile!("az.eval.value_threat.output");
             activation.resize(VALUE_THREAT_RANK * 2, 0.0);
             for rank in 0..VALUE_THREAT_RANK {
-                let value = accumulator[rank].clamp(0.0, 1.0);
+                let value = accumulator[rank];
                 activation[rank] = value;
                 activation[VALUE_THREAT_RANK + rank] = value * value;
             }
@@ -3357,6 +3504,37 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cannon_features_bind_screen_target_and_ray_state() {
+        let position = Position::from_fen("4k4/9/9/9/9/9/9/4r4/4P4/3KC4 w - - 0 1").unwrap();
+        let mut features = Vec::new();
+        visit_value_threat_features(&position, Color::Red, |feature| features.push(feature));
+        assert!(features.iter().any(|&feature| {
+            (VALUE_THREAT_PAIR_VOCAB..VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB).contains(&feature)
+        }));
+        assert!(
+            features
+                .iter()
+                .any(|&feature| feature >= VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB)
+        );
+        assert!(features.iter().all(|&feature| feature < VALUE_THREAT_VOCAB));
+    }
+
+    #[test]
+    fn generalized_policy_terms_distinguish_piece_roles_and_exchange() {
+        let base = policy_tactical_indices(0, 4, true, true, false, true, true, false, 1, 2, 4, 0);
+        let changed =
+            policy_tactical_indices(0, 4, true, true, false, true, true, false, 6, 3, 5, 4);
+        assert_eq!(base[..2], changed[..2]);
+        assert_ne!(base[2..], changed[2..]);
+        assert!(base.into_iter().all(|index| index < POLICY_TACTICAL_SIZE));
+        assert!(
+            changed
+                .into_iter()
+                .all(|index| index < POLICY_TACTICAL_SIZE)
+        );
+    }
     use std::fs;
 
     #[test]
@@ -4074,62 +4252,6 @@ mod tests {
             model.policy_accumulator_move,
             loaded.policy_accumulator_move
         );
-    }
-
-    #[test]
-    fn v22_policy_accumulator_expansion_preserves_existing_logits() {
-        let hidden_size = 3;
-        let legacy_hidden: Vec<f32> = (0..LEGACY_POLICY_ACCUMULATOR_RANK * hidden_size)
-            .map(|index| index as f32 * 0.01 - 0.2)
-            .collect();
-        let legacy_move: Vec<f32> = (0..DENSE_MOVE_SPACE * LEGACY_POLICY_ACCUMULATOR_RANK)
-            .map(|index| index as f32 * 0.0001 - 0.3)
-            .collect();
-        let (expanded_hidden, expanded_move) = expand_legacy_policy_accumulator(
-            hidden_size,
-            legacy_hidden.clone(),
-            legacy_move.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            &expanded_hidden[..legacy_hidden.len()],
-            legacy_hidden.as_slice()
-        );
-        assert!(
-            expanded_hidden[legacy_hidden.len()..]
-                .iter()
-                .any(|&weight| weight != 0.0)
-        );
-        let old_activation: Vec<f32> = (0..LEGACY_POLICY_ACCUMULATOR_RANK)
-            .map(|index| index as f32 * 0.02 - 0.1)
-            .collect();
-        let mut new_activation = vec![0.75; POLICY_ACCUMULATOR_RANK];
-        new_activation[..LEGACY_POLICY_ACCUMULATOR_RANK].copy_from_slice(&old_activation);
-        for move_index in [0, 1, DENSE_MOVE_SPACE - 1] {
-            let old = &legacy_move[move_index * LEGACY_POLICY_ACCUMULATOR_RANK
-                ..(move_index + 1) * LEGACY_POLICY_ACCUMULATOR_RANK];
-            let new = &expanded_move
-                [move_index * POLICY_ACCUMULATOR_RANK..(move_index + 1) * POLICY_ACCUMULATOR_RANK];
-            assert_eq!(&new[..LEGACY_POLICY_ACCUMULATOR_RANK], old);
-            assert!(
-                new[LEGACY_POLICY_ACCUMULATOR_RANK..]
-                    .iter()
-                    .all(|&weight| weight == 0.0)
-            );
-
-            let old_logit: f32 = old
-                .iter()
-                .zip(&old_activation)
-                .map(|(left, right)| left * right)
-                .sum();
-            let new_logit: f32 = new
-                .iter()
-                .zip(&new_activation)
-                .map(|(left, right)| left * right)
-                .sum();
-            assert_eq!(old_logit, new_logit);
-        }
     }
 
     #[test]

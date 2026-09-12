@@ -3,9 +3,9 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
-    POLICY_TACTICAL_SIZE, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_FILE_SIZE,
-    STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE, VALUE_HEAD_SIZE,
-    VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE,
+    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
+    VALUE_HEAD_SIZE, VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
@@ -82,8 +82,9 @@ impl AzCandleModel {
         let threat_accumulator = sparse_pool(
             self.value_threat_embedding.as_tensor(),
             &batch.value_threat_indices,
-        )?;
-        let threat_activation = threat_accumulator.clamp(0.0f64, 1.0f64)?;
+        )?
+        .broadcast_mul(&batch.value_threat_scales)?;
+        let threat_activation = threat_accumulator;
         let threat_pair = Tensor::cat(&[&threat_activation, &threat_activation.sqr()?], 1)?;
         let value_logits = (value_logits + threat_pair.matmul(&self.value_threat_output.t()?)?)?;
         let piece_square_policy = self
@@ -164,6 +165,7 @@ pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
     pub(super) feature_items: Tensor,
     pub(super) value_threat_indices: Tensor,
+    pub(super) value_threat_scales: Tensor,
     pub(super) policy_items: Tensor,
     pub(super) policy_sparse_indices: Tensor,
     pub(super) policy_tactical_indices: Tensor,
@@ -204,6 +206,11 @@ impl BatchTensors {
                 (batch_size, max_value_threats),
                 device,
             )?,
+            value_threat_scales: Tensor::from_vec(
+                packed.value_threat_scales,
+                (batch_size, 1),
+                device,
+            )?,
             policy_items: Tensor::from_vec(
                 packed.policy_items,
                 (batch_size, max_policy_moves),
@@ -216,7 +223,7 @@ impl BatchTensors {
             )?,
             policy_tactical_indices: Tensor::from_vec(
                 packed.policy_tactical_indices,
-                (batch_size, max_policy_moves, 2),
+                (batch_size, max_policy_moves, POLICY_TACTICAL_TERMS),
                 device,
             )?,
             policy_targets: Tensor::from_vec(
@@ -498,6 +505,15 @@ mod tests {
         for (index, weight) in model.policy_accumulator_move.iter_mut().enumerate() {
             *weight = ((index % POLICY_ACCUMULATOR_RANK) as f32 + 1.0) * 0.0002;
         }
+        for (index, weight) in model.value_threat_output.iter_mut().enumerate() {
+            *weight = (index % 17) as f32 * 0.0003 - 0.002;
+        }
+        for (index, weight) in model.policy_threat_context.iter_mut().enumerate() {
+            *weight = (index % 13) as f32 * 0.0001 - 0.0005;
+        }
+        for (index, weight) in model.policy_tactical.iter_mut().enumerate() {
+            *weight = (index % 11) as f32 * 0.0002 - 0.001;
+        }
         model.policy_sparse_table[POLICY_SPARSE_TABLE_SIZE - 1] = 0.127;
         let side = position.side_to_move();
         let buckets = canonical_buckets_for_perspective(&position, side);
@@ -519,9 +535,16 @@ mod tests {
             }
         }
         model.rebuild_policy_cache();
+        model.rebuild_policy_tactical();
+        model.rebuild_value_threat();
 
         let mut cpu = AzEvalScratch::new(model.arch);
-        model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut cpu);
+        let cpu_output = model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &mut cpu,
+        );
 
         let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
@@ -543,6 +566,15 @@ mod tests {
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
         let forward = candle.forward(&batch).unwrap();
         let legal = forward.policy_logits.to_vec2::<f32>().unwrap();
+        let value_logits = forward.value_logits.to_vec2::<f32>().unwrap();
+        let candle_wdl = crate::az::softmax_fixed3(value_logits[0].clone().try_into().unwrap());
+
+        for (candle_value, cpu_value) in candle_wdl.iter().zip(cpu_output.value_wdl) {
+            assert!(
+                (candle_value - cpu_value).abs() < 2.0e-5,
+                "candle={candle_value} cpu={cpu_value}"
+            );
+        }
 
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
