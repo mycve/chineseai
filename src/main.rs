@@ -33,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex, RwLock,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -952,15 +952,18 @@ fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> V
     })
 }
 
-#[derive(Default)]
-struct SelfplayPauseState {
-    arena_paused: bool,
-}
-
-impl SelfplayPauseState {
-    fn is_paused(&self) -> bool {
-        self.arena_paused
-    }
+fn publish_selfplay_model(
+    shared_model: &RwLock<SharedSelfplayModel>,
+    models_by_numa_node: Vec<Arc<AzNnue>>,
+    learner_update: usize,
+) -> u64 {
+    let mut shared = shared_model
+        .write()
+        .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
+    shared.models_by_numa_node = models_by_numa_node;
+    shared.version = shared.version.wrapping_add(1);
+    shared.learner_update = learner_update.min(u32::MAX as usize) as u32;
+    shared.version
 }
 
 #[derive(Default)]
@@ -2139,10 +2142,10 @@ fn main() {
                 }
                 reference
             };
-            let initial_selfplay_model = initial_arena_reference_model.clone();
-            println!("selfplay : starts from best; publish only after promotion");
+            let initial_selfplay_model = selfplay_model;
+            println!("selfplay : starts from current learner; publish after every update");
             if config.arena_interval == 0 {
-                println!("selfplay : arena disabled; best remains fixed");
+                println!("selfplay : arena disabled; learner still publishes continuously");
             }
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
@@ -2235,11 +2238,7 @@ fn main() {
                 config.replay_capacity as f32 / config.selfplay_samples_per_update.max(1) as f32;
             let warmup_update_span = config.train_warmup_samples as f32
                 / config.selfplay_samples_per_update.max(1) as f32;
-            let replay_actor_span = if config.arena_interval > 0 {
-                "promotion-dependent"
-            } else {
-                "fixed-best"
-            };
+            let replay_actor_span = "continuous/every-update";
 
             println!(
                 "design   : replay={:.1}updates actor_generations={} warmup={:.1}updates expected_sample_exposures={:.2} optimizer_steps_per_update={}",
@@ -2254,7 +2253,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=batch search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_promotion(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.simulations,
                 config.value_td_lambda,
@@ -2340,11 +2339,7 @@ fn main() {
                 config.midgame_start_fraction * 100.0,
                 config.opening_reservoir_capacity,
                 config.midgame_reservoir_capacity,
-                if config.arena_interval > 0 {
-                    "promotion-only"
-                } else {
-                    "fixed-best"
-                }
+                "every-update"
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
             let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
@@ -2353,7 +2348,8 @@ fn main() {
             let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(2).max(32);
             let (selfplay_tx, selfplay_rx) =
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
-            let (trainer_tx, trainer_rx) = mpsc::sync_channel::<TrainerEvent>(2);
+            // 评估在主线程同步汇总时，训练结果仍可排队，避免反压训练和自对弈流水线。
+            let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
             let llc_domains = cpu_placements
                 .iter()
                 .map(|placement| (placement.node, placement.package, placement.llc))
@@ -2391,18 +2387,11 @@ fn main() {
             } else {
                 println!("champion : loaded history={}", champion_paths.len());
             }
-            let initial_actor_update = champion_paths
-                .last()
-                .and_then(|path| checkpoint_number(path))
-                .unwrap_or(start_update.saturating_sub(1) as u64)
-                .min(u32::MAX as u64) as u32;
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: start_update.saturating_sub(1) as u64,
-                learner_update: initial_actor_update,
+                learner_update: start_update.saturating_sub(1).min(u32::MAX as usize) as u32,
                 models_by_numa_node: initial_numa_models,
             }));
-            let selfplay_pause =
-                Arc::new((Mutex::new(SelfplayPauseState::default()), Condvar::new()));
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
             for worker_id in 0..selfplay_worker_count {
                 let placement = cpu_placements[worker_id % cpu_placements.len()];
@@ -2414,7 +2403,6 @@ fn main() {
                 let selfplay_config = config.clone();
                 let selfplay_tx = selfplay_tx.clone();
                 let shared_model = Arc::clone(&shared_model);
-                let selfplay_pause = Arc::clone(&selfplay_pause);
                 let selfplay_opening_pool = Arc::clone(&shared_opening_pool);
                 let selfplay_midgame_pool = Arc::clone(&shared_midgame_pool);
                 selfplay_handles.push(thread::spawn(move || {
@@ -2429,17 +2417,6 @@ fn main() {
                     let mut local_learner_update = 0u32;
                     let mut local_model: Option<Arc<AzNnue>> = None;
                     while !selfplay_stop.load(Ordering::SeqCst) {
-                        {
-                            let (pause_lock, pause_cvar) = &*selfplay_pause;
-                            let mut pause_state = pause_lock
-                                .lock()
-                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                            while pause_state.is_paused() && !selfplay_stop.load(Ordering::SeqCst) {
-                                pause_state = pause_cvar
-                                    .wait(pause_state)
-                                    .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                            }
-                        }
                         if selfplay_stop.load(Ordering::SeqCst) {
                             break;
                         }
@@ -2560,6 +2537,8 @@ fn main() {
             let trainer_config = config.clone();
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
+            let trainer_shared_model = Arc::clone(&shared_model);
+            let trainer_numa_nodes = numa_nodes.clone();
             let trainer_handle = thread::spawn(move || {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
@@ -2637,10 +2616,19 @@ fn main() {
                         pool.window_stats(trainer_config.replay_recent_games),
                         train_source_stats,
                     );
+                    let candidate_model = trainer_model.clone();
+                    let actor_version = publish_selfplay_model(
+                        &trainer_shared_model,
+                        build_numa_model_replicas(&candidate_model, &trainer_numa_nodes),
+                        train_update,
+                    );
+                    println!(
+                        "actor    : published learner update {train_update} as generation {actor_version}"
+                    );
                     if trainer_tx
                         .send(TrainerEvent {
                             report,
-                            candidate_model: trainer_model.clone(),
+                            candidate_model,
                         })
                         .is_err()
                     {
@@ -3463,14 +3451,6 @@ fn main() {
                 );
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
-                        let (pause_lock, _) = &*selfplay_pause;
-                        let mut pause_state = pause_lock
-                            .lock()
-                            .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                        pause_state.arena_paused = true;
-                    }
-                    println!("pause    : selfplay paused for arena");
-                    {
                         let (mut arena_start_positions, arena_mode) =
                             build_arena_start_positions(&config, update);
                         shuffle_positions(
@@ -3599,20 +3579,6 @@ fn main() {
                             save_model(&deployed_model, &best_path);
                             champion_paths.push(best_checkpoint.clone());
                             println!("best     : saved {}", best_checkpoint.display());
-                            let updated_numa_models =
-                                build_numa_model_replicas(&deployed_model, &numa_nodes);
-                            let actor_version = {
-                                let mut shared = shared_model
-                                    .write()
-                                    .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-                                shared.models_by_numa_node = updated_numa_models;
-                                shared.version = shared.version.wrapping_add(1);
-                                shared.learner_update = update.min(u32::MAX as usize) as u32;
-                                shared.version
-                            };
-                            println!(
-                                "actor    : published champion update {update} as generation {actor_version}"
-                            );
                         }
                         println!(
                             "arena {update:04}: mode={} positions={} current_games={} pairs={} current_W/L/D={}/{}/{} current_rate={:.3} paired_se={:.4} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} elo_diff={:+.1} elo_ci={:+.1}..{:+.1} best_ref=memory{}",
@@ -3745,15 +3711,6 @@ fn main() {
                             if promoted { 1.0 } else { 0.0 },
                         );
                     }
-                    {
-                        let (pause_lock, pause_cvar) = &*selfplay_pause;
-                        let mut pause_state = pause_lock
-                            .lock()
-                            .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                        pause_state.arena_paused = false;
-                        pause_cvar.notify_all();
-                    }
-                    println!("resume   : selfplay resumed after arena");
                 }
                 if config.pikafish_label_eval_interval > 0
                     && update.is_multiple_of(config.pikafish_label_eval_interval)
@@ -3761,14 +3718,6 @@ fn main() {
                 {
                     let sqlite_path = Path::new(&config.pikafish_label_eval_sqlite);
                     if sqlite_path.exists() {
-                        {
-                            let (pause_lock, _) = &*selfplay_pause;
-                            let mut pause_state = pause_lock
-                                .lock()
-                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                            pause_state.arena_paused = true;
-                        }
-                        println!("pause    : selfplay paused for pikafish label eval");
                         let started = Instant::now();
                         let eval_result = (|| -> io::Result<LabelEvalStats> {
                             let conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
@@ -3804,14 +3753,6 @@ fn main() {
                                 config.arena_processes,
                             )
                         })();
-                        {
-                            let (pause_lock, pause_cvar) = &*selfplay_pause;
-                            let mut pause_state = pause_lock
-                                .lock()
-                                .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                            pause_state.arena_paused = false;
-                            pause_cvar.notify_all();
-                        }
                         match eval_result {
                             Ok(stats) => {
                                 println!(
@@ -3907,7 +3848,6 @@ fn main() {
                                 );
                             }
                         }
-                        println!("resume   : selfplay resumed after pikafish label eval");
                     } else {
                         let resolved = if sqlite_path.is_absolute() {
                             sqlite_path.to_path_buf()
@@ -3933,14 +3873,6 @@ fn main() {
                 }
             }
             stop_requested.store(true, Ordering::SeqCst);
-            {
-                let (pause_lock, pause_cvar) = &*selfplay_pause;
-                let mut pause_state = pause_lock
-                    .lock()
-                    .unwrap_or_else(|_| panic!("selfplay pause state poisoned"));
-                pause_state.arena_paused = false;
-                pause_cvar.notify_all();
-            }
             // 等待线程前持续排空结果队列，避免满队列让训练及产数线程相互等待。
             for event in trainer_rx {
                 if exited_after_ctrl_c {
@@ -5497,6 +5429,25 @@ fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
 mod reporting_tests {
     use super::*;
     use chineseai::az::AzSampleMeta;
+
+    #[test]
+    fn learner_publish_advances_actor_without_arena_decision() {
+        let initial = Arc::new(AzNnue::random(8, 1));
+        let latest = Arc::new(AzNnue::random(8, 2));
+        let shared = RwLock::new(SharedSelfplayModel {
+            version: 7,
+            learner_update: 6,
+            models_by_numa_node: vec![initial],
+        });
+
+        let version = publish_selfplay_model(&shared, vec![Arc::clone(&latest)], 8);
+        let published = shared.read().unwrap();
+
+        assert_eq!(version, 8);
+        assert_eq!(published.version, 8);
+        assert_eq!(published.learner_update, 8);
+        assert!(Arc::ptr_eq(&published.models_by_numa_node[0], &latest));
+    }
 
     #[test]
     fn progress_roundtrip_preserves_generated_totals() {
