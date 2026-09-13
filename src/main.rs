@@ -44,7 +44,7 @@ use tensorboard_rs::summary_writer::SummaryWriter;
 
 const DEFAULT_VS_PIKAFISH_DEPTH: u32 = 10;
 const DEFAULT_VS_PIKAFISH_GAMES: usize = 20;
-const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 5;
+const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 128;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -119,22 +119,22 @@ struct AzSearchArgs {
     /// AZ-NNUE model path.
     model: String,
     /// Number of MCTS simulations.
-    #[arg(default_value_t = 10_000)]
+    #[arg(default_value_t = 800)]
     simulations: usize,
     /// Non-root PUCT init.
-    #[arg(default_value_t = 0.9)]
+    #[arg(default_value_t = 1.2)]
     cpuct: f32,
     /// Root PUCT init.
     #[arg(long, default_value_t = 2.0)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.20)]
+    #[arg(long, default_value_t = 0.15)]
     fpu_value: f32,
     /// Root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.10)]
+    #[arg(long, default_value_t = 0.05)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before root search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.2)]
+    #[arg(long, default_value_t = 1.45)]
     policy_softmax_temp: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
@@ -192,13 +192,13 @@ struct AzBenchArgs {
     /// AZ-NNUE model path.
     model: String,
     /// Simulations per search.
-    #[arg(default_value_t = 512)]
+    #[arg(default_value_t = 800)]
     simulations: usize,
     /// Number of repeated searches.
     #[arg(default_value_t = 100)]
     repeat: usize,
     /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.5)]
+    #[arg(default_value_t = 1.2)]
     cpuct: f32,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -219,7 +219,7 @@ struct AzTrainBenchArgs {
     #[arg(default_value_t = 1024)]
     batch_size: usize,
     /// Learning rate.
-    #[arg(default_value_t = 0.0003)]
+    #[arg(default_value_t = 0.0004)]
     lr: f32,
     /// Random seed.
     #[arg(default_value_t = 20260411)]
@@ -297,28 +297,28 @@ struct CheckpointCyclesArgs {
     #[arg(long)]
     adjacent_only: bool,
     /// MCTS simulations per move.
-    #[arg(short = 's', long, default_value_t = 400)]
+    #[arg(short = 's', long, default_value_t = 800)]
     simulations: usize,
     /// Random OBK positions; every pair uses the same positions with colors swapped.
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 1000)]
     opening_positions: usize,
     /// OBK opening book. Empty uses startpos.
     #[arg(long, default_value = "opening.obk")]
     opening_book: String,
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = 8)]
     opening_plies_min: usize,
     #[arg(long, default_value_t = 10)]
     opening_plies_max: usize,
     /// Parallel arena workers for each checkpoint pair.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 128)]
     threads: usize,
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 200)]
     max_plies: usize,
     /// Minimum score-rate excess over 50% used to report a directed edge or cycle.
     #[arg(long, default_value_t = 0.02)]
     cycle_margin: f32,
     /// One-sided confidence multiplier used by cycle and regression detection.
-    #[arg(long, default_value_t = 1.28)]
+    #[arg(long, default_value_t = 1.96)]
     confidence_z: f32,
     #[arg(long, default_value_t = 20260823)]
     seed: u64,
@@ -337,10 +337,10 @@ struct VsPikafishArgs {
     /// ChineseAI AZ-NNUE model path.
     model: String,
     /// ChineseAI MCTS simulations per move.
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, default_value = "800")]
     simulations: Option<usize>,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 0.9)]
+    #[arg(long, default_value_t = 1.2)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
     #[arg(long, default_value_t = 2.0)]
@@ -358,16 +358,16 @@ struct VsPikafishArgs {
     #[arg(long, default_value_t = 1.5)]
     cpuct_factor_at_root: f32,
     /// ChineseAI non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(long, default_value_t = 0.15)]
     fpu_value: f32,
     /// ChineseAI root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.05)]
     fpu_value_at_root: f32,
     /// Divisor applied to ChineseAI policy logits before search.
-    #[arg(long, default_value_t = 1.2)]
+    #[arg(long, default_value_t = 1.45)]
     policy_softmax_temp: f32,
     /// Draw after this many plies.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 200)]
     max_plies: usize,
     /// Random seed.
     #[arg(long, default_value_t = 20260411)]
@@ -388,10 +388,10 @@ struct VsPikafishArgs {
     #[arg(long, default_value = "opening.obk")]
     opening_book: String,
     /// Number of random opening positions to generate from the OBK book.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 1000)]
     opening_positions: usize,
     /// Minimum book plies before handing the position to both engines.
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = 8)]
     opening_plies_min: usize,
     /// Maximum book plies before handing the position to both engines.
     #[arg(long, default_value_t = 10)]
@@ -445,9 +445,9 @@ struct PikafishLabelSelfplayArgs {
     sqlite: String,
     #[arg(long, default_value_t = 100_000)]
     count: usize,
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 800)]
     simulations: usize,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 200)]
     max_plies: usize,
     #[arg(long, default_value_t = 16)]
     workers: usize,
@@ -498,13 +498,13 @@ struct PikafishLabelEvalArgs {
     /// SQLite labels produced by pikafish-label-random.
     sqlite: String,
     /// ChineseAI MCTS simulations per position.
-    #[arg(short = 's', long, default_value_t = 64)]
+    #[arg(short = 's', long, default_value_t = 6000)]
     simulations: usize,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 0.65)]
+    #[arg(long, default_value_t = 1.2)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 2.0)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
     #[arg(long, default_value_t = 0.15)]
@@ -513,7 +513,7 @@ struct PikafishLabelEvalArgs {
     #[arg(long, default_value_t = 0.05)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 1.45)]
     policy_softmax_temp: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
@@ -522,10 +522,10 @@ struct PikafishLabelEvalArgs {
     #[arg(long, default_value_t = 20260628)]
     seed: u64,
     /// Limit number of positions; 0 means all.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 1000)]
     limit: usize,
     /// Parallel evaluator threads.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 128)]
     threads: usize,
 }
 
@@ -1445,8 +1445,8 @@ fn fixed_az_search_limits(
         max_depth,
         root_dirichlet_total_concentration: 0.0,
         root_exploration_fraction: 0.0,
-        fpu_value: 0.30,
-        fpu_value_at_root: 0.20,
+        fpu_value: 0.15,
+        fpu_value_at_root: 0.05,
         policy_softmax_temp: policy_softmax_temp.max(1.0e-3),
         draw_score: 0.0,
         value_scale: 1.0,
@@ -1806,7 +1806,7 @@ fn main() {
             let _ = alphazero_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.0),
+                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.45),
             );
 
             let started = std::time::Instant::now();
@@ -1816,7 +1816,7 @@ fn main() {
                 let result = alphazero_search(
                     &position,
                     &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.0),
+                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.45),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -4033,7 +4033,7 @@ fn main() {
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
             let model_path = cmd.model;
-            let simulations = cmd.simulations.unwrap_or(192).max(1);
+            let simulations = cmd.simulations.unwrap_or(800).max(1);
             let cpuct = cmd.cpuct.max(0.0);
             let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
             let cpuct_base = cmd.cpuct_base.max(1.0);
@@ -4326,16 +4326,16 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
                 simulations: cmd.simulations.max(1),
                 max_plies: cmd.max_plies.max(1),
                 rule60_max_ply: Some(120),
-                cpuct: 0.9,
+                cpuct: 1.2,
                 cpuct_at_root: 2.0,
                 cpuct_base: 19652.0,
                 cpuct_factor: 1.5,
                 cpuct_base_at_root: 19652.0,
                 cpuct_factor_at_root: 1.5,
-                fpu_value: 0.2,
-                fpu_value_at_root: 0.1,
+                fpu_value: 0.15,
+                fpu_value_at_root: 0.05,
                 draw_score: 0.0,
-                policy_softmax_temp: 1.2,
+                policy_softmax_temp: 1.45,
                 thread_count: cmd.threads.max(1),
                 seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
             });
@@ -5524,13 +5524,13 @@ mod reporting_tests {
         let Some(CliCommand::AzSearch(args)) = cli.command else {
             panic!("expected az-search command");
         };
-        assert_eq!(args.cpuct, 0.9);
+        assert_eq!(args.cpuct, 1.2);
         assert_eq!(args.cpuct_at_root, 2.0);
         assert_eq!(args.cpuct_factor, 1.5);
         assert_eq!(args.cpuct_factor_at_root, 1.5);
-        assert_eq!(args.fpu_value, 0.20);
-        assert_eq!(args.fpu_value_at_root, 0.10);
-        assert_eq!(args.policy_softmax_temp, 1.2);
+        assert_eq!(args.fpu_value, 0.15);
+        assert_eq!(args.fpu_value_at_root, 0.05);
+        assert_eq!(args.policy_softmax_temp, 1.45);
     }
 
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
@@ -5655,6 +5655,7 @@ mod reporting_tests {
     #[test]
     fn arena_adds_random_takeover_positions() {
         let mut config = AzLoopFileConfig::default();
+        config.arena_interval = 10;
         config.arena_opening_book.clear();
         config.arena_random_positions = 8;
         config.arena_random_plies_min = 4;
