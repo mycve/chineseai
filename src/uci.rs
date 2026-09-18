@@ -447,6 +447,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let model = state.model.as_ref().expect("model was loaded");
 
     let mut legal = uci_root_moves(&state.position, &state.rule_history);
+    let root_has_legal_moves = !legal.is_empty();
     if !params.searchmoves.is_empty() {
         legal.retain(|mv| {
             params
@@ -457,7 +458,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
 
     if legal.is_empty() {
-        println!("info depth 1 nodes 0 time 0 score cp -32000");
+        let score = if root_has_legal_moves { "cp 0" } else { "cp -1000" };
+        println!("info depth 1 nodes 0 time 0 score {score}");
         println!("bestmove 0000");
         flush();
         return;

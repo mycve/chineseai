@@ -894,7 +894,8 @@ impl<'a> AzTree<'a> {
             if self.nodes[node_index].children_len > 0
                 && (was_in_check || self.nodes[node_index].children_len == 1)
             {
-                return self.simulate_child(node_index, 0, depth + 1);
+                let child_index = self.select_child(node_index);
+                return self.simulate_child(node_index, child_index, depth + 1);
             }
             self.add_node_visit(node_index, eval);
             self.record_leaf_depth(depth, false);
