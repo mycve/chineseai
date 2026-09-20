@@ -321,13 +321,6 @@ fn apply_uci_moves(
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
-        // The external controller owns adjudication of the moves it supplied.
-        // Once that history has completed any repetition, start a fresh rule
-        // segment at the accepted board instead of exposing an inherited
-        // long-check/long-chase "win" to evaluation of the next side.
-        if position.rule_outcome_with_history(rule_history).is_some() {
-            *rule_history = position.initial_rule_history();
-        }
     }
 }
 
@@ -458,7 +451,11 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
 
     if legal.is_empty() {
-        let score = if root_has_legal_moves { "cp 0" } else { "cp -1000" };
+        let score = if root_has_legal_moves {
+            "cp 0"
+        } else {
+            "cp -1000"
+        };
         println!("info depth 1 nodes 0 time 0 score {score}");
         println!("bestmove 0000");
         flush();
@@ -689,8 +686,7 @@ mod tests {
         let moves = ["g0g1", "f0e1", "g1g0", "e1f0", "g0g1"];
         apply_uci_moves(&mut position, &mut history, &moves);
 
-        assert_eq!(history.len(), 2);
-        assert_eq!(position.rule_outcome_with_history(&history), None);
+        assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Red);
         assert!(!uci_root_moves(&position, &history).is_empty());
     }
@@ -704,9 +700,25 @@ mod tests {
         let moves = ["c7b5", "d4d5", "b5c7", "d5d4", "c7b5"];
         apply_uci_moves(&mut position, &mut history, &moves);
 
-        assert_eq!(history.len(), 2);
-        assert_eq!(position.rule_outcome_with_history(&history), None);
+        assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Red);
         assert!(!uci_root_moves(&position, &history).is_empty());
+    }
+
+    #[test]
+    fn uci_import_preserves_repetition_history_for_value_evaluation() {
+        let mut position = Position::from_fen(
+            "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1",
+        )
+        .unwrap();
+        let mut history = position.initial_rule_history();
+        let moves = "b2e2 b9c7 b0c2 h9g7 c3c4 g6g5 a0b0 a9b9 h0i2 i6i5 h2f2 b7b5 b0b4 i9i6 c4c5 c6c5 i0h0 c5c4 b4c4 g7h5 f2h2 h5g7 h2f2 g7h5 f2h2 h5g7 h2f2 g7h5 f2h2";
+        let moves = moves.split_whitespace().collect::<Vec<_>>();
+
+        apply_uci_moves(&mut position, &mut history, &moves);
+
+        assert_eq!(history.len(), moves.len() + 1);
+        assert_eq!(position.side_to_move(), Color::Black);
+        assert!(crate::az::rule_context_features(&position, &history)[1] > 0.0);
     }
 }
