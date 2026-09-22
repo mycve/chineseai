@@ -32,8 +32,6 @@ pub struct AzLoopFileConfig {
     pub sixty_move_rule: bool,
     pub rule60_max_ply: u16,
     pub hidden_size: usize,
-    pub trunk_residual_rank: usize,
-    pub policy_interaction_rank: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
@@ -119,13 +117,11 @@ impl Default for AzLoopFileConfig {
             lr_decay_start_update: 100,
             lr_decay_interval: 100,
             lr_decay_factor: 0.97,
-            batch_size: 1024,
+            batch_size: 512,
             max_plies: 200,
             sixty_move_rule: true,
             rule60_max_ply: 120,
-            hidden_size: 256,
-            trunk_residual_rank: 0,
-            policy_interaction_rank: 0,
+            hidden_size: 128,
             seed: 20260420,
             workers: 0,
             temperature_start: 1.2,
@@ -145,7 +141,7 @@ impl Default for AzLoopFileConfig {
             fpu_value: 0.15,
             fpu_value_at_root: 0.05,
             draw_score: 0.0,
-            policy_softmax_temp: 1.45,
+            policy_softmax_temp: 1.25,
             opening_start_fraction: 0.30,
             opening_reservoir_capacity: 50_000,
             opening_snapshot_path: "opening-pool.lz4".into(),
@@ -173,9 +169,9 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 20,
             arena_simulations: 800,
-            arena_cpuct: 1.2,
+            arena_cpuct: 0.9,
             arena_cpuct_at_root: 2.0,
-            arena_policy_softmax_temp: 1.45,
+            arena_policy_softmax_temp: 1.25,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.96,
             arena_processes: 128,
@@ -190,9 +186,9 @@ impl Default for AzLoopFileConfig {
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
             pikafish_label_eval_simulations: 6000,
-            pikafish_label_eval_cpuct: 1.2,
+            pikafish_label_eval_cpuct: 0.9,
             pikafish_label_eval_cpuct_at_root: 2.0,
-            pikafish_label_eval_policy_softmax_temp: 1.45,
+            pikafish_label_eval_policy_softmax_temp: 1.25,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -240,8 +236,6 @@ impl AzLoopFileConfig {
         line!("sixty_move_rule", self.sixty_move_rule);
         line!("rule60_max_ply", self.rule60_max_ply);
         line!("hidden_size", self.hidden_size);
-        line!("trunk_residual_rank", self.trunk_residual_rank);
-        line!("policy_interaction_rank", self.policy_interaction_rank);
         line!("seed", self.seed);
         line!("workers", self.workers);
         line!("temperature_start", f(self.temperature_start));
@@ -383,39 +377,20 @@ impl AzLoopFileConfig {
     }
 
     pub(crate) fn parse(text: &str) -> Self {
-        let mut document = toml::from_str::<toml::Value>(text)
+        let config = toml::from_str::<AzLoopFileConfig>(text)
             .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
-        let format_version = document
-            .get("format_version")
-            .and_then(toml::Value::as_integer)
-            .unwrap_or(AZ_LOOP_CONFIG_FORMAT_VERSION as i64) as u32;
-        if !(24..=AZ_LOOP_CONFIG_FORMAT_VERSION).contains(&format_version) {
+        if config.format_version != AZ_LOOP_CONFIG_FORMAT_VERSION {
             panic!(
-                "unsupported az-loop config format {}; expected 24..={}",
-                format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
+                "unsupported az-loop config format {}; expected {}",
+                config.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
             );
         }
-        if format_version < 27 {
-            document
-                .as_table_mut()
-                .expect("az-loop TOML root must be a table")
-                .remove("value_td_lambda");
-        }
-        let config = document
-            .try_into::<AzLoopFileConfig>()
-            .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
-        let mut config = config.normalize();
-        config.format_version = AZ_LOOP_CONFIG_FORMAT_VERSION;
-        config
+        config.normalize()
     }
 
     pub fn arch(&self) -> AzNnueArch {
         AzNnueArch {
             hidden_size: self.hidden_size,
-            residual_rank: self.trunk_residual_rank,
-            policy_interaction_rank: self.policy_interaction_rank,
-            policy_context_extra_rank: 0,
-            value_extra_rank: 0,
         }
     }
 
@@ -540,7 +515,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 27\n"));
+        assert!(text.starts_with("format_version = 28\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00001\n"));
         assert!(text.contains("temperature_start = 1.2\n"));
@@ -563,7 +538,7 @@ mod tests {
         assert!(text.contains("fpu_value = 0.15\n"));
         assert!(text.contains("fpu_value_at_root = 0.05\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("policy_softmax_temp = 1.25\n"));
         assert!(!text.contains("value_td_lambda"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_start_fraction = 0.3\n"));
@@ -583,11 +558,9 @@ mod tests {
         assert!(!text.contains("high_simulation_start_plies"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 0\n"));
-        assert!(text.contains("batch_size = 1024\n"));
+        assert!(text.contains("batch_size = 512\n"));
         assert!(text.contains("max_plies = 200\n"));
-        assert!(text.contains("hidden_size = 256\n"));
-        assert!(text.contains("trunk_residual_rank = 0\n"));
-        assert!(text.contains("policy_interaction_rank = 0\n"));
+        assert!(text.contains("hidden_size = 128\n"));
         assert!(text.contains("replay_capacity = 2400000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));
         assert!(text.contains("train_warmup_samples = 600000\n"));
@@ -623,9 +596,9 @@ mod tests {
         assert!(text.contains("arena_simulations = 800\n"));
         assert!(text.contains("arena_promotion_rate = 0.5\n"));
         assert!(text.contains("arena_promotion_confidence_z = 1.96\n"));
-        assert!(text.contains("arena_cpuct = 1.2\n"));
+        assert!(text.contains("arena_cpuct = 0.9\n"));
         assert!(text.contains("arena_cpuct_at_root = 2.0\n"));
-        assert!(text.contains("arena_policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("arena_policy_softmax_temp = 1.25\n"));
         assert!(
             text.contains(
                 "pikafish_label_eval_sqlite = \"eval/pikafish-selfplay-5000-d20.sqlite\"\n"
@@ -634,9 +607,9 @@ mod tests {
         assert!(text.contains("pikafish_label_eval_interval = 20\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
         assert!(text.contains("pikafish_label_eval_simulations = 6000\n"));
-        assert!(text.contains("pikafish_label_eval_cpuct = 1.2\n"));
+        assert!(text.contains("pikafish_label_eval_cpuct = 0.9\n"));
         assert!(text.contains("pikafish_label_eval_cpuct_at_root = 2.0\n"));
-        assert!(text.contains("pikafish_label_eval_policy_softmax_temp = 1.45\n"));
+        assert!(text.contains("pikafish_label_eval_policy_softmax_temp = 1.25\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));
@@ -652,31 +625,12 @@ mod tests {
     }
 
     #[test]
-    fn version_24_config_migrates_to_current_with_no_optional_branches() {
+    fn old_config_versions_are_rejected() {
         let text = AzLoopFileConfig::default()
             .to_file_text()
-            .replace("format_version = 27", "format_version = 24")
-            .replace("trunk_residual_rank = 0\n", "")
-            .replace("policy_interaction_rank = 0\n", "");
-        let parsed = AzLoopFileConfig::parse(&text);
-        assert_eq!(parsed.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION);
-        assert_eq!(parsed.trunk_residual_rank, 0);
-        assert_eq!(parsed.policy_interaction_rank, 0);
-    }
-
-    #[test]
-    fn version_26_config_drops_td_lambda() {
-        let text = AzLoopFileConfig::default()
-            .to_file_text()
-            .replace("format_version = 27", "format_version = 26")
-            .replacen(
-                "policy_softmax_temp = 1.45\n",
-                "policy_softmax_temp = 1.45\nvalue_td_lambda = 0.95\n",
-                1,
-            );
-        let parsed = AzLoopFileConfig::parse(&text);
-        assert_eq!(parsed.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION);
-        assert!(!parsed.to_file_text().contains("value_td_lambda"));
+            .replace("format_version = 28", "format_version = 27");
+        let error = std::panic::catch_unwind(|| AzLoopFileConfig::parse(&text));
+        assert!(error.is_err());
     }
 
     #[test]

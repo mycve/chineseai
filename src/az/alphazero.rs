@@ -10,7 +10,8 @@ use super::{
     color_index, rule_context_features,
 };
 
-const DEFAULT_CPUCT: f32 = 1.5;
+const DEFAULT_CPUCT: f32 = 0.9;
+const DEFAULT_CPUCT_AT_ROOT: f32 = 2.0;
 const DEFAULT_CPUCT_BASE: f32 = 19652.0;
 const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
 const NO_CHILD: u32 = u32::MAX;
@@ -48,7 +49,7 @@ impl Default for AzSearchLimits {
             simulations: 10_000,
             seed: 0,
             cpuct: DEFAULT_CPUCT,
-            cpuct_at_root: DEFAULT_CPUCT,
+            cpuct_at_root: DEFAULT_CPUCT_AT_ROOT,
             cpuct_base: DEFAULT_CPUCT_BASE,
             cpuct_factor: DEFAULT_CPUCT_FACTOR,
             cpuct_base_at_root: DEFAULT_CPUCT_BASE,

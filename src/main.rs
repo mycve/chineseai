@@ -64,14 +64,6 @@ struct Cli {
 enum CliCommand {
     /// Create a random AZ-NNUE model.
     AzInit(AzInitArgs),
-    /// Add an exactly neutral low-rank residual trunk to an existing model.
-    AzResidualUpgrade(AzResidualUpgradeArgs),
-    /// Add an exactly neutral board × threat policy interaction to an existing model.
-    AzPolicyInteractionUpgrade(AzPolicyInteractionUpgradeArgs),
-    /// Add exactly neutral extra policy-context channels to an existing model.
-    AzPolicyContextUpgrade(AzPolicyContextUpgradeArgs),
-    /// Add exactly neutral nonlinear units to the value head.
-    AzValueHeadUpgrade(AzValueHeadUpgradeArgs),
     /// Scale one policy component for structural ablation.
     AzPolicyScale(AzPolicyScaleArgs),
     /// Search one position and print policy/debug details.
@@ -113,7 +105,7 @@ enum CliCommand {
 #[derive(Args, Debug, Clone)]
 struct AzInitArgs {
     /// Hidden size of the model.
-    #[arg(default_value_t = 256)]
+    #[arg(default_value_t = 128)]
     hidden: usize,
     /// Output model path.
     #[arg(default_value = "model.safetensors")]
@@ -121,72 +113,12 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
-    /// Rank of the optional board × threat policy interaction.
-    #[arg(long, default_value_t = 0)]
-    policy_interaction_rank: usize,
 }
 
 impl AzInitArgs {
     fn arch(&self) -> chineseai::az::AzNnueArch {
         chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1))
-            .with_policy_interaction_rank(self.policy_interaction_rank)
     }
-}
-
-#[derive(Args, Debug, Clone)]
-struct AzResidualUpgradeArgs {
-    /// Existing model path.
-    input: String,
-    /// Upgraded model path.
-    output: String,
-    /// Bottleneck rank of the residual branch.
-    #[arg(long, default_value_t = 32)]
-    rank: usize,
-    /// Seed used to initialize the down projection.
-    #[arg(long, default_value_t = 20260922)]
-    seed: u64,
-}
-
-#[derive(Args, Debug, Clone)]
-struct AzPolicyInteractionUpgradeArgs {
-    /// Existing model path.
-    input: String,
-    /// Upgraded model path.
-    output: String,
-    /// Bilinear interaction rank.
-    #[arg(long, default_value_t = 16)]
-    rank: usize,
-    /// Seed used to initialize the board and threat projections.
-    #[arg(long, default_value_t = 20260922)]
-    seed: u64,
-}
-
-#[derive(Args, Debug, Clone)]
-struct AzPolicyContextUpgradeArgs {
-    /// Existing model path.
-    input: String,
-    /// Upgraded model path.
-    output: String,
-    /// Number of extra policy-context channels.
-    #[arg(long, default_value_t = 16)]
-    rank: usize,
-    /// Seed used to initialize the added context projections.
-    #[arg(long, default_value_t = 20260922)]
-    seed: u64,
-}
-
-#[derive(Args, Debug, Clone)]
-struct AzValueHeadUpgradeArgs {
-    /// Existing model path.
-    input: String,
-    /// Upgraded model path.
-    output: String,
-    /// Number of added value-head units.
-    #[arg(long, default_value_t = 32)]
-    rank: usize,
-    /// Seed used to initialize the added hidden projection.
-    #[arg(long, default_value_t = 20260922)]
-    seed: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -231,7 +163,7 @@ struct AzSearchArgs {
     #[arg(default_value_t = 800)]
     simulations: usize,
     /// Non-root PUCT init.
-    #[arg(default_value_t = 1.2)]
+    #[arg(default_value_t = 0.9)]
     cpuct: f32,
     /// Root PUCT init.
     #[arg(long, default_value_t = 2.0)]
@@ -243,7 +175,7 @@ struct AzSearchArgs {
     #[arg(long, default_value_t = 0.05)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before root search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.45)]
+    #[arg(long, default_value_t = 1.25)]
     policy_softmax_temp: f32,
     /// Dynamic PUCT base.
     #[arg(long, default_value_t = 19652.0)]
@@ -307,7 +239,7 @@ struct AzBenchArgs {
     #[arg(default_value_t = 100)]
     repeat: usize,
     /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.2)]
+    #[arg(default_value_t = 0.9)]
     cpuct: f32,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -566,7 +498,7 @@ struct VsPikafishArgs {
     #[arg(short = 's', long, default_value = "800")]
     simulations: Option<usize>,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.2)]
+    #[arg(long, default_value_t = 0.9)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
     #[arg(long, default_value_t = 2.0)]
@@ -590,7 +522,7 @@ struct VsPikafishArgs {
     #[arg(long, default_value_t = 0.05)]
     fpu_value_at_root: f32,
     /// Divisor applied to ChineseAI policy logits before search.
-    #[arg(long, default_value_t = 1.45)]
+    #[arg(long, default_value_t = 1.25)]
     policy_softmax_temp: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 200)]
@@ -727,7 +659,7 @@ struct PikafishLabelEvalArgs {
     #[arg(short = 's', long, default_value_t = 6000)]
     simulations: usize,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.2)]
+    #[arg(long, default_value_t = 0.9)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
     #[arg(long, default_value_t = 2.0)]
@@ -739,7 +671,7 @@ struct PikafishLabelEvalArgs {
     #[arg(long, default_value_t = 0.05)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.45)]
+    #[arg(long, default_value_t = 1.25)]
     policy_softmax_temp: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
@@ -887,7 +819,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     let encoded = format!(
         concat!(
-            "sim{}_sspu{}_bs{}_lr{}_h{}_rr{}_pir{}_mxp{}_sr{}_r60{}_wk{}_",
+            "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_op{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_of{}_mf{}_rt{}_rd{}_prf{}_prg{}_sd{}"
         ),
@@ -896,8 +828,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.batch_size,
         f32_slug(config.lr),
         config.hidden_size,
-        config.trunk_residual_rank,
-        config.policy_interaction_rank,
         config.max_plies,
         u8::from(config.sixty_move_rule),
         config.rule60_max_ply,
@@ -952,13 +882,11 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }
     format!(
-        "sim{}_bs{}_lr{}_h{}_rr{}_pir{}_sd{}_cfg{:016x}",
+        "sim{}_bs{}_lr{}_h{}_sd{}_cfg{:016x}",
         config.simulations,
         config.batch_size,
         f32_slug(config.lr),
         config.hidden_size,
-        config.trunk_residual_rank,
-        config.policy_interaction_rank,
         config.seed,
         hash
     )
@@ -1012,8 +940,6 @@ fn write_sampling_ablation_plan(args: AzSamplingAblationArgs) {
         )
     });
     base.hidden_size = initial_model.arch.hidden_size;
-    base.trunk_residual_rank = initial_model.arch.residual_rank;
-    base.policy_interaction_rank = initial_model.arch.policy_interaction_rank;
     let common_pools = args.opening_pool.as_ref().zip(args.midgame_pool.as_ref());
     if let Some((opening, midgame)) = common_pools {
         for path in [opening, midgame] {
@@ -1047,7 +973,7 @@ fn write_sampling_ablation_plan(args: AzSamplingAblationArgs) {
     });
     let configs = sampling_ablation_configs(&base, &output, &args.seeds);
     let mut manifest = String::from(
-        "run\tmode\tseed\tstart_fraction\topening_fraction\tmidgame_fraction\thidden\tresidual_rank\ttarget_update\tinitial_model\tcommon_pools\tconfig\n",
+        "run\tmode\tseed\tstart_fraction\topening_fraction\tmidgame_fraction\thidden\ttarget_update\tinitial_model\tcommon_pools\tconfig\n",
     );
     let mut script = String::from("$ErrorActionPreference = 'Stop'\n");
     script.push_str("cargo build --profile fast\n");
@@ -1097,13 +1023,12 @@ fn write_sampling_ablation_plan(args: AzSamplingAblationArgs) {
         use std::fmt::Write as _;
         writeln!(
             manifest,
-            "{name}\t{}\t{}\t{start:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{name}\t{}\t{}\t{start:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
             if args.smoke { "smoke" } else { "fixed-compute" },
             config.seed,
             config.opening_start_fraction,
             config.midgame_start_fraction,
             config.hidden_size,
-            config.trunk_residual_rank,
             args.target_update.max(1),
             initial_model_path.display(),
             common_pools.map_or_else(
@@ -2013,7 +1938,7 @@ fn run_arena_suite(args: AzArenaSuiteArgs) {
             simulations: args.simulations.max(1),
             max_plies: args.max_plies.max(1),
             rule60_max_ply: Some(120),
-            cpuct: 1.2,
+            cpuct: 0.9,
             cpuct_at_root: 2.0,
             cpuct_base: 19652.0,
             cpuct_factor: 1.5,
@@ -2022,7 +1947,7 @@ fn run_arena_suite(args: AzArenaSuiteArgs) {
             fpu_value: 0.15,
             fpu_value_at_root: 0.05,
             draw_score: 0.0,
-            policy_softmax_temp: 1.45,
+            policy_softmax_temp: 1.25,
             thread_count: threads,
             seed: args.seed ^ (suite_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
         });
@@ -2275,161 +2200,9 @@ fn main() {
                 "aznnue   : initialized (safetensors, format v{})",
                 chineseai::version::MODEL_FORMAT_VERSION
             );
-            println!(
-                "arch     : hidden={} residual_rank={} policy_interaction_rank={} policy_context_extra_rank={} value_extra_rank={}",
-                arch.hidden_size,
-                arch.residual_rank,
-                arch.policy_interaction_rank,
-                arch.policy_context_extra_rank,
-                arch.value_extra_rank
-            );
+            println!("arch     : hidden={}", arch.hidden_size);
             println!("seed     : {seed}");
             println!("output   : {output}");
-        }
-        Some(CliCommand::AzResidualUpgrade(cmd)) => {
-            let mut model = AzNnue::load(&cmd.input)
-                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
-            let position = Position::startpos();
-            let moves = position.legal_moves();
-            let before = model.evaluate_value(&position, &moves);
-            model
-                .enable_trunk_residual(cmd.rank, cmd.seed)
-                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
-            let after = model.evaluate_value(&position, &moves);
-            assert_eq!(
-                before.to_bits(),
-                after.to_bits(),
-                "residual upgrade changed the start-position output"
-            );
-            model
-                .save(&cmd.output)
-                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
-            println!("input    : {}", cmd.input);
-            println!("output   : {}", cmd.output);
-            println!(
-                "arch     : hidden={} residual_rank={}",
-                model.arch.hidden_size, cmd.rank
-            );
-            println!("warmstart: exact-output verified");
-        }
-        Some(CliCommand::AzPolicyInteractionUpgrade(cmd)) => {
-            let mut model = AzNnue::load(&cmd.input)
-                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
-            let position = Position::startpos();
-            let moves = position.legal_moves();
-            let before = model.clone();
-            let before_value = before.evaluate_value(&position, &moves);
-            model
-                .enable_policy_interaction(cmd.rank, cmd.seed)
-                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
-            let after_value = model.evaluate_value(&position, &moves);
-            assert_eq!(
-                before_value.to_bits(),
-                after_value.to_bits(),
-                "policy interaction upgrade changed the start-position value"
-            );
-            let limits = fixed_az_search_limits(1, 20260922, 1.2, 2.0, 0, 1.45);
-            let before_search = alphazero_search(&position, &before, limits);
-            let after_search = alphazero_search(&position, &model, limits);
-            assert_eq!(
-                before_search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.raw_prior.to_bits())
-                    .collect::<Vec<_>>(),
-                after_search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.raw_prior.to_bits())
-                    .collect::<Vec<_>>(),
-                "policy interaction upgrade changed the start-position policy"
-            );
-            model
-                .save(&cmd.output)
-                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
-            println!("input    : {}", cmd.input);
-            println!("output   : {}", cmd.output);
-            println!(
-                "arch     : hidden={} residual_rank={} policy_interaction_rank={}",
-                model.arch.hidden_size, model.arch.residual_rank, cmd.rank
-            );
-            println!("warmstart: exact value and policy verified");
-        }
-        Some(CliCommand::AzPolicyContextUpgrade(cmd)) => {
-            let mut model = AzNnue::load(&cmd.input)
-                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
-            let position = Position::startpos();
-            let moves = position.legal_moves();
-            let before = model.clone();
-            let before_value = before.evaluate_value(&position, &moves);
-            model
-                .enable_policy_context_extra(cmd.rank, cmd.seed)
-                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
-            let after_value = model.evaluate_value(&position, &moves);
-            assert_eq!(before_value.to_bits(), after_value.to_bits());
-            let limits = fixed_az_search_limits(1, 20260922, 1.2, 2.0, 0, 1.45);
-            let before_search = alphazero_search(&position, &before, limits);
-            let after_search = alphazero_search(&position, &model, limits);
-            assert_eq!(
-                before_search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.raw_prior.to_bits())
-                    .collect::<Vec<_>>(),
-                after_search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.raw_prior.to_bits())
-                    .collect::<Vec<_>>()
-            );
-            model
-                .save(&cmd.output)
-                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
-            println!("input    : {}", cmd.input);
-            println!("output   : {}", cmd.output);
-            println!(
-                "arch     : hidden={} residual_rank={} policy_context_extra_rank={}",
-                model.arch.hidden_size, model.arch.residual_rank, cmd.rank
-            );
-            println!("warmstart: exact value and policy verified");
-        }
-        Some(CliCommand::AzValueHeadUpgrade(cmd)) => {
-            let mut model = AzNnue::load(&cmd.input)
-                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
-            let position = Position::startpos();
-            let moves = position.legal_moves();
-            let before = model.clone();
-            let before_value = before.evaluate_value(&position, &moves);
-            model
-                .enable_value_extra(cmd.rank, cmd.seed)
-                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
-            let after_value = model.evaluate_value(&position, &moves);
-            assert_eq!(before_value.to_bits(), after_value.to_bits());
-            let limits = fixed_az_search_limits(1, 20260922, 1.2, 2.0, 0, 1.45);
-            let before_search = alphazero_search(&position, &before, limits);
-            let after_search = alphazero_search(&position, &model, limits);
-            assert_eq!(
-                before_search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.raw_prior.to_bits())
-                    .collect::<Vec<_>>(),
-                after_search
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.raw_prior.to_bits())
-                    .collect::<Vec<_>>()
-            );
-            model
-                .save(&cmd.output)
-                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
-            println!("input    : {}", cmd.input);
-            println!("output   : {}", cmd.output);
-            println!(
-                "arch     : hidden={} residual_rank={} value_extra_rank={}",
-                model.arch.hidden_size, model.arch.residual_rank, cmd.rank
-            );
-            println!("warmstart: exact value and policy verified");
         }
         Some(CliCommand::AzPolicyScale(cmd)) => {
             assert!(
@@ -2732,7 +2505,7 @@ fn main() {
             let _ = alphazero_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.45),
+                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.25),
             );
 
             let started = std::time::Instant::now();
@@ -2742,7 +2515,7 @@ fn main() {
                 let result = alphazero_search(
                     &position,
                     &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.45),
+                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.25),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -2751,14 +2524,7 @@ fn main() {
             let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
             println!("bench        : fixed-search");
             println!("model        : {model_path}");
-            println!(
-                "arch         : hidden={} residual_rank={} policy_interaction_rank={} policy_context_extra_rank={} value_extra_rank={}",
-                model.arch.hidden_size,
-                model.arch.residual_rank,
-                model.arch.policy_interaction_rank,
-                model.arch.policy_context_extra_rank,
-                model.arch.value_extra_rank
-            );
+            println!("arch         : hidden={}", model.arch.hidden_size);
             println!("fen          : {}", position.to_fen());
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
@@ -2973,14 +2739,7 @@ fn main() {
             });
             println!("replay-fit : {}", cmd.replay);
             println!("window     : {:?}", window);
-            println!(
-                "arch       : hidden={} residual_rank={} policy_interaction_rank={} policy_context_extra_rank={} value_extra_rank={}",
-                arch.hidden_size,
-                arch.residual_rank,
-                arch.policy_interaction_rank,
-                arch.policy_context_extra_rank,
-                arch.value_extra_rank
-            );
+            println!("arch       : hidden={}", arch.hidden_size);
             println!(
                 "split      : train={} validation={} games={}",
                 train.len(),
@@ -3209,11 +2968,9 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=continuous search=alphazero arch(hidden={},residual_rank={},policy_interaction_rank={}) sims={} value_target=terminal replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous search=alphazero arch(hidden={}) sims={} value_target=terminal replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.hidden_size,
-                config.trunk_residual_rank,
-                config.policy_interaction_rank,
                 config.simulations,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
@@ -5339,7 +5096,7 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
                 simulations: cmd.simulations.max(1),
                 max_plies: cmd.max_plies.max(1),
                 rule60_max_ply: Some(120),
-                cpuct: 1.2,
+                cpuct: 0.9,
                 cpuct_at_root: 2.0,
                 cpuct_base: 19652.0,
                 cpuct_factor: 1.5,
@@ -5348,7 +5105,7 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
                 fpu_value: 0.15,
                 fpu_value_at_root: 0.05,
                 draw_score: 0.0,
-                policy_softmax_temp: 1.45,
+                policy_softmax_temp: 1.25,
                 thread_count: cmd.threads.max(1),
                 seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
             });
@@ -5714,7 +5471,7 @@ fn run_replay_coverage(cmd: AzReplayCoverageArgs) -> io::Result<()> {
         }
     }
 
-    let limits = fixed_az_search_limits(cmd.simulations.max(1), cmd.seed, 1.2, 2.0, 0, 1.45);
+    let limits = fixed_az_search_limits(cmd.simulations.max(1), cmd.seed, 0.9, 2.0, 0, 1.25);
     let names = ["unseen", "seen-1-2", "seen-3-9", "seen-10+"];
     let path = Path::new(&cmd.output);
     if let Some(parent) = path
@@ -6804,13 +6561,13 @@ mod reporting_tests {
         let Some(CliCommand::AzSearch(args)) = cli.command else {
             panic!("expected az-search command");
         };
-        assert_eq!(args.cpuct, 1.2);
+        assert_eq!(args.cpuct, 0.9);
         assert_eq!(args.cpuct_at_root, 2.0);
         assert_eq!(args.cpuct_factor, 1.5);
         assert_eq!(args.cpuct_factor_at_root, 1.5);
         assert_eq!(args.fpu_value, 0.15);
         assert_eq!(args.fpu_value_at_root, 0.05);
-        assert_eq!(args.policy_softmax_temp, 1.45);
+        assert_eq!(args.policy_softmax_temp, 1.25);
     }
 
     #[test]
@@ -6850,12 +6607,6 @@ mod reporting_tests {
         assert_ne!(
             tensorboard_encoded_subdir(&configs[0].2),
             tensorboard_encoded_subdir(&configs[3].2)
-        );
-        let mut residual = configs[0].2.clone();
-        residual.trunk_residual_rank = 32;
-        assert_ne!(
-            tensorboard_encoded_subdir(&configs[0].2),
-            tensorboard_encoded_subdir(&residual)
         );
     }
 

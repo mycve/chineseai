@@ -247,20 +247,6 @@ fn load_candle_f32_tensor(
         .map_err(candle_io_error)
 }
 
-fn transpose_legacy_residual_up(
-    stored: &[f32],
-    hidden_size: usize,
-    residual_rank: usize,
-) -> Vec<f32> {
-    let mut transposed = vec![0.0; stored.len()];
-    for hidden in 0..hidden_size {
-        for rank in 0..residual_rank {
-            transposed[rank * hidden_size + hidden] = stored[hidden * residual_rank + rank];
-        }
-    }
-    transposed
-}
-
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h]);
@@ -308,21 +294,11 @@ macro_rules! az_weight_tensors {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AzNnueArch {
     pub hidden_size: usize,
-    pub residual_rank: usize,
-    pub policy_interaction_rank: usize,
-    pub policy_context_extra_rank: usize,
-    pub value_extra_rank: usize,
 }
 
 impl AzNnueArch {
     pub const fn default_const() -> Self {
-        Self {
-            hidden_size: 128,
-            residual_rank: 0,
-            policy_interaction_rank: 0,
-            policy_context_extra_rank: 0,
-            value_extra_rank: 0,
-        }
+        Self { hidden_size: 128 }
     }
 
     pub const fn with_hidden_size(hidden_size: usize) -> Self {
@@ -331,53 +307,9 @@ impl AzNnueArch {
         arch
     }
 
-    pub const fn with_residual_rank(mut self, residual_rank: usize) -> Self {
-        self.residual_rank = residual_rank;
-        self
-    }
-
-    pub const fn with_policy_interaction_rank(mut self, rank: usize) -> Self {
-        self.policy_interaction_rank = rank;
-        self
-    }
-
-    pub const fn with_policy_context_extra_rank(mut self, rank: usize) -> Self {
-        self.policy_context_extra_rank = rank;
-        self
-    }
-
-    pub const fn with_value_extra_rank(mut self, rank: usize) -> Self {
-        self.value_extra_rank = rank;
-        self
-    }
-
     pub fn validate(&self) -> Result<(), String> {
         if self.hidden_size == 0 {
             return Err(format!("invalid hidden_size {}", self.hidden_size));
-        }
-        if self.residual_rank > self.hidden_size {
-            return Err(format!(
-                "residual_rank {} exceeds hidden_size {}",
-                self.residual_rank, self.hidden_size
-            ));
-        }
-        if self.policy_interaction_rank > self.hidden_size {
-            return Err(format!(
-                "policy_interaction_rank {} exceeds hidden_size {}",
-                self.policy_interaction_rank, self.hidden_size
-            ));
-        }
-        if self.policy_context_extra_rank > self.hidden_size {
-            return Err(format!(
-                "policy_context_extra_rank {} exceeds hidden_size {}",
-                self.policy_context_extra_rank, self.hidden_size
-            ));
-        }
-        if self.value_extra_rank > self.hidden_size {
-            return Err(format!(
-                "value_extra_rank {} exceeds hidden_size {}",
-                self.value_extra_rank, self.hidden_size
-            ));
         }
         Ok(())
     }
@@ -392,14 +324,10 @@ pub(super) struct AzEvalScratch {
     // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
     features: Vec<usize>,
     hidden: Vec<f32>,
-    residual: Vec<f32>,
     policy_context: Vec<f32>,
-    policy_interaction: Vec<f32>,
-    policy_context_extra: Vec<f32>,
     policy_accumulator_context: [f32; POLICY_ACCUMULATOR_RANK],
     policy_piece_square_scores: Vec<f32>,
     value_head: Vec<f32>,
-    value_extra: Vec<f32>,
     value_threat_accumulator: Vec<f32>,
     value_threat_activation: Vec<f32>,
     policy_gives_check: Vec<f32>,
@@ -413,14 +341,10 @@ impl AzEvalScratch {
         Self {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
-            residual: vec![0.0; arch.residual_rank],
             policy_context: vec![0.0; POLICY_MOVE_CONTEXT_SIZE],
-            policy_interaction: vec![0.0; arch.policy_interaction_rank],
-            policy_context_extra: vec![0.0; arch.policy_context_extra_rank],
             policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
-            value_extra: vec![0.0; arch.value_extra_rank],
             value_threat_accumulator: vec![0.0; VALUE_THREAT_RANK],
             value_threat_activation: vec![0.0; VALUE_THREAT_RANK * 2],
             policy_gives_check: Vec::with_capacity(192),
@@ -433,14 +357,10 @@ impl AzEvalScratch {
         Self {
             features: Vec::new(),
             hidden: Vec::new(),
-            residual: Vec::new(),
             policy_context: Vec::new(),
-            policy_interaction: Vec::new(),
-            policy_context_extra: Vec::new(),
             policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
             value_head: Vec::new(),
-            value_extra: Vec::new(),
             value_threat_accumulator: Vec::new(),
             value_threat_activation: Vec::new(),
             policy_gives_check: Vec::new(),
@@ -1071,15 +991,9 @@ pub struct AzNnue {
     pub input_king_piece_hidden: Vec<f32>,
     pub rule_context_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
-    pub trunk_residual_down: Vec<f32>,
-    pub trunk_residual_bias: Vec<f32>,
-    pub trunk_residual_up: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_head_output: Vec<f32>,
-    pub value_extra_hidden: Vec<f32>,
-    pub value_extra_bias: Vec<f32>,
-    pub value_extra_output: Vec<f32>,
     pub short_value_head_output: Vec<f32>,
     pub short_value_head_bias: Vec<f32>,
     pub value_threat_embedding: Vec<f32>,
@@ -1089,12 +1003,6 @@ pub struct AzNnue {
     pub policy_consequence_output: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
     pub policy_move_context: Vec<f32>,
-    pub policy_interaction_hidden: Vec<f32>,
-    pub policy_interaction_threat: Vec<f32>,
-    pub policy_interaction_move: Vec<f32>,
-    pub policy_context_extra_hidden: Vec<f32>,
-    pub policy_context_extra_threat: Vec<f32>,
-    pub policy_context_extra_move: Vec<f32>,
     pub policy_accumulator_hidden: Vec<f32>,
     pub policy_accumulator_move: Vec<f32>,
     pub policy_sparse_table: Vec<f32>,
@@ -1123,15 +1031,9 @@ impl Clone for AzNnue {
             input_king_piece_hidden: self.input_king_piece_hidden.clone(),
             rule_context_hidden: self.rule_context_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
-            trunk_residual_down: self.trunk_residual_down.clone(),
-            trunk_residual_bias: self.trunk_residual_bias.clone(),
-            trunk_residual_up: self.trunk_residual_up.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_head_output: self.value_head_output.clone(),
-            value_extra_hidden: self.value_extra_hidden.clone(),
-            value_extra_bias: self.value_extra_bias.clone(),
-            value_extra_output: self.value_extra_output.clone(),
             short_value_head_output: self.short_value_head_output.clone(),
             short_value_head_bias: self.short_value_head_bias.clone(),
             value_threat_embedding: self.value_threat_embedding.clone(),
@@ -1141,12 +1043,6 @@ impl Clone for AzNnue {
             policy_consequence_output: self.policy_consequence_output.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
             policy_move_context: self.policy_move_context.clone(),
-            policy_interaction_hidden: self.policy_interaction_hidden.clone(),
-            policy_interaction_threat: self.policy_interaction_threat.clone(),
-            policy_interaction_move: self.policy_interaction_move.clone(),
-            policy_context_extra_hidden: self.policy_context_extra_hidden.clone(),
-            policy_context_extra_threat: self.policy_context_extra_threat.clone(),
-            policy_context_extra_move: self.policy_context_extra_move.clone(),
             policy_accumulator_hidden: self.policy_accumulator_hidden.clone(),
             policy_accumulator_move: self.policy_accumulator_move.clone(),
             policy_sparse_table: self.policy_sparse_table.clone(),
@@ -1640,13 +1536,6 @@ impl AzNnue {
         // Start history-neutral; rule context is learned from self-play.
         let rule_context_hidden = vec![0.0; RULE_CONTEXT_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
-        let residual_rank = arch.residual_rank;
-        let trunk_residual_down = (0..residual_rank * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        let trunk_residual_bias = vec![0.0; residual_rank];
-        // Zero projection makes the residual branch an exact identity at initialization.
-        let trunk_residual_up = vec![0.0; hidden_size * residual_rank];
         // Start value-neutral. A random value head can evaluate startpos as a
         // large red/black advantage before any training, and MCTS amplifies
         // that noise into the first self-play dataset.
@@ -1657,12 +1546,6 @@ impl AzNnue {
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
-        let value_extra_rank = arch.value_extra_rank;
-        let value_extra_hidden = (0..value_extra_rank * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
-            .collect();
-        let value_extra_bias = vec![0.0; value_extra_rank];
-        let value_extra_output = vec![0.0; WDL_HEAD_SIZE * value_extra_rank];
         let short_value_head_output =
             vec![0.0; SHORT_VALUE_HEADS * WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
         let short_value_head_bias = vec![0.0; SHORT_VALUE_HEADS * WDL_HEAD_SIZE];
@@ -1681,23 +1564,6 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let policy_move_context = vec![0.0; DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE];
-        let policy_interaction_rank = arch.policy_interaction_rank;
-        let policy_interaction_hidden = (0..policy_interaction_rank * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        let policy_interaction_threat = (0..policy_interaction_rank * VALUE_THREAT_RANK * 2)
-            .map(|_| rng.weight((1.0 / VALUE_THREAT_RANK as f32).sqrt()))
-            .collect();
-        // A zero move projection makes the added bilinear branch exactly policy-neutral.
-        let policy_interaction_move = vec![0.0; DENSE_MOVE_SPACE * policy_interaction_rank];
-        let policy_context_extra_rank = arch.policy_context_extra_rank;
-        let policy_context_extra_hidden = (0..policy_context_extra_rank * hidden_size)
-            .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
-            .collect();
-        let policy_context_extra_threat = (0..policy_context_extra_rank * VALUE_THREAT_RANK * 2)
-            .map(|_| rng.weight((1.0 / VALUE_THREAT_RANK as f32).sqrt() * 0.5))
-            .collect();
-        let policy_context_extra_move = vec![0.0; DENSE_MOVE_SPACE * policy_context_extra_rank];
         let policy_accumulator_hidden = (0..POLICY_ACCUMULATOR_RANK * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
@@ -1715,15 +1581,9 @@ impl AzNnue {
             input_king_piece_hidden,
             rule_context_hidden,
             hidden_bias,
-            trunk_residual_down,
-            trunk_residual_bias,
-            trunk_residual_up,
             value_head_hidden,
             value_head_bias,
             value_head_output,
-            value_extra_hidden,
-            value_extra_bias,
-            value_extra_output,
             short_value_head_output,
             short_value_head_bias,
             value_threat_embedding,
@@ -1733,12 +1593,6 @@ impl AzNnue {
             policy_consequence_output,
             policy_context_hidden,
             policy_move_context,
-            policy_interaction_hidden,
-            policy_interaction_threat,
-            policy_interaction_move,
-            policy_context_extra_hidden,
-            policy_context_extra_threat,
-            policy_context_extra_move,
             policy_accumulator_hidden,
             policy_accumulator_move,
             policy_sparse_table,
@@ -1762,119 +1616,6 @@ impl AzNnue {
         Self::random_with_arch(AzNnueArch::with_hidden_size(hidden_size), seed)
     }
 
-    /// Adds an exactly neutral low-rank residual branch to an existing model.
-    pub fn enable_trunk_residual(&mut self, rank: usize, seed: u64) -> Result<(), String> {
-        if rank == 0 {
-            return Err("residual rank must be positive".into());
-        }
-        if rank > self.hidden_size {
-            return Err(format!(
-                "residual rank {rank} exceeds hidden size {}",
-                self.hidden_size
-            ));
-        }
-        if self.arch.residual_rank != 0 {
-            return Err(format!(
-                "model already has residual rank {}",
-                self.arch.residual_rank
-            ));
-        }
-        let mut rng = SplitMix64::new(seed);
-        self.trunk_residual_down = (0..rank * self.hidden_size)
-            .map(|_| rng.weight((2.0 / self.hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        self.trunk_residual_bias = vec![0.0; rank];
-        self.trunk_residual_up = vec![0.0; self.hidden_size * rank];
-        self.arch.residual_rank = rank;
-        Ok(())
-    }
-
-    /// Adds an exactly neutral board × threat × move policy interaction branch.
-    pub fn enable_policy_interaction(&mut self, rank: usize, seed: u64) -> Result<(), String> {
-        if rank == 0 {
-            return Err("policy interaction rank must be positive".into());
-        }
-        if rank > self.hidden_size {
-            return Err(format!(
-                "policy interaction rank {rank} exceeds hidden size {}",
-                self.hidden_size
-            ));
-        }
-        if self.arch.policy_interaction_rank != 0 {
-            return Err(format!(
-                "model already has policy interaction rank {}",
-                self.arch.policy_interaction_rank
-            ));
-        }
-        let mut rng = SplitMix64::new(seed);
-        self.policy_interaction_hidden = (0..rank * self.hidden_size)
-            .map(|_| rng.weight((2.0 / self.hidden_size.max(1) as f32).sqrt()))
-            .collect();
-        self.policy_interaction_threat = (0..rank * VALUE_THREAT_RANK * 2)
-            .map(|_| rng.weight((1.0 / VALUE_THREAT_RANK as f32).sqrt()))
-            .collect();
-        self.policy_interaction_move = vec![0.0; DENSE_MOVE_SPACE * rank];
-        self.arch.policy_interaction_rank = rank;
-        Ok(())
-    }
-
-    /// Adds exactly neutral extra policy-context channels to an existing model.
-    pub fn enable_policy_context_extra(&mut self, rank: usize, seed: u64) -> Result<(), String> {
-        if rank == 0 {
-            return Err("extra policy context rank must be positive".into());
-        }
-        if rank > self.hidden_size {
-            return Err(format!(
-                "extra policy context rank {rank} exceeds hidden size {}",
-                self.hidden_size
-            ));
-        }
-        if self.arch.policy_context_extra_rank != 0 {
-            return Err(format!(
-                "model already has extra policy context rank {}",
-                self.arch.policy_context_extra_rank
-            ));
-        }
-        let mut rng = SplitMix64::new(seed);
-        self.policy_context_extra_hidden = (0..rank * self.hidden_size)
-            .map(|_| rng.weight((2.0 / self.hidden_size.max(1) as f32).sqrt() * 0.5))
-            .collect();
-        self.policy_context_extra_threat = (0..rank * VALUE_THREAT_RANK * 2)
-            .map(|_| rng.weight((1.0 / VALUE_THREAT_RANK as f32).sqrt() * 0.5))
-            .collect();
-        self.policy_context_extra_move = vec![0.0; DENSE_MOVE_SPACE * rank];
-        self.arch.policy_context_extra_rank = rank;
-        self.rebuild_value_threat();
-        Ok(())
-    }
-
-    /// Adds exactly neutral extra nonlinear value-head units to an existing model.
-    pub fn enable_value_extra(&mut self, rank: usize, seed: u64) -> Result<(), String> {
-        if rank == 0 {
-            return Err("extra value rank must be positive".into());
-        }
-        if rank > self.hidden_size {
-            return Err(format!(
-                "extra value rank {rank} exceeds hidden size {}",
-                self.hidden_size
-            ));
-        }
-        if self.arch.value_extra_rank != 0 {
-            return Err(format!(
-                "model already has extra value rank {}",
-                self.arch.value_extra_rank
-            ));
-        }
-        let mut rng = SplitMix64::new(seed);
-        self.value_extra_hidden = (0..rank * self.hidden_size)
-            .map(|_| rng.weight((2.0 / self.hidden_size.max(1) as f32).sqrt() * 0.5))
-            .collect();
-        self.value_extra_bias = vec![0.0; rank];
-        self.value_extra_output = vec![0.0; WDL_HEAD_SIZE * rank];
-        self.arch.value_extra_rank = rank;
-        Ok(())
-    }
-
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let h = self.hidden_size;
         let varmap = VarMap::new();
@@ -1884,116 +1625,12 @@ impl AzNnue {
             &[MODEL_FORMAT_VERSION],
             (1,),
         )?;
-        insert_candle_var(
-            &varmap,
-            "trunk_residual_rank",
-            &[self.arch.residual_rank as f32],
-            (1,),
-        )?;
-        insert_candle_var(
-            &varmap,
-            "policy_interaction_rank",
-            &[self.arch.policy_interaction_rank as f32],
-            (1,),
-        )?;
-        insert_candle_var(
-            &varmap,
-            "policy_context_extra_rank",
-            &[self.arch.policy_context_extra_rank as f32],
-            (1,),
-        )?;
-        insert_candle_var(
-            &varmap,
-            "value_extra_rank",
-            &[self.arch.value_extra_rank as f32],
-            (1,),
-        )?;
         macro_rules! save_tensor {
             ($field:ident, [$($dim:expr),+]) => {
                 insert_candle_var(&varmap, stringify!($field), &self.$field, ($($dim),+))?;
             };
         }
         az_weight_tensors!(save_tensor, h);
-        if self.arch.residual_rank > 0 {
-            let rank = self.arch.residual_rank;
-            insert_candle_var(&varmap, "trunk_residual_layout", &[1.0], (1,))?;
-            insert_candle_var(
-                &varmap,
-                "trunk_residual_down",
-                &self.trunk_residual_down,
-                (rank, h),
-            )?;
-            insert_candle_var(
-                &varmap,
-                "trunk_residual_bias",
-                &self.trunk_residual_bias,
-                rank,
-            )?;
-            insert_candle_var(
-                &varmap,
-                "trunk_residual_up",
-                &self.trunk_residual_up,
-                (rank, h),
-            )?;
-        }
-        if self.arch.policy_interaction_rank > 0 {
-            let rank = self.arch.policy_interaction_rank;
-            insert_candle_var(
-                &varmap,
-                "policy_interaction_hidden",
-                &self.policy_interaction_hidden,
-                (rank, h),
-            )?;
-            insert_candle_var(
-                &varmap,
-                "policy_interaction_threat",
-                &self.policy_interaction_threat,
-                (rank, VALUE_THREAT_RANK * 2),
-            )?;
-            insert_candle_var(
-                &varmap,
-                "policy_interaction_move",
-                &self.policy_interaction_move,
-                (DENSE_MOVE_SPACE, rank),
-            )?;
-        }
-        if self.arch.policy_context_extra_rank > 0 {
-            let rank = self.arch.policy_context_extra_rank;
-            insert_candle_var(
-                &varmap,
-                "policy_context_extra_hidden",
-                &self.policy_context_extra_hidden,
-                (rank, h),
-            )?;
-            insert_candle_var(
-                &varmap,
-                "policy_context_extra_threat",
-                &self.policy_context_extra_threat,
-                (rank, VALUE_THREAT_RANK * 2),
-            )?;
-            insert_candle_var(
-                &varmap,
-                "policy_context_extra_move",
-                &self.policy_context_extra_move,
-                (DENSE_MOVE_SPACE, rank),
-            )?;
-        }
-        if self.arch.value_extra_rank > 0 {
-            let rank = self.arch.value_extra_rank;
-            insert_candle_var(
-                &varmap,
-                "value_extra_hidden",
-                &self.value_extra_hidden,
-                (rank, h),
-            )?;
-            insert_candle_var(&varmap, "value_extra_bias", &self.value_extra_bias, rank)?;
-            insert_candle_var(
-                &varmap,
-                "value_extra_output",
-                &self.value_extra_output,
-                (WDL_HEAD_SIZE, rank),
-            )?;
-        }
         varmap.save(path).map_err(candle_io_error)
     }
 
@@ -2020,101 +1657,7 @@ impl AzNnue {
         }
         let hidden_bias = load_candle_f32_tensor(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
-        let has_residual_rank = tensors
-            .tensors()
-            .iter()
-            .any(|(name, _)| name == "trunk_residual_rank");
-        let residual_rank = if has_residual_rank {
-            let values = load_candle_f32_tensor(&tensors, "trunk_residual_rank")?;
-            let Some(&value) = values.first() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing trunk residual rank value",
-                ));
-            };
-            if value < 0.0 || value.fract() != 0.0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid trunk residual rank {value}"),
-                ));
-            }
-            value as usize
-        } else {
-            0
-        };
-        let has_policy_interaction_rank = tensors
-            .tensors()
-            .iter()
-            .any(|(name, _)| name == "policy_interaction_rank");
-        let policy_interaction_rank = if has_policy_interaction_rank {
-            let values = load_candle_f32_tensor(&tensors, "policy_interaction_rank")?;
-            let Some(&value) = values.first() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing policy interaction rank value",
-                ));
-            };
-            if value < 0.0 || value.fract() != 0.0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid policy interaction rank {value}"),
-                ));
-            }
-            value as usize
-        } else {
-            0
-        };
-        let has_policy_context_extra_rank = tensors
-            .tensors()
-            .iter()
-            .any(|(name, _)| name == "policy_context_extra_rank");
-        let policy_context_extra_rank = if has_policy_context_extra_rank {
-            let values = load_candle_f32_tensor(&tensors, "policy_context_extra_rank")?;
-            let Some(&value) = values.first() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing extra policy context rank value",
-                ));
-            };
-            if value < 0.0 || value.fract() != 0.0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid extra policy context rank {value}"),
-                ));
-            }
-            value as usize
-        } else {
-            0
-        };
-        let has_value_extra_rank = tensors
-            .tensors()
-            .iter()
-            .any(|(name, _)| name == "value_extra_rank");
-        let value_extra_rank = if has_value_extra_rank {
-            let values = load_candle_f32_tensor(&tensors, "value_extra_rank")?;
-            let Some(&value) = values.first() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing extra value rank value",
-                ));
-            };
-            if value < 0.0 || value.fract() != 0.0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid extra value rank {value}"),
-                ));
-            }
-            value as usize
-        } else {
-            0
-        };
-        let arch = AzNnueArch {
-            hidden_size,
-            residual_rank,
-            policy_interaction_rank,
-            policy_context_extra_rank,
-            value_extra_rank,
-        };
+        let arch = AzNnueArch { hidden_size };
         let policy_accumulator_hidden =
             load_candle_f32_tensor(&tensors, "policy_accumulator_hidden")?;
         let policy_accumulator_move = load_candle_f32_tensor(&tensors, "policy_accumulator_move")?;
@@ -2128,67 +1671,9 @@ impl AzNnue {
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             rule_context_hidden: load_candle_f32_tensor(&tensors, "rule_context_hidden")?,
             hidden_bias,
-            trunk_residual_down: if residual_rank > 0 {
-                load_candle_f32_tensor(&tensors, "trunk_residual_down")?
-            } else {
-                Vec::new()
-            },
-            trunk_residual_bias: if residual_rank > 0 {
-                load_candle_f32_tensor(&tensors, "trunk_residual_bias")?
-            } else {
-                Vec::new()
-            },
-            trunk_residual_up: if residual_rank > 0 {
-                let stored = load_candle_f32_tensor(&tensors, "trunk_residual_up")?;
-                if stored.len() != hidden_size * residual_rank {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "trunk residual up length mismatch: got {}, expected {}",
-                            stored.len(),
-                            hidden_size * residual_rank
-                        ),
-                    ));
-                }
-                let has_layout = tensors
-                    .tensors()
-                    .iter()
-                    .any(|(name, _)| name == "trunk_residual_layout");
-                if has_layout {
-                    let layout = load_candle_f32_tensor(&tensors, "trunk_residual_layout")?;
-                    if layout.as_slice() != [1.0] {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unsupported trunk residual layout {layout:?}"),
-                        ));
-                    }
-                    stored
-                } else {
-                    // Early residual checkpoints stored [hidden, rank]. Convert once to
-                    // the CPU-friendly [rank, hidden] layout without changing outputs.
-                    transpose_legacy_residual_up(&stored, hidden_size, residual_rank)
-                }
-            } else {
-                Vec::new()
-            },
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
-            value_extra_hidden: if value_extra_rank > 0 {
-                load_candle_f32_tensor(&tensors, "value_extra_hidden")?
-            } else {
-                Vec::new()
-            },
-            value_extra_bias: if value_extra_rank > 0 {
-                load_candle_f32_tensor(&tensors, "value_extra_bias")?
-            } else {
-                Vec::new()
-            },
-            value_extra_output: if value_extra_rank > 0 {
-                load_candle_f32_tensor(&tensors, "value_extra_output")?
-            } else {
-                Vec::new()
-            },
             short_value_head_output: load_candle_f32_tensor(&tensors, "short_value_head_output")?,
             short_value_head_bias: load_candle_f32_tensor(&tensors, "short_value_head_bias")?,
             value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
@@ -2201,36 +1686,6 @@ impl AzNnue {
             )?,
             policy_context_hidden: load_candle_f32_tensor(&tensors, "policy_context_hidden")?,
             policy_move_context: load_candle_f32_tensor(&tensors, "policy_move_context")?,
-            policy_interaction_hidden: if policy_interaction_rank > 0 {
-                load_candle_f32_tensor(&tensors, "policy_interaction_hidden")?
-            } else {
-                Vec::new()
-            },
-            policy_interaction_threat: if policy_interaction_rank > 0 {
-                load_candle_f32_tensor(&tensors, "policy_interaction_threat")?
-            } else {
-                Vec::new()
-            },
-            policy_interaction_move: if policy_interaction_rank > 0 {
-                load_candle_f32_tensor(&tensors, "policy_interaction_move")?
-            } else {
-                Vec::new()
-            },
-            policy_context_extra_hidden: if policy_context_extra_rank > 0 {
-                load_candle_f32_tensor(&tensors, "policy_context_extra_hidden")?
-            } else {
-                Vec::new()
-            },
-            policy_context_extra_threat: if policy_context_extra_rank > 0 {
-                load_candle_f32_tensor(&tensors, "policy_context_extra_threat")?
-            } else {
-                Vec::new()
-            },
-            policy_context_extra_move: if policy_context_extra_rank > 0 {
-                load_candle_f32_tensor(&tensors, "policy_context_extra_move")?
-            } else {
-                Vec::new()
-            },
             policy_accumulator_hidden,
             policy_accumulator_move,
             policy_sparse_table: load_candle_f32_tensor(&tensors, "policy_sparse_table")?,
@@ -2323,7 +1778,6 @@ impl AzNnue {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
-            self.apply_trunk_residual(&mut scratch.hidden, &mut scratch.residual);
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
@@ -2336,7 +1790,6 @@ impl AzNnue {
                 &scratch.hidden,
                 &features,
                 &mut scratch.value_head,
-                &mut scratch.value_extra,
                 threat_logits,
             )
         };
@@ -2374,7 +1827,6 @@ impl AzNnue {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
-            self.apply_trunk_residual(&mut scratch.hidden, &mut scratch.residual);
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
@@ -2387,7 +1839,6 @@ impl AzNnue {
                 &scratch.hidden,
                 &[],
                 &mut scratch.value_head,
-                &mut scratch.value_extra,
                 threat_logits,
             )
         };
@@ -2419,35 +1870,6 @@ impl AzNnue {
                     &self.policy_threat_context[threat_start..threat_start + VALUE_THREAT_RANK * 2],
                 );
             }
-        }
-        let interaction_rank = self.arch.policy_interaction_rank;
-        scratch.policy_interaction.resize(interaction_rank, 0.0);
-        for rank in 0..interaction_rank {
-            let hidden_start = rank * self.hidden_size;
-            let threat_start = rank * VALUE_THREAT_RANK * 2;
-            let board = dot_product(
-                &scratch.hidden,
-                &self.policy_interaction_hidden[hidden_start..hidden_start + self.hidden_size],
-            );
-            let threat = dot_product(
-                &scratch.value_threat_activation,
-                &self.policy_interaction_threat[threat_start..threat_start + VALUE_THREAT_RANK * 2],
-            );
-            scratch.policy_interaction[rank] = board * threat;
-        }
-        let extra_rank = self.arch.policy_context_extra_rank;
-        scratch.policy_context_extra.resize(extra_rank, 0.0);
-        for rank in 0..extra_rank {
-            let hidden_start = rank * self.hidden_size;
-            let threat_start = rank * VALUE_THREAT_RANK * 2;
-            scratch.policy_context_extra[rank] = dot_product(
-                &scratch.hidden,
-                &self.policy_context_extra_hidden[hidden_start..hidden_start + self.hidden_size],
-            ) + dot_product(
-                &scratch.value_threat_activation,
-                &self.policy_context_extra_threat
-                    [threat_start..threat_start + VALUE_THREAT_RANK * 2],
-            );
         }
         self.evaluate_prepared_hidden_with_context(position, features, value, moves, scratch)
     }
@@ -2490,8 +1912,6 @@ impl AzNnue {
                     );
                     let move_index = dense as usize;
                     let context_start = move_index * POLICY_MOVE_CONTEXT_SIZE;
-                    let interaction_start = move_index * self.arch.policy_interaction_rank;
-                    let extra_context_start = move_index * self.arch.policy_context_extra_rank;
                     let accumulator_start = move_index * POLICY_ACCUMULATOR_RANK;
                     let accumulator_move = &self.policy_accumulator_move
                         [accumulator_start..accumulator_start + POLICY_ACCUMULATOR_RANK];
@@ -2562,16 +1982,6 @@ impl AzNnue {
                             &scratch.policy_context,
                             &self.policy_move_context
                                 [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
-                        )
-                        + dot_product(
-                            &scratch.policy_interaction,
-                            &self.policy_interaction_move[interaction_start
-                                ..interaction_start + self.arch.policy_interaction_rank],
-                        )
-                        + dot_product(
-                            &scratch.policy_context_extra,
-                            &self.policy_context_extra_move[extra_context_start
-                                ..extra_context_start + self.arch.policy_context_extra_rank],
                         )
                         + accumulator_logit
                         + sparse_logit
@@ -2821,14 +2231,8 @@ impl AzNnue {
         features: &[usize],
         value_head: &mut Vec<f32>,
     ) -> f32 {
-        let mut value_extra = Vec::new();
-        let probs = self.value_wdl_from_hidden_into(
-            hidden,
-            features,
-            value_head,
-            &mut value_extra,
-            [0.0; 3],
-        );
+        let probs =
+            self.value_wdl_from_hidden_into(hidden, features, value_head, [0.0; WDL_HEAD_SIZE]);
         probs.1
     }
 
@@ -2837,7 +2241,6 @@ impl AzNnue {
         hidden: &[f32],
         features: &[usize],
         value_head: &mut Vec<f32>,
-        value_extra: &mut Vec<f32>,
         threat_logits: [f32; WDL_HEAD_SIZE],
     ) -> ([f32; WDL_HEAD_SIZE], f32) {
         value_head.resize(VALUE_HEAD_SIZE, 0.0);
@@ -2848,22 +2251,11 @@ impl AzNnue {
             *value += dot_product(hidden, hidden_row);
             *value = (*value).max(0.0);
         }
-        let extra_rank = self.arch.value_extra_rank;
-        value_extra.resize(extra_rank, 0.0);
-        value_extra.copy_from_slice(&self.value_extra_bias);
-        for (rank, value) in value_extra.iter_mut().enumerate() {
-            let row =
-                &self.value_extra_hidden[rank * self.hidden_size..(rank + 1) * self.hidden_size];
-            *value = (*value + dot_product(hidden, row)).max(0.0);
-        }
         let _ = features;
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
             let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
-            let extra_row = &self.value_extra_output[out * extra_rank..(out + 1) * extra_rank];
-            *logit = dot_product(value_head, row)
-                + dot_product(value_extra, extra_row)
-                + threat_logits[out];
+            *logit = dot_product(value_head, row) + threat_logits[out];
         }
         let wdl = softmax_fixed3(logits);
         let q = wdl[0] - wdl[2];
@@ -2886,14 +2278,6 @@ impl AzNnue {
         self.value_threat_active = self.value_threat_output.iter().any(|&weight| weight != 0.0)
             || self
                 .policy_threat_context
-                .iter()
-                .any(|&weight| weight != 0.0)
-            || self
-                .policy_interaction_threat
-                .iter()
-                .any(|&weight| weight != 0.0)
-            || self
-                .policy_context_extra_threat
                 .iter()
                 .any(|&weight| weight != 0.0);
     }
@@ -3128,46 +2512,6 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(validate_tensor, hidden);
-        let rank = arch.residual_rank;
-        if self.trunk_residual_down.len() != rank * hidden
-            || self.trunk_residual_bias.len() != rank
-            || self.trunk_residual_up.len() != hidden * rank
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "az model residual tensor length mismatch",
-            ));
-        }
-        let interaction_rank = arch.policy_interaction_rank;
-        if self.policy_interaction_hidden.len() != interaction_rank * hidden
-            || self.policy_interaction_threat.len() != interaction_rank * VALUE_THREAT_RANK * 2
-            || self.policy_interaction_move.len() != DENSE_MOVE_SPACE * interaction_rank
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "az model policy interaction tensor length mismatch",
-            ));
-        }
-        let extra_context_rank = arch.policy_context_extra_rank;
-        if self.policy_context_extra_hidden.len() != extra_context_rank * hidden
-            || self.policy_context_extra_threat.len() != extra_context_rank * VALUE_THREAT_RANK * 2
-            || self.policy_context_extra_move.len() != DENSE_MOVE_SPACE * extra_context_rank
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "az model extra policy context tensor length mismatch",
-            ));
-        }
-        let value_extra_rank = arch.value_extra_rank;
-        if self.value_extra_hidden.len() != value_extra_rank * hidden
-            || self.value_extra_bias.len() != value_extra_rank
-            || self.value_extra_output.len() != WDL_HEAD_SIZE * value_extra_rank
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "az model extra value tensor length mismatch",
-            ));
-        }
         if self.policy_accumulator_features.len()
             != POLICY_ACCUMULATOR_ROWS * POLICY_ACCUMULATOR_RANK
             || self.policy_accumulator_move.len() != DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK
@@ -3182,68 +2526,6 @@ impl AzNnue {
             ));
         }
         Ok(())
-    }
-
-    fn apply_trunk_residual(&self, hidden: &mut [f32], residual: &mut Vec<f32>) {
-        let rank = self.arch.residual_rank;
-        if rank == 0 {
-            return;
-        }
-        residual.resize(rank, 0.0);
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if self.hidden_size >= 64 && std::arch::is_x86_feature_detected!("avx2") {
-            #[cfg(target_arch = "x86_64")]
-            if std::arch::is_x86_feature_detected!("fma") {
-                for (index, (row, output)) in self
-                    .trunk_residual_down
-                    .chunks_exact(self.hidden_size)
-                    .zip(residual.iter_mut())
-                    .enumerate()
-                {
-                    *output = (unsafe { dot_product_avx2_fma(row, hidden) }
-                        + self.trunk_residual_bias[index])
-                        .max(0.0);
-                }
-                for (&activation, row) in residual
-                    .iter()
-                    .zip(self.trunk_residual_up.chunks_exact(self.hidden_size))
-                {
-                    unsafe { add_scaled_feature_row_avx2_fma(hidden, row, activation) };
-                }
-                return;
-            }
-            for (index, (row, output)) in self
-                .trunk_residual_down
-                .chunks_exact(self.hidden_size)
-                .zip(residual.iter_mut())
-                .enumerate()
-            {
-                *output = (unsafe { dot_product_avx2(row, hidden) }
-                    + self.trunk_residual_bias[index])
-                    .max(0.0);
-            }
-            for (&activation, row) in residual
-                .iter()
-                .zip(self.trunk_residual_up.chunks_exact(self.hidden_size))
-            {
-                unsafe { add_scaled_feature_row_avx2(hidden, row, activation) };
-            }
-            return;
-        }
-        for (index, (row, output)) in self
-            .trunk_residual_down
-            .chunks_exact(self.hidden_size)
-            .zip(residual.iter_mut())
-            .enumerate()
-        {
-            *output = (dot_product(row, hidden) + self.trunk_residual_bias[index]).max(0.0);
-        }
-        for (&activation, row) in residual
-            .iter()
-            .zip(self.trunk_residual_up.chunks_exact(self.hidden_size))
-        {
-            add_scaled_feature_row(hidden, row, self.hidden_size, 0, activation);
-        }
     }
 }
 
@@ -4011,26 +3293,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_residual_up_layout_transposes_without_changing_projection() {
-        let hidden_size = 3;
-        let rank = 2;
-        let legacy = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let activation = [0.25, -0.5];
-        let expected = legacy
-            .chunks_exact(rank)
-            .map(|row| dot_product(row, &activation))
-            .collect::<Vec<_>>();
-        let transposed = transpose_legacy_residual_up(&legacy, hidden_size, rank);
-        let mut actual = vec![0.0; hidden_size];
-        for (&scale, row) in activation.iter().zip(transposed.chunks_exact(hidden_size)) {
-            for (value, &weight) in actual.iter_mut().zip(row) {
-                *value += scale * weight;
-            }
-        }
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
     fn tactical_piece_factor_is_folded_into_exact_cpu_table() {
         let mut model = AzNnue::random(16, 20260922);
         model.policy_tactical.fill(0.0);
@@ -4038,193 +3300,6 @@ mod tests {
         model.rebuild_policy_tactical();
         let tactical = policy_tactical_indices(0, 0, false, false, false, false, false, false);
         assert_eq!(model.policy_tactical_folded[tactical[0]], 0.75);
-    }
-
-    #[test]
-    fn residual_upgrade_is_exactly_output_neutral_and_roundtrips() {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let mut model = AzNnue::random(32, 20260922);
-        let mut before_scratch = AzEvalScratch::new(model.arch);
-        let before = model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut before_scratch,
-        );
-
-        model.enable_trunk_residual(8, 17).unwrap();
-        let mut after_scratch = AzEvalScratch::new(model.arch);
-        let after = model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut after_scratch,
-        );
-        assert_eq!(before.value.to_bits(), after.value.to_bits());
-        assert_eq!(
-            before.value_wdl.map(f32::to_bits),
-            after.value_wdl.map(f32::to_bits)
-        );
-        assert_eq!(before_scratch.logits, after_scratch.logits);
-        assert_eq!(before_scratch.priors, after_scratch.priors);
-
-        for (index, weight) in model.trunk_residual_up.iter_mut().enumerate() {
-            *weight = (index % 13) as f32 * 0.0002 - 0.0012;
-        }
-        let expected_value = model.evaluate_value(&position, &moves);
-
-        let path = std::env::temp_dir().join("chineseai_residual_roundtrip.safetensors");
-        let _ = fs::remove_file(&path);
-        model.save(&path).unwrap();
-        let loaded = AzNnue::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-        assert_eq!(loaded.arch, model.arch);
-        assert_eq!(loaded.trunk_residual_down, model.trunk_residual_down);
-        assert_eq!(loaded.trunk_residual_bias, model.trunk_residual_bias);
-        assert_eq!(loaded.trunk_residual_up, model.trunk_residual_up);
-        assert_eq!(
-            loaded.evaluate_value(&position, &moves).to_bits(),
-            expected_value.to_bits()
-        );
-    }
-
-    #[test]
-    fn policy_interaction_upgrade_is_exactly_neutral_and_roundtrips() {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let mut model = AzNnue::random(32, 20260922);
-        let mut before_scratch = AzEvalScratch::new(model.arch);
-        let before = model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut before_scratch,
-        );
-
-        model.enable_policy_interaction(8, 17).unwrap();
-        let mut after_scratch = AzEvalScratch::new(model.arch);
-        let after = model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut after_scratch,
-        );
-        assert_eq!(before.value.to_bits(), after.value.to_bits());
-        assert_eq!(
-            before.value_wdl.map(f32::to_bits),
-            after.value_wdl.map(f32::to_bits)
-        );
-        assert_eq!(before_scratch.logits, after_scratch.logits);
-        assert_eq!(before_scratch.priors, after_scratch.priors);
-
-        for (index, weight) in model.policy_interaction_move.iter_mut().enumerate() {
-            *weight = (index % 11) as f32 * 0.0002 - 0.001;
-        }
-        let expected = model.evaluate_value(&position, &moves);
-        let path = std::env::temp_dir().join("chineseai_policy_interaction_roundtrip.safetensors");
-        let _ = fs::remove_file(&path);
-        model.save(&path).unwrap();
-        let loaded = AzNnue::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-        assert_eq!(loaded.arch, model.arch);
-        assert_eq!(
-            loaded.policy_interaction_hidden,
-            model.policy_interaction_hidden
-        );
-        assert_eq!(
-            loaded.policy_interaction_threat,
-            model.policy_interaction_threat
-        );
-        assert_eq!(
-            loaded.policy_interaction_move,
-            model.policy_interaction_move
-        );
-        assert_eq!(
-            loaded.evaluate_value(&position, &moves).to_bits(),
-            expected.to_bits()
-        );
-    }
-
-    #[test]
-    fn extra_policy_context_upgrade_is_exactly_neutral_and_roundtrips() {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let mut model = AzNnue::random(32, 20260922);
-        let mut before_scratch = AzEvalScratch::new(model.arch);
-        let before = model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut before_scratch,
-        );
-        model.enable_policy_context_extra(8, 19).unwrap();
-        let mut after_scratch = AzEvalScratch::new(model.arch);
-        let after = model.evaluate_with_scratch_output(
-            &position,
-            &moves,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut after_scratch,
-        );
-        assert_eq!(before.value.to_bits(), after.value.to_bits());
-        assert_eq!(before_scratch.logits, after_scratch.logits);
-        assert_eq!(before_scratch.priors, after_scratch.priors);
-
-        for (index, weight) in model.policy_context_extra_move.iter_mut().enumerate() {
-            *weight = (index % 7) as f32 * 0.0003 - 0.0009;
-        }
-        let expected = model.evaluate_value(&position, &moves);
-        let path =
-            std::env::temp_dir().join("chineseai_policy_context_extra_roundtrip.safetensors");
-        let _ = fs::remove_file(&path);
-        model.save(&path).unwrap();
-        let loaded = AzNnue::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-        assert_eq!(loaded.arch, model.arch);
-        assert_eq!(
-            loaded.policy_context_extra_hidden,
-            model.policy_context_extra_hidden
-        );
-        assert_eq!(
-            loaded.policy_context_extra_threat,
-            model.policy_context_extra_threat
-        );
-        assert_eq!(
-            loaded.policy_context_extra_move,
-            model.policy_context_extra_move
-        );
-        assert_eq!(
-            loaded.evaluate_value(&position, &moves).to_bits(),
-            expected.to_bits()
-        );
-    }
-
-    #[test]
-    fn extra_value_head_upgrade_is_exactly_neutral_and_roundtrips() {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let mut model = AzNnue::random(32, 20260922);
-        let before = model.evaluate_value(&position, &moves);
-        model.enable_value_extra(8, 23).unwrap();
-        let after = model.evaluate_value(&position, &moves);
-        assert_eq!(before.to_bits(), after.to_bits());
-        for (index, weight) in model.value_extra_output.iter_mut().enumerate() {
-            *weight = (index % 5) as f32 * 0.0004 - 0.0008;
-        }
-        let expected = model.evaluate_value(&position, &moves);
-        let path = std::env::temp_dir().join("chineseai_value_extra_roundtrip.safetensors");
-        let _ = fs::remove_file(&path);
-        model.save(&path).unwrap();
-        let loaded = AzNnue::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-        assert_eq!(loaded.arch, model.arch);
-        assert_eq!(loaded.value_extra_hidden, model.value_extra_hidden);
-        assert_eq!(loaded.value_extra_bias, model.value_extra_bias);
-        assert_eq!(loaded.value_extra_output, model.value_extra_output);
-        assert_eq!(
-            loaded.evaluate_value(&position, &moves).to_bits(),
-            expected.to_bits()
-        );
     }
 
     #[test]

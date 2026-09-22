@@ -194,7 +194,6 @@ pub(super) struct PackedBatch {
     pub value_threat_indices: Vec<u32>,
     pub value_threat_scales: Vec<f32>,
     pub policy_items: Vec<i64>,
-    pub policy_move_indices: Vec<u32>,
     pub policy_sparse_indices: Vec<i64>,
     pub policy_tactical_indices: Vec<i64>,
     pub policy_targets: Vec<f32>,
@@ -245,7 +244,6 @@ impl PackedBatch {
             value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
             value_threat_scales: vec![1.0; batch_size],
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
-            policy_move_indices: vec![0; batch_size * max_policy_moves],
             policy_sparse_indices: vec![
                 (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
                 batch_size * max_policy_moves * 7
@@ -356,7 +354,6 @@ impl PackedBatch {
                     }
                 }
                 let item_index = policy_base + policy_offset;
-                self.policy_move_indices[item_index] = move_index as u32;
                 self.policy_items[item_index] = pack_policy_item(
                     move_index,
                     consequence_from,
