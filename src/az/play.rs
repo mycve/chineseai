@@ -491,7 +491,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_temperature_sum[start_source_index] +=
             selfplay_temperature(config, start_source, 0, start_phase_ply);
         let mut game_samples = Vec::new();
-        let mut game_bootstrap_wdls = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
 
@@ -634,7 +633,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     1.0,
                 );
                 game_samples.push(sample);
-                game_bootstrap_wdls.push(search.network_value_wdl);
             }
             let mover = position.side_to_move();
             let captured = position.piece_at(mv.to as usize);
@@ -700,12 +698,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            assign_td_lambda_value_targets(
-                &mut game_samples,
-                &game_bootstrap_wdls,
-                result,
-                config.value_td_lambda,
-            );
+            assign_terminal_value_targets(&mut game_samples, result);
             assign_short_value_targets(&mut game_samples, result);
         }
         samples.extend(game_samples.clone());
@@ -940,30 +933,12 @@ fn move_search_meta(
     meta
 }
 
-fn assign_td_lambda_value_targets(
-    samples: &mut [AzTrainingSample],
-    bootstrap_wdls: &[[f32; 3]],
-    game_result_red: f32,
-    td_lambda: f32,
-) {
-    assert_eq!(samples.len(), bootstrap_wdls.len());
-    let Some(last) = samples.last_mut() else {
-        return;
-    };
-    let lambda = td_lambda.clamp(0.0, 1.0);
-    let terminal = scalar_value_to_wdl_target((game_result_red * last.side_sign).clamp(-1.0, 1.0));
-    last.value_wdl = terminal;
-    last.value = terminal[0] - terminal[2];
-    let mut next_target = terminal;
-    for index in (0..samples.len().saturating_sub(1)).rev() {
-        let bootstrap = flip_wdl(bootstrap_wdls[index + 1]);
-        let continuation = flip_wdl(next_target);
-        let target = std::array::from_fn(|part| {
-            (1.0 - lambda) * bootstrap[part] + lambda * continuation[part]
-        });
-        samples[index].value_wdl = target;
-        samples[index].value = target[0] - target[2];
-        next_target = target;
+fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
+    for sample in samples {
+        let target =
+            scalar_value_to_wdl_target((game_result_red * sample.side_sign).clamp(-1.0, 1.0));
+        sample.value_wdl = target;
+        sample.value = target[0] - target[2];
     }
 }
 
@@ -1347,7 +1322,6 @@ mod tests {
             fpu_value_at_root: 0.20,
             draw_score: 0.0,
             policy_softmax_temp: 1.0,
-            value_td_lambda: 0.9,
             opening_positions: Default::default(),
             opening_start_fraction: 0.0,
             midgame_positions: Default::default(),
@@ -1561,33 +1535,17 @@ mod tests {
     }
 
     #[test]
-    fn td_lambda_one_is_terminal_mc() {
+    fn terminal_value_targets_use_game_result_for_each_side() {
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
         samples[0].meta.root_q = -1.0;
         samples[1].meta.root_q = 1.0;
 
-        assign_td_lambda_value_targets(&mut samples, &[[0.2, 0.3, 0.5], [0.6, 0.2, 0.2]], 1.0, 1.0);
+        assign_terminal_value_targets(&mut samples, 1.0);
 
         assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(samples[0].value, 1.0);
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
-    }
-
-    #[test]
-    fn td_lambda_mixes_wdl_bootstrap_and_terminal_return() {
-        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
-        let bootstraps = [[0.4, 0.4, 0.2], [0.1, 0.6, 0.3], [0.6, 0.2, 0.2]];
-
-        assign_td_lambda_value_targets(&mut samples, &bootstraps, 1.0, 0.9);
-
-        let expected = [[0.894, 0.078, 0.028], [0.02, 0.02, 0.96], [1.0, 0.0, 0.0]];
-        for (sample, expected) in samples.iter().zip(expected) {
-            for (actual, expected) in sample.value_wdl.iter().zip(expected) {
-                assert!((actual - expected).abs() < 1.0e-6);
-            }
-            assert!((sample.value - (expected[0] - expected[2])).abs() < 1.0e-6);
-        }
     }
 
     #[test]
@@ -1697,6 +1655,19 @@ mod tests {
         let weights = temperature_move_weights(&candidates, 1.0);
 
         assert_eq!(weights, vec![1.0, 10.0]);
+    }
+
+    #[test]
+    fn opening_temperature_stays_at_start_value_through_40_plies() {
+        let mut config = selfplay_test_config(1);
+        config.temperature_start = 1.2;
+        config.temperature_endgame = 0.05;
+        config.temperature_decay_delay_plies = 40;
+        config.temperature_decay_plies = 40;
+
+        assert_eq!(temperature_for_ply(&config, 0), 1.2);
+        assert_eq!(temperature_for_ply(&config, 40), 1.2);
+        assert!(temperature_for_ply(&config, 41) < 1.2);
     }
 
     #[test]

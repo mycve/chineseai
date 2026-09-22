@@ -1192,7 +1192,6 @@ pub struct AzLoopConfig {
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
-    pub value_td_lambda: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,
     pub opening_start_fraction: f32,
     pub midgame_positions: Arc<[AzStartSnapshot]>,

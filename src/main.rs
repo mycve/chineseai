@@ -888,7 +888,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_rr{}_pir{}_mxp{}_sr{}_r60{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tdl{}_op{}_rc{}_",
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_op{}_rc{}_",
             "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_of{}_mf{}_rt{}_rd{}_prf{}_prg{}_sd{}"
         ),
         config.simulations,
@@ -917,7 +917,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.temperature_endgame),
         config.temperature_decay_delay_plies,
         config.temperature_decay_plies,
-        f32_slug(config.value_td_lambda),
         format!(
             "{}x{}",
             f32_slug(config.opening_start_fraction),
@@ -1572,7 +1571,6 @@ fn build_az_loop_config(
         fpu_value_at_root: config.fpu_value_at_root,
         draw_score: config.draw_score,
         policy_softmax_temp: config.policy_softmax_temp,
-        value_td_lambda: config.value_td_lambda,
         opening_positions: Arc::clone(opening_positions),
         opening_start_fraction: config.opening_start_fraction,
         midgame_positions: Arc::default(),
@@ -3211,13 +3209,12 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=continuous search=alphazero arch(hidden={},residual_rank={},policy_interaction_rank={}) sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous search=alphazero arch(hidden={},residual_rank={},policy_interaction_rank={}) sims={} value_target=terminal replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.hidden_size,
                 config.trunk_residual_rank,
                 config.policy_interaction_rank,
                 config.simulations,
-                config.value_td_lambda,
                 config.replay_recent_sample_fraction,
                 config.replay_recent_games,
                 config.selfplay_samples_per_update,

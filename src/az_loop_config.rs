@@ -56,7 +56,6 @@ pub struct AzLoopFileConfig {
     pub fpu_value_at_root: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
-    pub value_td_lambda: f32,
     pub opening_start_fraction: f32,
     pub opening_reservoir_capacity: usize,
     pub opening_snapshot_path: String,
@@ -129,13 +128,13 @@ impl Default for AzLoopFileConfig {
             policy_interaction_rank: 0,
             seed: 20260420,
             workers: 0,
-            temperature_start: 0.9,
+            temperature_start: 1.2,
             temperature_endgame: 0.05,
-            temperature_decay_delay_plies: 20,
+            temperature_decay_delay_plies: 40,
             temperature_decay_plies: 40,
             restart_temperature_start: 0.6,
             restart_temperature_decay_plies: 8,
-            cpuct: 1.2,
+            cpuct: 0.9,
             cpuct_at_root: 2.0,
             cpuct_base: 19652.0,
             cpuct_factor: 1.5,
@@ -147,7 +146,6 @@ impl Default for AzLoopFileConfig {
             fpu_value_at_root: 0.05,
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
-            value_td_lambda: 0.95,
             opening_start_fraction: 0.30,
             opening_reservoir_capacity: 50_000,
             opening_snapshot_path: "opening-pool.lz4".into(),
@@ -279,7 +277,6 @@ impl AzLoopFileConfig {
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
-        line!("value_td_lambda", f(self.value_td_lambda));
         line!("opening_start_fraction", f(self.opening_start_fraction));
         line!(
             "opening_reservoir_capacity",
@@ -386,14 +383,27 @@ impl AzLoopFileConfig {
     }
 
     pub(crate) fn parse(text: &str) -> Self {
-        let config = toml::from_str::<AzLoopFileConfig>(text)
+        let mut document = toml::from_str::<toml::Value>(text)
             .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
-        if !(24..=AZ_LOOP_CONFIG_FORMAT_VERSION).contains(&config.format_version) {
+        let format_version = document
+            .get("format_version")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(AZ_LOOP_CONFIG_FORMAT_VERSION as i64) as u32;
+        if !(24..=AZ_LOOP_CONFIG_FORMAT_VERSION).contains(&format_version) {
             panic!(
                 "unsupported az-loop config format {}; expected 24..={}",
-                config.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
+                format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
             );
         }
+        if format_version < 27 {
+            document
+                .as_table_mut()
+                .expect("az-loop TOML root must be a table")
+                .remove("value_td_lambda");
+        }
+        let config = document
+            .try_into::<AzLoopFileConfig>()
+            .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
         let mut config = config.normalize();
         config.format_version = AZ_LOOP_CONFIG_FORMAT_VERSION;
         config
@@ -451,7 +461,6 @@ impl AzLoopFileConfig {
             self.opening_start_fraction,
             self.midgame_start_fraction
         );
-        self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.start_pool_recent_fraction = self.start_pool_recent_fraction.clamp(0.0, 1.0);
         self.start_pool_recent_generations = self.start_pool_recent_generations.max(1);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
@@ -531,19 +540,19 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 26\n"));
+        assert!(text.starts_with("format_version = 27\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00001\n"));
-        assert!(text.contains("temperature_start = 0.9\n"));
+        assert!(text.contains("temperature_start = 1.2\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
         assert!(text.contains("temperature_endgame = 0.05\n"));
-        assert!(text.contains("temperature_decay_delay_plies = 20\n"));
+        assert!(text.contains("temperature_decay_delay_plies = 40\n"));
         assert!(text.contains("temperature_decay_plies = 40\n"));
         assert!(text.contains("restart_temperature_start = 0.6\n"));
         assert!(text.contains("restart_temperature_decay_plies = 8\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("cpuct = 1.2\n"));
+        assert!(text.contains("cpuct = 0.9\n"));
         assert!(text.contains("cpuct_at_root = 2.0\n"));
         assert!(text.contains("cpuct_base = 19652.0\n"));
         assert!(text.contains("cpuct_factor = 1.5\n"));
@@ -555,7 +564,7 @@ mod tests {
         assert!(text.contains("fpu_value_at_root = 0.05\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
-        assert!(text.contains("value_td_lambda = 0.95\n"));
+        assert!(!text.contains("value_td_lambda"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("opening_start_fraction = 0.3\n"));
         assert!(text.contains("opening_reservoir_capacity = 50000\n"));
@@ -646,13 +655,28 @@ mod tests {
     fn version_24_config_migrates_to_current_with_no_optional_branches() {
         let text = AzLoopFileConfig::default()
             .to_file_text()
-            .replace("format_version = 26", "format_version = 24")
+            .replace("format_version = 27", "format_version = 24")
             .replace("trunk_residual_rank = 0\n", "")
             .replace("policy_interaction_rank = 0\n", "");
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION);
         assert_eq!(parsed.trunk_residual_rank, 0);
         assert_eq!(parsed.policy_interaction_rank, 0);
+    }
+
+    #[test]
+    fn version_26_config_drops_td_lambda() {
+        let text = AzLoopFileConfig::default()
+            .to_file_text()
+            .replace("format_version = 27", "format_version = 26")
+            .replacen(
+                "policy_softmax_temp = 1.45\n",
+                "policy_softmax_temp = 1.45\nvalue_td_lambda = 0.95\n",
+                1,
+            );
+        let parsed = AzLoopFileConfig::parse(&text);
+        assert_eq!(parsed.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION);
+        assert!(!parsed.to_file_text().contains("value_td_lambda"));
     }
 
     #[test]
@@ -674,6 +698,7 @@ mod tests {
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
             "value_target_search_q_mix = 0.4\n",
+            "value_td_lambda = 0.95\n",
             "arena_pikafish_exe = \"./pikafish\"\n",
             "arena_pikafish_depth = 10\n",
             "arena_pikafish_games = 20\n",
