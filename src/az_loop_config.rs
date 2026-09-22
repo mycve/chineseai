@@ -32,12 +32,17 @@ pub struct AzLoopFileConfig {
     pub sixty_move_rule: bool,
     pub rule60_max_ply: u16,
     pub hidden_size: usize,
+    pub trunk_residual_rank: usize,
+    pub policy_interaction_rank: usize,
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
+    /// 池化局面重启后的局部探索温度；实际温度取其与全局温度曲线的较大值。
+    pub restart_temperature_start: f32,
+    pub restart_temperature_decay_plies: usize,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
     pub cpuct_base: f32,
@@ -58,6 +63,9 @@ pub struct AzLoopFileConfig {
     pub midgame_start_fraction: f32,
     pub midgame_reservoir_capacity: usize,
     pub midgame_snapshot_path: String,
+    /// 从最近若干代快照中采样的比例，其余样本来自完整 reservoir。
+    pub start_pool_recent_fraction: f32,
+    pub start_pool_recent_generations: u32,
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_games: u32,
@@ -116,13 +124,17 @@ impl Default for AzLoopFileConfig {
             max_plies: 200,
             sixty_move_rule: true,
             rule60_max_ply: 120,
-            hidden_size: 128,
+            hidden_size: 256,
+            trunk_residual_rank: 0,
+            policy_interaction_rank: 0,
             seed: 20260420,
             workers: 0,
             temperature_start: 0.9,
             temperature_endgame: 0.05,
             temperature_decay_delay_plies: 20,
             temperature_decay_plies: 40,
+            restart_temperature_start: 0.6,
+            restart_temperature_decay_plies: 8,
             cpuct: 1.2,
             cpuct_at_root: 2.0,
             cpuct_base: 19652.0,
@@ -142,6 +154,8 @@ impl Default for AzLoopFileConfig {
             midgame_start_fraction: 0.40,
             midgame_reservoir_capacity: 50_000,
             midgame_snapshot_path: "midgame-pool.lz4".into(),
+            start_pool_recent_fraction: 0.75,
+            start_pool_recent_generations: 20,
             replay_capacity: 2400000,
             replay_recent_sample_fraction: 0.35,
             replay_recent_games: 7500,
@@ -228,6 +242,8 @@ impl AzLoopFileConfig {
         line!("sixty_move_rule", self.sixty_move_rule);
         line!("rule60_max_ply", self.rule60_max_ply);
         line!("hidden_size", self.hidden_size);
+        line!("trunk_residual_rank", self.trunk_residual_rank);
+        line!("policy_interaction_rank", self.policy_interaction_rank);
         line!("seed", self.seed);
         line!("workers", self.workers);
         line!("temperature_start", f(self.temperature_start));
@@ -237,6 +253,14 @@ impl AzLoopFileConfig {
             self.temperature_decay_delay_plies
         );
         line!("temperature_decay_plies", self.temperature_decay_plies);
+        line!(
+            "restart_temperature_start",
+            f(self.restart_temperature_start)
+        );
+        line!(
+            "restart_temperature_decay_plies",
+            self.restart_temperature_decay_plies
+        );
         line!("cpuct", f(self.cpuct));
         line!("cpuct_at_root", f(self.cpuct_at_root));
         line!("cpuct_base", f(self.cpuct_base));
@@ -268,6 +292,14 @@ impl AzLoopFileConfig {
             self.midgame_reservoir_capacity
         );
         line!("midgame_snapshot_path", q(&self.midgame_snapshot_path));
+        line!(
+            "start_pool_recent_fraction",
+            f(self.start_pool_recent_fraction)
+        );
+        line!(
+            "start_pool_recent_generations",
+            self.start_pool_recent_generations
+        );
         line!("replay_capacity", self.replay_capacity);
         line!(
             "replay_recent_sample_fraction",
@@ -353,21 +385,27 @@ impl AzLoopFileConfig {
         out
     }
 
-    fn parse(text: &str) -> Self {
+    pub(crate) fn parse(text: &str) -> Self {
         let config = toml::from_str::<AzLoopFileConfig>(text)
             .unwrap_or_else(|err| panic!("invalid az-loop TOML config: {err}"));
-        if config.format_version != AZ_LOOP_CONFIG_FORMAT_VERSION {
+        if !(24..=AZ_LOOP_CONFIG_FORMAT_VERSION).contains(&config.format_version) {
             panic!(
-                "unsupported az-loop config format {}; expected {}",
+                "unsupported az-loop config format {}; expected 24..={}",
                 config.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION
             );
         }
-        config.normalize()
+        let mut config = config.normalize();
+        config.format_version = AZ_LOOP_CONFIG_FORMAT_VERSION;
+        config
     }
 
     pub fn arch(&self) -> AzNnueArch {
         AzNnueArch {
             hidden_size: self.hidden_size,
+            residual_rank: self.trunk_residual_rank,
+            policy_interaction_rank: self.policy_interaction_rank,
+            policy_context_extra_rank: 0,
+            value_extra_rank: 0,
         }
     }
 
@@ -389,6 +427,9 @@ impl AzLoopFileConfig {
         self.temperature_endgame = self.temperature_endgame.max(0.0);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
         self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
+        self.restart_temperature_start = self.restart_temperature_start.max(0.0);
+        self.restart_temperature_decay_plies =
+            self.restart_temperature_decay_plies.min(self.max_plies);
         self.cpuct = self.cpuct.max(0.0);
         self.cpuct_at_root = self.cpuct_at_root.max(0.0);
         self.cpuct_base = self.cpuct_base.max(1.0);
@@ -411,6 +452,8 @@ impl AzLoopFileConfig {
             self.midgame_start_fraction
         );
         self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
+        self.start_pool_recent_fraction = self.start_pool_recent_fraction.clamp(0.0, 1.0);
+        self.start_pool_recent_generations = self.start_pool_recent_generations.max(1);
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
         let mut replay_phase_fractions = [
@@ -488,7 +531,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 23\n"));
+        assert!(text.starts_with("format_version = 26\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00001\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
@@ -497,6 +540,8 @@ mod tests {
         assert!(text.contains("temperature_endgame = 0.05\n"));
         assert!(text.contains("temperature_decay_delay_plies = 20\n"));
         assert!(text.contains("temperature_decay_plies = 40\n"));
+        assert!(text.contains("restart_temperature_start = 0.6\n"));
+        assert!(text.contains("restart_temperature_decay_plies = 8\n"));
         assert!(!text.contains("temperature_cutoff_plies"));
         assert!(text.contains("cpuct = 1.2\n"));
         assert!(text.contains("cpuct_at_root = 2.0\n"));
@@ -518,6 +563,8 @@ mod tests {
         assert!(text.contains("midgame_start_fraction = 0.4\n"));
         assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
         assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
+        assert!(text.contains("start_pool_recent_fraction = 0.75\n"));
+        assert!(text.contains("start_pool_recent_generations = 20\n"));
         assert!(text.contains("simulations = 800\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
@@ -529,7 +576,9 @@ mod tests {
         assert!(text.contains("workers = 0\n"));
         assert!(text.contains("batch_size = 1024\n"));
         assert!(text.contains("max_plies = 200\n"));
-        assert!(text.contains("hidden_size = 128\n"));
+        assert!(text.contains("hidden_size = 256\n"));
+        assert!(text.contains("trunk_residual_rank = 0\n"));
+        assert!(text.contains("policy_interaction_rank = 0\n"));
         assert!(text.contains("replay_capacity = 2400000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));
         assert!(text.contains("train_warmup_samples = 600000\n"));
@@ -591,6 +640,19 @@ mod tests {
         assert!((parsed.lr - 0.0004).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
+    }
+
+    #[test]
+    fn version_24_config_migrates_to_current_with_no_optional_branches() {
+        let text = AzLoopFileConfig::default()
+            .to_file_text()
+            .replace("format_version = 26", "format_version = 24")
+            .replace("trunk_residual_rank = 0\n", "")
+            .replace("policy_interaction_rank = 0\n", "");
+        let parsed = AzLoopFileConfig::parse(&text);
+        assert_eq!(parsed.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION);
+        assert_eq!(parsed.trunk_residual_rank, 0);
+        assert_eq!(parsed.policy_interaction_rank, 0);
     }
 
     #[test]

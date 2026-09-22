@@ -6,6 +6,6 @@ pub const MODEL_FORMAT_VERSION: f32 = 26.0;
 /// ???replay????????
 pub const REPLAY_FILE_VERSION: u32 = 38;
 /// az-loop ?????TOML??????
-pub const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 23;
+pub const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 26;
 /// az-loop ?????????
 pub const AZ_LOOP_PROGRESS_VERSION: u32 = 8;

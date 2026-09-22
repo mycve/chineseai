@@ -12,18 +12,20 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
-        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        DENSE_MOVE_SPACE, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
-        generate_selfplay_data, play_arena_games_from_positions, train_samples_weighted,
-        train_samples_weighted_owned,
+        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzSparseActivationStats,
+        AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_MAIN_SIZE,
+        POLICY_TACTICAL_EXACT_SIZE, SplitMix64, alphazero_search,
+        alphazero_search_trace_with_rules, alphazero_search_with_rules, benchmark_training,
+        dense_move_index, evaluate_policy_groups, generate_selfplay_data,
+        play_arena_games_from_positions, play_arena_games_from_snapshots, sparse_activation_stats,
+        train_samples_weighted, train_samples_weighted_owned,
     },
-    nnue::{canonical_move, extract_sparse_features_az},
+    nnue::{AZ_NNUE_INPUT_SIZE, canonical_move, extract_sparse_features_az},
     opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     xiangqi::{Move, Position, RuleOutcome},
 };
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -62,6 +64,16 @@ struct Cli {
 enum CliCommand {
     /// Create a random AZ-NNUE model.
     AzInit(AzInitArgs),
+    /// Add an exactly neutral low-rank residual trunk to an existing model.
+    AzResidualUpgrade(AzResidualUpgradeArgs),
+    /// Add an exactly neutral board × threat policy interaction to an existing model.
+    AzPolicyInteractionUpgrade(AzPolicyInteractionUpgradeArgs),
+    /// Add exactly neutral extra policy-context channels to an existing model.
+    AzPolicyContextUpgrade(AzPolicyContextUpgradeArgs),
+    /// Add exactly neutral nonlinear units to the value head.
+    AzValueHeadUpgrade(AzValueHeadUpgradeArgs),
+    /// Scale one policy component for structural ablation.
+    AzPolicyScale(AzPolicyScaleArgs),
     /// Search one position and print policy/debug details.
     AzSearch(AzSearchArgs),
     /// Benchmark fixed-position search speed.
@@ -72,8 +84,16 @@ enum CliCommand {
     AzReplayFit(AzReplayFitArgs),
     /// Report start-position policy targets, played moves, and outcomes from a replay snapshot.
     AzReplayOpeningStats(AzReplayOpeningStatsArgs),
+    /// Compare fixed label accuracy across replay position-coverage buckets.
+    AzReplayCoverage(AzReplayCoverageArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
+    /// Generate a fixed-compute 3x3 start-ratio ablation plan.
+    AzSamplingAblation(AzSamplingAblationArgs),
+    /// Build common opening/midgame start pools without training.
+    AzPoolBootstrap(AzPoolBootstrapArgs),
+    /// Compare two models on fixed startpos, opening, and midgame suites.
+    AzArenaSuite(AzArenaSuiteArgs),
     /// Evaluate checkpoint non-transitivity and historical regressions.
     CheckpointCycles(CheckpointCyclesArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
@@ -93,7 +113,7 @@ enum CliCommand {
 #[derive(Args, Debug, Clone)]
 struct AzInitArgs {
     /// Hidden size of the model.
-    #[arg(default_value_t = 128)]
+    #[arg(default_value_t = 256)]
     hidden: usize,
     /// Output model path.
     #[arg(default_value = "model.safetensors")]
@@ -101,12 +121,101 @@ struct AzInitArgs {
     /// Random seed.
     #[arg(default_value_t = 20260409)]
     seed: u64,
+    /// Rank of the optional board × threat policy interaction.
+    #[arg(long, default_value_t = 0)]
+    policy_interaction_rank: usize,
 }
 
 impl AzInitArgs {
     fn arch(&self) -> chineseai::az::AzNnueArch {
         chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1))
+            .with_policy_interaction_rank(self.policy_interaction_rank)
     }
+}
+
+#[derive(Args, Debug, Clone)]
+struct AzResidualUpgradeArgs {
+    /// Existing model path.
+    input: String,
+    /// Upgraded model path.
+    output: String,
+    /// Bottleneck rank of the residual branch.
+    #[arg(long, default_value_t = 32)]
+    rank: usize,
+    /// Seed used to initialize the down projection.
+    #[arg(long, default_value_t = 20260922)]
+    seed: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct AzPolicyInteractionUpgradeArgs {
+    /// Existing model path.
+    input: String,
+    /// Upgraded model path.
+    output: String,
+    /// Bilinear interaction rank.
+    #[arg(long, default_value_t = 16)]
+    rank: usize,
+    /// Seed used to initialize the board and threat projections.
+    #[arg(long, default_value_t = 20260922)]
+    seed: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct AzPolicyContextUpgradeArgs {
+    /// Existing model path.
+    input: String,
+    /// Upgraded model path.
+    output: String,
+    /// Number of extra policy-context channels.
+    #[arg(long, default_value_t = 16)]
+    rank: usize,
+    /// Seed used to initialize the added context projections.
+    #[arg(long, default_value_t = 20260922)]
+    seed: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct AzValueHeadUpgradeArgs {
+    /// Existing model path.
+    input: String,
+    /// Upgraded model path.
+    output: String,
+    /// Number of added value-head units.
+    #[arg(long, default_value_t = 32)]
+    rank: usize,
+    /// Seed used to initialize the added hidden projection.
+    #[arg(long, default_value_t = 20260922)]
+    seed: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+struct AzPolicyScaleArgs {
+    /// Existing model path.
+    input: String,
+    /// Modified model path.
+    output: String,
+    /// Policy component to scale.
+    #[arg(long, value_enum)]
+    component: PolicyComponent,
+    /// Multiplier applied to the selected component.
+    #[arg(long)]
+    scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PolicyComponent {
+    Exact,
+    Capture,
+    Factor,
+    Tactical,
+    TacticalExact,
+    TacticalFactor,
+    Accumulator,
+    Context,
+    Consequence,
+    MoveBias,
+    ThreatContext,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -233,6 +342,9 @@ struct AzReplayFitArgs {
     /// Output model path.
     #[arg(long, default_value = "replay-fit.safetensors")]
     output: String,
+    /// Optional warm-start model; when omitted, initialize a fresh model.
+    #[arg(long)]
+    initial_model: Option<String>,
     /// Hidden width of the model under test.
     #[arg(long, default_value_t = 192)]
     hidden: usize,
@@ -266,6 +378,34 @@ struct AzReplayOpeningStatsArgs {
 }
 
 #[derive(Args, Debug)]
+struct AzReplayCoverageArgs {
+    /// Replay snapshot produced by az-loop.
+    replay: String,
+    /// Model evaluated on the fixed labels.
+    model: String,
+    /// SQLite label set produced by pikafish-label-random.
+    sqlite: String,
+    /// Latest replay samples retained for the coverage index.
+    #[arg(long, default_value_t = 300_000)]
+    samples: usize,
+    /// Uniformly sampled label rows; 0 uses all rows.
+    #[arg(long, default_value_t = 5_000)]
+    limit: usize,
+    /// Search simulations per label position.
+    #[arg(long, default_value_t = 64)]
+    simulations: usize,
+    /// Parallel evaluator threads.
+    #[arg(long, default_value_t = 16)]
+    threads: usize,
+    /// Shared sampling and search seed.
+    #[arg(long, default_value_t = 20260923)]
+    seed: u64,
+    /// TSV result path.
+    #[arg(long, default_value = "experiments/replay-coverage.tsv")]
+    output: String,
+}
+
+#[derive(Args, Debug)]
 struct AzLoopArgs {
     /// Training config path.
     #[arg(default_value = DEFAULT_AZ_LOOP_CONFIG)]
@@ -273,6 +413,92 @@ struct AzLoopArgs {
     /// Stop after completing this absolute update number and save the model/progress.
     #[arg(long)]
     target_update: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+struct AzSamplingAblationArgs {
+    /// Optional TOML template; defaults are used when omitted.
+    #[arg(long)]
+    template: Option<String>,
+    /// Directory for isolated configs, models, pools, logs, and checkpoints.
+    #[arg(long, default_value = "experiments/sampling-ratios")]
+    output: String,
+    /// Common checkpoint copied into every run before training.
+    #[arg(long, default_value = "best.safetensors")]
+    initial_model: String,
+    /// Optional common opening pool copied into every run.
+    #[arg(long, requires = "midgame_pool")]
+    opening_pool: Option<String>,
+    /// Optional common midgame pool copied into every run.
+    #[arg(long, requires = "opening_pool")]
+    midgame_pool: Option<String>,
+    /// Paired initialization/self-play seeds, comma separated.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "20260420,20260421,20260422"
+    )]
+    seeds: Vec<u64>,
+    /// Absolute training update at which every run stops.
+    #[arg(long, default_value_t = 100)]
+    target_update: usize,
+    /// Generate a tiny one-update pipeline check; results are not strength evidence.
+    #[arg(long)]
+    smoke: bool,
+}
+
+#[derive(Args, Debug)]
+struct AzPoolBootstrapArgs {
+    /// Model used to generate standard-start self-play games.
+    #[arg(default_value = "best.safetensors")]
+    model: String,
+    #[arg(
+        long,
+        default_value = "experiments/common-start-pools/opening-pool.lz4"
+    )]
+    opening_output: String,
+    #[arg(
+        long,
+        default_value = "experiments/common-start-pools/midgame-pool.lz4"
+    )]
+    midgame_output: String,
+    /// Required unique snapshots in each pool.
+    #[arg(long, default_value_t = 256)]
+    count: usize,
+    #[arg(long, default_value_t = 200)]
+    simulations: usize,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
+    #[arg(long, default_value_t = 20260922)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct AzArenaSuiteArgs {
+    candidate: String,
+    baseline: String,
+    #[arg(long, default_value = "opening.obk")]
+    opening_book: String,
+    #[arg(
+        long,
+        default_value = "experiments/common-start-pools/midgame-pool.lz4"
+    )]
+    midgame_pool: String,
+    /// Number of distinct opening and midgame positions. Startpos is evaluated once.
+    #[arg(long, default_value_t = 128)]
+    positions: usize,
+    #[arg(long, default_value_t = 800)]
+    simulations: usize,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    #[arg(long, default_value_t = 20260922)]
+    seed: u64,
+    #[arg(long, default_value = "experiments/arena-suite.tsv")]
+    output: String,
 }
 
 #[derive(Args, Debug)]
@@ -527,6 +753,9 @@ struct PikafishLabelEvalArgs {
     /// Parallel evaluator threads.
     #[arg(long, default_value_t = 128)]
     threads: usize,
+    /// Optional one-row TSV metrics artifact.
+    #[arg(long)]
+    output: Option<String>,
 }
 
 fn best_model_path(model_path: &str) -> PathBuf {
@@ -658,15 +887,17 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
 
     let encoded = format!(
         concat!(
-            "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
+            "sim{}_sspu{}_bs{}_lr{}_h{}_rr{}_pir{}_mxp{}_sr{}_r60{}_wk{}_",
             "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_tdl{}_op{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_of{}_mf{}_rt{}_rd{}_prf{}_prg{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
         config.batch_size,
         f32_slug(config.lr),
         config.hidden_size,
+        config.trunk_residual_rank,
+        config.policy_interaction_rank,
         config.max_plies,
         u8::from(config.sixty_move_rule),
         config.rule60_max_ply,
@@ -704,6 +935,12 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_policy_softmax_temp),
         f32_slug(config.root_dirichlet_total_concentration),
         f32_slug(config.root_exploration_fraction),
+        f32_slug(config.opening_start_fraction),
+        f32_slug(config.midgame_start_fraction),
+        f32_slug(config.restart_temperature_start),
+        config.restart_temperature_decay_plies,
+        f32_slug(config.start_pool_recent_fraction),
+        config.start_pool_recent_generations,
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -716,14 +953,324 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }
     format!(
-        "sim{}_bs{}_lr{}_h{}_sd{}_cfg{:016x}",
+        "sim{}_bs{}_lr{}_h{}_rr{}_pir{}_sd{}_cfg{:016x}",
         config.simulations,
         config.batch_size,
         f32_slug(config.lr),
         config.hidden_size,
+        config.trunk_residual_rank,
+        config.policy_interaction_rank,
         config.seed,
         hash
     )
+}
+
+fn sampling_ablation_configs(
+    base: &AzLoopFileConfig,
+    output: &Path,
+    seeds: &[u64],
+) -> Vec<(String, PathBuf, AzLoopFileConfig)> {
+    let variants = [
+        ("a-30-30-40", 0.30f32, 0.40f32),
+        ("b-20-30-50", 0.30f32, 0.50f32),
+        ("c-10-30-60", 0.30f32, 0.60f32),
+    ];
+    let mut configs = Vec::with_capacity(variants.len() * seeds.len());
+    for &(variant, opening, midgame) in &variants {
+        for &seed in seeds {
+            let name = format!("{variant}-seed{seed}");
+            let run_dir = output.join(&name);
+            let mut config = base.clone();
+            config.seed = seed;
+            config.opening_start_fraction = opening;
+            config.midgame_start_fraction = midgame;
+            config.model_path = run_dir.join("model.safetensors").display().to_string();
+            config.opening_snapshot_path = run_dir.join("opening-pool.lz4").display().to_string();
+            config.midgame_snapshot_path = run_dir.join("midgame-pool.lz4").display().to_string();
+            config.checkpoint_dir = run_dir.join("checkpoints").display().to_string();
+            config.tensorboard_logdir = run_dir.join("tensorboard").display().to_string();
+            configs.push((name, run_dir.join("config.toml"), config));
+        }
+    }
+    configs
+}
+
+fn write_sampling_ablation_plan(args: AzSamplingAblationArgs) {
+    assert!(!args.seeds.is_empty(), "at least one seed is required");
+    let mut base = args
+        .template
+        .as_ref()
+        .map_or_else(AzLoopFileConfig::default, |path| {
+            let text = fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("failed to read template `{path}`: {err}"));
+            AzLoopFileConfig::parse(&text)
+        });
+    let initial_model_path = Path::new(&args.initial_model);
+    let initial_model = AzNnue::load(initial_model_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to load common initial model `{}`: {err}",
+            initial_model_path.display()
+        )
+    });
+    base.hidden_size = initial_model.arch.hidden_size;
+    base.trunk_residual_rank = initial_model.arch.residual_rank;
+    base.policy_interaction_rank = initial_model.arch.policy_interaction_rank;
+    let common_pools = args.opening_pool.as_ref().zip(args.midgame_pool.as_ref());
+    if let Some((opening, midgame)) = common_pools {
+        for path in [opening, midgame] {
+            if !Path::new(path).is_file() {
+                panic!("common start pool `{path}` does not exist");
+            }
+        }
+    }
+    if args.smoke {
+        base.simulations = 8;
+        base.selfplay_samples_per_update = 64;
+        base.batch_size = 32;
+        base.max_plies = 160;
+        base.workers = 2;
+        base.opening_reservoir_capacity = 128;
+        base.midgame_reservoir_capacity = 128;
+        base.replay_capacity = 512;
+        base.train_warmup_samples = 64;
+        base.train_samples_per_update = 64;
+        base.train_epochs_per_update = 1;
+        base.checkpoint_interval = 0;
+        base.arena_interval = 0;
+        base.pikafish_label_eval_interval = 0;
+    }
+    let output = PathBuf::from(&args.output);
+    fs::create_dir_all(&output).unwrap_or_else(|err| {
+        panic!(
+            "failed to create ablation directory `{}`: {err}",
+            output.display()
+        )
+    });
+    let configs = sampling_ablation_configs(&base, &output, &args.seeds);
+    let mut manifest = String::from(
+        "run\tmode\tseed\tstart_fraction\topening_fraction\tmidgame_fraction\thidden\tresidual_rank\ttarget_update\tinitial_model\tcommon_pools\tconfig\n",
+    );
+    let mut script = String::from("$ErrorActionPreference = 'Stop'\n");
+    script.push_str("cargo build --profile fast\n");
+    let mut evaluate_script = String::from("$ErrorActionPreference = 'Stop'\n");
+    evaluate_script.push_str("cargo build --profile fast\n");
+    for (name, config_path, config) in &configs {
+        if let Some(run_dir) = config_path.parent() {
+            fs::create_dir_all(run_dir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to create run directory `{}`: {err}",
+                    run_dir.display()
+                )
+            });
+        }
+        let run_model = Path::new(&config.model_path);
+        let progress_path = az_loop_progress_path(config_path.to_string_lossy().as_ref());
+        if progress_path.exists() || run_model.exists() {
+            panic!(
+                "refusing to overwrite started run `{name}`; remove its model/progress explicitly first"
+            );
+        }
+        fs::write(config_path, config.to_file_text()).unwrap_or_else(|err| {
+            panic!("failed to write config `{}`: {err}", config_path.display())
+        });
+        fs::copy(initial_model_path, run_model).unwrap_or_else(|err| {
+            panic!(
+                "failed to copy initial model `{}` to `{}`: {err}",
+                initial_model_path.display(),
+                run_model.display()
+            )
+        });
+        if let Some((opening, midgame)) = common_pools {
+            fs::copy(opening, &config.opening_snapshot_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to copy common opening pool `{opening}` to `{}`: {err}",
+                    config.opening_snapshot_path
+                )
+            });
+            fs::copy(midgame, &config.midgame_snapshot_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to copy common midgame pool `{midgame}` to `{}`: {err}",
+                    config.midgame_snapshot_path
+                )
+            });
+        }
+        let start = 1.0 - config.opening_start_fraction - config.midgame_start_fraction;
+        use std::fmt::Write as _;
+        writeln!(
+            manifest,
+            "{name}\t{}\t{}\t{start:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}",
+            if args.smoke { "smoke" } else { "fixed-compute" },
+            config.seed,
+            config.opening_start_fraction,
+            config.midgame_start_fraction,
+            config.hidden_size,
+            config.trunk_residual_rank,
+            args.target_update.max(1),
+            initial_model_path.display(),
+            common_pools.map_or_else(
+                || "empty".to_string(),
+                |(opening, midgame)| format!("{opening};{midgame}"),
+            ),
+            config_path.display()
+        )
+        .unwrap();
+        writeln!(
+            script,
+            "& .\\target\\fast\\chineseai.exe az-loop {:?} --target-update {}",
+            config_path.display().to_string(),
+            args.target_update.max(1)
+        )
+        .unwrap();
+        let run_dir = config_path.parent().expect("ablation config has parent");
+        let arena_output = run_dir.join("arena-vs-initial.tsv");
+        let label_output = run_dir.join("pikafish-label-eval.tsv");
+        let eval_midgame_pool = args
+            .midgame_pool
+            .as_deref()
+            .unwrap_or("experiments/common-start-pools/midgame-pool.lz4");
+        writeln!(
+            evaluate_script,
+            "& .\\target\\fast\\chineseai.exe az-arena-suite {:?} {:?} --midgame-pool {:?} --positions 128 --simulations 800 --seed 20260922 --output {:?}",
+            config.model_path,
+            initial_model_path.display().to_string(),
+            eval_midgame_pool,
+            arena_output.display().to_string(),
+        )
+        .unwrap();
+        writeln!(
+            evaluate_script,
+            "& .\\target\\fast\\chineseai.exe pikafish-label-eval {:?} {:?} --simulations 64 --limit 1000 --threads 16 --seed 20260922 --output {:?}",
+            config.model_path,
+            base.pikafish_label_eval_sqlite,
+            label_output.display().to_string(),
+        )
+        .unwrap();
+    }
+    fs::write(output.join("manifest.tsv"), manifest).unwrap();
+    fs::write(output.join("run.ps1"), script).unwrap();
+    fs::write(output.join("evaluate.ps1"), evaluate_script).unwrap();
+    println!(
+        "created {} isolated runs in {} ({} variants x {} paired seeds, target_update={})",
+        configs.len(),
+        output.display(),
+        3,
+        args.seeds.len(),
+        args.target_update.max(1)
+    );
+    println!(
+        "run      : powershell -File {}",
+        output.join("run.ps1").display()
+    );
+}
+
+fn run_pool_bootstrap(args: AzPoolBootstrapArgs) {
+    let target = args.count.max(1);
+    let opening_path = Path::new(&args.opening_output);
+    let midgame_path = Path::new(&args.midgame_output);
+    let mut opening_pool = if opening_path.exists() {
+        AzMidgamePool::load_lz4(opening_path, target).unwrap_or_else(|err| {
+            panic!(
+                "failed to resume opening pool `{}`: {err}",
+                opening_path.display()
+            )
+        })
+    } else {
+        AzMidgamePool::new(target)
+    };
+    let mut midgame_pool = if midgame_path.exists() {
+        AzMidgamePool::load_lz4(midgame_path, target).unwrap_or_else(|err| {
+            panic!(
+                "failed to resume midgame pool `{}`: {err}",
+                midgame_path.display()
+            )
+        })
+    } else {
+        AzMidgamePool::new(target)
+    };
+    if opening_pool.len() >= target && midgame_pool.len() >= target {
+        println!(
+            "pool-bootstrap: already complete opening={}/{} midgame={}/{}",
+            opening_pool.len(),
+            target,
+            midgame_pool.len(),
+            target
+        );
+        return;
+    }
+
+    let model = AzNnue::load(&args.model)
+        .unwrap_or_else(|err| panic!("failed to load bootstrap model `{}`: {err}", args.model));
+    let workers = if args.workers == 0 {
+        num_cpus::get_physical()
+    } else {
+        args.workers
+    }
+    .max(1);
+    let base = AzLoopFileConfig::default();
+    let started = Instant::now();
+    let mut batch = 0u64;
+    let mut stalled_batches = 0usize;
+    while opening_pool.len() < target || midgame_pool.len() < target {
+        let seed = args.seed ^ batch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut config = build_az_loop_config(&base, seed, workers, 0, &Arc::default());
+        config.games = workers.saturating_mul(2);
+        config.simulations = args.simulations.max(1);
+        config.max_plies = args.max_plies.max(140);
+        config.opening_start_fraction = 0.0;
+        config.midgame_start_fraction = 0.0;
+        config.mirror_probability = 0.0;
+        let mut data = generate_selfplay_data(&model, &config);
+        let completed_games = data.red_wins + data.black_wins + data.draws;
+        let avg_plies = data.plies_total as f32 / completed_games.max(1) as f32;
+        let avg_simulations = data.search_simulations.simulations_sum as f32
+            / data.search_simulations.searches.max(1) as f32;
+        let opening_added = if opening_pool.len() < target {
+            opening_pool.add_snapshots(
+                std::mem::take(&mut data.opening_snapshots),
+                seed ^ 0xA076_1D64_78BD_642F,
+            )
+        } else {
+            0
+        };
+        let midgame_added = if midgame_pool.len() < target {
+            midgame_pool.add_snapshots(
+                std::mem::take(&mut data.midgame_snapshots),
+                seed ^ 0xE703_7ED1_A0B4_28DB,
+            )
+        } else {
+            0
+        };
+        opening_pool
+            .save_lz4(opening_path)
+            .unwrap_or_else(|err| panic!("failed to save `{}`: {err}", opening_path.display()));
+        midgame_pool
+            .save_lz4(midgame_path)
+            .unwrap_or_else(|err| panic!("failed to save `{}`: {err}", midgame_path.display()));
+        batch += 1;
+        println!(
+            "pool-bootstrap: batch={} games={} avg_plies={:.1} avg_sims={:.1} added={}/{} opening={}/{} midgame={}/{} elapsed={:.1}s",
+            batch,
+            completed_games,
+            avg_plies,
+            avg_simulations,
+            opening_added,
+            midgame_added,
+            opening_pool.len(),
+            target,
+            midgame_pool.len(),
+            target,
+            started.elapsed().as_secs_f32()
+        );
+        stalled_batches = if opening_added == 0 && midgame_added == 0 {
+            stalled_batches + 1
+        } else {
+            0
+        };
+        assert!(
+            stalled_batches < 10,
+            "pool bootstrap made no progress for 10 batches"
+        );
+    }
 }
 
 fn learning_rate_for_update(config: &AzLoopFileConfig, update: usize) -> f32 {
@@ -983,6 +1530,7 @@ struct TrainBatchSourceStats {
     policy_target_top1: f32,
     policy_target_top2: f32,
     start_source_rate: [f32; 3],
+    sparse_activation: AzSparseActivationStats,
 }
 
 impl PendingTrainingData {
@@ -1010,6 +1558,8 @@ fn build_az_loop_config(
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
+        restart_temperature_start: config.restart_temperature_start,
+        restart_temperature_decay_plies: config.restart_temperature_decay_plies,
         cpuct: config.cpuct,
         cpuct_at_root: config.cpuct_at_root,
         cpuct_base: config.cpuct_base,
@@ -1087,6 +1637,22 @@ fn build_async_training_report(
     };
     let phase_value = stats.phase_value.map(value_report);
     let source_phase_value = stats.source_phase_value.map(value_report);
+    let start_source_rate = pending
+        .selfplay
+        .start_games
+        .map(|count| count as f32 / selfplay_games.max(1) as f32);
+    let start_phase_ply = std::array::from_fn(|source| {
+        pending.selfplay.start_phase_ply_sum[source] as f32
+            / pending.selfplay.start_games[source].max(1) as f32
+    });
+    let start_age = std::array::from_fn(|source| {
+        pending.selfplay.start_age_sum[source] as f32
+            / pending.selfplay.start_games[source].max(1) as f32
+    });
+    let start_temperature = std::array::from_fn(|source| {
+        pending.selfplay.start_temperature_sum[source]
+            / pending.selfplay.start_games[source].max(1) as f32
+    });
     AzLoopReport {
         games: selfplay_games,
         samples: selfplay_samples,
@@ -1100,6 +1666,11 @@ fn build_async_training_report(
         } else {
             pending.selfplay.plies_total as f32 / selfplay_games as f32
         },
+        selfplay_start_source_rate: start_source_rate,
+        selfplay_start_phase_ply: start_phase_ply,
+        selfplay_start_age: start_age,
+        selfplay_start_age_max: pending.selfplay.start_age_max,
+        selfplay_start_temperature: start_temperature,
         loss: stats.loss,
         learning_rate,
         value_loss: stats.value_loss,
@@ -1168,6 +1739,7 @@ fn build_async_training_report(
         train_start_source_rate: train_source.start_source_rate,
         train_policy_target_top1: train_source.policy_target_top1,
         train_policy_target_top2: train_source.policy_target_top2,
+        train_sparse_activation: train_source.sparse_activation,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_checkmate: pending.selfplay.terminal.checkmate,
         terminal_stalemate: pending.selfplay.terminal.stalemate,
@@ -1252,6 +1824,7 @@ fn train_batch_source_stats(
         target_top2_sum += top[0] + top[1];
     }
     let denom = samples.len() as f32;
+    let sparse_activation = sparse_activation_stats(samples, 4096);
     TrainBatchSourceStats {
         fast_sample_rate: fast as f32 / denom,
         policy_weight_mean: policy_weight_sum / denom,
@@ -1262,13 +1835,14 @@ fn train_batch_source_stats(
         policy_target_top1: target_top1_sum / denom,
         policy_target_top2: target_top2_sum / denom,
         start_source_rate: start_source_count.map(|count| count as f32 / denom),
+        sparse_activation,
     }
 }
 
 struct ArenaThreadConfig {
     candidate: Arc<AzNnue>,
     baseline: Arc<AzNnue>,
-    eval_positions: Arc<Vec<Position>>,
+    eval_starts: ArenaStarts,
     simulations: usize,
     max_plies: usize,
     rule60_max_ply: Option<u16>,
@@ -1286,11 +1860,26 @@ struct ArenaThreadConfig {
     seed: u64,
 }
 
+#[derive(Clone)]
+enum ArenaStarts {
+    Positions(Arc<Vec<Position>>),
+    Snapshots(Arc<Vec<chineseai::az::AzStartSnapshot>>),
+}
+
+impl ArenaStarts {
+    fn len(&self) -> usize {
+        match self {
+            Self::Positions(positions) => positions.len(),
+            Self::Snapshots(snapshots) => snapshots.len(),
+        }
+    }
+}
+
 fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
-    let games_per_side = if config.eval_positions.is_empty() {
+    let games_per_side = if config.eval_starts.len() == 0 {
         1
     } else {
-        config.eval_positions.len().max(1)
+        config.eval_starts.len().max(1)
     };
     let thread_count = config.thread_count.max(1).min(games_per_side);
     let mut handles = Vec::with_capacity(thread_count);
@@ -1304,7 +1893,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         }
         let candidate = Arc::clone(&config.candidate);
         let baseline = Arc::clone(&config.baseline);
-        let eval_positions = Arc::clone(&config.eval_positions);
+        let eval_starts = config.eval_starts.clone();
         let simulations = config.simulations;
         let max_plies = config.max_plies;
         let rule60_max_ply = config.rule60_max_ply;
@@ -1323,30 +1912,39 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let thread_start_index = start_index;
         start_index += red_games;
         handles.push(thread::spawn(move || {
-            play_arena_games_from_positions(
-                candidate.as_ref(),
-                baseline.as_ref(),
-                eval_positions.as_slice(),
-                AzArenaConfig {
-                    simulations,
-                    max_plies,
-                    rule60_max_ply,
-                    games_as_red: red_games,
-                    games_as_black: black_games,
-                    start_index: thread_start_index,
-                    seed,
-                    cpuct,
-                    cpuct_at_root,
-                    cpuct_base,
-                    cpuct_factor,
-                    cpuct_base_at_root,
-                    cpuct_factor_at_root,
-                    fpu_value,
-                    fpu_value_at_root,
-                    draw_score,
-                    policy_softmax_temp,
-                },
-            )
+            let arena_config = AzArenaConfig {
+                simulations,
+                max_plies,
+                rule60_max_ply,
+                games_as_red: red_games,
+                games_as_black: black_games,
+                start_index: thread_start_index,
+                seed,
+                cpuct,
+                cpuct_at_root,
+                cpuct_base,
+                cpuct_factor,
+                cpuct_base_at_root,
+                cpuct_factor_at_root,
+                fpu_value,
+                fpu_value_at_root,
+                draw_score,
+                policy_softmax_temp,
+            };
+            match eval_starts {
+                ArenaStarts::Positions(positions) => play_arena_games_from_positions(
+                    candidate.as_ref(),
+                    baseline.as_ref(),
+                    positions.as_slice(),
+                    arena_config,
+                ),
+                ArenaStarts::Snapshots(snapshots) => play_arena_games_from_snapshots(
+                    candidate.as_ref(),
+                    baseline.as_ref(),
+                    snapshots.as_slice(),
+                    arena_config,
+                ),
+            }
         }));
     }
 
@@ -1359,6 +1957,131 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         );
     }
     merged
+}
+
+fn run_arena_suite(args: AzArenaSuiteArgs) {
+    let candidate = Arc::new(
+        AzNnue::load(&args.candidate)
+            .unwrap_or_else(|err| panic!("failed to load candidate `{}`: {err}", args.candidate)),
+    );
+    let baseline = Arc::new(
+        AzNnue::load(&args.baseline)
+            .unwrap_or_else(|err| panic!("failed to load baseline `{}`: {err}", args.baseline)),
+    );
+    assert_eq!(
+        candidate.arch, baseline.arch,
+        "arena models must use the same architecture"
+    );
+    let count = args.positions.max(1);
+    let threads = if args.threads == 0 {
+        num_cpus::get_physical()
+    } else {
+        args.threads
+    }
+    .max(1);
+    // Search is deterministic, so repeating startpos would duplicate the same color-swapped
+    // pair and manufacture confidence without adding any independent evidence.
+    let startpos = ArenaStarts::Positions(Arc::new(vec![Position::startpos()]));
+    let book = ObkBook::load(&args.opening_book)
+        .unwrap_or_else(|err| panic!("failed to load opening book `{}`: {err}", args.opening_book));
+    let mut rng = SplitMix64::new(args.seed ^ 0xA076_1D64_78BD_642F);
+    let openings = (0..count)
+        .map(|_| book.random_prefix_position(8, 12, &mut rng))
+        .collect::<Vec<_>>();
+    let pool = AzMidgamePool::load_lz4(Path::new(&args.midgame_pool), count)
+        .unwrap_or_else(|err| panic!("failed to load midgame pool `{}`: {err}", args.midgame_pool));
+    assert!(
+        pool.len() >= count,
+        "midgame pool has {} snapshots but {} are required",
+        pool.len(),
+        count
+    );
+    let midgames = pool.sample(count, &mut rng);
+    let suites = [
+        ("startpos", startpos),
+        ("opening", ArenaStarts::Positions(Arc::new(openings))),
+        ("midgame", ArenaStarts::Snapshots(Arc::new(midgames))),
+    ];
+    let mut rows = String::from(
+        "suite\tpaired_positions\tgames\twins\tdraws\tlosses\tscore_rate\telo\telo_low\telo_high\tseconds\tgames_per_second\tcandidate\tbaseline\n",
+    );
+    let mut total = AzArenaReport::default();
+    for (suite_index, (name, starts)) in suites.into_iter().enumerate() {
+        let started = Instant::now();
+        let report = run_arena_threads(ArenaThreadConfig {
+            candidate: Arc::clone(&candidate),
+            baseline: Arc::clone(&baseline),
+            eval_starts: starts,
+            simulations: args.simulations.max(1),
+            max_plies: args.max_plies.max(1),
+            rule60_max_ply: Some(120),
+            cpuct: 1.2,
+            cpuct_at_root: 2.0,
+            cpuct_base: 19652.0,
+            cpuct_factor: 1.5,
+            cpuct_base_at_root: 19652.0,
+            cpuct_factor_at_root: 1.5,
+            fpu_value: 0.15,
+            fpu_value_at_root: 0.05,
+            draw_score: 0.0,
+            policy_softmax_temp: 1.45,
+            thread_count: threads,
+            seed: args.seed ^ (suite_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        });
+        let seconds = started.elapsed().as_secs_f32();
+        let (elo_low, elo_high) = report.elo_diff_bounds(1.96);
+        use std::fmt::Write as _;
+        writeln!(
+            rows,
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.2}\t{:.2}\t{:.2}\t{:.3}\t{:.3}\t{}\t{}",
+            report.paired_openings,
+            report.total_games(),
+            report.wins,
+            report.draws,
+            report.losses,
+            report.score_rate(),
+            report.elo_diff_vs_even(),
+            elo_low,
+            elo_high,
+            seconds,
+            report.total_games() as f32 / seconds.max(1.0e-6),
+            args.candidate,
+            args.baseline,
+        )
+        .unwrap();
+        println!(
+            "arena-suite: {name} W/D/L={}/{}/{} score={:.3} elo={:+.1} [{:+.1},{:+.1}] seconds={:.1}",
+            report.wins,
+            report.draws,
+            report.losses,
+            report.score_rate(),
+            report.elo_diff_vs_even(),
+            elo_low,
+            elo_high,
+            seconds
+        );
+        total.add_assign(&report);
+    }
+    if let Some(parent) = Path::new(&args.output)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&args.output, rows)
+        .unwrap_or_else(|err| panic!("failed to write arena suite `{}`: {err}", args.output));
+    let (elo_low, elo_high) = total.elo_diff_bounds(1.96);
+    println!(
+        "arena-suite: combined W/D/L={}/{}/{} score={:.3} elo={:+.1} [{:+.1},{:+.1}] output={}",
+        total.wins,
+        total.draws,
+        total.losses,
+        total.score_rate(),
+        total.elo_diff_vs_even(),
+        elo_low,
+        elo_high,
+        args.output
+    );
 }
 
 fn build_arena_start_positions(
@@ -1554,9 +2277,211 @@ fn main() {
                 "aznnue   : initialized (safetensors, format v{})",
                 chineseai::version::MODEL_FORMAT_VERSION
             );
-            println!("arch     : hidden={}", arch.hidden_size,);
+            println!(
+                "arch     : hidden={} residual_rank={} policy_interaction_rank={} policy_context_extra_rank={} value_extra_rank={}",
+                arch.hidden_size,
+                arch.residual_rank,
+                arch.policy_interaction_rank,
+                arch.policy_context_extra_rank,
+                arch.value_extra_rank
+            );
             println!("seed     : {seed}");
             println!("output   : {output}");
+        }
+        Some(CliCommand::AzResidualUpgrade(cmd)) => {
+            let mut model = AzNnue::load(&cmd.input)
+                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
+            let position = Position::startpos();
+            let moves = position.legal_moves();
+            let before = model.evaluate_value(&position, &moves);
+            model
+                .enable_trunk_residual(cmd.rank, cmd.seed)
+                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
+            let after = model.evaluate_value(&position, &moves);
+            assert_eq!(
+                before.to_bits(),
+                after.to_bits(),
+                "residual upgrade changed the start-position output"
+            );
+            model
+                .save(&cmd.output)
+                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
+            println!("input    : {}", cmd.input);
+            println!("output   : {}", cmd.output);
+            println!(
+                "arch     : hidden={} residual_rank={}",
+                model.arch.hidden_size, cmd.rank
+            );
+            println!("warmstart: exact-output verified");
+        }
+        Some(CliCommand::AzPolicyInteractionUpgrade(cmd)) => {
+            let mut model = AzNnue::load(&cmd.input)
+                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
+            let position = Position::startpos();
+            let moves = position.legal_moves();
+            let before = model.clone();
+            let before_value = before.evaluate_value(&position, &moves);
+            model
+                .enable_policy_interaction(cmd.rank, cmd.seed)
+                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
+            let after_value = model.evaluate_value(&position, &moves);
+            assert_eq!(
+                before_value.to_bits(),
+                after_value.to_bits(),
+                "policy interaction upgrade changed the start-position value"
+            );
+            let limits = fixed_az_search_limits(1, 20260922, 1.2, 2.0, 0, 1.45);
+            let before_search = alphazero_search(&position, &before, limits);
+            let after_search = alphazero_search(&position, &model, limits);
+            assert_eq!(
+                before_search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior.to_bits())
+                    .collect::<Vec<_>>(),
+                after_search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior.to_bits())
+                    .collect::<Vec<_>>(),
+                "policy interaction upgrade changed the start-position policy"
+            );
+            model
+                .save(&cmd.output)
+                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
+            println!("input    : {}", cmd.input);
+            println!("output   : {}", cmd.output);
+            println!(
+                "arch     : hidden={} residual_rank={} policy_interaction_rank={}",
+                model.arch.hidden_size, model.arch.residual_rank, cmd.rank
+            );
+            println!("warmstart: exact value and policy verified");
+        }
+        Some(CliCommand::AzPolicyContextUpgrade(cmd)) => {
+            let mut model = AzNnue::load(&cmd.input)
+                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
+            let position = Position::startpos();
+            let moves = position.legal_moves();
+            let before = model.clone();
+            let before_value = before.evaluate_value(&position, &moves);
+            model
+                .enable_policy_context_extra(cmd.rank, cmd.seed)
+                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
+            let after_value = model.evaluate_value(&position, &moves);
+            assert_eq!(before_value.to_bits(), after_value.to_bits());
+            let limits = fixed_az_search_limits(1, 20260922, 1.2, 2.0, 0, 1.45);
+            let before_search = alphazero_search(&position, &before, limits);
+            let after_search = alphazero_search(&position, &model, limits);
+            assert_eq!(
+                before_search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior.to_bits())
+                    .collect::<Vec<_>>(),
+                after_search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            model
+                .save(&cmd.output)
+                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
+            println!("input    : {}", cmd.input);
+            println!("output   : {}", cmd.output);
+            println!(
+                "arch     : hidden={} residual_rank={} policy_context_extra_rank={}",
+                model.arch.hidden_size, model.arch.residual_rank, cmd.rank
+            );
+            println!("warmstart: exact value and policy verified");
+        }
+        Some(CliCommand::AzValueHeadUpgrade(cmd)) => {
+            let mut model = AzNnue::load(&cmd.input)
+                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
+            let position = Position::startpos();
+            let moves = position.legal_moves();
+            let before = model.clone();
+            let before_value = before.evaluate_value(&position, &moves);
+            model
+                .enable_value_extra(cmd.rank, cmd.seed)
+                .unwrap_or_else(|err| panic!("failed to upgrade `{}`: {err}", cmd.input));
+            let after_value = model.evaluate_value(&position, &moves);
+            assert_eq!(before_value.to_bits(), after_value.to_bits());
+            let limits = fixed_az_search_limits(1, 20260922, 1.2, 2.0, 0, 1.45);
+            let before_search = alphazero_search(&position, &before, limits);
+            let after_search = alphazero_search(&position, &model, limits);
+            assert_eq!(
+                before_search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior.to_bits())
+                    .collect::<Vec<_>>(),
+                after_search
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_prior.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            model
+                .save(&cmd.output)
+                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
+            println!("input    : {}", cmd.input);
+            println!("output   : {}", cmd.output);
+            println!(
+                "arch     : hidden={} residual_rank={} value_extra_rank={}",
+                model.arch.hidden_size, model.arch.residual_rank, cmd.rank
+            );
+            println!("warmstart: exact value and policy verified");
+        }
+        Some(CliCommand::AzPolicyScale(cmd)) => {
+            assert!(
+                cmd.scale.is_finite() && cmd.scale >= 0.0,
+                "policy exact scale must be finite and non-negative"
+            );
+            let mut model = AzNnue::load(&cmd.input)
+                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
+            let sparse_len = model.policy_sparse_table.len();
+            let weights: &mut [f32] = match cmd.component {
+                PolicyComponent::Exact => &mut model.policy_sparse_table[..POLICY_SPARSE_MAIN_SIZE],
+                PolicyComponent::Capture => {
+                    &mut model.policy_sparse_table[POLICY_SPARSE_MAIN_SIZE..sparse_len - 1]
+                }
+                PolicyComponent::Factor => &mut model.policy_sparse_factor,
+                PolicyComponent::Tactical => &mut model.policy_tactical,
+                PolicyComponent::TacticalExact => {
+                    &mut model.policy_tactical[..POLICY_TACTICAL_EXACT_SIZE]
+                }
+                PolicyComponent::TacticalFactor => {
+                    &mut model.policy_tactical[POLICY_TACTICAL_EXACT_SIZE..]
+                }
+                PolicyComponent::Accumulator => &mut model.policy_accumulator_move,
+                PolicyComponent::Context => &mut model.policy_move_context,
+                PolicyComponent::Consequence => &mut model.policy_consequence_output,
+                PolicyComponent::MoveBias => &mut model.policy_move_bias,
+                PolicyComponent::ThreatContext => &mut model.policy_threat_context,
+            };
+            let (rows, nonzero, before_l2) = {
+                let nonzero = weights.iter().filter(|&&weight| weight != 0.0).count();
+                let before_l2 = weights
+                    .iter()
+                    .map(|&weight| f64::from(weight) * f64::from(weight))
+                    .sum::<f64>()
+                    .sqrt();
+                for weight in weights.iter_mut() {
+                    *weight *= cmd.scale;
+                }
+                (weights.len(), nonzero, before_l2)
+            };
+            let after_l2 = before_l2 * f64::from(cmd.scale);
+            model
+                .save(&cmd.output)
+                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
+            println!("input    : {}", cmd.input);
+            println!("output   : {}", cmd.output);
+            println!("component: {:?}", cmd.component);
+            println!("scale    : {}", cmd.scale);
+            println!("weights  : rows={} nonzero={}", rows, nonzero);
+            println!("l2       : {:.6} -> {:.6}", before_l2, after_l2);
         }
         Some(CliCommand::AzSearch(cmd)) => {
             let model_path = cmd.model;
@@ -1828,6 +2753,14 @@ fn main() {
             let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
             println!("bench        : fixed-search");
             println!("model        : {model_path}");
+            println!(
+                "arch         : hidden={} residual_rank={} policy_interaction_rank={} policy_context_extra_rank={} value_extra_rank={}",
+                model.arch.hidden_size,
+                model.arch.residual_rank,
+                model.arch.policy_interaction_rank,
+                model.arch.policy_context_extra_rank,
+                model.arch.value_extra_rank
+            );
             println!("fen          : {}", position.to_fen());
             println!("sims/search  : {simulations}");
             println!("repeat       : {repeat}");
@@ -1958,6 +2891,9 @@ fn main() {
                 );
             }
         }
+        Some(CliCommand::AzReplayCoverage(cmd)) => {
+            run_replay_coverage(cmd).expect("replay coverage audit failed");
+        }
         Some(CliCommand::AzReplayFit(cmd)) => {
             let capacity = cmd.samples.max(2);
             let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), capacity)
@@ -1979,8 +2915,20 @@ fn main() {
                     validation.extend(group);
                 }
             }
-            let arch = chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1));
-            let mut model = AzNnue::random_with_arch(arch, cmd.seed);
+            let mut model = cmd.initial_model.as_ref().map_or_else(
+                || {
+                    AzNnue::random_with_arch(
+                        chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1)),
+                        cmd.seed,
+                    )
+                },
+                |path| {
+                    AzNnue::load(path).unwrap_or_else(|err| {
+                        panic!("failed to load initial model `{path}`: {err}")
+                    })
+                },
+            );
+            let arch = model.arch;
             let weights = AzTrainLossWeights::default();
             let mut eval_rng = SplitMix64::new(cmd.seed ^ 0xD1B5_4A32_D192_ED03);
             let baseline = train_samples_weighted(
@@ -2027,7 +2975,14 @@ fn main() {
             });
             println!("replay-fit : {}", cmd.replay);
             println!("window     : {:?}", window);
-            println!("arch       : hidden={}", arch.hidden_size);
+            println!(
+                "arch       : hidden={} residual_rank={} policy_interaction_rank={} policy_context_extra_rank={} value_extra_rank={}",
+                arch.hidden_size,
+                arch.residual_rank,
+                arch.policy_interaction_rank,
+                arch.policy_context_extra_rank,
+                arch.value_extra_rank
+            );
             println!(
                 "split      : train={} validation={} games={}",
                 train.len(),
@@ -2050,6 +3005,9 @@ fn main() {
             println!("no-delta   : {ablated_groups:?}");
             println!("output     : {}", cmd.output);
         }
+        Some(CliCommand::AzSamplingAblation(cmd)) => write_sampling_ablation_plan(cmd),
+        Some(CliCommand::AzPoolBootstrap(cmd)) => run_pool_bootstrap(cmd),
+        Some(CliCommand::AzArenaSuite(cmd)) => run_arena_suite(cmd),
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
@@ -2253,8 +3211,11 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=continuous search=alphazero sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous search=alphazero arch(hidden={},residual_rank={},policy_interaction_rank={}) sims={} value_td_lambda={} replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
+                config.hidden_size,
+                config.trunk_residual_rank,
+                config.policy_interaction_rank,
                 config.simulations,
                 config.value_td_lambda,
                 config.replay_recent_sample_fraction,
@@ -2328,17 +3289,22 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(total_concentration={},fraction={}) move_temp={}..{} policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} actor_publish={}",
+                "explore  : root_noise(total_concentration={},fraction={}) move_temp={}..{} restart_temp={}..{}({}ply) policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} pool_recent={:.0}%/{}gen actor_publish={}",
                 config.root_dirichlet_total_concentration,
                 config.root_exploration_fraction,
                 config.temperature_start,
                 config.temperature_endgame,
+                config.restart_temperature_start,
+                config.temperature_endgame,
+                config.restart_temperature_decay_plies,
                 config.policy_softmax_temp,
                 (1.0 - config.opening_start_fraction - config.midgame_start_fraction) * 100.0,
                 config.opening_start_fraction * 100.0,
                 config.midgame_start_fraction * 100.0,
                 config.opening_reservoir_capacity,
                 config.midgame_reservoir_capacity,
+                config.start_pool_recent_fraction * 100.0,
+                config.start_pool_recent_generations,
                 "every-update"
             );
             let cpu_placements = chineseai::cpu_topology::cpu_placements();
@@ -2446,12 +3412,24 @@ fn main() {
                         loop_config.opening_positions = selfplay_opening_pool
                             .read()
                             .unwrap_or_else(|_| panic!("opening pool poisoned"))
-                            .sample(loop_config.games, &mut pool_rng)
+                            .sample_recent_mixed(
+                                loop_config.games,
+                                selfplay_config.start_pool_recent_fraction,
+                                selfplay_config.start_pool_recent_generations,
+                                local_learner_update,
+                                &mut pool_rng,
+                            )
                             .into();
                         loop_config.midgame_positions = selfplay_midgame_pool
                             .read()
                             .unwrap_or_else(|_| panic!("midgame pool poisoned"))
-                            .sample(loop_config.games, &mut pool_rng)
+                            .sample_recent_mixed(
+                                loop_config.games,
+                                selfplay_config.start_pool_recent_fraction,
+                                selfplay_config.start_pool_recent_generations,
+                                local_learner_update,
+                                &mut pool_rng,
+                            )
                             .into();
                         let data = generate_selfplay_data(
                             local_model
@@ -2498,6 +3476,8 @@ fn main() {
                 let mut pending = PendingTrainingData::default();
                 let mut batch_index = 0usize;
                 let mut window_started = Instant::now();
+                let warmup_progress_step = (collector_warmup_missing / 10).clamp(10_000, 100_000);
+                let mut next_warmup_progress = warmup_progress_step;
                 while let Ok(mut batch) = selfplay_rx.recv() {
                     let opening_snapshots = std::mem::take(&mut batch.data.opening_snapshots);
                     if !opening_snapshots.is_empty() {
@@ -2522,6 +3502,22 @@ fn main() {
                     } else {
                         collector_config.selfplay_samples_per_update
                     };
+                    if batch_index == 0
+                        && collector_warmup_missing > 0
+                        && pending.selfplay.samples.len() >= next_warmup_progress
+                        && pending.selfplay.samples.len() < required_samples
+                    {
+                        println!(
+                            "warmup   : {}/{} samples ({:.1}%) elapsed={:.1}s",
+                            pending.selfplay.samples.len(),
+                            required_samples,
+                            100.0 * pending.selfplay.samples.len() as f32
+                                / required_samples.max(1) as f32,
+                            window_started.elapsed().as_secs_f32()
+                        );
+                        next_warmup_progress =
+                            next_warmup_progress.saturating_add(warmup_progress_step);
+                    }
                     if pending.selfplay.samples.len() < required_samples {
                         continue;
                     }
@@ -2944,6 +3940,39 @@ fn main() {
                             path.display()
                         ))
                 );
+                println!(
+                    "starts   {update:04}: rate(start/opening/mid)={:.3}/{:.3}/{:.3} phase={:.1}/{:.1}/{:.1} age_mean={:.1}/{:.1}/{:.1} age_max={}/{}/{} temp={:.3}/{:.3}/{:.3}",
+                    report.selfplay_start_source_rate[0],
+                    report.selfplay_start_source_rate[1],
+                    report.selfplay_start_source_rate[2],
+                    report.selfplay_start_phase_ply[0],
+                    report.selfplay_start_phase_ply[1],
+                    report.selfplay_start_phase_ply[2],
+                    report.selfplay_start_age[0],
+                    report.selfplay_start_age[1],
+                    report.selfplay_start_age[2],
+                    report.selfplay_start_age_max[0],
+                    report.selfplay_start_age_max[1],
+                    report.selfplay_start_age_max[2],
+                    report.selfplay_start_temperature[0],
+                    report.selfplay_start_temperature[1],
+                    report.selfplay_start_temperature[2],
+                );
+                let sparse = report.train_sparse_activation;
+                println!(
+                    "sparse   {update:04}: subset={}/{} moves={} coverage(value/exact/factor/tactical)={:.6}/{:.6}/{:.6}/{:.6} unique={}/{}/{}/{}",
+                    sparse.inspected_samples,
+                    report.train_samples,
+                    sparse.inspected_policy_moves,
+                    sparse.value_threat_coverage,
+                    sparse.policy_exact_coverage,
+                    sparse.policy_factor_coverage,
+                    sparse.policy_tactical_coverage,
+                    sparse.value_threat_unique,
+                    sparse.policy_exact_unique,
+                    sparse.policy_factor_unique,
+                    sparse.policy_tactical_unique,
+                );
                 let source_phase =
                     |source: usize, phase: usize| report.source_phase_value[source * 3 + phase];
                 println!(
@@ -3101,6 +4130,26 @@ fn main() {
                     update,
                     report.train_policy_target_top2,
                 );
+                for (name, value) in [
+                    ("value_threat_coverage", sparse.value_threat_coverage),
+                    ("policy_exact_coverage", sparse.policy_exact_coverage),
+                    ("policy_factor_coverage", sparse.policy_factor_coverage),
+                    ("policy_tactical_coverage", sparse.policy_tactical_coverage),
+                    ("value_threat_unique", sparse.value_threat_unique as f32),
+                    ("policy_exact_unique", sparse.policy_exact_unique as f32),
+                    ("policy_factor_unique", sparse.policy_factor_unique as f32),
+                    (
+                        "policy_tactical_unique",
+                        sparse.policy_tactical_unique as f32,
+                    ),
+                    ("inspected_samples", sparse.inspected_samples as f32),
+                    (
+                        "inspected_policy_moves",
+                        sparse.inspected_policy_moves as f32,
+                    ),
+                ] {
+                    log_scalar(&mut tb, &format!("train_sparse/{name}"), update, value);
+                }
                 log_scalar(&mut tb, "train/lr", update, report.learning_rate);
                 log_scalar(
                     &mut tb,
@@ -3207,6 +4256,41 @@ fn main() {
                     report.replay_recent_window_fraction,
                 );
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
+                for (source, source_name) in ["startpos", "opening_pool", "midgame"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    log_scalar(
+                        &mut tb,
+                        &format!("selfplay_start/{source_name}_rate"),
+                        update,
+                        report.selfplay_start_source_rate[source],
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("selfplay_start/{source_name}_phase_ply"),
+                        update,
+                        report.selfplay_start_phase_ply[source],
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("selfplay_start/{source_name}_age_mean"),
+                        update,
+                        report.selfplay_start_age[source],
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("selfplay_start/{source_name}_age_max"),
+                        update,
+                        report.selfplay_start_age_max[source] as f32,
+                    );
+                    log_scalar(
+                        &mut tb,
+                        &format!("selfplay_start/{source_name}_temperature"),
+                        update,
+                        report.selfplay_start_temperature[source],
+                    );
+                }
                 log_scalar(
                     &mut tb,
                     "selfplay/visit_policy_entropy",
@@ -3484,7 +4568,7 @@ fn main() {
                                 run_arena_threads(ArenaThreadConfig {
                                     candidate: Arc::clone(&candidate),
                                     baseline,
-                                    eval_positions: Arc::new(positions),
+                                    eval_starts: ArenaStarts::Positions(Arc::new(positions)),
                                     simulations: config.arena_simulations,
                                     max_plies: config.max_plies,
                                     rule60_max_ply: config
@@ -4254,7 +5338,7 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
             let report = run_arena_threads(ArenaThreadConfig {
                 candidate: Arc::clone(&models[newer]),
                 baseline: Arc::clone(&models[older]),
-                eval_positions: Arc::clone(&positions),
+                eval_starts: ArenaStarts::Positions(Arc::clone(&positions)),
                 simulations: cmd.simulations.max(1),
                 max_plies: cmd.max_plies.max(1),
                 rule60_max_ply: Some(120),
@@ -4362,12 +5446,13 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
     if regressions == 0 {
         println!("  none");
     }
+    let elapsed = started.elapsed().as_secs_f32();
     println!(
         "\nSUMMARY models={} cycles={} regressions={} elapsed={:.1}s",
         models.len(),
         cycles,
         regressions,
-        started.elapsed().as_secs_f32()
+        elapsed
     );
     Ok(())
 }
@@ -4510,6 +5595,18 @@ impl LabelEvalStats {
         }
     }
 
+    fn raw_value_calibration(&self) -> f64 {
+        let n = self.raw_value_pairs as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+        let cov =
+            self.raw_value_target_cross_sum - self.raw_value_q_sum * self.raw_target_q_sum / n;
+        let prediction_variance =
+            self.raw_value_q_sq_sum - self.raw_value_q_sum * self.raw_value_q_sum / n;
+        cov / prediction_variance.max(1.0e-12)
+    }
+
     fn value_corr(&self) -> f64 {
         let n = self.value_count() as f64;
         if n <= 1.0 {
@@ -4524,6 +5621,206 @@ impl LabelEvalStats {
             cov / (left * right).sqrt()
         }
     }
+
+    fn value_calibration(&self) -> f64 {
+        let n = self.value_count() as f64;
+        if n <= 1.0 {
+            return 0.0;
+        }
+        let cov = self.value_target_cross_sum - self.value_q_sum * self.target_q_sum / n;
+        let prediction_variance = self.value_q_sq_sum - self.value_q_sum * self.value_q_sum / n;
+        cov / prediction_variance.max(1.0e-12)
+    }
+}
+
+fn replay_position_signature(features: &[usize]) -> u128 {
+    let mut left = 0xcbf2_9ce4_8422_2325u64;
+    let mut right = 0x9e37_79b9_7f4a_7c15u64;
+    for &feature in features {
+        let value = feature as u64 + 1;
+        left ^= value;
+        left = left.wrapping_mul(0x1000_0000_01b3);
+        right ^= value.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        right = right.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    (u128::from(left) << 64) | u128::from(right)
+}
+
+fn run_replay_coverage(cmd: AzReplayCoverageArgs) -> io::Result<()> {
+    let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), cmd.samples.max(1))?;
+    let samples = pool.all_samples();
+    let mut coverage = HashMap::<u128, u32>::with_capacity(samples.len());
+    let mut pair_coverage = vec![0u32; AZ_NNUE_INPUT_SIZE * AZ_NNUE_INPUT_SIZE];
+    for sample in &samples {
+        *coverage
+            .entry(replay_position_signature(&sample.features))
+            .or_default() += 1;
+        for (offset, &left) in sample.features.iter().enumerate() {
+            for &right in &sample.features[offset + 1..] {
+                let index = left * AZ_NNUE_INPUT_SIZE + right;
+                pair_coverage[index] = pair_coverage[index].saturating_add(1);
+            }
+        }
+    }
+    let model = Arc::new(AzNnue::load(&cmd.model)?);
+    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
+    let rows = load_pikafish_label_rows(&conn, cmd.limit, cmd.seed).map_err(sqlite_io_error)?;
+    let mut buckets: [Vec<PikafishLabelRow>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut piece_sums = [0usize; 4];
+    let mut rule60_sums = [0usize; 4];
+    let mut structural_by_piece_count: [Vec<(PikafishLabelRow, f64)>; 33] =
+        std::array::from_fn(|_| Vec::new());
+    for row in rows {
+        let position = Position::from_fen(&row.fen).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid label FEN id={}: {err}", row.id),
+            )
+        })?;
+        let features = extract_sparse_features_az(&position);
+        let mut pair_log_sum = 0.0;
+        let mut pair_count = 0usize;
+        for (offset, &left) in features.iter().enumerate() {
+            for &right in &features[offset + 1..] {
+                pair_log_sum += f64::from(pair_coverage[left * AZ_NNUE_INPUT_SIZE + right]).ln_1p();
+                pair_count += 1;
+            }
+        }
+        let structural_score = pair_log_sum / pair_count.max(1) as f64;
+        let count = coverage
+            .get(&replay_position_signature(&features))
+            .copied()
+            .unwrap_or(0);
+        let bucket = match count {
+            0 => 0,
+            1..=2 => 1,
+            3..=9 => 2,
+            _ => 3,
+        };
+        piece_sums[bucket] += features.len();
+        rule60_sums[bucket] += usize::from(position.halfmove_clock());
+        structural_by_piece_count[features.len().min(32)].push((row.clone(), structural_score));
+        buckets[bucket].push(row);
+    }
+
+    let mut structural_buckets: [Vec<PikafishLabelRow>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut structural_piece_sums = [0usize; 4];
+    let mut structural_score_sums = [0.0f64; 4];
+    for (piece_count, mut rows) in structural_by_piece_count.into_iter().enumerate() {
+        rows.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
+        let row_count = rows.len();
+        for (index, (row, score)) in rows.into_iter().enumerate() {
+            let quartile = (index * 4 / row_count.max(1)).min(3);
+            structural_piece_sums[quartile] += piece_count;
+            structural_score_sums[quartile] += score;
+            structural_buckets[quartile].push(row);
+        }
+    }
+
+    let limits = fixed_az_search_limits(cmd.simulations.max(1), cmd.seed, 1.2, 2.0, 0, 1.45);
+    let names = ["unseen", "seen-1-2", "seen-3-9", "seen-10+"];
+    let path = Path::new(&cmd.output);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = String::from(
+        "analysis\tbucket\tlabel_rows\tavg_pieces\tavg_rule60\tavg_pair_log_count\tevaluated\traw_top1\tsearch_top1\tsearch_top4\traw_value_mae\tsearch_value_mae\n",
+    );
+    println!(
+        "replay-coverage: replay={} samples={} unique_positions={} labels={} sims={}",
+        cmd.replay,
+        samples.len(),
+        coverage.len(),
+        buckets.iter().map(Vec::len).sum::<usize>(),
+        cmd.simulations.max(1)
+    );
+    for (bucket_index, (name, rows)) in names.into_iter().zip(buckets).enumerate() {
+        let row_count = rows.len();
+        let denominator = row_count.max(1) as f64;
+        let avg_pieces = piece_sums[bucket_index] as f64 / denominator;
+        let avg_rule60 = rule60_sums[bucket_index] as f64 / denominator;
+        let stats =
+            evaluate_pikafish_labels_parallel(Arc::clone(&model), rows, limits, cmd.threads)?;
+        println!(
+            "  {name}: rows={} avg_pieces={:.2} avg_rule60={:.2} evaluated={} raw_top1={:.2}% search_top1={:.2}% search_top4={:.2}% raw_value_mae={:.4} search_value_mae={:.4}",
+            row_count,
+            avg_pieces,
+            avg_rule60,
+            stats.count,
+            100.0 * stats.prior_top1_rate(),
+            100.0 * stats.top1_rate(),
+            100.0 * stats.top4_rate(),
+            stats.raw_value_mae_wdl_q(),
+            stats.value_mae_wdl_q(),
+        );
+        use std::fmt::Write as _;
+        writeln!(
+            output,
+            "exact\t{name}\t{}\t{:.6}\t{:.6}\t\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            row_count,
+            avg_pieces,
+            avg_rule60,
+            stats.count,
+            stats.prior_top1_rate(),
+            stats.top1_rate(),
+            stats.top4_rate(),
+            stats.raw_value_mae_wdl_q(),
+            stats.value_mae_wdl_q(),
+        )
+        .unwrap();
+    }
+    let structural_names = [
+        "least-covered",
+        "low-covered",
+        "high-covered",
+        "most-covered",
+    ];
+    println!("piece-count-matched structural coverage:");
+    for (bucket_index, (name, rows)) in structural_names
+        .into_iter()
+        .zip(structural_buckets)
+        .enumerate()
+    {
+        let row_count = rows.len();
+        let denominator = row_count.max(1) as f64;
+        let avg_pieces = structural_piece_sums[bucket_index] as f64 / denominator;
+        let avg_score = structural_score_sums[bucket_index] / denominator;
+        let stats =
+            evaluate_pikafish_labels_parallel(Arc::clone(&model), rows, limits, cmd.threads)?;
+        println!(
+            "  {name}: rows={} avg_pieces={:.2} avg_pair_log_count={:.3} evaluated={} raw_top1={:.2}% search_top1={:.2}% search_top4={:.2}% raw_value_mae={:.4} search_value_mae={:.4}",
+            row_count,
+            avg_pieces,
+            avg_score,
+            stats.count,
+            100.0 * stats.prior_top1_rate(),
+            100.0 * stats.top1_rate(),
+            100.0 * stats.top4_rate(),
+            stats.raw_value_mae_wdl_q(),
+            stats.value_mae_wdl_q(),
+        );
+        use std::fmt::Write as _;
+        writeln!(
+            output,
+            "structural\t{name}\t{}\t{:.6}\t\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            row_count,
+            avg_pieces,
+            avg_score,
+            stats.count,
+            stats.prior_top1_rate(),
+            stats.top1_rate(),
+            stats.top4_rate(),
+            stats.raw_value_mae_wdl_q(),
+            stats.value_mae_wdl_q(),
+        )
+        .unwrap();
+    }
+    fs::write(path, output)?;
+    println!("output: {}", path.display());
+    Ok(())
 }
 
 fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
@@ -4561,8 +5858,9 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         cmd.threads,
     )?;
 
+    let elapsed = started.elapsed().as_secs_f32();
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} cpuct={}/{} fpu={}/{} policy_temp={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} cpuct={}/{} fpu={}/{} policy_temp={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_cal={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_cal={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
@@ -4581,11 +5879,45 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         100.0 * stats.top8_rate(),
         100.0 * stats.prior_top1_rate(),
         stats.raw_value_corr(),
+        stats.raw_value_calibration(),
         stats.raw_value_mae_wdl_q(),
         stats.value_corr(),
+        stats.value_calibration(),
         stats.value_mae_wdl_q(),
-        started.elapsed().as_secs_f32()
+        elapsed
     );
+    if let Some(output) = &cmd.output {
+        let path = Path::new(output);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let header = "model\tsqlite\tevaluated\tlegal_labels\tvalue_labels\tsimulations\traw_prior_top1\traw_value_corr\traw_value_calibration\traw_value_mae\tsearch_top1\tsearch_top2\tsearch_top4\tsearch_top8\tsearch_value_corr\tsearch_value_calibration\tsearch_value_mae\telapsed_seconds\n";
+        let row = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.3}\n",
+            cmd.model,
+            cmd.sqlite,
+            stats.count,
+            stats.legal_bestmove,
+            stats.value_count(),
+            cmd.simulations.max(1),
+            stats.prior_top1_rate(),
+            stats.raw_value_corr(),
+            stats.raw_value_calibration(),
+            stats.raw_value_mae_wdl_q(),
+            stats.top1_rate(),
+            stats.top2_rate(),
+            stats.top4_rate(),
+            stats.top8_rate(),
+            stats.value_corr(),
+            stats.value_calibration(),
+            stats.value_mae_wdl_q(),
+            elapsed,
+        );
+        fs::write(path, format!("{header}{row}"))?;
+    }
     Ok(())
 }
 
@@ -5484,6 +6816,52 @@ mod reporting_tests {
         assert_eq!(args.policy_softmax_temp, 1.45);
     }
 
+    #[test]
+    fn sampling_ablation_uses_paired_seeds_and_isolated_artifacts() {
+        let base = AzLoopFileConfig::default();
+        let configs = sampling_ablation_configs(&base, Path::new("matrix"), &[11, 22, 33]);
+        assert_eq!(configs.len(), 9);
+        for (variant, start, midgame) in [
+            ("a-30-30-40", 0.30f32, 0.40f32),
+            ("b-20-30-50", 0.20f32, 0.50f32),
+            ("c-10-30-60", 0.10f32, 0.60f32),
+        ] {
+            let runs = configs
+                .iter()
+                .filter(|(name, _, _)| name.starts_with(variant))
+                .collect::<Vec<_>>();
+            assert_eq!(runs.len(), 3);
+            assert_eq!(
+                runs.iter().map(|run| run.2.seed).collect::<Vec<_>>(),
+                [11, 22, 33]
+            );
+            for (_, path, config) in runs {
+                assert!(
+                    (1.0 - config.opening_start_fraction - config.midgame_start_fraction - start)
+                        .abs()
+                        < 1.0e-6
+                );
+                assert!((config.midgame_start_fraction - midgame).abs() < 1.0e-6);
+                assert!(config.model_path.contains(variant));
+                assert!(config.opening_snapshot_path.contains(variant));
+                assert!(config.midgame_snapshot_path.contains(variant));
+                assert!(config.checkpoint_dir.contains(variant));
+                assert!(config.tensorboard_logdir.contains(variant));
+                assert!(path.ends_with("config.toml"));
+            }
+        }
+        assert_ne!(
+            tensorboard_encoded_subdir(&configs[0].2),
+            tensorboard_encoded_subdir(&configs[3].2)
+        );
+        let mut residual = configs[0].2.clone();
+        residual.trunk_residual_rank = 32;
+        assert_ne!(
+            tensorboard_encoded_subdir(&configs[0].2),
+            tensorboard_encoded_subdir(&residual)
+        );
+    }
+
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         AzTrainingSample {
             features: vec![0],
@@ -5565,6 +6943,17 @@ mod reporting_tests {
 
         assert_eq!(stats.value_count(), 1);
         assert!((stats.value_mae_wdl_q() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pikafish_value_calibration_reports_target_on_prediction_slope() {
+        let mut stats = LabelEvalStats::default();
+        for (prediction, target) in [(0.25, [750, 0, 250]), (-0.25, [250, 0, 750])] {
+            stats.push_raw_value_pair(prediction, target);
+            stats.push_value_pair(prediction, target);
+        }
+        assert!((stats.raw_value_calibration() - 2.0).abs() < 1e-9);
+        assert!((stats.value_calibration() - 2.0).abs() < 1e-9);
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub struct AzStartSnapshot {
 pub struct AzMidgamePool {
     capacity: usize,
     snapshots: Vec<AzStartSnapshot>,
-    hashes: HashSet<u64>,
+    identities: HashSet<u64>,
     seen: u64,
 }
 
@@ -38,7 +38,7 @@ impl AzMidgamePool {
         Self {
             capacity,
             snapshots: Vec::with_capacity(capacity.min(65_536)),
-            hashes: HashSet::with_capacity(capacity.min(65_536)),
+            identities: HashSet::with_capacity(capacity.min(65_536)),
             seen: 0,
         }
     }
@@ -64,13 +64,13 @@ impl AzMidgamePool {
             if self.capacity == 0 || !snapshot_is_consistent(&snapshot) {
                 continue;
             }
-            let hash = snapshot.position.hash();
-            if self.hashes.contains(&hash) {
+            let identity = snapshot_identity(&snapshot);
+            if self.identities.contains(&identity) {
                 continue;
             }
             self.seen = self.seen.saturating_add(1);
             if self.snapshots.len() < self.capacity {
-                self.hashes.insert(hash);
+                self.identities.insert(identity);
                 self.snapshots.push(snapshot);
                 added += 1;
                 continue;
@@ -80,8 +80,9 @@ impl AzMidgamePool {
             if slot >= self.capacity {
                 continue;
             }
-            self.hashes.remove(&self.snapshots[slot].position.hash());
-            self.hashes.insert(hash);
+            self.identities
+                .remove(&snapshot_identity(&self.snapshots[slot]));
+            self.identities.insert(identity);
             self.snapshots[slot] = snapshot;
             added += 1;
         }
@@ -99,6 +100,40 @@ impl AzMidgamePool {
             }
         }
         out
+    }
+
+    /// Samples a requested share from recent generations and fills the remainder
+    /// from older snapshots. If either side lacks enough entries, the other side
+    /// supplies the deficit without duplicating a snapshot within the batch.
+    pub fn sample_recent_mixed(
+        &self,
+        count: usize,
+        recent_fraction: f32,
+        recent_generations: u32,
+        current_generation: u32,
+        rng: &mut SplitMix64,
+    ) -> Vec<AzStartSnapshot> {
+        let count = count.min(self.snapshots.len());
+        if count == 0 {
+            return Vec::new();
+        }
+        let cutoff = current_generation.saturating_sub(recent_generations.max(1) - 1);
+        let (recent, old): (Vec<_>, Vec<_>) = (0..self.snapshots.len())
+            .partition(|&index| self.snapshots[index].generation >= cutoff);
+        let recent_target =
+            ((count as f32 * recent_fraction.clamp(0.0, 1.0)).round() as usize).min(recent.len());
+        let old_target = (count - recent_target).min(old.len());
+        let mut selected = HashSet::with_capacity(count);
+        sample_indices(&recent, recent_target, &mut selected, rng);
+        sample_indices(&old, old_target, &mut selected, rng);
+        if selected.len() < count {
+            let all = (0..self.snapshots.len()).collect::<Vec<_>>();
+            sample_indices(&all, count - selected.len(), &mut selected, rng);
+        }
+        selected
+            .into_iter()
+            .map(|index| self.snapshots[index].clone())
+            .collect()
     }
 
     pub fn save_lz4(&self, path: &Path) -> io::Result<()> {
@@ -147,13 +182,61 @@ impl AzMidgamePool {
         for _ in 0..count {
             let snapshot = decode_snapshot(&mut reader)?;
             if pool.snapshots.len() < capacity {
-                pool.hashes.insert(snapshot.position.hash());
+                pool.identities.insert(snapshot_identity(&snapshot));
                 pool.snapshots.push(snapshot);
             }
         }
         pool.seen = seen.max(pool.snapshots.len() as u64);
         Ok(pool)
     }
+}
+
+fn sample_indices(
+    choices: &[usize],
+    count: usize,
+    selected: &mut HashSet<usize>,
+    rng: &mut SplitMix64,
+) {
+    let available = choices
+        .iter()
+        .filter(|index| !selected.contains(index))
+        .count();
+    let target = count.min(available);
+    let initial_len = selected.len();
+    while selected.len() < initial_len + target {
+        selected.insert(choices[rng.next_u64() as usize % choices.len()]);
+    }
+}
+
+/// Board hashes alone are insufficient in Xiangqi: the same placement can have
+/// different repetition, long-check, long-chase, and natural-move-limit state.
+/// Keep a compact deterministic digest of the rule-relevant recent history.
+fn snapshot_identity(snapshot: &AzStartSnapshot) -> u64 {
+    fn mix(state: u64, value: u64) -> u64 {
+        let mut value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        state.rotate_left(17) ^ value ^ (value >> 31)
+    }
+
+    let mut state = mix(0xA076_1D64_78BD_642F, snapshot.position.hash());
+    state = mix(state, snapshot.rule_history.len() as u64);
+    for entry in snapshot.rule_history.iter().rev().take(32).rev() {
+        state = mix(state, entry.hash);
+        let flags = encode_color(entry.side_to_move) as u64
+            | (entry.mover.map(encode_color).unwrap_or(2) as u64) << 2
+            | u64::from(entry.gives_check) << 4
+            | (entry.rule60_clock as u64) << 5;
+        state = mix(state, flags);
+        state = mix(state, entry.chased_mask as u64);
+        state = mix(state, (entry.chased_mask >> 64) as u64);
+        let move_code = entry
+            .mv
+            .map_or(u16::MAX, |mv| u16::from(mv.from) | (u16::from(mv.to) << 8));
+        let captured = entry.captured.map(encode_piece).unwrap_or(u8::MAX);
+        state = mix(state, u64::from(move_code) | (u64::from(captured) << 16));
+    }
+    state
 }
 
 fn snapshot_is_consistent(snapshot: &AzStartSnapshot) -> bool {
@@ -351,5 +434,38 @@ mod tests {
         let mut pool = AzMidgamePool::new(1);
         assert_eq!(pool.add_snapshots([snapshot(30), snapshot(31)], 2), 1);
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn pool_keeps_same_board_with_distinct_rule_history() {
+        let first = snapshot(42);
+        let mut second = first.clone();
+        second.rule_history.last_mut().unwrap().rule60_clock = 1;
+        assert_eq!(first.position.hash(), second.position.hash());
+        assert_ne!(snapshot_identity(&first), snapshot_identity(&second));
+
+        let mut pool = AzMidgamePool::new(8);
+        assert_eq!(pool.add_snapshots([first, second], 3), 2);
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn mixed_sampling_prioritizes_recent_generations() {
+        let mut pool = AzMidgamePool::new(8);
+        pool.snapshots = (0..8)
+            .map(|generation| AzStartSnapshot {
+                generation,
+                ..snapshot(generation as u16)
+            })
+            .collect();
+        let sampled = pool.sample_recent_mixed(4, 0.75, 4, 7, &mut SplitMix64::new(9));
+        assert_eq!(sampled.len(), 4);
+        assert_eq!(
+            sampled
+                .iter()
+                .filter(|sample| sample.generation >= 4)
+                .count(),
+            3
+        );
     }
 }

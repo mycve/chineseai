@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -20,6 +20,101 @@ use super::{
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
+
+/// 稀疏参数在一个确定性抽样训练子集中的激活覆盖。
+///
+/// 这是“本批次可能收到梯度的参数行”的近似观测，不是跨更新累计覆盖率。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AzSparseActivationStats {
+    pub inspected_samples: usize,
+    pub inspected_policy_moves: usize,
+    pub value_threat_unique: usize,
+    pub policy_exact_unique: usize,
+    pub policy_factor_unique: usize,
+    pub policy_tactical_unique: usize,
+    pub value_threat_coverage: f32,
+    pub policy_exact_coverage: f32,
+    pub policy_factor_coverage: f32,
+    pub policy_tactical_coverage: f32,
+}
+
+/// 对训练样本做等距、确定性抽样，统计本批次激活的稀疏参数行。
+pub fn sparse_activation_stats(
+    samples: &[AzTrainingSample],
+    max_samples: usize,
+) -> AzSparseActivationStats {
+    let sample_count = samples.len().min(max_samples);
+    if sample_count == 0 {
+        return AzSparseActivationStats::default();
+    }
+    let indices = (0..sample_count)
+        .map(|index| index * samples.len() / sample_count)
+        .collect::<Vec<_>>();
+    let mut value_threats = HashSet::new();
+    let mut policy_exact = HashSet::new();
+    let mut policy_factor = HashSet::new();
+    let mut policy_tactical = HashSet::new();
+    let mut policy_moves = 0usize;
+
+    for chunk in indices.chunks(128) {
+        let packed = PackedBatch::from_indices(samples, chunk);
+        for (row, &sample_index) in chunk.iter().enumerate() {
+            let sample = &samples[sample_index];
+            if sample.value_weight > 0.0 {
+                let base = row * packed.max_value_threats;
+                for &feature in &packed.value_threat_indices[base..base + packed.max_value_threats]
+                {
+                    if feature != PADDING_ITEM && (feature as usize) < super::VALUE_THREAT_VOCAB {
+                        value_threats.insert(feature);
+                    }
+                }
+            }
+            if sample.policy_weight <= 0.0 {
+                continue;
+            }
+            let move_base = row * packed.max_policy_moves;
+            for move_offset in 0..packed.max_policy_moves {
+                if packed.policy_mask[move_base + move_offset] <= POLICY_MASK_VALUE * 0.5 {
+                    continue;
+                }
+                policy_moves += 1;
+                let sparse_base = (move_base + move_offset) * 7;
+                for &index in &packed.policy_sparse_indices[sparse_base..sparse_base + 7] {
+                    if index >= 0 && (index as usize) < POLICY_SPARSE_TABLE_SIZE - 1 {
+                        policy_exact.insert(index as usize);
+                    } else if index >= POLICY_SPARSE_TABLE_SIZE as i64 {
+                        let factor = index as usize - POLICY_SPARSE_TABLE_SIZE;
+                        if factor < super::POLICY_SPARSE_FACTOR_SIZE {
+                            policy_factor.insert(factor);
+                        }
+                    }
+                }
+                let tactical_base = (move_base + move_offset) * POLICY_TACTICAL_TERMS;
+                for &index in &packed.policy_tactical_indices
+                    [tactical_base..tactical_base + POLICY_TACTICAL_TERMS]
+                {
+                    if index >= 0 && (index as usize) < POLICY_TACTICAL_SIZE {
+                        policy_tactical.insert(index as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    AzSparseActivationStats {
+        inspected_samples: sample_count,
+        inspected_policy_moves: policy_moves,
+        value_threat_unique: value_threats.len(),
+        policy_exact_unique: policy_exact.len(),
+        policy_factor_unique: policy_factor.len(),
+        policy_tactical_unique: policy_tactical.len(),
+        value_threat_coverage: value_threats.len() as f32 / super::VALUE_THREAT_VOCAB as f32,
+        policy_exact_coverage: policy_exact.len() as f32 / (POLICY_SPARSE_TABLE_SIZE - 1) as f32,
+        policy_factor_coverage: policy_factor.len() as f32
+            / super::POLICY_SPARSE_FACTOR_SIZE as f32,
+        policy_tactical_coverage: policy_tactical.len() as f32 / POLICY_TACTICAL_SIZE as f32,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct DataLoaderConfig {
@@ -99,6 +194,7 @@ pub(super) struct PackedBatch {
     pub value_threat_indices: Vec<u32>,
     pub value_threat_scales: Vec<f32>,
     pub policy_items: Vec<i64>,
+    pub policy_move_indices: Vec<u32>,
     pub policy_sparse_indices: Vec<i64>,
     pub policy_tactical_indices: Vec<i64>,
     pub policy_targets: Vec<f32>,
@@ -149,6 +245,7 @@ impl PackedBatch {
             value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
             value_threat_scales: vec![1.0; batch_size],
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
+            policy_move_indices: vec![0; batch_size * max_policy_moves],
             policy_sparse_indices: vec![
                 (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
                 batch_size * max_policy_moves * 7
@@ -259,6 +356,7 @@ impl PackedBatch {
                     }
                 }
                 let item_index = policy_base + policy_offset;
+                self.policy_move_indices[item_index] = move_index as u32;
                 self.policy_items[item_index] = pack_policy_item(
                     move_index,
                     consequence_from,
@@ -553,6 +651,28 @@ mod tests {
                 true,
             )]
         );
+    }
+
+    #[test]
+    fn sparse_activation_stats_counts_only_weighted_valid_moves() {
+        let moved_feature = 6 * BOARD_SIZE;
+        let move_index = super::super::dense_move_index(Move::new(0, 1));
+        let mut active = sample(0);
+        active.features = vec![moved_feature];
+        active.move_indices = vec![move_index];
+        active.policy = vec![1.0];
+        let mut disabled = active.clone();
+        disabled.policy_weight = 0.0;
+        disabled.value_weight = 0.0;
+
+        let stats = sparse_activation_stats(&[active, disabled], 16);
+        assert_eq!(stats.inspected_samples, 2);
+        assert_eq!(stats.inspected_policy_moves, 1);
+        assert_eq!(stats.policy_exact_unique, 2);
+        assert_eq!(stats.policy_factor_unique, 5);
+        assert!(stats.policy_tactical_unique > 0);
+        assert!(stats.policy_exact_coverage > 0.0);
+        assert!(stats.policy_factor_coverage > 0.0);
     }
 
     #[test]

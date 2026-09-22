@@ -25,9 +25,15 @@ pub(super) struct AzCandleModel {
     input_king_piece_hidden: Var,
     rule_context_hidden: Var,
     hidden_bias: Var,
+    trunk_residual_down: Option<Var>,
+    trunk_residual_bias: Option<Var>,
+    trunk_residual_up: Option<Var>,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_output: Var,
+    value_extra_hidden: Option<Var>,
+    value_extra_bias: Option<Var>,
+    value_extra_output: Option<Var>,
     short_value_head_output: Var,
     short_value_head_bias: Var,
     value_threat_embedding: Var,
@@ -37,6 +43,12 @@ pub(super) struct AzCandleModel {
     policy_consequence_output: Var,
     policy_context_hidden: Var,
     policy_move_context: Var,
+    policy_interaction_hidden: Option<Var>,
+    policy_interaction_threat: Option<Var>,
+    policy_interaction_move: Option<Var>,
+    policy_context_extra_hidden: Option<Var>,
+    policy_context_extra_threat: Option<Var>,
+    policy_context_extra_move: Option<Var>,
     policy_accumulator_hidden: Var,
     policy_accumulator_move: Var,
     policy_sparse_table: Var,
@@ -69,12 +81,31 @@ impl AzCandleModel {
             .mean_keepdim(1)?
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
-        let hidden = sparse_hidden.broadcast_div(&rms)?;
+        let mut hidden = sparse_hidden.broadcast_div(&rms)?;
+        if let (Some(down), Some(bias), Some(up)) = (
+            &self.trunk_residual_down,
+            &self.trunk_residual_bias,
+            &self.trunk_residual_up,
+        ) {
+            let residual = hidden.matmul(&down.t()?)?.broadcast_add(bias)?.relu()?;
+            hidden = (hidden + residual.matmul(up)?)?;
+        }
         let value_head = hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
-        let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
+        let mut value_logits = value_head.matmul(&self.value_head_output.t()?)?;
+        if let (Some(hidden_projection), Some(bias), Some(output)) = (
+            &self.value_extra_hidden,
+            &self.value_extra_bias,
+            &self.value_extra_output,
+        ) {
+            let extra = hidden
+                .matmul(&hidden_projection.t()?)?
+                .broadcast_add(bias)?
+                .relu()?;
+            value_logits = (value_logits + extra.matmul(&output.t()?)?)?;
+        }
         let short_value_logits = value_head
             .matmul(&self.short_value_head_output.t()?)?
             .broadcast_add(&self.short_value_head_bias)?
@@ -145,7 +176,48 @@ impl AzCandleModel {
             0,
         )?;
         let tactical_logits = tactical_policy(&tactical_table, &batch.policy_tactical_indices)?;
-        let policy_logits = (policy_logits + sparse_logits + tactical_logits)?;
+        let mut policy_logits = (policy_logits + sparse_logits + tactical_logits)?;
+        if let (Some(board_projection), Some(threat_projection), Some(move_embedding)) = (
+            &self.policy_interaction_hidden,
+            &self.policy_interaction_threat,
+            &self.policy_interaction_move,
+        ) {
+            let board = hidden.matmul(&board_projection.t()?)?;
+            let threat = threat_pair.matmul(&threat_projection.t()?)?;
+            let interaction = (board * threat)?;
+            let move_factors = move_embedding
+                .as_tensor()
+                .embedding(&batch.policy_move_indices.flatten_all()?)?
+                .reshape((
+                    batch.batch_size,
+                    batch.policy_move_indices.dim(1)?,
+                    self.arch.policy_interaction_rank,
+                ))?;
+            let interaction_logits = move_factors
+                .broadcast_mul(&interaction.unsqueeze(1)?)?
+                .sum(2)?;
+            policy_logits = (policy_logits + interaction_logits)?;
+        }
+        if let (Some(board_projection), Some(threat_projection), Some(move_embedding)) = (
+            &self.policy_context_extra_hidden,
+            &self.policy_context_extra_threat,
+            &self.policy_context_extra_move,
+        ) {
+            let extra_context = (hidden.matmul(&board_projection.t()?)?
+                + threat_pair.matmul(&threat_projection.t()?)?)?;
+            let move_factors = move_embedding
+                .as_tensor()
+                .embedding(&batch.policy_move_indices.flatten_all()?)?
+                .reshape((
+                    batch.batch_size,
+                    batch.policy_move_indices.dim(1)?,
+                    self.arch.policy_context_extra_rank,
+                ))?;
+            let extra_logits = move_factors
+                .broadcast_mul(&extra_context.unsqueeze(1)?)?
+                .sum(2)?;
+            policy_logits = (policy_logits + extra_logits)?;
+        }
 
         Ok(ForwardOutput {
             value_logits,
@@ -167,6 +239,7 @@ pub(super) struct BatchTensors {
     pub(super) value_threat_indices: Tensor,
     pub(super) value_threat_scales: Tensor,
     pub(super) policy_items: Tensor,
+    pub(super) policy_move_indices: Tensor,
     pub(super) policy_sparse_indices: Tensor,
     pub(super) policy_tactical_indices: Tensor,
     pub(super) policy_targets: Tensor,
@@ -213,6 +286,11 @@ impl BatchTensors {
             )?,
             policy_items: Tensor::from_vec(
                 packed.policy_items,
+                (batch_size, max_policy_moves),
+                device,
+            )?,
+            policy_move_indices: Tensor::from_vec(
+                packed.policy_move_indices,
                 (batch_size, max_policy_moves),
                 device,
             )?,
@@ -297,6 +375,27 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
+            trunk_residual_down: (arch.residual_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.trunk_residual_down,
+                        (arch.residual_rank, hidden),
+                        device,
+                    )
+                })
+                .transpose()?,
+            trunk_residual_bias: (arch.residual_rank > 0)
+                .then(|| var_from_slice(&model.trunk_residual_bias, arch.residual_rank, device))
+                .transpose()?,
+            trunk_residual_up: (arch.residual_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.trunk_residual_up,
+                        (arch.residual_rank, hidden),
+                        device,
+                    )
+                })
+                .transpose()?,
             value_head_hidden: var_from_slice(
                 &model.value_head_hidden,
                 (VALUE_HEAD_SIZE, hidden),
@@ -308,6 +407,27 @@ impl AzCandleModel {
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
+            value_extra_hidden: (arch.value_extra_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.value_extra_hidden,
+                        (arch.value_extra_rank, hidden),
+                        device,
+                    )
+                })
+                .transpose()?,
+            value_extra_bias: (arch.value_extra_rank > 0)
+                .then(|| var_from_slice(&model.value_extra_bias, arch.value_extra_rank, device))
+                .transpose()?,
+            value_extra_output: (arch.value_extra_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.value_extra_output,
+                        (WDL_HEAD_SIZE, arch.value_extra_rank),
+                        device,
+                    )
+                })
+                .transpose()?,
             short_value_head_output: var_from_slice(
                 &model.short_value_head_output,
                 (super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
@@ -349,6 +469,60 @@ impl AzCandleModel {
                 (DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE),
                 device,
             )?,
+            policy_interaction_hidden: (arch.policy_interaction_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.policy_interaction_hidden,
+                        (arch.policy_interaction_rank, hidden),
+                        device,
+                    )
+                })
+                .transpose()?,
+            policy_interaction_threat: (arch.policy_interaction_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.policy_interaction_threat,
+                        (arch.policy_interaction_rank, VALUE_THREAT_RANK * 2),
+                        device,
+                    )
+                })
+                .transpose()?,
+            policy_interaction_move: (arch.policy_interaction_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.policy_interaction_move,
+                        (DENSE_MOVE_SPACE, arch.policy_interaction_rank),
+                        device,
+                    )
+                })
+                .transpose()?,
+            policy_context_extra_hidden: (arch.policy_context_extra_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.policy_context_extra_hidden,
+                        (arch.policy_context_extra_rank, hidden),
+                        device,
+                    )
+                })
+                .transpose()?,
+            policy_context_extra_threat: (arch.policy_context_extra_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.policy_context_extra_threat,
+                        (arch.policy_context_extra_rank, VALUE_THREAT_RANK * 2),
+                        device,
+                    )
+                })
+                .transpose()?,
+            policy_context_extra_move: (arch.policy_context_extra_rank > 0)
+                .then(|| {
+                    var_from_slice(
+                        &model.policy_context_extra_move,
+                        (DENSE_MOVE_SPACE, arch.policy_context_extra_rank),
+                        device,
+                    )
+                })
+                .transpose()?,
             policy_accumulator_hidden: var_from_slice(
                 &model.policy_accumulator_hidden,
                 (POLICY_ACCUMULATOR_RANK, hidden),
@@ -382,9 +556,15 @@ impl AzCandleModel {
         vars.push(self.input_king_piece_hidden.clone());
         vars.push(self.rule_context_hidden.clone());
         vars.push(self.hidden_bias.clone());
+        vars.extend(self.trunk_residual_down.iter().cloned());
+        vars.extend(self.trunk_residual_bias.iter().cloned());
+        vars.extend(self.trunk_residual_up.iter().cloned());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_head_output.clone());
+        vars.extend(self.value_extra_hidden.iter().cloned());
+        vars.extend(self.value_extra_bias.iter().cloned());
+        vars.extend(self.value_extra_output.iter().cloned());
         vars.push(self.short_value_head_output.clone());
         vars.push(self.short_value_head_bias.clone());
         vars.push(self.value_threat_embedding.clone());
@@ -394,6 +574,12 @@ impl AzCandleModel {
         vars.push(self.policy_consequence_output.clone());
         vars.push(self.policy_context_hidden.clone());
         vars.push(self.policy_move_context.clone());
+        vars.extend(self.policy_interaction_hidden.iter().cloned());
+        vars.extend(self.policy_interaction_threat.iter().cloned());
+        vars.extend(self.policy_interaction_move.iter().cloned());
+        vars.extend(self.policy_context_extra_hidden.iter().cloned());
+        vars.extend(self.policy_context_extra_threat.iter().cloned());
+        vars.extend(self.policy_context_extra_move.iter().cloned());
         vars.push(self.policy_accumulator_hidden.clone());
         vars.push(self.policy_accumulator_move.clone());
         vars.push(self.policy_sparse_table.clone());
@@ -413,9 +599,27 @@ impl AzCandleModel {
         )?;
         copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
+        if let Some(var) = &self.trunk_residual_down {
+            copy_var(var, &mut model.trunk_residual_down)?;
+        }
+        if let Some(var) = &self.trunk_residual_bias {
+            copy_var(var, &mut model.trunk_residual_bias)?;
+        }
+        if let Some(var) = &self.trunk_residual_up {
+            copy_var(var, &mut model.trunk_residual_up)?;
+        }
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
+        if let Some(var) = &self.value_extra_hidden {
+            copy_var(var, &mut model.value_extra_hidden)?;
+        }
+        if let Some(var) = &self.value_extra_bias {
+            copy_var(var, &mut model.value_extra_bias)?;
+        }
+        if let Some(var) = &self.value_extra_output {
+            copy_var(var, &mut model.value_extra_output)?;
+        }
         copy_var(
             &self.short_value_head_output,
             &mut model.short_value_head_output,
@@ -443,6 +647,24 @@ impl AzCandleModel {
             &mut model.policy_context_hidden,
         )?;
         copy_var(&self.policy_move_context, &mut model.policy_move_context)?;
+        if let Some(var) = &self.policy_interaction_hidden {
+            copy_var(var, &mut model.policy_interaction_hidden)?;
+        }
+        if let Some(var) = &self.policy_interaction_threat {
+            copy_var(var, &mut model.policy_interaction_threat)?;
+        }
+        if let Some(var) = &self.policy_interaction_move {
+            copy_var(var, &mut model.policy_interaction_move)?;
+        }
+        if let Some(var) = &self.policy_context_extra_hidden {
+            copy_var(var, &mut model.policy_context_extra_hidden)?;
+        }
+        if let Some(var) = &self.policy_context_extra_threat {
+            copy_var(var, &mut model.policy_context_extra_threat)?;
+        }
+        if let Some(var) = &self.policy_context_extra_move {
+            copy_var(var, &mut model.policy_context_extra_move)?;
+        }
         copy_var(
             &self.policy_accumulator_hidden,
             &mut model.policy_accumulator_hidden,
@@ -496,6 +718,13 @@ mod tests {
                 .unwrap();
         let moves = position.legal_moves();
         let mut model = AzNnue::random(32, 20260730);
+        model.enable_trunk_residual(8, 20260922).unwrap();
+        model.enable_policy_interaction(8, 20260923).unwrap();
+        model.enable_policy_context_extra(8, 20260924).unwrap();
+        model.enable_value_extra(8, 20260925).unwrap();
+        for (index, weight) in model.trunk_residual_up.iter_mut().enumerate() {
+            *weight = (index % 19) as f32 * 0.0001 - 0.0009;
+        }
         for (index, weight) in model.policy_consequence_output.iter_mut().enumerate() {
             *weight = (index as f32 + 1.0) * 0.003;
         }
@@ -508,8 +737,17 @@ mod tests {
         for (index, weight) in model.value_threat_output.iter_mut().enumerate() {
             *weight = (index % 17) as f32 * 0.0003 - 0.002;
         }
+        for (index, weight) in model.value_extra_output.iter_mut().enumerate() {
+            *weight = (index % 7) as f32 * 0.0002 - 0.0006;
+        }
         for (index, weight) in model.policy_threat_context.iter_mut().enumerate() {
             *weight = (index % 13) as f32 * 0.0001 - 0.0005;
+        }
+        for (index, weight) in model.policy_interaction_move.iter_mut().enumerate() {
+            *weight = (index % 17) as f32 * 0.0001 - 0.0008;
+        }
+        for (index, weight) in model.policy_context_extra_move.iter_mut().enumerate() {
+            *weight = (index % 13) as f32 * 0.0001 - 0.0006;
         }
         for (index, weight) in model.policy_tactical.iter_mut().enumerate() {
             *weight = (index % 11) as f32 * 0.0002 - 0.001;
@@ -584,7 +822,16 @@ mod tests {
             );
         }
 
-        let gradient_model = AzNnue::random(32, 20260731);
+        let mut gradient_model = AzNnue::random(32, 20260731);
+        gradient_model.enable_trunk_residual(8, 20260922).unwrap();
+        gradient_model
+            .enable_policy_interaction(8, 20260923)
+            .unwrap();
+        gradient_model
+            .enable_policy_context_extra(8, 20260924)
+            .unwrap();
+        gradient_model.enable_value_extra(8, 20260925).unwrap();
+        gradient_model.policy_move_context.fill(0.01);
         let gradient_candle = AzCandleModel::from_model(&gradient_model, &Device::Cpu).unwrap();
         let gradient_forward = gradient_candle.forward(&batch).unwrap();
         let gradients = gradient_forward
@@ -617,6 +864,40 @@ mod tests {
                 .iter()
                 .any(|gradient| gradient.abs() > 1.0e-8)
         );
+        let interaction_move_gradient = gradients
+            .get(
+                gradient_candle
+                    .policy_interaction_move
+                    .as_ref()
+                    .expect("interaction move variable"),
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            interaction_move_gradient
+                .iter()
+                .any(|gradient| gradient.abs() > 1.0e-8)
+        );
+        let extra_move_gradient = gradients
+            .get(
+                gradient_candle
+                    .policy_context_extra_move
+                    .as_ref()
+                    .expect("extra context move variable"),
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            extra_move_gradient
+                .iter()
+                .any(|gradient| gradient.abs() > 1.0e-8)
+        );
         let accumulator_move_gradient = gradients
             .get(&gradient_candle.policy_accumulator_move)
             .unwrap()
@@ -629,6 +910,18 @@ mod tests {
                 .iter()
                 .any(|gradient| gradient.abs() > 1.0e-8)
         );
+        let residual_up_gradient = gradients
+            .get(gradient_candle.trunk_residual_up.as_ref().unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            residual_up_gradient
+                .iter()
+                .any(|gradient| gradient.abs() > 1.0e-8)
+        );
     }
 
     /// CPU ???`AzNnue`?? Candle GPU ???????????
@@ -636,9 +929,16 @@ mod tests {
     /// ?? CPU/GPU ???????????
     #[test]
     fn gpu_and_cpu_weight_tensors_roundtrip() {
-        let model = AzNnue::random(16, 12345);
+        let mut model = AzNnue::random(16, 12345);
+        model.enable_trunk_residual(4, 67890).unwrap();
+        model.enable_policy_interaction(4, 13579).unwrap();
+        model.enable_policy_context_extra(4, 24680).unwrap();
+        model.enable_value_extra(4, 11223).unwrap();
+        for (index, weight) in model.policy_interaction_move.iter_mut().enumerate() {
+            *weight = (index % 17) as f32 * 0.0001;
+        }
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
-        let mut back = AzNnue::random(16, 54321);
+        let mut back = AzNnue::random_with_arch(model.arch, 54321);
         candle.copy_to_model(&mut back).unwrap();
 
         macro_rules! assert_weight_parity {
@@ -660,16 +960,31 @@ mod tests {
             input_king_piece_hidden,
             rule_context_hidden,
             hidden_bias,
+            trunk_residual_down,
+            trunk_residual_bias,
+            trunk_residual_up,
             value_head_hidden,
             value_head_bias,
             value_head_output,
+            value_extra_hidden,
+            value_extra_bias,
+            value_extra_output,
             policy_threat_context,
             policy_move_bias,
             policy_consequence_output,
             policy_context_hidden,
             policy_move_context,
+            policy_interaction_hidden,
+            policy_interaction_threat,
+            policy_interaction_move,
+            policy_context_extra_hidden,
+            policy_context_extra_threat,
+            policy_context_extra_move,
             policy_accumulator_hidden,
             policy_accumulator_move,
+            policy_sparse_table,
+            policy_sparse_factor,
+            policy_tactical,
         );
     }
 }
