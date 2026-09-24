@@ -1,5 +1,5 @@
 use crate::az::{
-    AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult,
+    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult, SplitMix64,
     alphazero_search_external_root_controlled_with_progress,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
@@ -22,6 +22,7 @@ const DEFAULT_CPUCT_FACTOR: f32 = 1.5;
 const DEFAULT_FPU_VALUE: f32 = 0.15;
 const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 0.05;
 const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.25;
+const DEFAULT_OPENING_TEMPERATURE: f32 = 0.8;
 
 #[derive(Clone, Debug)]
 struct UciState {
@@ -40,6 +41,9 @@ struct UciState {
     fpu_value: f32,
     fpu_value_at_root: f32,
     policy_softmax_temp: f32,
+    opening_temp_plies: usize,
+    opening_temperature: f32,
+    game_ply: Option<usize>,
     draw_score: f32,
     sixty_move_rule: bool,
     rule60_max_ply: u16,
@@ -64,6 +68,9 @@ impl Default for UciState {
             fpu_value: DEFAULT_FPU_VALUE,
             fpu_value_at_root: DEFAULT_FPU_VALUE_AT_ROOT,
             policy_softmax_temp: DEFAULT_POLICY_SOFTMAX_TEMP,
+            opening_temp_plies: 0,
+            opening_temperature: DEFAULT_OPENING_TEMPERATURE,
+            game_ply: Some(0),
             draw_score: 0.0,
             sixty_move_rule: true,
             rule60_max_ply: 120,
@@ -114,6 +121,7 @@ pub fn run_uci() {
                 state.position = Position::startpos();
                 apply_rule_options(&mut state);
                 state.rule_history = state.position.initial_rule_history();
+                state.game_ply = Some(0);
                 state.seed = 20260409;
             }
             Some("setoption") => {
@@ -160,6 +168,8 @@ fn print_uci_id() {
     println!("option name FpuValue type string default {DEFAULT_FPU_VALUE}");
     println!("option name FpuValueAtRoot type string default {DEFAULT_FPU_VALUE_AT_ROOT}");
     println!("option name PolicySoftmaxTemp type string default {DEFAULT_POLICY_SOFTMAX_TEMP}");
+    println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
+    println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
@@ -248,6 +258,19 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .unwrap_or(state.policy_softmax_temp)
                 .max(1.0e-3);
         }
+        "openingtempplies" => {
+            state.opening_temp_plies = value
+                .parse::<usize>()
+                .unwrap_or(state.opening_temp_plies)
+                .min(1000);
+        }
+        "openingtemperature" => {
+            if let Ok(temperature) = value.parse::<f32>()
+                && temperature.is_finite()
+            {
+                state.opening_temperature = temperature.clamp(0.0, 2.0);
+            }
+        }
         "drawscore" => {
             state.draw_score = value
                 .parse::<f32>()
@@ -285,6 +308,7 @@ fn handle_position(line: &str, state: &mut UciState) {
             let move_list = &tokens[moves_index + 1..];
             apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
         }
+        state.game_ply = Some(state.rule_history.len() - 1);
         return;
     }
 
@@ -293,6 +317,7 @@ fn handle_position(line: &str, state: &mut UciState) {
         let fen_end = moves_index.unwrap_or(tokens.len());
         let fen = tokens[2..fen_end].join(" ");
         if let Ok(position) = Position::from_fen(&fen) {
+            let base_ply = fen_game_ply(&fen, position.side_to_move());
             state.position = position;
             apply_rule_options(state);
             state.rule_history = state.position.initial_rule_history();
@@ -300,8 +325,19 @@ fn handle_position(line: &str, state: &mut UciState) {
                 let move_list = &tokens[moves_index + 1..];
                 apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
             }
+            state.game_ply = base_ply.map(|ply| ply.saturating_add(state.rule_history.len() - 1));
         }
     }
+}
+
+fn fen_game_ply(fen: &str, side: Color) -> Option<usize> {
+    let fullmove = fen.split_whitespace().nth(5)?.parse::<usize>().ok()?;
+    Some(
+        fullmove
+            .checked_sub(1)?
+            .saturating_mul(2)
+            .saturating_add(usize::from(side == Color::Black)),
+    )
 }
 
 fn apply_uci_moves(
@@ -518,9 +554,34 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
     match result.best_move {
         Some(mv) => {
-            let best_text = mv.to_string();
+            let chosen = if state
+                .game_ply
+                .is_some_and(|ply| ply < state.opening_temp_plies)
+                && state.opening_temperature > 0.0
+            {
+                let entropy = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |time| time.as_nanos() as u64);
+                choose_opening_move(
+                    &result.candidates,
+                    mv,
+                    state.opening_temperature,
+                    state.seed ^ entropy,
+                )
+            } else {
+                mv
+            };
             print_search_info(&result, started);
-            println!("bestmove {best_text}");
+            if chosen != mv {
+                println!(
+                    "info string openingtemp ply={} temperature={:.2} searchbest={} sampled={}",
+                    state.game_ply.unwrap_or(0),
+                    state.opening_temperature,
+                    mv,
+                    chosen
+                );
+            }
+            println!("bestmove {chosen}");
         }
         None => {
             println!(
@@ -591,6 +652,42 @@ fn flush() {
     let _ = io::stdout().flush();
 }
 
+fn choose_opening_move(
+    candidates: &[AzCandidate],
+    best: Move,
+    temperature: f32,
+    seed: u64,
+) -> Move {
+    let max_visits = candidates
+        .iter()
+        .map(|candidate| candidate.visits)
+        .max()
+        .unwrap_or(0);
+    if max_visits == 0 || temperature <= 0.0 {
+        return best;
+    }
+    let exponent = 1.0 / temperature;
+    let weight = |candidate: &AzCandidate| {
+        let visit_ratio = candidate.visits as f32 / max_visits as f32;
+        if visit_ratio < 0.25 {
+            0.0
+        } else {
+            visit_ratio.powf(exponent)
+        }
+    };
+    let total = candidates.iter().map(&weight).sum::<f32>();
+    let mut rng = SplitMix64::new(seed);
+    let mut ticket = rng.unit_f32() * total;
+    for candidate in candidates {
+        let candidate_weight = weight(candidate);
+        if ticket < candidate_weight {
+            return candidate.mv;
+        }
+        ticket -= candidate_weight;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +705,9 @@ mod tests {
         assert_eq!(state.fpu_value, DEFAULT_FPU_VALUE);
         assert_eq!(state.fpu_value_at_root, DEFAULT_FPU_VALUE_AT_ROOT);
         assert_eq!(state.policy_softmax_temp, DEFAULT_POLICY_SOFTMAX_TEMP);
+        assert_eq!(state.opening_temp_plies, 0);
+        assert_eq!(state.opening_temperature, DEFAULT_OPENING_TEMPERATURE);
+        assert_eq!(state.game_ply, Some(0));
     }
 
     #[test]
@@ -703,6 +803,67 @@ mod tests {
         assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Red);
         assert!(!uci_root_moves(&position, &history).is_empty());
+    }
+
+    #[test]
+    fn opening_temperature_tracks_game_ply() {
+        let mut state = UciState::default();
+        handle_setoption("setoption name OpeningTempPlies value 20", &mut state);
+        handle_setoption("setoption name OpeningTemperature value 1.2", &mut state);
+        assert_eq!(state.opening_temp_plies, 20);
+        assert_eq!(state.opening_temperature, 1.2);
+
+        handle_position("position startpos moves b2e2 b9c7", &mut state);
+        assert_eq!(state.game_ply, Some(2));
+        handle_position(
+            "position fen rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 11",
+            &mut state,
+        );
+        assert_eq!(state.game_ply, Some(20));
+        handle_position(
+            &format!("position fen {}", crate::xiangqi::STARTPOS_FEN),
+            &mut state,
+        );
+        assert_eq!(state.game_ply, None);
+    }
+
+    #[test]
+    fn opening_temperature_samples_only_visited_moves() {
+        let best = Move::new(0, 1);
+        let alternate = Move::new(0, 2);
+        let candidates = [
+            AzCandidate {
+                mv: best,
+                visits: 80,
+                q: 0.0,
+                raw_prior: 0.0,
+                prior: 0.0,
+                policy: 0.8,
+            },
+            AzCandidate {
+                mv: alternate,
+                visits: 20,
+                q: 0.0,
+                raw_prior: 0.0,
+                prior: 0.0,
+                policy: 0.2,
+            },
+            AzCandidate {
+                mv: Move::new(0, 3),
+                visits: 19,
+                q: 0.0,
+                raw_prior: 0.0,
+                prior: 0.0,
+                policy: 0.0,
+            },
+        ];
+        assert_eq!(choose_opening_move(&candidates, best, 0.0, 1), best);
+        let alternates = (0..1000)
+            .map(|seed| choose_opening_move(&candidates, best, 1.0, seed))
+            .inspect(|mv| assert!(*mv == best || *mv == alternate))
+            .filter(|mv| *mv == alternate)
+            .count();
+        assert!((100..300).contains(&alternates));
     }
 
     #[test]

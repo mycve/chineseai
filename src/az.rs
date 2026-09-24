@@ -1639,6 +1639,23 @@ impl AzNnue {
             candle_core::safetensors::MmapedSafetensors::new(path.as_ref())
                 .map_err(candle_io_error)?
         };
+        let mut expected_tensors = vec!["az_model_format_version"];
+        macro_rules! expect_tensor {
+            ($field:ident, [$($dim:expr),+]) => {
+                expected_tensors.push(stringify!($field));
+            };
+        }
+        az_weight_tensors!(expect_tensor, 0);
+        if let Some((name, _)) = tensors
+            .tensors()
+            .iter()
+            .find(|(name, _)| !expected_tensors.contains(&name.as_str()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported AZ model tensor `{name}`"),
+            ));
+        }
         let format_version = load_candle_f32_tensor(&tensors, "az_model_format_version")?;
         let Some(&format_version) = format_version.first() else {
             return Err(io::Error::new(
