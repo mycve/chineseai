@@ -111,7 +111,8 @@ impl Default for AzLoopFileConfig {
             lr_decay_interval: 100,
             lr_decay_factor: 0.97,
             batch_size: 512,
-            max_plies: 200,
+            // Px0 SelfPlayGame采用450步上限，200步会过早丢失终局价值标签。
+            max_plies: 450,
             sixty_move_rule: true,
             rule60_max_ply: 120,
             hidden_size: 128,
@@ -509,7 +510,7 @@ mod tests {
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 0\n"));
         assert!(text.contains("batch_size = 512\n"));
-        assert!(text.contains("max_plies = 200\n"));
+        assert!(text.contains("max_plies = 450\n"));
         assert!(text.contains("hidden_size = 128\n"));
         assert!(text.contains("replay_capacity = 2400000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));

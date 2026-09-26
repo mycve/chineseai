@@ -719,7 +719,17 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
         }
         if result.is_none() && !search_failed {
-            terminal.max_plies += 1;
+            // 最后一手也可能形成将死、困毙或规则禁着，不能先记作步数截断。
+            if position.legal_moves_with_rules(&rule_history).is_empty() {
+                result = Some(if position.side_to_move() == Color::Red {
+                    -1.0
+                } else {
+                    1.0
+                });
+                terminal.record_no_legal_moves(&position);
+            } else {
+                terminal.max_plies += 1;
+            }
         }
 
         let terminal_result = result;
@@ -1368,7 +1378,15 @@ fn play_arena_game(
             };
         }
     }
-    0.0
+    if position.legal_moves_with_rules(&rule_history).is_empty() {
+        if position.side_to_move() == Color::Red {
+            -1.0
+        } else {
+            1.0
+        }
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -1547,6 +1565,71 @@ mod tests {
         );
         assert_eq!(stopped.terminal.max_plies, 0);
         assert_eq!(stopped.terminal.adjudication.unresolved, [0, 0, 0]);
+    }
+
+    #[test]
+    fn mate_on_last_allowed_ply_keeps_terminal_value_supervision() {
+        let mut model = AzNnue::random(16, 20260907);
+        let mut position = Position::from_fen(
+            "r1baka3/4n4/n3b4/4p3p/1PP3pr1/5RC2/4P1ccP/3CB1N2/5R3/2BAKA3 b - - 3 1",
+        )
+        .unwrap();
+        let mut history = position.initial_rule_history();
+        let mv = position.parse_uci_move("a9b9").unwrap();
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+        let mate = position.parse_uci_move("f4f9").unwrap();
+        let mate_index = dense_move_index(canonical_move(position.side_to_move(), mate));
+        model.policy_move_bias.fill(-100.0);
+        model.policy_move_bias[mate_index] = 100.0;
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.simulations = 2;
+        config.mirror_probability = 0.0;
+        config.opening_positions = vec![AzStartSnapshot {
+            position,
+            rule_history: history,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let data = generate_selfplay_chunk(&model, &config);
+        let sample = &data.samples[0];
+        assert_eq!(
+            sample.move_indices[sample.meta.played_index as usize],
+            mate_index
+        );
+        assert_eq!(data.red_wins, 1, "terminal={:?}", data.terminal);
+        assert_eq!(data.terminal.checkmate, 1);
+        assert_eq!(data.terminal.max_plies, 0);
+        assert_eq!(data.samples.len(), 1);
+        assert_eq!(data.samples[0].value_weight, 1.0);
+        assert_eq!(data.samples[0].value_wdl, [1.0, 0.0, 0.0]);
+        let start = &config.opening_positions[0];
+        assert_eq!(
+            play_arena_game(
+                &start.position,
+                &start.rule_history,
+                &model,
+                &model,
+                config.simulations,
+                config.max_plies,
+                config.seed,
+                config.cpuct,
+                config.cpuct_at_root,
+                config.cpuct_base,
+                config.cpuct_factor,
+                config.cpuct_base_at_root,
+                config.cpuct_factor_at_root,
+                config.fpu_value,
+                config.fpu_value_at_root,
+                config.fpu_absolute_at_root,
+                config.minimum_kldgain_per_node,
+                config.draw_score,
+                config.policy_softmax_temp,
+            ),
+            1.0
+        );
     }
 
     #[test]
