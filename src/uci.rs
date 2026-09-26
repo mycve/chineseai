@@ -660,8 +660,14 @@ fn choose_opening_move(
     temperature: f32,
     seed: u64,
 ) -> Move {
+    let priority = candidates
+        .iter()
+        .map(AzCandidate::proof_priority)
+        .max()
+        .unwrap_or(0);
     let max_visits = candidates
         .iter()
+        .filter(|candidate| candidate.proof_priority() == priority)
         .map(|candidate| candidate.visits)
         .max()
         .unwrap_or(0);
@@ -670,6 +676,9 @@ fn choose_opening_move(
     }
     let exponent = 1.0 / temperature;
     let weight = |candidate: &AzCandidate| {
+        if candidate.proof_priority() != priority {
+            return 0.0;
+        }
         let visit_ratio = candidate.visits as f32 / max_visits as f32;
         if visit_ratio < 0.25 {
             0.0
@@ -841,6 +850,7 @@ mod tests {
                 raw_prior: 0.0,
                 prior: 0.0,
                 policy: 0.8,
+                solved: None,
             },
             AzCandidate {
                 mv: alternate,
@@ -849,6 +859,7 @@ mod tests {
                 raw_prior: 0.0,
                 prior: 0.0,
                 policy: 0.2,
+                solved: None,
             },
             AzCandidate {
                 mv: Move::new(0, 3),
@@ -857,6 +868,7 @@ mod tests {
                 raw_prior: 0.0,
                 prior: 0.0,
                 policy: 0.0,
+                solved: None,
             },
         ];
         assert_eq!(choose_opening_move(&candidates, best, 0.0, 1), best);

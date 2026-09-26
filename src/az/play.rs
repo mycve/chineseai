@@ -939,13 +939,22 @@ fn choose_selfplay_move(
     visit_offset: f32,
     rng: &mut SplitMix64,
 ) -> Option<Move> {
+    let priority = candidates.iter().map(AzCandidate::proof_priority).max()?;
+    let fallback = candidates
+        .iter()
+        .find(|candidate| candidate.proof_priority() == priority)
+        .map(|candidate| candidate.mv);
     if temperature <= 1e-6 {
         return candidates
             .iter()
             .max_by(|left, right| {
-                left.policy
-                    .total_cmp(&right.policy)
-                    .then_with(|| left.visits.cmp(&right.visits))
+                left.proof_priority()
+                    .cmp(&right.proof_priority())
+                    .then_with(|| {
+                        left.policy
+                            .total_cmp(&right.policy)
+                            .then_with(|| left.visits.cmp(&right.visits))
+                    })
             })
             .map(|candidate| candidate.mv);
     }
@@ -957,7 +966,7 @@ fn choose_selfplay_move(
         .map(|(_, weight)| *weight)
         .sum::<f32>();
     if total <= 0.0 {
-        return candidates.first().map(|candidate| candidate.mv);
+        return fallback;
     }
 
     let mut ticket = rng.unit_f32() * total;
@@ -967,7 +976,7 @@ fn choose_selfplay_move(
         }
         ticket -= weight;
     }
-    candidates.first().map(|candidate| candidate.mv)
+    fallback
 }
 
 fn temperature_move_weights(
@@ -976,14 +985,22 @@ fn temperature_move_weights(
     visit_offset: f32,
 ) -> Vec<f32> {
     let inv_temperature = 1.0 / temperature.max(1e-3);
+    let priority = candidates
+        .iter()
+        .map(AzCandidate::proof_priority)
+        .max()
+        .unwrap_or(0);
     let max_visits = candidates
         .iter()
+        .filter(|candidate| candidate.proof_priority() == priority)
         .map(|c| (c.visits as f32 + visit_offset).max(0.0))
         .fold(0.0f32, f32::max);
     candidates
         .iter()
         .map(|candidate| {
-            if max_visits > 0.0 {
+            if candidate.proof_priority() != priority {
+                0.0
+            } else if max_visits > 0.0 {
                 ((candidate.visits as f32 + visit_offset).max(0.0) / max_visits)
                     .powf(inv_temperature)
             } else {
@@ -1310,9 +1327,8 @@ mod tests {
 
     #[test]
     fn px0_kld_selfplay_records_actual_visits() {
-        let mut position = Position::from_fen(
-            "4k1b2/4a4/4ba3/p8/4cN3/3n2N1P/c8/4C4/4A4/2B1KAB2 b",
-        ).unwrap();
+        let mut position =
+            Position::from_fen("4k1b2/4a4/4ba3/p8/4cN3/3n2N1P/c8/4C4/4A4/2B1KAB2 b").unwrap();
         let checking_move = position.parse_uci_move("a3a0").unwrap();
         position.make_move(checking_move);
         assert_eq!(position.legal_moves(), [Move::from_uci("c0a2").unwrap()]);
@@ -1325,7 +1341,8 @@ mod tests {
             position,
             phase_ply: 0,
             generation: 0,
-        }].into();
+        }]
+        .into();
         let data = generate_selfplay_chunk(&AzNnue::random(4, 7), &config);
         assert_eq!(data.samples.len(), 1);
         assert_eq!(data.samples[0].search_simulations, 400);
@@ -1463,6 +1480,7 @@ mod tests {
             raw_prior: policy,
             prior: policy,
             policy,
+            solved: None,
         }
     }
 
@@ -1474,6 +1492,7 @@ mod tests {
             raw_prior: 0.0,
             prior: 0.0,
             policy: 0.0,
+            solved: None,
         }
     }
 
@@ -1616,7 +1635,11 @@ mod tests {
             ];
             for temperature in [0.001, 0.05, 0.6, 0.9, 1.2] {
                 let weights = temperature_move_weights(&candidates, temperature, -0.8);
-                assert!(weights.iter().all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0));
+                assert!(
+                    weights
+                        .iter()
+                        .all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0)
+                );
                 assert_eq!(weights[1], 1.0);
             }
         }
@@ -1645,5 +1668,59 @@ mod tests {
         assert_eq!(temperature_for_ply(&config, 0), 1.2);
         assert_eq!(temperature_for_ply(&config, 40), 1.2);
         assert!(temperature_for_ply(&config, 42) < 1.2);
+    }
+
+    #[test]
+    fn solver_temperature_excludes_proven_losses_despite_old_visits() {
+        let mut lost = candidate(Move::new(0, 1), 0.99);
+        lost.visits = u32::MAX;
+        lost.solved = Some(-1);
+        let safe = candidate(Move::new(2, 3), 0.01);
+        let moves = [lost, safe];
+        let mut rng = SplitMix64::new(20260927);
+        for temperature in [0.0, 0.05, 0.9, 1.2] {
+            if temperature > 0.0 {
+                assert_eq!(temperature_move_weights(&moves, temperature, -0.8)[0], 0.0);
+            }
+            for _ in 0..128 {
+                assert_eq!(
+                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng),
+                    Some(moves[1].mv)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn solver_temperature_selects_proven_win_over_unresolved_favorite() {
+        let favorite = candidate(Move::new(0, 1), 0.99);
+        let mut winning = candidate(Move::new(2, 3), 0.01);
+        winning.solved = Some(1);
+        let moves = [favorite, winning];
+        let mut rng = SplitMix64::new(20260927);
+        for temperature in [0.0, 0.05, 0.9, 1.2] {
+            if temperature > 0.0 {
+                assert_eq!(temperature_move_weights(&moves, temperature, -0.8)[0], 0.0);
+            }
+            for _ in 0..128 {
+                assert_eq!(
+                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng),
+                    Some(moves[1].mv)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn solver_temperature_zero_mass_fallback_still_excludes_proven_loss() {
+        let mut lost = candidate(Move::new(0, 1), 0.99);
+        lost.solved = Some(-1);
+        let safe = candidate(Move::new(2, 3), 0.0);
+        let moves = [lost, safe];
+        let mut rng = SplitMix64::new(20260927);
+        assert_eq!(
+            choose_selfplay_move(&moves, 0.9, -0.8, &mut rng),
+            Some(moves[1].mv)
+        );
     }
 }

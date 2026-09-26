@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 flate2 = "1"
+tar = "0.4"
 tensorboard-rs = "0.5"
 byteorder = "1.5"
 candle-core = "0.10.2"

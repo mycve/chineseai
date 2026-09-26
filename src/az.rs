@@ -19,6 +19,7 @@ mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
 mod play;
+pub mod px0_data;
 mod px0_policy_map;
 mod replay;
 mod start;

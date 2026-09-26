@@ -78,6 +78,22 @@ pub struct AzCandidate {
     pub raw_prior: f32,
     pub prior: f32,
     pub policy: f32,
+    /// 已证明的结果，按根走棋方视角：胜 1、和 0、负 -1。
+    pub solved: Option<i8>,
+}
+
+impl AzCandidate {
+    pub(crate) fn proof_priority(&self) -> u8 {
+        proof_priority(self.solved)
+    }
+}
+
+fn proof_priority(solved: Option<i8>) -> u8 {
+    match solved {
+        Some(1) => 2,
+        Some(-1) => 0,
+        _ => 1,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +179,9 @@ pub fn alphazero_search_trace_with_rules(
     for _ in 0..limits.simulations {
         tree.simulate(root, 0);
         used += 1;
-        if stopper.should_stop(&tree, limits.minimum_kldgain_per_node) {
+        if tree.nodes[root].solved.is_some()
+            || stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
+        {
             break;
         }
     }
@@ -290,7 +308,9 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             }
             tree.simulate(root, 0);
             used += 1;
-            if kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node) {
+            if tree.nodes[root].solved.is_some()
+                || kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
+            {
                 break;
             }
             if used % SEARCH_PROGRESS_POLL_SIMULATIONS == 0
@@ -369,7 +389,9 @@ pub(super) fn alphazero_search_with_rules_reusing(
         for _ in 0..limits.simulations {
             tree.simulate(root, 0);
             used += 1;
-            if kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node) {
+            if tree.nodes[root].solved.is_some()
+                || kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
+            {
                 break;
             }
         }
@@ -470,6 +492,8 @@ struct AzNode {
     value: f32,
     value_wdl: [f32; 3],
     expanded: bool,
+    // 只由规则终局与完整子树证明产生，始终是当前走棋方视角。
+    solved: Option<i8>,
 }
 
 #[derive(Clone)]
@@ -506,7 +530,9 @@ impl<'a> AzTree<'a> {
     fn search_result(&self, simulations: usize) -> AzSearchResult {
         let root_node = &self.nodes[self.root];
         let root_children = self.node_children(self.root);
-        let searched_wdl = if root_node.visits > 0 {
+        let searched_wdl = if let Some(value) = root_node.solved {
+            scalar_terminal_wdl(value as f32)
+        } else if root_node.visits > 0 {
             root_node
                 .value_wdl_sum
                 .map(|value| value / root_node.visits as f32)
@@ -525,7 +551,7 @@ impl<'a> AzTree<'a> {
             .map(|(index, (child, policy))| AzCandidate {
                 mv: child.mv,
                 visits: child.visits,
-                q: child.q(self.draw_score),
+                q: self.child_q(child, self.draw_score),
                 raw_prior: self
                     .root_raw_priors
                     .get(index)
@@ -533,6 +559,7 @@ impl<'a> AzTree<'a> {
                     .unwrap_or(child.prior),
                 prior: child.prior,
                 policy,
+                solved: self.child_solved(child),
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -556,6 +583,9 @@ impl<'a> AzTree<'a> {
                 .best_root_child(self.root)
                 .map_or(searched_wdl, |index| {
                     let child = &root_children[index];
+                    if let Some(value) = self.child_solved(child) {
+                        return scalar_terminal_wdl(value as f32);
+                    }
                     if child.visits == 0 {
                         searched_wdl
                     } else {
@@ -591,7 +621,7 @@ impl<'a> AzTree<'a> {
                 ply: trace.len() + 1,
                 mv: child.mv,
                 visits: child.visits,
-                q: child.q(self.node_draw_score(node_index)),
+                q: self.child_q(child, self.node_draw_score(node_index)),
                 prior: child.prior,
                 gives_check: self.nodes[node_index]
                     .position
@@ -605,18 +635,7 @@ impl<'a> AzTree<'a> {
                 break;
             }
             node_index = next_node_index;
-            child_index = self
-                .node_children(node_index)
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| {
-                    left.visits.cmp(&right.visits).then_with(|| {
-                        left.q(self.node_draw_score(node_index))
-                            .total_cmp(&right.q(self.node_draw_score(node_index)))
-                    })
-                })
-                .map(|(index, _)| index)
-                .unwrap_or(0);
+            child_index = self.best_root_child(node_index).unwrap_or(0);
         }
         trace
     }
@@ -723,6 +742,7 @@ impl<'a> AzTree<'a> {
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
             expanded: false,
+            solved: None,
         });
         Self {
             nodes,
@@ -838,6 +858,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].expanded = true;
+            self.nodes[node_index].solved = Some(value as i8);
             return AzEvalOutput { value_wdl, value };
         }
 
@@ -877,6 +898,7 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
             self.nodes[node_index].expanded = true;
+            self.nodes[node_index].solved = Some(-1);
             return AzEvalOutput {
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
@@ -960,6 +982,12 @@ impl<'a> AzTree<'a> {
 
     fn simulate(&mut self, node_index: usize, depth: usize) -> AzEvalOutput {
         crate::scope_profile!("az.search.simulate");
+        if self.nodes[node_index].solved.is_some() {
+            let eval = self.node_eval(node_index);
+            self.add_node_visit(node_index, eval);
+            self.record_leaf_depth(depth, false);
+            return eval;
+        }
         if depth >= self.max_depth {
             let eval = self.cutoff_value(node_index);
             self.add_node_visit(node_index, eval);
@@ -1110,6 +1138,7 @@ impl<'a> AzTree<'a> {
                     value: 0.0,
                     value_wdl: [0.0, 1.0, 0.0],
                     expanded: false,
+                    solved: None,
                 });
                 self.node_children_mut(node_index)[child_index].set_child_node(child_node);
                 child_node
@@ -1127,6 +1156,12 @@ impl<'a> AzTree<'a> {
         let child = &mut self.node_children_mut(node_index)[child_index];
         child.visits += 1;
         add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
+        self.update_solved(node_index);
+        let eval = if self.nodes[node_index].solved.is_some() {
+            self.node_eval(node_index)
+        } else {
+            eval
+        };
         self.add_node_visit(node_index, eval);
         eval
     }
@@ -1144,6 +1179,7 @@ impl<'a> AzTree<'a> {
             let value_wdl = scalar_terminal_wdl(value);
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
+            self.nodes[node_index].solved = Some(value as i8);
             return AzEvalOutput { value_wdl, value };
         }
         let (moves, repetition_flags): (Vec<_>, Vec<_>) = {
@@ -1158,6 +1194,7 @@ impl<'a> AzTree<'a> {
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
+            self.nodes[node_index].solved = Some(-1);
             return AzEvalOutput {
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
@@ -1188,6 +1225,12 @@ impl<'a> AzTree<'a> {
     }
 
     fn node_eval(&self, node_index: usize) -> AzEvalOutput {
+        if let Some(value) = self.nodes[node_index].solved {
+            return AzEvalOutput {
+                value_wdl: scalar_terminal_wdl(value as f32),
+                value: value as f32,
+            };
+        }
         AzEvalOutput {
             value_wdl: self.nodes[node_index].value_wdl,
             value: self.nodes[node_index].value,
@@ -1229,6 +1272,17 @@ impl<'a> AzTree<'a> {
     fn select_child(&self, node_index: usize) -> usize {
         let node = &self.nodes[node_index];
         let children = self.node_children(node_index);
+        if let Some(index) = children
+            .iter()
+            .position(|child| self.child_solved(child) == Some(1))
+        {
+            return index;
+        }
+        let priority = children
+            .iter()
+            .map(|child| self.child_priority(child))
+            .max()
+            .unwrap_or(0);
         let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
         let is_root = node_index == self.root;
         let draw_score = self.node_draw_score(node_index);
@@ -1245,6 +1299,9 @@ impl<'a> AzTree<'a> {
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let mut best: Option<(usize, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
+            if self.child_priority(child) != priority {
+                continue;
+            }
             let score = self.child_score(child, draw_score, fpu_value, parent_visits_sqrt, cpuct);
             if best.is_none_or(|(_, best_prior, best_score)| {
                 score.total_cmp(&best_score).is_gt()
@@ -1260,26 +1317,20 @@ impl<'a> AzTree<'a> {
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
         let draw_score = self.node_draw_score(node_index);
         let children = self.node_children(node_index);
-        let first = children.first()?;
-        let mut best_index = 0;
-        let mut best_visits = first.visits;
-        let mut best_q = first.q(draw_score);
-        let mut best_prior = first.prior;
-        for (index, child) in children.iter().enumerate().skip(1) {
-            let q = child.q(draw_score);
-            if child.visits > best_visits
-                || (child.visits == best_visits
-                    && (q.total_cmp(&best_q).is_gt()
-                        || (q.total_cmp(&best_q).is_eq()
-                            && child.prior.total_cmp(&best_prior).is_gt())))
-            {
-                best_index = index;
-                best_visits = child.visits;
-                best_q = q;
-                best_prior = child.prior;
-            }
-        }
-        Some(best_index)
+        children
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                self.child_priority(left)
+                    .cmp(&self.child_priority(right))
+                    .then_with(|| left.visits.cmp(&right.visits))
+                    .then_with(|| {
+                        self.child_q(left, draw_score)
+                            .total_cmp(&self.child_q(right, draw_score))
+                    })
+                    .then_with(|| left.prior.total_cmp(&right.prior))
+            })
+            .map(|(index, _)| index)
     }
 
     fn compute_cpuct(&self, visits: u32, is_root: bool) -> f32 {
@@ -1314,7 +1365,7 @@ impl<'a> AzTree<'a> {
         cpuct: f32,
     ) -> f32 {
         let q = if child.visits > 0 {
-            child.q(draw_score)
+            self.child_q(child, draw_score)
         } else {
             fpu_value
         };
@@ -1324,27 +1375,91 @@ impl<'a> AzTree<'a> {
 
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
         let children = self.node_children(node_index);
+        let priority = children
+            .iter()
+            .map(|child| self.child_priority(child))
+            .max()
+            .unwrap_or(0);
+        let eligible = |child: &&AzChild| self.child_priority(child) == priority;
         let total_visits = children
             .iter()
+            .filter(eligible)
             .map(|child| child.visits as f32)
             .sum::<f32>()
             .max(1.0);
-        if children.iter().any(|child| child.visits > 0) {
+        if children
+            .iter()
+            .filter(eligible)
+            .any(|child| child.visits > 0)
+        {
             return children
                 .iter()
-                .map(|child| child.visits as f32 / total_visits)
+                .map(|child| {
+                    if self.child_priority(child) == priority {
+                        child.visits as f32 / total_visits
+                    } else {
+                        0.0
+                    }
+                })
                 .collect();
         }
 
         let total_prior = children
             .iter()
+            .filter(eligible)
             .map(|child| child.prior)
             .sum::<f32>()
             .max(1e-12);
         children
             .iter()
-            .map(|child| child.prior / total_prior)
+            .map(|child| {
+                if self.child_priority(child) == priority {
+                    child.prior / total_prior
+                } else {
+                    0.0
+                }
+            })
             .collect()
+    }
+
+    fn child_solved(&self, child: &AzChild) -> Option<i8> {
+        child
+            .child_node()
+            .and_then(|index| self.nodes[index].solved)
+            .map(|value| -value)
+    }
+
+    fn child_priority(&self, child: &AzChild) -> u8 {
+        proof_priority(self.child_solved(child))
+    }
+
+    fn child_q(&self, child: &AzChild, draw_score: f32) -> f32 {
+        self.child_solved(child).map_or_else(
+            || child.q(draw_score),
+            |value| wdl_utility(scalar_terminal_wdl(value as f32), draw_score),
+        )
+    }
+
+    fn update_solved(&mut self, node_index: usize) {
+        let children = self.node_children(node_index);
+        if children.is_empty() {
+            return;
+        }
+        let mut best = -1;
+        let mut complete = true;
+        for child in children {
+            match self.child_solved(child) {
+                Some(1) => {
+                    self.nodes[node_index].solved = Some(1);
+                    return;
+                }
+                Some(value) => best = best.max(value),
+                None => complete = false,
+            }
+        }
+        if complete {
+            self.nodes[node_index].solved = Some(best);
+        }
     }
 }
 
@@ -1600,14 +1715,28 @@ mod tests {
             ..AzSearchLimits::default()
         };
         let ordinary = alphazero_search_with_rules(
-            &position, Some(history.clone()), Some(vec![mv]), &model, limits,
+            &position,
+            Some(history.clone()),
+            Some(vec![mv]),
+            &model,
+            limits,
         );
         let mut workspace = AzSearchWorkspace::new(&model);
         let reused = alphazero_search_with_rules_reusing(
-            &position, &history, vec![mv], &model, limits, &mut workspace,
+            &position,
+            &history,
+            vec![mv],
+            &model,
+            limits,
+            &mut workspace,
         );
         let (traced, _) = alphazero_search_trace_with_rules(
-            &position, Some(history), Some(vec![mv]), &model, limits, mv,
+            &position,
+            Some(history),
+            Some(vec![mv]),
+            &model,
+            limits,
+            mv,
         );
         // 单个根走法的分布恒定：200 次建立基准，400 次第一次比较并停止。
         for result in [ordinary, reused, traced] {
@@ -1615,8 +1744,15 @@ mod tests {
             assert_eq!(result.candidates[0].visits, 400);
         }
         let fixed_budget = alphazero_search_with_rules(
-            &position, None, Some(vec![mv]), &model,
-            AzSearchLimits { simulations: 512, minimum_kldgain_per_node: 0.0, ..limits },
+            &position,
+            None,
+            Some(vec![mv]),
+            &model,
+            AzSearchLimits {
+                simulations: 512,
+                minimum_kldgain_per_node: 0.0,
+                ..limits
+            },
         );
         assert_eq!(fixed_budget.simulations, 512);
     }
@@ -2385,5 +2521,215 @@ mod tests {
             tree.children.capacity(),
             INITIAL_TREE_NODE_CAPACITY * INITIAL_CHILDREN_PER_NODE_ESTIMATE
         );
+    }
+
+    #[test]
+    #[ignore = "需要本地 Px0 65536 蒸馏检查点"]
+    fn solver_does_not_select_proven_mate_in_px0_trajectory() {
+        let model = AzNnue::load("tmp/px0-reservoir-65536.best.safetensors").unwrap();
+        let mut position = Position::from_fen(
+            "rnbakab1r/9/1c4n2/2p1p1p1p/p8/1C7/P1P1P1PcP/3CB4/9/RNBAKA1NR w - - 0 1",
+        )
+        .unwrap();
+        let mut history = position.initial_rule_history();
+        for name in "h0g2 i9h9 c3c4 b9a7 b0c2 b7c7 a3a4 c6c5 c4c5 c7c2 a4a5 a9b9 a5b5 b9a9 i0i1 h9h5 b4g4 g7e8 i1f1 g9e7 a0a2 c2c3 a2a3 c3g3 a3a4 g6g5 a4f4".split_whitespace() {
+            let mv = position.parse_uci_move(name).unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+        let mut tree = AzTree::new(position, history, None, &model, AzSearchLimits::default());
+        let root = tree.root;
+        tree.expand(root);
+        for _ in 0..6400 {
+            tree.simulate(root, 0);
+        }
+        let result = tree.search_result(6400);
+        assert!(
+            tree.node_children(root)
+                .iter()
+                .any(|c| tree.child_solved(c) != Some(-1))
+        );
+        let mut proven_losses = 0;
+        for child in tree.node_children(root) {
+            let candidate = result.candidates.iter().find(|c| c.mv == child.mv).unwrap();
+            if tree.child_solved(child) == Some(-1) {
+                proven_losses += 1;
+                assert_ne!(result.best_move, Some(child.mv));
+                assert_eq!(candidate.policy, 0.0);
+                assert_eq!(candidate.q, -1.0);
+            }
+        }
+        assert!(proven_losses > 0);
+        assert!((result.candidates.iter().map(|c| c.policy).sum::<f32>() - 1.0).abs() < 1e-5);
+        println!(
+            "SOLVER selected={:?} excluded_proven_losses={proven_losses}",
+            result.best_move
+        );
+        for name in ["a9b9", "g5g4", "h5h9"] {
+            let child = tree
+                .node_children(root)
+                .iter()
+                .find(|c| c.mv.to_string() == name)
+                .unwrap();
+            let Some(ni) = child.child_node() else {
+                continue;
+            };
+            let node = &tree.nodes[ni];
+            let children = tree.node_children(ni);
+            let fpu = alphazero_fpu_value_reduction(node, children, 0.23, 0.0);
+            println!(
+                "AUDIT root_move={name} visits={} q={} node_nn_q={} internal_fpu={fpu}",
+                child.visits,
+                child.q(0.0),
+                node.value
+            );
+            for reply in ["f4f9", "f4g4"] {
+                if let Some(edge) = children.iter().find(|c| c.mv.to_string() == reply) {
+                    println!(
+                        "AUDIT reply={reply} visits={} prior={} q={} child_exists={}",
+                        edge.visits,
+                        edge.prior,
+                        edge.q(0.0),
+                        edge.child_node().is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    fn solver_tree_with_two_unresolved_children(model: &AzNnue) -> AzTree<'_> {
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let legal = position.legal_moves();
+        let mut tree = AzTree::new(
+            position,
+            history,
+            Some(legal[..2].to_vec()),
+            model,
+            AzSearchLimits::default(),
+        );
+        let root = tree.root;
+        tree.expand(root);
+        tree.simulate_child(root, 0, 1);
+        tree.simulate_child(root, 1, 1);
+        assert_eq!(tree.nodes[root].solved, None);
+        tree
+    }
+
+    #[test]
+    fn solver_draw_requires_all_replies_proven_and_ignores_network_draw() {
+        let model = AzNnue::random(4, 7);
+        let mut tree = solver_tree_with_two_unresolved_children(&model);
+        let root = tree.root;
+        let first = tree.node_children(root)[0].child_node().unwrap();
+        let second = tree.node_children(root)[1].child_node().unwrap();
+        tree.nodes[first].solved = Some(0);
+        tree.nodes[second].value = 0.0;
+        tree.nodes[second].value_wdl = [0.0, 1.0, 0.0];
+        tree.update_solved(root);
+        assert_eq!(tree.nodes[root].solved, None);
+        assert_eq!(tree.nodes[second].solved, None);
+        tree.nodes[second].solved = Some(1);
+        tree.update_solved(root);
+        assert_eq!(tree.nodes[root].solved, Some(0));
+        assert_eq!(tree.node_eval(root).value_wdl, [0.0, 1.0, 0.0]);
+        assert_eq!(tree.root_policy(root), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn solver_win_and_loss_flip_child_perspective() {
+        let model = AzNnue::random(4, 7);
+        let mut winning = solver_tree_with_two_unresolved_children(&model);
+        let root = winning.root;
+        let first = winning.node_children(root)[0].child_node().unwrap();
+        winning.nodes[first].solved = Some(-1);
+        winning.update_solved(root);
+        assert_eq!(winning.nodes[root].solved, Some(1));
+        assert_eq!(winning.node_eval(root).value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(winning.root_policy(root), vec![1.0, 0.0]);
+        let mut losing = solver_tree_with_two_unresolved_children(&model);
+        let root = losing.root;
+        for index in 0..2 {
+            let child = losing.node_children(root)[index].child_node().unwrap();
+            losing.nodes[child].solved = Some(1);
+        }
+        losing.update_solved(root);
+        assert_eq!(losing.nodes[root].solved, Some(-1));
+        assert_eq!(losing.node_eval(root).value_wdl, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn solver_marks_actual_rule_draw_without_network_prediction() {
+        let model = AzNnue::random(4, 7);
+        let mut position = Position::startpos();
+        position.set_rule60_max_ply(Some(1));
+        let mv = position.legal_moves()[0];
+        let mut history = position.initial_rule_history();
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+        assert!(matches!(
+            position.rule_outcome_with_history(&history),
+            Some(RuleOutcome::Draw(_))
+        ));
+        let mut tree = AzTree::new(position, history, None, &model, AzSearchLimits::default());
+        let root = tree.root;
+        let output = tree.expand(root);
+        assert_eq!(tree.nodes[root].solved, Some(0));
+        assert_eq!(output.value_wdl, [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn solver_proven_mate_stops_all_search_paths_before_kl_interval() {
+        let model = AzNnue::random(4, 7);
+        let mut position = Position::from_fen(
+            "r1baka3/4n4/n3b4/4p3p/1PP3pr1/5RC2/4P1ccP/3CB1N2/5R3/2BAKA3 b - - 3 1",
+        )
+        .unwrap();
+        let mut history = position.initial_rule_history();
+        let mv = position.parse_uci_move("a9b9").unwrap();
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+        let mate = position.parse_uci_move("f4f9").unwrap();
+        let limits = AzSearchLimits {
+            simulations: 10000,
+            minimum_kldgain_per_node: 0.00005,
+            ..AzSearchLimits::default()
+        };
+        let ordinary = alphazero_search_with_rules(
+            &position,
+            Some(history.clone()),
+            Some(vec![mate]),
+            &model,
+            limits,
+        );
+        let mut workspace = AzSearchWorkspace::new(&model);
+        let reused = alphazero_search_with_rules_reusing(
+            &position,
+            &history,
+            vec![mate],
+            &model,
+            limits,
+            &mut workspace,
+        );
+        let (traced, trace) = alphazero_search_trace_with_rules(
+            &position,
+            Some(history),
+            Some(vec![mate]),
+            &model,
+            limits,
+            mate,
+        );
+        for result in [ordinary, reused, traced] {
+            assert_eq!(result.simulations, 1);
+            assert_eq!(result.best_move, Some(mate));
+            assert_eq!(result.value_wdl, [1.0, 0.0, 0.0]);
+            assert_eq!(result.best_value_wdl, [1.0, 0.0, 0.0]);
+            assert_ne!(result.network_value_wdl, result.value_wdl);
+            assert_eq!(result.candidates[0].visits, 1);
+            assert_eq!(result.candidates[0].policy, 1.0);
+            assert_eq!(result.candidates[0].q, 1.0);
+        }
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].q, 1.0);
     }
 }
