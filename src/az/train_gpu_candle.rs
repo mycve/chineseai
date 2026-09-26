@@ -508,6 +508,7 @@ mod monitoring_tests {
         let position = crate::xiangqi::Position::startpos();
         let moves = position.legal_moves();
         let sample = AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: crate::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
             move_indices: moves

@@ -139,6 +139,14 @@ impl Position {
             .collect()
     }
 
+    pub fn move_repeats_history(&self, history: &[RuleHistoryEntry], mv: Move) -> bool {
+        let next_hash = self.hash_after_move(mv);
+        let next_side = self.side_to_move.opposite();
+        history
+            .iter()
+            .any(|entry| entry.hash == next_hash && entry.side_to_move == next_side)
+    }
+
     pub fn legal_moves_with_rules_and_repetition(
         &self,
         history: &[RuleHistoryEntry],
@@ -158,11 +166,7 @@ impl Position {
         legal
             .into_iter()
             .filter_map(|mv| {
-                let next_hash = self.hash_after_move(mv);
-                let next_side_to_move = mover.opposite();
-                let repeats_history = history.iter().any(|entry| {
-                    entry.hash == next_hash && entry.side_to_move == next_side_to_move
-                });
+                let repeats_history = self.move_repeats_history(history, mv);
                 if !repeats_history {
                     return Some((mv, false));
                 }
@@ -538,6 +542,25 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_candidate_is_marked_from_exact_history() {
+        let mut position = Position::startpos();
+        let mut history = position.initial_rule_history();
+        for notation in ["a0a1", "a9a8", "a1a0"] {
+            let mv = position.parse_uci_move(notation).unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+        let repeat = position.parse_uci_move("a8a9").unwrap();
+        assert!(position.move_repeats_history(&history, repeat));
+        assert!(
+            position
+                .legal_moves_with_rules_and_repetition(&history)
+                .iter()
+                .any(|&(mv, repeats)| mv == repeat && repeats)
+        );
+    }
 
     #[test]
     fn full_cycle_chase_diff_detects_discovered_attack() {

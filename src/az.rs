@@ -288,6 +288,8 @@ macro_rules! az_weight_tensors {
         $visit!(policy_sparse_table, [POLICY_SPARSE_TABLE_SIZE]);
         $visit!(policy_sparse_factor, [POLICY_SPARSE_FACTOR_SIZE]);
         $visit!(policy_tactical, [POLICY_TACTICAL_SIZE]);
+        $visit!(policy_repetition_hidden, [$h]);
+        $visit!(policy_repetition_bias, [1]);
     };
 }
 
@@ -1008,6 +1010,8 @@ pub struct AzNnue {
     pub policy_sparse_table: Vec<f32>,
     pub policy_sparse_factor: Vec<f32>,
     pub policy_tactical: Vec<f32>,
+    pub policy_repetition_hidden: Vec<f32>,
+    pub policy_repetition_bias: Vec<f32>,
     policy_accumulator_features: Vec<f32>,
     policy_accumulator_moved_delta: Vec<f32>,
     policy_accumulator_capture: Vec<f32>,
@@ -1048,6 +1052,8 @@ impl Clone for AzNnue {
             policy_sparse_table: self.policy_sparse_table.clone(),
             policy_sparse_factor: self.policy_sparse_factor.clone(),
             policy_tactical: self.policy_tactical.clone(),
+            policy_repetition_hidden: self.policy_repetition_hidden.clone(),
+            policy_repetition_bias: self.policy_repetition_bias.clone(),
             policy_accumulator_features: self.policy_accumulator_features.clone(),
             policy_accumulator_moved_delta: self.policy_accumulator_moved_delta.clone(),
             policy_accumulator_capture: self.policy_accumulator_capture.clone(),
@@ -1171,6 +1177,8 @@ pub struct AzLoopReport {
     pub train_start_source_rate: [f32; 3],
     pub train_policy_target_top1: f32,
     pub train_policy_target_top2: f32,
+    pub train_repetition_opportunity_rate: f32,
+    pub train_repetition_target_mass: f32,
     pub train_sparse_activation: AzSparseActivationStats,
     pub terminal_no_legal_moves: usize,
     pub terminal_checkmate: usize,
@@ -1210,6 +1218,7 @@ pub struct AzTrainingSample {
     pub features: Vec<usize>,
     pub rule_context: [f32; RULE_CONTEXT_SIZE],
     pub move_indices: Vec<usize>,
+    pub repetition_flags: Vec<u8>,
     pub policy: Vec<f32>,
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub root_search_wdl: [f32; WDL_HEAD_SIZE],
@@ -1231,6 +1240,14 @@ pub struct AzPolicyGroupStats {
     pub quiet_target_mass: f32,
     pub quiet_predicted_mass: f32,
     pub quiet_top1_rank: f32,
+    pub repetition_samples: usize,
+    pub no_repetition_samples: usize,
+    pub repetition_kl: f32,
+    pub no_repetition_kl: f32,
+    pub repetition_target_mass: f32,
+    pub repetition_predicted_mass: f32,
+    pub repetition_target_top1_rate: f32,
+    pub repetition_predicted_top1_rate: f32,
 }
 
 pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> AzPolicyGroupStats {
@@ -1262,7 +1279,13 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
         if moves.len() != sample.policy.len() {
             continue;
         }
-        model.evaluate_with_scratch_output(&position, &moves, &sample.rule_context, &mut scratch);
+        model.evaluate_with_scratch_output_with_repetition(
+            &position,
+            &moves,
+            &sample.repetition_flags,
+            &sample.rule_context,
+            &mut scratch,
+        );
         let max_logit = scratch
             .logits
             .iter()
@@ -1295,6 +1318,41 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
             .zip(&predicted)
             .map(|(&target, &probability)| -target.max(0.0) * probability.max(1.0e-12).ln())
             .sum::<f32>();
+        if sample.repetition_flags.len() == moves.len() {
+            let entropy = sample
+                .policy
+                .iter()
+                .filter(|&&target| target > 0.0)
+                .map(|&target| -target * target.ln())
+                .sum::<f32>();
+            if sample.repetition_flags.iter().any(|&flag| flag != 0) {
+                stats.repetition_samples += 1;
+                stats.repetition_kl += ce - entropy;
+                stats.repetition_target_mass += sample
+                    .policy
+                    .iter()
+                    .zip(&sample.repetition_flags)
+                    .filter_map(|(&target, &flag)| (flag != 0).then_some(target))
+                    .sum::<f32>();
+                stats.repetition_predicted_mass += predicted
+                    .iter()
+                    .zip(&sample.repetition_flags)
+                    .filter_map(|(&probability, &flag)| (flag != 0).then_some(probability))
+                    .sum::<f32>();
+                stats.repetition_target_top1_rate += f32::from(sample.repetition_flags[top1] != 0);
+                let predicted_top1 = predicted
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                stats.repetition_predicted_top1_rate +=
+                    f32::from(sample.repetition_flags[predicted_top1] != 0);
+            } else {
+                stats.no_repetition_samples += 1;
+                stats.no_repetition_kl += ce - entropy;
+            }
+        }
         if quiet[top1] {
             stats.quiet_samples += 1;
             stats.quiet_ce += ce;
@@ -1325,6 +1383,13 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
     stats.quiet_target_mass = quiet_target_mass_sum / total_samples;
     stats.quiet_predicted_mass = quiet_predicted_mass_sum / total_samples;
     stats.quiet_top1_rank = quiet_rank_sum / stats.quiet_samples.max(1) as f32;
+    let repetition_count = stats.repetition_samples.max(1) as f32;
+    stats.repetition_kl /= repetition_count;
+    stats.no_repetition_kl /= stats.no_repetition_samples.max(1) as f32;
+    stats.repetition_target_mass /= repetition_count;
+    stats.repetition_predicted_mass /= repetition_count;
+    stats.repetition_target_top1_rate /= repetition_count;
+    stats.repetition_predicted_top1_rate /= repetition_count;
     stats
 }
 
@@ -1571,6 +1636,8 @@ impl AzNnue {
         let policy_sparse_table = vec![0.0; POLICY_SPARSE_TABLE_SIZE];
         let policy_sparse_factor = vec![0.0; POLICY_SPARSE_FACTOR_SIZE];
         let policy_tactical = vec![0.0; POLICY_TACTICAL_SIZE];
+        let policy_repetition_hidden = vec![0.0; hidden_size];
+        let policy_repetition_bias = vec![0.0; 1];
         let mut model = Self {
             hidden_size,
             arch,
@@ -1598,6 +1665,8 @@ impl AzNnue {
             policy_sparse_table,
             policy_sparse_factor,
             policy_tactical,
+            policy_repetition_hidden,
+            policy_repetition_bias,
             policy_accumulator_features: Vec::new(),
             policy_accumulator_moved_delta: Vec::new(),
             policy_accumulator_capture: Vec::new(),
@@ -1707,6 +1776,8 @@ impl AzNnue {
             policy_accumulator_move,
             policy_sparse_table: load_candle_f32_tensor(&tensors, "policy_sparse_table")?,
             policy_sparse_factor: load_candle_f32_tensor(&tensors, "policy_sparse_factor")?,
+            policy_repetition_hidden: load_candle_f32_tensor(&tensors, "policy_repetition_hidden")?,
+            policy_repetition_bias: load_candle_f32_tensor(&tensors, "policy_repetition_bias")?,
             policy_tactical: load_candle_f32_tensor(&tensors, "policy_tactical")?,
             policy_accumulator_features: Vec::new(),
             policy_accumulator_moved_delta: Vec::new(),
@@ -1778,6 +1849,23 @@ impl AzNnue {
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
+        self.evaluate_with_scratch_output_with_repetition(
+            position,
+            moves,
+            &[],
+            rule_context,
+            scratch,
+        )
+    }
+
+    pub(super) fn evaluate_with_scratch_output_with_repetition(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        repetition_flags: &[u8],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_with_scratch");
         let mut features = std::mem::take(&mut scratch.features);
         {
@@ -1810,7 +1898,14 @@ impl AzNnue {
                 threat_logits,
             )
         };
-        self.evaluate_prepared_hidden_with_scratch(position, &features, value, moves, scratch);
+        self.evaluate_prepared_hidden_with_scratch(
+            position,
+            &features,
+            value,
+            moves,
+            repetition_flags,
+            scratch,
+        );
         scratch.features = features;
         AzEvalOutput { value_wdl, value }
     }
@@ -1821,6 +1916,7 @@ impl AzNnue {
         accumulator_hidden: &[f32],
         policy_accumulator: &[f32; POLICY_ACCUMULATOR_RANK],
         moves: &[Move],
+        repetition_flags: &[u8],
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
@@ -1859,7 +1955,14 @@ impl AzNnue {
                 threat_logits,
             )
         };
-        self.evaluate_prepared_hidden_with_scratch(position, &[], value, moves, scratch);
+        self.evaluate_prepared_hidden_with_scratch(
+            position,
+            &[],
+            value,
+            moves,
+            repetition_flags,
+            scratch,
+        );
         AzEvalOutput { value_wdl, value }
     }
 
@@ -1869,6 +1972,7 @@ impl AzNnue {
         features: &[usize],
         value: f32,
         moves: &[Move],
+        repetition_flags: &[u8],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         scratch.policy_context.resize(POLICY_MOVE_CONTEXT_SIZE, 0.0);
@@ -1888,7 +1992,14 @@ impl AzNnue {
                 );
             }
         }
-        self.evaluate_prepared_hidden_with_context(position, features, value, moves, scratch)
+        self.evaluate_prepared_hidden_with_context(
+            position,
+            features,
+            value,
+            moves,
+            repetition_flags,
+            scratch,
+        )
     }
 
     fn evaluate_prepared_hidden_with_context(
@@ -1897,6 +2008,7 @@ impl AzNnue {
         features: &[usize],
         value: f32,
         moves: &[Move],
+        repetition_flags: &[u8],
         scratch: &mut AzEvalScratch,
     ) -> f32 {
         scratch.logits.resize(moves.len(), 0.0);
@@ -1913,6 +2025,8 @@ impl AzNnue {
             .unwrap_or_default();
         let opponent_attacks = attack_masks[color_index(side.opposite())];
         let own_attacks = attack_masks[color_index(side)];
+        let repetition_logit = dot_product(&scratch.hidden, &self.policy_repetition_hidden)
+            + self.policy_repetition_bias[0];
         {
             crate::scope_profile!("az.eval.policy_logits");
             {
@@ -2002,7 +2116,9 @@ impl AzNnue {
                         )
                         + accumulator_logit
                         + sparse_logit
-                        + tactical_logit;
+                        + tactical_logit
+                        + f32::from(repetition_flags.get(index).copied().unwrap_or(0))
+                            * repetition_logit;
                 }
             }
         }
@@ -2582,6 +2698,7 @@ pub fn benchmark_training(
             *value /= policy_sum;
         }
         samples.push(AzTrainingSample {
+            repetition_flags: Vec::new(),
             features,
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices,
@@ -3270,6 +3387,7 @@ pub fn dense_move_index(mv: Move) -> usize {
 fn replay_pool_test_fixture() -> AzExperiencePool {
     fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
         AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: vec![1, 2, 3],
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: vec![0, 1],
@@ -3308,6 +3426,42 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repetition_policy_metrics_separate_opportunities_and_model_mass() {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let sample = AzTrainingSample {
+            features: crate::nnue::extract_sparse_features_az(&position),
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            move_indices: moves
+                .iter()
+                .take(2)
+                .map(|&mv| dense_move_index(mv))
+                .collect(),
+            repetition_flags: vec![1, 0],
+            policy: vec![1.0, 0.0],
+            value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
+            value: 0.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            search_simulations: 1,
+            meta: AzSampleMeta::default(),
+        };
+        let model = AzNnue::random(8, 19);
+        let baseline = evaluate_policy_groups(&model, std::slice::from_ref(&sample));
+        assert_eq!(baseline.repetition_samples, 1);
+        assert_eq!(baseline.no_repetition_samples, 0);
+        assert_eq!(baseline.repetition_target_mass, 1.0);
+        let mut favored = model.clone();
+        favored.policy_repetition_bias[0] = 5.0;
+        let changed = evaluate_policy_groups(&favored, &[sample]);
+        assert!(changed.repetition_predicted_mass > baseline.repetition_predicted_mass);
+        assert!(changed.repetition_kl < baseline.repetition_kl);
+    }
 
     #[test]
     fn tactical_piece_factor_is_folded_into_exact_cpu_table() {
@@ -3573,6 +3727,7 @@ mod tests {
 
         let samples = vec![
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![0],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3588,6 +3743,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![1],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3603,6 +3759,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![2],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3618,6 +3775,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![3],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3650,6 +3808,7 @@ mod tests {
     #[test]
     fn short_value_heads_can_overfit_tiny_fixed_dataset() {
         let make_sample = |feature: usize, value: f32| AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: vec![feature],
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: Vec::new(),
@@ -3699,6 +3858,7 @@ mod tests {
     fn batched_training_is_deterministic() {
         let samples = vec![
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![0, 4, 8],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3714,6 +3874,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![1, 5, 9],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3729,6 +3890,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![2, 6, 10],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3744,6 +3906,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![3, 7, 11],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3789,6 +3952,7 @@ mod tests {
     fn value_only_training_updates_trunk_when_trunk_training_enabled() {
         let samples = vec![
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![0, 4, 8],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3804,6 +3968,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![1, 5, 9],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3819,6 +3984,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![2, 6, 10],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3834,6 +4000,7 @@ mod tests {
                 meta: AzSampleMeta::default(),
             },
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![3, 7, 11],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: Vec::new(),
@@ -3968,6 +4135,7 @@ mod tests {
     fn replay_pool_prunes_whole_game_chunks() {
         fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![1],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: vec![0],
@@ -4010,6 +4178,7 @@ mod tests {
     fn replay_pool_mixed_recent_sampling_uses_requested_recent_fraction() {
         fn sample(update: u32, game_id: u64, ply: u16) -> AzTrainingSample {
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![1],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: vec![0],
@@ -4052,6 +4221,7 @@ mod tests {
     fn replay_recent_games_counts_complete_games_not_generation_batches() {
         fn sample(game_id: u64) -> AzTrainingSample {
             AzTrainingSample {
+                repetition_flags: Vec::new(),
                 features: vec![1],
                 rule_context: [0.0; RULE_CONTEXT_SIZE],
                 move_indices: vec![0],

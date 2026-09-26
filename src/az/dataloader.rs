@@ -198,6 +198,7 @@ pub(super) struct PackedBatch {
     pub policy_tactical_indices: Vec<i64>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
+    pub policy_repetition: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub short_value_wdl: Vec<f32>,
     pub values: Vec<f32>,
@@ -254,6 +255,7 @@ impl PackedBatch {
             ],
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
+            policy_repetition: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             short_value_wdl: vec![0.0f32; batch_size * super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
@@ -328,10 +330,22 @@ impl PackedBatch {
         let opponent_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Black);
         let own_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Red);
         let mut policy_offset = 0usize;
-        for (&move_index, &target) in sample.move_indices.iter().zip(sample.policy.iter()) {
+        for (sample_offset, (&move_index, &target)) in sample
+            .move_indices
+            .iter()
+            .zip(sample.policy.iter())
+            .enumerate()
+        {
             if move_index < DENSE_MOVE_SPACE {
                 self.policy_targets[policy_base + policy_offset] = target.max(0.0);
                 self.policy_mask[policy_base + policy_offset] = 0.0;
+                self.policy_repetition[policy_base + policy_offset] = f32::from(
+                    sample
+                        .repetition_flags
+                        .get(sample_offset)
+                        .copied()
+                        .unwrap_or(0),
+                );
                 let mut consequence_from = 0usize;
                 let mut consequence_to = 0usize;
                 let mut consequence_captured = 0usize;
@@ -577,6 +591,7 @@ mod tests {
 
     fn sample(index: usize) -> AzTrainingSample {
         AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: vec![index % AZ_NNUE_INPUT_SIZE],
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: vec![0, 1],

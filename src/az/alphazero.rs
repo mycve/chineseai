@@ -769,26 +769,36 @@ impl<'a> AzTree<'a> {
             return AzEvalOutput { value_wdl, value };
         }
 
-        let moves = {
+        let (moves, repetition_flags): (Vec<_>, Vec<_>) = {
             crate::scope_profile!("az.search.expand_legal_moves");
             if node_index == self.root {
                 if let Some(moves) = self.root_moves.take() {
-                    moves
+                    let flags = moves
+                        .iter()
+                        .map(|&mv| {
+                            u8::from(
+                                self.nodes[node_index]
+                                    .position
+                                    .move_repeats_history(&self.rule_history_scratch, mv),
+                            )
+                        })
+                        .collect();
+                    (moves, flags)
                 } else {
                     self.nodes[node_index]
                         .position
                         .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
                         .into_iter()
-                        .map(|(mv, _)| mv)
-                        .collect()
+                        .map(|(mv, repeats)| (mv, u8::from(repeats)))
+                        .unzip()
                 }
             } else {
                 self.nodes[node_index]
                     .position
                     .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
                     .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect()
+                    .map(|(mv, repeats)| (mv, u8::from(repeats)))
+                    .unzip()
             }
         };
         if moves.is_empty() {
@@ -810,6 +820,7 @@ impl<'a> AzTree<'a> {
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
+                &repetition_flags,
                 &rule_context_features(
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,
@@ -1063,14 +1074,14 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value_wdl = value_wdl;
             return AzEvalOutput { value_wdl, value };
         }
-        let moves: Vec<_> = {
+        let (moves, repetition_flags): (Vec<_>, Vec<_>) = {
             crate::scope_profile!("az.search.expand_legal_moves");
             self.nodes[node_index]
                 .position
                 .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
                 .into_iter()
-                .map(|(mv, _)| mv)
-                .collect()
+                .map(|(mv, repeats)| (mv, u8::from(repeats)))
+                .unzip()
         };
         if moves.is_empty() {
             self.nodes[node_index].value = -1.0;
@@ -1089,6 +1100,7 @@ impl<'a> AzTree<'a> {
                 &self.accumulator_arena[accumulator_start..accumulator_end],
                 &self.nodes[node_index].policy_accumulator,
                 &moves,
+                &repetition_flags,
                 &rule_context_features(
                     &self.nodes[node_index].position,
                     &self.rule_history_scratch,

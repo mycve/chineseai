@@ -1453,6 +1453,8 @@ struct TrainBatchSourceStats {
     policy_target_entropy: f32,
     policy_target_top1: f32,
     policy_target_top2: f32,
+    repetition_opportunity_rate: f32,
+    repetition_target_mass: f32,
     start_source_rate: [f32; 3],
     sparse_activation: AzSparseActivationStats,
 }
@@ -1662,6 +1664,8 @@ fn build_async_training_report(
         train_start_source_rate: train_source.start_source_rate,
         train_policy_target_top1: train_source.policy_target_top1,
         train_policy_target_top2: train_source.policy_target_top2,
+        train_repetition_opportunity_rate: train_source.repetition_opportunity_rate,
+        train_repetition_target_mass: train_source.repetition_target_mass,
         train_sparse_activation: train_source.sparse_activation,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_checkmate: pending.selfplay.terminal.checkmate,
@@ -1701,6 +1705,8 @@ fn train_batch_source_stats(
     let mut target_entropy_sum = 0.0f32;
     let mut target_top1_sum = 0.0f32;
     let mut target_top2_sum = 0.0f32;
+    let mut repetition_opportunities = 0usize;
+    let mut repetition_target_mass_sum = 0.0f32;
     let mut start_source_count = [0usize; 3];
     for sample in samples {
         start_source_count[sample.meta.start_source.index()] += 1;
@@ -1745,6 +1751,22 @@ fn train_batch_source_stats(
         }
         target_top1_sum += top[0];
         target_top2_sum += top[0] + top[1];
+        if sample.repetition_flags.len() == sample.move_indices.len()
+            && sample.repetition_flags.iter().any(|&flag| flag != 0)
+        {
+            repetition_opportunities += 1;
+            let mass = sample
+                .move_indices
+                .iter()
+                .zip(&sample.policy)
+                .zip(&sample.repetition_flags)
+                .filter_map(|((&move_index, &target), &flag)| {
+                    (move_index < DENSE_MOVE_SPACE && flag != 0)
+                        .then_some(normalize_target(target.max(0.0)))
+                })
+                .sum::<f32>();
+            repetition_target_mass_sum += mass;
+        }
     }
     let denom = samples.len() as f32;
     let sparse_activation = sparse_activation_stats(samples, 4096);
@@ -1757,6 +1779,8 @@ fn train_batch_source_stats(
         policy_target_entropy: target_entropy_sum / denom,
         policy_target_top1: target_top1_sum / denom,
         policy_target_top2: target_top2_sum / denom,
+        repetition_opportunity_rate: repetition_opportunities as f32 / denom,
+        repetition_target_mass: repetition_target_mass_sum / repetition_opportunities.max(1) as f32,
         start_source_rate: start_source_count.map(|count| count as f32 / denom),
         sparse_activation,
     }
@@ -3884,6 +3908,20 @@ fn main() {
                     update,
                     report.train_policy_target_top2,
                 );
+                log_scalar(
+                    &mut tb,
+                    "train/repetition_opportunity_rate",
+                    update,
+                    report.train_repetition_opportunity_rate,
+                );
+                if report.train_repetition_opportunity_rate > 0.0 {
+                    log_scalar(
+                        &mut tb,
+                        "train/repetition_target_mass",
+                        update,
+                        report.train_repetition_target_mass,
+                    );
+                }
                 for (name, value) in [
                     ("value_threat_coverage", sparse.value_threat_coverage),
                     ("policy_exact_coverage", sparse.policy_exact_coverage),
@@ -6310,6 +6348,7 @@ fn load_pikafish_training_samples(path: &str) -> io::Result<Vec<AzTrainingSample
         let sum = wdl.iter().sum::<f32>().max(1.0);
         wdl.iter_mut().for_each(|x| *x /= sum);
         samples.push(AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: extract_sparse_features_az(&position),
             rule_context: chineseai::az::rule_context_features(
                 &position,
@@ -6612,6 +6651,7 @@ mod reporting_tests {
 
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: vec![0],
             rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
             move_indices: (0..policy.len()).collect(),
@@ -6633,10 +6673,12 @@ mod reporting_tests {
 
     #[test]
     fn train_source_reports_actual_recent_and_real_target_shape() {
-        let samples = vec![
+        let mut samples = vec![
             reporting_sample(10, vec![3.0, 1.0]),
             reporting_sample(5, vec![2.0, 2.0]),
         ];
+        samples[0].repetition_flags = vec![1, 0];
+        samples[1].repetition_flags = vec![0, 0];
         let stats = train_batch_source_stats(&samples, 4_000, 1, 1);
 
         assert!((stats.recent_quota_rate - 0.5).abs() < 1e-6);
@@ -6646,6 +6688,8 @@ mod reporting_tests {
         assert!((stats.policy_target_entropy - expected_entropy).abs() < 1e-6);
         assert!((stats.policy_target_top1 - 0.625).abs() < 1e-6);
         assert!((stats.policy_target_top2 - 1.0).abs() < 1e-6);
+        assert!((stats.repetition_opportunity_rate - 0.5).abs() < 1e-6);
+        assert!((stats.repetition_target_mass - 0.75).abs() < 1e-6);
     }
 
     #[test]

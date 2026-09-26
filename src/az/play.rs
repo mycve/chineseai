@@ -835,6 +835,10 @@ fn make_training_sample(
         .copied()
         .map(|mv| dense_move_index(canonical_move(side, mv)))
         .collect();
+    let repetition_flags = candidates
+        .iter()
+        .map(|candidate| u8::from(position.move_repeats_history(rule_history, candidate.mv)))
+        .collect();
     let mut policy = candidates
         .iter()
         .map(|candidate| candidate.policy.max(0.0))
@@ -848,6 +852,7 @@ fn make_training_sample(
         features,
         rule_context: rule_context_features(position, rule_history),
         move_indices,
+        repetition_flags,
         policy,
         value_wdl: scalar_value_to_wdl_target(value),
         root_search_wdl: normalize_wdl_target(root_search_wdl),
@@ -1518,6 +1523,7 @@ mod tests {
 
     fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
         AzTrainingSample {
+            repetition_flags: Vec::new(),
             features: Vec::new(),
             rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
             move_indices: Vec::new(),

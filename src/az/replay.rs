@@ -77,6 +77,8 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
         || sample.policy.len() != sample.move_indices.len()
+        || (!sample.repetition_flags.is_empty()
+            && sample.repetition_flags.len() != sample.move_indices.len())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -93,6 +95,11 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_u32(out, sample.move_indices.len() as u32);
     for &m in &sample.move_indices {
         replay_push_u32(out, m as u32);
+    }
+    if sample.repetition_flags.is_empty() {
+        out.resize(out.len() + sample.move_indices.len(), 0);
+    } else {
+        out.extend_from_slice(&sample.repetition_flags);
     }
     for &p in &sample.policy {
         replay_push_f32(out, p);
@@ -210,6 +217,14 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     for _ in 0..nm {
         move_indices.push(replay_read_u32(reader)? as usize);
     }
+    let mut repetition_flags = vec![0; nm as usize];
+    reader.read_exact(&mut repetition_flags)?;
+    if repetition_flags.iter().any(|&flag| flag > 1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "replay decode: invalid repetition flag",
+        ));
+    }
     let mut policy = Vec::with_capacity(nm as usize);
     for _ in 0..nm {
         policy.push(replay_read_f32(reader)?);
@@ -258,6 +273,7 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         features,
         rule_context,
         move_indices,
+        repetition_flags,
         policy,
         value_wdl,
         root_search_wdl,
@@ -795,6 +811,7 @@ mod tests {
 
     fn sample(source: AzStartSource, generation: u32, id: u64) -> AzTrainingSample {
         AzTrainingSample {
+            repetition_flags: vec![0],
             features: vec![0],
             rule_context: [0.0; super::super::RULE_CONTEXT_SIZE],
             move_indices: vec![0],
@@ -821,6 +838,7 @@ mod tests {
         let mut encoded = Vec::new();
         let mut original = sample(AzStartSource::OpeningPool, 7, 11);
         original.root_search_wdl = [0.6, 0.3, 0.1];
+        original.repetition_flags[0] = 1;
         original.short_value_wdl = [[0.5, 0.3, 0.2], [0.4, 0.4, 0.2], [0.3, 0.5, 0.2]];
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
@@ -829,6 +847,7 @@ mod tests {
         assert_eq!(decoded.meta.game_id, 11);
         assert_eq!(decoded.root_search_wdl, original.root_search_wdl);
         assert_eq!(decoded.short_value_wdl, original.short_value_wdl);
+        assert_eq!(decoded.repetition_flags, original.repetition_flags);
     }
 
     #[test]
