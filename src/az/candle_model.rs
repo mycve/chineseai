@@ -524,6 +524,77 @@ mod tests {
     };
 
     #[test]
+    #[ignore = "需要本地已训练检查点、Px0数据及CUDA；只核对前向"]
+    fn trained_cuda_forward_matches_search_cpu() {
+        let path = std::env::var("CHINESEAI_AUDIT_MODEL")
+            .unwrap_or_else(|_| "tmp/px0-reservoir-131072.epoch-3.safetensors".into());
+        let model = AzNnue::load(path).unwrap();
+        let dataset =
+            crate::az::px0_data::load(std::path::Path::new("data/data.bin"), 1024, 1024).unwrap();
+        let stride = (dataset.train.len() / 128).max(1);
+        let samples: Vec<_> = dataset
+            .train
+            .iter()
+            .step_by(stride)
+            .take(128)
+            .cloned()
+            .collect();
+        assert!(samples.len() >= 64);
+        let device = Device::new_cuda(0).unwrap();
+        let candle = AzCandleModel::from_model(&model, &device).unwrap();
+        let ids: Vec<_> = (0..samples.len()).collect();
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&samples, &ids), &device).unwrap();
+        let forward = candle.forward(&batch).unwrap();
+        let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let policy = forward.policy_logits.to_vec2::<f32>().unwrap();
+        let mut max_value = 0f32;
+        let mut max_policy = 0f32;
+        let mut max_wdl = 0f32;
+        let mut moves_checked = 0;
+        for (row, sample) in samples.iter().enumerate() {
+            let position = crate::az::position_for_training_sample(sample).unwrap();
+            let moves: Vec<_> = sample
+                .move_indices
+                .iter()
+                .map(|&index| {
+                    let (from, to) = crate::az::dense_move_squares(index).unwrap();
+                    crate::xiangqi::Move::new(from, to)
+                })
+                .collect();
+            let mut scratch = AzEvalScratch::new(model.arch);
+            let cpu = model.evaluate_with_scratch_output_with_repetition(
+                &position,
+                &moves,
+                &sample.repetition_flags,
+                &sample.rule_context,
+                &mut scratch,
+            );
+            max_value = max_value.max((cpu.value - (wdl[row][0] - wdl[row][2])).abs());
+            for (a, b) in cpu.value_wdl.iter().zip(&wdl[row]) {
+                max_wdl = max_wdl.max((a - b).abs());
+            }
+            for (a, b) in scratch.logits.iter().zip(&policy[row]) {
+                max_policy = max_policy.max((a - b).abs());
+            }
+            moves_checked += moves.len();
+            assert!(
+                (cpu.value - (wdl[row][0] - wdl[row][2])).abs() < 1e-4,
+                "row={row} fen={}",
+                position.to_fen()
+            );
+        }
+        println!(
+            "trained GPU/CPU audit: samples={} moves={moves_checked} max_value={max_value:.8} max_wdl={max_wdl:.8} max_policy={max_policy:.8}",
+            samples.len()
+        );
+        assert!(max_wdl < 1e-4 && max_policy < 1e-3);
+    }
+
+    #[test]
     fn candle_and_cpu_policy_consequence_logits_match() {
         let position =
             Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
@@ -601,6 +672,10 @@ mod tests {
             search_simulations: 1,
             meta: AzSampleMeta::default(),
         };
+        let (sample_wdl, _, sample_logits) =
+            crate::az::outputs_for_training_sample(&model, &sample).unwrap();
+        assert_eq!(sample_wdl, cpu_output.value_wdl);
+        assert_eq!(sample_logits, cpu.logits);
         let packed = PackedBatch::from_indices(&[sample], &[0]);
         let batch = BatchTensors::from_packed(packed, &Device::Cpu).unwrap();
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();

@@ -566,11 +566,13 @@ impl AzExperiencePool {
     }
 
     pub fn all_samples(&self) -> Vec<AzTrainingSample> {
+        self.iter_samples().cloned().collect()
+    }
+
+    pub fn iter_samples(&self) -> impl Iterator<Item = &AzTrainingSample> {
         self.chunks
             .iter()
-            .flat_map(|chunk| chunk.entries.iter())
-            .map(|entry| entry.sample.clone())
-            .collect()
+            .flat_map(|chunk| chunk.entries.iter().map(|entry| &entry.sample))
     }
 
     pub fn all_sample_groups(&self) -> Vec<Vec<AzTrainingSample>> {

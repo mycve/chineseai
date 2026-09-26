@@ -435,6 +435,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let enable_resign = rng.unit_f32() >= config.resign_playthrough;
         let mut game_samples = Vec::new();
         let mut result = None;
+        let mut search_failed = false;
         let mut plies = 0usize;
 
         for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
@@ -550,7 +551,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             };
             let Some(mv) = mv_opt else {
                 terminal.search_no_move += 1;
-                result = Some(0.0);
+                search_failed = true;
                 break;
             };
             let mut move_meta = move_search_meta(
@@ -646,11 +647,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
         }
-        if result.is_none() {
+        if result.is_none() && !search_failed {
             terminal.max_plies += 1;
         }
 
-        let result: f32 = result.unwrap_or(0.0);
+        let terminal_result = result;
+        let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => red_wins += 1,
             std::cmp::Ordering::Less => black_wins += 1,
@@ -660,8 +662,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            assign_terminal_value_targets(&mut game_samples, result);
-            assign_short_value_targets(&mut game_samples, result);
+            if let Some(result) = terminal_result {
+                assign_terminal_value_targets(&mut game_samples, result);
+                assign_short_value_targets(&mut game_samples, result);
+            } else {
+                // 步数截断或搜索失败不是规则和棋；没有终局标签时只训练policy。
+                for sample in &mut game_samples {
+                    sample.value_weight = 0.0;
+                }
+            }
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -1403,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_monitoring_tracks_cutoffs_without_changing_legacy_labels() {
+    fn cutoff_games_keep_policy_but_do_not_train_false_draw_values() {
         let model = AzNnue::random(16, 20260907);
         let mut config = selfplay_test_config(4);
         config.max_plies = 1;
@@ -1413,7 +1422,12 @@ mod tests {
         assert_eq!(data.terminal.search_no_move, 0);
         assert_eq!(data.draws, 4);
         assert!(!data.samples.is_empty());
-        assert!(data.samples.iter().all(|sample| sample.value_weight == 1.0));
+        assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
+        assert!(
+            data.samples
+                .iter()
+                .all(|sample| sample.policy_weight == 1.0)
+        );
     }
 
     #[test]
@@ -1525,6 +1539,7 @@ mod tests {
 
         assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(samples[0].value, 1.0);
+        assert!(samples.iter().all(|sample| sample.value_weight == 1.0));
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
     }

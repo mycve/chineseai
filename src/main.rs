@@ -2465,7 +2465,10 @@ fn main() {
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             // 评估在主线程同步汇总时，训练结果仍可排队，避免反压训练和自对弈流水线。
             let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
-            println!("selfplay : workers={} queue={}", selfplay_worker_count, selfplay_queue_capacity);
+            println!(
+                "selfplay : workers={} queue={}",
+                selfplay_worker_count, selfplay_queue_capacity
+            );
             let mut arena_reference_model = initial_arena_reference_model;
             let mut champion_paths =
                 champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
@@ -2525,8 +2528,7 @@ fn main() {
                                 .read()
                                 .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
                             if shared.version != local_version {
-                                local_model =
-                                    Some(Arc::clone(&shared.model));
+                                local_model = Some(Arc::clone(&shared.model));
                                 local_version = shared.version;
                                 local_learner_update = shared.learner_update;
                             }
@@ -3049,6 +3051,16 @@ fn main() {
                     report.selfplay_start_temperature[1],
                     report.selfplay_start_temperature[2],
                 );
+                let truncated = report.terminal_max_plies + report.terminal_search_no_move;
+                let completed = report.games.saturating_sub(truncated);
+                println!(
+                    "outcomes {update:04}: completed={} draw_rate={:.3} cutoff={} search_failed={} unknown_rate={:.3}",
+                    completed,
+                    report.draws.saturating_sub(truncated) as f32 / completed.max(1) as f32,
+                    report.terminal_max_plies,
+                    report.terminal_search_no_move,
+                    truncated as f32 / report.games.max(1) as f32,
+                );
                 let sparse = report.train_sparse_activation;
                 println!(
                     "sparse   {update:04}: subset={}/{} moves={} coverage(value/exact/factor/tactical)={:.6}/{:.6}/{:.6}/{:.6} unique={}/{}/{}/{}",
@@ -3513,9 +3525,7 @@ fn main() {
                 );
                 log_scalar(&mut tb, "stats/avg_max_child_q", update, report.avg_best_q);
                 log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
-                // Unknown outcomes remain legacy draw labels; exclude them from completed-game statistics.
-                let truncated = report.terminal_max_plies + report.terminal_search_no_move;
-                let completed = report.games.saturating_sub(truncated);
+                // 未知结果不训练value，也不计入已完成对局的和棋率。
                 log_scalar(
                     &mut tb,
                     "selfplay/completed_games",

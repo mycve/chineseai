@@ -20,6 +20,9 @@ struct Args {
     seed: u64,
     #[arg(long, default_value = "tmp/px0-distill.safetensors")]
     output: String,
+    /// 从已有检查点继续监督训练；优化器状态重新初始化。
+    #[arg(long)]
+    initial_model: Option<String>,
     /// 小样本记忆实验，保留独立的整局验证集。
     #[arg(long)]
     train_limit: Option<usize>,
@@ -92,11 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let mut model = AzNnue::random(args.hidden, args.seed);
+    let mut model = match args.initial_model.as_ref() {
+        Some(path) => AzNnue::load(path)?,
+        None => AzNnue::random(args.hidden, args.seed),
+    };
     let evaluated_train = &data.train[..data.train.len().min(args.eval_train_samples)];
     println!(
         "experiment hidden={} seed={} lr={} batch={} policy_weight={} value_weight={} train_eval={}",
-        args.hidden,
+        model.hidden_size,
         args.seed,
         args.lr,
         args.batch,

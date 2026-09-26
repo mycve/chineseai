@@ -4,7 +4,7 @@ use chineseai::{
     xiangqi::{Color, Position},
 };
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 #[path = "support/pikafish.rs"]
 mod pikafish;
@@ -23,13 +23,29 @@ struct Args {
     pikafish: String,
     #[arg(long, value_delimiter = ',', default_value = "400,1600")]
     simulations: Vec<usize>,
+    #[arg(long, default_value_t = 10)]
+    depth: usize,
+    #[arg(long)]
+    trace: bool,
+    /// 从真实对局前若干步选出每局损失最大的落子，保存为固定病例。
+    #[arg(long)]
+    discover_output: Option<String>,
+    #[arg(long, default_value_t = 30)]
+    discover_plies: usize,
+    /// 优先检查尚可防守的局面，避免在已败局中比较两个败着。
+    #[arg(long, default_value_t = -200)]
+    discover_min_best_cp: i32,
+    #[arg(long)]
+    search_config: Option<String>,
+    #[arg(long)]
+    minimum_kldgain_per_node: Option<f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Cases {
     cases: Vec<Case>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Case {
     game: usize,
     ply: usize,
@@ -49,13 +65,109 @@ fn command(fen: &str, moves: &[&str]) -> String {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let mut base_limits = AzSearchLimits::default();
+    if let Some(path) = args.search_config.as_ref() {
+        let config: toml::Value = toml::from_str(&fs::read_to_string(path)?)?;
+        macro_rules! load_fields {
+            ($($field:ident),*) => { $(if let Some(value) = config.get(stringify!($field)) {
+                base_limits.$field = value.clone().try_into()?;
+            })* };
+        }
+        load_fields!(
+            seed,
+            cpuct,
+            cpuct_at_root,
+            cpuct_base,
+            cpuct_factor,
+            cpuct_base_at_root,
+            cpuct_factor_at_root,
+            root_dirichlet_alpha,
+            root_exploration_fraction,
+            fpu_value,
+            fpu_value_at_root,
+            fpu_absolute_at_root,
+            minimum_kldgain_per_node,
+            policy_softmax_temp,
+            draw_score
+        );
+    }
+    if let Some(value) = args.minimum_kldgain_per_node {
+        base_limits.minimum_kldgain_per_node = value;
+    }
     let model = AzNnue::load(&args.model)?;
     let text = fs::read_to_string(&args.trajectories)?;
+    if let Some(output) = args.discover_output.as_ref() {
+        let mut engine = Engine::new(&args.pikafish)?;
+        let mut cases = Vec::new();
+        for line in text
+            .lines()
+            .filter(|line| line.starts_with("vs-pikafish-final:"))
+        {
+            let game: usize = line
+                .split("game=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()?;
+            let chinese = if line.contains("chinese=red") {
+                Color::Red
+            } else {
+                Color::Black
+            };
+            let (fen, moves) = line
+                .split(" position fen ")
+                .nth(1)
+                .unwrap()
+                .split_once(" moves ")
+                .unwrap();
+            let moves = moves.split_whitespace().collect::<Vec<_>>();
+            let mut position = Position::from_fen(fen)?;
+            let mut worst = None;
+            let mut worst_gap = 0;
+            for (ply, &played) in moves.iter().take(args.discover_plies).enumerate() {
+                if position.side_to_move() == chinese {
+                    let cmd = command(fen, &moves[..ply]);
+                    let best = engine.score(&cmd, args.depth, None)?;
+                    let actual = engine.score(&cmd, args.depth, Some(played))?;
+                    let gap = best.cp - actual.cp;
+                    if best.cp >= args.discover_min_best_cp && gap > worst_gap {
+                        worst_gap = gap;
+                        worst = Some(Case {
+                            game,
+                            ply,
+                            fen: position.to_fen(),
+                            played: played.into(),
+                        });
+                    }
+                }
+                let mv = position
+                    .parse_uci_move(played)
+                    .ok_or("invalid trajectory move")?;
+                position.make_move(mv);
+            }
+            if let Some(case) = worst {
+                println!(
+                    "discovered game={game} ply={} played={} cp_gap={worst_gap}",
+                    case.ply, case.played
+                );
+                cases.push(case);
+            }
+        }
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)?;
+        file.write_all(toml::to_string(&Cases { cases })?.as_bytes())?;
+        return Ok(());
+    }
     let cases: Cases = toml::from_str(&fs::read_to_string(&args.cases)?)?;
     let mut engine = Engine::new(&args.pikafish)?;
     let mut evaluated = 0;
     println!(
-        "audit model={} fixed_cases={} simulations={:?}",
+        "audit model={} fixed_cases={} simulations={:?} limits={base_limits:?}",
         args.model,
         cases.cases.len(),
         args.simulations
@@ -107,8 +219,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ply = case.ply;
         let played = case.played.as_str();
         let cmd = command(fen, &moves[..ply]);
-        let best = engine.score(&cmd, 10, None)?;
-        let actual = engine.score(&cmd, 10, Some(played))?;
+        let best = engine.score(&cmd, args.depth, None)?;
+        let actual = engine.score(&cmd, args.depth, Some(played))?;
         println!(
             "CASE game={game} ply={ply} side={chinese:?} fen=\"{}\" played={played} pf_best={best:?} pf_played={actual:?}",
             position.to_fen()
@@ -129,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wdl[2] - wdl[0]
             );
         }
-        if game == 5 {
+        if actual.mate == Some(-1) {
             let mut child = position.clone();
             let mut child_history = history.clone();
             for name in &actual.pv {
@@ -146,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 child.rule_outcome_with_history(&child_history)
             );
         }
-        if game == 5 {
+        if actual.mate == Some(-1) && played == "a9b9" {
             for name in ["a9b9", "g5g4"] {
                 let mut child = position.clone();
                 let mv = child.parse_uci_move(name).ok_or("invalid branch move")?;
@@ -160,7 +272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &model,
                     AzSearchLimits {
                         simulations: 400,
-                        ..AzSearchLimits::default()
+                        ..base_limits
                     },
                 );
                 let mut priors = reply.candidates.clone();
@@ -184,11 +296,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &model,
                 AzSearchLimits {
                     simulations,
-                    ..AzSearchLimits::default()
+                    ..base_limits
                 },
             );
             let selected = search.best_move.unwrap().to_string();
-            let score = engine.score(&cmd, 10, Some(&selected))?;
+            let score = engine.score(&cmd, args.depth, Some(&selected))?;
             let mut order = search.candidates.clone();
             order.sort_by(|a, b| b.raw_prior.total_cmp(&a.raw_prior));
             let best_rank = order
@@ -210,7 +322,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 search.value_q,
                 search.search_depth_max
             );
-            if game == 5 && simulations == 6400 {
+            if args.trace || (game == 5 && simulations == 6400) {
+                if args.trace {
+                    let mut child = position.clone();
+                    let mut child_history = history.clone();
+                    let mv = search.best_move.unwrap();
+                    child_history.push(child.rule_history_entry_after_move(mv));
+                    child.make_move(mv);
+                    let mut child_moves = moves[..ply].to_vec();
+                    child_moves.push(&selected);
+                    let pf_reply = engine.score(&command(fen, &child_moves), args.depth, None)?;
+                    let reply = alphazero_search_with_rules(
+                        &child,
+                        Some(child_history),
+                        None,
+                        &model,
+                        AzSearchLimits {
+                            simulations,
+                            ..base_limits
+                        },
+                    );
+                    println!(
+                        "  opponent_probe sims={simulations} pf_reply={pf_reply:?} selected={:?} pf_candidate={:?} search_q={:.4}",
+                        reply.best_move,
+                        reply
+                            .candidates
+                            .iter()
+                            .find(|c| c.mv.to_string() == pf_reply.best),
+                        reply.value_q,
+                    );
+                }
                 let (_, trace) = alphazero_search_trace_with_rules(
                     &position,
                     Some(history.clone()),
@@ -218,7 +359,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &model,
                     AzSearchLimits {
                         simulations,
-                        ..AzSearchLimits::default()
+                        ..base_limits
                     },
                     search.best_move.unwrap(),
                 );

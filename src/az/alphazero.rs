@@ -2498,6 +2498,162 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要本地已训练检查点；不训练、不对弈"]
+    fn trained_incremental_value_matches_full_recompute() {
+        let path = std::env::var("CHINESEAI_AUDIT_MODEL")
+            .unwrap_or_else(|_| "tmp/px0-reservoir-131072.epoch-3.safetensors".into());
+        let model = AzNnue::load(path).unwrap();
+        let mut rng = SplitMix64::new(20260928);
+        let mut checked = 0;
+        let mut captures = 0;
+        let mut king_moves = 0;
+        let mut max_hidden = 0f32;
+        let mut max_value = 0f32;
+        let mut max_policy = 0f32;
+        for game in 0..8 {
+            let mut position = Position::startpos();
+            let mut history = position.initial_rule_history();
+            let mut hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+            let mut policy = [
+                model.policy_accumulator(&position, Color::Red),
+                model.policy_accumulator(&position, Color::Black),
+            ];
+            for ply in 0..160 {
+                let moves = position.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                let context = rule_context_features(&position, &history);
+                let mut full = AzEvalScratch::new(model.arch);
+                let mut incremental = AzEvalScratch::new(model.arch);
+                let a = model.evaluate_with_scratch_output(&position, &moves, &context, &mut full);
+                let b = model.evaluate_incremental_with_scratch_output(
+                    &position,
+                    &hidden,
+                    &policy[color_index(position.side_to_move())],
+                    &moves,
+                    &[],
+                    &context,
+                    &mut incremental,
+                );
+                max_value = max_value.max((a.value - b.value).abs());
+                for (a, b) in a.value_wdl.iter().zip(b.value_wdl) {
+                    max_value = max_value.max((a - b).abs());
+                }
+                for (a, b) in full.logits.iter().zip(&incremental.logits) {
+                    max_policy = max_policy.max((a - b).abs());
+                }
+                let refreshed = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+                for (a, b) in hidden.iter().zip(refreshed) {
+                    max_hidden = max_hidden.max((a - b).abs());
+                }
+                assert!(
+                    (a.value - b.value).abs() < 1e-4,
+                    "game={game} ply={ply} fen={}",
+                    position.to_fen()
+                );
+                checked += 1;
+                let preferred: Vec<_> = moves
+                    .iter()
+                    .copied()
+                    .filter(|mv| {
+                        if ply % 5 == 0 {
+                            position.piece_at(mv.from as usize).unwrap().kind
+                                == crate::xiangqi::PieceKind::General
+                        } else {
+                            position.piece_at(mv.to as usize).is_some()
+                        }
+                    })
+                    .collect();
+                let choices = if preferred.is_empty() {
+                    &moves
+                } else {
+                    &preferred
+                };
+                let mv = choices[rng.next_u64() as usize % choices.len()];
+                let before = position.clone();
+                let moved = before.piece_at(mv.from as usize).unwrap();
+                let captured = before.piece_at(mv.to as usize);
+                captures += usize::from(captured.is_some());
+                king_moves += usize::from(moved.kind == crate::xiangqi::PieceKind::General);
+                position.make_move(mv);
+                AzEvalAccumulator::apply_transition_to_hidden(
+                    &model,
+                    &before,
+                    &position,
+                    mv,
+                    moved,
+                    captured,
+                    &mut hidden,
+                );
+                for side in [Color::Red, Color::Black] {
+                    model.apply_policy_transition(
+                        &before,
+                        &position,
+                        mv,
+                        moved,
+                        captured,
+                        side,
+                        &mut policy[color_index(side)],
+                    );
+                }
+                history.push(position.rule_history_entry_after_moved(
+                    before.side_to_move(),
+                    mv,
+                    captured,
+                ));
+            }
+        }
+        // 核对搜索实际存储的单视角、跨祖父节点更新的缓存。
+        let position = Position::startpos();
+        let root_history = position.initial_rule_history();
+        let mut tree = AzTree::new(
+            position,
+            root_history.clone(),
+            None,
+            &model,
+            AzSearchLimits {
+                simulations: 800,
+                ..AzSearchLimits::default()
+            },
+        );
+        for _ in 0..800 {
+            tree.simulate(tree.root, 0);
+        }
+        for node in &tree.nodes {
+            let fresh = AzEvalAccumulator::new(&model, &node.position).into_hidden_sum();
+            let expected = AzEvalAccumulator::hidden_for_slice(
+                &fresh,
+                model.hidden_size,
+                node.position.side_to_move(),
+            );
+            let offset = node.accumulator_offset as usize;
+            for (a, b) in tree.accumulator_arena[offset..offset + model.hidden_size]
+                .iter()
+                .zip(expected)
+            {
+                max_hidden = max_hidden.max((a - b).abs());
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "tree cache fen={}",
+                    node.position.to_fen()
+                );
+            }
+            let expected_policy =
+                model.policy_accumulator(&node.position, node.position.side_to_move());
+            for (a, b) in node.policy_accumulator.iter().zip(expected_policy) {
+                assert!((a - b).abs() < 1e-4, "tree policy cache");
+            }
+        }
+        println!(
+            "incremental audit: sequence_positions={checked} tree_nodes={} captures={captures} king_moves={king_moves} max_hidden={max_hidden:.8} max_value={max_value:.8} max_policy={max_policy:.8}",
+            tree.nodes.len()
+        );
+        assert!(captures > 0 && king_moves > 0 && checked > 100);
+        assert!(max_policy < 1e-3);
+    }
+
+    #[test]
     fn huge_timed_simulation_limit_uses_bounded_initial_capacity() {
         let position = Position::startpos();
         let model = AzNnue::random(4, 71);

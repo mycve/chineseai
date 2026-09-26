@@ -1894,21 +1894,9 @@ impl AzNnue {
                 &mut scratch.value_threat_accumulator,
                 &mut scratch.value_threat_activation,
             );
-            self.value_wdl_from_hidden_into(
-                &scratch.hidden,
-                &features,
-                &mut scratch.value_head,
-                threat_logits,
-            )
+            self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head, threat_logits)
         };
-        self.evaluate_prepared_hidden_with_scratch(
-            position,
-            &features,
-            value,
-            moves,
-            repetition_flags,
-            scratch,
-        );
+        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         scratch.features = features;
         AzEvalOutput { value_wdl, value }
     }
@@ -1951,33 +1939,19 @@ impl AzNnue {
                 &mut scratch.value_threat_accumulator,
                 &mut scratch.value_threat_activation,
             );
-            self.value_wdl_from_hidden_into(
-                &scratch.hidden,
-                &[],
-                &mut scratch.value_head,
-                threat_logits,
-            )
+            self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head, threat_logits)
         };
-        self.evaluate_prepared_hidden_with_scratch(
-            position,
-            &[],
-            value,
-            moves,
-            repetition_flags,
-            scratch,
-        );
+        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         AzEvalOutput { value_wdl, value }
     }
 
-    fn evaluate_prepared_hidden_with_scratch(
+    fn evaluate_policy_with_scratch(
         &self,
         position: &Position,
-        features: &[usize],
-        value: f32,
         moves: &[Move],
         repetition_flags: &[u8],
         scratch: &mut AzEvalScratch,
-    ) -> f32 {
+    ) {
         scratch.policy_context.resize(POLICY_MOVE_CONTEXT_SIZE, 0.0);
         for (context_index, context) in scratch.policy_context.iter_mut().enumerate() {
             let start = context_index * self.hidden_size;
@@ -1995,25 +1969,6 @@ impl AzNnue {
                 );
             }
         }
-        self.evaluate_prepared_hidden_with_context(
-            position,
-            features,
-            value,
-            moves,
-            repetition_flags,
-            scratch,
-        )
-    }
-
-    fn evaluate_prepared_hidden_with_context(
-        &self,
-        position: &Position,
-        features: &[usize],
-        value: f32,
-        moves: &[Move],
-        repetition_flags: &[u8],
-        scratch: &mut AzEvalScratch,
-    ) -> f32 {
         scratch.logits.resize(moves.len(), 0.0);
         if scratch.policy_piece_square_scores.is_empty() {
             self.fill_policy_piece_square_scores(&mut scratch.policy_piece_square_scores);
@@ -2125,8 +2080,6 @@ impl AzNnue {
                 }
             }
         }
-        let _ = features;
-        value
     }
 
     fn fill_policy_gives_checks(&self, position: &Position, moves: &[Move], output: &mut Vec<f32>) {
@@ -2360,22 +2313,9 @@ impl AzNnue {
         logits
     }
 
-    #[allow(dead_code)]
-    fn value_from_hidden_into(
-        &self,
-        hidden: &[f32],
-        features: &[usize],
-        value_head: &mut Vec<f32>,
-    ) -> f32 {
-        let probs =
-            self.value_wdl_from_hidden_into(hidden, features, value_head, [0.0; WDL_HEAD_SIZE]);
-        probs.1
-    }
-
     fn value_wdl_from_hidden_into(
         &self,
         hidden: &[f32],
-        features: &[usize],
         value_head: &mut Vec<f32>,
         threat_logits: [f32; WDL_HEAD_SIZE],
     ) -> ([f32; WDL_HEAD_SIZE], f32) {
@@ -2387,7 +2327,6 @@ impl AzNnue {
             *value += dot_product(hidden, hidden_row);
             *value = (*value).max(0.0);
         }
-        let _ = features;
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
             let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
@@ -2762,8 +2701,13 @@ pub fn outputs_for_training_sample(
         return None;
     }
     let mut scratch = AzEvalScratch::new(model.arch);
-    let evaluated =
-        model.evaluate_with_scratch_output(&position, &moves, &sample.rule_context, &mut scratch);
+    let evaluated = model.evaluate_with_scratch_output_with_repetition(
+        &position,
+        &moves,
+        &sample.repetition_flags,
+        &sample.rule_context,
+        &mut scratch,
+    );
     let short = std::array::from_fn(|head| {
         let base = head * WDL_HEAD_SIZE * VALUE_HEAD_SIZE;
         let bias = head * WDL_HEAD_SIZE;
@@ -3572,7 +3516,11 @@ mod tests {
     fn scalar_value_head_starts_neutral() {
         let model = AzNnue::random(16, 7);
         let mut scratch = AzEvalScratch::new(model.arch);
-        let value = model.value_from_hidden_into(&scratch.hidden, &[], &mut scratch.value_head);
+        let (_, value) = model.value_wdl_from_hidden_into(
+            &scratch.hidden,
+            &mut scratch.value_head,
+            [0.0; WDL_HEAD_SIZE],
+        );
 
         assert!(value.abs() < 1e-6);
     }
