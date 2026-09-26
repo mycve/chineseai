@@ -977,7 +977,46 @@ impl<'a> AzTree<'a> {
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
         self.nodes[node_index].expanded = true;
+        if let Some(index) = self.immediate_mate_child(node_index) {
+            let mut depth = 1;
+            let mut parent = node_index;
+            while parent != self.root {
+                depth += 1;
+                parent = self.nodes[parent].parent as usize;
+            }
+            // 建立终局子节点并传播证明；父节点的本次访问由 simulate 统一计数。
+            let visits = self.nodes[node_index].visits;
+            let sum = self.nodes[node_index].value_wdl_sum;
+            let proven = self.simulate_child(node_index, index, depth);
+            self.nodes[node_index].visits = visits;
+            self.nodes[node_index].value_wdl_sum = sum;
+            return proven;
+        }
         eval
+    }
+
+    fn immediate_mate_child(&self, node_index: usize) -> Option<usize> {
+        let position = &self.nodes[node_index].position;
+        for (index, child) in self.node_children(node_index).iter().enumerate() {
+            if !position.gives_check_after_move_fast(child.mv) {
+                continue;
+            }
+            let mut reply = position.clone();
+            reply.make_move(child.mv);
+            if !reply.legal_moves().is_empty() {
+                continue;
+            }
+            let mut history = self.rule_history_scratch.clone();
+            history.push(position.rule_history_entry_after_move(child.mv));
+            match reply.rule_outcome_with_history(&history) {
+                None => return Some(index),
+                Some(RuleOutcome::Win(side)) if side == position.side_to_move() => {
+                    return Some(index);
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn simulate(&mut self, node_index: usize, depth: usize) -> AzEvalOutput {
@@ -1004,6 +1043,7 @@ impl<'a> AzTree<'a> {
             // 应将；若应将后仍被将军，会递归继续。唯一合法着同理不是
             // 需要策略分配预算的选择。
             if self.nodes[node_index].children_len > 0
+                && self.nodes[node_index].solved.is_none()
                 && (was_in_check || self.nodes[node_index].children_len == 1)
             {
                 let child_index = self.select_child(node_index);
@@ -1647,6 +1687,85 @@ fn sample_standard_normal(rng: &mut SplitMix64, salt: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
+
+    const HIDDEN_MATE_FEN: &str =
+        "2bak2r1/4a4/4b4/p2R4p/4C1n2/2P1c3P/P1r3P2/4B4/4A4/2BK1A2R w - - 1 1";
+
+    #[test]
+    fn expansion_proves_immediate_mate_without_prior_visits() {
+        let position = Position::from_fen(HIDDEN_MATE_FEN).unwrap();
+        let mut model = AzNnue::random(16, 7);
+        let mate = position.parse_uci_move("d6d9").unwrap();
+        model.policy_move_bias[super::super::dense_move_index(crate::nnue::canonical_move(
+            position.side_to_move(),
+            mate,
+        ))] = -100.0;
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits {
+                simulations: 1,
+                ..Default::default()
+            },
+        );
+        let eval = tree.simulate(tree.root, 0);
+        assert_eq!(eval.value, 1.0);
+        assert_eq!(tree.nodes[tree.root].solved, Some(1));
+        assert_eq!(tree.nodes[tree.root].visits, 1);
+        let winning: Vec<_> = tree
+            .node_children(tree.root)
+            .iter()
+            .filter(|child| {
+                child.child != NO_CHILD && tree.nodes[child.child as usize].solved == Some(-1)
+            })
+            .collect();
+        assert_eq!(winning.len(), 1);
+        assert_eq!(winning[0].mv.to_string(), "d6d9");
+        assert_eq!(winning[0].visits, 1);
+    }
+
+    #[test]
+    fn mate_probe_respects_root_move_restriction() {
+        let position = Position::from_fen(HIDDEN_MATE_FEN).unwrap();
+        let model = AzNnue::random(16, 7);
+        let mv = position.parse_uci_move("g3g4").unwrap();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            Some(vec![mv]),
+            &model,
+            AzSearchLimits {
+                max_depth: 1,
+                ..Default::default()
+            },
+        );
+        tree.expand(tree.root);
+        assert_eq!(tree.nodes[tree.root].solved, None);
+        assert_eq!(tree.node_children(tree.root).len(), 1);
+    }
+
+    #[test]
+    fn checking_move_with_escape_is_not_mate() {
+        let position = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K2R1 w - - 0 1").unwrap();
+        let model = AzNnue::random(16, 7);
+        let mv = position.parse_uci_move("h0h9").unwrap();
+        assert!(position.gives_check_after_move_fast(mv));
+        let mut reply = position.clone();
+        reply.make_move(mv);
+        assert!(!reply.legal_moves().is_empty());
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            Some(vec![mv]),
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.expand(tree.root);
+        assert_eq!(tree.nodes[tree.root].solved, None);
+        assert_eq!(tree.nodes[tree.root].visits, 0);
+    }
 
     #[test]
     fn absolute_root_fpu_explores_unvisited_move_despite_negative_parent_value() {
