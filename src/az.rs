@@ -18,9 +18,10 @@ mod dataloader;
 mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
-mod midgame;
 mod play;
+mod px0_policy_map;
 mod replay;
+mod start;
 mod train;
 mod train_gpu;
 #[cfg(any(
@@ -49,16 +50,16 @@ pub use alphazero::{
     cp_from_q,
 };
 pub use dataloader::{AzSparseActivationStats, sparse_activation_stats};
-pub use midgame::{AzMidgamePool, AzStartSnapshot};
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions, play_arena_games_from_snapshots,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
+pub use start::AzStartSnapshot;
 pub use train::{train_samples, train_samples_weighted, train_samples_weighted_owned};
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
-pub const DENSE_MOVE_SPACE: usize = compute_dense_move_count();
+pub const DENSE_MOVE_SPACE: usize = 2062;
 pub(super) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
@@ -1076,28 +1077,29 @@ pub struct AzLoopConfig {
     pub workers: usize,
     pub generation_update: u32,
     pub temperature_start: f32,
+    pub temperature_cutoff_plies: usize,
+    pub temperature_visit_offset: f32,
+    pub resign_percentage: f32,
+    pub resign_playthrough: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub restart_temperature_start: f32,
-    pub restart_temperature_decay_plies: usize,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
     pub cpuct_base: f32,
     pub cpuct_factor: f32,
     pub cpuct_base_at_root: f32,
     pub cpuct_factor_at_root: f32,
-    /// 动态 Dirichlet 总浓度；alpha = 总浓度 / 根合法走法数，0 关闭噪声。
-    pub root_dirichlet_total_concentration: f32,
+    /// 每个根走法的固定 Dirichlet alpha，0 关闭噪声。
+    pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
+    pub fpu_absolute_at_root: bool,
+    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,
-    pub opening_start_fraction: f32,
-    pub midgame_positions: Arc<[AzStartSnapshot]>,
-    pub midgame_start_fraction: f32,
     pub mirror_probability: f32,
     pub record_fens: bool,
 }
@@ -1443,7 +1445,7 @@ pub fn rule_context_features(
 pub enum AzStartSource {
     #[default]
     Startpos = 0,
-    OpeningPool = 1,
+    OpeningBook = 1,
     Midgame = 2,
 }
 
@@ -1453,7 +1455,7 @@ impl AzStartSource {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Startpos),
-            1 => Some(Self::OpeningPool),
+            1 => Some(Self::OpeningBook),
             2 => Some(Self::Midgame),
             _ => None,
         }
@@ -3258,83 +3260,6 @@ fn splitmix64(mut value: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-const fn is_advisor_pos(rank: usize, file: usize) -> bool {
-    matches!(
-        (rank, file),
-        (0, 3) | (0, 5) | (1, 4) | (2, 3) | (2, 5) | (7, 3) | (7, 5) | (8, 4) | (9, 3) | (9, 5)
-    )
-}
-
-const fn is_elephant_pos(rank: usize, file: usize) -> bool {
-    matches!(
-        (rank, file),
-        (0, 2)
-            | (0, 6)
-            | (2, 0)
-            | (2, 4)
-            | (2, 8)
-            | (4, 2)
-            | (4, 6)
-            | (5, 2)
-            | (5, 6)
-            | (7, 0)
-            | (7, 4)
-            | (7, 8)
-            | (9, 2)
-            | (9, 6)
-    )
-}
-
-const fn is_valid_policy_move(from: usize, to: usize) -> bool {
-    let from_file = from % BOARD_FILES;
-    let from_rank = from / BOARD_FILES;
-    let to_file = to % BOARD_FILES;
-    let to_rank = to / BOARD_FILES;
-
-    let df_signed = to_file as i32 - from_file as i32;
-    let dr_signed = to_rank as i32 - from_rank as i32;
-    let df = if df_signed < 0 { -df_signed } else { df_signed };
-    let dr = if dr_signed < 0 { -dr_signed } else { dr_signed };
-
-    if df == 0 || dr == 0 {
-        return true;
-    }
-    if (df == 1 && dr == 2) || (df == 2 && dr == 1) {
-        return true;
-    }
-    if df == 1
-        && dr == 1
-        && is_advisor_pos(from_rank, from_file)
-        && is_advisor_pos(to_rank, to_file)
-    {
-        return true;
-    }
-    if df == 2
-        && dr == 2
-        && is_elephant_pos(from_rank, from_file)
-        && is_elephant_pos(to_rank, to_file)
-    {
-        return true;
-    }
-    false
-}
-
-const fn compute_dense_move_count() -> usize {
-    let mut count = 0;
-    let mut from = 0;
-    while from < BOARD_SIZE {
-        let mut to = 0;
-        while to < BOARD_SIZE {
-            if from != to && is_valid_policy_move(from, to) {
-                count += 1;
-            }
-            to += 1;
-        }
-        from += 1;
-    }
-    count
-}
-
 struct MoveMap {
     sparse_to_dense: [u16; SPARSE_MOVE_SPACE],
     #[allow(dead_code)]
@@ -3346,19 +3271,11 @@ fn move_map() -> &'static MoveMap {
     static MAP: OnceLock<MoveMap> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut sparse_to_dense = [u16::MAX; SPARSE_MOVE_SPACE];
-        let mut dense_to_sparse = [0u16; DENSE_MOVE_SPACE];
-        let mut idx = 0usize;
-        for from in 0..BOARD_SIZE {
-            for to in 0..BOARD_SIZE {
-                if from != to && is_valid_policy_move(from, to) {
-                    let sparse = from * BOARD_SIZE + to;
-                    sparse_to_dense[sparse] = idx as u16;
-                    dense_to_sparse[idx] = sparse as u16;
-                    idx += 1;
-                }
-            }
+        let dense_to_sparse = px0_policy_map::PX0_MOVES;
+        for (index, &sparse) in dense_to_sparse.iter().enumerate() {
+            assert_eq!(sparse_to_dense[sparse as usize], u16::MAX);
+            sparse_to_dense[sparse as usize] = index as u16;
         }
-        assert_eq!(idx, DENSE_MOVE_SPACE);
         MoveMap {
             sparse_to_dense,
             dense_to_sparse,
@@ -3504,9 +3421,35 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn px0_policy_indices_cover_both_sides_of_legal_selfplay() {
+        assert_eq!(dense_move_index(Move::new(81, 72)), 0); // Px0 a0a1
+        assert_eq!(dense_move_index(Move::new(81, 63)), 1); // Px0 a0a2
+        assert_eq!(dense_move_index(Move::new(81, 82)), 9); // Px0 a0b0
+        let mut position = Position::startpos();
+        let mut rng = SplitMix64::new(17);
+        for _ in 0..500 {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                position = Position::startpos();
+                continue;
+            }
+            for &mv in &moves {
+                let normalized = canonical_move(position.side_to_move(), mv);
+                let index = dense_move_index(normalized);
+                assert!(index < 2062);
+                assert_eq!(
+                    dense_move_squares(index),
+                    Some((normalized.from as usize, normalized.to as usize))
+                );
+            }
+            position.make_move(moves[rng.next_u64() as usize % moves.len()]);
+        }
+    }
+
+    #[test]
     fn dense_move_space_matches_enumeration() {
         let map = move_map();
-        assert_eq!(DENSE_MOVE_SPACE, 2086);
+        assert_eq!(DENSE_MOVE_SPACE, 2062);
         for i in 0..DENSE_MOVE_SPACE {
             let sparse = map.dense_to_sparse[i] as usize;
             assert_eq!(map.sparse_to_dense[sparse], i as u16);

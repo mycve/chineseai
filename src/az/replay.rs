@@ -836,13 +836,13 @@ mod tests {
     #[test]
     fn replay_roundtrip_preserves_start_source() {
         let mut encoded = Vec::new();
-        let mut original = sample(AzStartSource::OpeningPool, 7, 11);
+        let mut original = sample(AzStartSource::OpeningBook, 7, 11);
         original.root_search_wdl = [0.6, 0.3, 0.1];
         original.repetition_flags[0] = 1;
         original.short_value_wdl = [[0.5, 0.3, 0.2], [0.4, 0.4, 0.2], [0.3, 0.5, 0.2]];
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
-        assert_eq!(decoded.meta.start_source, AzStartSource::OpeningPool);
+        assert_eq!(decoded.meta.start_source, AzStartSource::OpeningBook);
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
         assert_eq!(decoded.root_search_wdl, original.root_search_wdl);
@@ -855,7 +855,7 @@ mod tests {
         let mut pool = AzExperiencePool::new(1_000);
         let sources = [
             AzStartSource::Startpos,
-            AzStartSource::OpeningPool,
+            AzStartSource::OpeningBook,
             AzStartSource::Midgame,
         ];
         for generation in 0..10 {

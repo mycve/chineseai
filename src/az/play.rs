@@ -173,8 +173,6 @@ pub struct AzSelfplayData {
     pub samples: Vec<AzTrainingSample>,
     pub games: Vec<Vec<AzTrainingSample>>,
     pub position_fens: Vec<String>,
-    pub opening_snapshots: Vec<AzStartSnapshot>,
-    pub midgame_snapshots: Vec<AzStartSnapshot>,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
@@ -222,10 +220,6 @@ impl AzSelfplayData {
         self.games.extend(other.games.iter().cloned());
         self.position_fens
             .extend(other.position_fens.iter().cloned());
-        self.opening_snapshots
-            .extend(other.opening_snapshots.iter().cloned());
-        self.midgame_snapshots
-            .extend(other.midgame_snapshots.iter().cloned());
         self.red_wins += other.red_wins;
         self.black_wins += other.black_wins;
         self.draws += other.draws;
@@ -291,6 +285,16 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
                 let games = config.games / workers + usize::from(worker < config.games % workers);
                 let mut worker_config = config.clone();
                 worker_config.games = games;
+                if !config.opening_positions.is_empty() {
+                    let offset =
+                        worker * (config.games / workers) + worker.min(config.games % workers);
+                    worker_config.opening_positions = (offset..offset + games)
+                        .map(|i| {
+                            config.opening_positions[i % config.opening_positions.len()].clone()
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                }
                 worker_config.workers = 1;
                 worker_config.seed ^= (worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let chunk = generate_selfplay_chunk(&shared_model, &worker_config);
@@ -317,10 +321,12 @@ fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSe
         cpuct_base_at_root: config.cpuct_base_at_root,
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         max_depth: 0,
-        root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
+        root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
+        fpu_absolute_at_root: config.fpu_absolute_at_root,
+        minimum_kldgain_per_node: config.minimum_kldgain_per_node,
         policy_softmax_temp: config.policy_softmax_temp,
         draw_score: config.draw_score,
         value_scale: 1.0,
@@ -336,79 +342,22 @@ struct SelfplayStart {
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     phase_ply: usize,
-    opening_harvest_ply: Option<usize>,
-    midgame_harvest_ply: Option<usize>,
     source: AzStartSource,
     generation: u32,
 }
 
-fn choose_midgame_harvest_ply(
-    rng: &mut SplitMix64,
-    phase_ply: usize,
-    max_plies: usize,
-) -> Option<usize> {
-    let roll = rng.unit_f32();
-    let (start, width) = if roll < 0.50 {
-        (30usize, 30usize)
-    } else if roll < 0.85 {
-        (60, 40)
-    } else {
-        (100, 40)
-    };
-    let target = start + (rng.next_u64() as usize % width);
-    (target >= phase_ply && target < max_plies).then_some(target)
-}
-
-fn choose_opening_harvest_ply(rng: &mut SplitMix64, max_plies: usize) -> Option<usize> {
-    let roll = rng.unit_f32();
-    let (start, width) = if roll < 0.20 {
-        (6usize, 6usize)
-    } else if roll < 0.60 {
-        (12, 8)
-    } else {
-        (20, 10)
-    };
-    let target = start + rng.next_u64() as usize % width;
-    (target < max_plies).then_some(target)
-}
-
-fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> SelfplayStart {
-    let roll = rng.unit_f32();
-    let configured_midgame_fraction = config.midgame_start_fraction.clamp(0.0, 1.0);
-    let pool_empty = config.midgame_positions.is_empty();
-    let midgame_fraction = if pool_empty {
-        0.0
-    } else {
-        configured_midgame_fraction
-    };
-    if roll < midgame_fraction {
-        let index = rng.next_u64() as usize % config.midgame_positions.len();
-        let snapshot = &config.midgame_positions[index];
+fn choose_selfplay_start(
+    config: &AzLoopConfig,
+    _rng: &mut SplitMix64,
+    game_index: usize,
+) -> SelfplayStart {
+    if !config.opening_positions.is_empty() {
+        let snapshot = &config.opening_positions[game_index % config.opening_positions.len()];
         return SelfplayStart {
             position: configure_selfplay_rules(snapshot.position.clone(), config),
             rule_history: snapshot.rule_history.clone(),
             phase_ply: snapshot.phase_ply as usize,
-            opening_harvest_ply: None,
-            midgame_harvest_ply: None,
-            source: AzStartSource::Midgame,
-            generation: snapshot.generation,
-        };
-    }
-    let opening_fraction = if config.opening_positions.is_empty() {
-        0.0
-    } else {
-        config.opening_start_fraction.clamp(0.0, 1.0)
-    };
-    if roll < midgame_fraction + opening_fraction {
-        let index = rng.next_u64() as usize % config.opening_positions.len();
-        let snapshot = &config.opening_positions[index];
-        return SelfplayStart {
-            position: configure_selfplay_rules(snapshot.position.clone(), config),
-            rule_history: snapshot.rule_history.clone(),
-            phase_ply: snapshot.phase_ply as usize,
-            opening_harvest_ply: None,
-            midgame_harvest_ply: None,
-            source: AzStartSource::OpeningPool,
+            source: AzStartSource::OpeningBook,
             generation: snapshot.generation,
         };
     }
@@ -418,8 +367,6 @@ fn choose_selfplay_start(config: &AzLoopConfig, rng: &mut SplitMix64) -> Selfpla
         position,
         rule_history,
         phase_ply: 0,
-        opening_harvest_ply: choose_opening_harvest_ply(rng, config.max_plies),
-        midgame_harvest_ply: choose_midgame_harvest_ply(rng, 0, config.max_plies),
         source: AzStartSource::Startpos,
         generation: config.generation_update,
     }
@@ -430,8 +377,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
     let mut position_fens = Vec::new();
-    let mut opening_snapshots = Vec::new();
-    let mut midgame_snapshots = Vec::new();
     let mut red_wins = 0usize;
     let mut black_wins = 0usize;
     let mut draws = 0usize;
@@ -475,12 +420,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
-        let start = choose_selfplay_start(config, &mut rng);
+        let start = choose_selfplay_start(config, &mut rng, game_index);
         let mut position = start.position;
         let mut rule_history = start.rule_history;
         let start_phase_ply = start.phase_ply;
-        let opening_harvest_ply = start.opening_harvest_ply;
-        let midgame_harvest_ply = start.midgame_harvest_ply;
         let start_source = start.source;
         let start_source_index = start_source.index();
         let start_age = config.generation_update.saturating_sub(start.generation);
@@ -488,8 +431,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_phase_ply_sum[start_source_index] += start_phase_ply as u64;
         start_age_sum[start_source_index] += u64::from(start_age);
         start_age_max[start_source_index] = start_age_max[start_source_index].max(start_age);
-        start_temperature_sum[start_source_index] +=
-            selfplay_temperature(config, start_source, 0, start_phase_ply);
+        start_temperature_sum[start_source_index] += temperature_for_ply(config, start_phase_ply);
+        let enable_resign = rng.unit_f32() >= config.resign_playthrough;
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut plies = 0usize;
@@ -497,22 +440,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
             let ply = start_phase_ply + local_ply;
             plies = local_ply + 1;
-            if opening_harvest_ply == Some(ply) {
-                opening_snapshots.push(AzStartSnapshot {
-                    position: position.clone(),
-                    rule_history: rule_history.clone(),
-                    phase_ply: ply.min(u16::MAX as usize) as u16,
-                    generation: config.generation_update,
-                });
-            }
-            if midgame_harvest_ply == Some(ply) {
-                midgame_snapshots.push(AzStartSnapshot {
-                    position: position.clone(),
-                    rule_history: rule_history.clone(),
-                    phase_ply: ply.min(u16::MAX as usize) as u16,
-                    generation: config.generation_update,
-                });
-            }
             let legal = {
                 crate::scope_profile!("az.selfplay.root_legal_moves");
                 position
@@ -531,9 +458,8 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            let search_simulation_count = config.simulations.max(1);
             search_simulations.searches += 1;
-            search_simulations.simulations_sum += search_simulation_count;
+
             let limits = selfplay_search_limits(
                 config,
                 ply,
@@ -550,7 +476,33 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &mut search_workspace,
                 )
             };
+            search_simulations.simulations_sum += search.simulations;
             crate::scope_profile!("az.selfplay.post_search");
+            if enable_resign && config.resign_percentage > 0.0 {
+                let threshold = 1.0 - config.resign_percentage / 100.0;
+                let [win, draw, loss] = search.best_value_wdl;
+                let outcome = if draw > threshold {
+                    Some(0.0)
+                } else if win > threshold {
+                    Some(if position.side_to_move() == Color::Red {
+                        1.0
+                    } else {
+                        -1.0
+                    })
+                } else if loss > threshold {
+                    Some(if position.side_to_move() == Color::Red {
+                        -1.0
+                    } else {
+                        1.0
+                    })
+                } else {
+                    None
+                };
+                if let Some(outcome) = outcome {
+                    result = Some(outcome);
+                    break;
+                }
+            }
             let entropy = policy_entropy(&search.candidates);
             let shape = policy_shape_stats(&search.candidates);
             raw_prior_top1_sum += shape.raw_prior_top1;
@@ -578,13 +530,23 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 entropy_mid_sum += entropy;
                 entropy_mid_count += 1;
             }
-            let temperature = selfplay_temperature(config, start_source, local_ply, ply);
+            let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
-                search
-                    .best_move
-                    .or_else(|| choose_selfplay_move(&search.candidates, temperature, &mut rng))
+                search.best_move.or_else(|| {
+                    choose_selfplay_move(
+                        &search.candidates,
+                        temperature,
+                        config.temperature_visit_offset,
+                        &mut rng,
+                    )
+                })
             } else {
-                choose_selfplay_move(&search.candidates, temperature, &mut rng)
+                choose_selfplay_move(
+                    &search.candidates,
+                    temperature,
+                    config.temperature_visit_offset,
+                    &mut rng,
+                )
             };
             let Some(mv) = mv_opt else {
                 terminal.search_no_move += 1;
@@ -629,7 +591,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     search.value_wdl,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
-                    search_simulation_count,
+                    search.simulations,
                     1.0,
                 );
                 game_samples.push(sample);
@@ -709,8 +671,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         samples,
         games,
         position_fens,
-        opening_snapshots,
-        midgame_snapshots,
         red_wins,
         black_wins,
         draws,
@@ -952,34 +912,19 @@ fn flip_wdl(wdl: [f32; 3]) -> [f32; 3] {
 }
 
 fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
-    if ply < config.temperature_decay_delay_plies {
-        return config.temperature_start;
-    }
-    if config.temperature_decay_plies == 0 {
+    if config.temperature_cutoff_plies > 0 && ply >= config.temperature_cutoff_plies {
         return config.temperature_endgame;
     }
-    let decay_ply = ply.saturating_sub(config.temperature_decay_delay_plies);
-    if decay_ply >= config.temperature_decay_plies {
-        return config.temperature_endgame;
+    let decay = if config.temperature_decay_plies == 0 {
+        1.0
+    } else {
+        1.0 - (ply.saturating_sub(config.temperature_decay_delay_plies) / 2) as f32
+            / (config.temperature_decay_plies / 2).max(1) as f32
+    };
+    if config.temperature_start <= 0.0 {
+        return 0.0;
     }
-    let progress = decay_ply as f32 / config.temperature_decay_plies as f32;
-    config.temperature_start + (config.temperature_endgame - config.temperature_start) * progress
-}
-
-fn selfplay_temperature(
-    config: &AzLoopConfig,
-    start_source: AzStartSource,
-    local_ply: usize,
-    phase_ply: usize,
-) -> f32 {
-    let global = temperature_for_ply(config, phase_ply);
-    if start_source == AzStartSource::Startpos || config.restart_temperature_decay_plies == 0 {
-        return global;
-    }
-    let progress = (local_ply as f32 / config.restart_temperature_decay_plies as f32).min(1.0);
-    let restart = config.restart_temperature_start
-        + (config.temperature_endgame - config.restart_temperature_start) * progress;
-    global.max(restart)
+    (config.temperature_start * decay.max(0.0)).max(config.temperature_endgame)
 }
 
 fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
@@ -991,6 +936,7 @@ fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
 fn choose_selfplay_move(
     candidates: &[AzCandidate],
     temperature: f32,
+    visit_offset: f32,
     rng: &mut SplitMix64,
 ) -> Option<Move> {
     if temperature <= 1e-6 {
@@ -1004,7 +950,7 @@ fn choose_selfplay_move(
             .map(|candidate| candidate.mv);
     }
 
-    let weights = temperature_move_weights(candidates, temperature);
+    let weights = temperature_move_weights(candidates, temperature, visit_offset);
     let total = candidates
         .iter()
         .zip(&weights)
@@ -1024,11 +970,26 @@ fn choose_selfplay_move(
     candidates.first().map(|candidate| candidate.mv)
 }
 
-fn temperature_move_weights(candidates: &[AzCandidate], temperature: f32) -> Vec<f32> {
+fn temperature_move_weights(
+    candidates: &[AzCandidate],
+    temperature: f32,
+    visit_offset: f32,
+) -> Vec<f32> {
     let inv_temperature = 1.0 / temperature.max(1e-3);
+    let max_visits = candidates
+        .iter()
+        .map(|c| (c.visits as f32 + visit_offset).max(0.0))
+        .fold(0.0f32, f32::max);
     candidates
         .iter()
-        .map(|candidate| (candidate.visits as f32).powf(inv_temperature))
+        .map(|candidate| {
+            if max_visits > 0.0 {
+                ((candidate.visits as f32 + visit_offset).max(0.0) / max_visits)
+                    .powf(inv_temperature)
+            } else {
+                candidate.prior.max(0.0).powf(inv_temperature)
+            }
+        })
         .collect()
 }
 
@@ -1067,6 +1028,8 @@ pub struct AzArenaConfig {
     pub cpuct_factor_at_root: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
+    pub fpu_absolute_at_root: bool,
+    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
 }
@@ -1118,6 +1081,8 @@ pub fn play_arena_games_from_snapshots(
             config.cpuct_factor_at_root,
             config.fpu_value,
             config.fpu_value_at_root,
+            config.fpu_absolute_at_root,
+            config.minimum_kldgain_per_node,
             config.draw_score,
             config.policy_softmax_temp,
         );
@@ -1158,6 +1123,8 @@ pub fn play_arena_games_from_snapshots(
             config.cpuct_factor_at_root,
             config.fpu_value,
             config.fpu_value_at_root,
+            config.fpu_absolute_at_root,
+            config.minimum_kldgain_per_node,
             config.draw_score,
             config.policy_softmax_temp,
         );
@@ -1218,6 +1185,8 @@ fn play_arena_game(
     cpuct_factor_at_root: f32,
     fpu_value: f32,
     fpu_value_at_root: f32,
+    fpu_absolute_at_root: bool,
+    minimum_kldgain_per_node: f32,
     draw_score: f32,
     policy_softmax_temp: f32,
 ) -> f32 {
@@ -1262,10 +1231,12 @@ fn play_arena_game(
                 cpuct_base_at_root,
                 cpuct_factor_at_root,
                 max_depth: 0,
-                root_dirichlet_total_concentration: 0.0,
+                root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value,
                 fpu_value_at_root,
+                fpu_absolute_at_root,
+                minimum_kldgain_per_node,
                 policy_softmax_temp,
                 draw_score,
                 value_scale: 1.0,
@@ -1310,30 +1281,87 @@ mod tests {
             workers: 1,
             generation_update: 0,
             temperature_start: 0.0,
+            temperature_cutoff_plies: 0,
+            temperature_visit_offset: 0.0,
+            resign_percentage: 0.0,
+            resign_playthrough: 1.0,
             temperature_endgame: 0.0,
             temperature_decay_delay_plies: 0,
             temperature_decay_plies: 0,
-            restart_temperature_start: 0.0,
-            restart_temperature_decay_plies: 0,
             cpuct: 0.65,
             cpuct_at_root: 1.5,
             cpuct_base: 19652.0,
             cpuct_factor: 1.5,
             cpuct_base_at_root: 19652.0,
             cpuct_factor_at_root: 1.5,
-            root_dirichlet_total_concentration: 0.0,
+            root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
+            fpu_absolute_at_root: false,
+            minimum_kldgain_per_node: 0.0,
             draw_score: 0.0,
             policy_softmax_temp: 1.0,
             opening_positions: Default::default(),
-            opening_start_fraction: 0.0,
-            midgame_positions: Default::default(),
-            midgame_start_fraction: 0.0,
             mirror_probability: 0.0,
             record_fens: false,
         }
+    }
+
+    #[test]
+    fn px0_kld_selfplay_records_actual_visits() {
+        let mut position = Position::from_fen(
+            "4k1b2/4a4/4ba3/p8/4cN3/3n2N1P/c8/4C4/4A4/2B1KAB2 b",
+        ).unwrap();
+        let checking_move = position.parse_uci_move("a3a0").unwrap();
+        position.make_move(checking_move);
+        assert_eq!(position.legal_moves(), [Move::from_uci("c0a2").unwrap()]);
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 1;
+        config.simulations = 10_000;
+        config.minimum_kldgain_per_node = 0.00005;
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: 0,
+            generation: 0,
+        }].into();
+        let data = generate_selfplay_chunk(&AzNnue::random(4, 7), &config);
+        assert_eq!(data.samples.len(), 1);
+        assert_eq!(data.samples[0].search_simulations, 400);
+        assert_eq!(data.search_simulations.searches, 1);
+        assert_eq!(data.search_simulations.simulations_sum, 400);
+    }
+
+    #[test]
+    fn px0_temperature_uses_full_moves_and_cutoff() {
+        let mut config = selfplay_test_config(1);
+        config.temperature_start = 0.9;
+        config.temperature_endgame = 0.6;
+        config.temperature_decay_delay_plies = 40;
+        config.temperature_decay_plies = 120;
+        config.temperature_cutoff_plies = 78;
+        assert_eq!(temperature_for_ply(&config, 39), 0.9);
+        assert_eq!(temperature_for_ply(&config, 41), 0.9);
+        assert!((temperature_for_ply(&config, 42) - 0.885).abs() < 1e-6);
+        assert!((temperature_for_ply(&config, 77) - 0.63).abs() < 1e-6);
+        assert_eq!(temperature_for_ply(&config, 78), 0.6);
+        assert_eq!(temperature_for_ply(&config, 200), 0.6);
+        let mut candidates = vec![
+            candidate_q(Move::new(0, 1), 0, 0.0),
+            candidate_q(Move::new(0, 2), 0, 0.0),
+        ];
+        candidates[0].prior = 0.2;
+        candidates[1].prior = 0.8;
+        assert_eq!(
+            temperature_move_weights(&candidates, 1.0, -0.8),
+            vec![0.2, 0.8]
+        );
+        candidates[0].visits = 1;
+        candidates[1].visits = 2;
+        let weights = temperature_move_weights(&candidates, 1.0, -0.8);
+        assert!((weights[0] - 1.0 / 6.0).abs() < 1e-6);
+        assert_eq!(weights[1], 1.0);
     }
 
     #[test]
@@ -1372,25 +1400,17 @@ mod tests {
     }
 
     #[test]
-    fn selfplay_data_merge_preserves_opening_snapshots_and_start_stats() {
+    fn selfplay_data_merge_preserves_start_stats() {
         let mut merged = AzSelfplayData::default();
-        let position = Position::startpos();
         let mut chunk = AzSelfplayData::default();
-        chunk.opening_snapshots.push(AzStartSnapshot {
-            rule_history: position.initial_rule_history(),
-            position,
-            phase_ply: 8,
-            generation: 4,
-        });
-        chunk.start_games[AzStartSource::OpeningPool.index()] = 2;
-        chunk.start_phase_ply_sum[AzStartSource::OpeningPool.index()] = 16;
-        chunk.start_age_sum[AzStartSource::OpeningPool.index()] = 6;
-        chunk.start_age_max[AzStartSource::OpeningPool.index()] = 4;
-        chunk.start_temperature_sum[AzStartSource::OpeningPool.index()] = 1.2;
+        chunk.start_games[AzStartSource::OpeningBook.index()] = 2;
+        chunk.start_phase_ply_sum[AzStartSource::OpeningBook.index()] = 16;
+        chunk.start_age_sum[AzStartSource::OpeningBook.index()] = 6;
+        chunk.start_age_max[AzStartSource::OpeningBook.index()] = 4;
+        chunk.start_temperature_sum[AzStartSource::OpeningBook.index()] = 1.2;
 
         merged.add_assign(&chunk);
 
-        assert_eq!(merged.opening_snapshots.len(), 1);
         assert_eq!(merged.start_games, [0, 2, 0]);
         assert_eq!(merged.start_phase_ply_sum, [0, 16, 0]);
         assert_eq!(merged.start_age_sum, [0, 6, 0]);
@@ -1414,32 +1434,9 @@ mod tests {
     }
 
     #[test]
-    fn midgame_start_preserves_phase_and_rule_history_without_reharvesting() {
-        let mut config = selfplay_test_config(1);
-        config.max_plies = 100;
-        config.midgame_start_fraction = 1.0;
-        let position = Position::startpos();
-        let rule_history = position.initial_rule_history();
-        config.midgame_positions = vec![AzStartSnapshot {
-            position,
-            rule_history: rule_history.clone(),
-            phase_ply: 57,
-            generation: 9,
-        }]
-        .into();
-        let start = choose_selfplay_start(&config, &mut SplitMix64::new(3));
-        assert_eq!(start.position.hash(), rule_history.last().unwrap().hash);
-        assert_eq!(start.rule_history, rule_history);
-        assert_eq!(start.phase_ply, 57);
-        assert_eq!(start.opening_harvest_ply, None);
-        assert_eq!(start.midgame_harvest_ply, None);
-        assert_eq!(start.source, AzStartSource::Midgame);
-    }
-
-    #[test]
     fn start_source_distinguishes_standard_and_opening_positions() {
         let config = selfplay_test_config(1);
-        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1));
+        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1), 0);
         assert_eq!(start.source, AzStartSource::Startpos);
 
         let mut config = selfplay_test_config(1);
@@ -1453,52 +1450,11 @@ mod tests {
             generation: 1,
         }]
         .into();
-        config.opening_start_fraction = 1.0;
-        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1));
-        assert_eq!(start.source, AzStartSource::OpeningPool);
+        let start = choose_selfplay_start(&config, &mut SplitMix64::new(1), 0);
+        assert_eq!(start.source, AzStartSource::OpeningBook);
         assert_eq!(start.phase_ply, 8);
-        assert_eq!(start.opening_harvest_ply, None);
-        assert_eq!(start.midgame_harvest_ply, None);
     }
 
-    #[test]
-    fn standard_start_harvests_disjoint_opening_and_midgame_ranges() {
-        let mut config = selfplay_test_config(1);
-        config.max_plies = 200;
-        for seed in 0..10_000 {
-            let start = choose_selfplay_start(&config, &mut SplitMix64::new(seed));
-            assert_eq!(start.source, AzStartSource::Startpos);
-            assert!(matches!(start.opening_harvest_ply, Some(6..=29)));
-            assert!(matches!(start.midgame_harvest_ply, Some(30..=139)));
-        }
-    }
-
-    #[test]
-    fn empty_midgame_pool_falls_back_to_startpos_share() {
-        let mut config = selfplay_test_config(1);
-        let position =
-            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/4P4/P1P3P1P/1C5C1/9/RNBAKABNR b")
-                .unwrap();
-        config.opening_positions = vec![AzStartSnapshot {
-            rule_history: position.initial_rule_history(),
-            position,
-            phase_ply: 8,
-            generation: 1,
-        }]
-        .into();
-        config.opening_start_fraction = 0.1;
-        config.midgame_start_fraction = 0.3;
-        let opening_hash = config.opening_positions[0].position.hash();
-        let openings = (0..10_000)
-            .filter(|seed| {
-                choose_selfplay_start(&config, &mut SplitMix64::new(*seed))
-                    .position
-                    .hash()
-                    == opening_hash
-            })
-            .count();
-        assert!((800..1_200).contains(&openings));
-    }
     fn candidate(mv: Move, policy: f32) -> AzCandidate {
         AzCandidate {
             mv,
@@ -1652,15 +1608,30 @@ mod tests {
     }
 
     #[test]
+    fn temperature_weights_remain_finite_for_large_visit_counts() {
+        for visits in [65, 85, 65_535, 85_000, u32::MAX] {
+            let candidates = vec![
+                candidate_q(Move::new(0, 1), visits / 2, 0.0),
+                candidate_q(Move::new(0, 2), visits, 0.0),
+            ];
+            for temperature in [0.001, 0.05, 0.6, 0.9, 1.2] {
+                let weights = temperature_move_weights(&candidates, temperature, -0.8);
+                assert!(weights.iter().all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1.0));
+                assert_eq!(weights[1], 1.0);
+            }
+        }
+    }
+
+    #[test]
     fn temperature_one_samples_directly_from_visit_counts() {
         let candidates = vec![
             candidate_q(Move::new(0, 1), 1, 0.0),
             candidate_q(Move::new(0, 2), 10, 0.0),
         ];
 
-        let weights = temperature_move_weights(&candidates, 1.0);
+        let weights = temperature_move_weights(&candidates, 1.0, 0.0);
 
-        assert_eq!(weights, vec![1.0, 10.0]);
+        assert_eq!(weights, vec![0.1, 1.0]);
     }
 
     #[test]
@@ -1673,32 +1644,6 @@ mod tests {
 
         assert_eq!(temperature_for_ply(&config, 0), 1.2);
         assert_eq!(temperature_for_ply(&config, 40), 1.2);
-        assert!(temperature_for_ply(&config, 41) < 1.2);
-    }
-
-    #[test]
-    fn pooled_start_uses_local_restart_temperature_window() {
-        let mut config = selfplay_test_config(1);
-        config.temperature_start = 0.9;
-        config.temperature_endgame = 0.05;
-        config.temperature_decay_delay_plies = 20;
-        config.temperature_decay_plies = 40;
-        config.restart_temperature_start = 0.6;
-        config.restart_temperature_decay_plies = 8;
-
-        assert_eq!(
-            selfplay_temperature(&config, AzStartSource::Startpos, 0, 80),
-            0.05
-        );
-        assert_eq!(
-            selfplay_temperature(&config, AzStartSource::Midgame, 0, 80),
-            0.6
-        );
-        assert!(
-            (selfplay_temperature(&config, AzStartSource::Midgame, 4, 84) - 0.325).abs() < 1.0e-6
-        );
-        assert!(
-            (selfplay_temperature(&config, AzStartSource::Midgame, 8, 88) - 0.05).abs() < 1.0e-6
-        );
+        assert!(temperature_for_ply(&config, 42) < 1.2);
     }
 }

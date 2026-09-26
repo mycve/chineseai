@@ -11,18 +11,17 @@ use chineseai::version::AZ_LOOP_PROGRESS_VERSION;
 use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzMidgamePool,
-        AzNnue, AzSampleMeta, AzSearchLimits, AzSelfplayData, AzSparseActivationStats,
-        AzTrainLossWeights, AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_MAIN_SIZE,
-        POLICY_TACTICAL_EXACT_SIZE, SplitMix64, alphazero_search,
-        alphazero_search_trace_with_rules, alphazero_search_with_rules, benchmark_training,
-        dense_move_index, evaluate_policy_groups, generate_selfplay_data,
-        play_arena_games_from_positions, play_arena_games_from_snapshots, sparse_activation_stats,
+        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
+        AzSampleMeta, AzSearchLimits, AzSelfplayData, AzSparseActivationStats, AzTrainLossWeights,
+        AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE,
+        SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
+        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
+        generate_selfplay_data, play_arena_games_from_positions, sparse_activation_stats,
         train_samples_weighted, train_samples_weighted_owned,
     },
     nnue::{AZ_NNUE_INPUT_SIZE, canonical_move, extract_sparse_features_az},
-    opening_book::ObkBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
+    px0_opening_book::Px0OpeningBook,
     xiangqi::{Move, Position, RuleOutcome},
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -80,12 +79,6 @@ enum CliCommand {
     AzReplayCoverage(AzReplayCoverageArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
-    /// Generate a fixed-compute 3x3 start-ratio ablation plan.
-    AzSamplingAblation(AzSamplingAblationArgs),
-    /// Build common opening/midgame start pools without training.
-    AzPoolBootstrap(AzPoolBootstrapArgs),
-    /// Compare two models on fixed startpos, opening, and midgame suites.
-    AzArenaSuite(AzArenaSuiteArgs),
     /// Evaluate checkpoint non-transitivity and historical regressions.
     CheckpointCycles(CheckpointCyclesArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
@@ -163,31 +156,31 @@ struct AzSearchArgs {
     #[arg(default_value_t = 800)]
     simulations: usize,
     /// Non-root PUCT init.
-    #[arg(default_value_t = 0.9)]
+    #[arg(default_value_t = 1.0)]
     cpuct: f32,
     /// Root PUCT init.
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 1.9)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.15)]
+    #[arg(long, default_value_t = 0.23)]
     fpu_value: f32,
-    /// Root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.05)]
+    /// Root absolute first-play urgency.
+    #[arg(long, default_value_t = 1.0)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before root search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.25)]
+    #[arg(long, default_value_t = 1.4)]
     policy_softmax_temp: f32,
     /// Dynamic PUCT base.
-    #[arg(long, default_value_t = 19652.0)]
+    #[arg(long, default_value_t = 38739.0)]
     cpuct_base: f32,
     /// Dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 3.894)]
     cpuct_factor: f32,
     /// Root dynamic PUCT base.
-    #[arg(long, default_value_t = 19652.0)]
+    #[arg(long, default_value_t = 38739.0)]
     cpuct_base_at_root: f32,
     /// Root dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 3.894)]
     cpuct_factor_at_root: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
     #[arg(long, default_value_t = 0)]
@@ -239,7 +232,7 @@ struct AzBenchArgs {
     #[arg(default_value_t = 100)]
     repeat: usize,
     /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 0.9)]
+    #[arg(default_value_t = 1.0)]
     cpuct: f32,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -348,92 +341,6 @@ struct AzLoopArgs {
 }
 
 #[derive(Args, Debug)]
-struct AzSamplingAblationArgs {
-    /// Optional TOML template; defaults are used when omitted.
-    #[arg(long)]
-    template: Option<String>,
-    /// Directory for isolated configs, models, pools, logs, and checkpoints.
-    #[arg(long, default_value = "experiments/sampling-ratios")]
-    output: String,
-    /// Common checkpoint copied into every run before training.
-    #[arg(long, default_value = "best.safetensors")]
-    initial_model: String,
-    /// Optional common opening pool copied into every run.
-    #[arg(long, requires = "midgame_pool")]
-    opening_pool: Option<String>,
-    /// Optional common midgame pool copied into every run.
-    #[arg(long, requires = "opening_pool")]
-    midgame_pool: Option<String>,
-    /// Paired initialization/self-play seeds, comma separated.
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = "20260420,20260421,20260422"
-    )]
-    seeds: Vec<u64>,
-    /// Absolute training update at which every run stops.
-    #[arg(long, default_value_t = 100)]
-    target_update: usize,
-    /// Generate a tiny one-update pipeline check; results are not strength evidence.
-    #[arg(long)]
-    smoke: bool,
-}
-
-#[derive(Args, Debug)]
-struct AzPoolBootstrapArgs {
-    /// Model used to generate standard-start self-play games.
-    #[arg(default_value = "best.safetensors")]
-    model: String,
-    #[arg(
-        long,
-        default_value = "experiments/common-start-pools/opening-pool.lz4"
-    )]
-    opening_output: String,
-    #[arg(
-        long,
-        default_value = "experiments/common-start-pools/midgame-pool.lz4"
-    )]
-    midgame_output: String,
-    /// Required unique snapshots in each pool.
-    #[arg(long, default_value_t = 256)]
-    count: usize,
-    #[arg(long, default_value_t = 200)]
-    simulations: usize,
-    #[arg(long, default_value_t = 200)]
-    max_plies: usize,
-    #[arg(long, default_value_t = 0)]
-    workers: usize,
-    #[arg(long, default_value_t = 20260922)]
-    seed: u64,
-}
-
-#[derive(Args, Debug)]
-struct AzArenaSuiteArgs {
-    candidate: String,
-    baseline: String,
-    #[arg(long, default_value = "opening.obk")]
-    opening_book: String,
-    #[arg(
-        long,
-        default_value = "experiments/common-start-pools/midgame-pool.lz4"
-    )]
-    midgame_pool: String,
-    /// Number of distinct opening and midgame positions. Startpos is evaluated once.
-    #[arg(long, default_value_t = 128)]
-    positions: usize,
-    #[arg(long, default_value_t = 800)]
-    simulations: usize,
-    #[arg(long, default_value_t = 200)]
-    max_plies: usize,
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
-    #[arg(long, default_value_t = 20260922)]
-    seed: u64,
-    #[arg(long, default_value = "experiments/arena-suite.tsv")]
-    output: String,
-}
-
-#[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
   chineseai checkpoint-cycles checkpoints
@@ -457,16 +364,12 @@ struct CheckpointCyclesArgs {
     /// MCTS simulations per move.
     #[arg(short = 's', long, default_value_t = 800)]
     simulations: usize,
-    /// Random OBK positions; every pair uses the same positions with colors swapped.
+    /// Shuffled Px0 FEN positions; every pair uses the same positions with colors swapped.
     #[arg(long, default_value_t = 1000)]
     opening_positions: usize,
-    /// OBK opening book. Empty uses startpos.
-    #[arg(long, default_value = "opening.obk")]
+    /// Px0 book.pgn.gz. Empty uses startpos.
+    #[arg(long, default_value = "book.pgn.gz")]
     opening_book: String,
-    #[arg(long, default_value_t = 8)]
-    opening_plies_min: usize,
-    #[arg(long, default_value_t = 10)]
-    opening_plies_max: usize,
     /// Parallel arena workers for each checkpoint pair.
     #[arg(long, default_value_t = 128)]
     threads: usize,
@@ -488,7 +391,7 @@ Examples:
   chineseai vs-pikafish ./tools/pikafish model.safetensors
   chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --simulations 192
   chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5
-  chineseai vs-pikafish ./tools/pikafish model.safetensors --opening-book opening.obk --opening-plies-min 6 --opening-plies-max 10")]
+  chineseai vs-pikafish ./tools/pikafish model.safetensors --opening-book book.pgn.gz")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
@@ -498,31 +401,31 @@ struct VsPikafishArgs {
     #[arg(short = 's', long, default_value = "800")]
     simulations: Option<usize>,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 0.9)]
+    #[arg(long, default_value_t = 1.0)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 1.9)]
     cpuct_at_root: f32,
     /// ChineseAI dynamic PUCT base.
-    #[arg(long, default_value_t = 19652.0)]
+    #[arg(long, default_value_t = 38739.0)]
     cpuct_base: f32,
     /// ChineseAI dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 3.894)]
     cpuct_factor: f32,
     /// ChineseAI root dynamic PUCT base.
-    #[arg(long, default_value_t = 19652.0)]
+    #[arg(long, default_value_t = 38739.0)]
     cpuct_base_at_root: f32,
     /// ChineseAI root dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 3.894)]
     cpuct_factor_at_root: f32,
     /// ChineseAI non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.15)]
+    #[arg(long, default_value_t = 0.23)]
     fpu_value: f32,
     /// ChineseAI root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, default_value_t = 1.0)]
     fpu_value_at_root: f32,
     /// Divisor applied to ChineseAI policy logits before search.
-    #[arg(long, default_value_t = 1.25)]
+    #[arg(long, default_value_t = 1.4)]
     policy_softmax_temp: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 200)]
@@ -542,18 +445,12 @@ struct VsPikafishArgs {
     /// Print the final FEN and complete move list for every game.
     #[arg(long)]
     report_games: bool,
-    /// OBK opening book used to generate random start positions. Empty uses startpos.
-    #[arg(long, default_value = "opening.obk")]
+    /// Px0 book.pgn.gz used to generate random start positions. Empty uses startpos.
+    #[arg(long, default_value = "book.pgn.gz")]
     opening_book: String,
-    /// Number of random opening positions to generate from the OBK book.
+    /// Number of shuffled FEN positions to take from the Px0 book.
     #[arg(long, default_value_t = 1000)]
     opening_positions: usize,
-    /// Minimum book plies before handing the position to both engines.
-    #[arg(long, default_value_t = 8)]
-    opening_plies_min: usize,
-    /// Maximum book plies before handing the position to both engines.
-    #[arg(long, default_value_t = 10)]
-    opening_plies_max: usize,
 }
 
 #[derive(Args, Debug)]
@@ -659,19 +556,19 @@ struct PikafishLabelEvalArgs {
     #[arg(short = 's', long, default_value_t = 6000)]
     simulations: usize,
     /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 0.9)]
+    #[arg(long, default_value_t = 1.0)]
     cpuct: f32,
     /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 1.9)]
     cpuct_at_root: f32,
     /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.15)]
+    #[arg(long, default_value_t = 0.23)]
     fpu_value: f32,
-    /// Root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.05)]
+    /// Root absolute first-play urgency.
+    #[arg(long, default_value_t = 1.0)]
     fpu_value_at_root: f32,
     /// Divisor applied to policy logits before search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.25)]
+    #[arg(long, default_value_t = 1.4)]
     policy_softmax_temp: f32,
     /// Maximum search depth in plies below root; 0 keeps the MCTS default.
     #[arg(long, default_value_t = 0)]
@@ -820,8 +717,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_op{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_of{}_mf{}_rt{}_rd{}_prf{}_prg{}_sd{}"
+            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_rc{}_",
+            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -847,11 +744,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.temperature_endgame),
         config.temperature_decay_delay_plies,
         config.temperature_decay_plies,
-        format!(
-            "{}x{}",
-            f32_slug(config.opening_start_fraction),
-            config.opening_reservoir_capacity
-        ),
         config.replay_capacity,
         config.train_samples_per_update,
         config.train_epochs_per_update,
@@ -862,14 +754,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.arena_cpuct),
         f32_slug(config.arena_cpuct_at_root),
         f32_slug(config.arena_policy_softmax_temp),
-        f32_slug(config.root_dirichlet_total_concentration),
+        f32_slug(config.root_dirichlet_alpha),
         f32_slug(config.root_exploration_fraction),
-        f32_slug(config.opening_start_fraction),
-        f32_slug(config.midgame_start_fraction),
-        f32_slug(config.restart_temperature_start),
-        config.restart_temperature_decay_plies,
-        f32_slug(config.start_pool_recent_fraction),
-        config.start_pool_recent_generations,
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -890,311 +776,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.seed,
         hash
     )
-}
-
-fn sampling_ablation_configs(
-    base: &AzLoopFileConfig,
-    output: &Path,
-    seeds: &[u64],
-) -> Vec<(String, PathBuf, AzLoopFileConfig)> {
-    let variants = [
-        ("a-30-30-40", 0.30f32, 0.40f32),
-        ("b-20-30-50", 0.30f32, 0.50f32),
-        ("c-10-30-60", 0.30f32, 0.60f32),
-    ];
-    let mut configs = Vec::with_capacity(variants.len() * seeds.len());
-    for &(variant, opening, midgame) in &variants {
-        for &seed in seeds {
-            let name = format!("{variant}-seed{seed}");
-            let run_dir = output.join(&name);
-            let mut config = base.clone();
-            config.seed = seed;
-            config.opening_start_fraction = opening;
-            config.midgame_start_fraction = midgame;
-            config.model_path = run_dir.join("model.safetensors").display().to_string();
-            config.opening_snapshot_path = run_dir.join("opening-pool.lz4").display().to_string();
-            config.midgame_snapshot_path = run_dir.join("midgame-pool.lz4").display().to_string();
-            config.checkpoint_dir = run_dir.join("checkpoints").display().to_string();
-            config.tensorboard_logdir = run_dir.join("tensorboard").display().to_string();
-            configs.push((name, run_dir.join("config.toml"), config));
-        }
-    }
-    configs
-}
-
-fn write_sampling_ablation_plan(args: AzSamplingAblationArgs) {
-    assert!(!args.seeds.is_empty(), "at least one seed is required");
-    let mut base = args
-        .template
-        .as_ref()
-        .map_or_else(AzLoopFileConfig::default, |path| {
-            let text = fs::read_to_string(path)
-                .unwrap_or_else(|err| panic!("failed to read template `{path}`: {err}"));
-            AzLoopFileConfig::parse(&text)
-        });
-    let initial_model_path = Path::new(&args.initial_model);
-    let initial_model = AzNnue::load(initial_model_path).unwrap_or_else(|err| {
-        panic!(
-            "failed to load common initial model `{}`: {err}",
-            initial_model_path.display()
-        )
-    });
-    base.hidden_size = initial_model.arch.hidden_size;
-    let common_pools = args.opening_pool.as_ref().zip(args.midgame_pool.as_ref());
-    if let Some((opening, midgame)) = common_pools {
-        for path in [opening, midgame] {
-            if !Path::new(path).is_file() {
-                panic!("common start pool `{path}` does not exist");
-            }
-        }
-    }
-    if args.smoke {
-        base.simulations = 8;
-        base.selfplay_samples_per_update = 64;
-        base.batch_size = 32;
-        base.max_plies = 160;
-        base.workers = 2;
-        base.opening_reservoir_capacity = 128;
-        base.midgame_reservoir_capacity = 128;
-        base.replay_capacity = 512;
-        base.train_warmup_samples = 64;
-        base.train_samples_per_update = 64;
-        base.train_epochs_per_update = 1;
-        base.checkpoint_interval = 0;
-        base.arena_interval = 0;
-        base.pikafish_label_eval_interval = 0;
-    }
-    let output = PathBuf::from(&args.output);
-    fs::create_dir_all(&output).unwrap_or_else(|err| {
-        panic!(
-            "failed to create ablation directory `{}`: {err}",
-            output.display()
-        )
-    });
-    let configs = sampling_ablation_configs(&base, &output, &args.seeds);
-    let mut manifest = String::from(
-        "run\tmode\tseed\tstart_fraction\topening_fraction\tmidgame_fraction\thidden\ttarget_update\tinitial_model\tcommon_pools\tconfig\n",
-    );
-    let mut script = String::from("$ErrorActionPreference = 'Stop'\n");
-    script.push_str("cargo build --profile fast\n");
-    let mut evaluate_script = String::from("$ErrorActionPreference = 'Stop'\n");
-    evaluate_script.push_str("cargo build --profile fast\n");
-    for (name, config_path, config) in &configs {
-        if let Some(run_dir) = config_path.parent() {
-            fs::create_dir_all(run_dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to create run directory `{}`: {err}",
-                    run_dir.display()
-                )
-            });
-        }
-        let run_model = Path::new(&config.model_path);
-        let progress_path = az_loop_progress_path(config_path.to_string_lossy().as_ref());
-        if progress_path.exists() || run_model.exists() {
-            panic!(
-                "refusing to overwrite started run `{name}`; remove its model/progress explicitly first"
-            );
-        }
-        fs::write(config_path, config.to_file_text()).unwrap_or_else(|err| {
-            panic!("failed to write config `{}`: {err}", config_path.display())
-        });
-        fs::copy(initial_model_path, run_model).unwrap_or_else(|err| {
-            panic!(
-                "failed to copy initial model `{}` to `{}`: {err}",
-                initial_model_path.display(),
-                run_model.display()
-            )
-        });
-        if let Some((opening, midgame)) = common_pools {
-            fs::copy(opening, &config.opening_snapshot_path).unwrap_or_else(|err| {
-                panic!(
-                    "failed to copy common opening pool `{opening}` to `{}`: {err}",
-                    config.opening_snapshot_path
-                )
-            });
-            fs::copy(midgame, &config.midgame_snapshot_path).unwrap_or_else(|err| {
-                panic!(
-                    "failed to copy common midgame pool `{midgame}` to `{}`: {err}",
-                    config.midgame_snapshot_path
-                )
-            });
-        }
-        let start = 1.0 - config.opening_start_fraction - config.midgame_start_fraction;
-        use std::fmt::Write as _;
-        writeln!(
-            manifest,
-            "{name}\t{}\t{}\t{start:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
-            if args.smoke { "smoke" } else { "fixed-compute" },
-            config.seed,
-            config.opening_start_fraction,
-            config.midgame_start_fraction,
-            config.hidden_size,
-            args.target_update.max(1),
-            initial_model_path.display(),
-            common_pools.map_or_else(
-                || "empty".to_string(),
-                |(opening, midgame)| format!("{opening};{midgame}"),
-            ),
-            config_path.display()
-        )
-        .unwrap();
-        writeln!(
-            script,
-            "& .\\target\\fast\\chineseai.exe az-loop {:?} --target-update {}",
-            config_path.display().to_string(),
-            args.target_update.max(1)
-        )
-        .unwrap();
-        let run_dir = config_path.parent().expect("ablation config has parent");
-        let arena_output = run_dir.join("arena-vs-initial.tsv");
-        let label_output = run_dir.join("pikafish-label-eval.tsv");
-        let eval_midgame_pool = args
-            .midgame_pool
-            .as_deref()
-            .unwrap_or("experiments/common-start-pools/midgame-pool.lz4");
-        writeln!(
-            evaluate_script,
-            "& .\\target\\fast\\chineseai.exe az-arena-suite {:?} {:?} --midgame-pool {:?} --positions 128 --simulations 800 --seed 20260922 --output {:?}",
-            config.model_path,
-            initial_model_path.display().to_string(),
-            eval_midgame_pool,
-            arena_output.display().to_string(),
-        )
-        .unwrap();
-        writeln!(
-            evaluate_script,
-            "& .\\target\\fast\\chineseai.exe pikafish-label-eval {:?} {:?} --simulations 64 --limit 1000 --threads 16 --seed 20260922 --output {:?}",
-            config.model_path,
-            base.pikafish_label_eval_sqlite,
-            label_output.display().to_string(),
-        )
-        .unwrap();
-    }
-    fs::write(output.join("manifest.tsv"), manifest).unwrap();
-    fs::write(output.join("run.ps1"), script).unwrap();
-    fs::write(output.join("evaluate.ps1"), evaluate_script).unwrap();
-    println!(
-        "created {} isolated runs in {} ({} variants x {} paired seeds, target_update={})",
-        configs.len(),
-        output.display(),
-        3,
-        args.seeds.len(),
-        args.target_update.max(1)
-    );
-    println!(
-        "run      : powershell -File {}",
-        output.join("run.ps1").display()
-    );
-}
-
-fn run_pool_bootstrap(args: AzPoolBootstrapArgs) {
-    let target = args.count.max(1);
-    let opening_path = Path::new(&args.opening_output);
-    let midgame_path = Path::new(&args.midgame_output);
-    let mut opening_pool = if opening_path.exists() {
-        AzMidgamePool::load_lz4(opening_path, target).unwrap_or_else(|err| {
-            panic!(
-                "failed to resume opening pool `{}`: {err}",
-                opening_path.display()
-            )
-        })
-    } else {
-        AzMidgamePool::new(target)
-    };
-    let mut midgame_pool = if midgame_path.exists() {
-        AzMidgamePool::load_lz4(midgame_path, target).unwrap_or_else(|err| {
-            panic!(
-                "failed to resume midgame pool `{}`: {err}",
-                midgame_path.display()
-            )
-        })
-    } else {
-        AzMidgamePool::new(target)
-    };
-    if opening_pool.len() >= target && midgame_pool.len() >= target {
-        println!(
-            "pool-bootstrap: already complete opening={}/{} midgame={}/{}",
-            opening_pool.len(),
-            target,
-            midgame_pool.len(),
-            target
-        );
-        return;
-    }
-
-    let model = AzNnue::load(&args.model)
-        .unwrap_or_else(|err| panic!("failed to load bootstrap model `{}`: {err}", args.model));
-    let workers = if args.workers == 0 {
-        num_cpus::get_physical()
-    } else {
-        args.workers
-    }
-    .max(1);
-    let base = AzLoopFileConfig::default();
-    let started = Instant::now();
-    let mut batch = 0u64;
-    let mut stalled_batches = 0usize;
-    while opening_pool.len() < target || midgame_pool.len() < target {
-        let seed = args.seed ^ batch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut config = build_az_loop_config(&base, seed, workers, 0, &Arc::default());
-        config.games = workers.saturating_mul(2);
-        config.simulations = args.simulations.max(1);
-        config.max_plies = args.max_plies.max(140);
-        config.opening_start_fraction = 0.0;
-        config.midgame_start_fraction = 0.0;
-        config.mirror_probability = 0.0;
-        let mut data = generate_selfplay_data(&model, &config);
-        let completed_games = data.red_wins + data.black_wins + data.draws;
-        let avg_plies = data.plies_total as f32 / completed_games.max(1) as f32;
-        let avg_simulations = data.search_simulations.simulations_sum as f32
-            / data.search_simulations.searches.max(1) as f32;
-        let opening_added = if opening_pool.len() < target {
-            opening_pool.add_snapshots(
-                std::mem::take(&mut data.opening_snapshots),
-                seed ^ 0xA076_1D64_78BD_642F,
-            )
-        } else {
-            0
-        };
-        let midgame_added = if midgame_pool.len() < target {
-            midgame_pool.add_snapshots(
-                std::mem::take(&mut data.midgame_snapshots),
-                seed ^ 0xE703_7ED1_A0B4_28DB,
-            )
-        } else {
-            0
-        };
-        opening_pool
-            .save_lz4(opening_path)
-            .unwrap_or_else(|err| panic!("failed to save `{}`: {err}", opening_path.display()));
-        midgame_pool
-            .save_lz4(midgame_path)
-            .unwrap_or_else(|err| panic!("failed to save `{}`: {err}", midgame_path.display()));
-        batch += 1;
-        println!(
-            "pool-bootstrap: batch={} games={} avg_plies={:.1} avg_sims={:.1} added={}/{} opening={}/{} midgame={}/{} elapsed={:.1}s",
-            batch,
-            completed_games,
-            avg_plies,
-            avg_simulations,
-            opening_added,
-            midgame_added,
-            opening_pool.len(),
-            target,
-            midgame_pool.len(),
-            target,
-            started.elapsed().as_secs_f32()
-        );
-        stalled_batches = if opening_added == 0 && midgame_added == 0 {
-            stalled_batches + 1
-        } else {
-            0
-        };
-        assert!(
-            stalled_batches < 10,
-            "pool bootstrap made no progress for 10 batches"
-        );
-    }
 }
 
 fn learning_rate_for_update(config: &AzLoopFileConfig, update: usize) -> f32 {
@@ -1403,35 +984,18 @@ struct TrainerEvent {
 struct SharedSelfplayModel {
     version: u64,
     learner_update: u32,
-    models_by_numa_node: Vec<Arc<AzNnue>>,
-}
-
-fn build_numa_model_replicas(model: &AzNnue, numa_nodes: &[(usize, usize)]) -> Vec<Arc<AzNnue>> {
-    thread::scope(|scope| {
-        numa_nodes
-            .iter()
-            .map(|&(_node, cpu)| {
-                scope.spawn(move || {
-                    let _ = chineseai::cpu_topology::pin_current_thread(cpu);
-                    Arc::new(model.clone())
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().expect("NUMA model replica thread panicked"))
-            .collect()
-    })
+    model: Arc<AzNnue>,
 }
 
 fn publish_selfplay_model(
     shared_model: &RwLock<SharedSelfplayModel>,
-    models_by_numa_node: Vec<Arc<AzNnue>>,
+    model: Arc<AzNnue>,
     learner_update: usize,
 ) -> u64 {
     let mut shared = shared_model
         .write()
         .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
-    shared.models_by_numa_node = models_by_numa_node;
+    shared.model = model;
     shared.version = shared.version.wrapping_add(1);
     shared.learner_update = learner_update.min(u32::MAX as usize) as u32;
     shared.version
@@ -1481,27 +1045,28 @@ fn build_az_loop_config(
         workers,
         generation_update,
         temperature_start: config.temperature_start,
+        temperature_cutoff_plies: config.temperature_cutoff_plies,
+        temperature_visit_offset: config.temperature_visit_offset,
+        resign_percentage: config.resign_percentage,
+        resign_playthrough: config.resign_playthrough,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
-        restart_temperature_start: config.restart_temperature_start,
-        restart_temperature_decay_plies: config.restart_temperature_decay_plies,
         cpuct: config.cpuct,
         cpuct_at_root: config.cpuct_at_root,
         cpuct_base: config.cpuct_base,
         cpuct_factor: config.cpuct_factor,
         cpuct_base_at_root: config.cpuct_base_at_root,
         cpuct_factor_at_root: config.cpuct_factor_at_root,
-        root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
+        root_dirichlet_alpha: config.root_dirichlet_alpha,
         root_exploration_fraction: config.root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
+        fpu_absolute_at_root: config.fpu_absolute_at_root,
+        minimum_kldgain_per_node: config.minimum_kldgain_per_node,
         draw_score: config.draw_score,
         policy_softmax_temp: config.policy_softmax_temp,
         opening_positions: Arc::clone(opening_positions),
-        opening_start_fraction: config.opening_start_fraction,
-        midgame_positions: Arc::default(),
-        midgame_start_fraction: config.midgame_start_fraction,
         mirror_probability: config.mirror_probability,
         record_fens: false,
     }
@@ -1810,14 +1375,12 @@ struct ArenaThreadConfig {
 #[derive(Clone)]
 enum ArenaStarts {
     Positions(Arc<Vec<Position>>),
-    Snapshots(Arc<Vec<chineseai::az::AzStartSnapshot>>),
 }
 
 impl ArenaStarts {
     fn len(&self) -> usize {
         match self {
             Self::Positions(positions) => positions.len(),
-            Self::Snapshots(snapshots) => snapshots.len(),
         }
     }
 }
@@ -1875,6 +1438,8 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                 cpuct_factor_at_root,
                 fpu_value,
                 fpu_value_at_root,
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 draw_score,
                 policy_softmax_temp,
             };
@@ -1883,12 +1448,6 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                     candidate.as_ref(),
                     baseline.as_ref(),
                     positions.as_slice(),
-                    arena_config,
-                ),
-                ArenaStarts::Snapshots(snapshots) => play_arena_games_from_snapshots(
-                    candidate.as_ref(),
-                    baseline.as_ref(),
-                    snapshots.as_slice(),
                     arena_config,
                 ),
             }
@@ -1904,131 +1463,6 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         );
     }
     merged
-}
-
-fn run_arena_suite(args: AzArenaSuiteArgs) {
-    let candidate = Arc::new(
-        AzNnue::load(&args.candidate)
-            .unwrap_or_else(|err| panic!("failed to load candidate `{}`: {err}", args.candidate)),
-    );
-    let baseline = Arc::new(
-        AzNnue::load(&args.baseline)
-            .unwrap_or_else(|err| panic!("failed to load baseline `{}`: {err}", args.baseline)),
-    );
-    assert_eq!(
-        candidate.arch, baseline.arch,
-        "arena models must use the same architecture"
-    );
-    let count = args.positions.max(1);
-    let threads = if args.threads == 0 {
-        num_cpus::get_physical()
-    } else {
-        args.threads
-    }
-    .max(1);
-    // Search is deterministic, so repeating startpos would duplicate the same color-swapped
-    // pair and manufacture confidence without adding any independent evidence.
-    let startpos = ArenaStarts::Positions(Arc::new(vec![Position::startpos()]));
-    let book = ObkBook::load(&args.opening_book)
-        .unwrap_or_else(|err| panic!("failed to load opening book `{}`: {err}", args.opening_book));
-    let mut rng = SplitMix64::new(args.seed ^ 0xA076_1D64_78BD_642F);
-    let openings = (0..count)
-        .map(|_| book.random_prefix_position(8, 12, &mut rng))
-        .collect::<Vec<_>>();
-    let pool = AzMidgamePool::load_lz4(Path::new(&args.midgame_pool), count)
-        .unwrap_or_else(|err| panic!("failed to load midgame pool `{}`: {err}", args.midgame_pool));
-    assert!(
-        pool.len() >= count,
-        "midgame pool has {} snapshots but {} are required",
-        pool.len(),
-        count
-    );
-    let midgames = pool.sample(count, &mut rng);
-    let suites = [
-        ("startpos", startpos),
-        ("opening", ArenaStarts::Positions(Arc::new(openings))),
-        ("midgame", ArenaStarts::Snapshots(Arc::new(midgames))),
-    ];
-    let mut rows = String::from(
-        "suite\tpaired_positions\tgames\twins\tdraws\tlosses\tscore_rate\telo\telo_low\telo_high\tseconds\tgames_per_second\tcandidate\tbaseline\n",
-    );
-    let mut total = AzArenaReport::default();
-    for (suite_index, (name, starts)) in suites.into_iter().enumerate() {
-        let started = Instant::now();
-        let report = run_arena_threads(ArenaThreadConfig {
-            candidate: Arc::clone(&candidate),
-            baseline: Arc::clone(&baseline),
-            eval_starts: starts,
-            simulations: args.simulations.max(1),
-            max_plies: args.max_plies.max(1),
-            rule60_max_ply: Some(120),
-            cpuct: 0.9,
-            cpuct_at_root: 2.0,
-            cpuct_base: 19652.0,
-            cpuct_factor: 1.5,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 1.5,
-            fpu_value: 0.15,
-            fpu_value_at_root: 0.05,
-            draw_score: 0.0,
-            policy_softmax_temp: 1.25,
-            thread_count: threads,
-            seed: args.seed ^ (suite_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        });
-        let seconds = started.elapsed().as_secs_f32();
-        let (elo_low, elo_high) = report.elo_diff_bounds(1.96);
-        use std::fmt::Write as _;
-        writeln!(
-            rows,
-            "{name}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.2}\t{:.2}\t{:.2}\t{:.3}\t{:.3}\t{}\t{}",
-            report.paired_openings,
-            report.total_games(),
-            report.wins,
-            report.draws,
-            report.losses,
-            report.score_rate(),
-            report.elo_diff_vs_even(),
-            elo_low,
-            elo_high,
-            seconds,
-            report.total_games() as f32 / seconds.max(1.0e-6),
-            args.candidate,
-            args.baseline,
-        )
-        .unwrap();
-        println!(
-            "arena-suite: {name} W/D/L={}/{}/{} score={:.3} elo={:+.1} [{:+.1},{:+.1}] seconds={:.1}",
-            report.wins,
-            report.draws,
-            report.losses,
-            report.score_rate(),
-            report.elo_diff_vs_even(),
-            elo_low,
-            elo_high,
-            seconds
-        );
-        total.add_assign(&report);
-    }
-    if let Some(parent) = Path::new(&args.output)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(&args.output, rows)
-        .unwrap_or_else(|err| panic!("failed to write arena suite `{}`: {err}", args.output));
-    let (elo_low, elo_high) = total.elo_diff_bounds(1.96);
-    println!(
-        "arena-suite: combined W/D/L={}/{}/{} score={:.3} elo={:+.1} [{:+.1},{:+.1}] output={}",
-        total.wins,
-        total.draws,
-        total.losses,
-        total.score_rate(),
-        total.elo_diff_vs_even(),
-        elo_low,
-        elo_high,
-        args.output
-    );
 }
 
 fn build_arena_start_positions(
@@ -2048,27 +1482,18 @@ fn build_arena_start_positions(
     );
     let mut modes = Vec::with_capacity(2);
     if !config.arena_opening_book.trim().is_empty() {
-        let book = ObkBook::load(&config.arena_opening_book).unwrap_or_else(|err| {
-            panic!(
-                "failed to load arena opening book `{}`: {err}",
-                config.arena_opening_book
-            )
-        });
-        let mut rng = SplitMix64::new(seed);
-        for _ in 0..config.arena_opening_positions {
-            positions.push(book.random_prefix_position(
-                config.arena_opening_plies_min,
-                config.arena_opening_plies_max,
-                &mut rng,
-            ));
-        }
+        let mut book = Px0OpeningBook::load(&config.arena_opening_book, seed)
+            .unwrap_or_else(|err| panic!("failed to load Px0 arena book: {err}"));
+        let count = book.len();
+        positions.extend(
+            book.next_batch(config.arena_opening_positions, 0)
+                .unwrap_or_else(|err| panic!("invalid Px0 arena FEN: {err}"))
+                .into_iter()
+                .map(|snapshot| snapshot.position),
+        );
         modes.push(format!(
-            "obk(count={},keys={},moves={},plies={}-{})",
-            config.arena_opening_positions,
-            book.key_count(),
-            book.move_count(),
-            config.arena_opening_plies_min,
-            config.arena_opening_plies_max
+            "px0(shuffled,count={},book_positions={count})",
+            config.arena_opening_positions
         ));
     }
 
@@ -2111,15 +1536,17 @@ fn fixed_az_search_limits(
         seed,
         cpuct,
         cpuct_at_root,
-        cpuct_base: 19652.0,
-        cpuct_factor: 1.5,
-        cpuct_base_at_root: 19652.0,
-        cpuct_factor_at_root: 1.5,
+        cpuct_base: 38739.0,
+        cpuct_factor: 3.894,
+        cpuct_base_at_root: 38739.0,
+        cpuct_factor_at_root: 3.894,
         max_depth,
-        root_dirichlet_total_concentration: 0.0,
+        root_dirichlet_alpha: 0.0,
         root_exploration_fraction: 0.0,
-        fpu_value: 0.15,
-        fpu_value_at_root: 0.05,
+        fpu_value: 0.23,
+        fpu_value_at_root: 1.0,
+        fpu_absolute_at_root: true,
+        minimum_kldgain_per_node: 0.0,
         policy_softmax_temp: policy_softmax_temp.max(1.0e-3),
         draw_score: 0.0,
         value_scale: 1.0,
@@ -2306,10 +1733,12 @@ fn main() {
                 cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
                 cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
                 max_depth: cmd.max_depth,
-                root_dirichlet_total_concentration: 0.0,
+                root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: cmd.fpu_value.max(0.0),
                 fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
                 value_scale: cmd.value_scale.clamp(0.0, 1.0),
@@ -2529,7 +1958,7 @@ fn main() {
             let _ = alphazero_search(
                 &position,
                 &model,
-                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.25),
+                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.4),
             );
 
             let started = std::time::Instant::now();
@@ -2539,7 +1968,7 @@ fn main() {
                 let result = alphazero_search(
                     &position,
                     &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.25),
+                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.4),
                 );
                 total_sims += result.simulations;
                 best_move = result.best_move;
@@ -2786,9 +2215,6 @@ fn main() {
             println!("no-delta   : {ablated_groups:?}");
             println!("output     : {}", cmd.output);
         }
-        Some(CliCommand::AzSamplingAblation(cmd)) => write_sampling_ablation_plan(cmd),
-        Some(CliCommand::AzPoolBootstrap(cmd)) => run_pool_bootstrap(cmd),
-        Some(CliCommand::AzArenaSuite(cmd)) => run_arena_suite(cmd),
         Some(CliCommand::AzLoop(cmd)) => {
             let config_path = cmd.config;
             let Some(config) = load_or_create_az_loop_config(&config_path) else {
@@ -2928,48 +2354,6 @@ fn main() {
                 );
             });
             let mut tb = SummaryWriter::new(&tb_dir);
-            let opening_snapshot_path = PathBuf::from(&config.opening_snapshot_path);
-            let opening_pool = if config.opening_reservoir_capacity == 0 {
-                AzMidgamePool::new(0)
-            } else if opening_snapshot_path.exists() {
-                AzMidgamePool::load_lz4(&opening_snapshot_path, config.opening_reservoir_capacity)
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "failed to restore opening pool `{}`: {err}",
-                            opening_snapshot_path.display()
-                        )
-                    })
-            } else {
-                AzMidgamePool::new(config.opening_reservoir_capacity)
-            };
-            println!(
-                "opening  : restored {}/{} snapshots from `{}`",
-                opening_pool.len(),
-                opening_pool.capacity(),
-                opening_snapshot_path.display()
-            );
-            let shared_opening_pool = Arc::new(RwLock::new(opening_pool));
-            let midgame_snapshot_path = PathBuf::from(&config.midgame_snapshot_path);
-            let midgame_pool = if config.midgame_reservoir_capacity == 0 {
-                AzMidgamePool::new(0)
-            } else if midgame_snapshot_path.exists() {
-                AzMidgamePool::load_lz4(&midgame_snapshot_path, config.midgame_reservoir_capacity)
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "failed to restore midgame pool `{}`: {err}",
-                            midgame_snapshot_path.display()
-                        )
-                    })
-            } else {
-                AzMidgamePool::new(config.midgame_reservoir_capacity)
-            };
-            println!(
-                "midgame  : restored {}/{} snapshots from `{}`",
-                midgame_pool.len(),
-                midgame_pool.capacity(),
-                midgame_snapshot_path.display()
-            );
-            let shared_midgame_pool = Arc::new(RwLock::new(midgame_pool));
             let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
                 * config.train_epochs_per_update as f32)
                 / config.selfplay_samples_per_update.max(1) as f32;
@@ -2992,7 +2376,7 @@ fn main() {
             );
 
             println!(
-                "loop     : config={} mode=continuous search=alphazero arch(hidden={}) sims={} value_target=terminal replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(total_concentration={},fraction={}) opening_pool={}/{} replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_opening_plies={}-{} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "loop     : config={} mode=continuous search=alphazero arch(hidden={}) sims={} value_target=terminal replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
                 config_path,
                 config.hidden_size,
                 config.simulations,
@@ -3022,10 +2406,8 @@ fn main() {
                 config.fpu_value,
                 config.fpu_value_at_root,
                 config.policy_softmax_temp,
-                config.root_dirichlet_total_concentration,
+                config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
-                config.opening_snapshot_path,
-                config.opening_reservoir_capacity,
                 config.replay_capacity,
                 config.mirror_probability,
                 config.train_value_weight,
@@ -3047,8 +2429,6 @@ fn main() {
                     config.arena_opening_book.as_str()
                 },
                 config.arena_opening_positions,
-                config.arena_opening_plies_min,
-                config.arena_opening_plies_max,
                 config.arena_random_positions,
                 config.arena_random_plies_min,
                 config.arena_random_plies_max,
@@ -3067,26 +2447,17 @@ fn main() {
                 tensorboard_encoded_subdir(&config)
             );
             println!(
-                "explore  : root_noise(total_concentration={},fraction={}) move_temp={}..{} restart_temp={}..{}({}ply) policy_temp={} starts(start/opening/midgame)={:.1}%/{:.1}%/{:.1}% pools(opening/midgame)={}/{} pool_recent={:.0}%/{}gen actor_publish={}",
-                config.root_dirichlet_total_concentration,
+                "explore  : Px0 book={} shuffled; root_noise(alpha={},fraction={}) temp_cutoff={}ply visit_offset={} root_fpu_absolute={} kld_min={} resign={}%,playthrough={:.0}%",
+                config.selfplay_opening_book,
+                config.root_dirichlet_alpha,
                 config.root_exploration_fraction,
-                config.temperature_start,
-                config.temperature_endgame,
-                config.restart_temperature_start,
-                config.temperature_endgame,
-                config.restart_temperature_decay_plies,
-                config.policy_softmax_temp,
-                (1.0 - config.opening_start_fraction - config.midgame_start_fraction) * 100.0,
-                config.opening_start_fraction * 100.0,
-                config.midgame_start_fraction * 100.0,
-                config.opening_reservoir_capacity,
-                config.midgame_reservoir_capacity,
-                config.start_pool_recent_fraction * 100.0,
-                config.start_pool_recent_generations,
-                "every-update"
+                config.temperature_cutoff_plies,
+                config.temperature_visit_offset,
+                config.fpu_absolute_at_root,
+                config.minimum_kldgain_per_node,
+                config.resign_percentage,
+                config.resign_playthrough * 100.0
             );
-            let cpu_placements = chineseai::cpu_topology::cpu_placements();
-            let numa_nodes = chineseai::cpu_topology::numa_nodes(&cpu_placements);
             let selfplay_worker_count = config.workers.max(1);
             // 覆盖一次GPU更新期间完成的批次，同时限制旧模型样本和内存积压。
             let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(2).max(32);
@@ -3094,27 +2465,7 @@ fn main() {
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             // 评估在主线程同步汇总时，训练结果仍可排队，避免反压训练和自对弈流水线。
             let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
-            let llc_domains = cpu_placements
-                .iter()
-                .map(|placement| (placement.node, placement.package, placement.llc))
-                .collect::<HashSet<_>>()
-                .len();
-            println!(
-                "cpu      : physical={} numa_nodes={} llc_domains={} selfplay_workers={} selfplay_queue={} affinity={} model_replicas={}",
-                cpu_placements.len(),
-                numa_nodes.len(),
-                llc_domains,
-                selfplay_worker_count,
-                selfplay_queue_capacity,
-                if cfg!(target_os = "linux") {
-                    "on"
-                } else {
-                    "unsupported"
-                },
-                numa_nodes.len(),
-            );
-            let initial_numa_models =
-                build_numa_model_replicas(&initial_selfplay_model, &numa_nodes);
+            println!("selfplay : workers={} queue={}", selfplay_worker_count, selfplay_queue_capacity);
             let mut arena_reference_model = initial_arena_reference_model;
             let mut champion_paths =
                 champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
@@ -3134,28 +2485,33 @@ fn main() {
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: start_update.saturating_sub(1) as u64,
                 learner_update: start_update.saturating_sub(1).min(u32::MAX as usize) as u32,
-                models_by_numa_node: initial_numa_models,
+                model: Arc::new(initial_selfplay_model),
             }));
+            let book_openings = Arc::new(std::sync::Mutex::new(
+                chineseai::px0_opening_book::Px0OpeningBook::load(
+                    &config.selfplay_opening_book,
+                    config.seed,
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to load Px0 opening book `{}`: {err}",
+                        config.selfplay_opening_book
+                    )
+                }),
+            ));
+            println!(
+                "selfplay : Px0 book={} positions={} mode=shuffled",
+                config.selfplay_opening_book,
+                book_openings.lock().unwrap().len()
+            );
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
             for worker_id in 0..selfplay_worker_count {
-                let placement = cpu_placements[worker_id % cpu_placements.len()];
-                let model_slot = numa_nodes
-                    .iter()
-                    .position(|&(node, _)| node == placement.node)
-                    .unwrap_or(0);
                 let selfplay_stop = stop_requested.clone();
                 let selfplay_config = config.clone();
                 let selfplay_tx = selfplay_tx.clone();
                 let shared_model = Arc::clone(&shared_model);
-                let selfplay_opening_pool = Arc::clone(&shared_opening_pool);
-                let selfplay_midgame_pool = Arc::clone(&shared_midgame_pool);
+                let book_openings = Arc::clone(&book_openings);
                 selfplay_handles.push(thread::spawn(move || {
-                    if let Err(err) = chineseai::cpu_topology::pin_current_thread(placement.cpu) {
-                        eprintln!(
-                            "warning: failed to pin selfplay worker {worker_id} to cpu {}: {err}",
-                            placement.cpu
-                        );
-                    }
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
                     let mut local_learner_update = 0u32;
@@ -3170,7 +2526,7 @@ fn main() {
                                 .unwrap_or_else(|_| panic!("shared selfplay model poisoned"));
                             if shared.version != local_version {
                                 local_model =
-                                    Some(Arc::clone(&shared.models_by_numa_node[model_slot]));
+                                    Some(Arc::clone(&shared.model));
                                 local_version = shared.version;
                                 local_learner_update = shared.learner_update;
                             }
@@ -3186,28 +2542,11 @@ fn main() {
                             &Arc::default(),
                         );
                         loop_config.games = 4;
-                        let mut pool_rng = SplitMix64::new(batch_seed ^ 0xA076_1D64_78BD_642F);
-                        loop_config.opening_positions = selfplay_opening_pool
-                            .read()
-                            .unwrap_or_else(|_| panic!("opening pool poisoned"))
-                            .sample_recent_mixed(
-                                loop_config.games,
-                                selfplay_config.start_pool_recent_fraction,
-                                selfplay_config.start_pool_recent_generations,
-                                local_learner_update,
-                                &mut pool_rng,
-                            )
-                            .into();
-                        loop_config.midgame_positions = selfplay_midgame_pool
-                            .read()
-                            .unwrap_or_else(|_| panic!("midgame pool poisoned"))
-                            .sample_recent_mixed(
-                                loop_config.games,
-                                selfplay_config.start_pool_recent_fraction,
-                                selfplay_config.start_pool_recent_generations,
-                                local_learner_update,
-                                &mut pool_rng,
-                            )
+                        loop_config.opening_positions = book_openings
+                            .lock()
+                            .unwrap_or_else(|_| panic!("Px0 opening book poisoned"))
+                            .next_batch(loop_config.games, local_learner_update)
+                            .unwrap_or_else(|err| panic!("invalid Px0 opening: {err}"))
                             .into();
                         let data = generate_selfplay_data(
                             local_model
@@ -3235,8 +2574,6 @@ fn main() {
             let collector_warmup_missing = config
                 .train_warmup_samples
                 .saturating_sub(replay_samples_at_start);
-            let collector_midgame_pool = Arc::clone(&shared_midgame_pool);
-            let collector_opening_pool = Arc::clone(&shared_opening_pool);
             println!(
                 "warmup   : {} (model={} replay_start={})",
                 if collector_warmup_missing > 0 {
@@ -3256,24 +2593,7 @@ fn main() {
                 let mut window_started = Instant::now();
                 let warmup_progress_step = (collector_warmup_missing / 10).clamp(10_000, 100_000);
                 let mut next_warmup_progress = warmup_progress_step;
-                while let Ok(mut batch) = selfplay_rx.recv() {
-                    let opening_snapshots = std::mem::take(&mut batch.data.opening_snapshots);
-                    if !opening_snapshots.is_empty() {
-                        collector_opening_pool
-                            .write()
-                            .unwrap_or_else(|_| panic!("opening pool poisoned"))
-                            .add_snapshots(
-                                opening_snapshots,
-                                collector_config.seed ^ !(batch_index as u64),
-                            );
-                    }
-                    let snapshots = std::mem::take(&mut batch.data.midgame_snapshots);
-                    if !snapshots.is_empty() {
-                        collector_midgame_pool
-                            .write()
-                            .unwrap_or_else(|_| panic!("midgame pool poisoned"))
-                            .add_snapshots(snapshots, collector_config.seed ^ batch_index as u64);
-                    }
+                while let Ok(batch) = selfplay_rx.recv() {
                     pending.push(batch);
                     let required_samples = if batch_index == 0 {
                         collector_warmup_missing.max(collector_config.selfplay_samples_per_update)
@@ -3312,7 +2632,6 @@ fn main() {
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
             let trainer_shared_model = Arc::clone(&shared_model);
-            let trainer_numa_nodes = numa_nodes.clone();
             let trainer_handle = thread::spawn(move || {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
@@ -3393,7 +2712,7 @@ fn main() {
                     let candidate_model = trainer_model.clone();
                     let actor_version = publish_selfplay_model(
                         &trainer_shared_model,
-                        build_numa_model_replicas(&candidate_model, &trainer_numa_nodes),
+                        Arc::new(candidate_model.clone()),
                         train_update,
                     );
                     println!(
@@ -3624,12 +2943,8 @@ fn main() {
                     None
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
-                let midgame_pool_len = shared_midgame_pool
-                    .read()
-                    .unwrap_or_else(|_| panic!("midgame pool poisoned"))
-                    .len();
                 println!(
-                    "update {update:04}: games={}(total={}) samples={}(total={}) train_samples={} pool={}/{} fill={:.0}% midpool={}/{} replay(chunks={} actor_updates={}-{} actor_update_span={} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
+                    "update {update:04}: games={}(total={}) samples={}(total={}) train_samples={} pool={}/{} fill={:.0}% replay(chunks={} actor_updates={}-{} actor_update_span={} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
                     report.games,
                     generated_games_total,
                     report.samples,
@@ -3642,8 +2957,6 @@ fn main() {
                     } else {
                         100.0 * report.pool_samples as f32 / report.pool_capacity as f32
                     },
-                    midgame_pool_len,
-                    config.midgame_reservoir_capacity,
                     report.replay_chunks,
                     report.replay_oldest_update,
                     report.replay_newest_update,
@@ -3754,7 +3067,7 @@ fn main() {
                 let source_phase =
                     |source: usize, phase: usize| report.source_phase_value[source * 3 + phase];
                 println!(
-                    "valueSrc {update:04}: startpos(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3}) opening_pool(p0={}/{:.3}/{:.3}/{:.3}) midgame(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3})",
+                    "valueSrc {update:04}: startpos(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3}) opening_book(p0={}/{:.3}/{:.3}/{:.3}) midgame(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3})",
                     source_phase(0, 0).samples,
                     source_phase(0, 0).rmse,
                     source_phase(0, 0).corr,
@@ -3833,7 +3146,7 @@ fn main() {
                         phase_value.calibration,
                     );
                 }
-                for (source, source_name) in ["startpos", "opening_pool", "midgame"]
+                for (source, source_name) in ["startpos", "opening_book", "midgame"]
                     .into_iter()
                     .enumerate()
                 {
@@ -4048,7 +3361,7 @@ fn main() {
                     report.replay_recent_window_fraction,
                 );
                 log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
-                for (source, source_name) in ["startpos", "opening_pool", "midgame"]
+                for (source, source_name) in ["startpos", "opening_book", "midgame"]
                     .into_iter()
                     .enumerate()
                 {
@@ -4372,8 +3685,8 @@ fn main() {
                                     cpuct_factor: config.cpuct_factor,
                                     cpuct_base_at_root: config.cpuct_base_at_root,
                                     cpuct_factor_at_root: config.cpuct_factor_at_root,
-                                    fpu_value: config.fpu_value,
-                                    fpu_value_at_root: config.fpu_value_at_root,
+                                    fpu_value: 0.23,
+                                    fpu_value_at_root: 1.0,
                                     draw_score: config.draw_score,
                                     policy_softmax_temp: config.arena_policy_softmax_temp,
                                     thread_count: config.arena_processes,
@@ -4617,10 +3930,12 @@ fn main() {
                                     cpuct_base_at_root: config.cpuct_base_at_root,
                                     cpuct_factor_at_root: config.cpuct_factor_at_root,
                                     max_depth: config.max_plies,
-                                    root_dirichlet_total_concentration: 0.0,
+                                    root_dirichlet_alpha: 0.0,
                                     root_exploration_fraction: 0.0,
-                                    fpu_value: config.fpu_value,
-                                    fpu_value_at_root: config.fpu_value_at_root,
+                                    fpu_value: 0.23,
+                                    fpu_value_at_root: 1.0,
+                                    fpu_absolute_at_root: true,
+                                    minimum_kldgain_per_node: 0.0,
                                     policy_softmax_temp: config
                                         .pikafish_label_eval_policy_softmax_temp,
                                     draw_score: config.draw_score,
@@ -4772,40 +4087,6 @@ fn main() {
             trainer_handle
                 .join()
                 .unwrap_or_else(|_| panic!("training thread panicked"));
-            if config.opening_reservoir_capacity > 0 {
-                let pool = shared_opening_pool
-                    .read()
-                    .unwrap_or_else(|_| panic!("opening pool poisoned"));
-                pool.save_lz4(&opening_snapshot_path).unwrap_or_else(|err| {
-                    panic!(
-                        "failed to save opening pool `{}`: {err}",
-                        opening_snapshot_path.display()
-                    )
-                });
-                println!(
-                    "opening  : saved {}/{} snapshots to `{}`",
-                    pool.len(),
-                    pool.capacity(),
-                    opening_snapshot_path.display()
-                );
-            }
-            if config.midgame_reservoir_capacity > 0 {
-                let pool = shared_midgame_pool
-                    .read()
-                    .unwrap_or_else(|_| panic!("midgame pool poisoned"));
-                pool.save_lz4(&midgame_snapshot_path).unwrap_or_else(|err| {
-                    panic!(
-                        "failed to save midgame pool `{}`: {err}",
-                        midgame_snapshot_path.display()
-                    )
-                });
-                println!(
-                    "midgame  : saved {}/{} snapshots to `{}`",
-                    pool.len(),
-                    pool.capacity(),
-                    midgame_snapshot_path.display()
-                );
-            }
             if exited_after_ctrl_c || exited_after_target_update {
                 if let Some(model) = interrupt_save_model.as_ref() {
                     save_model(model, Path::new(&config.model_path));
@@ -4855,41 +4136,20 @@ fn main() {
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
             let parallel_games = cmd.parallel_games.max(1);
-            let (opening_plies_min, opening_plies_max) =
-                if cmd.opening_plies_min <= cmd.opening_plies_max {
-                    (cmd.opening_plies_min, cmd.opening_plies_max)
-                } else {
-                    (cmd.opening_plies_max, cmd.opening_plies_min)
-                };
             let (start_positions, opening_mode) = if cmd.opening_book.trim().is_empty() {
                 (Vec::new(), "startpos_fallback".to_string())
             } else {
-                let book = ObkBook::load(&cmd.opening_book).unwrap_or_else(|err| {
-                    panic!(
-                        "failed to load vs-pikafish opening book `{}`: {err}",
-                        cmd.opening_book
-                    )
-                });
-                let mut rng = SplitMix64::new(cmd.seed ^ 0xA24B_AED4_963E_E407);
-                let count = cmd.opening_positions.max(1);
-                let mut positions = Vec::with_capacity(count);
-                for _ in 0..count {
-                    positions.push(book.random_prefix_position(
-                        opening_plies_min,
-                        opening_plies_max,
-                        &mut rng,
-                    ));
-                }
+                let mut book = Px0OpeningBook::load(&cmd.opening_book, cmd.seed)
+                    .unwrap_or_else(|err| panic!("failed to load Px0 opening book: {err}"));
+                let positions = book
+                    .next_batch(cmd.opening_positions.max(1), 0)
+                    .unwrap_or_else(|err| panic!("invalid Px0 FEN: {err}"))
+                    .into_iter()
+                    .map(|s| s.position)
+                    .collect();
                 (
                     positions,
-                    format!(
-                        "obk_openings(book={},keys={},moves={},plies={}-{})",
-                        cmd.opening_book,
-                        book.key_count(),
-                        book.move_count(),
-                        opening_plies_min,
-                        opening_plies_max
-                    ),
+                    format!("px0(shuffled,book={})", cmd.opening_book),
                 )
             };
             let summary = run_vs_pikafish(
@@ -5074,23 +4334,18 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
         ));
     }
 
-    let mut rng = SplitMix64::new(cmd.seed);
     let (positions, opening_mode) = if cmd.opening_book.trim().is_empty() {
         (vec![Position::startpos()], "startpos".to_string())
     } else {
-        let book = ObkBook::load(&cmd.opening_book).map_err(sqlite_io_error)?;
-        let count = cmd.opening_positions.max(1);
-        let positions = (0..count)
-            .map(|_| {
-                book.random_prefix_position(cmd.opening_plies_min, cmd.opening_plies_max, &mut rng)
-            })
-            .collect::<Vec<_>>();
+        let mut book = Px0OpeningBook::load(&cmd.opening_book, cmd.seed)?;
+        let positions = book
+            .next_batch(cmd.opening_positions.max(1), 0)?
+            .into_iter()
+            .map(|s| s.position)
+            .collect();
         (
             positions,
-            format!(
-                "obk:{} positions={} plies={}-{}",
-                cmd.opening_book, count, cmd.opening_plies_min, cmd.opening_plies_max
-            ),
+            format!("px0(shuffled,book={})", cmd.opening_book),
         )
     };
     let positions = Arc::new(positions);
@@ -5136,14 +4391,14 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
                 rule60_max_ply: Some(120),
                 cpuct: 0.9,
                 cpuct_at_root: 2.0,
-                cpuct_base: 19652.0,
-                cpuct_factor: 1.5,
-                cpuct_base_at_root: 19652.0,
-                cpuct_factor_at_root: 1.5,
-                fpu_value: 0.15,
-                fpu_value_at_root: 0.05,
+                cpuct_base: 38739.0,
+                cpuct_factor: 3.894,
+                cpuct_base_at_root: 38739.0,
+                cpuct_factor_at_root: 3.894,
+                fpu_value: 0.23,
+                fpu_value_at_root: 1.0,
                 draw_score: 0.0,
-                policy_softmax_temp: 1.25,
+                policy_softmax_temp: 1.4,
                 thread_count: cmd.threads.max(1),
                 seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
             });
@@ -5509,7 +4764,7 @@ fn run_replay_coverage(cmd: AzReplayCoverageArgs) -> io::Result<()> {
         }
     }
 
-    let limits = fixed_az_search_limits(cmd.simulations.max(1), cmd.seed, 0.9, 2.0, 0, 1.25);
+    let limits = fixed_az_search_limits(cmd.simulations.max(1), cmd.seed, 0.9, 2.0, 0, 1.4);
     let names = ["unseen", "seen-1-2", "seen-3-9", "seen-10+"];
     let path = Path::new(&cmd.output);
     if let Some(parent) = path
@@ -5638,6 +4893,8 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         AzSearchLimits {
             fpu_value: cmd.fpu_value.max(0.0),
             fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
+            fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.0,
             ..fixed_az_search_limits(
                 cmd.simulations.max(1),
                 cmd.seed,
@@ -6268,7 +5525,6 @@ fn run_pikafish_label_selfplay(cmd: PikafishLabelSelfplayArgs) -> io::Result<()>
         config.games = games;
         config.simulations = cmd.simulations.max(1);
         config.max_plies = cmd.max_plies.max(1);
-        config.opening_start_fraction = 0.0;
         config.record_fens = true;
         config.mirror_probability = 0.0;
         let data = generate_selfplay_data(&model, &config);
@@ -6562,16 +5818,16 @@ mod reporting_tests {
         let shared = RwLock::new(SharedSelfplayModel {
             version: 7,
             learner_update: 6,
-            models_by_numa_node: vec![initial],
+            model: initial,
         });
 
-        let version = publish_selfplay_model(&shared, vec![Arc::clone(&latest)], 8);
+        let version = publish_selfplay_model(&shared, Arc::clone(&latest), 8);
         let published = shared.read().unwrap();
 
         assert_eq!(version, 8);
         assert_eq!(published.version, 8);
         assert_eq!(published.learner_update, 8);
-        assert!(Arc::ptr_eq(&published.models_by_numa_node[0], &latest));
+        assert!(Arc::ptr_eq(&published.model, &latest));
     }
 
     #[test]
@@ -6594,59 +5850,19 @@ mod reporting_tests {
     }
 
     #[test]
-    fn az_search_defaults_match_selfplay_and_uci_search() {
+    fn az_search_defaults_match_px0_match_settings() {
         let cli =
             Cli::try_parse_from(["chineseai", "az-search", "model.safetensors", "3200"]).unwrap();
         let Some(CliCommand::AzSearch(args)) = cli.command else {
             panic!("expected az-search command");
         };
-        assert_eq!(args.cpuct, 0.9);
-        assert_eq!(args.cpuct_at_root, 2.0);
-        assert_eq!(args.cpuct_factor, 1.5);
-        assert_eq!(args.cpuct_factor_at_root, 1.5);
-        assert_eq!(args.fpu_value, 0.15);
-        assert_eq!(args.fpu_value_at_root, 0.05);
-        assert_eq!(args.policy_softmax_temp, 1.25);
-    }
-
-    #[test]
-    fn sampling_ablation_uses_paired_seeds_and_isolated_artifacts() {
-        let base = AzLoopFileConfig::default();
-        let configs = sampling_ablation_configs(&base, Path::new("matrix"), &[11, 22, 33]);
-        assert_eq!(configs.len(), 9);
-        for (variant, start, midgame) in [
-            ("a-30-30-40", 0.30f32, 0.40f32),
-            ("b-20-30-50", 0.20f32, 0.50f32),
-            ("c-10-30-60", 0.10f32, 0.60f32),
-        ] {
-            let runs = configs
-                .iter()
-                .filter(|(name, _, _)| name.starts_with(variant))
-                .collect::<Vec<_>>();
-            assert_eq!(runs.len(), 3);
-            assert_eq!(
-                runs.iter().map(|run| run.2.seed).collect::<Vec<_>>(),
-                [11, 22, 33]
-            );
-            for (_, path, config) in runs {
-                assert!(
-                    (1.0 - config.opening_start_fraction - config.midgame_start_fraction - start)
-                        .abs()
-                        < 1.0e-6
-                );
-                assert!((config.midgame_start_fraction - midgame).abs() < 1.0e-6);
-                assert!(config.model_path.contains(variant));
-                assert!(config.opening_snapshot_path.contains(variant));
-                assert!(config.midgame_snapshot_path.contains(variant));
-                assert!(config.checkpoint_dir.contains(variant));
-                assert!(config.tensorboard_logdir.contains(variant));
-                assert!(path.ends_with("config.toml"));
-            }
-        }
-        assert_ne!(
-            tensorboard_encoded_subdir(&configs[0].2),
-            tensorboard_encoded_subdir(&configs[3].2)
-        );
+        assert_eq!(args.cpuct, 1.0);
+        assert_eq!(args.cpuct_at_root, 1.9);
+        assert_eq!(args.cpuct_factor, 3.894);
+        assert_eq!(args.cpuct_factor_at_root, 3.894);
+        assert_eq!(args.fpu_value, 0.23);
+        assert_eq!(args.fpu_value_at_root, 1.0);
+        assert_eq!(args.policy_softmax_temp, 1.4);
     }
 
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {

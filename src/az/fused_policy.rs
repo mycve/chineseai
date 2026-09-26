@@ -29,10 +29,10 @@ const _: () = assert!(
         && POLICY_MOVE_CONTEXT_SIZE == 16
         && POLICY_ACCUMULATOR_RANK == 64
 );
-const _: () = assert!(DENSE_MOVE_SPACE == 2086);
+const _: () = assert!(DENSE_MOVE_SPACE == 2062);
 const _: () = assert!(CONSEQUENCE_OFFSET == 40320 && BIAS_OFFSET == 40352);
-const _: () = assert!(CONTEXT_OFFSET == 42438 && ACCUMULATOR_FEATURE_OFFSET == 75814);
-const _: () = assert!(ACCUMULATOR_MOVE_OFFSET == 156454 && TABLE_LEN == 289958);
+const _: () = assert!(CONTEXT_OFFSET == 42414 && ACCUMULATOR_FEATURE_OFFSET == 75406);
+const _: () = assert!(ACCUMULATOR_MOVE_OFFSET == 156046 && TABLE_LEN == 288014);
 
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void fused_policy_fwd(
@@ -57,14 +57,14 @@ extern "C" __global__ void fused_policy_fwd(
         }
         for (unsigned int h = 0; h < 16u; ++h) {
             value += context[(index / moves) * 80u + h]
-                   * tables[42438u + move_index * 16u + h];
+                   * tables[42414u + move_index * 16u + h];
         }
         for (unsigned int h = 0; h < 64u; ++h) {
             float after = context[(index / moves) * 80u + 16u + h]
-                        + tables[75814u + to * 64u + h]
-                        - tables[75814u + from * 64u + h];
-            if (has_capture) after -= tables[75814u + captured * 64u + h];
-            value += after * tables[156454u + move_index * 64u + h];
+                        + tables[75406u + to * 64u + h]
+                        - tables[75406u + from * 64u + h];
+            if (has_capture) after -= tables[75406u + captured * 64u + h];
+            value += after * tables[156046u + move_index * 64u + h];
         }
     }
     output[index] = value;
@@ -83,7 +83,7 @@ extern "C" __global__ void fused_policy_grad(
     const float* context = context_grad;
     const float* grad_output = context_grad + batch * 80u;
     float* grad_tables = output;
-    float* grad_context = output + 289958u;
+    float* grad_context = output + 288014u;
     float g = grad_output[index];
     atomicAdd(grad_tables + 40352u + move_index, g);
     if (((packed >> 45) & 1u) == 0u) return;
@@ -104,22 +104,22 @@ extern "C" __global__ void fused_policy_grad(
         atomicAdd(grad_tables + 40320u + h, g * delta);
     }
     for (unsigned int h = 0; h < 16u; ++h) {
-        unsigned int context_index = 42438u + move_index * 16u + h;
+        unsigned int context_index = 42414u + move_index * 16u + h;
         atomicAdd(grad_tables + context_index, g * context[b * 80u + h]);
         atomicAdd(grad_context + b * 80u + h, g * tables[context_index]);
     }
     for (unsigned int h = 0; h < 64u; ++h) {
-        unsigned int move_factor = 156454u + move_index * 64u + h;
+        unsigned int move_factor = 156046u + move_index * 64u + h;
         float w = tables[move_factor];
         float after = context[b * 80u + 16u + h]
-                    + tables[75814u + to * 64u + h]
-                    - tables[75814u + from * 64u + h];
+                    + tables[75406u + to * 64u + h]
+                    - tables[75406u + from * 64u + h];
         atomicAdd(grad_context + b * 80u + 16u + h, g * w);
-        atomicAdd(grad_tables + 75814u + to * 64u + h, g * w);
-        atomicAdd(grad_tables + 75814u + from * 64u + h, -g * w);
+        atomicAdd(grad_tables + 75406u + to * 64u + h, g * w);
+        atomicAdd(grad_tables + 75406u + from * 64u + h, -g * w);
         if (has_capture) {
-            after -= tables[75814u + captured * 64u + h];
-            atomicAdd(grad_tables + 75814u + captured * 64u + h, -g * w);
+            after -= tables[75406u + captured * 64u + h];
+            atomicAdd(grad_tables + 75406u + captured * 64u + h, -g * w);
         }
         atomicAdd(grad_tables + move_factor, g * after);
     }

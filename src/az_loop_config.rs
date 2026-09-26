@@ -35,34 +35,29 @@ pub struct AzLoopFileConfig {
     pub seed: u64,
     pub workers: usize,
     pub temperature_start: f32,
+    pub temperature_cutoff_plies: usize,
+    pub temperature_visit_offset: f32,
+    pub resign_percentage: f32,
+    pub resign_playthrough: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    /// 池化局面重启后的局部探索温度；实际温度取其与全局温度曲线的较大值。
-    pub restart_temperature_start: f32,
-    pub restart_temperature_decay_plies: usize,
     pub cpuct: f32,
     pub cpuct_at_root: f32,
     pub cpuct_base: f32,
     pub cpuct_factor: f32,
     pub cpuct_base_at_root: f32,
     pub cpuct_factor_at_root: f32,
-    /// 动态 Dirichlet 总浓度；alpha = 总浓度 / 根合法走法数，0 关闭噪声。
-    pub root_dirichlet_total_concentration: f32,
+    /// 每个根走法的 Dirichlet alpha，0 关闭噪声。
+    pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
+    pub fpu_absolute_at_root: bool,
+    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
-    pub opening_start_fraction: f32,
-    pub opening_reservoir_capacity: usize,
-    pub opening_snapshot_path: String,
-    pub midgame_start_fraction: f32,
-    pub midgame_reservoir_capacity: usize,
-    pub midgame_snapshot_path: String,
-    /// 从最近若干代快照中采样的比例，其余样本来自完整 reservoir。
-    pub start_pool_recent_fraction: f32,
-    pub start_pool_recent_generations: u32,
+    pub selfplay_opening_book: String,
     pub replay_capacity: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_games: u32,
@@ -90,8 +85,6 @@ pub struct AzLoopFileConfig {
     pub arena_processes: usize,
     pub arena_opening_book: String,
     pub arena_opening_positions: usize,
-    pub arena_opening_plies_min: usize,
-    pub arena_opening_plies_max: usize,
     pub arena_random_positions: usize,
     pub arena_random_plies_min: usize,
     pub arena_random_plies_max: usize,
@@ -110,7 +103,7 @@ impl Default for AzLoopFileConfig {
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
-            simulations: 800,
+            simulations: 10_000,
             selfplay_samples_per_update: 120000,
             lr: 0.0004,
             lr_min: 0.00001,
@@ -124,32 +117,29 @@ impl Default for AzLoopFileConfig {
             hidden_size: 128,
             seed: 20260420,
             workers: 0,
-            temperature_start: 1.2,
-            temperature_endgame: 0.05,
+            temperature_start: 0.9,
+            temperature_cutoff_plies: 78,
+            temperature_visit_offset: -0.8,
+            resign_percentage: 2.0,
+            resign_playthrough: 0.20,
+            temperature_endgame: 0.6,
             temperature_decay_delay_plies: 40,
-            temperature_decay_plies: 40,
-            restart_temperature_start: 0.6,
-            restart_temperature_decay_plies: 8,
-            cpuct: 0.9,
+            temperature_decay_plies: 120,
+            cpuct: 1.2,
             cpuct_at_root: 2.0,
-            cpuct_base: 19652.0,
-            cpuct_factor: 1.5,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 1.5,
-            root_dirichlet_total_concentration: 8.0,
-            root_exploration_fraction: 0.08,
-            fpu_value: 0.15,
-            fpu_value_at_root: 0.05,
+            cpuct_base: 38739.0,
+            cpuct_factor: 3.894,
+            cpuct_base_at_root: 38739.0,
+            cpuct_factor_at_root: 3.894,
+            root_dirichlet_alpha: 0.12,
+            root_exploration_fraction: 0.1,
+            fpu_value: 0.49,
+            fpu_value_at_root: 1.0,
+            fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.00005,
             draw_score: 0.0,
-            policy_softmax_temp: 1.25,
-            opening_start_fraction: 0.30,
-            opening_reservoir_capacity: 50_000,
-            opening_snapshot_path: "opening-pool.lz4".into(),
-            midgame_start_fraction: 0.40,
-            midgame_reservoir_capacity: 50_000,
-            midgame_snapshot_path: "midgame-pool.lz4".into(),
-            start_pool_recent_fraction: 0.75,
-            start_pool_recent_generations: 20,
+            policy_softmax_temp: 1.45,
+            selfplay_opening_book: "book.pgn.gz".into(),
             replay_capacity: 2400000,
             replay_recent_sample_fraction: 0.35,
             replay_recent_games: 7500,
@@ -169,26 +159,24 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 20,
             arena_simulations: 800,
-            arena_cpuct: 0.9,
-            arena_cpuct_at_root: 2.0,
-            arena_policy_softmax_temp: 1.25,
+            arena_cpuct: 1.0,
+            arena_cpuct_at_root: 1.9,
+            arena_policy_softmax_temp: 1.4,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.96,
             arena_processes: 128,
-            arena_opening_book: "opening.obk".into(),
+            arena_opening_book: "book.pgn.gz".into(),
             arena_opening_positions: 1000,
-            arena_opening_plies_min: 8,
-            arena_opening_plies_max: 10,
-            arena_random_positions: 1000,
+            arena_random_positions: 0,
             arena_random_plies_min: 6,
             arena_random_plies_max: 12,
             pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
             pikafish_label_eval_simulations: 6000,
-            pikafish_label_eval_cpuct: 0.9,
-            pikafish_label_eval_cpuct_at_root: 2.0,
-            pikafish_label_eval_policy_softmax_temp: 1.25,
+            pikafish_label_eval_cpuct: 1.0,
+            pikafish_label_eval_cpuct_at_root: 1.9,
+            pikafish_label_eval_policy_softmax_temp: 1.4,
             tensorboard_logdir: "runs/chineseai".into(),
         }
     }
@@ -221,6 +209,13 @@ impl AzLoopFileConfig {
         }
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
+        line!("selfplay_opening_book", q(&self.selfplay_opening_book));
+        line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
+        line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
+        line!("resign_playthrough", f(self.resign_playthrough));
+        line!("resign_percentage", f(self.resign_percentage));
+        line!("temperature_visit_offset", f(self.temperature_visit_offset));
+        line!("temperature_cutoff_plies", self.temperature_cutoff_plies);
         line!("simulations", self.simulations);
         line!(
             "selfplay_samples_per_update",
@@ -245,24 +240,13 @@ impl AzLoopFileConfig {
             self.temperature_decay_delay_plies
         );
         line!("temperature_decay_plies", self.temperature_decay_plies);
-        line!(
-            "restart_temperature_start",
-            f(self.restart_temperature_start)
-        );
-        line!(
-            "restart_temperature_decay_plies",
-            self.restart_temperature_decay_plies
-        );
         line!("cpuct", f(self.cpuct));
         line!("cpuct_at_root", f(self.cpuct_at_root));
         line!("cpuct_base", f(self.cpuct_base));
         line!("cpuct_factor", f(self.cpuct_factor));
         line!("cpuct_base_at_root", f(self.cpuct_base_at_root));
         line!("cpuct_factor_at_root", f(self.cpuct_factor_at_root));
-        line!(
-            "root_dirichlet_total_concentration",
-            f(self.root_dirichlet_total_concentration)
-        );
+        line!("root_dirichlet_alpha", f(self.root_dirichlet_alpha));
         line!(
             "root_exploration_fraction",
             f(self.root_exploration_fraction)
@@ -271,26 +255,6 @@ impl AzLoopFileConfig {
         line!("fpu_value_at_root", f(self.fpu_value_at_root));
         line!("draw_score", f(self.draw_score));
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
-        line!("opening_start_fraction", f(self.opening_start_fraction));
-        line!(
-            "opening_reservoir_capacity",
-            self.opening_reservoir_capacity
-        );
-        line!("opening_snapshot_path", q(&self.opening_snapshot_path));
-        line!("midgame_start_fraction", f(self.midgame_start_fraction));
-        line!(
-            "midgame_reservoir_capacity",
-            self.midgame_reservoir_capacity
-        );
-        line!("midgame_snapshot_path", q(&self.midgame_snapshot_path));
-        line!(
-            "start_pool_recent_fraction",
-            f(self.start_pool_recent_fraction)
-        );
-        line!(
-            "start_pool_recent_generations",
-            self.start_pool_recent_generations
-        );
         line!("replay_capacity", self.replay_capacity);
         line!(
             "replay_recent_sample_fraction",
@@ -342,8 +306,6 @@ impl AzLoopFileConfig {
         line!("arena_processes", self.arena_processes);
         line!("arena_opening_book", q(&self.arena_opening_book));
         line!("arena_opening_positions", self.arena_opening_positions);
-        line!("arena_opening_plies_min", self.arena_opening_plies_min);
-        line!("arena_opening_plies_max", self.arena_opening_plies_max);
         line!("arena_random_positions", self.arena_random_positions);
         line!("arena_random_plies_min", self.arena_random_plies_min);
         line!("arena_random_plies_max", self.arena_random_plies_max);
@@ -412,32 +374,22 @@ impl AzLoopFileConfig {
         self.temperature_endgame = self.temperature_endgame.max(0.0);
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
         self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
-        self.restart_temperature_start = self.restart_temperature_start.max(0.0);
-        self.restart_temperature_decay_plies =
-            self.restart_temperature_decay_plies.min(self.max_plies);
         self.cpuct = self.cpuct.max(0.0);
         self.cpuct_at_root = self.cpuct_at_root.max(0.0);
         self.cpuct_base = self.cpuct_base.max(1.0);
         self.cpuct_factor = self.cpuct_factor.max(0.0);
         self.cpuct_base_at_root = self.cpuct_base_at_root.max(1.0);
         self.cpuct_factor_at_root = self.cpuct_factor_at_root.max(0.0);
-        self.root_dirichlet_total_concentration = self.root_dirichlet_total_concentration.max(0.0);
+        self.root_dirichlet_alpha = self.root_dirichlet_alpha.max(0.0);
         self.root_exploration_fraction = self.root_exploration_fraction.clamp(0.0, 1.0);
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
+        self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
+        self.resign_playthrough = self.resign_playthrough.clamp(0.0, 1.0);
+        self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
-        self.midgame_start_fraction = self.midgame_start_fraction.clamp(0.0, 1.0);
-        self.opening_start_fraction = self.opening_start_fraction.clamp(0.0, 1.0);
-        let start_fraction = 1.0 - self.opening_start_fraction - self.midgame_start_fraction;
-        assert!(
-            start_fraction >= -1.0e-6,
-            "opening_start_fraction ({}) + midgame_start_fraction ({}) must not exceed 1; the remainder is the start-position share",
-            self.opening_start_fraction,
-            self.midgame_start_fraction
-        );
-        self.start_pool_recent_fraction = self.start_pool_recent_fraction.clamp(0.0, 1.0);
-        self.start_pool_recent_generations = self.start_pool_recent_generations.max(1);
+
         self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
         let mut replay_phase_fractions = [
@@ -480,12 +432,6 @@ impl AzLoopFileConfig {
         self.pikafish_label_eval_cpuct_at_root = self.pikafish_label_eval_cpuct_at_root.max(0.0);
         self.pikafish_label_eval_policy_softmax_temp =
             self.pikafish_label_eval_policy_softmax_temp.max(1e-3);
-        if self.arena_opening_plies_min > self.arena_opening_plies_max {
-            std::mem::swap(
-                &mut self.arena_opening_plies_min,
-                &mut self.arena_opening_plies_max,
-            );
-        }
         if self.arena_random_plies_min > self.arena_random_plies_max {
             std::mem::swap(
                 &mut self.arena_random_plies_min,
@@ -501,13 +447,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dynamic_dirichlet_config_roundtrips() {
+    fn embedded_defaults_match_public_px0_selfplay_settings() {
+        let config = AzLoopFileConfig::parse(&AzLoopFileConfig::default().to_file_text());
+        let expected = AzLoopFileConfig::default();
+        assert_eq!(config.selfplay_opening_book, "book.pgn.gz");
+        assert_eq!(config.arena_opening_book, "book.pgn.gz");
+        assert_eq!(config.simulations, 10000);
+        assert_eq!(config.cpuct, expected.cpuct);
+        assert_eq!(config.root_dirichlet_alpha, 0.12);
+        assert_eq!(config.temperature_cutoff_plies, 78);
+        assert!(config.fpu_absolute_at_root);
+        assert_eq!(config.resign_playthrough, 0.2);
+    }
+
+    #[test]
+    fn fixed_dirichlet_config_roundtrips() {
         let config = AzLoopFileConfig {
-            root_dirichlet_total_concentration: 8.0,
+            root_dirichlet_alpha: 0.12,
             ..AzLoopFileConfig::default()
         };
         let restored: AzLoopFileConfig = toml::from_str(&config.to_file_text()).unwrap();
-        assert_eq!(restored.root_dirichlet_total_concentration, 8.0);
+        assert_eq!(restored.root_dirichlet_alpha, 0.12);
     }
 
     #[test]
@@ -515,41 +475,31 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 28\n"));
+        assert!(text.starts_with("format_version = 29\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("lr_min = 0.00001\n"));
-        assert!(text.contains("temperature_start = 1.2\n"));
+        assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
-        assert!(text.contains("temperature_endgame = 0.05\n"));
+        assert!(text.contains("temperature_endgame = 0.6\n"));
         assert!(text.contains("temperature_decay_delay_plies = 40\n"));
-        assert!(text.contains("temperature_decay_plies = 40\n"));
-        assert!(text.contains("restart_temperature_start = 0.6\n"));
-        assert!(text.contains("restart_temperature_decay_plies = 8\n"));
-        assert!(!text.contains("temperature_cutoff_plies"));
-        assert!(text.contains("cpuct = 0.9\n"));
+        assert!(text.contains("temperature_decay_plies = 120\n"));
+        assert!(text.contains("temperature_cutoff_plies = 78"));
+        assert!(text.contains("cpuct = 1.2\n"));
         assert!(text.contains("cpuct_at_root = 2.0\n"));
-        assert!(text.contains("cpuct_base = 19652.0\n"));
-        assert!(text.contains("cpuct_factor = 1.5\n"));
-        assert!(text.contains("cpuct_base_at_root = 19652.0\n"));
-        assert!(text.contains("cpuct_factor_at_root = 1.5\n"));
-        assert!(text.contains("root_dirichlet_total_concentration = 8.0\n"));
-        assert!(text.contains("root_exploration_fraction = 0.08\n"));
-        assert!(text.contains("fpu_value = 0.15\n"));
-        assert!(text.contains("fpu_value_at_root = 0.05\n"));
+        assert!(text.contains("cpuct_base = 38739.0\n"));
+        assert!(text.contains("cpuct_factor = 3.894\n"));
+        assert!(text.contains("cpuct_base_at_root = 38739.0\n"));
+        assert!(text.contains("cpuct_factor_at_root = 3.894\n"));
+        assert!(text.contains("root_dirichlet_alpha = 0.12\n"));
+        assert!(text.contains("root_exploration_fraction = 0.1\n"));
+        assert!(text.contains("fpu_value = 0.49\n"));
+        assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
-        assert!(text.contains("policy_softmax_temp = 1.25\n"));
+        assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(!text.contains("value_td_lambda"));
         assert!(!text.contains("value_target_search_q_mix"));
-        assert!(text.contains("opening_start_fraction = 0.3\n"));
-        assert!(text.contains("opening_reservoir_capacity = 50000\n"));
-        assert!(text.contains("opening_snapshot_path = \"opening-pool.lz4\"\n"));
-        assert!(text.contains("midgame_start_fraction = 0.4\n"));
-        assert!(text.contains("midgame_reservoir_capacity = 50000\n"));
-        assert!(text.contains("midgame_snapshot_path = \"midgame-pool.lz4\"\n"));
-        assert!(text.contains("start_pool_recent_fraction = 0.75\n"));
-        assert!(text.contains("start_pool_recent_generations = 20\n"));
-        assert!(text.contains("simulations = 800\n"));
+        assert!(text.contains("simulations = 10000\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));
@@ -585,20 +535,18 @@ mod tests {
         assert!(text.contains("replay_phase_140_plus_fraction = 0.05\n"));
         assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
-        assert!(text.contains("arena_opening_book = \"opening.obk\"\n"));
+        assert!(text.contains("arena_opening_book = \"book.pgn.gz\"\n"));
         assert!(text.contains("arena_opening_positions = 1000\n"));
-        assert!(text.contains("arena_opening_plies_min = 8\n"));
-        assert!(text.contains("arena_opening_plies_max = 10\n"));
-        assert!(text.contains("arena_random_positions = 1000\n"));
+        assert!(text.contains("arena_random_positions = 0\n"));
         assert!(text.contains("arena_random_plies_min = 6\n"));
         assert!(text.contains("arena_random_plies_max = 12\n"));
         assert!(text.contains("arena_interval = 20\n"));
         assert!(text.contains("arena_simulations = 800\n"));
         assert!(text.contains("arena_promotion_rate = 0.5\n"));
         assert!(text.contains("arena_promotion_confidence_z = 1.96\n"));
-        assert!(text.contains("arena_cpuct = 0.9\n"));
-        assert!(text.contains("arena_cpuct_at_root = 2.0\n"));
-        assert!(text.contains("arena_policy_softmax_temp = 1.25\n"));
+        assert!(text.contains("arena_cpuct = 1.0\n"));
+        assert!(text.contains("arena_cpuct_at_root = 1.9\n"));
+        assert!(text.contains("arena_policy_softmax_temp = 1.4\n"));
         assert!(
             text.contains(
                 "pikafish_label_eval_sqlite = \"eval/pikafish-selfplay-5000-d20.sqlite\"\n"
@@ -607,9 +555,9 @@ mod tests {
         assert!(text.contains("pikafish_label_eval_interval = 20\n"));
         assert!(text.contains("pikafish_label_eval_limit = 1000\n"));
         assert!(text.contains("pikafish_label_eval_simulations = 6000\n"));
-        assert!(text.contains("pikafish_label_eval_cpuct = 0.9\n"));
-        assert!(text.contains("pikafish_label_eval_cpuct_at_root = 2.0\n"));
-        assert!(text.contains("pikafish_label_eval_policy_softmax_temp = 1.25\n"));
+        assert!(text.contains("pikafish_label_eval_cpuct = 1.0\n"));
+        assert!(text.contains("pikafish_label_eval_cpuct_at_root = 1.9\n"));
+        assert!(text.contains("pikafish_label_eval_policy_softmax_temp = 1.4\n"));
         assert!(!text.contains("root_exploration_plies"));
         assert!(!text.contains("search_algorithm"));
         assert!(!text.contains("arena_pikafish"));
@@ -628,7 +576,7 @@ mod tests {
     fn old_config_versions_are_rejected() {
         let text = AzLoopFileConfig::default()
             .to_file_text()
-            .replace("format_version = 28", "format_version = 27");
+            .replace("format_version = 29", "format_version = 27");
         let error = std::panic::catch_unwind(|| AzLoopFileConfig::parse(&text));
         assert!(error.is_err());
     }
@@ -636,10 +584,14 @@ mod tests {
     #[test]
     fn removed_config_names_are_rejected() {
         for removed in [
+            "opening_start_fraction = 1.0\n",
+            "midgame_start_fraction = 0.0\n",
+            "opening_reservoir_capacity = 0\n",
+            "midgame_reservoir_capacity = 0\n",
+            "root_dirichlet_total_concentration = 8.0\n",
             "actor_publish_interval_updates = 5\n",
             "actor_noninferiority_margin = 0.02\n",
             "actor_gate_min_games = 400\n",
-            "root_dirichlet_alpha = 0.2\n",
             "persistent_exploration_root_dirichlet_alpha = 0.15\n",
             "selfplay_update_warmup_updates = 5\n",
             "opening_temperature = 1.25\n",
@@ -659,10 +611,7 @@ mod tests {
             "persistent_exploration_fraction = 0.1\n",
             "persistent_exploration_temperature = 0.8\n",
             "persistent_exploration_root_exploration_fraction = 0.35\n",
-            "resign_percentage = 1.0\n",
-            "resign_playthrough = 20.0\n",
             "temperature_value_cutoff = 0.07\n",
-            "temperature_visit_offset = -0.8\n",
         ] {
             let error = toml::from_str::<AzLoopFileConfig>(removed)
                 .expect_err("removed config keys must not be accepted");

@@ -10,10 +10,10 @@ use super::{
     color_index, rule_context_features,
 };
 
-const DEFAULT_CPUCT: f32 = 0.9;
-const DEFAULT_CPUCT_AT_ROOT: f32 = 2.0;
-const DEFAULT_CPUCT_BASE: f32 = 19652.0;
-const DEFAULT_CPUCT_FACTOR: f32 = 2.0;
+const DEFAULT_CPUCT: f32 = 1.0;
+const DEFAULT_CPUCT_AT_ROOT: f32 = 1.9;
+const DEFAULT_CPUCT_BASE: f32 = 38739.0;
+const DEFAULT_CPUCT_FACTOR: f32 = 3.894;
 const NO_CHILD: u32 = u32::MAX;
 const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -32,11 +32,13 @@ pub struct AzSearchLimits {
     /// Maximum search depth in plies below root. 0 keeps the default:
     /// max_depth = num_simulations.
     pub max_depth: usize,
-    /// 动态 Dirichlet 总浓度；alpha = 总浓度 / 根合法走法数，0 关闭噪声。
-    pub root_dirichlet_total_concentration: f32,
+    /// 每个根走法的 Dirichlet alpha，0 关闭噪声。
+    pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
+    pub fpu_absolute_at_root: bool,
+    pub minimum_kldgain_per_node: f32,
     /// Divisor applied to policy logits before softmax. Values above 1 flatten priors.
     pub policy_softmax_temp: f32,
     pub draw_score: f32,
@@ -55,11 +57,13 @@ impl Default for AzSearchLimits {
             cpuct_base_at_root: DEFAULT_CPUCT_BASE,
             cpuct_factor_at_root: DEFAULT_CPUCT_FACTOR,
             max_depth: 0,
-            root_dirichlet_total_concentration: 0.0,
+            root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
-            fpu_value: 0.30,
-            fpu_value_at_root: 0.20,
-            policy_softmax_temp: 1.0,
+            fpu_value: 0.23,
+            fpu_value_at_root: 1.0,
+            fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.0,
+            policy_softmax_temp: 1.4,
             draw_score: 0.0,
             value_scale: 1.0,
         }
@@ -85,6 +89,7 @@ pub struct AzSearchResult {
     pub value_wdl: [f32; 3],
     /// Raw network WDL at the root before search. Used only for TD bootstrapping.
     pub network_value_wdl: [f32; 3],
+    pub best_value_wdl: [f32; 3],
     pub simulations: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
@@ -153,10 +158,16 @@ pub fn alphazero_search_trace_with_rules(
     );
     let root = tree.root;
     tree.expand(root);
+    let mut stopper = KldGainStopper::default();
+    let mut used = 0;
     for _ in 0..limits.simulations {
         tree.simulate(root, 0);
+        used += 1;
+        if stopper.should_stop(&tree, limits.minimum_kldgain_per_node) {
+            break;
+        }
     }
-    let result = tree.search_result(limits.simulations);
+    let result = tree.search_result(used);
     let trace = tree.trace_root_move(trace_move);
     (result, trace)
 }
@@ -258,6 +269,7 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             value_cp: cp_from_q(value_q),
             value_wdl: tree.nodes[root].value_wdl,
             network_value_wdl: tree.nodes[root].value_wdl,
+            best_value_wdl: tree.nodes[root].value_wdl,
             simulations: 0,
             search_depth_avg: 0.0,
             search_depth_max: 0,
@@ -268,6 +280,7 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
     }
 
     let mut used = 0usize;
+    let mut kld_stopper = KldGainStopper::default();
     let mut last_progress = Instant::now();
     {
         crate::scope_profile!("az.search.simulations");
@@ -277,6 +290,9 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             }
             tree.simulate(root, 0);
             used += 1;
+            if kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node) {
+                break;
+            }
             if used % SEARCH_PROGRESS_POLL_SIMULATIONS == 0
                 && progress.is_some()
                 && last_progress.elapsed() >= SEARCH_PROGRESS_INTERVAL
@@ -348,14 +364,58 @@ pub(super) fn alphazero_search_with_rules_reusing(
         0
     } else {
         crate::scope_profile!("az.search.simulations");
+        let mut used = 0;
+        let mut kld_stopper = KldGainStopper::default();
         for _ in 0..limits.simulations {
             tree.simulate(root, 0);
+            used += 1;
+            if kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node) {
+                break;
+            }
         }
-        limits.simulations
+        used
     };
     let result = tree.search_result(used);
     tree.recycle_into(workspace);
     result
+}
+
+#[derive(Default)]
+struct KldGainStopper {
+    previous: Vec<u32>,
+    total: u32,
+}
+
+impl KldGainStopper {
+    fn should_stop(&mut self, tree: &AzTree<'_>, threshold: f32) -> bool {
+        if threshold <= 0.0 {
+            return false;
+        }
+        // 根展开不计访问，所以 root.visits 对应 Px0 的 total_nodes - 1。
+        let total = tree.nodes[tree.root].visits;
+        if total < self.total.saturating_add(200) {
+            return false;
+        }
+        let children = tree.node_children(tree.root);
+        let mut gain = 0.0f64;
+        if self.total > 0 {
+            for (previous, child) in self.previous.iter().zip(children) {
+                if *previous > 0 {
+                    let old_p = *previous as f64 / self.total as f64;
+                    let new_p = child.visits as f64 / total as f64;
+                    gain += old_p * (old_p / new_p).ln();
+                }
+            }
+            if gain / ((total - self.total) as f64) < threshold as f64 {
+                return true;
+            }
+        }
+        self.previous.clear();
+        self.previous
+            .extend(children.iter().map(|child| child.visits));
+        self.total = total;
+        false
+    }
 }
 
 pub fn cp_from_q(q: f32) -> i32 {
@@ -378,11 +438,12 @@ struct AzTree<'a> {
     cpuct_factor: f32,
     cpuct_base_at_root: f32,
     cpuct_factor_at_root: f32,
-    root_dirichlet_total_concentration: f32,
+    root_dirichlet_alpha: f32,
     root_exploration_fraction: f32,
     root_noise_seed: u64,
     fpu_value: f32,
     fpu_value_at_root: f32,
+    fpu_absolute_at_root: bool,
     policy_softmax_temp: f32,
     draw_score: f32,
     value_scale: f32,
@@ -491,6 +552,16 @@ impl<'a> AzTree<'a> {
             value_cp: cp_from_q(searched_value),
             value_wdl: searched_wdl,
             network_value_wdl: root_node.value_wdl,
+            best_value_wdl: self
+                .best_root_child(self.root)
+                .map_or(searched_wdl, |index| {
+                    let child = &root_children[index];
+                    if child.visits == 0 {
+                        searched_wdl
+                    } else {
+                        child.value_wdl_sum.map(|v| v / child.visits as f32)
+                    }
+                }),
             simulations,
             search_depth_avg: self.search_depth_avg(),
             search_depth_max: self.search_depth_max,
@@ -687,11 +758,12 @@ impl<'a> AzTree<'a> {
             } else {
                 limits.cpuct_factor.max(0.0)
             },
-            root_dirichlet_total_concentration: limits.root_dirichlet_total_concentration.max(0.0),
+            root_dirichlet_alpha: limits.root_dirichlet_alpha.max(0.0),
             root_exploration_fraction: limits.root_exploration_fraction.clamp(0.0, 1.0),
             root_noise_seed: limits.seed,
             fpu_value: limits.fpu_value.max(0.0),
             fpu_value_at_root: limits.fpu_value_at_root.max(0.0),
+            fpu_absolute_at_root: limits.fpu_absolute_at_root,
             policy_softmax_temp: limits.policy_softmax_temp.max(1.0e-3),
             draw_score: limits.draw_score.clamp(-1.0, 1.0),
             value_scale: limits.value_scale.clamp(0.0, 1.0),
@@ -846,10 +918,10 @@ impl<'a> AzTree<'a> {
             )
         };
         if node_index == self.root
-            && self.root_dirichlet_total_concentration > 0.0
+            && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
         {
-            let alpha = self.root_dirichlet_total_concentration / priors.len() as f32;
+            let alpha = self.root_dirichlet_alpha;
             apply_root_dirichlet_noise(
                 priors,
                 alpha,
@@ -1165,7 +1237,11 @@ impl<'a> AzTree<'a> {
         } else {
             self.fpu_value
         };
-        let fpu_value = alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score);
+        let fpu_value = if is_root && self.fpu_absolute_at_root {
+            self.fpu_value_at_root
+        } else {
+            alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score)
+        };
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let mut best: Option<(usize, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
@@ -1458,14 +1534,102 @@ mod tests {
     use crate::xiangqi::{RuleDrawReason, RuleOutcome};
 
     #[test]
-    fn dynamic_noise_uses_actual_root_move_count() {
+    fn absolute_root_fpu_explores_unvisited_move_despite_negative_parent_value() {
+        let position = Position::startpos();
+        let model = AzNnue::random(4, 7);
+        let moves = position.legal_moves()[..2].to_vec();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            Some(moves),
+            &model,
+            AzSearchLimits {
+                cpuct_at_root: 0.0,
+                cpuct_factor_at_root: 0.0,
+                ..AzSearchLimits::default()
+            },
+        );
+        tree.expand(tree.root);
+        tree.nodes[tree.root].value_wdl = [0.0, 0.0, 1.0];
+        tree.nodes[tree.root].value = -1.0;
+        let children = tree.node_children_mut(tree.root);
+        children[0].visits = 10;
+        children[0].value_wdl_sum = [0.0, 5.0, 5.0];
+        assert_eq!(tree.select_child(tree.root), 1);
+        tree.fpu_absolute_at_root = false;
+        assert_eq!(tree.select_child(tree.root), 0);
+    }
+
+    #[test]
+    fn kld_stopper_stops_stable_distribution_and_keeps_changing_distribution() {
+        let position = Position::startpos();
+        let model = AzNnue::random(4, 7);
+        let moves = position.legal_moves()[..2].to_vec();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            Some(moves),
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.expand(tree.root);
+        let mut stopper = KldGainStopper::default();
+        tree.node_children_mut(tree.root)[0].visits = 100;
+        tree.node_children_mut(tree.root)[1].visits = 100;
+        tree.nodes[tree.root].visits = 200;
+        assert!(!stopper.should_stop(&tree, 0.00005));
+        tree.node_children_mut(tree.root)[0].visits = 300;
+        tree.nodes[tree.root].visits = 400;
+        assert!(!stopper.should_stop(&tree, 0.00005));
+        tree.node_children_mut(tree.root)[0].visits = 450;
+        tree.node_children_mut(tree.root)[1].visits = 150;
+        tree.nodes[tree.root].visits = 600;
+        assert!(stopper.should_stop(&tree, 0.00005));
+        assert!(!stopper.should_stop(&tree, 0.0));
+    }
+
+    #[test]
+    fn px0_kld_stopping_is_executed_by_all_search_paths() {
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let mv = position.legal_moves()[0];
+        let model = AzNnue::random(4, 7);
+        let limits = AzSearchLimits {
+            simulations: 10_000,
+            minimum_kldgain_per_node: 0.00005,
+            ..AzSearchLimits::default()
+        };
+        let ordinary = alphazero_search_with_rules(
+            &position, Some(history.clone()), Some(vec![mv]), &model, limits,
+        );
+        let mut workspace = AzSearchWorkspace::new(&model);
+        let reused = alphazero_search_with_rules_reusing(
+            &position, &history, vec![mv], &model, limits, &mut workspace,
+        );
+        let (traced, _) = alphazero_search_trace_with_rules(
+            &position, Some(history), Some(vec![mv]), &model, limits, mv,
+        );
+        // 单个根走法的分布恒定：200 次建立基准，400 次第一次比较并停止。
+        for result in [ordinary, reused, traced] {
+            assert_eq!(result.simulations, 400);
+            assert_eq!(result.candidates[0].visits, 400);
+        }
+        let fixed_budget = alphazero_search_with_rules(
+            &position, None, Some(vec![mv]), &model,
+            AzSearchLimits { simulations: 512, minimum_kldgain_per_node: 0.0, ..limits },
+        );
+        assert_eq!(fixed_budget.simulations, 512);
+    }
+
+    #[test]
+    fn fixed_alpha_noise_matches_px0_for_different_legal_move_counts() {
         let position = Position::startpos();
         let model = AzNnue::random(4, 31);
         for count in [1, 7, position.legal_moves().len()] {
             let moves = position.legal_moves()[..count].to_vec();
             let limits = AzSearchLimits {
                 simulations: 32,
-                root_dirichlet_total_concentration: 8.0,
+                root_dirichlet_alpha: 8.0,
                 root_exploration_fraction: 0.15,
                 ..AzSearchLimits::default()
             };
@@ -1477,7 +1641,7 @@ mod tests {
                 Some(moves.clone()),
                 &model,
                 AzSearchLimits {
-                    root_dirichlet_total_concentration: 0.0,
+                    root_dirichlet_alpha: 0.0,
                     ..limits
                 },
             );
@@ -1494,7 +1658,7 @@ mod tests {
                 .collect();
             apply_root_dirichlet_noise(
                 &mut expected,
-                8.0 / count as f32,
+                8.0,
                 limits.root_exploration_fraction,
                 limits.seed,
             );
@@ -1663,10 +1827,12 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_total_concentration: 0.0,
+                root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1698,7 +1864,7 @@ mod tests {
         let limits = AzSearchLimits {
             simulations: 128,
             seed: 91,
-            root_dirichlet_total_concentration: 8.0,
+            root_dirichlet_alpha: 8.0,
             root_exploration_fraction: 0.1,
             ..AzSearchLimits::default()
         };
@@ -1748,10 +1914,12 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 1,
-                root_dirichlet_total_concentration: 0.0,
+                root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1777,10 +1945,12 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_total_concentration: 0.0,
+                root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1794,10 +1964,12 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_total_concentration: 8.0,
+                root_dirichlet_alpha: 8.0,
                 root_exploration_fraction: 0.25,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1831,10 +2003,12 @@ mod tests {
                 cpuct: 1.5,
                 cpuct_at_root: 1.5,
                 max_depth: 0,
-                root_dirichlet_total_concentration: 0.0,
+                root_dirichlet_alpha: 0.0,
                 root_exploration_fraction: 0.0,
                 fpu_value: 0.33,
                 fpu_value_at_root: 0.33,
+                fpu_absolute_at_root: true,
+                minimum_kldgain_per_node: 0.0,
                 value_scale: 1.0,
                 ..AzSearchLimits::default()
             },
@@ -1918,6 +2092,8 @@ mod tests {
                 cpuct_at_root: 0.0,
                 cpuct_factor_at_root: 0.0,
                 fpu_value_at_root: 0.33,
+                fpu_absolute_at_root: false,
+                minimum_kldgain_per_node: 0.0,
                 ..AzSearchLimits::default()
             },
         );

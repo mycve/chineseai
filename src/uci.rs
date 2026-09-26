@@ -15,14 +15,14 @@ const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
 // MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_SIMULATIONS: usize = 800;
-const DEFAULT_CPUCT: f32 = 0.9;
-const DEFAULT_CPUCT_AT_ROOT: f32 = 2.0;
-const DEFAULT_CPUCT_BASE: f32 = 19_652.0;
-const DEFAULT_CPUCT_FACTOR: f32 = 1.5;
-const DEFAULT_FPU_VALUE: f32 = 0.15;
-const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 0.05;
-const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.25;
-const DEFAULT_OPENING_TEMPERATURE: f32 = 0.8;
+const DEFAULT_CPUCT: f32 = 1.0;
+const DEFAULT_CPUCT_AT_ROOT: f32 = 1.9;
+const DEFAULT_CPUCT_BASE: f32 = 38_739.0;
+const DEFAULT_CPUCT_FACTOR: f32 = 3.894;
+const DEFAULT_FPU_VALUE: f32 = 0.23;
+const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
+const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
+const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 
 #[derive(Clone, Debug)]
 struct UciState {
@@ -536,10 +536,12 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             cpuct_base_at_root: state.cpuct_base_at_root,
             cpuct_factor_at_root: state.cpuct_factor_at_root,
             max_depth: params.depth.unwrap_or(0),
-            root_dirichlet_total_concentration: 0.0,
+            root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,
             fpu_value: state.fpu_value,
             fpu_value_at_root: state.fpu_value_at_root,
+            fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.0,
             policy_softmax_temp: state.policy_softmax_temp,
             draw_score: state.draw_score,
             value_scale: 1.0,
