@@ -16,7 +16,80 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct AzAdjudicationStats {
+    /// 提前判定的结果，按红胜、和棋、黑胜排列。
+    pub stopped: [usize; 3],
+    /// stopped中已由搜索终局证明的判定，不能算成网络自我标签。
+    pub stopped_proven: [usize; 3],
+    pub stopped_samples: usize,
+    /// 继续下完的对局：行是首次未经证明的预测结果，列是真实终局结果。
+    pub verified: [[usize; 3]; 3],
+    /// 触发判定但继续下到截断或搜索失败，不能用于计算误判率。
+    pub unresolved: [usize; 3],
+}
+
+impl AzAdjudicationStats {
+    pub fn checked(&self) -> usize {
+        self.verified.iter().flatten().sum()
+    }
+
+    pub fn incorrect(&self) -> usize {
+        self.checked() - (0..3).map(|i| self.verified[i][i]).sum::<usize>()
+    }
+
+    fn record_playthrough(&mut self, predicted: f32, actual: Option<f32>) {
+        let predicted = outcome_index(predicted);
+        if let Some(actual) = actual {
+            self.verified[predicted][outcome_index(actual)] += 1;
+        } else {
+            self.unresolved[predicted] += 1;
+        }
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        self.stopped_samples += other.stopped_samples;
+        for i in 0..3 {
+            self.stopped[i] += other.stopped[i];
+            self.stopped_proven[i] += other.stopped_proven[i];
+            self.unresolved[i] += other.unresolved[i];
+            for j in 0..3 {
+                self.verified[i][j] += other.verified[i][j];
+            }
+        }
+    }
+}
+
+fn outcome_index(result_red: f32) -> usize {
+    if result_red > 0.0 {
+        0
+    } else if result_red < 0.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn adjudicated_result(wdl: [f32; 3], side: Color, percentage: f32) -> Option<f32> {
+    if percentage <= 0.0 {
+        return None;
+    }
+    let threshold = 1.0 - percentage / 100.0;
+    let [win, draw, loss] = wdl;
+    let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
+    if draw > threshold {
+        Some(0.0)
+    } else if win > threshold {
+        Some(side_sign)
+    } else if loss > threshold {
+        Some(-side_sign)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
+    pub adjudication: AzAdjudicationStats,
     pub no_legal_moves: usize,
     pub checkmate: usize,
     pub stalemate: usize,
@@ -61,6 +134,7 @@ impl AzTerminalStats {
     }
 
     pub fn add_assign(&mut self, other: &Self) {
+        self.adjudication.add_assign(&other.adjudication);
         self.no_legal_moves += other.no_legal_moves;
         self.checkmate += other.checkmate;
         self.stalemate += other.stalemate;
@@ -433,6 +507,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_age_max[start_source_index] = start_age_max[start_source_index].max(start_age);
         start_temperature_sum[start_source_index] += temperature_for_ply(config, start_phase_ply);
         let enable_resign = rng.unit_f32() >= config.resign_playthrough;
+        let mut first_adjudication = None;
         let mut game_samples = Vec::new();
         let mut result = None;
         let mut search_failed = false;
@@ -479,27 +554,23 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             };
             search_simulations.simulations_sum += search.simulations;
             crate::scope_profile!("az.selfplay.post_search");
-            if enable_resign && config.resign_percentage > 0.0 {
-                let threshold = 1.0 - config.resign_percentage / 100.0;
-                let [win, draw, loss] = search.best_value_wdl;
-                let outcome = if draw > threshold {
-                    Some(0.0)
-                } else if win > threshold {
-                    Some(if position.side_to_move() == Color::Red {
-                        1.0
-                    } else {
-                        -1.0
-                    })
-                } else if loss > threshold {
-                    Some(if position.side_to_move() == Color::Red {
-                        -1.0
-                    } else {
-                        1.0
-                    })
-                } else {
-                    None
-                };
-                if let Some(outcome) = outcome {
+            if let Some(outcome) = adjudicated_result(
+                search.best_value_wdl,
+                position.side_to_move(),
+                config.resign_percentage,
+            ) {
+                let proven = search.candidates.iter().any(|candidate| {
+                    Some(candidate.mv) == search.best_move && candidate.solved.is_some()
+                });
+                if !proven {
+                    first_adjudication.get_or_insert(outcome);
+                }
+                if enable_resign {
+                    terminal.adjudication.stopped[outcome_index(outcome)] += 1;
+                    if proven {
+                        terminal.adjudication.stopped_proven[outcome_index(outcome)] += 1;
+                    }
+                    terminal.adjudication.stopped_samples += game_samples.len();
                     result = Some(outcome);
                     break;
                 }
@@ -652,6 +723,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         }
 
         let terminal_result = result;
+        if !enable_resign {
+            if let Some(predicted) = first_adjudication {
+                terminal
+                    .adjudication
+                    .record_playthrough(predicted, terminal_result);
+            }
+        }
         let result: f32 = terminal_result.unwrap_or(0.0);
         match result.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => red_wins += 1,
@@ -1409,6 +1487,66 @@ mod tests {
         assert_eq!(merged.checkmate, 1);
         assert_eq!(merged.stalemate, 1);
         assert_eq!(merged.rule_blocked, 1);
+    }
+
+    #[test]
+    fn adjudication_verification_excludes_unknown_outcomes_and_preserves_colors() {
+        assert_eq!(
+            adjudicated_result([0.99, 0.005, 0.005], Color::Black, 2.0),
+            Some(-1.0)
+        );
+        assert_eq!(
+            adjudicated_result([0.005, 0.005, 0.99], Color::Black, 2.0),
+            Some(1.0)
+        );
+        assert_eq!(
+            adjudicated_result([0.005, 0.99, 0.005], Color::Red, 2.0),
+            Some(0.0)
+        );
+        assert_eq!(adjudicated_result([0.7, 0.1, 0.2], Color::Red, 2.0), None);
+        assert_eq!(adjudicated_result([1.0, 0.0, 0.0], Color::Red, 0.0), None);
+        let mut stats = AzAdjudicationStats::default();
+        stats.record_playthrough(1.0, Some(-1.0));
+        stats.record_playthrough(0.0, Some(0.0));
+        stats.record_playthrough(-1.0, None);
+        assert_eq!(stats.checked(), 2);
+        assert_eq!(stats.incorrect(), 1);
+        assert_eq!(stats.verified[0][2], 1);
+        assert_eq!(stats.unresolved, [0, 0, 1]);
+        let mut merged = AzTerminalStats::default();
+        merged.add_assign(&AzTerminalStats {
+            adjudication: stats,
+            ..Default::default()
+        });
+        assert_eq!(merged.adjudication.checked(), 2);
+        assert_eq!(merged.adjudication.incorrect(), 1);
+        assert_eq!(merged.adjudication.unresolved, [0, 0, 1]);
+    }
+
+    #[test]
+    fn playthrough_monitoring_does_not_change_cutoff_labels() {
+        let model = AzNnue::random(16, 20260907);
+        let mut config = selfplay_test_config(4);
+        config.max_plies = 1;
+        config.simulations = 2;
+        config.resign_percentage = 99.0;
+        config.resign_playthrough = 1.0;
+        let data = generate_selfplay_chunk(&model, &config);
+        assert_eq!(
+            data.terminal.adjudication.unresolved.iter().sum::<usize>(),
+            4
+        );
+        assert_eq!(data.terminal.adjudication.checked(), 0);
+        assert_eq!(data.terminal.adjudication.stopped, [0, 0, 0]);
+        assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
+        config.resign_playthrough = 0.0;
+        let stopped = generate_selfplay_chunk(&model, &config);
+        assert_eq!(
+            stopped.terminal.adjudication.stopped.iter().sum::<usize>(),
+            4
+        );
+        assert_eq!(stopped.terminal.max_plies, 0);
+        assert_eq!(stopped.terminal.adjudication.unresolved, [0, 0, 0]);
     }
 
     #[test]

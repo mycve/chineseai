@@ -52,8 +52,8 @@ pub use alphazero::{
 };
 pub use dataloader::{AzSparseActivationStats, sparse_activation_stats};
 pub use play::{
-    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
-    play_arena_games_from_positions, play_arena_games_from_snapshots,
+    AzAdjudicationStats, AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats,
+    generate_selfplay_data, play_arena_games_from_positions, play_arena_games_from_snapshots,
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
 pub use start::AzStartSnapshot;
@@ -1199,6 +1199,7 @@ pub struct AzLoopReport {
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
+    pub adjudication: AzAdjudicationStats,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

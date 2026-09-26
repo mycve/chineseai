@@ -1251,6 +1251,7 @@ fn build_async_training_report(
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
+        adjudication: pending.selfplay.terminal.adjudication,
     }
 }
 
@@ -3062,6 +3063,41 @@ fn main() {
                     truncated as f32 / report.games.max(1) as f32,
                 );
                 let sparse = report.train_sparse_activation;
+                let adjudication = report.adjudication;
+                println!(
+                    "adjudicate {update:04}: stopped(R/D/B)={}/{}/{} proven={} samples={} playthrough_checked_unproven={} incorrect={} unresolved={} matrix={:?}",
+                    adjudication.stopped[0],
+                    adjudication.stopped[1],
+                    adjudication.stopped[2],
+                    adjudication.stopped_proven.iter().sum::<usize>(),
+                    adjudication.stopped_samples,
+                    adjudication.checked(),
+                    adjudication.incorrect(),
+                    adjudication.unresolved.iter().sum::<usize>(),
+                    adjudication.verified,
+                );
+                for (tag, count) in [
+                    (
+                        "adjudication/stopped_proven",
+                        adjudication.stopped_proven.iter().sum::<usize>(),
+                    ),
+                    (
+                        "adjudication/stopped",
+                        adjudication.stopped.iter().sum::<usize>(),
+                    ),
+                    ("adjudication/stopped_samples", adjudication.stopped_samples),
+                    ("adjudication/playthrough_checked", adjudication.checked()),
+                    (
+                        "adjudication/playthrough_incorrect",
+                        adjudication.incorrect(),
+                    ),
+                    (
+                        "adjudication/playthrough_unresolved",
+                        adjudication.unresolved.iter().sum::<usize>(),
+                    ),
+                ] {
+                    log_scalar(&mut tb, tag, update, count as f32);
+                }
                 println!(
                     "sparse   {update:04}: subset={}/{} moves={} coverage(value/exact/factor/tactical)={:.6}/{:.6}/{:.6}/{:.6} unique={}/{}/{}/{}",
                     sparse.inspected_samples,
