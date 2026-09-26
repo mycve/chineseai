@@ -554,6 +554,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             };
             search_simulations.simulations_sum += search.simulations;
             crate::scope_profile!("az.selfplay.post_search");
+            let mut proven_adjudication = None;
             if let Some(outcome) = adjudicated_result(
                 search.best_value_wdl,
                 position.side_to_move(),
@@ -570,9 +571,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     if proven {
                         terminal.adjudication.stopped_proven[outcome_index(outcome)] += 1;
                     }
-                    terminal.adjudication.stopped_samples += game_samples.len();
-                    result = Some(outcome);
-                    break;
+                    if proven {
+                        // 当前证明局面也必须进入经验池，才能训练网络记住搜索纠错。
+                        proven_adjudication = Some(outcome);
+                    } else {
+                        terminal.adjudication.stopped_samples += game_samples.len();
+                        result = Some(outcome);
+                        break;
+                    }
                 }
             }
             let entropy = policy_entropy(&search.candidates);
@@ -667,6 +673,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     1.0,
                 );
                 game_samples.push(sample);
+            }
+            if let Some(outcome) = proven_adjudication {
+                terminal.adjudication.stopped_samples += game_samples.len();
+                result = Some(outcome);
+                break;
             }
             let mover = position.side_to_move();
             let captured = position.piece_at(mv.to as usize);
@@ -1565,6 +1576,42 @@ mod tests {
         );
         assert_eq!(stopped.terminal.max_plies, 0);
         assert_eq!(stopped.terminal.adjudication.unresolved, [0, 0, 0]);
+    }
+
+    #[test]
+    fn proven_mate_adjudication_keeps_the_training_sample() {
+        let model = AzNnue::random(16, 20260907);
+        let position = Position::from_fen(
+            "2bak2r1/4a4/4b4/p2R4p/4C1n2/2P1c3P/P1r3P2/4B4/4A4/2BK1A2R w - - 1 1",
+        )
+        .unwrap();
+        let mate = position.parse_uci_move("d6d9").unwrap();
+        let mate_index = dense_move_index(canonical_move(position.side_to_move(), mate));
+        let mut config = selfplay_test_config(1);
+        config.simulations = 1;
+        config.resign_percentage = 2.0;
+        config.resign_playthrough = 0.0;
+        config.mirror_probability = 0.0;
+        config.opening_positions = vec![AzStartSnapshot {
+            rule_history: position.initial_rule_history(),
+            position,
+            phase_ply: 0,
+            generation: 0,
+        }]
+        .into();
+        let data = generate_selfplay_chunk(&model, &config);
+        assert_eq!(data.terminal.adjudication.stopped_proven, [1, 0, 0]);
+        assert_eq!(data.samples.len(), 1);
+        assert_eq!(data.terminal.adjudication.stopped_samples, 1);
+        let sample = &data.samples[0];
+        assert_eq!(sample.value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(sample.value_weight, 1.0);
+        let policy = sample
+            .move_indices
+            .iter()
+            .position(|&index| index == mate_index)
+            .unwrap();
+        assert_eq!(sample.policy[policy], 1.0);
     }
 
     #[test]
