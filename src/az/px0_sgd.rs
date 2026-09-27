@@ -5,7 +5,6 @@ use std::{collections::HashMap, path::Path};
 const MOMENTUM: f64 = 0.9;
 const MAX_GRAD_NORM: f64 = 10_000.0;
 const WARMUP_STEPS: usize = 250;
-const TOTAL_STEPS: usize = super::PX0_CYCLE_STEPS;
 
 #[derive(Debug)]
 pub(super) struct Px0Sgd {
@@ -17,8 +16,8 @@ pub(super) struct Px0Sgd {
 }
 
 pub(super) fn learning_rate(base_lr: f64, steps: usize) -> f64 {
-    // 公开 example.yaml：0.02/0.002/0.0005，100000/130000，周期140000。
-    let factor = match steps % TOTAL_STEPS {
+    // 按累计优化器步数衰减；保存周期不重启学习率或warmup。
+    let factor = match steps {
         0..100_000 => 1.0,
         100_000..130_000 => 0.1,
         _ => 0.025,
@@ -204,7 +203,12 @@ mod tests {
             }
         }
         assert!((learning_rate(0.02, 249) - 0.02).abs() < 1e-12);
-        assert!((learning_rate(0.02, 140_000) - 0.02).abs() < 1e-12);
+        for steps in [130_000, 139_999, 140_000, 150_000, 280_000, 1_000_000] {
+            assert!((learning_rate(0.02, steps) - 0.0005).abs() < 1e-12);
+        }
+        assert!((learning_rate(0.02, 99_999) - 0.02).abs() < 1e-12);
+        assert!((learning_rate(0.02, 100_000) - 0.002).abs() < 1e-12);
+        assert!((learning_rate(0.02, 129_999) - 0.002).abs() < 1e-12);
     }
 
     #[test]
@@ -214,6 +218,9 @@ mod tests {
         step(&mut opt, &[3., -4.]);
         let dir = std::env::current_dir().unwrap().join("tmp");
         std::fs::create_dir_all(&dir).unwrap();
+        // 旧版cycle 2检查点可正常恢复，下一步采用修正后的低学习率。
+        opt.steps = 150_000;
+        opt.last_lr = 0.02;
         let path = dir.join(format!(
             "chineseai-sgd-test-{}.safetensors",
             std::process::id()
@@ -225,8 +232,11 @@ mod tests {
         let mut restored = Px0Sgd::new(vec![restored_var.clone()], 0.02).unwrap();
         assert!(restored.restore(&path, 43).is_err());
         restored.restore(&path, 42).unwrap();
+        assert_eq!(restored.steps, 150_000);
         step(&mut opt, &[2., 5.]);
         step(&mut restored, &[2., 5.]);
+        assert!((restored.last_lr - 0.0005).abs() < 1e-12);
+        assert_eq!(restored.steps, 150_001);
         assert_eq!(
             var.to_vec1::<f32>().unwrap(),
             restored_var.to_vec1::<f32>().unwrap()
