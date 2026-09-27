@@ -5,6 +5,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "uci_search.rs"]
+mod uci_search;
+pub(crate) use uci_search::{AzUciSearchCache, AzUciSearchResult, search_uci};
+
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, POLICY_ACCUMULATOR_RANK, SplitMix64,
     color_index, rule_context_features,
@@ -19,7 +23,7 @@ const SEARCH_PROGRESS_POLL_SIMULATIONS: usize = 64;
 const SEARCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AzSearchLimits {
     pub simulations: usize,
     pub seed: u64,
@@ -478,6 +482,7 @@ struct AzTree<'a> {
     rule_history_scratch: Vec<RuleHistoryEntry>,
 }
 
+#[derive(Clone)]
 struct AzNode {
     position: Position,
     accumulator_offset: u32,

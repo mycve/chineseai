@@ -1,11 +1,11 @@
 use crate::az::{
-    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult, SplitMix64,
-    alphazero_search_external_root_controlled_with_progress,
+    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchCache, AzUciSearchResult,
+    SplitMix64, cp_from_q, search_uci,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -24,7 +24,7 @@ const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
 const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
 const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct UciState {
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
@@ -48,6 +48,8 @@ struct UciState {
     sixty_move_rule: bool,
     rule60_max_ply: u16,
     seed: u64,
+    multipv: usize,
+    tree_cache: Arc<Mutex<AzUciSearchCache>>,
 }
 
 impl Default for UciState {
@@ -75,6 +77,8 @@ impl Default for UciState {
             sixty_move_rule: true,
             rule60_max_ply: 120,
             seed: 20260409,
+            multipv: 1,
+            tree_cache: Arc::new(Mutex::new(AzUciSearchCache::default())),
         }
     }
 }
@@ -118,6 +122,7 @@ pub fn run_uci() {
             }
             Some("ucinewgame") => {
                 stop_active_search(&mut active_search);
+                state.tree_cache.lock().unwrap().clear();
                 state.position = Position::startpos();
                 apply_rule_options(&mut state);
                 state.rule_history = state.position.initial_rule_history();
@@ -159,6 +164,7 @@ fn print_uci_id() {
     println!("option name EvalFile type string default model.safetensors");
     println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
+    println!("option name MultiPV type spin default 1 min 1 max 64");
     println!("option name Cpuct type string default {DEFAULT_CPUCT}");
     println!("option name CpuctAtRoot type string default {DEFAULT_CPUCT_AT_ROOT}");
     println!("option name CpuctBase type string default {DEFAULT_CPUCT_BASE}");
@@ -207,7 +213,16 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         .map(|index| tokens[index + 1..].join(" "))
         .unwrap_or_default();
 
+    if name != "multipv" {
+        state.tree_cache.lock().unwrap().clear();
+    }
+
     match name.as_str() {
+        "multipv" => {
+            if let Ok(value) = value.parse::<usize>() {
+                state.multipv = value.clamp(1, 64);
+            }
+        }
         "evalfile" => {
             state.eval_file = value;
             state.model = None;
@@ -515,14 +530,14 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         state.policy_softmax_temp
     );
     flush();
-    let mut report_progress = |progress: &AzSearchResult| {
+    let mut report_progress = |progress: &AzUciSearchResult| {
         print_search_info(progress, started);
         flush();
     };
-    let result = alphazero_search_external_root_controlled_with_progress(
+    let report = search_uci(
         &state.position,
-        Some(state.rule_history.clone()),
-        Some(legal),
+        state.rule_history.clone(),
+        legal,
         model,
         AzSearchLimits {
             simulations,
@@ -544,11 +559,21 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             draw_score: state.draw_score,
             value_scale: 1.0,
         },
-        Some(&control),
-        Some(&mut report_progress),
+        &control,
+        &mut state.tree_cache.lock().unwrap(),
+        state.multipv,
+        params.searchmoves.is_empty(),
+        &mut report_progress,
     );
-    // UCI 规定无限分析在收到 `stop` 前不发送 bestmove。只有达到内部 u32
-    // 节点索引的表示上限时才会进入等待；正常分析不会受配置节点数限制。
+    let result = &report.search;
+    if report.reused_visits > 0 {
+        println!("info string tree reused visits={}", report.reused_visits);
+    }
+    if report.tree_limit_reached {
+        println!("info string tree node limit reached; waiting for stop if infinite");
+        flush();
+    }
+    // 无限分析在收到 stop 前不发 bestmove；达到树规模上限或证明终局后等待。
     while params.infinite && !stop.load(Ordering::Relaxed) {
         thread::park_timeout(Duration::from_millis(10));
     }
@@ -571,7 +596,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             } else {
                 mv
             };
-            print_search_info(&result, started);
+            print_search_info(&report, started);
             if chosen != mv {
                 println!(
                     "info string openingtemp ply={} temperature={:.2} searchbest={} sampled={}",
@@ -607,36 +632,38 @@ fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: 
     requested.clamp(1, MAX_UCI_SIMULATIONS)
 }
 
-fn print_search_info(result: &AzSearchResult, started: Instant) {
+fn print_search_info(report: &AzUciSearchResult, started: Instant) {
+    let result = &report.search;
     let elapsed_ms = started.elapsed().as_millis();
-    let nps = (result.simulations as u128 * 1000 / elapsed_ms.max(1)) as usize;
-    let wdl = uci_wdl(result.value_wdl);
-    match result.best_move {
-        Some(mv) => println!(
-            "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
+    let nps = result.simulations as u128 * 1000 / elapsed_ms.max(1);
+    for (index, pv) in report.variations.iter().enumerate() {
+        let wdl = uci_wdl(pv.wdl);
+        let moves = pv
+            .moves
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "info depth {} seldepth {} multipv {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
             result.search_depth_avg.round() as usize,
             result.search_depth_max,
+            index + 1,
             result.simulations,
             nps,
             elapsed_ms,
-            result.value_cp,
+            cp_from_q(pv.q),
             wdl[0],
             wdl[1],
             wdl[2],
-            mv
-        ),
-        None => println!(
-            "info depth {} seldepth {} nodes {} nps {} time {} score cp {} wdl {} {} {}",
-            result.search_depth_avg.round() as usize,
-            result.search_depth_max,
-            result.simulations,
-            nps,
-            elapsed_ms,
-            result.value_cp,
-            wdl[0],
-            wdl[1],
-            wdl[2]
-        ),
+            moves,
+        );
+    }
+    if report.variations.is_empty() {
+        println!(
+            "info depth 0 nodes {} time {} score cp {}",
+            result.simulations, elapsed_ms, result.value_cp
+        );
     }
 }
 

@@ -6,6 +6,7 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 mod alphazero;
+pub(crate) use alphazero::{AzUciSearchCache, AzUciSearchResult, search_uci};
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl")),
