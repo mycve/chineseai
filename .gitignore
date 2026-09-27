@@ -29,7 +29,6 @@ data
 scripts
 /data/*.bin
 docs
-!tools/upgrade_capture_relation.py
 !docs/
 docs/*
 !docs/吃子共享关系扩展.md
