@@ -72,19 +72,31 @@ impl Position {
 
     pub fn rule_outcome_with_history(&self, history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome_with_history");
-        if let Some(entries) = repetition_cycle(history) {
-            let exact_entries = self.recompute_cycle_chases(entries);
-            return Some(adjudicate_repetition(
-                exact_entries.as_deref().unwrap_or(entries),
-            ));
+        if !self.has_general(Color::Red) {
+            return Some(RuleOutcome::Win(Color::Black));
         }
-        if self
+        if !self.has_general(Color::Black) {
+            return Some(RuleOutcome::Win(Color::Red));
+        }
+        let outcome = if let Some(entries) = repetition_cycle(history) {
+            let exact_entries = self.recompute_cycle_chases(entries);
+            Some(adjudicate_repetition(
+                exact_entries.as_deref().unwrap_or(entries),
+            ))
+        } else if self
             .rule60_max_ply
             .is_some_and(|max_ply| self.rule60_count_with_history(history) >= max_ply)
         {
-            return Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit));
+            Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit))
+        } else {
+            self.insufficient_material_outcome()
+        };
+        // 将死、困毙优先于重复和无吃子和棋；仅在已有判定时追加检查。
+        if outcome.is_some() && self.legal_moves().is_empty() {
+            Some(RuleOutcome::Win(self.side_to_move.opposite()))
+        } else {
+            outcome
         }
-        self.insufficient_material_outcome()
     }
 
     pub fn rule60_count_with_history(&self, history: &[RuleHistoryEntry]) -> u16 {
@@ -495,11 +507,6 @@ fn rule_outcome_forbidden_for_mover(outcome: Option<RuleOutcome>, mover: Color) 
     matches!(
         outcome,
         Some(RuleOutcome::Win(winner)) if winner == mover.opposite()
-    ) || matches!(
-        outcome,
-        Some(RuleOutcome::Draw(
-            RuleDrawReason::MutualLongCheck | RuleDrawReason::MutualLongChase
-        ))
     )
 }
 
@@ -606,6 +613,25 @@ mod tests {
             }
             let index = (ply.wrapping_mul(37).wrapping_add(11)) % legal.len();
             position.make_move(legal[index]);
+        }
+    }
+    #[test]
+    fn drawn_repetition_is_allowed_for_either_mover() {
+        for reason in [
+            RuleDrawReason::Repetition,
+            RuleDrawReason::MutualLongCheck,
+            RuleDrawReason::MutualLongChase,
+        ] {
+            for mover in [Color::Red, Color::Black] {
+                assert!(!rule_outcome_forbidden_for_mover(
+                    Some(RuleOutcome::Draw(reason)),
+                    mover
+                ));
+                assert!(rule_outcome_forbidden_for_mover(
+                    Some(RuleOutcome::Win(mover.opposite())),
+                    mover
+                ));
+            }
         }
     }
 }

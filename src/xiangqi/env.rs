@@ -70,6 +70,13 @@ impl XiangqiEnv {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
+        if self
+            .position
+            .rule_outcome_with_history(&self.rule_history)
+            .is_some()
+        {
+            return Vec::new();
+        }
         self.position.legal_moves_with_rules(&self.rule_history)
     }
 
@@ -147,5 +154,22 @@ mod tests {
         assert_eq!(env.undo(), Some(mv));
         assert!(env.history().is_empty());
         assert_eq!(env.rule_history().len(), initial_history_len);
+    }
+
+    #[test]
+    fn finished_game_rejects_moves_without_changing_history() {
+        let fen = format!("{} - - 120 1", super::super::STARTPOS_FEN);
+        let mut env = XiangqiEnv::from_fen(&fen).unwrap();
+        assert_eq!(
+            env.current_outcome(),
+            StepOutcome::Draw(super::super::RuleDrawReason::NaturalMoveLimit)
+        );
+        assert!(!env.raw_legal_moves().is_empty());
+        assert!(env.legal_moves().is_empty());
+        let before = env.position().to_fen();
+        let history_len = env.rule_history().len();
+        assert!(env.step_uci("a0a1").is_err());
+        assert_eq!(env.position().to_fen(), before);
+        assert_eq!(env.rule_history().len(), history_len);
     }
 }

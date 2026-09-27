@@ -1057,3 +1057,25 @@ fn gives_check_fast_matches_bruteforce() {
         }
     }
 }
+
+#[test]
+fn stalemate_precedes_natural_move_limit() {
+    let position = Position::from_fen("4k4/3R1R3/9/9/9/9/9/9/9/3K5 b - - 120 1").unwrap();
+    assert!(!position.in_check(Color::Black));
+    assert!(position.legal_moves().is_empty());
+    assert_eq!(
+        position.rule_outcome_with_history(&position.initial_rule_history()),
+        Some(RuleOutcome::Win(Color::Red)),
+    );
+}
+
+#[test]
+fn checkmate_precedes_natural_move_limit() {
+    let position = Position::from_fen("3RkR3/9/2N6/9/9/9/9/9/9/3K5 b - - 120 1").unwrap();
+    assert!(position.in_check(Color::Black));
+    assert!(position.legal_moves().is_empty());
+    assert_eq!(
+        position.rule_outcome_with_history(&position.initial_rule_history()),
+        Some(RuleOutcome::Win(Color::Red)),
+    );
+}
