@@ -72,10 +72,6 @@ pub struct AzLoopFileConfig {
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
     pub arena_opening_book: String,
-    pub arena_opening_positions: usize,
-    pub arena_random_positions: usize,
-    pub arena_random_plies_min: usize,
-    pub arena_random_plies_max: usize,
     pub pikafish_label_eval_sqlite: String,
     pub pikafish_label_eval_interval: usize,
     pub pikafish_label_eval_limit: usize,
@@ -143,10 +139,6 @@ impl Default for AzLoopFileConfig {
             arena_promotion_confidence_z: 1.96,
             arena_processes: 128,
             arena_opening_book: "book.pgn.gz".into(),
-            arena_opening_positions: 1000,
-            arena_random_positions: 0,
-            arena_random_plies_min: 6,
-            arena_random_plies_max: 12,
             pikafish_label_eval_sqlite: "eval/pikafish-selfplay-5000-d20.sqlite".into(),
             pikafish_label_eval_interval: 20,
             pikafish_label_eval_limit: 1000,
@@ -252,10 +244,6 @@ impl AzLoopFileConfig {
         );
         line!("arena_processes", self.arena_processes);
         line!("arena_opening_book", q(&self.arena_opening_book));
-        line!("arena_opening_positions", self.arena_opening_positions);
-        line!("arena_random_positions", self.arena_random_positions);
-        line!("arena_random_plies_min", self.arena_random_plies_min);
-        line!("arena_random_plies_max", self.arena_random_plies_max);
         line!(
             "pikafish_label_eval_sqlite",
             q(&self.pikafish_label_eval_sqlite)
@@ -347,18 +335,11 @@ impl AzLoopFileConfig {
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_simulations = self.arena_simulations.max(1);
-        self.arena_opening_positions = self.arena_opening_positions.max(1);
         self.pikafish_label_eval_simulations = self.pikafish_label_eval_simulations.max(1);
         self.pikafish_label_eval_cpuct = self.pikafish_label_eval_cpuct.max(0.0);
         self.pikafish_label_eval_cpuct_at_root = self.pikafish_label_eval_cpuct_at_root.max(0.0);
         self.pikafish_label_eval_policy_softmax_temp =
             self.pikafish_label_eval_policy_softmax_temp.max(1e-3);
-        if self.arena_random_plies_min > self.arena_random_plies_max {
-            std::mem::swap(
-                &mut self.arena_random_plies_min,
-                &mut self.arena_random_plies_max,
-            );
-        }
         self
     }
 }
@@ -449,10 +430,6 @@ mod tests {
         assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"book.pgn.gz\"\n"));
-        assert!(text.contains("arena_opening_positions = 1000\n"));
-        assert!(text.contains("arena_random_positions = 0\n"));
-        assert!(text.contains("arena_random_plies_min = 6\n"));
-        assert!(text.contains("arena_random_plies_max = 12\n"));
         assert!(text.contains("arena_interval = 20\n"));
         assert!(text.contains("arena_simulations = 800\n"));
         assert!(text.contains("arena_promotion_rate = 0.5\n"));

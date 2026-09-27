@@ -1341,52 +1341,19 @@ fn build_arena_start_positions(
     let seed = config.seed
         ^ 0xD1B5_4A32_D192_ED03
         ^ (gate_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut positions = Vec::with_capacity(
-        config
-            .arena_opening_positions
-            .saturating_add(config.arena_random_positions),
-    );
-    let mut modes = Vec::with_capacity(2);
-    if !config.arena_opening_book.trim().is_empty() {
-        let mut book = Px0OpeningBook::load(&config.arena_opening_book, seed)
-            .unwrap_or_else(|err| panic!("failed to load Px0 arena book: {err}"));
-        let count = book.len();
-        positions.extend(
-            book.next_batch(config.arena_opening_positions, 0)
-                .unwrap_or_else(|err| panic!("invalid Px0 arena FEN: {err}"))
-                .into_iter()
-                .map(|snapshot| snapshot.position),
-        );
-        modes.push(format!(
-            "px0(shuffled,count={},book_positions={count})",
-            config.arena_opening_positions
-        ));
-    }
-
-    if config.arena_random_positions > 0 {
-        let random_fens = generate_random_eval_fens(
-            config.arena_random_positions,
-            config.arena_random_plies_min,
-            config.arena_random_plies_max,
-            seed ^ 0xA076_1D64_78BD_642F,
-        );
-        positions.extend(random_fens.iter().map(|fen| {
-            Position::from_fen(fen)
-                .unwrap_or_else(|err| panic!("generated invalid arena FEN `{fen}`: {err}"))
-        }));
-        modes.push(format!(
-            "random(count={},plies={}-{})",
-            config.arena_random_positions,
-            config.arena_random_plies_min,
-            config.arena_random_plies_max
-        ));
-    }
-
-    if positions.is_empty() {
-        (Vec::new(), "startpos_fallback".to_string())
-    } else {
-        (positions, modes.join("+"))
-    }
+    let mut book = Px0OpeningBook::load(&config.arena_opening_book, seed)
+        .unwrap_or_else(|err| panic!("failed to load Px0 arena book: {err}"));
+    let count = book.len();
+    let positions = book
+        .next_batch(1000, 0)
+        .unwrap_or_else(|err| panic!("invalid Px0 arena FEN: {err}"))
+        .into_iter()
+        .map(|snapshot| snapshot.position)
+        .collect();
+    (
+        positions,
+        format!("px0(shuffled,count=1000,book_positions={count})"),
+    )
 }
 
 fn fixed_az_search_limits(
@@ -2392,9 +2359,9 @@ fn main() {
                     trainer_config.seed,
                     true,
                 );
-                let mut cycle_end = (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS
-                    + 1)
-                    * chineseai::az::PX0_CYCLE_STEPS;
+                let mut cycle_end =
+                    (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS + 1)
+                        * chineseai::az::PX0_CYCLE_STEPS;
                 let min_train_samples = trainer_config.batch_size.max(1);
                 'training: while let Ok(mut pending) = ready_rx.recv() {
                     let pending_games = pending.selfplay.games.len();
@@ -5169,29 +5136,36 @@ mod reporting_tests {
     }
 
     #[test]
-    fn arena_adds_random_takeover_positions() {
-        let mut config = AzLoopFileConfig::default();
-        config.arena_interval = 10;
-        config.arena_opening_book.clear();
-        config.arena_random_positions = 8;
-        config.arena_random_plies_min = 4;
-        config.arena_random_plies_max = 12;
-
-        let (positions, mode) = build_arena_start_positions(&config, 7);
-
-        assert_eq!(positions.len(), 8);
-        assert_eq!(mode, "random(count=8,plies=4-12)");
-        assert!(positions.iter().all(|position| {
-            position.has_general(chineseai::xiangqi::Color::Red)
-                && position.has_general(chineseai::xiangqi::Color::Black)
-                && !position.legal_moves().is_empty()
-        }));
-
-        let (next_fold, _) = build_arena_start_positions(&config, 17);
-        assert_ne!(
-            positions.iter().map(Position::hash).collect::<Vec<_>>(),
-            next_fold.iter().map(Position::hash).collect::<Vec<_>>()
+    fn arena_uses_only_book_positions() {
+        use std::io::Write;
+        let dir = std::env::current_dir().unwrap().join("tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "chineseai-arena-book-{}.pgn.gz",
+            std::process::id()
+        ));
+        let start = Position::startpos();
+        let mut other = start.clone();
+        other.make_move(start.parse_uci_move("a0a1").unwrap());
+        let mut writer = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
         );
+        for position in [&start, &other] {
+            writeln!(writer, "[FEN \"{}\"]\n{{}}", position.to_fen()).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut config = AzLoopFileConfig::default();
+        config.arena_opening_book = path.to_string_lossy().into_owned();
+        let (positions, mode) = build_arena_start_positions(&config, 20);
+        assert_eq!(positions.len() * 2, 2000);
+        assert_eq!(mode, "px0(shuffled,count=1000,book_positions=2)");
+        assert!(
+            positions
+                .iter()
+                .all(|p| [start.hash(), other.hash()].contains(&p.hash()))
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
