@@ -417,7 +417,7 @@ impl PackedBatch {
                         destination_attacked,
                         source_defended,
                         destination_defended,
-                        capture_valid,
+                        captured_piece,
                         check,
                     )
                     .into_iter()

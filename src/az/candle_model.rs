@@ -709,6 +709,16 @@ mod tests {
             .unwrap()
             .backward()
             .unwrap();
+        let tactical_gradient = gradients
+            .get(&gradient_candle.policy_tactical)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            tactical_gradient[super::super::POLICY_CAPTURE_RELATION_OFFSET..]
+                .iter()
+                .any(|&gradient| gradient != 0.0)
+        );
         let repetition_gradient = gradients
             .get(&gradient_candle.policy_repetition_hidden)
             .unwrap()

@@ -71,13 +71,24 @@ pub(super) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
 pub(super) const POLICY_ACCUMULATOR_RANK: usize = 64;
 pub(super) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
-pub(super) const POLICY_TACTICAL_TERMS: usize = 2;
+pub(super) const POLICY_TACTICAL_TERMS: usize = 3;
 pub const POLICY_TACTICAL_EXACT_SIZE: usize =
     DENSE_MOVE_SPACE * (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
 pub const POLICY_TACTICAL_FACTOR_SIZE: usize =
     (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-pub(super) const POLICY_TACTICAL_SIZE: usize =
+const POLICY_CAPTURE_RELATION_OFFSET: usize =
     POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
+const POLICY_CAPTURE_RELATION_BUCKETS: usize = 32;
+const POLICY_CAPTURE_RELATION_SIZE: usize = 7 * 7 * POLICY_CAPTURE_RELATION_BUCKETS;
+pub(super) const POLICY_TACTICAL_SIZE: usize =
+    POLICY_CAPTURE_RELATION_OFFSET + POLICY_CAPTURE_RELATION_SIZE;
+// 推理只访问己方走子和敌方被吃子；训练张量保持原布局。
+const POLICY_CACHE_PIECE_SIZE: usize = STRUCTURAL_PIECE_SIZE / 2;
+const POLICY_CACHE_CAPTURE_CLASSES: usize = POLICY_CACHE_PIECE_SIZE + 1;
+const POLICY_CACHE_MAIN_SIZE: usize =
+    DENSE_MOVE_SPACE * POLICY_CACHE_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
+const POLICY_CACHE_TABLE_SIZE: usize =
+    POLICY_CACHE_MAIN_SIZE + DENSE_MOVE_SPACE * POLICY_CACHE_CAPTURE_CLASSES;
 pub(super) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
 pub const POLICY_SPARSE_MAIN_SIZE: usize =
     DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
@@ -892,6 +903,21 @@ fn policy_consequence_features(
 }
 
 #[inline]
+fn policy_cache_main_index(mv: usize, piece: usize, us: usize, them: usize) -> usize {
+    debug_assert!(piece < POLICY_CACHE_PIECE_SIZE);
+    ((mv * POLICY_CACHE_PIECE_SIZE + piece) * V2_KING_BUCKETS + us) * V2_KING_BUCKETS + them
+}
+
+#[inline]
+fn policy_cache_capture_index(mv: usize, captured: Option<usize>) -> usize {
+    let class = captured.map_or(POLICY_CACHE_PIECE_SIZE, |piece| {
+        debug_assert!((POLICY_CACHE_PIECE_SIZE..STRUCTURAL_PIECE_SIZE).contains(&piece));
+        piece - POLICY_CACHE_PIECE_SIZE
+    });
+    POLICY_CACHE_MAIN_SIZE + mv * POLICY_CACHE_CAPTURE_CLASSES + class
+}
+
+#[inline]
 pub(super) const fn policy_sparse_main_index(
     move_index: usize,
     moved_piece: usize,
@@ -951,7 +977,7 @@ pub(super) fn policy_tactical_indices(
     destination_attacked: bool,
     source_defended: bool,
     destination_defended: bool,
-    capture: bool,
+    captured_piece: Option<usize>,
     check: bool,
 ) -> [usize; POLICY_TACTICAL_TERMS] {
     debug_assert!(moved_piece < STRUCTURAL_PIECE_SIZE / 2);
@@ -959,14 +985,22 @@ pub(super) fn policy_tactical_indices(
         | usize::from(destination_attacked) << 1
         | usize::from(source_defended) << 2
         | usize::from(destination_defended) << 3
-        | usize::from(capture) << 4
+        | usize::from(captured_piece.is_some()) << 4
         | usize::from(check) << 5;
     let exact = (move_index * (STRUCTURAL_PIECE_SIZE / 2) + moved_piece)
         * POLICY_TACTICAL_SIGNATURE_BUCKETS
         + signature;
     let piece_factor =
         POLICY_TACTICAL_EXACT_SIZE + moved_piece * POLICY_TACTICAL_SIGNATURE_BUCKETS + signature;
-    [exact, piece_factor]
+    let relation = captured_piece.map_or(POLICY_TACTICAL_SIZE, |victim| {
+        debug_assert!((7..14).contains(&victim));
+        // 吃子位恒为 1，去掉它；其余五位沿用已有战术状态。
+        let state = (signature & 15) | ((signature >> 5) << 4);
+        POLICY_CAPTURE_RELATION_OFFSET
+            + (moved_piece * 7 + victim - 7) * POLICY_CAPTURE_RELATION_BUCKETS
+            + state
+    });
+    [exact, piece_factor, relation]
 }
 
 fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
@@ -2085,14 +2119,14 @@ impl AzNnue {
                     });
                     let accumulator_logit = if let Some((from, to, captured)) = consequence {
                         debug_assert_eq!(from / BOARD_SIZE, to / BOARD_SIZE);
-                        let cache_start = move_index * STRUCTURAL_PIECE_SIZE;
+                        let cache_start = move_index * POLICY_CACHE_PIECE_SIZE;
                         let mut value =
                             dot_product(&scratch.policy_accumulator_context, accumulator_move)
                                 + self.policy_accumulator_moved_delta
                                     [cache_start + from / BOARD_SIZE];
                         if let Some(captured) = captured {
                             value -= self.policy_accumulator_capture
-                                [cache_start + captured / BOARD_SIZE];
+                                [cache_start + captured / BOARD_SIZE - POLICY_CACHE_PIECE_SIZE];
                         }
                         value
                     } else {
@@ -2101,13 +2135,13 @@ impl AzNnue {
                     let sparse_logit = consequence.map_or(0.0, |(from, _, captured)| {
                         let moved_piece = from / BOARD_SIZE;
                         let captured_piece = captured.map(|feature| feature / BOARD_SIZE);
-                        let main = policy_sparse_main_index(
+                        let main = policy_cache_main_index(
                             move_index,
                             moved_piece,
                             king_buckets.0,
                             king_buckets.1,
                         );
-                        let capture = policy_sparse_capture_index(move_index, captured_piece);
+                        let capture = policy_cache_capture_index(move_index, captured_piece);
                         self.policy_sparse_table_folded[main]
                             + self.policy_sparse_table_folded[capture]
                     });
@@ -2129,10 +2163,11 @@ impl AzNnue {
                                 destination_attacked,
                                 source_defended,
                                 destination_defended,
-                                captured.is_some(),
+                                captured.map(|feature| feature / BOARD_SIZE),
                                 check != 0.0,
                             );
-                            self.policy_tactical_folded[tactical[0]]
+                            let base = self.policy_tactical_folded[tactical[0]];
+                            captured.map_or(base, |_| base + self.policy_tactical[tactical[2]])
                         })
                     } else {
                         0.0
@@ -2472,17 +2507,24 @@ impl AzNnue {
         );
         self.policy_accumulator_features = projected;
 
-        let mut folded_sparse = self.policy_sparse_table.clone();
+        let mut folded_sparse = vec![0.0; POLICY_CACHE_TABLE_SIZE];
         for move_index in 0..DENSE_MOVE_SPACE {
-            for moved_piece in 0..STRUCTURAL_PIECE_SIZE {
+            for moved_piece in 0..POLICY_CACHE_PIECE_SIZE {
                 for us_bucket in 0..V2_KING_BUCKETS {
                     for them_bucket in 0..V2_KING_BUCKETS {
-                        let main = policy_sparse_main_index(
+                        let raw = policy_sparse_main_index(
                             move_index,
                             moved_piece,
                             us_bucket,
                             them_bucket,
                         );
+                        let main = policy_cache_main_index(
+                            move_index,
+                            moved_piece,
+                            us_bucket,
+                            them_bucket,
+                        );
+                        folded_sparse[main] = self.policy_sparse_table[raw];
                         for factor in policy_sparse_factor_indices(
                             move_index,
                             moved_piece,
@@ -2494,10 +2536,17 @@ impl AzNnue {
                     }
                 }
             }
+            for captured in (POLICY_CACHE_PIECE_SIZE..STRUCTURAL_PIECE_SIZE)
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
+                folded_sparse[policy_cache_capture_index(move_index, captured)] =
+                    self.policy_sparse_table[policy_sparse_capture_index(move_index, captured)];
+            }
         }
         self.policy_sparse_table_folded = folded_sparse;
 
-        let cache_size = DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE;
+        let cache_size = DENSE_MOVE_SPACE * POLICY_CACHE_PIECE_SIZE;
         self.policy_accumulator_moved_delta = vec![0.0; cache_size];
         self.policy_accumulator_capture = vec![0.0; cache_size];
         for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
@@ -2507,9 +2556,12 @@ impl AzNnue {
             let move_start = move_index * POLICY_ACCUMULATOR_RANK;
             let move_weights =
                 &self.policy_accumulator_move[move_start..move_start + POLICY_ACCUMULATOR_RANK];
-            for piece_index in 0..STRUCTURAL_PIECE_SIZE {
+            for piece_index in 0..POLICY_CACHE_PIECE_SIZE {
                 let from_start = (piece_index * BOARD_SIZE + from_square) * POLICY_ACCUMULATOR_RANK;
                 let to_start = (piece_index * BOARD_SIZE + to_square) * POLICY_ACCUMULATOR_RANK;
+                let capture_start = ((piece_index + POLICY_CACHE_PIECE_SIZE) * BOARD_SIZE
+                    + to_square)
+                    * POLICY_ACCUMULATOR_RANK;
                 let mut moved_delta = 0.0;
                 let mut capture = 0.0;
                 for rank in 0..POLICY_ACCUMULATOR_RANK {
@@ -2517,9 +2569,9 @@ impl AzNnue {
                     let to = self.policy_accumulator_features[to_start + rank];
                     let from = self.policy_accumulator_features[from_start + rank];
                     moved_delta += (to - from) * weight;
-                    capture += to * weight;
+                    capture += self.policy_accumulator_features[capture_start + rank] * weight;
                 }
-                let cache_index = move_index * STRUCTURAL_PIECE_SIZE + piece_index;
+                let cache_index = move_index * POLICY_CACHE_PIECE_SIZE + piece_index;
                 self.policy_accumulator_moved_delta[cache_index] = moved_delta;
                 self.policy_accumulator_capture[cache_index] = capture;
             }
@@ -2662,9 +2714,10 @@ impl AzNnue {
         if self.policy_accumulator_features.len()
             != POLICY_ACCUMULATOR_ROWS * POLICY_ACCUMULATOR_RANK
             || self.policy_accumulator_move.len() != DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK
-            || self.policy_accumulator_moved_delta.len() != DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE
-            || self.policy_accumulator_capture.len() != DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE
-            || self.policy_sparse_table_folded.len() != POLICY_SPARSE_TABLE_SIZE
+            || self.policy_accumulator_moved_delta.len()
+                != DENSE_MOVE_SPACE * POLICY_CACHE_PIECE_SIZE
+            || self.policy_accumulator_capture.len() != DENSE_MOVE_SPACE * POLICY_CACHE_PIECE_SIZE
+            || self.policy_sparse_table_folded.len() != POLICY_CACHE_TABLE_SIZE
             || self.policy_tactical_folded.len() != POLICY_TACTICAL_EXACT_SIZE
         {
             return Err(io::Error::new(
@@ -3362,6 +3415,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_policy_cache_matches_original_formulas() {
+        let mut model = AzNnue::random(32, 20260928);
+        for (i, w) in model.policy_sparse_table.iter_mut().enumerate() {
+            *w = (i % 101) as f32 * 0.003;
+        }
+        for (i, w) in model.policy_sparse_factor.iter_mut().enumerate() {
+            *w = (i % 71) as f32 * -0.007;
+        }
+        for (i, w) in model.policy_accumulator_hidden.iter_mut().enumerate() {
+            *w = (i % 13) as f32 * 0.001;
+        }
+        for (i, w) in model.policy_accumulator_move.iter_mut().enumerate() {
+            *w = (i % 17) as f32 * -0.002;
+        }
+        model.rebuild_policy_cache();
+        for mv in 0..DENSE_MOVE_SPACE {
+            for piece in 0..POLICY_CACHE_PIECE_SIZE {
+                for us in 0..V2_KING_BUCKETS {
+                    for them in 0..V2_KING_BUCKETS {
+                        let mut expected = model.policy_sparse_table
+                            [policy_sparse_main_index(mv, piece, us, them)];
+                        for factor in policy_sparse_factor_indices(mv, piece, us, them) {
+                            expected += model.policy_sparse_factor[factor];
+                        }
+                        assert_eq!(
+                            model.policy_sparse_table_folded
+                                [policy_cache_main_index(mv, piece, us, them)]
+                            .to_bits(),
+                            expected.to_bits()
+                        );
+                    }
+                }
+                let sparse = move_map().dense_to_sparse[mv] as usize;
+                let from = (piece * BOARD_SIZE + sparse / BOARD_SIZE) * POLICY_ACCUMULATOR_RANK;
+                let to = (piece * BOARD_SIZE + sparse % BOARD_SIZE) * POLICY_ACCUMULATOR_RANK;
+                let victim = ((piece + POLICY_CACHE_PIECE_SIZE) * BOARD_SIZE + sparse % BOARD_SIZE)
+                    * POLICY_ACCUMULATOR_RANK;
+                let mut delta = 0.0f32;
+                let mut capture = 0.0f32;
+                for rank in 0..POLICY_ACCUMULATOR_RANK {
+                    let w = model.policy_accumulator_move[mv * POLICY_ACCUMULATOR_RANK + rank];
+                    delta += (model.policy_accumulator_features[to + rank]
+                        - model.policy_accumulator_features[from + rank])
+                        * w;
+                    capture += model.policy_accumulator_features[victim + rank] * w;
+                }
+                assert_eq!(
+                    model.policy_accumulator_moved_delta[mv * POLICY_CACHE_PIECE_SIZE + piece]
+                        .to_bits(),
+                    delta.to_bits()
+                );
+                assert_eq!(
+                    model.policy_accumulator_capture[mv * POLICY_CACHE_PIECE_SIZE + piece]
+                        .to_bits(),
+                    capture.to_bits()
+                );
+            }
+            for captured in (POLICY_CACHE_PIECE_SIZE..STRUCTURAL_PIECE_SIZE)
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
+                assert_eq!(
+                    model.policy_sparse_table_folded[policy_cache_capture_index(mv, captured)]
+                        .to_bits(),
+                    model.policy_sparse_table[policy_sparse_capture_index(mv, captured)].to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn repetition_policy_metrics_separate_opportunities_and_model_mass() {
         let position = Position::startpos();
         let moves = position.legal_moves();
@@ -3403,7 +3527,7 @@ mod tests {
         model.policy_tactical.fill(0.0);
         model.policy_tactical[POLICY_TACTICAL_EXACT_SIZE] = 0.75;
         model.rebuild_policy_tactical();
-        let tactical = policy_tactical_indices(0, 0, false, false, false, false, false, false);
+        let tactical = policy_tactical_indices(0, 0, false, false, false, false, None, false);
         assert_eq!(model.policy_tactical_folded[tactical[0]], 0.75);
     }
 
@@ -3424,9 +3548,91 @@ mod tests {
     }
 
     #[test]
+    fn capture_relation_changes_only_capture_policy_not_value() {
+        let position =
+            Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
+                .unwrap();
+        let moves = position.legal_moves();
+        let mut model = AzNnue::random(32, 20260928);
+        model.policy_tactical[..POLICY_CAPTURE_RELATION_OFFSET].fill(0.125);
+        model.rebuild_policy_tactical();
+        let mut before = AzEvalScratch::new(model.arch);
+        let old = model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &mut before,
+        );
+        model.policy_tactical[POLICY_CAPTURE_RELATION_OFFSET..].fill(0.25);
+        model.rebuild_policy_tactical();
+        let mut after = AzEvalScratch::new(model.arch);
+        let new = model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &mut after,
+        );
+        assert_eq!(old.value_wdl, new.value_wdl);
+        let mut captures = 0;
+        let mut quiet = 0;
+        for (index, mv) in moves.iter().enumerate() {
+            let (_, _, victim) =
+                policy_consequence_features(&position, position.side_to_move(), *mv).unwrap();
+            if victim.is_some() {
+                assert_eq!(
+                    after.logits[index].to_bits(),
+                    (before.logits[index] + 0.25).to_bits()
+                );
+                captures += 1;
+            } else {
+                assert_eq!(
+                    after.logits[index].to_bits(),
+                    before.logits[index].to_bits()
+                );
+                quiet += 1;
+            }
+        }
+        assert!(captures > 0 && quiet > 0);
+    }
+
+    #[test]
+    fn capture_relation_is_shared_and_excludes_quiet_moves() {
+        let quiet = policy_tactical_indices(0, 4, true, false, true, false, None, false);
+        assert_eq!(quiet[2], POLICY_TACTICAL_SIZE);
+        let pawn = policy_tactical_indices(0, 4, true, false, true, false, Some(7), false);
+        let rook = policy_tactical_indices(0, 4, true, false, true, false, Some(11), false);
+        let elsewhere = policy_tactical_indices(100, 4, true, false, true, false, Some(11), false);
+        assert_ne!(pawn[2], rook[2]);
+        assert_eq!(rook[2], elsewhere[2]);
+        let mut seen = std::collections::HashSet::new();
+        for mover in 0..7 {
+            for victim in 7..14 {
+                for state in 0..32 {
+                    let indices = policy_tactical_indices(
+                        0,
+                        mover,
+                        state & 1 != 0,
+                        state & 2 != 0,
+                        state & 4 != 0,
+                        state & 8 != 0,
+                        Some(victim),
+                        state & 16 != 0,
+                    );
+                    assert!(
+                        (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE)
+                            .contains(&indices[2])
+                    );
+                    assert!(seen.insert(indices[2]));
+                }
+            }
+        }
+        assert_eq!(seen.len(), POLICY_CAPTURE_RELATION_SIZE);
+    }
+
+    #[test]
     fn tactical_policy_terms_distinguish_move_state() {
-        let base = policy_tactical_indices(0, 4, true, true, false, true, true, false);
-        let changed = policy_tactical_indices(0, 4, false, true, false, true, true, false);
+        let base = policy_tactical_indices(0, 4, true, true, false, true, Some(7), false);
+        let changed = policy_tactical_indices(0, 4, false, true, false, true, Some(7), false);
         assert_ne!(base, changed);
         assert!(base.into_iter().all(|index| index < POLICY_TACTICAL_SIZE));
         assert!(
