@@ -11,7 +11,6 @@ pub struct TrainingConsole {
     value: ProgressBar,
     test: ProgressBar,
     arena: ProgressBar,
-    cycle_number: usize,
 }
 
 impl TrainingConsole {
@@ -51,7 +50,6 @@ impl TrainingConsole {
             value,
             test,
             arena,
-            cycle_number,
         }
     }
 
@@ -91,11 +89,13 @@ impl TrainingConsole {
             report.avg_search_simulations,
             report.train_seconds
         );
+        let cycle_number = report.training_steps.saturating_sub(1) / PX0_CYCLE_STEPS + 1;
         if self.interactive {
+            self.cycle.set_prefix(format!("cycle {cycle_number}"));
             self.cycle.set_position(
                 report
                     .training_steps
-                    .saturating_sub((self.cycle_number - 1) * PX0_CYCLE_STEPS)
+                    .saturating_sub((cycle_number - 1) * PX0_CYCLE_STEPS)
                     as u64,
             );
             self.production.set_message(production);
@@ -104,7 +104,7 @@ impl TrainingConsole {
         } else {
             println!(
                 "cycle={} step={} {production} {loss} {value}",
-                self.cycle_number, report.training_steps
+                cycle_number, report.training_steps
             );
         }
     }

@@ -2147,6 +2147,7 @@ fn main() {
             } else {
                 &optimizer_state_path
             };
+            let optimizer_state_path = restore_path.clone();
             if restore_path.exists() {
                 model
                     .restore_training_state(restore_path, start_update, config.lr)
@@ -2391,7 +2392,7 @@ fn main() {
                     trainer_config.seed,
                     true,
                 );
-                let cycle_end = (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS
+                let mut cycle_end = (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS
                     + 1)
                     * chineseai::az::PX0_CYCLE_STEPS;
                 let min_train_samples = trainer_config.batch_size.max(1);
@@ -2401,7 +2402,6 @@ fn main() {
                         pool.add_games(std::mem::take(&mut pending.selfplay.games));
                     }
                     if trainer_stop.load(Ordering::SeqCst)
-                        || trainer_model.training_steps() >= cycle_end
                         || target_update.is_some_and(|target| {
                             trainer_start_update.saturating_add(train_index) > target
                         })
@@ -2508,6 +2508,15 @@ fn main() {
                     report.test_chunks = test_chunks;
                     report.holdout_checks = trainer_model.take_training_checks();
                     report.cycle_complete = report.training_steps == cycle_end;
+                    if report.cycle_complete {
+                        save_model(&trainer_model, Path::new(&trainer_config.model_path));
+                        trainer_model.save_training_state(
+                            &optimizer_state_path,
+                            train_update.saturating_add(1),
+                        )?;
+                        pool.save_snapshot_lz4(&trainer_snapshot_path)?;
+                        cycle_end += chineseai::az::PX0_CYCLE_STEPS;
+                    }
                     let candidate_model = trainer_model.clone();
                     publish_selfplay_model(
                         &trainer_shared_model,
@@ -2540,7 +2549,6 @@ fn main() {
             });
             let mut exited_after_ctrl_c = false;
             let mut exited_after_target_update = false;
-            let mut exited_after_cycle = false;
             let mut update = start_update;
             let mut interrupt_save_model: Option<AzNnue> = None;
             let mut interrupt_save_next_update = start_update;
@@ -3211,8 +3219,19 @@ fn main() {
                 tb.flush();
                 update = update.saturating_add(1);
                 if report.cycle_complete {
-                    exited_after_cycle = true;
-                    break;
+                    save_az_loop_progress_pair(
+                        &config_path,
+                        interrupt_save_next_update,
+                        arena_nemesis_update,
+                        generated_games_total,
+                        generated_samples_total,
+                    );
+                    console.event(format!(
+                        "saved: cycle {} complete; optimizer+replay saved; continuing cycle {} next_update={}",
+                        report.training_steps / chineseai::az::PX0_CYCLE_STEPS,
+                        report.training_steps / chineseai::az::PX0_CYCLE_STEPS + 1,
+                        interrupt_save_next_update,
+                    ));
                 }
                 if let Some(target_update) = target_update
                     && update > target_update
@@ -3247,7 +3266,7 @@ fn main() {
                 .join()
                 .unwrap_or_else(|_| panic!("training thread panicked"))
                 .unwrap_or_else(|err| panic!("failed to save training state: {err}"));
-            if exited_after_ctrl_c || exited_after_target_update || exited_after_cycle {
+            if exited_after_ctrl_c || exited_after_target_update {
                 if let Some(model) = interrupt_save_model.as_ref() {
                     save_model(model, Path::new(&config.model_path));
                     save_az_loop_progress_pair(
@@ -3259,9 +3278,7 @@ fn main() {
                     );
                     println!(
                         "saved: {} model=`{}` optimizer+replay saved next_update={}",
-                        if exited_after_cycle {
-                            "cycle complete"
-                        } else if exited_after_target_update {
+                        if exited_after_target_update {
                             "target"
                         } else {
                             "interrupt"

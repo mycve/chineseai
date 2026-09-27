@@ -2547,7 +2547,7 @@ mod tests {
     #[test]
     fn terminal_value_uses_rule_history_not_just_board_hash() {
         let position = Position::startpos();
-        let rule_history = vec![
+        let mut rule_history = vec![
             position.rule_history_entry(None),
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2601,6 +2601,7 @@ mod tests {
             },
         ];
 
+        rule_history.extend_from_within(1..);
         assert_eq!(
             terminal_value(&position, &rule_history),
             Some(0.0),
@@ -2615,7 +2616,7 @@ mod tests {
     #[test]
     fn external_controller_mode_does_not_adjudicate_the_root() {
         let position = Position::startpos();
-        let rule_history = vec![
+        let mut rule_history = vec![
             position.rule_history_entry(None),
             RuleHistoryEntry {
                 hash: position.hash(),
@@ -2628,6 +2629,7 @@ mod tests {
                 rule60_clock: 0,
             },
         ];
+        rule_history.push(rule_history[1]);
         assert!(position.rule_outcome_with_history(&rule_history).is_some());
 
         let model = AzNnue::random(4, 72);

@@ -456,9 +456,15 @@ impl Position {
 fn repetition_cycle(history: &[RuleHistoryEntry]) -> Option<&[RuleHistoryEntry]> {
     let current_index = history.len().checked_sub(1)?;
     let current = history[current_index];
-    let cycle_start = history[..current_index].iter().position(|entry| {
-        entry.hash == current.hash && entry.side_to_move == current.side_to_move
-    })? + 1;
+    let mut matches = history[..current_index]
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.hash == current.hash && entry.side_to_move == current.side_to_move
+        });
+    let cycle_start = matches.next()?.0 + 1;
+    // Px0正式终局要求同一局面第三次出现；一次循环不能直接判负。
+    matches.next()?;
     Some(&history[cycle_start..=current_index])
 }
 
@@ -466,7 +472,7 @@ fn adjudicate_repetition(entries: &[RuleHistoryEntry]) -> RuleOutcome {
     let red_violation = repeated_rule_violation(entries, Color::Red);
     let black_violation = repeated_rule_violation(entries, Color::Black);
 
-    // Asian 2fold: 长将 > 长捉同一子 > 其他循环。
+    // 长将 > 长捉同一子 > 其他循环。
     match (red_violation, black_violation) {
         (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
             return RuleOutcome::Draw(RuleDrawReason::MutualLongCheck);
@@ -508,6 +514,11 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
 
     if mover_entries.iter().all(|entry| entry.gives_check) {
         return Some(RuleViolation::LongCheck);
+    }
+
+    // Px0 RuleJudge：循环中出现将军时，清除双方的长捉候选。
+    if entries.iter().any(|entry| entry.gives_check) {
+        return None;
     }
 
     let mut identity_at_square = std::array::from_fn::<_, { super::BOARD_SIZE }, _>(|sq| sq as u8);

@@ -300,34 +300,31 @@ fn apply_rule_options(state: &mut UciState) {
 
 fn handle_position(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
-    if tokens.get(1) == Some(&"startpos") {
-        state.position = Position::startpos();
-        apply_rule_options(state);
-        state.rule_history = state.position.initial_rule_history();
-        if let Some(moves_index) = tokens.iter().position(|token| *token == "moves") {
-            let move_list = &tokens[moves_index + 1..];
-            apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
-        }
-        state.game_ply = Some(state.rule_history.len() - 1);
-        return;
-    }
-
-    if tokens.get(1) == Some(&"fen") {
-        let moves_index = tokens.iter().position(|token| *token == "moves");
-        let fen_end = moves_index.unwrap_or(tokens.len());
-        let fen = tokens[2..fen_end].join(" ");
-        if let Ok(position) = Position::from_fen(&fen) {
+    let moves_index = tokens.iter().position(|token| *token == "moves");
+    let (mut position, base_ply) = match tokens.get(1) {
+        Some(&"startpos") => (Position::startpos(), Some(0)),
+        Some(&"fen") => {
+            let fen = tokens[2..moves_index.unwrap_or(tokens.len())].join(" ");
+            let Ok(position) = Position::from_fen(&fen) else {
+                println!("info string invalid position FEN");
+                return;
+            };
             let base_ply = fen_game_ply(&fen, position.side_to_move());
-            state.position = position;
-            apply_rule_options(state);
-            state.rule_history = state.position.initial_rule_history();
-            if let Some(moves_index) = moves_index {
-                let move_list = &tokens[moves_index + 1..];
-                apply_uci_moves(&mut state.position, &mut state.rule_history, move_list);
-            }
-            state.game_ply = base_ply.map(|ply| ply.saturating_add(state.rule_history.len() - 1));
+            (position, base_ply)
+        }
+        _ => return,
+    };
+    position.set_rule60_max_ply(state.sixty_move_rule.then_some(state.rule60_max_ply));
+    let mut history = position.initial_rule_history();
+    if let Some(index) = moves_index {
+        if let Err(error) = apply_uci_moves(&mut position, &mut history, &tokens[index + 1..]) {
+            println!("info string {error}; position rejected");
+            return;
         }
     }
+    state.game_ply = base_ply.map(|ply| ply.saturating_add(history.len() - 1));
+    state.position = position;
+    state.rule_history = history;
 }
 
 fn fen_game_ply(fen: &str, side: Color) -> Option<usize> {
@@ -344,20 +341,21 @@ fn apply_uci_moves(
     position: &mut Position,
     rule_history: &mut Vec<RuleHistoryEntry>,
     moves: &[&str],
-) {
-    for text in moves {
-        let Some(mv) = position.parse_uci_move(text) else {
-            break;
-        };
+) -> Result<(), String> {
+    for (ply, text) in moves.iter().enumerate() {
+        let mv = position
+            .parse_uci_move(text)
+            .ok_or_else(|| format!("invalid history move {} at ply {}", text, ply + 1))?;
         // `position ... moves` is the external controller's authoritative game
         // history. Accept every board-legal move even if its tournament rule set
         // differs from ours; our repetition rules only guide future search moves.
         if !position.legal_moves().contains(&mv) {
-            break;
+            return Err(format!("illegal history move {} at ply {}", text, ply + 1));
         }
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
+    Ok(())
 }
 
 fn uci_root_moves(position: &Position, rule_history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -788,6 +786,18 @@ mod tests {
     }
 
     #[test]
+    fn invalid_position_history_does_not_replace_current_state() {
+        let mut state = UciState::default();
+        let before = state.position.to_fen();
+        handle_position(
+            "position fen 2baka3/9/9/2p1r4/P8/4p1R1R/1n1cc4/B8/4A4/3K1AB2 w - - 0 1 moves h7d7",
+            &mut state,
+        );
+        assert_eq!(state.position.to_fen(), before);
+        assert_eq!(state.rule_history.len(), 1);
+    }
+
+    #[test]
     fn uci_import_accepts_external_repeated_long_check() {
         let mut position = Position::from_fen(
             "2Rakab2/8r/4c1n2/p3p1p1p/2p6/9/P3P3P/1CN1NC3/9/1RBAKArc1 b - - 0 1",
@@ -795,7 +805,7 @@ mod tests {
         .unwrap();
         let mut history = position.initial_rule_history();
         let moves = ["g0g1", "f0e1", "g1g0", "e1f0", "g0g1"];
-        apply_uci_moves(&mut position, &mut history, &moves);
+        apply_uci_moves(&mut position, &mut history, &moves).unwrap();
 
         assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Red);
@@ -809,7 +819,7 @@ mod tests {
                 .unwrap();
         let mut history = position.initial_rule_history();
         let moves = ["c7b5", "d4d5", "b5c7", "d5d4", "c7b5"];
-        apply_uci_moves(&mut position, &mut history, &moves);
+        apply_uci_moves(&mut position, &mut history, &moves).unwrap();
 
         assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Red);
@@ -890,7 +900,7 @@ mod tests {
         let moves = "b2e2 b9c7 b0c2 h9g7 c3c4 g6g5 a0b0 a9b9 h0i2 i6i5 h2f2 b7b5 b0b4 i9i6 c4c5 c6c5 i0h0 c5c4 b4c4 g7h5 f2h2 h5g7 h2f2 g7h5 f2h2 h5g7 h2f2 g7h5 f2h2";
         let moves = moves.split_whitespace().collect::<Vec<_>>();
 
-        apply_uci_moves(&mut position, &mut history, &moves);
+        apply_uci_moves(&mut position, &mut history, &moves).unwrap();
 
         assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Black);
