@@ -64,7 +64,8 @@ impl TrainingConsole {
         checkpoint: bool,
     ) {
         let production = format!(
-            "update {update:04}: games={} total={} pool={}/{} chunks(train/test)={}/{} R/B/D={}/{}/{} cutoff={} failed={}{}",
+            "update {update:04}: selfplay={:.1}s games={} total={} pool={}/{} chunks(train/test)={}/{} R/B/D={}/{}/{} cutoff={} failed={}{}",
+            report.total_seconds,
             report.games,
             games_total,
             report.pool_samples,
