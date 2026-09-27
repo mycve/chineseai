@@ -494,6 +494,8 @@ struct AzNode {
     expanded: bool,
     // 只由规则终局与完整子树证明产生，始终是当前走棋方视角。
     solved: Option<i8>,
+    // Px0 sticky-endgames：未完全证明时也保留 can't-win/can't-lose 边界。
+    bounds: (i8, i8),
 }
 
 #[derive(Clone)]
@@ -743,6 +745,7 @@ impl<'a> AzTree<'a> {
             value_wdl: [0.0, 1.0, 0.0],
             expanded: false,
             solved: None,
+            bounds: (-1, 1),
         });
         Self {
             nodes,
@@ -1180,6 +1183,7 @@ impl<'a> AzTree<'a> {
                     value_wdl: [0.0, 1.0, 0.0],
                     expanded: false,
                     solved: None,
+                    bounds: (-1, 1),
                 });
                 self.node_children_mut(node_index)[child_index].set_child_node(child_node);
                 child_node
@@ -1482,24 +1486,57 @@ impl<'a> AzTree<'a> {
     }
 
     fn update_solved(&mut self, node_index: usize) {
+        if self.nodes[node_index].solved.is_some() {
+            return;
+        }
         let children = self.node_children(node_index);
         if children.is_empty() {
             return;
         }
-        let mut best = -1;
-        let mut complete = true;
+        let mut lower = -1;
+        let mut upper = -1;
         for child in children {
-            match self.child_solved(child) {
-                Some(1) => {
-                    self.nodes[node_index].solved = Some(1);
-                    return;
-                }
-                Some(value) => best = best.max(value),
-                None => complete = false,
-            }
+            let (lo, hi) = child.child_node().map_or((-1, 1), |index| {
+                let node = &self.nodes[index];
+                let (lo, hi) = node.solved.map_or(node.bounds, |value| (value, value));
+                (-hi, -lo)
+            });
+            lower = lower.max(lo);
+            upper = upper.max(hi);
         }
-        if complete {
-            self.nodes[node_index].solved = Some(best);
+        self.nodes[node_index].bounds = (lower, upper);
+        if lower == upper {
+            self.set_proven(node_index, lower);
+        }
+    }
+
+    fn set_proven(&mut self, node_index: usize, value: i8) {
+        if self.nodes[node_index].solved.is_some() {
+            return;
+        }
+        let node = &mut self.nodes[node_index];
+        node.solved = Some(value);
+        node.bounds = (value, value);
+        let exact_sum = scalar_terminal_wdl(value as f32).map(|p| p * node.visits as f32);
+        let mut delta = std::array::from_fn(|i| exact_sum[i] - node.value_wdl_sum[i]);
+        node.value_wdl_sum = exact_sum;
+        // 与 Px0 AdjustForTerminal 相同：纠正此前的访问贡献，而非只替换下一次回传。
+        // 本次访问尚未计入该祖先，仍由 simulate_child 正常计数。
+        let mut current = node_index;
+        while self.nodes[current].parent != NO_CHILD {
+            let parent = self.nodes[current].parent as usize;
+            delta = flip_wdl(delta);
+            let edge = self
+                .node_children_mut(parent)
+                .iter_mut()
+                .find(|edge| edge.child_node() == Some(current))
+                .expect("missing incoming search edge");
+            add_wdl(&mut edge.value_wdl_sum, delta);
+            if self.nodes[parent].solved.is_some() {
+                break;
+            }
+            add_wdl(&mut self.nodes[parent].value_wdl_sum, delta);
+            current = parent;
         }
     }
 }
@@ -2904,12 +2941,39 @@ mod tests {
         tree.nodes[second].value_wdl = [0.0, 1.0, 0.0];
         tree.update_solved(root);
         assert_eq!(tree.nodes[root].solved, None);
+        assert_eq!(tree.nodes[root].bounds, (0, 1));
         assert_eq!(tree.nodes[second].solved, None);
         tree.nodes[second].solved = Some(1);
         tree.update_solved(root);
         assert_eq!(tree.nodes[root].solved, Some(0));
         assert_eq!(tree.node_eval(root).value_wdl, [0.0, 1.0, 0.0]);
         assert_eq!(tree.root_policy(root), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn sticky_proof_corrects_prior_visits_without_adding_visits_or_double_counting() {
+        let model = AzNnue::random(4, 7);
+        let mut tree = solver_tree_with_two_unresolved_children(&model);
+        let root = tree.root;
+        let first = tree.node_children(root)[0].child_node().unwrap();
+        tree.nodes[root].visits = 10;
+        tree.nodes[root].value_wdl_sum = [4.0, 2.0, 4.0];
+        tree.nodes[first].visits = 6;
+        tree.nodes[first].value_wdl_sum = [4.0, 1.0, 1.0];
+        tree.node_children_mut(root)[0].visits = 6;
+        tree.node_children_mut(root)[0].value_wdl_sum = [1.0, 1.0, 4.0];
+        tree.set_proven(first, -1);
+        assert_eq!(tree.nodes[first].value_wdl_sum, [0.0, 0.0, 6.0]);
+        assert_eq!(tree.node_children(root)[0].value_wdl_sum, [6.0, 0.0, 0.0]);
+        assert_eq!(tree.nodes[root].value_wdl_sum, [9.0, 1.0, 0.0]);
+        assert_eq!(tree.nodes[root].visits, 10);
+        assert_eq!(tree.node_children(root)[0].visits, 6);
+        tree.update_solved(root);
+        assert_eq!(tree.nodes[root].solved, Some(1));
+        assert_eq!(tree.nodes[root].value_wdl_sum, [10.0, 0.0, 0.0]);
+        tree.set_proven(first, -1);
+        tree.update_solved(root);
+        assert_eq!(tree.nodes[root].value_wdl_sum, [10.0, 0.0, 0.0]);
     }
 
     #[test]

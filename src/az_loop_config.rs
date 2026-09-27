@@ -23,10 +23,6 @@ pub struct AzLoopFileConfig {
     pub simulations: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
-    pub lr_min: f32,
-    pub lr_decay_start_update: usize,
-    pub lr_decay_interval: usize,
-    pub lr_decay_factor: f32,
     pub batch_size: usize,
     pub max_plies: usize,
     pub sixty_move_rule: bool,
@@ -37,8 +33,6 @@ pub struct AzLoopFileConfig {
     pub temperature_start: f32,
     pub temperature_cutoff_plies: usize,
     pub temperature_visit_offset: f32,
-    pub resign_percentage: f32,
-    pub resign_playthrough: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
@@ -59,16 +53,10 @@ pub struct AzLoopFileConfig {
     pub policy_softmax_temp: f32,
     pub selfplay_opening_book: String,
     pub replay_capacity: usize,
-    pub replay_recent_sample_fraction: f32,
+    pub shuffle_size: usize,
     pub replay_recent_games: u32,
-    pub replay_phase_0_29_fraction: f32,
-    pub replay_phase_30_59_fraction: f32,
-    pub replay_phase_60_99_fraction: f32,
-    pub replay_phase_100_139_fraction: f32,
-    pub replay_phase_140_plus_fraction: f32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
-    pub train_epochs_per_update: usize,
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
@@ -105,12 +93,8 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 10_000,
             selfplay_samples_per_update: 120000,
-            lr: 0.0004,
-            lr_min: 0.00001,
-            lr_decay_start_update: 100,
-            lr_decay_interval: 100,
-            lr_decay_factor: 0.97,
-            batch_size: 512,
+            lr: 0.02,
+            batch_size: 2048,
             // Px0 SelfPlayGame采用450步上限，200步会过早丢失终局价值标签。
             max_plies: 450,
             sixty_move_rule: true,
@@ -121,8 +105,6 @@ impl Default for AzLoopFileConfig {
             temperature_start: 0.9,
             temperature_cutoff_plies: 78,
             temperature_visit_offset: -0.8,
-            resign_percentage: 2.0,
-            resign_playthrough: 0.20,
             temperature_endgame: 0.6,
             temperature_decay_delay_plies: 40,
             temperature_decay_plies: 120,
@@ -142,16 +124,10 @@ impl Default for AzLoopFileConfig {
             policy_softmax_temp: 1.45,
             selfplay_opening_book: "book.pgn.gz".into(),
             replay_capacity: 2400000,
-            replay_recent_sample_fraction: 0.35,
+            shuffle_size: 524_288,
             replay_recent_games: 7500,
-            replay_phase_0_29_fraction: 0.15,
-            replay_phase_30_59_fraction: 0.40,
-            replay_phase_60_99_fraction: 0.30,
-            replay_phase_100_139_fraction: 0.10,
-            replay_phase_140_plus_fraction: 0.05,
             train_warmup_samples: 600000,
             train_samples_per_update: 120000,
-            train_epochs_per_update: 1,
             mirror_probability: 0.5,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
@@ -213,8 +189,6 @@ impl AzLoopFileConfig {
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
         line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
-        line!("resign_playthrough", f(self.resign_playthrough));
-        line!("resign_percentage", f(self.resign_percentage));
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
         line!("temperature_cutoff_plies", self.temperature_cutoff_plies);
         line!("simulations", self.simulations);
@@ -223,10 +197,6 @@ impl AzLoopFileConfig {
             self.selfplay_samples_per_update
         );
         line!("lr", f(self.lr));
-        line!("lr_min", f(self.lr_min));
-        line!("lr_decay_start_update", self.lr_decay_start_update);
-        line!("lr_decay_interval", self.lr_decay_interval);
-        line!("lr_decay_factor", f(self.lr_decay_factor));
         line!("batch_size", self.batch_size);
         line!("max_plies", self.max_plies);
         line!("sixty_move_rule", self.sixty_move_rule);
@@ -257,34 +227,10 @@ impl AzLoopFileConfig {
         line!("draw_score", f(self.draw_score));
         line!("policy_softmax_temp", f(self.policy_softmax_temp));
         line!("replay_capacity", self.replay_capacity);
-        line!(
-            "replay_recent_sample_fraction",
-            f(self.replay_recent_sample_fraction)
-        );
+        line!("shuffle_size", self.shuffle_size);
         line!("replay_recent_games", self.replay_recent_games);
-        line!(
-            "replay_phase_0_29_fraction",
-            f(self.replay_phase_0_29_fraction)
-        );
-        line!(
-            "replay_phase_30_59_fraction",
-            f(self.replay_phase_30_59_fraction)
-        );
-        line!(
-            "replay_phase_60_99_fraction",
-            f(self.replay_phase_60_99_fraction)
-        );
-        line!(
-            "replay_phase_100_139_fraction",
-            f(self.replay_phase_100_139_fraction)
-        );
-        line!(
-            "replay_phase_140_plus_fraction",
-            f(self.replay_phase_140_plus_fraction)
-        );
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
-        line!("train_epochs_per_update", self.train_epochs_per_update);
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
@@ -361,9 +307,6 @@ impl AzLoopFileConfig {
         self.simulations = self.simulations.max(1);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
-        self.lr_min = self.lr_min.max(0.0).min(self.lr);
-        self.lr_decay_interval = self.lr_decay_interval.max(1);
-        self.lr_decay_factor = self.lr_decay_factor.clamp(0.0, 1.0);
         self.batch_size = self.batch_size.max(1);
         self.max_plies = self.max_plies.max(1);
         self.rule60_max_ply = self.rule60_max_ply.clamp(1, 150);
@@ -386,36 +329,13 @@ impl AzLoopFileConfig {
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
-        self.resign_percentage = self.resign_percentage.clamp(0.0, 100.0);
-        self.resign_playthrough = self.resign_playthrough.clamp(0.0, 1.0);
         self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
 
-        self.replay_recent_sample_fraction = self.replay_recent_sample_fraction.clamp(0.0, 1.0);
         self.replay_recent_games = self.replay_recent_games.max(1);
-        let mut replay_phase_fractions = [
-            self.replay_phase_0_29_fraction.max(0.0),
-            self.replay_phase_30_59_fraction.max(0.0),
-            self.replay_phase_60_99_fraction.max(0.0),
-            self.replay_phase_100_139_fraction.max(0.0),
-            self.replay_phase_140_plus_fraction.max(0.0),
-        ];
-        let replay_source_total = replay_phase_fractions.iter().sum::<f32>();
-        assert!(
-            replay_source_total > 0.0,
-            "replay phase fractions must have positive total"
-        );
-        for fraction in &mut replay_phase_fractions {
-            *fraction /= replay_source_total;
-        }
-        self.replay_phase_0_29_fraction = replay_phase_fractions[0];
-        self.replay_phase_30_59_fraction = replay_phase_fractions[1];
-        self.replay_phase_60_99_fraction = replay_phase_fractions[2];
-        self.replay_phase_100_139_fraction = replay_phase_fractions[3];
-        self.replay_phase_140_plus_fraction = replay_phase_fractions[4];
+        self.shuffle_size = self.shuffle_size.max(1);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
-        self.train_epochs_per_update = self.train_epochs_per_update.max(1);
         self.arena_cpuct = self.arena_cpuct.max(0.0);
         self.arena_cpuct_at_root = self.arena_cpuct_at_root.max(0.0);
         self.arena_policy_softmax_temp = self.arena_policy_softmax_temp.max(1e-3);
@@ -458,7 +378,6 @@ mod tests {
         assert_eq!(config.root_dirichlet_alpha, 0.12);
         assert_eq!(config.temperature_cutoff_plies, 78);
         assert!(config.fpu_absolute_at_root);
-        assert_eq!(config.resign_playthrough, 0.2);
     }
 
     #[test]
@@ -476,9 +395,8 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 29\n"));
-        assert!(text.contains("lr = 0.0004\n"));
-        assert!(text.contains("lr_min = 0.00001\n"));
+        assert!(text.starts_with("format_version = 30\n"));
+        assert!(text.contains("lr = 0.02\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
@@ -509,13 +427,12 @@ mod tests {
         assert!(!text.contains("high_simulation_start_plies"));
         assert!(text.contains("selfplay_samples_per_update = 120000\n"));
         assert!(text.contains("workers = 0\n"));
-        assert!(text.contains("batch_size = 512\n"));
+        assert!(text.contains("batch_size = 2048\n"));
         assert!(text.contains("max_plies = 450\n"));
         assert!(text.contains("hidden_size = 128\n"));
         assert!(text.contains("replay_capacity = 2400000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));
         assert!(text.contains("train_warmup_samples = 600000\n"));
-        assert!(text.contains("train_epochs_per_update = 1\n"));
         assert!(text.contains("replay_recent_games = 7500\n"));
         assert_eq!(
             config.replay_capacity / config.selfplay_samples_per_update,
@@ -529,11 +446,6 @@ mod tests {
             config.train_samples_per_update / config.selfplay_samples_per_update,
             1
         );
-        assert!(text.contains("replay_phase_0_29_fraction = 0.15\n"));
-        assert!(text.contains("replay_phase_30_59_fraction = 0.4\n"));
-        assert!(text.contains("replay_phase_60_99_fraction = 0.3\n"));
-        assert!(text.contains("replay_phase_100_139_fraction = 0.1\n"));
-        assert!(text.contains("replay_phase_140_plus_fraction = 0.05\n"));
         assert!(text.contains("mirror_probability = 0.5\n"));
         assert!(text.contains("arena_processes = 128\n"));
         assert!(text.contains("arena_opening_book = \"book.pgn.gz\"\n"));
@@ -568,7 +480,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.0004).abs() < 1e-9);
+        assert!((parsed.lr - 0.02).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
     }
@@ -577,7 +489,7 @@ mod tests {
     fn old_config_versions_are_rejected() {
         let text = AzLoopFileConfig::default()
             .to_file_text()
-            .replace("format_version = 29", "format_version = 27");
+            .replace("format_version = 30", "format_version = 27");
         let error = std::panic::catch_unwind(|| AzLoopFileConfig::parse(&text));
         assert!(error.is_err());
     }
@@ -606,6 +518,9 @@ mod tests {
             "high_simulation_start_plies = 40\n",
             "value_target_search_q_mix = 0.4\n",
             "value_td_lambda = 0.95\n",
+            "train_epochs_per_update = 1\n",
+            "resign_percentage = 2.0\n",
+            "resign_playthrough = 0.2\n",
             "arena_pikafish_exe = \"./pikafish\"\n",
             "arena_pikafish_depth = 10\n",
             "arena_pikafish_games = 20\n",

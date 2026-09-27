@@ -26,18 +26,6 @@ const REPLAY_COMPRESS_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const REPLAY_COMPRESS_CHUNK_BYTES: usize = 512;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
 const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
-const REPLAY_PHASE_COUNT: usize = 5;
-
-fn replay_phase(ply: u16) -> usize {
-    match ply {
-        0..=29 => 0,
-        30..=59 => 1,
-        60..=99 => 2,
-        100..=139 => 3,
-        _ => 4,
-    }
-}
-
 fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
     let mut buf = [0u8; 4];
     LittleEndian::write_u32(&mut buf, v);
@@ -299,6 +287,105 @@ pub struct AzExperiencePool {
     sample_count: usize,
 }
 
+/// Px0 train.py SKIP=32 与 shufflebuffer.py insert_or_replace。
+/// 降采样发生在每次读取对局时；不永久删除经验池里的其余局面。
+pub struct Px0ReplaySampler {
+    capacity: usize,
+    buffer: Vec<AzTrainingSample>,
+    pending: VecDeque<AzTrainingSample>,
+    partition: Option<(u64, bool)>,
+}
+
+impl Px0ReplaySampler {
+    pub fn new(shuffle_size: usize) -> Self {
+        Self {
+            capacity: shuffle_size.max(1),
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            partition: None,
+        }
+    }
+
+    /// 整盘固定分组，避免滚动经验池或续训把测试对局重新送入训练。
+    pub fn partitioned(shuffle_size: usize, seed: u64, test: bool) -> Self {
+        let mut sampler = Self::new(shuffle_size);
+        sampler.partition = Some((seed, test));
+        sampler
+    }
+
+    pub fn sample(
+        &mut self,
+        pool: &AzExperiencePool,
+        count: usize,
+        recent_games: u32,
+        rng: &mut SplitMix64,
+    ) -> AzReplaySampleBatch {
+        if pool.sample_count == 0
+            || count == 0
+            || !pool.chunks.iter().any(|chunk| self.includes(chunk))
+        {
+            return AzReplaySampleBatch::default();
+        }
+        let recent_ids: std::collections::HashSet<_> = pool
+            .chunks
+            .iter()
+            .rev()
+            .take(recent_games as usize)
+            .flat_map(|chunk| chunk.entries.first())
+            .map(|entry| entry.sample.meta.game_id)
+            .collect();
+        let mut batch = AzReplaySampleBatch::default();
+        batch.samples.reserve(count);
+        while batch.samples.len() < count {
+            if self.pending.is_empty() {
+                let mut order: Vec<_> = pool
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, chunk)| self.includes(chunk).then_some(i))
+                    .collect();
+                for i in (1..order.len()).rev() {
+                    let j = rng.next_u64() as usize % (i + 1);
+                    order.swap(i, j);
+                }
+                for index in order {
+                    for entry in &pool.chunks[index].entries {
+                        if rng.next_u64() % 32 == 0 {
+                            self.pending.push_back(entry.sample.clone());
+                        }
+                    }
+                }
+            }
+            let Some(mut item) = self.pending.pop_front() else {
+                continue;
+            };
+            if !self.buffer.is_empty() {
+                let index = rng.next_u64() as usize % self.buffer.len();
+                item = std::mem::replace(&mut self.buffer[index], item);
+            }
+            if self.buffer.len() < self.capacity {
+                self.buffer.push(item);
+                continue;
+            }
+            batch.actual_recent_samples += usize::from(recent_ids.contains(&item.meta.game_id));
+            batch.source_samples[item.meta.start_source.index()] += 1;
+            batch.samples.push(item);
+        }
+        batch.full_window_samples = count;
+        batch
+    }
+
+    fn includes(&self, chunk: &ReplayChunk) -> bool {
+        self.partition
+            .is_none_or(|(seed, test)| chunk_is_test(chunk, seed) == test)
+    }
+}
+
+fn chunk_is_test(chunk: &ReplayChunk, seed: u64) -> bool {
+    let game_id = chunk.entries[0].sample.meta.game_id;
+    SplitMix64::new(game_id ^ seed ^ 0xA076_1D64_78BD_642F).next_u64() % 10 == 0
+}
+
 impl AzExperiencePool {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -314,6 +401,15 @@ impl AzExperiencePool {
 
     pub fn sample_count(&self) -> usize {
         self.sample_count
+    }
+
+    pub fn partition_chunks(&self, seed: u64) -> (usize, usize) {
+        let test = self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk_is_test(chunk, seed))
+            .count();
+        (self.chunks.len() - test, test)
     }
 
     pub fn add_samples<I>(&mut self, samples: I)
@@ -410,119 +506,6 @@ impl AzExperiencePool {
             actual_recent_samples,
             full_window_samples: full_count,
             source_samples: [0; AzStartSource::COUNT],
-        }
-    }
-
-    pub fn sample_phase_stratified_recent(
-        &self,
-        count: usize,
-        phase_fractions: [f32; REPLAY_PHASE_COUNT],
-        recent_fraction: f32,
-        recent_games: u32,
-        rng: &mut SplitMix64,
-    ) -> AzReplaySampleBatch {
-        if self.sample_count == 0 || count == 0 {
-            return AzReplaySampleBatch::default();
-        }
-        let chunk_ends = self.chunk_ends();
-        let recent_start = self
-            .recent_start_flat(recent_games.max(1))
-            .unwrap_or(self.sample_count);
-        let mut all_by_phase: [Vec<usize>; REPLAY_PHASE_COUNT] = Default::default();
-        let mut old_by_phase: [Vec<usize>; REPLAY_PHASE_COUNT] = Default::default();
-        let mut recent_by_phase: [Vec<usize>; REPLAY_PHASE_COUNT] = Default::default();
-        let mut flat = 0usize;
-        for chunk in &self.chunks {
-            for entry in &chunk.entries {
-                let phase = replay_phase(entry.sample.meta.ply);
-                all_by_phase[phase].push(flat);
-                if flat >= recent_start {
-                    recent_by_phase[phase].push(flat);
-                } else {
-                    old_by_phase[phase].push(flat);
-                }
-                flat += 1;
-            }
-        }
-        let mut weights = phase_fractions.map(|value| value.max(0.0));
-        for phase in 0..REPLAY_PHASE_COUNT {
-            if all_by_phase[phase].is_empty() {
-                weights[phase] = 0.0;
-            }
-        }
-        let total_weight = weights.iter().sum::<f32>();
-        if total_weight <= 0.0 {
-            return AzReplaySampleBatch {
-                samples: self.sample_uniform(count, rng),
-                full_window_samples: count,
-                ..AzReplaySampleBatch::default()
-            };
-        }
-        for weight in &mut weights {
-            *weight /= total_weight;
-        }
-        let mut phase_targets = [0usize; REPLAY_PHASE_COUNT];
-        let mut assigned = 0usize;
-        for phase in 0..REPLAY_PHASE_COUNT {
-            phase_targets[phase] = (count as f32 * weights[phase]).floor() as usize;
-            assigned += phase_targets[phase];
-        }
-        let remainder_phase = weights
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(phase, _)| phase)
-            .unwrap_or(0);
-        phase_targets[remainder_phase] += count - assigned;
-        let mut samples = Vec::with_capacity(count);
-        let mut source_samples = [0usize; AzStartSource::COUNT];
-        let recent_fraction = recent_fraction.clamp(0.0, 1.0);
-        let requested_recent_samples = (count as f32 * recent_fraction).round() as usize;
-        let mut recent_targets =
-            phase_targets.map(|target| (target as f32 * recent_fraction).floor() as usize);
-        let mut recent_assigned = recent_targets.iter().sum::<usize>();
-        while recent_assigned < requested_recent_samples {
-            let phase = (0..REPLAY_PHASE_COUNT)
-                .filter(|&phase| recent_targets[phase] < phase_targets[phase])
-                .max_by(|&left, &right| {
-                    let left_remainder =
-                        phase_targets[left] as f32 * recent_fraction - recent_targets[left] as f32;
-                    let right_remainder = phase_targets[right] as f32 * recent_fraction
-                        - recent_targets[right] as f32;
-                    left_remainder.total_cmp(&right_remainder)
-                })
-                .expect("recent replay quota must fit phase quotas");
-            recent_targets[phase] += 1;
-            recent_assigned += 1;
-        }
-        let mut actual_recent_samples = 0usize;
-        for phase in 0..REPLAY_PHASE_COUNT {
-            let target = phase_targets[phase];
-            let recent_target = recent_targets[phase];
-            for index in 0..target {
-                let want_recent = index < recent_target;
-                let preferred = if want_recent {
-                    &recent_by_phase[phase]
-                } else {
-                    &old_by_phase[phase]
-                };
-                let choices = if preferred.is_empty() {
-                    &all_by_phase[phase]
-                } else {
-                    preferred
-                };
-                let flat_index = choices[rng.next_u64() as usize % choices.len()];
-                actual_recent_samples += usize::from(flat_index >= recent_start);
-                samples.push(self.sample_by_flat_index(flat_index, &chunk_ends));
-                source_samples[samples.last().unwrap().meta.start_source.index()] += 1;
-            }
-        }
-        AzReplaySampleBatch {
-            samples,
-            recent_samples: requested_recent_samples,
-            actual_recent_samples,
-            full_window_samples: count.saturating_sub(requested_recent_samples),
-            source_samples,
         }
     }
 
@@ -836,6 +819,44 @@ mod tests {
     }
 
     #[test]
+    fn px0_sampler_keeps_pool_and_natural_phase_distribution_across_batches() {
+        let mut pool = AzExperiencePool::new(1000);
+        pool.add_games(
+            (0..100)
+                .map(|game| {
+                    (0..10)
+                        .map(|_| {
+                            let mut item = sample(AzStartSource::OpeningBook, 1, game);
+                            item.meta.ply = if game < 90 { 15 } else { 150 };
+                            item
+                        })
+                        .collect()
+                })
+                .collect(),
+        );
+        let mut sampler = Px0ReplaySampler::new(128);
+        let mut rng = SplitMix64::new(42);
+        let first = sampler.sample(&pool, 2500, 10, &mut rng);
+        let second = sampler.sample(&pool, 2500, 10, &mut rng);
+        let early = first
+            .samples
+            .iter()
+            .chain(&second.samples)
+            .filter(|s| s.meta.ply == 15)
+            .count();
+        assert!(
+            early > 4000 && early < 4900,
+            "unexpected phase bias: {early}/5000"
+        );
+        assert_eq!(sampler.buffer.len(), 128);
+        assert_eq!(pool.sample_count(), 1000);
+        assert_eq!(first.recent_samples, 0);
+        assert_eq!(first.full_window_samples, 2500);
+        assert!(first.actual_recent_samples < 500);
+        assert_eq!(second.samples.len(), 2500);
+    }
+
+    #[test]
     fn replay_roundtrip_preserves_start_source() {
         let mut encoded = Vec::new();
         let mut original = sample(AzStartSource::OpeningBook, 7, 11);
@@ -853,56 +874,47 @@ mod tests {
     }
 
     #[test]
-    fn phase_stratified_sampler_enforces_phase_and_recency_quotas() {
-        let mut pool = AzExperiencePool::new(1_000);
-        let sources = [
-            AzStartSource::Startpos,
-            AzStartSource::OpeningBook,
-            AzStartSource::Midgame,
-        ];
-        for generation in 0..10 {
-            pool.add_games(
-                sources
-                    .iter()
-                    .enumerate()
-                    .map(|(source_index, &source)| {
-                        (0..10)
-                            .map(|sample_index| {
-                                let mut sample = sample(
-                                    source,
-                                    generation,
-                                    generation as u64 * 1_000
-                                        + source_index as u64 * 100
-                                        + sample_index,
-                                );
-                                sample.meta.ply = [10, 40, 80][source_index];
-                                sample
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            );
-        }
-        let batch = pool.sample_phase_stratified_recent(
-            100,
-            [0.2, 0.5, 0.3, 0.0, 0.0],
-            0.35,
-            15,
-            &mut SplitMix64::new(42),
+    fn whole_game_holdout_is_disjoint_and_stable_after_decode() {
+        let mut pool = AzExperiencePool::new(20_000);
+        pool.add_games(
+            (0..1000)
+                .map(|id| {
+                    (0..10)
+                        .map(|_| sample(AzStartSource::OpeningBook, 1, id))
+                        .collect()
+                })
+                .collect(),
         );
-        assert_eq!(batch.recent_samples, 35);
-        assert_eq!(batch.actual_recent_samples, 35);
-        assert_eq!(batch.full_window_samples, 65);
-        assert_eq!(batch.samples.len(), 100);
-        let observed_phases =
-            batch
-                .samples
+        let (train_chunks, test_chunks) = pool.partition_chunks(77);
+        assert_eq!(train_chunks + test_chunks, 1000);
+        assert!(
+            (70..130).contains(&test_chunks),
+            "test chunks={test_chunks}"
+        );
+        let mut train = Px0ReplaySampler::partitioned(64, 77, false);
+        let mut test = Px0ReplaySampler::partitioned(6, 77, true);
+        let train = train.sample(&pool, 1000, 0, &mut SplitMix64::new(1));
+        let test = test.sample(&pool, 1000, 0, &mut SplitMix64::new(2));
+        let train_ids: std::collections::HashSet<_> =
+            train.samples.iter().map(|s| s.meta.game_id).collect();
+        assert!(
+            test.samples
                 .iter()
-                .fold([0usize; REPLAY_PHASE_COUNT], |mut counts, sample| {
-                    counts[replay_phase(sample.meta.ply)] += 1;
-                    counts
-                });
-        assert_eq!(observed_phases, [20, 50, 30, 0, 0]);
-        assert_eq!(batch.source_samples, [20, 50, 30]);
+                .all(|s| !train_ids.contains(&s.meta.game_id))
+        );
+        for chunk in &pool.chunks {
+            let mut encoded = Vec::new();
+            encode_replay_entry(&mut encoded, &chunk.entries[0]).unwrap();
+            let decoded = decode_replay_entry(&mut Cursor::new(encoded)).unwrap();
+            let restored = ReplayChunk::new(vec![decoded.sample]);
+            assert_eq!(chunk_is_test(chunk, 77), chunk_is_test(&restored, 77));
+        }
+        let empty = AzExperiencePool::new(10);
+        assert!(
+            Px0ReplaySampler::partitioned(6, 77, true)
+                .sample(&empty, 8, 0, &mut SplitMix64::new(3))
+                .samples
+                .is_empty()
+        );
     }
 }

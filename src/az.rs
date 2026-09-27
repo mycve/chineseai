@@ -21,6 +21,8 @@ mod fused_sparse_policy;
 mod play;
 pub mod px0_data;
 mod px0_policy_map;
+#[path = "az/px0_sgd.rs"]
+mod px0_sgd;
 mod replay;
 mod start;
 mod train;
@@ -52,10 +54,10 @@ pub use alphazero::{
 };
 pub use dataloader::{AzSparseActivationStats, sparse_activation_stats};
 pub use play::{
-    AzAdjudicationStats, AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats,
-    generate_selfplay_data, play_arena_games_from_positions, play_arena_games_from_snapshots,
+    AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
+    play_arena_games_from_positions, play_arena_games_from_snapshots,
 };
-pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats};
+pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats, Px0ReplaySampler};
 pub use start::AzStartSnapshot;
 pub use train::{train_samples, train_samples_weighted, train_samples_weighted_owned};
 
@@ -1080,8 +1082,6 @@ pub struct AzLoopConfig {
     pub temperature_start: f32,
     pub temperature_cutoff_plies: usize,
     pub temperature_visit_offset: f32,
-    pub resign_percentage: f32,
-    pub resign_playthrough: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
@@ -1107,6 +1107,11 @@ pub struct AzLoopConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct AzLoopReport {
+    pub training_steps: usize,
+    pub training_chunks: usize,
+    pub test_chunks: usize,
+    pub holdout_checks: Vec<AzHoldoutReport>,
+    pub cycle_complete: bool,
     pub games: usize,
     pub samples: usize,
     pub avg_search_simulations: f32,
@@ -1172,17 +1177,6 @@ pub struct AzLoopReport {
     pub replay_avg_update: f32,
     pub replay_window_games: u32,
     pub replay_recent_window_fraction: f32,
-    pub train_fast_sample_rate: f32,
-    pub train_policy_weight_mean: f32,
-    pub train_value_weight_mean: f32,
-    pub train_recent_quota_rate: f32,
-    pub train_actual_recent_sample_rate: f32,
-    pub train_start_source_rate: [f32; 3],
-    pub train_policy_target_top1: f32,
-    pub train_policy_target_top2: f32,
-    pub train_repetition_opportunity_rate: f32,
-    pub train_repetition_target_mass: f32,
-    pub train_sparse_activation: AzSparseActivationStats,
     pub terminal_no_legal_moves: usize,
     pub terminal_checkmate: usize,
     pub terminal_stalemate: usize,
@@ -1199,7 +1193,7 @@ pub struct AzLoopReport {
     pub terminal_rule_win_red: usize,
     pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
-    pub adjudication: AzAdjudicationStats,
+    pub terminal_search_proven: [usize; 3],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1508,6 +1502,20 @@ pub struct AzTrainStats {
     pub source_phase_value: [AzValueMomentStats; 9],
 }
 
+pub const PX0_CYCLE_STEPS: usize = 140_000;
+pub const PX0_TEST_STEPS: usize = 2_000;
+
+#[derive(Clone, Copy, Debug)]
+pub struct AzHoldoutReport {
+    pub step: usize,
+    pub samples: usize,
+    pub value_samples: usize,
+    pub loss: f32,
+    pub value_loss: f32,
+    pub policy_kl: f32,
+    pub value_rmse: f32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzValueMomentStats {
     pub pred_sum: f32,
@@ -1705,6 +1713,66 @@ impl AzNnue {
         }
         az_weight_tensors!(save_tensor, h);
         varmap.save(path).map_err(candle_io_error)
+    }
+
+    pub fn save_training_state(
+        &self,
+        path: impl AsRef<Path>,
+        next_update: usize,
+    ) -> io::Result<bool> {
+        let Some(trainer) = self.gpu_trainer.as_ref() else {
+            return Ok(false);
+        };
+        trainer
+            .save_state(path.as_ref(), next_update)
+            .map_err(candle_io_error)?;
+        Ok(true)
+    }
+
+    pub fn restore_training_state(
+        &mut self,
+        path: impl AsRef<Path>,
+        next_update: usize,
+        lr: f32,
+    ) -> io::Result<()> {
+        let mut trainer = train_gpu::GpuTrainer::new(self, lr).map_err(candle_io_error)?;
+        trainer
+            .restore_state(path.as_ref(), next_update)
+            .map_err(candle_io_error)?;
+        self.gpu_trainer = Some(Box::new(trainer));
+        Ok(())
+    }
+
+    pub fn training_steps(&self) -> usize {
+        self.gpu_trainer
+            .as_ref()
+            .map_or(0, |trainer| trainer.steps())
+    }
+
+    pub fn set_training_holdout(
+        &mut self,
+        samples: Vec<AzTrainingSample>,
+        lr: f32,
+    ) -> io::Result<()> {
+        if self.gpu_trainer.is_none() {
+            self.gpu_trainer = Some(Box::new(
+                train_gpu::GpuTrainer::new(self, lr).map_err(candle_io_error)?,
+            ));
+        }
+        self.gpu_trainer.as_mut().unwrap().set_holdout(samples);
+        Ok(())
+    }
+
+    pub fn take_training_checks(&mut self) -> Vec<AzHoldoutReport> {
+        self.gpu_trainer
+            .as_mut()
+            .map_or_else(Vec::new, |trainer| trainer.take_checks())
+    }
+
+    pub fn last_training_learning_rate(&self) -> Option<f32> {
+        self.gpu_trainer
+            .as_ref()
+            .map(|trainer| trainer.last_learning_rate())
     }
 
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -4159,4 +4227,30 @@ mod tests {
         assert!(context[2] > 0.0);
         assert_eq!(context[3..], [0.0; 4]);
     }
+}
+
+pub fn policy_target_entropy(samples: &[AzTrainingSample]) -> f32 {
+    let total = samples
+        .iter()
+        .map(|sample| {
+            let targets = || {
+                sample
+                    .move_indices
+                    .iter()
+                    .zip(&sample.policy)
+                    .filter_map(|(&index, &p)| (index < DENSE_MOVE_SPACE).then_some(p.max(0.0)))
+            };
+            let sum = targets().sum::<f32>();
+            if sum.is_finite() && sum > 1.0e-12 {
+                targets()
+                    .map(|p| p / sum)
+                    .filter(|&p| p > 0.0)
+                    .map(|p| -p * p.ln())
+                    .sum::<f32>()
+            } else {
+                (targets().count().max(1) as f32).ln()
+            }
+        })
+        .sum::<f32>();
+    total / samples.len().max(1) as f32
 }

@@ -3,6 +3,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod az_loop_config;
+mod training_console;
 
 use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az_loop_config};
 
@@ -12,12 +13,12 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSampleMeta, AzSearchLimits, AzSelfplayData, AzSparseActivationStats, AzTrainLossWeights,
-        AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE,
-        SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
-        generate_selfplay_data, play_arena_games_from_positions, sparse_activation_stats,
-        train_samples_weighted, train_samples_weighted_owned,
+        AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
+        POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, Px0ReplaySampler, SplitMix64,
+        alphazero_search, alphazero_search_trace_with_rules, alphazero_search_with_rules,
+        benchmark_training, dense_move_index, evaluate_policy_groups, generate_selfplay_data,
+        play_arena_games_from_positions, policy_target_entropy, train_samples_weighted,
+        train_samples_weighted_owned,
     },
     nnue::{AZ_NNUE_INPUT_SIZE, canonical_move, extract_sparse_features_az},
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -253,7 +254,7 @@ struct AzTrainBenchArgs {
     #[arg(default_value_t = 1024)]
     batch_size: usize,
     /// Learning rate.
-    #[arg(default_value_t = 0.0004)]
+    #[arg(default_value_t = 0.02)]
     lr: f32,
     /// Random seed.
     #[arg(default_value_t = 20260411)]
@@ -717,8 +718,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
-            "rrf{}_rrw{}_lrm{}_lds{}_ldi{}_ldf{}_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_rc{}_",
-            "tspu{}_tepu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
+            "shuf{}_rrw{}_sgd09nesterov_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_rc{}_",
+            "tspu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
         config.selfplay_samples_per_update,
@@ -729,12 +730,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         u8::from(config.sixty_move_rule),
         config.rule60_max_ply,
         config.workers,
-        f32_slug(config.replay_recent_sample_fraction),
+        config.shuffle_size,
         config.replay_recent_games,
-        f32_slug(config.lr_min),
-        config.lr_decay_start_update,
-        config.lr_decay_interval,
-        f32_slug(config.lr_decay_factor),
         f32_slug(config.cpuct),
         f32_slug(config.cpuct_at_root),
         f32_slug(config.fpu_value),
@@ -746,7 +743,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.temperature_decay_plies,
         config.replay_capacity,
         config.train_samples_per_update,
-        config.train_epochs_per_update,
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
@@ -778,24 +774,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     )
 }
 
-fn learning_rate_for_update(config: &AzLoopFileConfig, update: usize) -> f32 {
-    if config.lr <= 0.0 {
-        return 0.0;
-    }
-    let factor = config.lr_decay_factor.clamp(0.0, 1.0);
-    if factor <= 0.0 {
-        return config.lr_min.min(config.lr).max(0.0);
-    }
-    if factor >= 1.0 || update < config.lr_decay_start_update {
-        return config.lr;
-    }
-
-    let interval = config.lr_decay_interval.max(1);
-    let steps = 1 + (update - config.lr_decay_start_update) / interval;
-    let decayed = config.lr * factor.powi(steps as i32);
-    decayed.max(config.lr_min.min(config.lr).max(0.0))
-}
-
 fn tensorboard_effective_logdir(config: &AzLoopFileConfig) -> PathBuf {
     Path::new(&config.tensorboard_logdir).join(tensorboard_encoded_subdir(config))
 }
@@ -806,6 +784,10 @@ fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> Pat
         .and_then(|name| name.to_str())
         .unwrap_or("model.safetensors");
     Path::new(checkpoint_dir).join(format!("update-{update:06}-{base}"))
+}
+
+fn optimizer_checkpoint_path(model_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.sgd.safetensors", model_path.display()))
 }
 
 fn best_checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> PathBuf {
@@ -967,7 +949,11 @@ fn prune_old_checkpoints(
     entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let to_remove = entries.len().saturating_sub(max_checkpoints);
     for (_, _, path) in entries.into_iter().take(to_remove) {
+        let optimizer_path = optimizer_checkpoint_path(&path);
         fs::remove_file(path)?;
+        if optimizer_path.exists() {
+            fs::remove_file(optimizer_path)?;
+        }
     }
     Ok(())
 }
@@ -1007,22 +993,6 @@ struct PendingTrainingData {
     selfplay: AzSelfplayData,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct TrainBatchSourceStats {
-    fast_sample_rate: f32,
-    policy_weight_mean: f32,
-    value_weight_mean: f32,
-    recent_quota_rate: f32,
-    actual_recent_sample_rate: f32,
-    policy_target_entropy: f32,
-    policy_target_top1: f32,
-    policy_target_top2: f32,
-    repetition_opportunity_rate: f32,
-    repetition_target_mass: f32,
-    start_source_rate: [f32; 3],
-    sparse_activation: AzSparseActivationStats,
-}
-
 impl PendingTrainingData {
     fn push(&mut self, batch: SelfplayBatch) {
         self.selfplay.add_assign(&batch.data);
@@ -1047,8 +1017,6 @@ fn build_az_loop_config(
         temperature_start: config.temperature_start,
         temperature_cutoff_plies: config.temperature_cutoff_plies,
         temperature_visit_offset: config.temperature_visit_offset,
-        resign_percentage: config.resign_percentage,
-        resign_playthrough: config.resign_playthrough,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
@@ -1082,7 +1050,7 @@ fn build_async_training_report(
     pool_samples: usize,
     pool_capacity: usize,
     replay_window: chineseai::az::AzReplayWindowStats,
-    train_source: TrainBatchSourceStats,
+    target_entropy: f32,
 ) -> AzLoopReport {
     let selfplay_samples = pending.selfplay.samples.len();
     let total_seconds = pending.collection_seconds.max(1.0e-6);
@@ -1144,6 +1112,11 @@ fn build_async_training_report(
             / pending.selfplay.start_games[source].max(1) as f32
     });
     AzLoopReport {
+        training_steps: 0,
+        training_chunks: 0,
+        test_chunks: 0,
+        holdout_checks: Vec::new(),
+        cycle_complete: false,
         games: selfplay_games,
         samples: selfplay_samples,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
@@ -1180,8 +1153,8 @@ fn build_async_training_report(
         short_value_ce: stats.short_value_ce,
         short_value: stats.short_value.map(value_report),
         policy_ce: stats.policy_ce,
-        policy_target_entropy: train_source.policy_target_entropy,
-        policy_kl: stats.policy_ce - train_source.policy_target_entropy,
+        policy_target_entropy: target_entropy,
+        policy_kl: stats.policy_ce - target_entropy,
         root_visit_entropy,
         entropy_opening: pending.selfplay.entropy_opening_sum
             / pending.selfplay.entropy_opening_count.max(1) as f32,
@@ -1221,17 +1194,6 @@ fn build_async_training_report(
         replay_avg_update: replay_window.avg_generation_update,
         replay_window_games: replay_window.window_games,
         replay_recent_window_fraction: replay_window.recent_window_sample_fraction,
-        train_fast_sample_rate: train_source.fast_sample_rate,
-        train_policy_weight_mean: train_source.policy_weight_mean,
-        train_value_weight_mean: train_source.value_weight_mean,
-        train_recent_quota_rate: train_source.recent_quota_rate,
-        train_actual_recent_sample_rate: train_source.actual_recent_sample_rate,
-        train_start_source_rate: train_source.start_source_rate,
-        train_policy_target_top1: train_source.policy_target_top1,
-        train_policy_target_top2: train_source.policy_target_top2,
-        train_repetition_opportunity_rate: train_source.repetition_opportunity_rate,
-        train_repetition_target_mass: train_source.repetition_target_mass,
-        train_sparse_activation: train_source.sparse_activation,
         terminal_no_legal_moves: pending.selfplay.terminal.no_legal_moves,
         terminal_checkmate: pending.selfplay.terminal.checkmate,
         terminal_stalemate: pending.selfplay.terminal.stalemate,
@@ -1251,104 +1213,7 @@ fn build_async_training_report(
         terminal_rule_win_red: pending.selfplay.terminal.rule_win_red,
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
-        adjudication: pending.selfplay.terminal.adjudication,
-    }
-}
-
-fn train_batch_source_stats(
-    samples: &[AzTrainingSample],
-    full_simulations: usize,
-    recent_quota_samples: usize,
-    actual_recent_samples: usize,
-) -> TrainBatchSourceStats {
-    if samples.is_empty() {
-        return TrainBatchSourceStats::default();
-    }
-    let full_simulations = full_simulations.max(1) as u32;
-    let mut fast = 0usize;
-    let mut policy_weight_sum = 0.0f32;
-    let mut value_weight_sum = 0.0f32;
-    let mut target_entropy_sum = 0.0f32;
-    let mut target_top1_sum = 0.0f32;
-    let mut target_top2_sum = 0.0f32;
-    let mut repetition_opportunities = 0usize;
-    let mut repetition_target_mass_sum = 0.0f32;
-    let mut start_source_count = [0usize; 3];
-    for sample in samples {
-        start_source_count[sample.meta.start_source.index()] += 1;
-        fast += usize::from(
-            sample.search_simulations > 0 && sample.search_simulations < full_simulations,
-        );
-        policy_weight_sum += sample.policy_weight.max(0.0);
-        value_weight_sum += sample.value_weight.max(0.0);
-        let active_targets = sample
-            .move_indices
-            .iter()
-            .zip(&sample.policy)
-            .filter_map(|(&move_index, &target)| {
-                (move_index < DENSE_MOVE_SPACE).then_some(target.max(0.0))
-            })
-            .collect::<Vec<_>>();
-        let target_sum = active_targets.iter().copied().sum::<f32>();
-        let uniform_target = if active_targets.is_empty() {
-            0.0
-        } else {
-            1.0 / active_targets.len() as f32
-        };
-        let normalize_target = |target: f32| {
-            if target_sum.is_finite() && target_sum > 1.0e-12 {
-                target / target_sum
-            } else {
-                uniform_target
-            }
-        };
-        let mut top = [0.0f32; 2];
-        for &target in &active_targets {
-            let p = normalize_target(target);
-            if p > 0.0 {
-                target_entropy_sum -= p * p.ln();
-            }
-            if p > top[0] {
-                top[1] = top[0];
-                top[0] = p;
-            } else if p > top[1] {
-                top[1] = p;
-            }
-        }
-        target_top1_sum += top[0];
-        target_top2_sum += top[0] + top[1];
-        if sample.repetition_flags.len() == sample.move_indices.len()
-            && sample.repetition_flags.iter().any(|&flag| flag != 0)
-        {
-            repetition_opportunities += 1;
-            let mass = sample
-                .move_indices
-                .iter()
-                .zip(&sample.policy)
-                .zip(&sample.repetition_flags)
-                .filter_map(|((&move_index, &target), &flag)| {
-                    (move_index < DENSE_MOVE_SPACE && flag != 0)
-                        .then_some(normalize_target(target.max(0.0)))
-                })
-                .sum::<f32>();
-            repetition_target_mass_sum += mass;
-        }
-    }
-    let denom = samples.len() as f32;
-    let sparse_activation = sparse_activation_stats(samples, 4096);
-    TrainBatchSourceStats {
-        fast_sample_rate: fast as f32 / denom,
-        policy_weight_mean: policy_weight_sum / denom,
-        value_weight_mean: value_weight_sum / denom,
-        recent_quota_rate: recent_quota_samples.min(samples.len()) as f32 / denom,
-        actual_recent_sample_rate: actual_recent_samples.min(samples.len()) as f32 / denom,
-        policy_target_entropy: target_entropy_sum / denom,
-        policy_target_top1: target_top1_sum / denom,
-        policy_target_top2: target_top2_sum / denom,
-        repetition_opportunity_rate: repetition_opportunities as f32 / denom,
-        repetition_target_mass: repetition_target_mass_sum / repetition_opportunities.max(1) as f32,
-        start_source_rate: start_source_count.map(|count| count as f32 / denom),
-        sparse_activation,
+        terminal_search_proven: pending.selfplay.terminal.search_proven,
     }
 }
 
@@ -2236,18 +2101,11 @@ fn main() {
                 );
                 return;
             }
-            if start_update > 1 {
-                println!(
-                    "resume   : update starts at {} (from `{}`)",
-                    start_update,
-                    az_loop_progress_path(&config_path).display()
-                );
-            }
             let best_path = best_model_path(&config.model_path);
 
             let config_arch = config.arch();
             let model_path = Path::new(&config.model_path);
-            let (model, resumed_model) = if model_path.exists() {
+            let (mut model, resumed_model) = if model_path.exists() {
                 println!("model    : load {}", config.model_path);
                 let model = AzNnue::load(model_path).unwrap_or_else(|err| {
                     panic!(
@@ -2263,13 +2121,6 @@ fn main() {
                         config_arch
                     );
                 }
-                fs::remove_file(model_path).unwrap_or_else(|err| {
-                    panic!(
-                        "loaded model but failed to remove consumed `{}`: {err}",
-                        model_path.display()
-                    )
-                });
-                println!("resume   : consumed `{}` into memory", model_path.display());
                 (model, true)
             } else if config.arena_interval > 0 && best_path.exists() {
                 println!("model    : load best `{}` as current", best_path.display());
@@ -2289,8 +2140,25 @@ fn main() {
                 println!("model    : init {}", config.model_path);
                 (AzNnue::random_with_arch(config_arch, config.seed), false)
             };
+            let optimizer_state_path = PathBuf::from(format!("{config_path}.sgd.safetensors"));
+            let model_optimizer_path = optimizer_checkpoint_path(model_path);
+            let restore_path = if model_optimizer_path.exists() {
+                &model_optimizer_path
+            } else {
+                &optimizer_state_path
+            };
+            if restore_path.exists() {
+                model
+                    .restore_training_state(restore_path, start_update, config.lr)
+                    .unwrap_or_else(|err| panic!("refusing mismatched SGD resume state: {err}"));
+                println!(
+                    "optimizer: restored SGD momentum and global step from `{}`",
+                    restore_path.display()
+                );
+            } else {
+                println!("optimizer: fresh SGD momentum; global step=0, warmup=250");
+            }
             let selfplay_model = model.clone();
-            println!("selfplay : start from raw model");
             let initial_arena_reference_model = {
                 if !best_path.exists() {
                     save_model(&selfplay_model, &best_path);
@@ -2309,10 +2177,6 @@ fn main() {
                 reference
             };
             let initial_selfplay_model = selfplay_model;
-            println!("selfplay : starts from current learner; publish after every update");
-            if config.arena_interval == 0 {
-                println!("selfplay : arena disabled; learner still publishes continuously");
-            }
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -2355,109 +2219,16 @@ fn main() {
                 );
             });
             let mut tb = SummaryWriter::new(&tb_dir);
-            let effective_train_to_selfplay_ratio = (config.train_samples_per_update as f32
-                * config.train_epochs_per_update as f32)
-                / config.selfplay_samples_per_update.max(1) as f32;
-            let replay_update_span =
-                config.replay_capacity as f32 / config.selfplay_samples_per_update.max(1) as f32;
-            let warmup_update_span = config.train_warmup_samples as f32
-                / config.selfplay_samples_per_update.max(1) as f32;
-            let replay_actor_span = "continuous/every-update";
-
             println!(
-                "design   : replay={:.1}updates actor_generations={} warmup={:.1}updates expected_sample_exposures={:.2} optimizer_steps_per_update={}",
-                replay_update_span,
-                replay_actor_span,
-                warmup_update_span,
-                effective_train_to_selfplay_ratio,
-                config
-                    .train_samples_per_update
-                    .div_ceil(config.batch_size.max(1))
-                    .saturating_mul(config.train_epochs_per_update),
-            );
-
-            println!(
-                "loop     : config={} mode=continuous search=alphazero arch(hidden={}) sims={} value_target=terminal replay_recent(fraction={},games={}) selfplay_samples_per_update={} train_to_selfplay_ratio={:.2} lr={} lr_decay(min={},start={},interval={},factor={}) batch_size={} train_warmup_samples={} train_samples_per_update={} train_epochs_per_update={} max_plies={} rules(repetition=asian2fold,sixty={},max_ply={}) selfplay_workers={} temp(start={},endgame={},delay={}ply,decay={}ply) cpuct={} cpuct_at_root={} fpu(value={},root={}) policy_softmax_temp={} root_noise(alpha={},fraction={}) replay_capacity={} mirror_probability={} train(value={},policy={},short={}) checkpoint_interval={} max_checkpoints={} arena_interval={} arena_sims={} arena(cpuct={}/{},policy_temp={}) arena_best_publish(rate={},z={}) arena_processes={} arena_opening_book={} arena_opening_positions={} arena_random_positions={} arena_random_plies={}-{} pikafish_label_eval(sqlite={},interval={},limit={},sims={},cpuct={}/{},policy_temp={}) tb_base={} tb_run={}",
+                "train: config={} update={} sims={} batch={} optimizer=SGD+Nesterov lr={} max_plies={} book={} tensorboard={}",
                 config_path,
-                config.hidden_size,
+                start_update,
                 config.simulations,
-                config.replay_recent_sample_fraction,
-                config.replay_recent_games,
-                config.selfplay_samples_per_update,
-                effective_train_to_selfplay_ratio,
-                config.lr,
-                config.lr_min,
-                config.lr_decay_start_update,
-                config.lr_decay_interval,
-                config.lr_decay_factor,
                 config.batch_size,
-                config.train_warmup_samples,
-                config.train_samples_per_update,
-                config.train_epochs_per_update,
+                config.lr,
                 config.max_plies,
-                config.sixty_move_rule,
-                config.rule60_max_ply,
-                config.workers,
-                config.temperature_start,
-                config.temperature_endgame,
-                config.temperature_decay_delay_plies,
-                config.temperature_decay_plies,
-                config.cpuct,
-                config.cpuct_at_root,
-                config.fpu_value,
-                config.fpu_value_at_root,
-                config.policy_softmax_temp,
-                config.root_dirichlet_alpha,
-                config.root_exploration_fraction,
-                config.replay_capacity,
-                config.mirror_probability,
-                config.train_value_weight,
-                config.train_policy_weight,
-                chineseai::az::SHORT_VALUE_LOSS_WEIGHT,
-                config.checkpoint_interval,
-                config.max_checkpoints,
-                config.arena_interval,
-                config.arena_simulations,
-                config.arena_cpuct,
-                config.arena_cpuct_at_root,
-                config.arena_policy_softmax_temp,
-                config.arena_promotion_rate,
-                config.arena_promotion_confidence_z,
-                config.arena_processes,
-                if config.arena_opening_book.trim().is_empty() {
-                    "(none)"
-                } else {
-                    config.arena_opening_book.as_str()
-                },
-                config.arena_opening_positions,
-                config.arena_random_positions,
-                config.arena_random_plies_min,
-                config.arena_random_plies_max,
-                if config.pikafish_label_eval_sqlite.trim().is_empty() {
-                    "(none)"
-                } else {
-                    config.pikafish_label_eval_sqlite.as_str()
-                },
-                config.pikafish_label_eval_interval,
-                config.pikafish_label_eval_limit,
-                config.pikafish_label_eval_simulations,
-                config.pikafish_label_eval_cpuct,
-                config.pikafish_label_eval_cpuct_at_root,
-                config.pikafish_label_eval_policy_softmax_temp,
-                config.tensorboard_logdir,
-                tensorboard_encoded_subdir(&config)
-            );
-            println!(
-                "explore  : Px0 book={} shuffled; root_noise(alpha={},fraction={}) temp_cutoff={}ply visit_offset={} root_fpu_absolute={} kld_min={} resign={}%,playthrough={:.0}%",
                 config.selfplay_opening_book,
-                config.root_dirichlet_alpha,
-                config.root_exploration_fraction,
-                config.temperature_cutoff_plies,
-                config.temperature_visit_offset,
-                config.fpu_absolute_at_root,
-                config.minimum_kldgain_per_node,
-                config.resign_percentage,
-                config.resign_playthrough * 100.0
+                tb_dir.display()
             );
             let selfplay_worker_count = config.workers.max(1);
             // 覆盖一次GPU更新期间完成的批次，同时限制旧模型样本和内存积压。
@@ -2466,10 +2237,6 @@ fn main() {
                 mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
             // 评估在主线程同步汇总时，训练结果仍可排队，避免反压训练和自对弈流水线。
             let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
-            println!(
-                "selfplay : workers={} queue={}",
-                selfplay_worker_count, selfplay_queue_capacity
-            );
             let mut arena_reference_model = initial_arena_reference_model;
             let mut champion_paths =
                 champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
@@ -2481,10 +2248,7 @@ fn main() {
                     &config.checkpoint_dir,
                     start_update.saturating_sub(1),
                 );
-                println!("champion : initialized {}", initial_champion.display());
                 champion_paths.push(initial_champion);
-            } else {
-                println!("champion : loaded history={}", champion_paths.len());
             }
             let shared_model = Arc::new(RwLock::new(SharedSelfplayModel {
                 version: start_update.saturating_sub(1) as u64,
@@ -2503,11 +2267,6 @@ fn main() {
                     )
                 }),
             ));
-            println!(
-                "selfplay : Px0 book={} positions={} mode=shuffled",
-                config.selfplay_opening_book,
-                book_openings.lock().unwrap().len()
-            );
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
             for worker_id in 0..selfplay_worker_count {
                 let selfplay_stop = stop_requested.clone();
@@ -2590,12 +2349,11 @@ fn main() {
                 if resumed_model { "resumed" } else { "random" },
                 replay_samples_at_start,
             );
+            let mut console = training_console::TrainingConsole::new(model.training_steps());
             let collector_handle = thread::spawn(move || {
                 let mut pending = PendingTrainingData::default();
                 let mut batch_index = 0usize;
                 let mut window_started = Instant::now();
-                let warmup_progress_step = (collector_warmup_missing / 10).clamp(10_000, 100_000);
-                let mut next_warmup_progress = warmup_progress_step;
                 while let Ok(batch) = selfplay_rx.recv() {
                     pending.push(batch);
                     let required_samples = if batch_index == 0 {
@@ -2603,22 +2361,6 @@ fn main() {
                     } else {
                         collector_config.selfplay_samples_per_update
                     };
-                    if batch_index == 0
-                        && collector_warmup_missing > 0
-                        && pending.selfplay.samples.len() >= next_warmup_progress
-                        && pending.selfplay.samples.len() < required_samples
-                    {
-                        println!(
-                            "warmup   : {}/{} samples ({:.1}%) elapsed={:.1}s",
-                            pending.selfplay.samples.len(),
-                            required_samples,
-                            100.0 * pending.selfplay.samples.len() as f32
-                                / required_samples.max(1) as f32,
-                            window_started.elapsed().as_secs_f32()
-                        );
-                        next_warmup_progress =
-                            next_warmup_progress.saturating_add(warmup_progress_step);
-                    }
                     if pending.selfplay.samples.len() < required_samples {
                         continue;
                     }
@@ -2635,17 +2377,35 @@ fn main() {
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
             let trainer_shared_model = Arc::clone(&shared_model);
-            let trainer_handle = thread::spawn(move || {
+            let trainer_handle = thread::spawn(move || -> io::Result<()> {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
                 let mut train_index = 0usize;
+                let mut replay_sampler = Px0ReplaySampler::partitioned(
+                    trainer_config.shuffle_size,
+                    trainer_config.seed,
+                    false,
+                );
+                let mut test_sampler = Px0ReplaySampler::partitioned(
+                    (trainer_config.shuffle_size / 10).max(1),
+                    trainer_config.seed,
+                    true,
+                );
+                let cycle_end = (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS
+                    + 1)
+                    * chineseai::az::PX0_CYCLE_STEPS;
                 let min_train_samples = trainer_config.batch_size.max(1);
                 'training: while let Ok(mut pending) = ready_rx.recv() {
                     let pending_games = pending.selfplay.games.len();
                     if let Some(pool) = trainer_pool.as_mut() {
                         pool.add_games(std::mem::take(&mut pending.selfplay.games));
                     }
-                    if trainer_stop.load(Ordering::SeqCst) {
+                    if trainer_stop.load(Ordering::SeqCst)
+                        || trainer_model.training_steps() >= cycle_end
+                        || target_update.is_some_and(|target| {
+                            trainer_start_update.saturating_add(train_index) > target
+                        })
+                    {
                         continue;
                     }
                     let Some(pool) = trainer_pool.as_mut() else {
@@ -2658,16 +2418,31 @@ fn main() {
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
                     );
-                    let sampled_batch = pool.sample_phase_stratified_recent(
-                        trainer_config.train_samples_per_update,
-                        [
-                            trainer_config.replay_phase_0_29_fraction,
-                            trainer_config.replay_phase_30_59_fraction,
-                            trainer_config.replay_phase_60_99_fraction,
-                            trainer_config.replay_phase_100_139_fraction,
-                            trainer_config.replay_phase_140_plus_fraction,
-                        ],
-                        trainer_config.replay_recent_sample_fraction,
+                    let steps_before = trainer_model.training_steps();
+                    let train_steps = trainer_config
+                        .train_samples_per_update
+                        .div_ceil(trainer_config.batch_size)
+                        .min(cycle_end - steps_before);
+                    let (training_chunks, test_chunks) = pool.partition_chunks(trainer_config.seed);
+                    if training_chunks == 0 || test_chunks == 0 {
+                        continue;
+                    }
+                    let need_test = steps_before.is_multiple_of(chineseai::az::PX0_CYCLE_STEPS)
+                        || steps_before / chineseai::az::PX0_TEST_STEPS
+                            != (steps_before + train_steps) / chineseai::az::PX0_TEST_STEPS;
+                    if need_test {
+                        // 与公开入口相同：估计每个测试chunk约10个SKIP=32后的局面。
+                        let count = (test_chunks * 10 / trainer_config.batch_size).max(1)
+                            * trainer_config.batch_size;
+                        let mut test_rng = SplitMix64::new(
+                            trainer_config.seed ^ steps_before as u64 ^ 0xE703_7ED1_A0B4_28DB,
+                        );
+                        let test_data = test_sampler.sample(pool, count, 0, &mut test_rng).samples;
+                        trainer_model.set_training_holdout(test_data, trainer_config.lr)?;
+                    }
+                    let sampled_batch = replay_sampler.sample(
+                        pool,
+                        train_steps * trainer_config.batch_size,
                         trainer_config.replay_recent_games,
                         &mut rng,
                     );
@@ -2676,19 +2451,14 @@ fn main() {
                         continue;
                     }
                     let train_data_len = train_data.len();
-                    let train_source_stats = train_batch_source_stats(
-                        &train_data,
-                        trainer_config.simulations,
-                        sampled_batch.recent_samples,
-                        sampled_batch.actual_recent_samples,
-                    );
+                    let target_entropy = policy_target_entropy(&train_data);
                     let train_update = trainer_start_update.saturating_add(train_index);
-                    let current_lr = learning_rate_for_update(&trainer_config, train_update);
+                    let current_lr = trainer_config.lr;
                     let train_started = Instant::now();
                     let stats = train_samples_weighted_owned(
                         &mut trainer_model,
                         train_data,
-                        trainer_config.train_epochs_per_update,
+                        1,
                         current_lr,
                         trainer_config.batch_size,
                         &mut rng,
@@ -2700,7 +2470,28 @@ fn main() {
                     )
                     .unwrap_or_else(|err| panic!("training update {} failed: {err}", train_update));
                     let train_seconds = train_started.elapsed().as_secs_f32();
-                    let report = build_async_training_report(
+                    let current_lr = trainer_model
+                        .last_training_learning_rate()
+                        .unwrap_or(current_lr);
+                    if trainer_config.checkpoint_interval > 0
+                        && train_update.is_multiple_of(trainer_config.checkpoint_interval)
+                    {
+                        let path = save_checkpoint_model(
+                            &trainer_model,
+                            &trainer_config.model_path,
+                            &trainer_config.checkpoint_dir,
+                            train_update,
+                        );
+                        trainer_model
+                            .save_training_state(
+                                optimizer_checkpoint_path(&path),
+                                train_update.saturating_add(1),
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!("failed to save checkpoint SGD state: {err}")
+                            });
+                    }
+                    let mut report = build_async_training_report(
                         pending,
                         pending_games,
                         stats,
@@ -2710,16 +2501,18 @@ fn main() {
                         pool.sample_count(),
                         pool.capacity(),
                         pool.window_stats(trainer_config.replay_recent_games),
-                        train_source_stats,
+                        target_entropy,
                     );
+                    report.training_steps = trainer_model.training_steps();
+                    report.training_chunks = training_chunks;
+                    report.test_chunks = test_chunks;
+                    report.holdout_checks = trainer_model.take_training_checks();
+                    report.cycle_complete = report.training_steps == cycle_end;
                     let candidate_model = trainer_model.clone();
-                    let actor_version = publish_selfplay_model(
+                    publish_selfplay_model(
                         &trainer_shared_model,
                         Arc::new(candidate_model.clone()),
                         train_update,
-                    );
-                    println!(
-                        "actor    : published learner update {train_update} as generation {actor_version}"
                     );
                     if trainer_tx
                         .send(TrainerEvent {
@@ -2732,26 +2525,22 @@ fn main() {
                     }
                     train_index += 1;
                 }
+                if train_index > 0 {
+                    trainer_model.save_training_state(
+                        &optimizer_state_path,
+                        trainer_start_update.saturating_add(train_index),
+                    )?;
+                }
                 if let Some(pool) = trainer_pool.as_mut()
                     && trainer_stop.load(Ordering::SeqCst)
                 {
-                    match pool.save_snapshot_lz4(&trainer_snapshot_path) {
-                        Ok(()) => {
-                            if pool.sample_count() > 0 {
-                                println!(
-                                    "replay   : shutdown snapshot `{}` ({}/{} samples)",
-                                    trainer_snapshot_path.display(),
-                                    pool.sample_count(),
-                                    pool.capacity()
-                                );
-                            }
-                        }
-                        Err(err) => eprintln!("replay   : failed to write snapshot: {err}"),
-                    }
+                    pool.save_snapshot_lz4(&trainer_snapshot_path)?;
                 }
+                Ok(())
             });
             let mut exited_after_ctrl_c = false;
             let mut exited_after_target_update = false;
+            let mut exited_after_cycle = false;
             let mut update = start_update;
             let mut interrupt_save_model: Option<AzNnue> = None;
             let mut interrupt_save_next_update = start_update;
@@ -2760,7 +2549,6 @@ fn main() {
                     exited_after_ctrl_c = true;
                     break;
                 }
-                let started = Instant::now();
                 let (report, candidate_model) = loop {
                     match trainer_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(TrainerEvent {
@@ -2924,12 +2712,7 @@ fn main() {
                 let checkpoint_saved = if config.checkpoint_interval > 0
                     && update.is_multiple_of(config.checkpoint_interval)
                 {
-                    let path = save_checkpoint_model(
-                        &candidate_model,
-                        &config.model_path,
-                        &config.checkpoint_dir,
-                        update,
-                    );
+                    let path = checkpoint_path(&config.model_path, &config.checkpoint_dir, update);
                     prune_old_checkpoints(
                         &config.model_path,
                         &config.checkpoint_dir,
@@ -2946,747 +2729,123 @@ fn main() {
                     None
                 };
                 let value_rmse = report.value_mse.max(0.0).sqrt();
-                println!(
-                    "update {update:04}: games={}(total={}) samples={}(total={}) train_samples={} pool={}/{} fill={:.0}% replay(chunks={} actor_updates={}-{} actor_update_span={} span_games={} recent_pool={:.3}) train_src(recent={:.3} start/opening/mid={:.3}/{:.3}/{:.3} fast={:.3} pw={:.3} vw={:.3}) R/B/D={}/{}/{} red_win_all={:.3} avg_plies={:.1} avg_sims={:.1} opt_loss={:.4} wdl_ce={:.4} trainQ_rmse={:.4} trainQ_mu={:.3}/{:.3} trainQ_rms={:.3}/{:.3} trainQ_corr={:.3} trainQ_cal={:.3} trainPhaseQ(p0_39={}/{:.3}/{:.3}/{:.3} p40_119={}/{:.3}/{:.3}/{:.3} p120plus={}/{:.3}/{:.3}/{:.3}) policy_kl={:.4} trainTargetH={:.4} lr={:.6} visitH={:.3} visitH_p0_89={:.3} visitH_p90plus={:.3} rawP={:.3}/{:.3} visitP={:.3}/{:.3} trainTargetP={:.3}/{:.3} topQgap={:.3} topQabs={:.3} visitA={:.1} sampTopQ={:.3} playQGap={:.3} visitRatio={:.3} maxQ={:.3} playedQ={:.3} train={:.1}s gps={:.2} sps={:.1} train_sps={:.1} elapsed={:.1}s{}",
-                    report.games,
-                    generated_games_total,
-                    report.samples,
-                    generated_samples_total,
-                    report.train_samples,
-                    report.pool_samples,
-                    report.pool_capacity,
-                    if report.pool_capacity == 0 {
-                        0.0
-                    } else {
-                        100.0 * report.pool_samples as f32 / report.pool_capacity as f32
-                    },
-                    report.replay_chunks,
-                    report.replay_oldest_update,
-                    report.replay_newest_update,
-                    report
-                        .replay_newest_update
-                        .saturating_sub(report.replay_oldest_update),
-                    report.replay_window_games,
-                    report.replay_recent_window_fraction,
-                    report.train_actual_recent_sample_rate,
-                    report.train_start_source_rate[0],
-                    report.train_start_source_rate[1],
-                    report.train_start_source_rate[2],
-                    report.train_fast_sample_rate,
-                    report.train_policy_weight_mean,
-                    report.train_value_weight_mean,
-                    report.red_wins,
-                    report.black_wins,
-                    report.draws,
-                    report.red_wins as f32 / report.games.max(1) as f32,
-                    report.avg_plies,
-                    report.avg_search_simulations,
-                    report.loss,
-                    report.value_loss,
-                    value_rmse,
-                    report.value_pred_mean,
-                    report.value_target_mean,
-                    report.value_pred_rms,
-                    report.value_target_rms,
-                    report.value_corr,
-                    report.value_calibration,
-                    report.phase_value[0].samples,
-                    report.phase_value[0].rmse,
-                    report.phase_value[0].corr,
-                    report.phase_value[0].calibration,
-                    report.phase_value[1].samples,
-                    report.phase_value[1].rmse,
-                    report.phase_value[1].corr,
-                    report.phase_value[1].calibration,
-                    report.phase_value[2].samples,
-                    report.phase_value[2].rmse,
-                    report.phase_value[2].corr,
-                    report.phase_value[2].calibration,
-                    report.policy_kl,
-                    report.policy_target_entropy,
-                    report.learning_rate,
-                    report.root_visit_entropy,
-                    report.entropy_opening,
-                    report.entropy_mid,
-                    report.raw_prior_top1,
-                    report.raw_prior_top2,
-                    report.policy_top1,
-                    report.policy_top2,
-                    report.train_policy_target_top1,
-                    report.train_policy_target_top2,
-                    report.root_q_gap,
-                    report.root_q_top1_abs,
-                    report.visited_actions,
-                    report.sampled_best_rate,
-                    report.avg_best_played_q_gap,
-                    report.avg_played_top_visit_ratio,
-                    report.avg_best_q,
-                    report.avg_played_q,
-                    report.train_seconds,
-                    report.games_per_second,
-                    report.samples_per_second,
-                    report.train_samples_per_second,
-                    started.elapsed().as_secs_f32(),
-                    checkpoint_saved
-                        .as_ref()
-                        .map_or_else(String::new, |path| format!(
-                            " checkpoint={}",
-                            path.display()
-                        ))
-                );
-                println!(
-                    "starts   {update:04}: rate(start/opening/mid)={:.3}/{:.3}/{:.3} phase={:.1}/{:.1}/{:.1} age_mean={:.1}/{:.1}/{:.1} age_max={}/{}/{} temp={:.3}/{:.3}/{:.3}",
-                    report.selfplay_start_source_rate[0],
-                    report.selfplay_start_source_rate[1],
-                    report.selfplay_start_source_rate[2],
-                    report.selfplay_start_phase_ply[0],
-                    report.selfplay_start_phase_ply[1],
-                    report.selfplay_start_phase_ply[2],
-                    report.selfplay_start_age[0],
-                    report.selfplay_start_age[1],
-                    report.selfplay_start_age[2],
-                    report.selfplay_start_age_max[0],
-                    report.selfplay_start_age_max[1],
-                    report.selfplay_start_age_max[2],
-                    report.selfplay_start_temperature[0],
-                    report.selfplay_start_temperature[1],
-                    report.selfplay_start_temperature[2],
-                );
                 let truncated = report.terminal_max_plies + report.terminal_search_no_move;
                 let completed = report.games.saturating_sub(truncated);
-                println!(
-                    "outcomes {update:04}: completed={} draw_rate={:.3} cutoff={} search_failed={} unknown_rate={:.3}",
-                    completed,
-                    report.draws.saturating_sub(truncated) as f32 / completed.max(1) as f32,
-                    report.terminal_max_plies,
-                    report.terminal_search_no_move,
-                    truncated as f32 / report.games.max(1) as f32,
+                let true_draws = report.draws.saturating_sub(truncated);
+                console.update(
+                    update,
+                    &report,
+                    generated_games_total,
+                    true_draws,
+                    checkpoint_saved.is_some(),
                 );
-                let sparse = report.train_sparse_activation;
-                let adjudication = report.adjudication;
-                println!(
-                    "adjudicate {update:04}: stopped(R/D/B)={}/{}/{} proven={} samples={} playthrough_checked_unproven={} incorrect={} unresolved={} matrix={:?}",
-                    adjudication.stopped[0],
-                    adjudication.stopped[1],
-                    adjudication.stopped[2],
-                    adjudication.stopped_proven.iter().sum::<usize>(),
-                    adjudication.stopped_samples,
-                    adjudication.checked(),
-                    adjudication.incorrect(),
-                    adjudication.unresolved.iter().sum::<usize>(),
-                    adjudication.verified,
-                );
-                for (tag, count) in [
+                for check in &report.holdout_checks {
+                    console.test(check);
+                    for (tag, value) in [
+                        ("test/loss", check.loss),
+                        ("test/policy_kl", check.policy_kl),
+                        ("test/samples", check.samples as f32),
+                        ("test/value_samples", check.value_samples as f32),
+                    ] {
+                        log_scalar(&mut tb, tag, check.step, value);
+                    }
+                    if check.value_samples > 0 {
+                        log_scalar(&mut tb, "test/wdl_ce", check.step, check.value_loss);
+                        log_scalar(&mut tb, "test/value_rmse", check.step, check.value_rmse);
+                    }
+                }
+                for (tag, value) in [
+                    ("train/optimized_loss", report.loss),
+                    ("train/wdl_ce", report.value_loss),
+                    ("train/policy_kl", report.policy_kl),
+                    ("train/value_rmse", value_rmse),
+                    ("train/value_corr", report.value_corr),
+                    ("train/value_calibration", report.value_calibration),
+                    ("train/learning_rate", report.learning_rate),
+                    ("train/samples", report.train_samples as f32),
                     (
-                        "adjudication/stopped_proven",
-                        adjudication.stopped_proven.iter().sum::<usize>(),
+                        "train/value_samples",
+                        report
+                            .phase_value
+                            .iter()
+                            .map(|phase| phase.samples)
+                            .sum::<usize>() as f32,
+                    ),
+                    ("train/seconds", report.train_seconds),
+                    ("replay/samples", report.pool_samples as f32),
+                    ("selfplay/games_total", generated_games_total as f32),
+                    ("selfplay/samples_total", generated_samples_total as f32),
+                    (
+                        "selfplay/avg_search_simulations",
+                        report.avg_search_simulations,
+                    ),
+                    ("selfplay/avg_plies", report.avg_plies),
+                    ("selfplay/completed_games", completed as f32),
+                    ("selfplay/visit_policy_entropy", report.root_visit_entropy),
+                    (
+                        "truncation/rate",
+                        truncated as f32 / report.games.max(1) as f32,
+                    ),
+                    ("truncation/max_plies", report.terminal_max_plies as f32),
+                    (
+                        "truncation/search_no_move",
+                        report.terminal_search_no_move as f32,
+                    ),
+                    ("terminal/checkmate", report.terminal_checkmate as f32),
+                    ("terminal/stalemate", report.terminal_stalemate as f32),
+                    ("terminal/rule_blocked", report.terminal_rule_blocked as f32),
+                    (
+                        "terminal/red_general_missing",
+                        report.terminal_red_general_missing as f32,
                     ),
                     (
-                        "adjudication/stopped",
-                        adjudication.stopped.iter().sum::<usize>(),
+                        "terminal/black_general_missing",
+                        report.terminal_black_general_missing as f32,
                     ),
-                    ("adjudication/stopped_samples", adjudication.stopped_samples),
-                    ("adjudication/playthrough_checked", adjudication.checked()),
+                    ("terminal/rule_draw", report.terminal_rule_draw as f32),
                     (
-                        "adjudication/playthrough_incorrect",
-                        adjudication.incorrect(),
+                        "terminal/draw_natural_limit",
+                        report.terminal_rule_draw_natural_limit as f32,
                     ),
                     (
-                        "adjudication/playthrough_unresolved",
-                        adjudication.unresolved.iter().sum::<usize>(),
+                        "terminal/draw_insufficient_material",
+                        report.terminal_rule_draw_insufficient_material as f32,
+                    ),
+                    (
+                        "terminal/draw_repetition",
+                        report.terminal_rule_draw_repetition as f32,
+                    ),
+                    (
+                        "terminal/draw_mutual_long_check",
+                        report.terminal_rule_draw_mutual_long_check as f32,
+                    ),
+                    (
+                        "terminal/draw_mutual_long_chase",
+                        report.terminal_rule_draw_mutual_long_chase as f32,
+                    ),
+                    ("terminal/rule_win_red", report.terminal_rule_win_red as f32),
+                    (
+                        "terminal/rule_win_black",
+                        report.terminal_rule_win_black as f32,
+                    ),
+                    (
+                        "terminal/search_proven",
+                        report.terminal_search_proven.iter().sum::<usize>() as f32,
                     ),
                 ] {
-                    log_scalar(&mut tb, tag, update, count as f32);
+                    log_scalar(&mut tb, tag, report.training_steps, value);
                 }
-                println!(
-                    "sparse   {update:04}: subset={}/{} moves={} coverage(value/exact/factor/tactical)={:.6}/{:.6}/{:.6}/{:.6} unique={}/{}/{}/{}",
-                    sparse.inspected_samples,
-                    report.train_samples,
-                    sparse.inspected_policy_moves,
-                    sparse.value_threat_coverage,
-                    sparse.policy_exact_coverage,
-                    sparse.policy_factor_coverage,
-                    sparse.policy_tactical_coverage,
-                    sparse.value_threat_unique,
-                    sparse.policy_exact_unique,
-                    sparse.policy_factor_unique,
-                    sparse.policy_tactical_unique,
-                );
-                let source_phase =
-                    |source: usize, phase: usize| report.source_phase_value[source * 3 + phase];
-                println!(
-                    "valueSrc {update:04}: startpos(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3}) opening_book(p0={}/{:.3}/{:.3}/{:.3}) midgame(p0={}/{:.3}/{:.3}/{:.3} p40={}/{:.3}/{:.3}/{:.3})",
-                    source_phase(0, 0).samples,
-                    source_phase(0, 0).rmse,
-                    source_phase(0, 0).corr,
-                    source_phase(0, 0).calibration,
-                    source_phase(0, 1).samples,
-                    source_phase(0, 1).rmse,
-                    source_phase(0, 1).corr,
-                    source_phase(0, 1).calibration,
-                    source_phase(1, 0).samples,
-                    source_phase(1, 0).rmse,
-                    source_phase(1, 0).corr,
-                    source_phase(1, 0).calibration,
-                    source_phase(2, 0).samples,
-                    source_phase(2, 0).rmse,
-                    source_phase(2, 0).corr,
-                    source_phase(2, 0).calibration,
-                    source_phase(2, 1).samples,
-                    source_phase(2, 1).rmse,
-                    source_phase(2, 1).corr,
-                    source_phase(2, 1).calibration,
-                );
-                log_scalar(&mut tb, "train/optimized_loss", update, report.loss);
-                if report.phase_value.iter().map(|p| p.samples).sum::<usize>() > 0 {
-                    log_scalar(&mut tb, "train/wdl_ce", update, report.value_loss);
-                    log_scalar(&mut tb, "train/value_rmse", update, value_rmse);
-                    log_scalar(
-                        &mut tb,
-                        "train/value_pred_mean",
-                        update,
-                        report.value_pred_mean,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        "train/value_target_mean",
-                        update,
-                        report.value_target_mean,
-                    );
-                    log_scalar(&mut tb, "train/value_corr", update, report.value_corr);
-                    log_scalar(
-                        &mut tb,
-                        "train/value_calibration",
-                        update,
-                        report.value_calibration,
-                    );
-                }
-                for (phase, name) in ["ply_0_39", "ply_40_119", "ply_120_plus"]
-                    .into_iter()
-                    .enumerate()
-                {
-                    let phase_value = report.phase_value[phase];
-                    if phase_value.samples == 0 {
-                        continue;
-                    }
-                    log_scalar(
-                        &mut tb,
-                        &format!("train/value_{name}_samples"),
-                        update,
-                        phase_value.samples as f32,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("train/value_{name}_rmse"),
-                        update,
-                        phase_value.rmse,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("train/value_{name}_corr"),
-                        update,
-                        phase_value.corr,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("train/value_{name}_calibration"),
-                        update,
-                        phase_value.calibration,
-                    );
-                }
-                for (source, source_name) in ["startpos", "opening_book", "midgame"]
-                    .into_iter()
-                    .enumerate()
-                {
-                    for (phase, phase_name) in ["ply_0_39", "ply_40_119", "ply_120_plus"]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let value = report.source_phase_value[source * 3 + phase];
-                        if value.samples == 0 {
-                            continue;
-                        }
-                        log_scalar(
-                            &mut tb,
-                            &format!("value_source/{source_name}_{phase_name}_rmse"),
-                            update,
-                            value.rmse,
-                        );
-                        log_scalar(
-                            &mut tb,
-                            &format!("value_source/{source_name}_{phase_name}_corr"),
-                            update,
-                            value.corr,
-                        );
-                    }
-                }
-                log_scalar(&mut tb, "train/policy_ce", update, report.policy_ce);
-                for (head, horizon) in chineseai::az::SHORT_VALUE_HORIZONS.into_iter().enumerate() {
-                    let value = report.short_value[head];
-                    log_scalar(
-                        &mut tb,
-                        &format!("train/short_value_{horizon}_samples"),
-                        update,
-                        value.samples as f32,
-                    );
-                    if value.samples > 0 {
-                        log_scalar(
-                            &mut tb,
-                            &format!("train/short_value_{horizon}_ce"),
-                            update,
-                            report.short_value_ce[head],
-                        );
-                        log_scalar(
-                            &mut tb,
-                            &format!("train/short_value_{horizon}_rmse"),
-                            update,
-                            value.rmse,
-                        );
-                        log_scalar(
-                            &mut tb,
-                            &format!("train/short_value_{horizon}_corr"),
-                            update,
-                            value.corr,
-                        );
-                    }
-                }
-                log_scalar(&mut tb, "train/policy_kl", update, report.policy_kl);
-                log_scalar(
-                    &mut tb,
-                    "train/policy_target_entropy",
-                    update,
-                    report.policy_target_entropy,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/policy_target_top1",
-                    update,
-                    report.train_policy_target_top1,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/policy_target_top2",
-                    update,
-                    report.train_policy_target_top2,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/repetition_opportunity_rate",
-                    update,
-                    report.train_repetition_opportunity_rate,
-                );
-                if report.train_repetition_opportunity_rate > 0.0 {
-                    log_scalar(
-                        &mut tb,
-                        "train/repetition_target_mass",
-                        update,
-                        report.train_repetition_target_mass,
-                    );
-                }
-                for (name, value) in [
-                    ("value_threat_coverage", sparse.value_threat_coverage),
-                    ("policy_exact_coverage", sparse.policy_exact_coverage),
-                    ("policy_factor_coverage", sparse.policy_factor_coverage),
-                    ("policy_tactical_coverage", sparse.policy_tactical_coverage),
-                    ("value_threat_unique", sparse.value_threat_unique as f32),
-                    ("policy_exact_unique", sparse.policy_exact_unique as f32),
-                    ("policy_factor_unique", sparse.policy_factor_unique as f32),
-                    (
-                        "policy_tactical_unique",
-                        sparse.policy_tactical_unique as f32,
-                    ),
-                    ("inspected_samples", sparse.inspected_samples as f32),
-                    (
-                        "inspected_policy_moves",
-                        sparse.inspected_policy_moves as f32,
-                    ),
-                ] {
-                    log_scalar(&mut tb, &format!("train_sparse/{name}"), update, value);
-                }
-                log_scalar(&mut tb, "train/lr", update, report.learning_rate);
-                log_scalar(
-                    &mut tb,
-                    "pool/fill_ratio",
-                    update,
-                    if report.pool_capacity == 0 {
-                        0.0
-                    } else {
-                        report.pool_samples as f32 / report.pool_capacity as f32
-                    },
-                );
-                log_scalar(&mut tb, "selfplay/games", update, report.games as f32);
-                log_scalar(&mut tb, "selfplay/samples", update, report.samples as f32);
-                log_scalar(
-                    &mut tb,
-                    "selfplay/games_total",
-                    update,
-                    generated_games_total as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/samples_total",
-                    update,
-                    generated_samples_total as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/avg_search_simulations",
-                    update,
-                    report.avg_search_simulations,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/train_to_selfplay_ratio",
-                    update,
-                    (config.train_samples_per_update as f32
-                        * config.train_epochs_per_update as f32)
-                        / config.selfplay_samples_per_update.max(1) as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/fast_sample_rate",
-                    update,
-                    report.train_fast_sample_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/recent_quota_rate",
-                    update,
-                    report.train_recent_quota_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/actual_recent_sample_rate",
-                    update,
-                    report.train_actual_recent_sample_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/policy_weight_mean",
-                    update,
-                    report.train_policy_weight_mean,
-                );
-                log_scalar(
-                    &mut tb,
-                    "train/value_weight_mean",
-                    update,
-                    report.train_value_weight_mean,
-                );
-                log_scalar(
-                    &mut tb,
-                    "replay/chunks",
-                    update,
-                    report.replay_chunks as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "replay/oldest_generation_game",
-                    update,
-                    report.replay_oldest_update as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "replay/newest_generation_game",
-                    update,
-                    report.replay_newest_update as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "replay/avg_generation_game",
-                    update,
-                    report.replay_avg_update,
-                );
-                log_scalar(
-                    &mut tb,
-                    "replay/window_games",
-                    update,
-                    report.replay_window_games as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "replay/recent_window_fraction",
-                    update,
-                    report.replay_recent_window_fraction,
-                );
-                log_scalar(&mut tb, "selfplay/avg_plies", update, report.avg_plies);
-                for (source, source_name) in ["startpos", "opening_book", "midgame"]
-                    .into_iter()
-                    .enumerate()
-                {
-                    log_scalar(
-                        &mut tb,
-                        &format!("selfplay_start/{source_name}_rate"),
-                        update,
-                        report.selfplay_start_source_rate[source],
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("selfplay_start/{source_name}_phase_ply"),
-                        update,
-                        report.selfplay_start_phase_ply[source],
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("selfplay_start/{source_name}_age_mean"),
-                        update,
-                        report.selfplay_start_age[source],
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("selfplay_start/{source_name}_age_max"),
-                        update,
-                        report.selfplay_start_age_max[source] as f32,
-                    );
-                    log_scalar(
-                        &mut tb,
-                        &format!("selfplay_start/{source_name}_temperature"),
-                        update,
-                        report.selfplay_start_temperature[source],
-                    );
-                }
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_entropy",
-                    update,
-                    report.root_visit_entropy,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_entropy_ply_0_89",
-                    update,
-                    report.entropy_opening,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_entropy_ply_90_plus",
-                    update,
-                    report.entropy_mid,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/raw_prior_top1",
-                    update,
-                    report.raw_prior_top1,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/raw_prior_top2",
-                    update,
-                    report.raw_prior_top2,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_top1",
-                    update,
-                    report.policy_top1,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_top2",
-                    update,
-                    report.policy_top2,
-                );
-                log_scalar(&mut tb, "stats/top_q_gap", update, report.root_q_gap);
-                log_scalar(
-                    &mut tb,
-                    "stats/max_child_q_abs",
-                    update,
-                    report.root_q_top1_abs,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/visited_actions",
-                    update,
-                    report.visited_actions,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/raw_prior_top1_ply_0_89",
-                    update,
-                    report.opening_raw_prior_top1,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/raw_prior_top2_ply_0_89",
-                    update,
-                    report.opening_raw_prior_top2,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_top1_ply_0_89",
-                    update,
-                    report.opening_policy_top1,
-                );
-                log_scalar(
-                    &mut tb,
-                    "selfplay/visit_policy_top2_ply_0_89",
-                    update,
-                    report.opening_policy_top2,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/top_q_gap_ply_0_89",
-                    update,
-                    report.opening_q_gap,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/max_child_q_abs_ply_0_89",
-                    update,
-                    report.opening_q_top1_abs,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/visited_actions_ply_0_89",
-                    update,
-                    report.opening_visited_actions,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/sampled_top_q_rate",
-                    update,
-                    report.sampled_best_rate,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/avg_best_played_q_gap",
-                    update,
-                    report.avg_best_played_q_gap,
-                );
-                log_scalar(
-                    &mut tb,
-                    "stats/avg_played_top_visit_ratio",
-                    update,
-                    report.avg_played_top_visit_ratio,
-                );
-                log_scalar(&mut tb, "stats/avg_max_child_q", update, report.avg_best_q);
-                log_scalar(&mut tb, "stats/avg_played_q", update, report.avg_played_q);
-                // 未知结果不训练value，也不计入已完成对局的和棋率。
-                log_scalar(
-                    &mut tb,
-                    "selfplay/completed_games",
-                    update,
-                    completed as f32,
-                );
                 if completed > 0 {
                     log_scalar(
                         &mut tb,
                         "selfplay/draw_rate_completed",
                         update,
-                        report.draws.saturating_sub(truncated) as f32 / completed as f32,
+                        true_draws as f32 / completed as f32,
                     );
                 }
-                if report.games > 0 {
-                    log_scalar(
-                        &mut tb,
-                        "truncation/rate",
-                        update,
-                        truncated as f32 / report.games as f32,
-                    );
-                }
-                log_scalar(
-                    &mut tb,
-                    "train/value_samples",
-                    update,
-                    report
-                        .phase_value
-                        .iter()
-                        .map(|phase| phase.samples)
-                        .sum::<usize>() as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/stalemate",
-                    update,
-                    report.terminal_stalemate as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_blocked",
-                    update,
-                    report.terminal_rule_blocked as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "truncation/search_no_move",
-                    update,
-                    report.terminal_search_no_move as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/checkmate",
-                    update,
-                    report.terminal_checkmate as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/red_general_missing",
-                    update,
-                    report.terminal_red_general_missing as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/black_general_missing",
-                    update,
-                    report.terminal_black_general_missing as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_draw",
-                    update,
-                    report.terminal_rule_draw as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/draw_natural_limit",
-                    update,
-                    report.terminal_rule_draw_natural_limit as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/draw_insufficient_material",
-                    update,
-                    report.terminal_rule_draw_insufficient_material as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/draw_repetition",
-                    update,
-                    report.terminal_rule_draw_repetition as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/draw_mutual_long_check",
-                    update,
-                    report.terminal_rule_draw_mutual_long_check as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/draw_mutual_long_chase",
-                    update,
-                    report.terminal_rule_draw_mutual_long_chase as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_win_red",
-                    update,
-                    report.terminal_rule_win_red as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "terminal/rule_win_black",
-                    update,
-                    report.terminal_rule_win_black as f32,
-                );
-                log_scalar(
-                    &mut tb,
-                    "truncation/max_plies",
-                    update,
-                    report.terminal_max_plies as f32,
-                );
                 if config.arena_interval > 0 && update.is_multiple_of(config.arena_interval) {
                     {
-                        let (mut arena_start_positions, arena_mode) =
+                        let (mut arena_start_positions, _arena_mode) =
                             build_arena_start_positions(&config, update);
                         shuffle_positions(
                             &mut arena_start_positions,
@@ -3789,17 +2948,7 @@ fn main() {
                                 < 0.50
                             {
                                 arena_nemesis_update = checkpoint_number(&champion_paths[index]);
-                                println!(
-                                    "nemesis  : set {} rate={:.3}",
-                                    checkpoint_label(&champion_paths[index]),
-                                    report.score_rate()
-                                );
                             } else if promoted && nemesis_index == Some(index) {
-                                println!(
-                                    "nemesis  : cleared {} rate={:.3}",
-                                    checkpoint_label(&champion_paths[index]),
-                                    report.score_rate()
-                                );
                                 arena_nemesis_update = None;
                             }
                         }
@@ -3813,61 +2962,27 @@ fn main() {
                             );
                             save_model(&deployed_model, &best_path);
                             champion_paths.push(best_checkpoint.clone());
-                            println!("best     : saved {}", best_checkpoint.display());
                         }
-                        println!(
-                            "arena {update:04}: mode={} positions={} current_games={} pairs={} current_W/L/D={}/{}/{} current_rate={:.3} paired_se={:.4} ci={:.3}..{:.3} promote_at={:.3} z={:.2} decision={:?} elo_diff={:+.1} elo_ci={:+.1}..{:+.1} best_ref=memory{}",
-                            arena_mode,
-                            arena_position_count,
+
+                        console.arena(format!(
+                            "arena {update:04}: games={} W/L/D={}/{}/{} score={:.3} ci={:.3}..{:.3} previous={} anchor={} decision={:?}",
                             current_arena.total_games(),
-                            current_arena.paired_openings,
                             current_arena.wins,
                             current_arena.losses,
                             current_arena.draws,
                             current_arena.score_rate(),
-                            current_arena.score_rate_standard_error(),
                             current_arena
                                 .score_rate_lower_bound(config.arena_promotion_confidence_z),
                             current_arena
                                 .score_rate_upper_bound(config.arena_promotion_confidence_z),
-                            config.arena_promotion_rate,
-                            config.arena_promotion_confidence_z,
-                            gate_decision,
-                            elo_diff,
-                            elo_lower,
-                            elo_upper,
-                            if promoted {
-                                " promoted=current saved_best"
-                            } else {
-                                ""
-                            }
-                        );
-                        if let (Some(index), Some(report)) =
-                            (previous_index, previous_arena.as_ref())
-                        {
-                            println!(
-                                "arena {update:04}: previous={} games={} W/L/D={}/{}/{} rate={:.3} ucb={:.3}",
-                                checkpoint_label(&champion_paths[index]),
-                                report.total_games(),
-                                report.wins,
-                                report.losses,
-                                report.draws,
-                                report.score_rate(),
-                                report.score_rate_upper_bound(config.arena_promotion_confidence_z)
-                            );
-                        }
-                        if let (Some(index), Some(report)) = (anchor_index, anchor_arena.as_ref()) {
-                            println!(
-                                "arena {update:04}: anchor={} games={} W/L/D={}/{}/{} rate={:.3} ucb={:.3}",
-                                checkpoint_label(&champion_paths[index]),
-                                report.total_games(),
-                                report.wins,
-                                report.losses,
-                                report.draws,
-                                report.score_rate(),
-                                report.score_rate_upper_bound(config.arena_promotion_confidence_z)
-                            );
-                        }
+                            previous_arena
+                                .as_ref()
+                                .map_or_else(|| "-".into(), |r| format!("{:.3}", r.score_rate())),
+                            anchor_arena
+                                .as_ref()
+                                .map_or_else(|| "-".into(), |r| format!("{:.3}", r.score_rate())),
+                            gate_decision
+                        ));
                         let mut historical_arena = AzArenaReport::default();
                         if let Some(report) = previous_arena.as_ref() {
                             historical_arena.add_assign(report);
@@ -3876,13 +2991,6 @@ fn main() {
                             historical_arena.add_assign(report);
                         }
                         if historical_arena.total_games() > 0 {
-                            println!(
-                                "arena {update:04}: history_games={} history_rate={:.3} history_ucb={:.3}",
-                                historical_arena.total_games(),
-                                historical_arena.score_rate(),
-                                historical_arena
-                                    .score_rate_upper_bound(config.arena_promotion_confidence_z)
-                            );
                             log_scalar(
                                 &mut tb,
                                 "arena/history_score_rate",
@@ -3992,7 +3100,7 @@ fn main() {
                         })();
                         match eval_result {
                             Ok(stats) => {
-                                println!(
+                                console.event(format!(
                                     "pikafish-label {update:04}: sqlite={} evaluated={} legal={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae={:.4} search_value_corr={:.4} search_value_mae={:.4} elapsed={:.1}s",
                                     config.pikafish_label_eval_sqlite,
                                     stats.count,
@@ -4010,7 +3118,7 @@ fn main() {
                                     stats.value_corr(),
                                     stats.value_mae_wdl_q(),
                                     started.elapsed().as_secs_f32()
-                                );
+                                ));
                                 log_scalar(
                                     &mut tb,
                                     "pikafish_label/evaluated_positions",
@@ -4079,10 +3187,10 @@ fn main() {
                                 );
                             }
                             Err(err) => {
-                                eprintln!(
+                                console.event(format!(
                                     "pikafish-label {update:04}: failed sqlite={}: {err}",
                                     config.pikafish_label_eval_sqlite
-                                );
+                                ));
                             }
                         }
                     } else {
@@ -4093,15 +3201,19 @@ fn main() {
                                 .unwrap_or_else(|_| PathBuf::from("."))
                                 .join(sqlite_path)
                         };
-                        println!(
+                        console.event(format!(
                             "pikafish-label {update:04}: skipped missing sqlite={} resolved={} (copy the label DB or update pikafish_label_eval_sqlite)",
                             config.pikafish_label_eval_sqlite,
                             resolved.display()
-                        );
+                        ));
                     }
                 }
                 tb.flush();
                 update = update.saturating_add(1);
+                if report.cycle_complete {
+                    exited_after_cycle = true;
+                    break;
+                }
                 if let Some(target_update) = target_update
                     && update > target_update
                 {
@@ -4109,6 +3221,7 @@ fn main() {
                     break;
                 }
             }
+            console.finish();
             stop_requested.store(true, Ordering::SeqCst);
             // 等待线程前持续排空结果队列，避免满队列让训练及产数线程相互等待。
             for event in trainer_rx {
@@ -4132,8 +3245,9 @@ fn main() {
                 .unwrap_or_else(|_| panic!("selfplay collector thread panicked"));
             trainer_handle
                 .join()
-                .unwrap_or_else(|_| panic!("training thread panicked"));
-            if exited_after_ctrl_c || exited_after_target_update {
+                .unwrap_or_else(|_| panic!("training thread panicked"))
+                .unwrap_or_else(|err| panic!("failed to save training state: {err}"));
+            if exited_after_ctrl_c || exited_after_target_update || exited_after_cycle {
                 if let Some(model) = interrupt_save_model.as_ref() {
                     save_model(model, Path::new(&config.model_path));
                     save_az_loop_progress_pair(
@@ -4144,8 +3258,10 @@ fn main() {
                         generated_samples_total,
                     );
                     println!(
-                        "model    : {} save raw=`{}` next_update={}",
-                        if exited_after_target_update {
+                        "saved: {} model=`{}` optimizer+replay saved next_update={}",
+                        if exited_after_cycle {
+                            "cycle complete"
+                        } else if exited_after_target_update {
                             "target"
                         } else {
                             "interrupt"
@@ -5934,24 +5050,13 @@ mod reporting_tests {
     }
 
     #[test]
-    fn train_source_reports_actual_recent_and_real_target_shape() {
-        let mut samples = vec![
+    fn policy_entropy_normalizes_targets() {
+        let samples = vec![
             reporting_sample(10, vec![3.0, 1.0]),
             reporting_sample(5, vec![2.0, 2.0]),
         ];
-        samples[0].repetition_flags = vec![1, 0];
-        samples[1].repetition_flags = vec![0, 0];
-        let stats = train_batch_source_stats(&samples, 4_000, 1, 1);
-
-        assert!((stats.recent_quota_rate - 0.5).abs() < 1e-6);
-        assert!((stats.actual_recent_sample_rate - 0.5).abs() < 1e-6);
-        let expected_entropy =
-            (-(0.75f32 * 0.75f32.ln() + 0.25f32 * 0.25f32.ln()) - 0.5f32.ln()) / 2.0;
-        assert!((stats.policy_target_entropy - expected_entropy).abs() < 1e-6);
-        assert!((stats.policy_target_top1 - 0.625).abs() < 1e-6);
-        assert!((stats.policy_target_top2 - 1.0).abs() < 1e-6);
-        assert!((stats.repetition_opportunity_rate - 0.5).abs() < 1e-6);
-        assert!((stats.repetition_target_mass - 0.75).abs() < 1e-6);
+        let expected = (-(0.75f32 * 0.75f32.ln() + 0.25f32 * 0.25f32.ln()) - 0.5f32.ln()) / 2.0;
+        assert!((policy_target_entropy(&samples) - expected).abs() < 1e-6);
     }
 
     #[test]
