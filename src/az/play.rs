@@ -509,6 +509,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let enable_resign = rng.unit_f32() >= config.resign_playthrough;
         let mut first_adjudication = None;
         let mut game_samples = Vec::new();
+        let mut game_proofs = Vec::new();
         let mut result = None;
         let mut search_failed = false;
         let mut plies = 0usize;
@@ -673,6 +674,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     1.0,
                 );
                 game_samples.push(sample);
+                game_proofs.push(proven_root_value(&search.candidates));
             }
             if let Some(outcome) = proven_adjudication {
                 terminal.adjudication.stopped_samples += game_samples.len();
@@ -761,15 +763,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            if let Some(result) = terminal_result {
-                assign_terminal_value_targets(&mut game_samples, result);
-                assign_short_value_targets(&mut game_samples, result);
-            } else {
-                // 步数截断或搜索失败不是规则和棋；没有终局标签时只训练policy。
-                for sample in &mut game_samples {
-                    sample.value_weight = 0.0;
-                }
-            }
+            finalize_value_targets(&mut game_samples, &game_proofs, terminal_result);
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -1004,6 +998,51 @@ fn move_search_meta(
         meta.played_index = played_index.min(u16::MAX as usize) as u16;
     }
     meta
+}
+
+fn proven_root_value(candidates: &[AzCandidate]) -> Option<i8> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.solved == Some(1))
+    {
+        Some(1)
+    } else if !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| candidate.solved.is_some())
+    {
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.solved)
+            .max()
+    } else {
+        None
+    }
+}
+
+fn finalize_value_targets(
+    samples: &mut [AzTrainingSample],
+    proofs: &[Option<i8>],
+    terminal_result: Option<f32>,
+) {
+    assert_eq!(samples.len(), proofs.len());
+    if let Some(result) = terminal_result {
+        assign_terminal_value_targets(samples, result);
+        assign_short_value_targets(samples, result);
+    } else {
+        // 截断不提供终局标签，但搜索的规则证明仍然有效。
+        for sample in samples.iter_mut() {
+            sample.value_weight = 0.0;
+        }
+    }
+    for (sample, proof) in samples.iter_mut().zip(proofs) {
+        if let Some(value) = proof {
+            // 使用显式证明，不能从网络饱和的单点 WDL 推断。
+            sample.value = f32::from(*value);
+            sample.value_wdl = scalar_value_to_wdl_target(sample.value);
+            sample.value_weight = 1.0;
+        }
+    }
 }
 
 fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
@@ -1795,6 +1834,41 @@ mod tests {
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
+    }
+
+    #[test]
+    fn proven_value_targets_survive_truncation_and_opponent_blunders() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
+        samples[2].root_search_wdl = [1.0, 0.0, 0.0];
+        finalize_value_targets(&mut samples, &[Some(1), Some(-1), None], None);
+        assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
+        assert_eq!(samples[0].value_weight, 1.0);
+        assert_eq!(samples[1].value_weight, 1.0);
+        assert_eq!(samples[2].value_weight, 0.0);
+
+        finalize_value_targets(&mut samples, &[Some(1), Some(-1), None], Some(-1.0));
+        assert_eq!(samples[0].value, 1.0);
+        assert_eq!(samples[1].value, -1.0);
+        assert_eq!(samples[2].value, -1.0);
+    }
+
+    #[test]
+    fn root_value_proof_requires_a_win_or_all_replies_solved() {
+        let mut candidates = [
+            candidate(Move::new(0, 1), 0.5),
+            candidate(Move::new(0, 2), 0.5),
+        ];
+        assert_eq!(proven_root_value(&[]), None);
+        candidates[0].solved = Some(0);
+        assert_eq!(proven_root_value(&candidates), None);
+        candidates[1].solved = Some(-1);
+        assert_eq!(proven_root_value(&candidates), Some(0));
+        candidates[0].solved = Some(-1);
+        assert_eq!(proven_root_value(&candidates), Some(-1));
+        candidates[0].solved = Some(1);
+        candidates[1].solved = None;
+        assert_eq!(proven_root_value(&candidates), Some(1));
     }
 
     #[test]
