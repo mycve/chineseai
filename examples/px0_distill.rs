@@ -26,7 +26,7 @@ struct Args {
     /// 小样本记忆实验，保留独立的整局验证集。
     #[arg(long)]
     train_limit: Option<usize>,
-    /// 固定验证集来自归档前多少局；扩大训练集时保持此值。
+    /// 前缀加载时指定验证覆盖前多少局；reservoir 模式指定全归档抽取的验证对局数。
     #[arg(long, default_value_t = 1024)]
     validation_games: usize,
     #[arg(long, default_value_t = 1.0)]

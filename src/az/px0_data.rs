@@ -174,7 +174,7 @@ fn reservoir_slot(seen: usize, capacity: usize, rng: &mut SplitMix64) -> Option<
     (slot < capacity).then_some(slot)
 }
 
-/// 扫描整个 TAR，按整局均匀抽取训练对局；固定验证来自归档前 validation_games 局。
+/// 扫描整个 TAR，分别均匀抽取指定数量的训练对局和验证对局。
 /// 扫描时仅保留抽中的 gzip 字节，抽样结束后才解压及转换。
 pub fn load_reservoir(
     path: &Path,
@@ -193,6 +193,7 @@ pub fn load_reservoir(
     let mut validation = vec![];
     let mut scanned = 0;
     let mut eligible = 0;
+    let mut eligible_validation = 0;
     for entry in archive.entries()? {
         let mut entry = entry?;
         if !entry.header().entry_type().is_file() {
@@ -201,10 +202,9 @@ pub fn load_reservoir(
         let name = entry.path()?.to_string_lossy().into_owned();
         scanned += 1;
         if game_id(&name) % 10 == 0 {
-            if scanned <= validation_games {
-                let mut compressed = vec![];
-                entry.read_to_end(&mut compressed)?;
-                validation.push((name, compressed));
+            eligible_validation += 1;
+            if let Some(slot) = reservoir_slot(eligible_validation, validation_games, &mut rng) {
+                retain_compressed(slot, name, &mut entry, &mut validation)?;
             }
         } else {
             eligible += 1;
@@ -225,6 +225,11 @@ pub fn load_reservoir(
         train.len(),
         validation.len()
     );
+    if eligible_validation < validation_games {
+        return Err(invalid(format!(
+            "requested {validation_games} validation games, only {eligible_validation} eligible"
+        )));
+    }
     if eligible < train_games {
         return Err(invalid(format!(
             "requested {train_games} training games, only {eligible} eligible"

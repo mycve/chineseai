@@ -59,7 +59,10 @@ pub use play::{
 };
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats, Px0ReplaySampler};
 pub use start::AzStartSnapshot;
-pub use train::{train_samples, train_samples_weighted, train_samples_weighted_owned};
+pub use train::{
+    train_samples, train_samples_weighted, train_samples_weighted_owned,
+    train_samples_weighted_shared,
+};
 
 const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = 2062;

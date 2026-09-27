@@ -61,7 +61,7 @@ pub fn train_samples_weighted_owned(
     )
 }
 
-fn train_samples_weighted_shared(
+pub fn train_samples_weighted_shared(
     model: &mut AzNnue,
     samples: Arc<Vec<AzTrainingSample>>,
     epochs: usize,
