@@ -10,13 +10,14 @@ use crate::xiangqi::{BOARD_SIZE, Color, Position};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_TACTICAL_SIZE,
-    POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_THREAT_MAX_ACTIVE, WDL_HEAD_SIZE,
-    canonical_general_buckets_from_features, decode_current_piece_square_feature,
+    POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_KING_PIECE_MAX_ACTIVE, VALUE_THREAT_MAX_ACTIVE,
+    WDL_HEAD_SIZE, canonical_general_buckets_from_features, decode_current_piece_square_feature,
     dense_move_squares,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
-    policy_sparse_main_index, policy_tactical_indices, visit_value_threat_features,
+    policy_sparse_main_index, policy_tactical_indices, visit_value_king_piece_features,
+    visit_value_threat_features,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -190,9 +191,12 @@ pub(super) struct PackedBatch {
     pub max_features: usize,
     pub max_policy_moves: usize,
     pub max_value_threats: usize,
+    pub max_value_king_pieces: usize,
     pub feature_items: Vec<u32>,
     pub value_threat_indices: Vec<u32>,
     pub value_threat_scales: Vec<f32>,
+    pub value_king_piece_indices: Vec<u32>,
+    pub value_king_piece_scales: Vec<f32>,
     pub policy_items: Vec<i64>,
     pub policy_sparse_indices: Vec<i64>,
     pub policy_tactical_indices: Vec<i64>,
@@ -200,7 +204,6 @@ pub(super) struct PackedBatch {
     pub policy_mask: Vec<f32>,
     pub policy_repetition: Vec<f32>,
     pub value_wdl: Vec<f32>,
-    pub short_value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
@@ -235,15 +238,28 @@ impl PackedBatch {
             .map(|&sample_index| value_threat_features(&samples[sample_index]))
             .collect::<Vec<_>>();
         let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let value_king_pieces = batch
+            .iter()
+            .map(|&sample_index| value_king_piece_features(&samples[sample_index]))
+            .collect::<Vec<_>>();
+        let max_value_king_pieces = value_king_pieces
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
         let mut packed = Self {
             batch_size,
             max_features,
             max_policy_moves,
             max_value_threats,
+            max_value_king_pieces,
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
             value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
             value_threat_scales: vec![1.0; batch_size],
+            value_king_piece_indices: vec![PADDING_ITEM; batch_size * max_value_king_pieces],
+            value_king_piece_scales: vec![1.0; batch_size],
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
             policy_sparse_indices: vec![
                 (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
@@ -257,7 +273,6 @@ impl PackedBatch {
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
             policy_repetition: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
-            short_value_wdl: vec![0.0f32; batch_size * super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
@@ -273,14 +288,14 @@ impl PackedBatch {
             packed.value_threat_indices[threat_base..threat_base + threats.len()]
                 .copy_from_slice(threats);
             packed.value_threat_scales[row] = 1.0 / (threats.len().max(1) as f32).sqrt();
+            let king_pieces = &value_king_pieces[row];
+            let king_base = row * max_value_king_pieces;
+            packed.value_king_piece_indices[king_base..king_base + king_pieces.len()]
+                .copy_from_slice(king_pieces);
+            packed.value_king_piece_scales[row] = 1.0 / (king_pieces.len().max(1) as f32).sqrt();
             packed.pack_policy(row, sample);
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
-            for (head, target) in sample.short_value_wdl.iter().enumerate() {
-                let target = normalize_wdl_target(*target);
-                let base = (row * super::SHORT_VALUE_HEADS + head) * WDL_HEAD_SIZE;
-                packed.short_value_wdl[base..base + WDL_HEAD_SIZE].copy_from_slice(&target);
-            }
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
                 .copy_from_slice(&sample.rule_context);
@@ -455,6 +470,22 @@ fn value_threat_features(sample: &AzTrainingSample) -> Vec<u32> {
     features
 }
 
+fn value_king_piece_features(sample: &AzTrainingSample) -> Vec<u32> {
+    let pieces = sample
+        .features
+        .iter()
+        .filter_map(|&feature| decode_current_piece_square_feature(feature))
+        .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
+        .collect::<Vec<_>>();
+    let position = Position::from_canonical_piece_squares(&pieces);
+    let mut features = Vec::with_capacity(VALUE_KING_PIECE_MAX_ACTIVE);
+    visit_value_king_piece_features(&position, Color::Red, |feature| {
+        features.push(feature as u32)
+    });
+    assert!(features.len() <= VALUE_KING_PIECE_MAX_ACTIVE);
+    features
+}
+
 #[derive(Debug)]
 pub(super) enum DataLoaderError {
     WorkerPanic,
@@ -598,7 +629,6 @@ mod tests {
             policy: vec![1.0 + index as f32, 1.0],
             value_wdl: [1.0, 0.0, 0.0],
             root_search_wdl: [1.0, 0.0, 0.0],
-            short_value_wdl: [[1.0, 0.0, 0.0]; crate::az::SHORT_VALUE_HEADS],
             value: 2.0,
             side_sign: 1.0,
             policy_weight: 1.0,

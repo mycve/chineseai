@@ -68,7 +68,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights = AzTrainLossWeights {
         value: 1.0,
         policy: 1.0,
-        short_value: 0.0,
     };
     let mut best = f64::INFINITY;
     let mut best_epoch = 0;

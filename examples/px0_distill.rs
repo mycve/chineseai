@@ -120,7 +120,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights = AzTrainLossWeights {
         value: args.value_weight,
         policy: args.policy_weight,
-        short_value: 0.0,
     };
     let mut best_score = args.policy_weight as f64 * baseline_validation.policy_kl
         + args.value_weight as f64 * baseline_validation.value_ce;

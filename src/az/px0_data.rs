@@ -469,7 +469,6 @@ fn decode_game(
             policy,
             value_wdl: target,
             root_search_wdl: root,
-            short_value_wdl: [target; SHORT_VALUE_HEADS],
             value: target[0] - target[2],
             side_sign: if side == Color::Red { 1.0 } else { -1.0 },
             policy_weight: 1.0,

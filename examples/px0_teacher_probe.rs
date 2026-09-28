@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let score = engine.score(&format!("position fen {}", p.fen), args.depth, None)?;
         let mut qs = vec![p.teacher_q];
         for model in &models {
-            let (wdl, _, _) =
+            let (wdl, _) =
                 outputs_for_training_sample(model, &p.sample).ok_or("sample eval failed")?;
             qs.push(wdl[0] - wdl[2]);
         }

@@ -449,6 +449,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_temperature_sum[start_source_index] += temperature_for_ply(config, start_phase_ply);
         let mut game_samples = Vec::new();
         let mut game_proofs = Vec::new();
+        let mut game_network_values = Vec::new();
         let mut result = None;
         let mut search_failed = false;
         let mut plies = 0usize;
@@ -595,6 +596,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 );
                 game_samples.push(sample);
                 game_proofs.push(proven_root_value(&search.candidates));
+                game_network_values.push(search.network_value_wdl);
             }
             if let Some(outcome) = proven_result {
                 terminal.search_proven[outcome_index(outcome)] += 1;
@@ -676,7 +678,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
 
         {
             crate::scope_profile!("az.selfplay.finalize_game");
-            finalize_value_targets(&mut game_samples, &game_proofs, terminal_result);
+            finalize_value_targets(
+                &mut game_samples,
+                &game_network_values,
+                &game_proofs,
+                terminal_result,
+                config.value_td_lambda,
+            );
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -831,7 +839,6 @@ fn make_training_sample(
         policy,
         value_wdl: scalar_value_to_wdl_target(value),
         root_search_wdl: normalize_wdl_target(root_search_wdl),
-        short_value_wdl: [normalize_wdl_target(root_search_wdl); crate::az::SHORT_VALUE_HEADS],
         value: value.clamp(-1.0, 1.0),
         side_sign,
         policy_weight: policy_weight.max(0.0),
@@ -841,26 +848,35 @@ fn make_training_sample(
     }
 }
 
-fn assign_short_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
-    for (head, horizon) in crate::az::SHORT_VALUE_HORIZONS.into_iter().enumerate() {
-        let now_factor = 1.0 / (horizon as f32 + 1.0);
-        let mut next_target = None;
-        for index in (0..samples.len()).rev() {
-            let continuation = next_target.map_or_else(
-                || {
-                    scalar_value_to_wdl_target(
-                        (game_result_red * samples[index].side_sign).clamp(-1.0, 1.0),
-                    )
-                },
-                flip_wdl,
-            );
-            let search = normalize_wdl_target(samples[index].root_search_wdl);
-            let target = std::array::from_fn(|part| {
-                now_factor * search[part] + (1.0 - now_factor) * continuation[part]
-            });
-            samples[index].short_value_wdl[head] = normalize_wdl_target(target);
-            next_target = Some(target);
-        }
+fn assign_td_value_targets(
+    samples: &mut [AzTrainingSample],
+    network_values: &[[f32; 3]],
+    proofs: &[Option<i8>],
+    game_result_red: f32,
+    lambda: f32,
+) {
+    assert_eq!(samples.len(), proofs.len());
+    assert_eq!(samples.len(), network_values.len());
+    let lambda = lambda.clamp(0.0, 1.0);
+    for index in (0..samples.len()).rev() {
+        let terminal = scalar_value_to_wdl_target(
+            (game_result_red * samples[index].side_sign).clamp(-1.0, 1.0),
+        );
+        let target = if let Some(proven) = proofs[index] {
+            scalar_value_to_wdl_target(f32::from(proven))
+        } else if index + 1 == samples.len() {
+            terminal
+        } else if proofs[index + 1].is_some() {
+            flip_wdl(samples[index + 1].value_wdl)
+        } else {
+            let bootstrap = flip_wdl(normalize_wdl_target(network_values[index + 1]));
+            let continuation = flip_wdl(samples[index + 1].value_wdl);
+            normalize_wdl_target(std::array::from_fn(|part| {
+                (1.0 - lambda) * bootstrap[part] + lambda * continuation[part]
+            }))
+        };
+        samples[index].value_wdl = target;
+        samples[index].value = target[0] - target[2];
     }
 }
 
@@ -935,13 +951,15 @@ fn proven_root_value(candidates: &[AzCandidate]) -> Option<i8> {
 
 fn finalize_value_targets(
     samples: &mut [AzTrainingSample],
+    network_values: &[[f32; 3]],
     proofs: &[Option<i8>],
     terminal_result: Option<f32>,
+    lambda: f32,
 ) {
     assert_eq!(samples.len(), proofs.len());
+    assert_eq!(samples.len(), network_values.len());
     if let Some(result) = terminal_result {
-        assign_terminal_value_targets(samples, result);
-        assign_short_value_targets(samples, result);
+        assign_td_value_targets(samples, network_values, proofs, result, lambda);
     } else {
         // 截断不提供终局标签，但搜索的规则证明仍然有效。
         for sample in samples.iter_mut() {
@@ -955,15 +973,6 @@ fn finalize_value_targets(
             sample.value_wdl = scalar_value_to_wdl_target(sample.value);
             sample.value_weight = 1.0;
         }
-    }
-}
-
-fn assign_terminal_value_targets(samples: &mut [AzTrainingSample], game_result_red: f32) {
-    for sample in samples {
-        let target =
-            scalar_value_to_wdl_target((game_result_red * sample.side_sign).clamp(-1.0, 1.0));
-        sample.value_wdl = target;
-        sample.value = target[0] - target[2];
     }
 }
 
@@ -1387,6 +1396,7 @@ mod tests {
             policy_softmax_temp: 1.0,
             opening_positions: Default::default(),
             mirror_probability: 0.0,
+            value_td_lambda: 0.75,
             record_fens: false,
         }
     }
@@ -1686,7 +1696,6 @@ mod tests {
             policy: Vec::new(),
             value_wdl: scalar_value_to_wdl_target(value),
             root_search_wdl: scalar_value_to_wdl_target(value),
-            short_value_wdl: [scalar_value_to_wdl_target(value); crate::az::SHORT_VALUE_HEADS],
             value,
             side_sign,
             policy_weight: 1.0,
@@ -1700,14 +1709,26 @@ mod tests {
     fn proven_value_targets_survive_truncation_and_opponent_blunders() {
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
         samples[2].root_search_wdl = [1.0, 0.0, 0.0];
-        finalize_value_targets(&mut samples, &[Some(1), Some(-1), None], None);
+        finalize_value_targets(
+            &mut samples,
+            &[[0.0, 1.0, 0.0]; 3],
+            &[Some(1), Some(-1), None],
+            None,
+            0.75,
+        );
         assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[0].value_weight, 1.0);
         assert_eq!(samples[1].value_weight, 1.0);
         assert_eq!(samples[2].value_weight, 0.0);
 
-        finalize_value_targets(&mut samples, &[Some(1), Some(-1), None], Some(-1.0));
+        finalize_value_targets(
+            &mut samples,
+            &[[0.0, 1.0, 0.0]; 3],
+            &[Some(1), Some(-1), None],
+            Some(-1.0),
+            0.75,
+        );
         assert_eq!(samples[0].value, 1.0);
         assert_eq!(samples[1].value, -1.0);
         assert_eq!(samples[2].value, -1.0);
@@ -1737,37 +1758,49 @@ mod tests {
         samples[0].meta.root_q = -1.0;
         samples[1].meta.root_q = 1.0;
 
-        assign_terminal_value_targets(&mut samples, 1.0);
+        assign_td_value_targets(&mut samples, &[[0.0, 1.0, 0.0]; 2], &[None, None], 1.0, 0.75);
 
-        assert_eq!(samples[0].value_wdl, [1.0, 0.0, 0.0]);
-        assert_eq!(samples[0].value, 1.0);
+        assert_eq!(samples[0].value_wdl, [0.75, 0.25, 0.0]);
+        assert_eq!(samples[0].value, 0.75);
         assert!(samples.iter().all(|sample| sample.value_weight == 1.0));
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
     }
 
     #[test]
-    fn short_value_targets_use_geometric_search_values_and_terminal_tail() {
+    fn td_lambda_targets_bootstrap_from_network_and_terminal() {
         let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0), sample(0.0, 1.0)];
-        samples[0].root_search_wdl = [0.6, 0.3, 0.1];
-        samples[1].root_search_wdl = [0.2, 0.5, 0.3];
-        samples[2].root_search_wdl = [0.1, 0.2, 0.7];
-        assign_short_value_targets(&mut samples, 1.0);
+        samples[1].root_search_wdl = [1.0, 0.0, 0.0];
+        samples[2].root_search_wdl = [1.0, 0.0, 0.0];
+        let network = [[0.6, 0.3, 0.1], [0.2, 0.5, 0.3], [0.1, 0.2, 0.7]];
+        assign_td_value_targets(&mut samples, &network, &[None, None, None], 1.0, 0.75);
 
-        let expected_short = [
-            [0.6928, 0.1656, 0.1416],
-            [0.152, 0.132, 0.716],
-            [0.82, 0.04, 0.14],
+        let expected = [
+            [0.65625, 0.1625, 0.18125],
+            [0.175, 0.05, 0.775],
+            [1.0, 0.0, 0.0],
         ];
-        for (sample, expected) in samples.iter().zip(expected_short) {
-            for (actual, expected) in sample.short_value_wdl[0].iter().zip(expected) {
+        for (sample, target) in samples.iter().zip(expected) {
+            for (actual, expected) in sample.value_wdl.iter().zip(target) {
                 assert!((actual - expected).abs() < 1.0e-6);
             }
         }
-        let long_last = samples[2].short_value_wdl[2];
-        assert!((long_last[0] - (0.1 / 33.0 + 32.0 / 33.0)).abs() < 1.0e-6);
-        assert!((long_last[1] - 0.2 / 33.0).abs() < 1.0e-6);
-        assert!((long_last[2] - 0.7 / 33.0).abs() < 1.0e-6);
+
+        let mut proven = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        assign_td_value_targets(
+            &mut proven,
+            &[[0.0, 1.0, 0.0]; 2],
+            &[None, Some(-1)],
+            0.0,
+            0.75,
+        );
+        assert_eq!(proven[0].value_wdl, [1.0, 0.0, 0.0]);
+
+        let mut zero = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        assign_td_value_targets(&mut zero, &[[0.0, 1.0, 0.0]; 2], &[None, None], 1.0, 0.0);
+        assert_eq!(zero[0].value_wdl, [0.0, 1.0, 0.0]);
+        assign_td_value_targets(&mut zero, &[[0.0, 1.0, 0.0]; 2], &[None, None], 1.0, 1.0);
+        assert_eq!(zero[0].value_wdl, [1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1814,7 +1847,6 @@ mod tests {
             assert!((actual - expected / expected_total).abs() < 1e-6);
         }
         assert_eq!(sample.root_search_wdl, [0.6, 0.3, 0.1]);
-        assert_eq!(sample.short_value_wdl, [[0.6, 0.3, 0.1]; 3]);
     }
 
     #[test]

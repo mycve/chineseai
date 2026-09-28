@@ -59,6 +59,7 @@ pub struct AzLoopFileConfig {
     pub train_samples_per_update: usize,
     pub mirror_probability: f32,
     pub train_value_weight: f32,
+    pub value_td_lambda: f32,
     pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
@@ -126,6 +127,7 @@ impl Default for AzLoopFileConfig {
             train_samples_per_update: 120000,
             mirror_probability: 0.5,
             train_value_weight: 1.0,
+            value_td_lambda: chineseai::az::DEFAULT_VALUE_TD_LAMBDA,
             train_policy_weight: 1.0,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
@@ -225,6 +227,7 @@ impl AzLoopFileConfig {
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
+        line!("value_td_lambda", f(self.value_td_lambda));
         line!("train_policy_weight", f(self.train_policy_weight));
         line!("checkpoint_interval", self.checkpoint_interval);
         line!("checkpoint_dir", q(&self.checkpoint_dir));
@@ -329,6 +332,7 @@ impl AzLoopFileConfig {
         self.arena_policy_softmax_temp = self.arena_policy_softmax_temp.max(1e-3);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
+        self.value_td_lambda = self.value_td_lambda.clamp(0.0, 1.0);
         self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
@@ -358,6 +362,7 @@ mod tests {
         assert_eq!(config.cpuct, expected.cpuct);
         assert_eq!(config.root_dirichlet_alpha, 0.12);
         assert_eq!(config.temperature_cutoff_plies, 78);
+        assert_eq!(config.value_td_lambda, 0.75);
         assert!(config.fpu_absolute_at_root);
     }
 
@@ -369,6 +374,20 @@ mod tests {
         };
         let restored: AzLoopFileConfig = toml::from_str(&config.to_file_text()).unwrap();
         assert_eq!(restored.root_dirichlet_alpha, 0.12);
+    }
+
+    #[test]
+    fn td_lambda_roundtrips_and_is_bounded() {
+        let config = AzLoopFileConfig {
+            value_td_lambda: 0.6,
+            ..AzLoopFileConfig::default()
+        };
+        assert_eq!(AzLoopFileConfig::parse(&config.to_file_text()).value_td_lambda, 0.6);
+        let config = AzLoopFileConfig {
+            value_td_lambda: 1.5,
+            ..config
+        };
+        assert_eq!(AzLoopFileConfig::parse(&config.to_file_text()).value_td_lambda, 1.0);
     }
 
     #[test]
@@ -397,7 +416,7 @@ mod tests {
         assert!(text.contains("fpu_value_at_root = 1.0\n"));
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
-        assert!(!text.contains("value_td_lambda"));
+        assert!(text.contains("value_td_lambda = 0.75\n"));
         assert!(!text.contains("value_target_search_q_mix"));
         assert!(text.contains("simulations = 10000\n"));
         assert!(!text.contains("low_simulations"));
@@ -494,7 +513,6 @@ mod tests {
             "high_simulation_probability = 0.1\n",
             "high_simulation_start_plies = 40\n",
             "value_target_search_q_mix = 0.4\n",
-            "value_td_lambda = 0.95\n",
             "train_epochs_per_update = 1\n",
             "resign_percentage = 2.0\n",
             "resign_playthrough = 0.2\n",

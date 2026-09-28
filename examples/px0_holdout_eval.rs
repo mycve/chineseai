@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(output) = per_game.as_mut() {
             let mut games = BTreeMap::<u64, (usize, f64, f64, f64)>::new();
             for sample in &dataset.validation {
-                let (wdl, _, logits) =
+                let (wdl, logits) =
                     outputs_for_training_sample(&model, sample).ok_or("invalid holdout sample")?;
                 if logits.len() != sample.policy.len() || logits.len() != sample.move_indices.len()
                 {

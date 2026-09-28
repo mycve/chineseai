@@ -5,7 +5,7 @@ use super::{
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
     POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE,
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    VALUE_HEAD_SIZE, VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    VALUE_HEAD_SIZE, VALUE_KING_PIECE_VOCAB, VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
@@ -27,9 +27,8 @@ pub(super) struct AzCandleModel {
     hidden_bias: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
+    value_king_piece_hidden: Var,
     value_head_output: Var,
-    short_value_head_output: Var,
-    short_value_head_bias: Var,
     value_threat_embedding: Var,
     value_threat_output: Var,
     policy_threat_context: Var,
@@ -72,15 +71,17 @@ impl AzCandleModel {
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
         let hidden = sparse_hidden.broadcast_div(&rms)?;
+        let value_king_piece = sparse_pool(
+            self.value_king_piece_hidden.as_tensor(),
+            &batch.value_king_piece_indices,
+        )?
+        .broadcast_mul(&batch.value_king_piece_scales)?;
         let value_head = hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
+            .add(&value_king_piece)?
             .relu()?;
         let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
-        let short_value_logits = value_head
-            .matmul(&self.short_value_head_output.t()?)?
-            .broadcast_add(&self.short_value_head_bias)?
-            .reshape((batch.batch_size, super::SHORT_VALUE_HEADS, WDL_HEAD_SIZE))?;
         let threat_accumulator = sparse_pool(
             self.value_threat_embedding.as_tensor(),
             &batch.value_threat_indices,
@@ -161,7 +162,6 @@ impl AzCandleModel {
 
         Ok(ForwardOutput {
             value_logits,
-            short_value_logits,
             policy_logits,
         })
     }
@@ -169,7 +169,6 @@ impl AzCandleModel {
 
 pub(super) struct ForwardOutput {
     pub(super) value_logits: Tensor,
-    pub(super) short_value_logits: Tensor,
     pub(super) policy_logits: Tensor,
 }
 
@@ -178,6 +177,8 @@ pub(super) struct BatchTensors {
     pub(super) feature_items: Tensor,
     pub(super) value_threat_indices: Tensor,
     pub(super) value_threat_scales: Tensor,
+    pub(super) value_king_piece_indices: Tensor,
+    pub(super) value_king_piece_scales: Tensor,
     pub(super) policy_items: Tensor,
     pub(super) policy_sparse_indices: Tensor,
     pub(super) policy_tactical_indices: Tensor,
@@ -185,7 +186,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_mask: Tensor,
     pub(super) policy_repetition: Tensor,
     pub(super) value_wdl: Tensor,
-    pub(super) short_value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) rule_context: Tensor,
     pub(super) policy_weights: Tensor,
@@ -200,12 +200,19 @@ impl BatchTensors {
         let max_features = packed.max_features;
         let max_policy_moves = packed.max_policy_moves;
         let max_value_threats = packed.max_value_threats;
+        let max_value_king_pieces = packed.max_value_king_pieces;
         assert!(
             packed
                 .value_threat_indices
                 .iter()
                 .all(|&index| index == PADDING_ITEM || index < VALUE_THREAT_VOCAB as u32),
             "value threat index exceeds vocabulary"
+        );
+        assert!(
+            packed
+                .value_king_piece_indices
+                .iter()
+                .all(|&index| index == PADDING_ITEM || index < VALUE_KING_PIECE_VOCAB as u32)
         );
         Ok(Self {
             batch_size,
@@ -221,6 +228,16 @@ impl BatchTensors {
             )?,
             value_threat_scales: Tensor::from_vec(
                 packed.value_threat_scales,
+                (batch_size, 1),
+                device,
+            )?,
+            value_king_piece_indices: Tensor::from_vec(
+                packed.value_king_piece_indices,
+                (batch_size, max_value_king_pieces),
+                device,
+            )?,
+            value_king_piece_scales: Tensor::from_vec(
+                packed.value_king_piece_scales,
                 (batch_size, 1),
                 device,
             )?,
@@ -255,11 +272,6 @@ impl BatchTensors {
                 device,
             )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
-            short_value_wdl: Tensor::from_vec(
-                packed.short_value_wdl,
-                (batch_size, super::SHORT_VALUE_HEADS, WDL_HEAD_SIZE),
-                device,
-            )?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             rule_context: Tensor::from_vec(
                 packed.rule_context,
@@ -321,19 +333,14 @@ impl AzCandleModel {
                 device,
             )?,
             value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
+            value_king_piece_hidden: var_from_slice(
+                &model.value_king_piece_hidden,
+                (VALUE_KING_PIECE_VOCAB, VALUE_HEAD_SIZE),
+                device,
+            )?,
             value_head_output: var_from_slice(
                 &model.value_head_output,
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            short_value_head_output: var_from_slice(
-                &model.short_value_head_output,
-                (super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            short_value_head_bias: var_from_slice(
-                &model.short_value_head_bias,
-                super::SHORT_VALUE_HEADS * WDL_HEAD_SIZE,
                 device,
             )?,
             value_threat_embedding: var_from_slice(
@@ -408,9 +415,8 @@ impl AzCandleModel {
         vars.push(self.hidden_bias.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
+        vars.push(self.value_king_piece_hidden.clone());
         vars.push(self.value_head_output.clone());
-        vars.push(self.short_value_head_output.clone());
-        vars.push(self.short_value_head_bias.clone());
         vars.push(self.value_threat_embedding.clone());
         vars.push(self.value_threat_output.clone());
         vars.push(self.policy_threat_context.clone());
@@ -441,15 +447,11 @@ impl AzCandleModel {
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
+        copy_var(
+            &self.value_king_piece_hidden,
+            &mut model.value_king_piece_hidden,
+        )?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
-        copy_var(
-            &self.short_value_head_output,
-            &mut model.short_value_head_output,
-        )?;
-        copy_var(
-            &self.short_value_head_bias,
-            &mut model.short_value_head_bias,
-        )?;
         copy_var(
             &self.value_threat_embedding,
             &mut model.value_threat_embedding,
@@ -613,6 +615,13 @@ mod tests {
         for (index, weight) in model.value_threat_output.iter_mut().enumerate() {
             *weight = (index % 17) as f32 * 0.0003 - 0.002;
         }
+        for (index, weight) in model.value_king_piece_hidden.iter_mut().enumerate() {
+            *weight = (index % 19) as f32 * 0.001 - 0.009;
+        }
+        for (index, weight) in model.value_head_output.iter_mut().enumerate() {
+            *weight = (index % 11) as f32 * 0.003 - 0.015;
+        }
+        model.value_head_bias.fill(1.0);
         for (index, weight) in model.policy_threat_context.iter_mut().enumerate() {
             *weight = (index % 13) as f32 * 0.0001 - 0.0005;
         }
@@ -664,7 +673,6 @@ mod tests {
             policy: vec![1.0; moves.len()],
             value_wdl: [0.0, 1.0, 0.0],
             root_search_wdl: [0.0, 1.0, 0.0],
-            short_value_wdl: [[0.0, 1.0, 0.0]; crate::az::SHORT_VALUE_HEADS],
             value: 0.0,
             side_sign: 1.0,
             policy_weight: 1.0,
@@ -672,7 +680,7 @@ mod tests {
             search_simulations: 1,
             meta: AzSampleMeta::default(),
         };
-        let (sample_wdl, _, sample_logits) =
+        let (sample_wdl, sample_logits) =
             crate::az::outputs_for_training_sample(&model, &sample).unwrap();
         assert_eq!(sample_wdl, cpu_output.value_wdl);
         assert_eq!(sample_logits, cpu.logits);
@@ -690,6 +698,15 @@ mod tests {
                 "candle={candle_value} cpu={cpu_value}"
             );
         }
+        let gradients = forward.value_logits.sum_all().unwrap().backward().unwrap();
+        let king_gradient = gradients
+            .get(&candle.value_king_piece_hidden)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(king_gradient.iter().any(|&gradient| gradient != 0.0));
 
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
@@ -800,6 +817,7 @@ mod tests {
             hidden_bias,
             value_head_hidden,
             value_head_bias,
+            value_king_piece_hidden,
             value_head_output,
             policy_threat_context,
             policy_move_bias,

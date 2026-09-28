@@ -304,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut error = 0.0f64;
     let mut root_error = 0.0f64;
     for s in &sample {
-        let (wdl, _, _) = outputs_for_training_sample(&model, s).ok_or("invalid sample")?;
+        let (wdl, _) = outputs_for_training_sample(&model, s).ok_or("invalid sample")?;
         let q = wdl[0] - wdl[2];
         error += f64::from(q - s.value).powi(2);
         root_error += f64::from(q - (s.root_search_wdl[0] - s.root_search_wdl[2])).powi(2);
@@ -346,7 +346,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fields[4] = (s.rule_context[0] * 120.0).round().to_string();
             let fen = fields.join(" ");
             let pf = engine.score(&format!("position fen {fen}"), args.teacher_depth, None)?;
-            let (wdl, _, _) = outputs_for_training_sample(&model, s).unwrap();
+            let (wdl, _) = outputs_for_training_sample(&model, s).unwrap();
             let q = wdl[0] - wdl[2];
             if pf.cp.abs() >= 700 {
                 strong[0] += 1;

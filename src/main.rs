@@ -1036,6 +1036,7 @@ fn build_az_loop_config(
         policy_softmax_temp: config.policy_softmax_temp,
         opening_positions: Arc::clone(opening_positions),
         mirror_probability: config.mirror_probability,
+        value_td_lambda: config.value_td_lambda,
         record_fens: false,
     }
 }
@@ -1150,8 +1151,6 @@ fn build_async_training_report(
         value_calibration,
         phase_value,
         source_phase_value,
-        short_value_ce: stats.short_value_ce,
-        short_value: stats.short_value.map(value_report),
         policy_ce: stats.policy_ce,
         policy_target_entropy: target_entropy,
         policy_kl: stats.policy_ce - target_entropy,
@@ -2432,7 +2431,6 @@ fn main() {
                         AzTrainLossWeights {
                             value: trainer_config.train_value_weight,
                             policy: trainer_config.train_policy_weight,
-                            short_value: chineseai::az::SHORT_VALUE_LOSS_WEIGHT,
                         },
                     )
                     .unwrap_or_else(|err| panic!("training update {} failed: {err}", train_update));
@@ -4760,7 +4758,6 @@ fn load_pikafish_training_samples(path: &str) -> io::Result<Vec<AzTrainingSample
             policy,
             value_wdl: wdl,
             root_search_wdl: wdl,
-            short_value_wdl: [wdl; chineseai::az::SHORT_VALUE_HEADS],
             value: wdl[0] - wdl[2],
             side_sign: if side == chineseai::xiangqi::Color::Red {
                 1.0
@@ -5020,7 +5017,6 @@ mod reporting_tests {
             policy,
             value_wdl: [0.0, 1.0, 0.0],
             root_search_wdl: [0.0, 1.0, 0.0],
-            short_value_wdl: [[0.0, 1.0, 0.0]; chineseai::az::SHORT_VALUE_HEADS],
             value: 0.0,
             side_sign: 1.0,
             policy_weight: 1.0,
