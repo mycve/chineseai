@@ -132,8 +132,6 @@ const VALUE_CANNON_TRIPLE_VOCAB: usize = 32_768;
 pub(super) const VALUE_THREAT_VOCAB: usize =
     VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + VALUE_CANNON_TRIPLE_VOCAB;
 pub(super) const VALUE_THREAT_MAX_ACTIVE: usize = 192;
-/// 自对弈 WDL TD(λ) 的默认迹衰减系数。
-pub const DEFAULT_VALUE_TD_LAMBDA: f32 = 0.75;
 pub(super) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
@@ -1160,7 +1158,6 @@ pub struct AzLoopConfig {
     pub policy_softmax_temp: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,
     pub mirror_probability: f32,
-    pub value_td_lambda: f32,
     pub record_fens: bool,
 }
 

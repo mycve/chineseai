@@ -1036,7 +1036,6 @@ fn build_az_loop_config(
         policy_softmax_temp: config.policy_softmax_temp,
         opening_positions: Arc::clone(opening_positions),
         mirror_probability: config.mirror_probability,
-        value_td_lambda: config.value_td_lambda,
         record_fens: false,
     }
 }
