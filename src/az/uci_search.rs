@@ -1,5 +1,6 @@
 //! UCI 独占的树保留和 PV 提取，不改变自博弈搜索路径。
 use super::*;
+use std::collections::BinaryHeap;
 
 const MAX_RETAINED_NODES: usize = 100_000;
 
@@ -21,13 +22,13 @@ pub(crate) struct AzUciPv {
     pub moves: Vec<Move>,
     pub wdl: [f32; 3],
     pub q: f32,
+    pub proven: Option<i8>,
 }
 
 pub(crate) struct AzUciSearchResult {
     pub search: AzSearchResult,
     pub variations: Vec<AzUciPv>,
     pub reused_visits: u32,
-    pub tree_limit_reached: bool,
 }
 
 impl AzUciSearchCache {
@@ -129,6 +130,60 @@ impl AzUciSearchCache {
 }
 
 impl AzTree<'_> {
+    fn compact_uci_tree(&mut self, keep: usize) {
+        let mut selected = Vec::with_capacity(keep);
+        let mut map = vec![NO_CHILD; self.nodes.len()];
+        let mut queue = BinaryHeap::new();
+        queue.push((u32::MAX, u32::MAX, 0usize));
+        while selected.len() < keep {
+            let Some((_, depth_priority, index)) = queue.pop() else {
+                break;
+            };
+            map[index] = selected.len() as u32;
+            selected.push(index);
+            for child in self.node_children(index) {
+                if let Some(next) = child.child_node() {
+                    let priority = if self.child_solved(child).is_some() {
+                        u32::MAX
+                    } else {
+                        child.visits
+                    };
+                    queue.push((priority, depth_priority - 1, next));
+                }
+            }
+        }
+        let old_nodes = std::mem::take(&mut self.nodes);
+        let old_children = std::mem::take(&mut self.children);
+        let old_accumulators = std::mem::take(&mut self.accumulator_arena);
+        self.nodes = Vec::with_capacity(selected.len());
+        self.children = Vec::new();
+        self.accumulator_arena = old_accumulators[..2 * self.model.hidden_size].to_vec();
+        for (new_index, old_index) in selected.into_iter().enumerate() {
+            let mut node = old_nodes[old_index].clone();
+            node.parent = if new_index == 0 {
+                NO_CHILD
+            } else {
+                map[node.parent as usize]
+            };
+            if new_index > 0 {
+                let start = node.accumulator_offset as usize;
+                node.accumulator_offset = self.accumulator_arena.len() as u32;
+                self.accumulator_arena
+                    .extend_from_slice(&old_accumulators[start..start + self.model.hidden_size]);
+            }
+            let start = node.children_offset as usize;
+            node.children_offset = self.children.len() as u32;
+            for child in &old_children[start..start + node.children_len as usize] {
+                let mut child = child.clone();
+                if let Some(next) = child.child_node() {
+                    child.child = map[next];
+                }
+                self.children.push(child);
+            }
+            self.nodes.push(node);
+        }
+    }
+
     fn uci_snapshot(&self, used: usize, multipv: usize, reused_visits: u32) -> AzUciSearchResult {
         let search = self.search_result(used);
         let mut ranked = search.candidates.iter().collect::<Vec<_>>();
@@ -175,6 +230,7 @@ impl AzTree<'_> {
                     moves,
                     wdl,
                     q: wdl_utility(wdl, self.draw_score),
+                    proven: self.child_solved(child),
                 }
             })
             .collect();
@@ -182,7 +238,6 @@ impl AzTree<'_> {
             search,
             variations,
             reused_visits,
-            tree_limit_reached: self.nodes.len() >= MAX_RETAINED_NODES,
         }
     }
 }
@@ -219,8 +274,11 @@ pub(crate) fn search_uci(
     let mut last_progress = Instant::now();
     if tree.nodes[0].children_len > 0 {
         for _ in 0..limits.simulations {
-            if control.should_stop() || tree.nodes.len() >= MAX_RETAINED_NODES {
+            if control.should_stop() {
                 break;
+            }
+            if tree.nodes.len() >= MAX_RETAINED_NODES {
+                tree.compact_uci_tree(MAX_RETAINED_NODES / 2);
             }
             tree.simulate(0, 0);
             used += 1;
@@ -236,7 +294,10 @@ pub(crate) fn search_uci(
         }
     }
     let result = tree.uci_snapshot(used, multipv, reused);
-    if retain && tree.nodes.len() < MAX_RETAINED_NODES {
+    if tree.nodes.len() >= MAX_RETAINED_NODES {
+        tree.compact_uci_tree(MAX_RETAINED_NODES / 2);
+    }
+    if retain {
         cache.retained = Some(RetainedTree {
             nodes: tree.nodes,
             children: tree.children,
@@ -294,6 +355,59 @@ mod tests {
                 history.push(entry);
             }
         }
+    }
+
+    #[test]
+    fn compacted_tree_keeps_legal_pvs_and_can_continue_searching() {
+        let model = AzNnue::random(16, 20260928);
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let limits = AzSearchLimits {
+            simulations: 1024,
+            ..Default::default()
+        };
+        let mut tree = AzTree::new(
+            position.clone(),
+            history.clone(),
+            Some(position.legal_moves_with_rules(&history)),
+            &model,
+            limits,
+        );
+        tree.adjudicate_root_rules = false;
+        tree.expand(0);
+        for _ in 0..1024 {
+            tree.simulate(0, 0);
+        }
+        let before = tree.nodes[0].visits;
+        let original_nodes = tree.nodes.len();
+        assert!(original_nodes > 32);
+        tree.compact_uci_tree(original_nodes / 2);
+        assert_eq!(tree.nodes.len(), original_nodes / 2);
+        assert_eq!(tree.nodes[0].visits, before);
+        for (index, node) in tree.nodes.iter().enumerate() {
+            if index > 0 {
+                assert!((node.parent as usize) < index);
+            }
+            let expected = AzEvalAccumulator::new(&model, &node.position).into_hidden_sum();
+            let perspective = color_index(node.position.side_to_move()) * model.hidden_size;
+            let offset = node.accumulator_offset as usize;
+            for (actual, expected) in tree.accumulator_arena[offset..offset + model.hidden_size]
+                .iter()
+                .zip(&expected[perspective..perspective + model.hidden_size])
+            {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+            for child in tree.node_children(index) {
+                if let Some(next) = child.child_node() {
+                    assert_eq!(tree.nodes[next].parent as usize, index);
+                }
+            }
+        }
+        for _ in 0..128 {
+            tree.simulate(0, 0);
+        }
+        assert!(tree.nodes[0].visits > before);
+        validate_pvs(&position, &history, &tree.uci_snapshot(128, 4, 0));
     }
 
     #[test]

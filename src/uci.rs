@@ -530,7 +530,14 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         state.policy_softmax_temp
     );
     flush();
+    let mut last_score_source = None;
     let mut report_progress = |progress: &AzUciSearchResult| {
+        if let Some(proven) = high_score_source(progress) {
+            if last_score_source != Some(proven) {
+                print_high_score_source(progress, proven);
+                last_score_source = Some(proven);
+            }
+        }
         print_search_info(progress, started);
         flush();
     };
@@ -569,11 +576,12 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     if report.reused_visits > 0 {
         println!("info string tree reused visits={}", report.reused_visits);
     }
-    if report.tree_limit_reached {
-        println!("info string tree node limit reached; waiting for stop if infinite");
-        flush();
+    if let Some(proven) = high_score_source(&report) {
+        if last_score_source != Some(proven) {
+            print_high_score_source(&report, proven);
+        }
     }
-    // 无限分析在收到 stop 前不发 bestmove；达到树规模上限或证明终局后等待。
+    // 无限分析在收到 stop 前不发 bestmove；证明终局后等待。
     while params.infinite && !stop.load(Ordering::Relaxed) {
         thread::park_timeout(Duration::from_millis(10));
     }
@@ -630,6 +638,26 @@ fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: 
         configured.max(1)
     });
     requested.clamp(1, MAX_UCI_SIMULATIONS)
+}
+
+fn high_score_source(report: &AzUciSearchResult) -> Option<bool> {
+    report
+        .variations
+        .first()
+        .filter(|pv| cp_from_q(pv.q).abs() >= 900)
+        .map(|pv| pv.proven.is_some())
+}
+
+fn print_high_score_source(report: &AzUciSearchResult, proven: bool) {
+    println!(
+        "info string high score q={:.3} source={}",
+        report.variations[0].q,
+        if proven {
+            "search-proof"
+        } else {
+            "value-estimate"
+        }
+    );
 }
 
 fn print_search_info(report: &AzUciSearchResult, started: Instant) {
