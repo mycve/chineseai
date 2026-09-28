@@ -523,8 +523,8 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
         return Some(RuleViolation::LongCheck);
     }
 
-    // Px0 RuleJudge：循环中出现将军时，清除双方的长捉候选。
-    if entries.iter().any(|entry| entry.gives_check) {
+    // 本方一将一捉不能算逐着长捉；对方的将军不消除本方的捉子记录。
+    if mover_entries.iter().any(|entry| entry.gives_check) {
         return None;
     }
 

@@ -856,6 +856,34 @@ fn cannon_repetition_chasing_advisor_is_not_long_chase_loss() {
 }
 
 #[test]
+fn single_side_long_chase_survives_opponents_interleaved_check() {
+    let mut position =
+        Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1")
+            .unwrap();
+    let mut history = position.initial_rule_history();
+    let moves = "b2e2 b9c7 b0c2 a9b9 a0b0 c6c5 b0b4 h9g7 h0i2 h7h5 h2f2 i9h9 i0h0 c7b5 b4d4 b5c3 f0e1 c9e7 g3g4 f9e8 h0h4 b7c7 d4d6 c3b5 c2a1 c7c9 d6c6 c5c4 g4g5 g6g5 c6c4 b5a3 c4c7 a3b5 c7c4 g7f5 c4b4 f5e3 f2h2 e3d5 b4e4 b5c3 e4c4 h9h6 h2h5 c3e2 c0e2 d5f6 a1c0 b9b6 h4f4 f6h5 f4h4 h6h9 c0d2 h5g7 h4h9 g7h9 d2e4 c9b9 e4f6 h9i7 c4f4 e6e5 i2g3 b9b8 g3h5 b6d6 h5i7 g9i7 f6h7 g5g4 f4g4 d6h6 g4b4 b8c8 b4c4 c8b8 c4c8 b8b0 c8c0 b0b3 c0c3 b3b0 c3c0 b0b3 c0c3 b3b0 c3c0 b0b3 c0c3 b3b0 c3c0 b0b3";
+    let mut first_forbidden = None;
+    for (index, text) in moves.split_whitespace().enumerate() {
+        let mv = position.parse_uci_move(text).unwrap();
+        let allowed = position.legal_moves_with_rules(&history).contains(&mv);
+        if !allowed && first_forbidden.is_none() {
+            first_forbidden = Some(index + 1);
+        }
+        let entry = position.rule_history_entry_after_move(mv);
+        history.push(entry);
+        position.make_move(mv);
+    }
+    assert_eq!(first_forbidden, Some(89));
+    assert_eq!(position.side_to_move(), Color::Red);
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+    let repeat = position.parse_uci_move("c0c3").unwrap();
+    assert!(!position.legal_moves_with_rules(&history).contains(&repeat));
+}
+
+#[test]
 fn three_repetition_cycles_without_forcing_draw() {
     let history = vec![
         test_rule_entry(21, Color::Red, None, false, 0),
