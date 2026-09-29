@@ -17,6 +17,8 @@ tools
 !tools/
 tools/*
 !tools/policy_arch_search.py
+!tools/train_sparse_px0.py
+sparse_px0_*.json
 eval/*.csv
 eval/*.fens
 eval/*.bin
