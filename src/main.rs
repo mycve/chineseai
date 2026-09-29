@@ -25,6 +25,7 @@ use chineseai::{
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
     pikafish_pretrain::{PretrainConfig, train_teacher_tsv},
     pikafish_selfplay::{SelfplayConfig, generate as generate_pikafish_selfplay},
+    uci_tournament::{TournamentConfig, run as run_uci_tournament},
     xiangqi::Position,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -74,6 +75,34 @@ enum CliCommand {
     PikafishPretrain(PikafishPretrainArgs),
     /// Generate AB self-play using ChineseAI's Pikafish-shaped value network.
     PikafishCandidateSelfplay(PikafishCandidateSelfplayArgs),
+    /// Play paired timed UCI matches from distinct opening-book positions.
+    #[command(name = "uci-tournament")]
+    UciTournament(UciTournamentArgs),
+}
+
+#[derive(Args, Debug)]
+struct UciTournamentArgs {
+    #[arg(long, default_value = "target/fast/chineseai-uci.exe")]
+    chinese_exe: PathBuf,
+    #[arg(long, default_value = "tools/pikafish.exe")]
+    pikafish_exe: PathBuf,
+    #[arg(long, default_value = "tools/pikafish.nnue")]
+    nnue: PathBuf,
+    #[arg(long, default_value = "book.pgn.gz")]
+    opening_book: PathBuf,
+    #[arg(long, default_value_t = 100)]
+    opening_positions: usize,
+    /// Simultaneous games; each runs two engine processes.
+    #[arg(long, default_value_t = 15)]
+    parallel_games: usize,
+    #[arg(long, default_value_t = 500)]
+    movetime_ms: u64,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 20260930)]
+    seed: u64,
+    #[arg(long, default_value = "target/fast/uci-tournament.tsv")]
+    output: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -2154,6 +2183,30 @@ fn main() {
                 report.draws,
                 report.truncated,
                 report.positions,
+                cmd.output.display()
+            );
+        }
+        Some(CliCommand::UciTournament(cmd)) => {
+            let report = run_uci_tournament(TournamentConfig {
+                chinese_exe: cmd.chinese_exe,
+                pikafish_exe: cmd.pikafish_exe,
+                nnue: cmd.nnue,
+                opening_book: cmd.opening_book,
+                opening_positions: cmd.opening_positions,
+                parallel_games: cmd.parallel_games,
+                movetime_ms: cmd.movetime_ms,
+                max_plies: cmd.max_plies,
+                seed: cmd.seed,
+                output: cmd.output.clone(),
+            })
+            .unwrap_or_else(|err| panic!("uci-tournament failed: {err}"));
+            println!(
+                "uci-tournament: games={} chinese_wins={} losses={} draws={} abnormal={} output={}",
+                report.games,
+                report.wins,
+                report.losses,
+                report.draws,
+                report.abnormal,
                 cmd.output.display()
             );
         }

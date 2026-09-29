@@ -6,6 +6,7 @@ pub mod pikafish_pretrain;
 pub mod pikafish_selfplay;
 pub mod profile;
 pub mod uci;
+pub mod uci_tournament;
 pub mod version;
 pub mod xiangqi;
 
