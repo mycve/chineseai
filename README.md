@@ -10,7 +10,7 @@
 
 网络借鉴稀疏特征累加与王桶变化时刷新的做法，搜索叶节点只计算价值头，并复用增量缓冲。当前模型是项目自己的浮点 WDL 价值单头结构，模型文件使用 safetensors；不兼容 Pikafish 的量化 `.nnue` 文件。搜索剪枝仍需通过象棋规则、节点预算和训练推理一致性测试逐项验证。
 
-最新 Pikafish 网络的精确维度、权重表和训练接线验收见 [PIKAFISH_NNUE_DESIGN.md](PIKAFISH_NNUE_DESIGN.md)。已实现 HalfKAv2_hm、FullThreats 特征编号、完整浮点前向、AB 搜索和独立的自有权重自博弈训练链；尚未完成与官方逐局面索引比对或接入 `ab-evolve` 的晋级流程。
+最新 Pikafish 网络的精确维度、权重表和训练接线验收见 [PIKAFISH_NNUE_DESIGN.md](PIKAFISH_NNUE_DESIGN.md)。已实现 HalfKAv2_hm、FullThreats 特征编号、完整浮点前向、AB 搜索和独立的自有权重自博弈训练链。ChineseAI UCI 现在能直接加载 `tools/pikafish.nnue`；七个测试局面的原始 NNUE 整数值与 Pikafish 一致。搜索分数、最佳着和节点数仍不同，剪枝尚未对齐；新模型也尚未接入 `ab-evolve` 晋级流程。
 
 对照测试可让 Pikafish 自己加载其权重：`chineseai vs-pikafish tools/pikafish.exe best.safetensors --pikafish-nnue tools/pikafish.nnue --games 2 --parallel-games 1 --opening-book ""`。程序通过 UCI `EvalFile` 设置该文件，执行一次深度 1 的预检搜索，并核对 Pikafish 报告的实际加载路径；随后才开始对局。`best.safetensors` 始终由 ChineseAI 自己加载与训练，Pikafish 的 `.nnue` 只用于对手测试，可在测试结束后删除。
 

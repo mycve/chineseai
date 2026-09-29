@@ -1,6 +1,7 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
 use super::pikafish_candle::{PikafishExample, PikafishModel};
 use super::{AbEvalAccumulator, AbEvalScratch, AbNnue};
+use crate::nnue::pikafish_file::PikafishNet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -224,6 +225,42 @@ impl ValueModel for PikafishModel {
         let q = self
             .evaluate(position, history, &[], &mut None)?
             .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+        Ok([(1.0 + q) * 0.5, 0.0, (1.0 - q) * 0.5])
+    }
+    fn scratch(&self) -> Option<AbEvalScratch> {
+        None
+    }
+}
+
+impl ValueModel for PikafishNet {
+    fn root_hidden(&self, _position: &Position) -> Vec<f32> {
+        Vec::new()
+    }
+    fn transition(
+        &self,
+        _before_buckets: [(usize, usize); 2],
+        _after: &Position,
+        _mv: Move,
+        _moved: crate::xiangqi::Piece,
+        _captured: Option<crate::xiangqi::Piece>,
+        _hidden: &mut [f32],
+    ) {
+    }
+    fn evaluate(
+        &self,
+        position: &Position,
+        _history: &[RuleHistoryEntry],
+        _hidden: &[f32],
+        _scratch: &mut Option<AbEvalScratch>,
+    ) -> Result<f32, String> {
+        Ok((self.evaluate(position)? as f32 / 600.0).tanh())
+    }
+    fn root_wdl(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+    ) -> Result<[f32; 3], String> {
+        let q = ValueModel::evaluate(self, position, history, &[], &mut None)?;
         Ok([(1.0 + q) * 0.5, 0.0, (1.0 - q) * 0.5])
     }
     fn scratch(&self) -> Option<AbEvalScratch> {
@@ -991,9 +1028,39 @@ pub(crate) fn search_uci(
     limits: AbSearchLimits,
     control: &AbSearchControl,
     multipv: usize,
+    progress: impl FnMut(&AbUciSearchResult),
+) -> AbUciSearchResult {
+    search_uci_with_model(
+        position, history, root_moves, model, limits, control, multipv, progress,
+    )
+}
+
+pub(crate) fn search_uci_pikafish(
+    position: &Position,
+    history: Vec<RuleHistoryEntry>,
+    root_moves: Vec<Move>,
+    model: &PikafishNet,
+    limits: AbSearchLimits,
+    control: &AbSearchControl,
+    multipv: usize,
+    progress: impl FnMut(&AbUciSearchResult),
+) -> AbUciSearchResult {
+    search_uci_with_model(
+        position, history, root_moves, model, limits, control, multipv, progress,
+    )
+}
+
+fn search_uci_with_model<M: ValueModel + ?Sized>(
+    position: &Position,
+    history: Vec<RuleHistoryEntry>,
+    root_moves: Vec<Move>,
+    model: &M,
+    limits: AbSearchLimits,
+    control: &AbSearchControl,
+    multipv: usize,
     mut progress: impl FnMut(&AbUciSearchResult),
 ) -> AbUciSearchResult {
-    let search = search_with_control(
+    let search = search_with_model(
         position,
         &history,
         root_moves,
@@ -1006,7 +1073,8 @@ pub(crate) fn search_uci(
         },
         Some(control),
         |snapshot| progress(&uci_report(snapshot.clone(), multipv)),
-    );
+    )
+    .expect("NNUE evaluation failed");
     uci_report(search, multipv)
 }
 

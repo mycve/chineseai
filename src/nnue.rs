@@ -10,6 +10,7 @@ pub const AB_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
 
 #[path = "nnue/full_threats.rs"]
 mod full_threats;
+pub mod pikafish_file;
 
 /// Pikafish 当前 HalfKAv2_hm + FullThreats 网络的权重形状。
 /// 这些常量是训练格式约束；现有 AB 模型仍使用上面的独立特征编码。

@@ -1,6 +1,8 @@
 use crate::ab::{
     AbNnue, AbSearchControl, AbSearchLimits, AbUciSearchResult, cp_from_q, search_uci,
+    search_uci_pikafish,
 };
+use crate::nnue::pikafish_file::PikafishNet;
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
 use std::sync::{
@@ -17,11 +19,17 @@ const MAX_SEARCH_NODES_OPTION: usize = 100_000_000;
 const DEFAULT_MOVE_OVERHEAD_MS: u64 = 10;
 
 #[derive(Clone)]
+enum UciModel {
+    Native(Arc<AbNnue>),
+    Pikafish(Arc<PikafishNet>),
+}
+
+#[derive(Clone)]
 struct UciState {
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
-    model: Option<Arc<AbNnue>>,
+    model: Option<UciModel>,
     nodes: usize,
     sixty_move_rule: bool,
     rule60_max_ply: u16,
@@ -98,6 +106,10 @@ pub fn run_uci() {
                 stop_active_search(&mut active_search);
                 handle_position(line, &mut state);
             }
+            Some("eval") => {
+                stop_active_search(&mut active_search);
+                print_static_eval(&mut state);
+            }
             Some("go") => {
                 stop_active_search(&mut active_search);
                 active_search = start_go(line, &mut state);
@@ -139,9 +151,19 @@ fn ensure_model(state: &mut UciState) -> bool {
     if state.model.is_some() {
         return true;
     }
-    match AbNnue::load(&state.eval_file) {
+    let loaded = if state.eval_file.to_ascii_lowercase().ends_with(".nnue") {
+        PikafishNet::load(std::path::Path::new(&state.eval_file))
+            .map(|model| UciModel::Pikafish(Arc::new(model)))
+    } else {
+        AbNnue::load(&state.eval_file)
+            .map(|model| UciModel::Native(Arc::new(model)))
+            .map_err(|error| error.to_string())
+    };
+    match loaded {
         Ok(model) => {
-            state.model = Some(Arc::new(model));
+            println!("info string loaded {}", state.eval_file);
+            state.model = Some(model);
+            flush();
             true
         }
         Err(err) => {
@@ -150,6 +172,24 @@ fn ensure_model(state: &mut UciState) -> bool {
             false
         }
     }
+}
+
+fn print_static_eval(state: &mut UciState) {
+    if !ensure_model(state) {
+        return;
+    }
+    match state.model.as_ref().unwrap() {
+        UciModel::Pikafish(model) => match model.evaluate(&state.position) {
+            Ok(raw) => println!("NNUE evaluation: {raw:+} (internal units)"),
+            Err(error) => println!("info string eval failed: {error}"),
+        },
+        UciModel::Native(model) => {
+            let wdl = model.evaluate_wdl_with_rules(&state.position, &state.rule_history);
+            let cp = (((wdl[0] - wdl[2]).clamp(-1.0, 1.0)) * 1000.0).round() as i32;
+            println!("info string ChineseAI native static value: {cp:+} project cp");
+        }
+    }
+    flush();
 }
 
 fn handle_setoption(line: &str, state: &mut UciState) {
@@ -432,7 +472,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AbSearchControl::new(Arc::clone(&stop), deadline);
-    println!("info string searchparams mode=alphabeta nodes={nodes}");
+    println!("info string searchparams mode=alphabeta nodes={nodes} score_scale=ChineseAI-q1000");
     flush();
     let mut last_score_source = None;
     let mut report_progress = |progress: &AbUciSearchResult| {
@@ -445,20 +485,33 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         print_search_info(progress, started, state.show_wdl);
         flush();
     };
-    let report = search_uci(
-        &state.position,
-        state.rule_history.clone(),
-        legal,
-        model,
-        AbSearchLimits {
-            nodes,
-            max_depth: params.depth.unwrap_or(0),
-            ..AbSearchLimits::default()
-        },
-        &control,
-        state.multipv,
-        &mut report_progress,
-    );
+    let limits = AbSearchLimits {
+        nodes,
+        max_depth: params.depth.unwrap_or(0),
+        ..AbSearchLimits::default()
+    };
+    let report = match model {
+        UciModel::Native(model) => search_uci(
+            &state.position,
+            state.rule_history.clone(),
+            legal,
+            model,
+            limits,
+            &control,
+            state.multipv,
+            &mut report_progress,
+        ),
+        UciModel::Pikafish(model) => search_uci_pikafish(
+            &state.position,
+            state.rule_history.clone(),
+            legal,
+            model,
+            limits,
+            &control,
+            state.multipv,
+            &mut report_progress,
+        ),
+    };
     let result = &report.search;
     if let Some(proven) = high_score_source(&report) {
         if last_score_source != Some(proven) {

@@ -14,14 +14,14 @@
 
 ## 接线顺序和验收
 
-1. HalfKAv2_hm 编号、镜像及攻击桶已有实现和局面测试；仍需与官方引擎导出的逐局面索引比对。
-2. FullThreats 45,547 编号和占位攻击关系已有实现及测试；仍需与官方逐局面索引比对，未完成之前不可宣称二进制兼容。
+1. HalfKAv2_hm 编号、镜像及攻击桶已有实现和局面测试；已通过多个局面的最终量化网络值对照，仍需与官方引擎导出的逐局面索引比对。
+2. FullThreats 45,547 编号和占位攻击关系已有实现及测试；已通过多个局面的最终量化网络值对照，仍需与官方逐局面索引比对。
 3. 训练态双视角前向及反向、16 个材料桶、PSQT 和跳连已有浮点实现与梯度测试；仍需比较逐局面训练态与量化态推理。
 4. 新模型已接入共用 AB 搜索，完成自有权重双边自博弈、非零损失更新和恢复续训的烟测。`ab-evolve` 的回放池与晋级流程仍使用旧模型，需要迁移到新模型。
-5. 导出兼容 `.nnue`，让本地 Pikafish 加载后对同一局面给出与训练态在量化误差内一致的分数，再进行晋级赛。
+5. ChineseAI UCI 已能读取用户提供的 Pikafish `.nnue`，初始局面及六个后续局面的原始 NNUE 整数值与官方引擎一致。自训练浮点权重的兼容 `.nnue` 导出及量化误差验证仍待完成；再进行晋级赛。
 
 当前 `AbNnue` 仍是 1,260 输入、256 默认隐藏维、WDL 输出的独立模型，不能把它的更新称作 Pikafish 结构训练。`tools/pikafish.nnue` 通过 Pikafish 进程的 `EvalFile` 选项参与对照测试，不进入 ChineseAI 训练器。
 
-本地测试权重是 Zstandard 压缩文件。用户更新后，解压文件头的网络版本为 `0x6A448AFA`，与固定的最新源码版本一致；这只验证版本字段，还不能替代结构哈希、全部权重内容和逐局面输出检查。对照测试仍由 `tools/pikafish.exe` 加载该文件；最新结构训练从自己的浮点权重开始，后续导出时再做完整兼容性验证。
+本地测试权重是 Zstandard 压缩文件。用户更新后，解压文件头的网络版本为 `0x6A448AFA`，与固定源码版本一致。ChineseAI 已完整解析结构哈希、压缩权重与量化层，在三个固定局面及四个自博弈局面与本地 Pikafish `eval` 的原始 NNUE 内部整数值一致。此结果验证当前权重的加载和已测局面的网络推理；不证明搜索剪枝一致。初始局面 depth 1：ChineseAI 为 157 项目 cp、174 节点、`h2e2`，Pikafish 为 22 cp、53 节点、`b2e2`；depth 2 亦不一致。可用 `python tests/uci_diff.py --chineseai target/fast/chineseai-uci.exe --pikafish tools/pikafish.exe --chineseai-nnue tools/pikafish.nnue --pikafish-nnue tools/pikafish.nnue --depths 1 2` 复核。下一步需分别对齐分数换算、静态调整、搜索和剪枝，再比较固定深度节点与着法。自训练权重从自己的浮点权重开始，后续导出时还需完整兼容性验证。
 
 源码：[网络层](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/nnue_architecture.h)、[特征变换器](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/nnue_feature_transformer.h)、[HalfKAv2_hm](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/features/half_ka_v2_hm.cpp)、[FullThreats](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/features/full_threats.cpp)。
