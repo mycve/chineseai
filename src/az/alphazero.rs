@@ -436,7 +436,8 @@ impl KldGainStopper {
             }
         }
         self.previous.clear();
-        self.previous.extend(children.iter().map(|child| child.visits));
+        self.previous
+            .extend(children.iter().map(|child| child.visits));
         self.total = total;
         false
     }
@@ -1004,8 +1005,7 @@ impl<'a> AzTree<'a> {
     fn immediate_mate_child(&self, node_index: usize) -> Option<usize> {
         let position = &self.nodes[node_index].position;
         for (index, child) in self.node_children(node_index).iter().enumerate() {
-            // expand 刚评估过同序走法，复用 policy 已计算的将军标记。
-            if self.eval_scratch.policy_gives_check[index] == 0.0 {
+            if !position.gives_check_after_move_fast(child.mv) {
                 continue;
             }
             let mut reply = position.clone();

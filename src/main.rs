@@ -14,11 +14,10 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, Px0ReplaySampler, SplitMix64,
-        alphazero_search, alphazero_search_trace_with_rules, alphazero_search_with_rules,
-        benchmark_training, dense_move_index, evaluate_policy_groups, generate_selfplay_data,
-        play_arena_games_from_positions, policy_target_entropy, train_samples_weighted,
-        train_samples_weighted_owned,
+        Px0ReplaySampler, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
+        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
+        generate_selfplay_data, play_arena_games_from_positions, policy_target_entropy,
+        train_samples_weighted, train_samples_weighted_owned,
     },
     nnue::{AZ_NNUE_INPUT_SIZE, canonical_move, extract_sparse_features_az},
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -99,7 +98,7 @@ enum CliCommand {
 #[derive(Args, Debug, Clone)]
 struct AzInitArgs {
     /// Hidden size of the model.
-    #[arg(default_value_t = 128)]
+    #[arg(default_value_t = 64)]
     hidden: usize,
     /// Output model path.
     #[arg(default_value = "model.safetensors")]
@@ -131,17 +130,10 @@ struct AzPolicyScaleArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PolicyComponent {
-    Exact,
-    Capture,
-    Factor,
-    Tactical,
-    TacticalExact,
-    TacticalFactor,
     Accumulator,
     Context,
     Consequence,
     MoveBias,
-    ThreatContext,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -272,7 +264,7 @@ struct AzReplayFitArgs {
     #[arg(long)]
     initial_model: Option<String>,
     /// Hidden width of the model under test.
-    #[arg(long, default_value_t = 192)]
+    #[arg(long, default_value_t = 64)]
     hidden: usize,
     /// Latest replay samples retained for the experiment.
     #[arg(long, default_value_t = 300_000)]
@@ -1493,25 +1485,11 @@ fn main() {
             );
             let mut model = AzNnue::load(&cmd.input)
                 .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
-            let sparse_len = model.policy_sparse_table.len();
             let weights: &mut [f32] = match cmd.component {
-                PolicyComponent::Exact => &mut model.policy_sparse_table[..POLICY_SPARSE_MAIN_SIZE],
-                PolicyComponent::Capture => {
-                    &mut model.policy_sparse_table[POLICY_SPARSE_MAIN_SIZE..sparse_len - 1]
-                }
-                PolicyComponent::Factor => &mut model.policy_sparse_factor,
-                PolicyComponent::Tactical => &mut model.policy_tactical,
-                PolicyComponent::TacticalExact => {
-                    &mut model.policy_tactical[..POLICY_TACTICAL_EXACT_SIZE]
-                }
-                PolicyComponent::TacticalFactor => {
-                    &mut model.policy_tactical[POLICY_TACTICAL_EXACT_SIZE..]
-                }
                 PolicyComponent::Accumulator => &mut model.policy_accumulator_move,
                 PolicyComponent::Context => &mut model.policy_move_context,
                 PolicyComponent::Consequence => &mut model.policy_consequence_output,
                 PolicyComponent::MoveBias => &mut model.policy_move_bias,
-                PolicyComponent::ThreatContext => &mut model.policy_threat_context,
             };
             let (rows, nonzero, before_l2) = {
                 let nonzero = weights.iter().filter(|&&weight| weight != 0.0).count();
