@@ -9,14 +9,12 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 use super::{
-    AzSampleMeta, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE, SplitMix64, WDL_HEAD_SIZE,
-    normalize_wdl_target,
+    AbSampleMeta, AbStartSource, AbTrainingSample, SplitMix64, WDL_HEAD_SIZE, normalize_wdl_target,
 };
 
-/// 经验池磁盘快照（与 `AzExperiencePool::save_snapshot_lz4` 对应）。
-const REPLAY_MAGIC: &[u8] = b"AZRP";
-/// 经验池快照内 `encode_az_training_sample` 布局版本（与旧版不兼容时递增）。
-// v32 开始使用干净主搜索与独立战术教师；旧访问目标语义不同，禁止混入。
+/// 经验池磁盘快照（与 `AbExperiencePool::save_snapshot_lz4` 对应）。
+const REPLAY_MAGIC: &[u8] = b"ABRP";
+/// 经验池快照内 `encode_ab_training_sample` 布局版本（与旧版不兼容时递增）。
 /// 分块快照解压后体积极限（防恶意或损坏文件占满内存）。
 const REPLAY_MAX_DECOMPRESSED_BYTES: usize = 16usize << 30;
 const REPLAY_CHUNKED_MARKER: &[u8] = b"CHNK";
@@ -25,7 +23,6 @@ const REPLAY_COMPRESS_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 const REPLAY_COMPRESS_CHUNK_BYTES: usize = 512;
 const REPLAY_MAX_FEATURES_PER_SAMPLE: u32 = 16_384;
-const REPLAY_MAX_MOVES_PER_SAMPLE: u32 = (DENSE_MOVE_SPACE as u32).saturating_add(128);
 fn replay_push_u32(out: &mut Vec<u8>, v: u32) {
     let mut buf = [0u8; 4];
     LittleEndian::write_u32(&mut buf, v);
@@ -56,21 +53,11 @@ fn replay_read_f32<R: Read>(reader: &mut R) -> io::Result<f32> {
     reader.read_f32::<LittleEndian>()
 }
 
-fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io::Result<()> {
+fn encode_ab_training_sample(out: &mut Vec<u8>, sample: &AbTrainingSample) -> io::Result<()> {
     if sample.features.len() > REPLAY_MAX_FEATURES_PER_SAMPLE as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "replay encode: too many features",
-        ));
-    }
-    if sample.move_indices.len() > REPLAY_MAX_MOVES_PER_SAMPLE as usize
-        || sample.policy.len() != sample.move_indices.len()
-        || (!sample.repetition_flags.is_empty()
-            && sample.repetition_flags.len() != sample.move_indices.len())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "replay encode: move_indices/policy mismatch or too long",
         ));
     }
     replay_push_u32(out, sample.features.len() as u32);
@@ -80,18 +67,6 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     for &value in &sample.rule_context {
         replay_push_f32(out, value);
     }
-    replay_push_u32(out, sample.move_indices.len() as u32);
-    for &m in &sample.move_indices {
-        replay_push_u32(out, m as u32);
-    }
-    if sample.repetition_flags.is_empty() {
-        out.resize(out.len() + sample.move_indices.len(), 0);
-    } else {
-        out.extend_from_slice(&sample.repetition_flags);
-    }
-    for &p in &sample.policy {
-        replay_push_f32(out, p);
-    }
     for &value in &normalize_wdl_target(sample.value_wdl) {
         replay_push_f32(out, value);
     }
@@ -100,17 +75,14 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     }
     replay_push_f32(out, sample.value);
     replay_push_f32(out, sample.side_sign);
-    replay_push_f32(out, sample.policy_weight);
     replay_push_f32(out, sample.value_weight);
-    replay_push_u32(out, sample.search_simulations);
+    replay_push_u32(out, sample.search_nodes);
     replay_push_u32(out, sample.meta.generation_update);
     replay_push_u64(out, sample.meta.game_id);
     replay_push_u32(out, sample.meta.ply as u32);
     replay_push_f32(out, sample.meta.root_q);
     replay_push_f32(out, sample.meta.best_q);
     replay_push_f32(out, sample.meta.played_q);
-    replay_push_u32(out, sample.meta.best_visits);
-    replay_push_u32(out, sample.meta.played_visits);
     replay_push_u32(out, sample.meta.best_index as u32);
     replay_push_u32(out, sample.meta.played_index as u32);
     out.push(sample.meta.start_source as u8);
@@ -119,7 +91,7 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
 
 #[derive(Clone, Debug)]
 struct ReplayEntry {
-    sample: AzTrainingSample,
+    sample: AbTrainingSample,
 }
 
 #[derive(Clone, Debug)]
@@ -129,7 +101,7 @@ struct ReplayChunk {
 }
 
 impl ReplayChunk {
-    fn new(samples: Vec<AzTrainingSample>) -> Self {
+    fn new(samples: Vec<AbTrainingSample>) -> Self {
         let generation_update = samples
             .first()
             .map(|sample| sample.meta.generation_update)
@@ -150,7 +122,7 @@ impl ReplayChunk {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AzReplayWindowStats {
+pub struct AbReplayWindowStats {
     pub chunks: usize,
     pub samples: usize,
     pub oldest_generation_update: u32,
@@ -161,19 +133,19 @@ pub struct AzReplayWindowStats {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct AzReplaySampleBatch {
-    pub samples: Vec<AzTrainingSample>,
+pub struct AbReplaySampleBatch {
+    pub samples: Vec<AbTrainingSample>,
     pub recent_samples: usize,
     pub actual_recent_samples: usize,
     pub full_window_samples: usize,
-    pub source_samples: [usize; AzStartSource::COUNT],
+    pub source_samples: [usize; AbStartSource::COUNT],
 }
 
 fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()> {
-    encode_az_training_sample(out, &entry.sample)
+    encode_ab_training_sample(out, &entry.sample)
 }
 
-fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
+fn decode_ab_training_sample<R: Read>(reader: &mut R) -> io::Result<AbTrainingSample> {
     let nf = replay_read_u32(reader)?;
     if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
         return Err(io::Error::new(
@@ -189,29 +161,6 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     for value in &mut rule_context {
         *value = replay_read_f32(reader)?;
     }
-    let nm = replay_read_u32(reader)?;
-    if nm > REPLAY_MAX_MOVES_PER_SAMPLE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "replay decode: move count out of range",
-        ));
-    }
-    let mut move_indices = Vec::with_capacity(nm as usize);
-    for _ in 0..nm {
-        move_indices.push(replay_read_u32(reader)? as usize);
-    }
-    let mut repetition_flags = vec![0; nm as usize];
-    reader.read_exact(&mut repetition_flags)?;
-    if repetition_flags.iter().any(|&flag| flag > 1) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "replay decode: invalid repetition flag",
-        ));
-    }
-    let mut policy = Vec::with_capacity(nm as usize);
-    for _ in 0..nm {
-        policy.push(replay_read_f32(reader)?);
-    }
     let mut value_wdl = [0.0f32; WDL_HEAD_SIZE];
     for value in &mut value_wdl {
         *value = replay_read_f32(reader)?;
@@ -224,66 +173,58 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     root_search_wdl = normalize_wdl_target(root_search_wdl);
     let value = replay_read_f32(reader)?;
     let side_sign = replay_read_f32(reader)?;
-    let policy_weight = replay_read_f32(reader)?;
     let value_weight = replay_read_f32(reader)?;
-    let search_simulations = replay_read_u32(reader)?;
-    let meta = AzSampleMeta {
+    let search_nodes = replay_read_u32(reader)?;
+    let meta = AbSampleMeta {
         generation_update: replay_read_u32(reader)?,
         game_id: replay_read_u64(reader)?,
         ply: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
         root_q: replay_read_f32(reader)?,
         best_q: replay_read_f32(reader)?,
         played_q: replay_read_f32(reader)?,
-        best_visits: replay_read_u32(reader)?,
-        played_visits: replay_read_u32(reader)?,
         best_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
         played_index: replay_read_u32(reader)?.min(u16::MAX as u32) as u16,
-        start_source: AzStartSource::from_u8(reader.read_u8()?).ok_or_else(|| {
+        start_source: AbStartSource::from_u8(reader.read_u8()?).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "replay decode: invalid start source",
             )
         })?,
     };
-    Ok(AzTrainingSample {
+    Ok(AbTrainingSample {
         features,
         rule_context,
-        move_indices,
-        repetition_flags,
-        policy,
         value_wdl,
         root_search_wdl,
         value,
         side_sign,
-        policy_weight,
         value_weight,
-        search_simulations,
+        search_nodes,
         meta,
     })
 }
 
 fn decode_replay_entry<R: Read>(reader: &mut R) -> io::Result<ReplayEntry> {
-    let sample = decode_az_training_sample(reader)?;
+    let sample = decode_ab_training_sample(reader)?;
     Ok(ReplayEntry { sample })
 }
 
 #[derive(Clone, Debug)]
-pub struct AzExperiencePool {
+pub struct AbExperiencePool {
     capacity: usize,
     chunks: VecDeque<ReplayChunk>,
     sample_count: usize,
 }
 
-/// Px0 train.py SKIP=32 与 shufflebuffer.py insert_or_replace。
-/// 降采样发生在每次读取对局时；不永久删除经验池里的其余局面。
-pub struct Px0ReplaySampler {
+/// 从对局中抽样局面，并通过置换缓冲区打乱训练顺序。
+pub struct ReplaySampler {
     capacity: usize,
-    buffer: Vec<AzTrainingSample>,
-    pending: VecDeque<AzTrainingSample>,
+    buffer: Vec<AbTrainingSample>,
+    pending: VecDeque<AbTrainingSample>,
     partition: Option<(u64, bool)>,
 }
 
-impl Px0ReplaySampler {
+impl ReplaySampler {
     pub fn new(shuffle_size: usize) -> Self {
         Self {
             capacity: shuffle_size.max(1),
@@ -302,16 +243,16 @@ impl Px0ReplaySampler {
 
     pub fn sample(
         &mut self,
-        pool: &AzExperiencePool,
+        pool: &AbExperiencePool,
         count: usize,
         recent_games: u32,
         rng: &mut SplitMix64,
-    ) -> AzReplaySampleBatch {
+    ) -> AbReplaySampleBatch {
         if pool.sample_count == 0
             || count == 0
             || !pool.chunks.iter().any(|chunk| self.includes(chunk))
         {
-            return AzReplaySampleBatch::default();
+            return AbReplaySampleBatch::default();
         }
         let recent_ids: std::collections::HashSet<_> = pool
             .chunks
@@ -321,7 +262,7 @@ impl Px0ReplaySampler {
             .flat_map(|chunk| chunk.entries.first())
             .map(|entry| entry.sample.meta.game_id)
             .collect();
-        let mut batch = AzReplaySampleBatch::default();
+        let mut batch = AbReplaySampleBatch::default();
         batch.samples.reserve(count);
         while batch.samples.len() < count {
             if self.pending.is_empty() {
@@ -373,7 +314,7 @@ fn chunk_is_test(chunk: &ReplayChunk, seed: u64) -> bool {
     SplitMix64::new(game_id ^ seed ^ 0xA076_1D64_78BD_642F).next_u64() % 10 == 0
 }
 
-impl AzExperiencePool {
+impl AbExperiencePool {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -401,12 +342,12 @@ impl AzExperiencePool {
 
     pub fn add_samples<I>(&mut self, samples: I)
     where
-        I: IntoIterator<Item = AzTrainingSample>,
+        I: IntoIterator<Item = AbTrainingSample>,
     {
         self.add_chunk(samples.into_iter().collect());
     }
 
-    fn add_chunk(&mut self, samples: Vec<AzTrainingSample>) {
+    fn add_chunk(&mut self, samples: Vec<AbTrainingSample>) {
         if self.capacity == 0 {
             return;
         }
@@ -433,13 +374,13 @@ impl AzExperiencePool {
         }
     }
 
-    pub fn add_games(&mut self, games: Vec<Vec<AzTrainingSample>>) {
+    pub fn add_games(&mut self, games: Vec<Vec<AbTrainingSample>>) {
         for game in games {
             self.add_chunk(game);
         }
     }
 
-    pub fn sample_uniform(&self, count: usize, rng: &mut SplitMix64) -> Vec<AzTrainingSample> {
+    pub fn sample_uniform(&self, count: usize, rng: &mut SplitMix64) -> Vec<AbTrainingSample> {
         if self.sample_count == 0 || count == 0 {
             return Vec::new();
         }
@@ -458,17 +399,17 @@ impl AzExperiencePool {
         recent_fraction: f32,
         recent_games: u32,
         rng: &mut SplitMix64,
-    ) -> AzReplaySampleBatch {
+    ) -> AbReplaySampleBatch {
         if self.sample_count == 0 || count == 0 {
-            return AzReplaySampleBatch::default();
+            return AbReplaySampleBatch::default();
         }
         let Some(recent_start) = self.recent_start_flat(recent_games.max(1)) else {
-            return AzReplaySampleBatch {
+            return AbReplaySampleBatch {
                 samples: self.sample_uniform(count, rng),
                 recent_samples: 0,
                 actual_recent_samples: 0,
                 full_window_samples: count,
-                source_samples: [0; AzStartSource::COUNT],
+                source_samples: [0; AbStartSource::COUNT],
             };
         };
         let recent_count = self.sample_count - recent_start;
@@ -487,12 +428,12 @@ impl AzExperiencePool {
             actual_recent_samples += usize::from(flat >= recent_start);
             samples.push(self.sample_by_flat_index(flat, &chunk_ends));
         }
-        AzReplaySampleBatch {
+        AbReplaySampleBatch {
             samples,
             recent_samples: recent_target,
             actual_recent_samples,
             full_window_samples: full_count,
-            source_samples: [0; AzStartSource::COUNT],
+            source_samples: [0; AbStartSource::COUNT],
         }
     }
 
@@ -524,7 +465,7 @@ impl AzExperiencePool {
             .collect()
     }
 
-    fn sample_by_flat_index(&self, index: usize, chunk_ends: &[usize]) -> AzTrainingSample {
+    fn sample_by_flat_index(&self, index: usize, chunk_ends: &[usize]) -> AbTrainingSample {
         debug_assert!(index < self.sample_count);
         let chunk_index = chunk_ends.partition_point(|&end| end <= index);
         let chunk_start = chunk_index
@@ -535,17 +476,17 @@ impl AzExperiencePool {
             .clone()
     }
 
-    pub fn all_samples(&self) -> Vec<AzTrainingSample> {
+    pub fn all_samples(&self) -> Vec<AbTrainingSample> {
         self.iter_samples().cloned().collect()
     }
 
-    pub fn iter_samples(&self) -> impl Iterator<Item = &AzTrainingSample> {
+    pub fn iter_samples(&self) -> impl Iterator<Item = &AbTrainingSample> {
         self.chunks
             .iter()
             .flat_map(|chunk| chunk.entries.iter().map(|entry| &entry.sample))
     }
 
-    pub fn all_sample_groups(&self) -> Vec<Vec<AzTrainingSample>> {
+    pub fn all_sample_groups(&self) -> Vec<Vec<AbTrainingSample>> {
         self.chunks
             .iter()
             .map(|chunk| {
@@ -558,9 +499,9 @@ impl AzExperiencePool {
             .collect()
     }
 
-    pub fn window_stats(&self, recent_games: u32) -> AzReplayWindowStats {
+    pub fn window_stats(&self, recent_games: u32) -> AbReplayWindowStats {
         if self.sample_count == 0 {
-            return AzReplayWindowStats::default();
+            return AbReplayWindowStats::default();
         }
         let oldest = self
             .chunks
@@ -580,7 +521,7 @@ impl AzExperiencePool {
             .take(recent_games.max(1) as usize)
             .map(ReplayChunk::len)
             .sum::<usize>();
-        AzReplayWindowStats {
+        AbReplayWindowStats {
             chunks: self.chunks.len(),
             samples: self.sample_count,
             oldest_generation_update: oldest,
@@ -781,38 +722,34 @@ impl AzExperiencePool {
 mod tests {
     use super::*;
 
-    fn sample(source: AzStartSource, generation: u32, id: u64) -> AzTrainingSample {
-        AzTrainingSample {
-            repetition_flags: vec![0],
+    fn sample(source: AbStartSource, generation: u32, id: u64) -> AbTrainingSample {
+        AbTrainingSample {
             features: vec![0],
             rule_context: [0.0; super::super::RULE_CONTEXT_SIZE],
-            move_indices: vec![0],
-            policy: vec![1.0],
             value_wdl: [0.0, 1.0, 0.0],
             root_search_wdl: [0.0, 1.0, 0.0],
             value: 0.0,
             side_sign: 1.0,
-            policy_weight: 1.0,
             value_weight: 1.0,
-            search_simulations: 400,
-            meta: AzSampleMeta {
+            search_nodes: 400,
+            meta: AbSampleMeta {
                 generation_update: generation,
                 game_id: id,
                 start_source: source,
-                ..AzSampleMeta::default()
+                ..AbSampleMeta::default()
             },
         }
     }
 
     #[test]
-    fn px0_sampler_keeps_pool_and_natural_phase_distribution_across_batches() {
-        let mut pool = AzExperiencePool::new(1000);
+    fn sampler_keeps_pool_and_natural_phase_distribution_across_batches() {
+        let mut pool = AbExperiencePool::new(1000);
         pool.add_games(
             (0..100)
                 .map(|game| {
                     (0..10)
                         .map(|_| {
-                            let mut item = sample(AzStartSource::OpeningBook, 1, game);
+                            let mut item = sample(AbStartSource::OpeningBook, 1, game);
                             item.meta.ply = if game < 90 { 15 } else { 150 };
                             item
                         })
@@ -820,7 +757,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let mut sampler = Px0ReplaySampler::new(128);
+        let mut sampler = ReplaySampler::new(128);
         let mut rng = SplitMix64::new(42);
         let first = sampler.sample(&pool, 2500, 10, &mut rng);
         let second = sampler.sample(&pool, 2500, 10, &mut rng);
@@ -845,26 +782,24 @@ mod tests {
     #[test]
     fn replay_roundtrip_preserves_start_source() {
         let mut encoded = Vec::new();
-        let mut original = sample(AzStartSource::OpeningBook, 7, 11);
+        let mut original = sample(AbStartSource::OpeningBook, 7, 11);
         original.root_search_wdl = [0.6, 0.3, 0.1];
-        original.repetition_flags[0] = 1;
-        encode_az_training_sample(&mut encoded, &original).unwrap();
-        let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
-        assert_eq!(decoded.meta.start_source, AzStartSource::OpeningBook);
+        encode_ab_training_sample(&mut encoded, &original).unwrap();
+        let decoded = decode_ab_training_sample(&mut Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.meta.start_source, AbStartSource::OpeningBook);
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
         assert_eq!(decoded.root_search_wdl, original.root_search_wdl);
-        assert_eq!(decoded.repetition_flags, original.repetition_flags);
     }
 
     #[test]
     fn whole_game_holdout_is_disjoint_and_stable_after_decode() {
-        let mut pool = AzExperiencePool::new(20_000);
+        let mut pool = AbExperiencePool::new(20_000);
         pool.add_games(
             (0..1000)
                 .map(|id| {
                     (0..10)
-                        .map(|_| sample(AzStartSource::OpeningBook, 1, id))
+                        .map(|_| sample(AbStartSource::OpeningBook, 1, id))
                         .collect()
                 })
                 .collect(),
@@ -875,8 +810,8 @@ mod tests {
             (70..130).contains(&test_chunks),
             "test chunks={test_chunks}"
         );
-        let mut train = Px0ReplaySampler::partitioned(64, 77, false);
-        let mut test = Px0ReplaySampler::partitioned(6, 77, true);
+        let mut train = ReplaySampler::partitioned(64, 77, false);
+        let mut test = ReplaySampler::partitioned(6, 77, true);
         let train = train.sample(&pool, 1000, 0, &mut SplitMix64::new(1));
         let test = test.sample(&pool, 1000, 0, &mut SplitMix64::new(2));
         let train_ids: std::collections::HashSet<_> =
@@ -893,9 +828,9 @@ mod tests {
             let restored = ReplayChunk::new(vec![decoded.sample]);
             assert_eq!(chunk_is_test(chunk, 77), chunk_is_test(&restored, 77));
         }
-        let empty = AzExperiencePool::new(10);
+        let empty = AbExperiencePool::new(10);
         assert!(
-            Px0ReplaySampler::partitioned(6, 77, true)
+            ReplaySampler::partitioned(6, 77, true)
                 .sample(&empty, 8, 0, &mut SplitMix64::new(3))
                 .samples
                 .is_empty()

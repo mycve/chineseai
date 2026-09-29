@@ -475,7 +475,7 @@ fn repetition_cycle(history: &[RuleHistoryEntry]) -> Option<&[RuleHistoryEntry]>
             entry.hash == current.hash && entry.side_to_move == current.side_to_move
         });
     let cycle_start = matches.next()?.0 + 1;
-    // Px0正式终局要求同一局面第三次出现；一次循环不能直接判负。
+    // 同一局面第三次出现才构成终局；一次循环不能直接判负。
     matches.next()?;
     Some(&history[cycle_start..=current_index])
 }

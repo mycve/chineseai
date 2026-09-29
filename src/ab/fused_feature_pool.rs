@@ -5,16 +5,16 @@ use candle_core::{CpuStorage, CustomOp2, CustomOp3, Layout, Result, Shape, Tenso
 use super::{
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
 };
-use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::nnue::AB_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
 
 pub(super) const PADDING_ITEM: u32 = u32::MAX;
-const PIECE_OFFSET: usize = AZ_NNUE_INPUT_SIZE;
+const PIECE_OFFSET: usize = AB_NNUE_INPUT_SIZE;
 const RANK_OFFSET: usize = PIECE_OFFSET + STRUCTURAL_PIECE_SIZE;
 const FILE_OFFSET: usize = RANK_OFFSET + STRUCTURAL_RANK_SIZE;
 const KING_OFFSET: usize = FILE_OFFSET + STRUCTURAL_FILE_SIZE;
 const TABLE_ROWS: usize = KING_OFFSET + STRUCTURAL_KING_PIECE_SIZE;
-const _: () = assert!(AZ_NNUE_INPUT_SIZE == 1260);
+const _: () = assert!(AB_NNUE_INPUT_SIZE == 1260);
 const _: () = assert!(PIECE_OFFSET == 1260 && RANK_OFFSET == 1274);
 const _: () = assert!(FILE_OFFSET == 1284 && KING_OFFSET == 1293 && TABLE_ROWS == 1545);
 
@@ -109,7 +109,7 @@ pub(super) fn feature_pool(tables: &Tensor, items: &Tensor) -> Result<Tensor> {
 
 impl CustomOp2 for FeaturePool {
     fn name(&self) -> &'static str {
-        "az-feature-pool"
+        "ab-feature-pool"
     }
 
     fn cpu_fwd(
@@ -171,7 +171,7 @@ impl CustomOp2 for FeaturePool {
 
 impl CustomOp3 for FeaturePoolGrad {
     fn name(&self) -> &'static str {
-        "az-feature-pool-grad"
+        "ab-feature-pool-grad"
     }
 
     fn cpu_fwd(

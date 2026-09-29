@@ -5,19 +5,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
-use crate::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::BOARD_SIZE;
-
 use super::{
-    AzTrainingSample, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE,
-    canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    dense_move_squares,
+    AbTrainingSample, RULE_CONTEXT_SIZE, WDL_HEAD_SIZE, canonical_general_buckets_from_features,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
-    fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     normalize_wdl_target,
 };
-
-const POLICY_MASK_VALUE: f32 = -1.0e9;
+use crate::nnue::AB_NNUE_INPUT_SIZE;
 
 #[derive(Clone, Debug)]
 pub(super) struct DataLoaderConfig {
@@ -91,23 +84,17 @@ pub(super) struct PackedStepBatch {
 pub(super) struct PackedBatch {
     pub batch_size: usize,
     pub max_features: usize,
-    pub max_policy_moves: usize,
     pub feature_items: Vec<u32>,
-    pub policy_items: Vec<i64>,
-    pub policy_targets: Vec<f32>,
-    pub policy_mask: Vec<f32>,
-    pub policy_repetition: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
-    pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
     pub value_source_phase_masks: Vec<f32>,
 }
 
 impl PackedBatch {
-    pub(super) fn from_indices(samples: &[AzTrainingSample], batch: &[usize]) -> Self {
+    pub(super) fn from_indices(samples: &[AbTrainingSample], batch: &[usize]) -> Self {
         let batch_size = batch.len();
         let max_features = batch
             .iter()
@@ -115,31 +102,13 @@ impl PackedBatch {
             .max()
             .unwrap_or(0)
             .max(1);
-        let max_policy_moves = batch
-            .iter()
-            .map(|&sample_index| {
-                samples[sample_index]
-                    .move_indices
-                    .iter()
-                    .filter(|&&move_index| move_index < DENSE_MOVE_SPACE)
-                    .count()
-            })
-            .max()
-            .unwrap_or(0)
-            .max(1);
         let mut packed = Self {
             batch_size,
             max_features,
-            max_policy_moves,
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
-            policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
-            policy_targets: vec![0.0f32; batch_size * max_policy_moves],
-            policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
-            policy_repetition: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
-            policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
             value_phase_masks: vec![0.0f32; batch_size * 3],
             value_source_phase_masks: vec![0.0f32; batch_size * 9],
@@ -148,13 +117,11 @@ impl PackedBatch {
         for (row, &sample_index) in batch.iter().enumerate() {
             let sample = &samples[sample_index];
             packed.pack_features(row, sample);
-            packed.pack_policy(row, sample);
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
                 .copy_from_slice(&sample.rule_context);
-            packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
             let phase = if sample.meta.ply < 40 {
                 0
@@ -170,83 +137,18 @@ impl PackedBatch {
         packed
     }
 
-    fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
+    fn pack_features(&mut self, row: usize, sample: &AbTrainingSample) {
         let (us_king_bucket, them_king_bucket) =
             canonical_general_buckets_from_features(&sample.features);
         let feature_base = row * self.max_features;
         for (feature_offset, &feature) in sample.features.iter().enumerate() {
-            if feature >= AZ_NNUE_INPUT_SIZE {
+            if feature >= AB_NNUE_INPUT_SIZE {
                 continue;
             }
             let batch_feature_index = feature_base + feature_offset;
             self.feature_items[batch_feature_index] =
                 pack_feature(feature, us_king_bucket, them_king_bucket);
         }
-    }
-
-    fn pack_policy(&mut self, row: usize, sample: &AzTrainingSample) {
-        let policy_base = row * self.max_policy_moves;
-        let mut board_features = [usize::MAX; BOARD_SIZE];
-        for &feature in &sample.features {
-            if let Some(structural) = decode_current_piece_square_feature(feature) {
-                let square = structural.rank * 9 + structural.file;
-                board_features[square] = feature;
-            }
-        }
-        let mut policy_offset = 0usize;
-        for (sample_offset, (&move_index, &target)) in sample
-            .move_indices
-            .iter()
-            .zip(sample.policy.iter())
-            .enumerate()
-        {
-            if move_index < DENSE_MOVE_SPACE {
-                self.policy_targets[policy_base + policy_offset] = target.max(0.0);
-                self.policy_mask[policy_base + policy_offset] = 0.0;
-                self.policy_repetition[policy_base + policy_offset] = f32::from(
-                    sample
-                        .repetition_flags
-                        .get(sample_offset)
-                        .copied()
-                        .unwrap_or(0),
-                );
-                let mut consequence_from = 0usize;
-                let mut consequence_to = 0usize;
-                let mut consequence_captured = 0usize;
-                let mut move_valid = false;
-                let mut capture_valid = false;
-                if let Some((from, to)) = dense_move_squares(move_index) {
-                    let moved_feature = board_features[from];
-                    if moved_feature != usize::MAX
-                        && moved_feature / BOARD_SIZE < super::STRUCTURAL_PIECE_SIZE / 2
-                    {
-                        let piece_index = moved_feature / BOARD_SIZE;
-                        consequence_from = moved_feature;
-                        consequence_to = piece_index * BOARD_SIZE + to;
-                        move_valid = true;
-                        let captured_feature = board_features[to];
-                        if captured_feature != usize::MAX {
-                            consequence_captured = captured_feature;
-                            capture_valid = true;
-                        }
-                    }
-                }
-                let item_index = policy_base + policy_offset;
-                self.policy_items[item_index] = pack_policy_item(
-                    move_index,
-                    consequence_from,
-                    consequence_to,
-                    consequence_captured,
-                    move_valid,
-                    capture_valid,
-                );
-                policy_offset += 1;
-            }
-        }
-        normalize_policy_targets(
-            &mut self.policy_targets[policy_base..policy_base + self.max_policy_moves],
-            policy_offset,
-        );
     }
 }
 
@@ -266,7 +168,7 @@ pub(super) struct PrefetchDataLoader {
 
 impl PrefetchDataLoader {
     pub(super) fn new(
-        samples: Arc<Vec<AzTrainingSample>>,
+        samples: Arc<Vec<AbTrainingSample>>,
         plan: BatchPlan,
         config: &DataLoaderConfig,
     ) -> Self {
@@ -344,22 +246,6 @@ impl PrefetchDataLoader {
     }
 }
 
-fn normalize_policy_targets(targets: &mut [f32], active: usize) {
-    if active == 0 {
-        return;
-    }
-    let active_targets = &mut targets[..active];
-    let sum = active_targets.iter().copied().sum::<f32>();
-    if sum.is_finite() && sum > 1.0e-12 {
-        for target in active_targets.iter_mut() {
-            *target = (*target / sum).max(0.0);
-        }
-    } else {
-        let uniform = 1.0 / active as f32;
-        active_targets.fill(uniform);
-    }
-}
-
 fn shuffle_indices(values: &mut [usize], seed: u64) {
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     for index in (1..values.len()).rev() {
@@ -380,25 +266,21 @@ fn splitmix_next(state: &mut u64) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{az::AzSampleMeta, xiangqi::Move};
+    use crate::ab::AbSampleMeta;
 
     use super::*;
 
-    fn sample(index: usize) -> AzTrainingSample {
-        AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features: vec![index % AZ_NNUE_INPUT_SIZE],
+    fn sample(index: usize) -> AbTrainingSample {
+        AbTrainingSample {
+            features: vec![index % AB_NNUE_INPUT_SIZE],
             rule_context: [0.0; RULE_CONTEXT_SIZE],
-            move_indices: vec![0, 1],
-            policy: vec![1.0 + index as f32, 1.0],
             value_wdl: [1.0, 0.0, 0.0],
             root_search_wdl: [1.0, 0.0, 0.0],
             value: 2.0,
             side_sign: 1.0,
-            policy_weight: 1.0,
             value_weight: 1.0,
-            search_simulations: 0,
-            meta: AzSampleMeta::default(),
+            search_nodes: 0,
+            meta: AbSampleMeta::default(),
         }
     }
 
@@ -417,46 +299,17 @@ mod tests {
     }
 
     #[test]
-    fn packed_batch_normalizes_policy_and_clamps_targets() {
+    fn packed_batch_clamps_value_targets() {
         let mut samples = vec![sample(0), sample(1)];
-        samples[1].meta.start_source = crate::az::AzStartSource::Midgame;
+        samples[1].meta.start_source = crate::ab::AbStartSource::Midgame;
         samples[1].meta.ply = 130;
         let packed = PackedBatch::from_indices(&samples, &[0, 1]);
         assert_eq!(packed.batch_size, 2);
-        assert_eq!(packed.max_policy_moves, 2);
-        assert_eq!(packed.policy_targets[0], 0.5);
-        assert_eq!(packed.policy_targets[1], 0.5);
-        assert!((packed.policy_targets[2] - 2.0 / 3.0).abs() < 1.0e-6);
-        assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
         assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
         assert_eq!(packed.values, vec![1.0, 1.0]);
         assert_eq!(packed.value_source_phase_masks[0], 1.0);
         assert_eq!(packed.value_source_phase_masks[9 + 8], 1.0);
         assert_eq!(packed.value_source_phase_masks.iter().sum::<f32>(), 2.0);
-    }
-
-    #[test]
-    fn packed_policy_consequence_encodes_move_and_capture() {
-        let moved_feature = 6 * BOARD_SIZE;
-        let captured_feature = 10 * BOARD_SIZE + 1;
-        let move_index = super::super::dense_move_index(Move::new(0, 1));
-        let mut training_sample = sample(0);
-        training_sample.features = vec![moved_feature, captured_feature];
-        training_sample.move_indices = vec![move_index];
-        training_sample.policy = vec![1.0];
-
-        let packed = PackedBatch::from_indices(&[training_sample], &[0]);
-        assert_eq!(
-            packed.policy_items,
-            vec![pack_policy_item(
-                move_index,
-                moved_feature,
-                6 * BOARD_SIZE + 1,
-                captured_feature,
-                true,
-                true,
-            )]
-        );
     }
 
     #[test]

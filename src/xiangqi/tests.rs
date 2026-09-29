@@ -177,23 +177,6 @@ fn cannon_requires_exactly_one_screen_to_capture() {
 }
 
 #[test]
-fn network_relations_include_cannon_screen_and_target() {
-    let position = Position::from_canonical_piece_squares(&[
-        (5, 40),  // red cannon
-        (6, 41),  // red soldier used as screen
-        (11, 43), // black rook behind the screen
-    ]);
-    let mut targets = Vec::new();
-    position.visit_occupied_relations(|source, attacker, target, _| {
-        if source == 40 && attacker.kind == PieceKind::Cannon {
-            targets.push(target);
-        }
-    });
-    targets.sort_unstable();
-    assert_eq!(targets, vec![41, 43]);
-}
-
-#[test]
 fn facing_generals_exposure_is_illegal() {
     let position = Position::from_fen("4k4/9/9/9/9/9/4R4/9/9/4K4 w").unwrap();
     let moves = position.legal_moves();
@@ -319,35 +302,6 @@ fn fast_attack_detection_matches_slow_scan() {
                 );
             }
         }
-    }
-}
-
-#[test]
-fn batched_attack_mask_matches_individual_queries() {
-    let mut rng = 0xD1B54A32D192ED03u64;
-    let mut position = Position::startpos();
-    for ply in 0..1_000 {
-        let masks = position.attacked_squares_masks();
-        for color in [Color::Red, Color::Black] {
-            let mask = masks[color_index(color)];
-            for square in 0..BOARD_SIZE {
-                assert_eq!(
-                    mask & (1u128 << square) != 0,
-                    position.is_square_attacked(square, color),
-                    "ply={ply} color={color:?} square={square} fen={}",
-                    position.to_fen()
-                );
-            }
-        }
-        let moves = position.legal_moves();
-        if moves.is_empty() {
-            position = Position::startpos();
-            continue;
-        }
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        position.make_move(moves[rng as usize % moves.len()]);
     }
 }
 

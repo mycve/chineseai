@@ -2,18 +2,17 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::nnue::{
-    canonical_move, extract_sparse_features_az, mirror_file_move,
-    mirror_sparse_features_az_canonical_file,
-};
+use crate::nnue::{extract_sparse_features_ab, mirror_sparse_features_ab_canonical_file};
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
 use super::alphabeta;
 use super::{
-    AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
-    AzStartSource, AzTrainingSample, SplitMix64, dense_move_index, normalize_wdl_target,
-    rule_context_features, scalar_value_to_wdl_target,
+    AbCandidate, AbEvolveConfig, AbNnue, AbSampleMeta, AbSearchLimits, AbStartSnapshot,
+    AbStartSource, AbTrainingSample, SplitMix64, normalize_wdl_target, rule_context_features,
+    scalar_value_to_wdl_target,
 };
+
+const BOOTSTRAP_VALUE_WEIGHT: f32 = 0.25;
 
 fn outcome_index(result_red: f32) -> usize {
     if result_red > 0.0 {
@@ -26,7 +25,7 @@ fn outcome_index(result_red: f32) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AzTerminalStats {
+pub struct AbTerminalStats {
     /// 已由搜索证明的提前终局，按红胜、和棋、黑胜排列。
     pub search_proven: [usize; 3],
     pub no_legal_moves: usize,
@@ -48,19 +47,19 @@ pub struct AzTerminalStats {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AzSearchSimulationStats {
+pub struct AbSearchNodeStats {
     pub searches: usize,
-    pub simulations_sum: usize,
+    pub nodes_sum: usize,
 }
 
-impl AzSearchSimulationStats {
+impl AbSearchNodeStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.searches += other.searches;
-        self.simulations_sum += other.simulations_sum;
+        self.nodes_sum += other.nodes_sum;
     }
 }
 
-impl AzTerminalStats {
+impl AbTerminalStats {
     fn record_no_legal_moves(&mut self, position: &Position) {
         self.no_legal_moves += 1;
         if !position.legal_moves().is_empty() {
@@ -96,7 +95,7 @@ impl AzTerminalStats {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AzArenaReport {
+pub struct AbArenaReport {
     pub wins: usize,
     pub losses: usize,
     pub draws: usize,
@@ -110,7 +109,7 @@ pub struct AzArenaReport {
     pub paired_score_sq_sum: f32,
 }
 
-impl AzArenaReport {
+impl AbArenaReport {
     pub fn add_assign(&mut self, other: &Self) {
         self.wins += other.wins;
         self.losses += other.losses;
@@ -184,37 +183,27 @@ fn score_rate_to_elo(score: f32) -> f32 {
 }
 
 #[derive(Clone, Default)]
-pub struct AzSelfplayData {
-    pub samples: Vec<AzTrainingSample>,
-    pub games: Vec<Vec<AzTrainingSample>>,
+pub struct AbSelfplayData {
+    pub samples: Vec<AbTrainingSample>,
+    pub games: Vec<Vec<AbTrainingSample>>,
     pub position_fens: Vec<String>,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,
     pub plies_total: usize,
-    pub start_games: [usize; AzStartSource::COUNT],
-    pub start_phase_ply_sum: [u64; AzStartSource::COUNT],
-    pub start_age_sum: [u64; AzStartSource::COUNT],
-    pub start_age_max: [u32; AzStartSource::COUNT],
-    pub start_temperature_sum: [f32; AzStartSource::COUNT],
-    pub entropy_all_sum: f32,
-    pub entropy_all_count: usize,
+    pub start_games: [usize; AbStartSource::COUNT],
+    pub start_phase_ply_sum: [u64; AbStartSource::COUNT],
+    pub start_age_sum: [u64; AbStartSource::COUNT],
+    pub start_age_max: [u32; AbStartSource::COUNT],
+    pub start_temperature_sum: [f32; AbStartSource::COUNT],
     pub entropy_opening_sum: f32,
     pub entropy_opening_count: usize,
     pub entropy_mid_sum: f32,
     pub entropy_mid_count: usize,
-    pub raw_prior_top1_sum: f32,
-    pub raw_prior_top2_sum: f32,
-    pub policy_top1_sum: f32,
-    pub policy_top2_sum: f32,
     pub q_gap_sum: f32,
     pub q_top1_abs_sum: f32,
     pub root_actions_sum: usize,
     pub shape_count: usize,
-    pub opening_raw_prior_top1_sum: f32,
-    pub opening_raw_prior_top2_sum: f32,
-    pub opening_policy_top1_sum: f32,
-    pub opening_policy_top2_sum: f32,
     pub opening_q_gap_sum: f32,
     pub opening_q_top1_abs_sum: f32,
     pub opening_root_actions_sum: usize,
@@ -222,14 +211,13 @@ pub struct AzSelfplayData {
     pub sampled_moves: usize,
     pub sampled_best_moves: usize,
     pub best_played_q_gap_sum: f32,
-    pub played_top_policy_ratio_sum: f32,
     pub best_q_sum: f32,
     pub played_q_sum: f32,
-    pub terminal: AzTerminalStats,
-    pub search_simulations: AzSearchSimulationStats,
+    pub terminal: AbTerminalStats,
+    pub search_nodes: AbSearchNodeStats,
 }
 
-impl AzSelfplayData {
+impl AbSelfplayData {
     pub fn add_assign(&mut self, other: &Self) {
         self.samples.extend(other.samples.iter().cloned());
         self.games.extend(other.games.iter().cloned());
@@ -239,7 +227,7 @@ impl AzSelfplayData {
         self.black_wins += other.black_wins;
         self.draws += other.draws;
         self.plies_total += other.plies_total;
-        for source in 0..AzStartSource::COUNT {
+        for source in 0..AbStartSource::COUNT {
             self.start_games[source] += other.start_games[source];
             self.start_phase_ply_sum[source] += other.start_phase_ply_sum[source];
             self.start_age_sum[source] += other.start_age_sum[source];
@@ -247,24 +235,14 @@ impl AzSelfplayData {
                 self.start_age_max[source].max(other.start_age_max[source]);
             self.start_temperature_sum[source] += other.start_temperature_sum[source];
         }
-        self.entropy_all_sum += other.entropy_all_sum;
-        self.entropy_all_count += other.entropy_all_count;
         self.entropy_opening_sum += other.entropy_opening_sum;
         self.entropy_opening_count += other.entropy_opening_count;
         self.entropy_mid_sum += other.entropy_mid_sum;
         self.entropy_mid_count += other.entropy_mid_count;
-        self.raw_prior_top1_sum += other.raw_prior_top1_sum;
-        self.raw_prior_top2_sum += other.raw_prior_top2_sum;
-        self.policy_top1_sum += other.policy_top1_sum;
-        self.policy_top2_sum += other.policy_top2_sum;
         self.q_gap_sum += other.q_gap_sum;
         self.q_top1_abs_sum += other.q_top1_abs_sum;
         self.root_actions_sum += other.root_actions_sum;
         self.shape_count += other.shape_count;
-        self.opening_raw_prior_top1_sum += other.opening_raw_prior_top1_sum;
-        self.opening_raw_prior_top2_sum += other.opening_raw_prior_top2_sum;
-        self.opening_policy_top1_sum += other.opening_policy_top1_sum;
-        self.opening_policy_top2_sum += other.opening_policy_top2_sum;
         self.opening_q_gap_sum += other.opening_q_gap_sum;
         self.opening_q_top1_abs_sum += other.opening_q_top1_abs_sum;
         self.opening_root_actions_sum += other.opening_root_actions_sum;
@@ -272,17 +250,15 @@ impl AzSelfplayData {
         self.sampled_moves += other.sampled_moves;
         self.sampled_best_moves += other.sampled_best_moves;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
-        self.played_top_policy_ratio_sum += other.played_top_policy_ratio_sum;
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
-        self.search_simulations
-            .add_assign(&other.search_simulations);
+        self.search_nodes.add_assign(&other.search_nodes);
     }
 }
 
-pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
-    crate::scope_profile!("az.selfplay.generate");
+pub fn generate_selfplay_data(model: &AbNnue, config: &AbEvolveConfig) -> AbSelfplayData {
+    crate::scope_profile!("ab.selfplay.generate");
     let workers = config.workers.max(1).min(config.games.max(1));
     if workers == 1 || config.games <= 1 {
         return generate_selfplay_chunk(model, config);
@@ -318,21 +294,21 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
             })
             .collect::<Vec<_>>()
     });
-    let mut merged = AzSelfplayData::default();
+    let mut merged = AbSelfplayData::default();
     for chunk in chunks {
         merged.add_assign(&chunk);
     }
     merged
 }
 
-fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, _seed: u64) -> AzSearchLimits {
-    AzSearchLimits {
-        simulations: config.simulations.max(1),
+fn selfplay_search_limits(config: &AbEvolveConfig, _ply: usize, _seed: u64) -> AbSearchLimits {
+    AbSearchLimits {
+        nodes: config.nodes.max(1),
         max_depth: 0,
     }
 }
 
-fn configure_selfplay_rules(mut position: Position, config: &AzLoopConfig) -> Position {
+fn configure_selfplay_rules(mut position: Position, config: &AbEvolveConfig) -> Position {
     position.set_rule60_max_ply(config.rule60_max_ply);
     position
 }
@@ -341,12 +317,12 @@ struct SelfplayStart {
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     phase_ply: usize,
-    source: AzStartSource,
+    source: AbStartSource,
     generation: u32,
 }
 
 fn choose_selfplay_start(
-    config: &AzLoopConfig,
+    config: &AbEvolveConfig,
     _rng: &mut SplitMix64,
     game_index: usize,
 ) -> SelfplayStart {
@@ -356,7 +332,7 @@ fn choose_selfplay_start(
             position: configure_selfplay_rules(snapshot.position.clone(), config),
             rule_history: snapshot.rule_history.clone(),
             phase_ply: snapshot.phase_ply as usize,
-            source: AzStartSource::OpeningBook,
+            source: AbStartSource::OpeningBook,
             generation: snapshot.generation,
         };
     }
@@ -366,13 +342,13 @@ fn choose_selfplay_start(
         position,
         rule_history,
         phase_ply: 0,
-        source: AzStartSource::Startpos,
+        source: AbStartSource::Startpos,
         generation: config.generation_update,
     }
 }
 
-fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
-    crate::scope_profile!("az.selfplay.chunk");
+fn generate_selfplay_chunk(model: &AbNnue, config: &AbEvolveConfig) -> AbSelfplayData {
+    crate::scope_profile!("ab.selfplay.chunk");
     let mut rng = SplitMix64::new(config.seed);
     let mut samples = Vec::new();
     let mut position_fens = Vec::new();
@@ -380,30 +356,20 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut black_wins = 0usize;
     let mut draws = 0usize;
     let mut plies_total = 0usize;
-    let mut start_games = [0usize; AzStartSource::COUNT];
-    let mut start_phase_ply_sum = [0u64; AzStartSource::COUNT];
-    let mut start_age_sum = [0u64; AzStartSource::COUNT];
-    let mut start_age_max = [0u32; AzStartSource::COUNT];
-    let mut start_temperature_sum = [0.0f32; AzStartSource::COUNT];
+    let mut start_games = [0usize; AbStartSource::COUNT];
+    let mut start_phase_ply_sum = [0u64; AbStartSource::COUNT];
+    let mut start_age_sum = [0u64; AbStartSource::COUNT];
+    let mut start_age_max = [0u32; AbStartSource::COUNT];
+    let mut start_temperature_sum = [0.0f32; AbStartSource::COUNT];
     let mut games = Vec::with_capacity(config.games);
-    let mut entropy_all_sum = 0.0f32;
-    let mut entropy_all_count = 0usize;
     let mut entropy_opening_sum = 0.0f32;
     let mut entropy_opening_count = 0usize;
     let mut entropy_mid_sum = 0.0f32;
     let mut entropy_mid_count = 0usize;
-    let mut raw_prior_top1_sum = 0.0f32;
-    let mut raw_prior_top2_sum = 0.0f32;
-    let mut policy_top1_sum = 0.0f32;
-    let mut policy_top2_sum = 0.0f32;
     let mut q_gap_sum = 0.0f32;
     let mut q_top1_abs_sum = 0.0f32;
     let mut root_actions_sum = 0usize;
     let mut shape_count = 0usize;
-    let mut opening_raw_prior_top1_sum = 0.0f32;
-    let mut opening_raw_prior_top2_sum = 0.0f32;
-    let mut opening_policy_top1_sum = 0.0f32;
-    let mut opening_policy_top2_sum = 0.0f32;
     let mut opening_q_gap_sum = 0.0f32;
     let mut opening_q_top1_abs_sum = 0.0f32;
     let mut opening_root_actions_sum = 0usize;
@@ -411,11 +377,10 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut sampled_moves = 0usize;
     let mut sampled_best_moves = 0usize;
     let mut best_played_q_gap_sum = 0.0f32;
-    let mut played_top_policy_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
     let mut played_q_sum = 0.0f32;
-    let mut terminal = AzTerminalStats::default();
-    let mut search_simulations = AzSearchSimulationStats::default();
+    let mut terminal = AbTerminalStats::default();
+    let mut search_nodes = AbSearchNodeStats::default();
 
     for game_index in 0..config.games {
         let start = choose_selfplay_start(config, &mut rng, game_index);
@@ -440,7 +405,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             let ply = start_phase_ply + local_ply;
             plies = local_ply + 1;
             let legal = {
-                crate::scope_profile!("az.selfplay.root_legal_moves");
+                crate::scope_profile!("ab.selfplay.root_legal_moves");
                 position
                     .legal_moves_with_rules_and_repetition(&rule_history)
                     .into_iter()
@@ -457,7 +422,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
 
-            search_simulations.searches += 1;
+            search_nodes.searches += 1;
 
             let limits = selfplay_search_limits(
                 config,
@@ -465,11 +430,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 rng.next_u64() ^ ((game_index as u64) << 32) ^ ply as u64,
             );
             let search = {
-                crate::scope_profile!("az.selfplay.search");
-                alphabeta::search(&position, &rule_history, legal, model, limits.simulations)
+                crate::scope_profile!("ab.selfplay.search");
+                alphabeta::search(&position, &rule_history, legal, model, limits.nodes)
             };
-            search_simulations.simulations_sum += search.simulations;
-            crate::scope_profile!("az.selfplay.post_search");
+            search_nodes.nodes_sum += search.nodes;
+            crate::scope_profile!("ab.selfplay.post_search");
             let proven_result = proven_root_value(&search.candidates).map(|value| {
                 value as f32
                     * if position.side_to_move() == Color::Red {
@@ -478,25 +443,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                         -1.0
                     }
             });
-            let entropy = policy_entropy(&search.candidates);
-            let shape = policy_shape_stats(&search.candidates);
-            raw_prior_top1_sum += shape.raw_prior_top1;
-            raw_prior_top2_sum += shape.raw_prior_top2;
-            policy_top1_sum += shape.policy_top1;
-            policy_top2_sum += shape.policy_top2;
+            let entropy = selection_entropy(&search.candidates);
+            let shape = search_shape_stats(&search.candidates);
             q_gap_sum += shape.q_gap;
             q_top1_abs_sum += shape.q_top1_abs;
             root_actions_sum += shape.root_actions;
             shape_count += 1;
-            entropy_all_sum += entropy;
-            entropy_all_count += 1;
             if ply < temperature_opening_plies(config) {
                 entropy_opening_sum += entropy;
                 entropy_opening_count += 1;
-                opening_raw_prior_top1_sum += shape.raw_prior_top1;
-                opening_raw_prior_top2_sum += shape.raw_prior_top2;
-                opening_policy_top1_sum += shape.policy_top1;
-                opening_policy_top2_sum += shape.policy_top2;
                 opening_q_gap_sum += shape.q_gap;
                 opening_q_top1_abs_sum += shape.q_top1_abs;
                 opening_root_actions_sum += shape.root_actions;
@@ -530,38 +485,22 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             sampled_moves += 1;
             sampled_best_moves += usize::from(move_meta.best_index == move_meta.played_index);
             best_played_q_gap_sum += (move_meta.best_q - move_meta.played_q).max(0.0);
-            let top_policy = search
-                .candidates
-                .iter()
-                .map(|candidate| candidate.policy.max(0.0))
-                .fold(0.0f32, f32::max);
-            let played_policy = search
-                .candidates
-                .iter()
-                .find(|candidate| candidate.mv == mv)
-                .map_or(0.0, |candidate| candidate.policy.max(0.0));
-            played_top_policy_ratio_sum += if top_policy == 0.0 {
-                0.0
-            } else {
-                played_policy / top_policy
-            };
             best_q_sum += move_meta.best_q;
             played_q_sum += move_meta.played_q;
             {
-                crate::scope_profile!("az.selfplay.make_sample");
+                crate::scope_profile!("ab.selfplay.make_sample");
                 if config.record_fens {
                     position_fens.push(position.to_fen_with_history(&rule_history));
                 }
                 let sample = make_training_sample(
                     &position,
                     &rule_history,
-                    &search.candidates,
                     search.value_q,
                     search.value_wdl,
                     rng.unit_f32() < config.mirror_probability.clamp(0.0, 1.0),
                     move_meta,
-                    search.simulations,
-                    1.0,
+                    search.nodes,
+                    search.search_depth_max,
                 );
                 game_samples.push(sample);
                 game_proofs.push(proven_root_value(&search.candidates));
@@ -587,7 +526,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 break;
             }
             let rule_outcome = {
-                crate::scope_profile!("az.selfplay.rule_outcome");
+                crate::scope_profile!("ab.selfplay.rule_outcome");
                 position.rule_outcome_with_history(&rule_history)
             };
             if let Some(rule_outcome) = rule_outcome {
@@ -645,14 +584,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         plies_total += plies;
 
         {
-            crate::scope_profile!("az.selfplay.finalize_game");
+            crate::scope_profile!("ab.selfplay.finalize_game");
             finalize_value_targets(&mut game_samples, &game_proofs, terminal_result);
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
     }
 
-    AzSelfplayData {
+    AbSelfplayData {
         samples,
         games,
         position_fens,
@@ -665,24 +604,14 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         start_age_sum,
         start_age_max,
         start_temperature_sum,
-        entropy_all_sum,
-        entropy_all_count,
         entropy_opening_sum,
         entropy_opening_count,
         entropy_mid_sum,
         entropy_mid_count,
-        raw_prior_top1_sum,
-        raw_prior_top2_sum,
-        policy_top1_sum,
-        policy_top2_sum,
         q_gap_sum,
         q_top1_abs_sum,
         root_actions_sum,
         shape_count,
-        opening_raw_prior_top1_sum,
-        opening_raw_prior_top2_sum,
-        opening_policy_top1_sum,
-        opening_policy_top2_sum,
         opening_q_gap_sum,
         opening_q_top1_abs_sum,
         opening_root_actions_sum,
@@ -690,33 +619,24 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         sampled_moves,
         sampled_best_moves,
         best_played_q_gap_sum,
-        played_top_policy_ratio_sum,
         best_q_sum,
         played_q_sum,
         terminal,
-        search_simulations,
+        search_nodes,
     }
 }
 
-struct PolicyShapeStats {
-    raw_prior_top1: f32,
-    raw_prior_top2: f32,
-    policy_top1: f32,
-    policy_top2: f32,
+struct SearchShapeStats {
     q_gap: f32,
     q_top1_abs: f32,
     root_actions: usize,
 }
 
-fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
-    let mut raw_top = [0.0f32; 2];
-    let mut policy_top = [0.0f32; 2];
+fn search_shape_stats(candidates: &[AbCandidate]) -> SearchShapeStats {
     let mut q_top = [f32::NEG_INFINITY; 2];
     let mut root_actions = 0usize;
     for candidate in candidates {
-        insert_top2(candidate.raw_prior.max(0.0), &mut raw_top);
-        insert_top2(candidate.policy.max(0.0), &mut policy_top);
-        if candidate.policy > 0.0 {
+        if candidate.selection_weight > 0.0 {
             insert_top2(candidate.q, &mut q_top);
             root_actions += 1;
         }
@@ -731,11 +651,7 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
     } else {
         0.0
     };
-    PolicyShapeStats {
-        raw_prior_top1: raw_top[0],
-        raw_prior_top2: raw_top[0] + raw_top[1],
-        policy_top1: policy_top[0],
-        policy_top2: policy_top[0] + policy_top[1],
+    SearchShapeStats {
         q_gap,
         q_top1_abs,
         root_actions,
@@ -754,77 +670,54 @@ fn insert_top2(value: f32, top: &mut [f32; 2]) {
 fn make_training_sample(
     position: &Position,
     rule_history: &[RuleHistoryEntry],
-    candidates: &[AzCandidate],
     value: f32,
     root_search_wdl: [f32; 3],
     mirror_file: bool,
-    meta: AzSampleMeta,
-    search_simulations: usize,
-    policy_weight: f32,
-) -> AzTrainingSample {
+    meta: AbSampleMeta,
+    search_nodes: usize,
+    search_depth: usize,
+) -> AbTrainingSample {
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
-    let mut features = extract_sparse_features_az(position);
-    let mut moves = candidates
-        .iter()
-        .map(|candidate| candidate.mv)
-        .collect::<Vec<_>>();
+    let mut features = extract_sparse_features_ab(position);
     if mirror_file {
-        mirror_sparse_features_az_canonical_file(&mut features);
-        for mv in &mut moves {
-            *mv = mirror_file_move(*mv);
-        }
-    }
-    let move_indices = moves
-        .iter()
-        .copied()
-        .map(|mv| dense_move_index(canonical_move(side, mv)))
-        .collect();
-    let repetition_flags = candidates
-        .iter()
-        .map(|candidate| u8::from(position.move_repeats_history(rule_history, candidate.mv)))
-        .collect();
-    let mut policy = candidates
-        .iter()
-        .map(|candidate| candidate.policy.max(0.0))
-        .collect::<Vec<_>>();
-    let total_policy = policy.iter().sum::<f32>().max(1e-12);
-    for value in &mut policy {
-        *value /= total_policy;
+        mirror_sparse_features_ab_canonical_file(&mut features);
     }
 
-    AzTrainingSample {
+    AbTrainingSample {
         features,
         rule_context: rule_context_features(position, rule_history),
-        move_indices,
-        repetition_flags,
-        policy,
         value_wdl: scalar_value_to_wdl_target(value),
         root_search_wdl: normalize_wdl_target(root_search_wdl),
         value: value.clamp(-1.0, 1.0),
         side_sign,
-        policy_weight: policy_weight.max(0.0),
-        value_weight: 1.0,
-        search_simulations: search_simulations.min(u32::MAX as usize) as u32,
+        // Depth one is the fallback evaluation of child positions. A deeper
+        // completed iteration adds opponent replies and can supervise cutoff games.
+        value_weight: if search_depth >= 2 {
+            BOOTSTRAP_VALUE_WEIGHT
+        } else {
+            0.0
+        },
+        search_nodes: search_nodes.min(u32::MAX as usize) as u32,
         meta,
     }
 }
 
 fn root_search_meta(
-    candidates: &[AzCandidate],
+    candidates: &[AbCandidate],
     root_q: f32,
     generation_update: u32,
     game_id: u64,
     ply: usize,
-) -> AzSampleMeta {
-    let mut meta = AzSampleMeta {
+) -> AbSampleMeta {
+    let mut meta = AbSampleMeta {
         generation_update,
         game_id,
         ply: ply.min(u16::MAX as usize) as u16,
         root_q,
         best_index: u16::MAX,
         played_index: u16::MAX,
-        ..AzSampleMeta::default()
+        ..AbSampleMeta::default()
     };
     if let Some((best_index, best)) = candidates
         .iter()
@@ -838,13 +731,13 @@ fn root_search_meta(
 }
 
 fn move_search_meta(
-    candidates: &[AzCandidate],
+    candidates: &[AbCandidate],
     mv: Move,
     root_q: f32,
     generation_update: u32,
     game_id: u64,
     ply: usize,
-) -> AzSampleMeta {
+) -> AbSampleMeta {
     let mut meta = root_search_meta(candidates, root_q, generation_update, game_id, ply);
     if let Some((played_index, played)) = candidates
         .iter()
@@ -857,7 +750,7 @@ fn move_search_meta(
     meta
 }
 
-fn proven_root_value(candidates: &[AzCandidate]) -> Option<i8> {
+fn proven_root_value(candidates: &[AbCandidate]) -> Option<i8> {
     if candidates
         .iter()
         .any(|candidate| candidate.solved == Some(1))
@@ -878,7 +771,7 @@ fn proven_root_value(candidates: &[AzCandidate]) -> Option<i8> {
 }
 
 fn finalize_value_targets(
-    samples: &mut [AzTrainingSample],
+    samples: &mut [AbTrainingSample],
     proofs: &[Option<i8>],
     terminal_result: Option<f32>,
 ) {
@@ -887,11 +780,15 @@ fn finalize_value_targets(
         for sample in samples.iter_mut() {
             sample.value = (result * sample.side_sign).clamp(-1.0, 1.0);
             sample.value_wdl = scalar_value_to_wdl_target(sample.value);
+            sample.value_weight = 1.0;
         }
     } else {
-        // 截断不提供终局标签，但搜索的规则证明仍然有效。
+        // 截断时仅使用完成了至少两层搜索的根值，低权重蒸馏。
         for sample in samples.iter_mut() {
-            sample.value_weight = 0.0;
+            if sample.value_weight > 0.0 {
+                sample.value_wdl = normalize_wdl_target(sample.root_search_wdl);
+                sample.value = sample.value_wdl[0] - sample.value_wdl[2];
+            }
         }
     }
     for (sample, proof) in samples.iter_mut().zip(proofs) {
@@ -904,7 +801,7 @@ fn finalize_value_targets(
     }
 }
 
-fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
+fn temperature_for_ply(config: &AbEvolveConfig, ply: usize) -> f32 {
     if config.temperature_cutoff_plies > 0 && ply >= config.temperature_cutoff_plies {
         return config.temperature_endgame;
     }
@@ -920,18 +817,18 @@ fn temperature_for_ply(config: &AzLoopConfig, ply: usize) -> f32 {
     (config.temperature_start * decay.max(0.0)).max(config.temperature_endgame)
 }
 
-fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
+fn temperature_opening_plies(config: &AbEvolveConfig) -> usize {
     config
         .temperature_decay_delay_plies
         .saturating_add(config.temperature_decay_plies)
 }
 
 fn choose_selfplay_move(
-    candidates: &[AzCandidate],
+    candidates: &[AbCandidate],
     temperature: f32,
     rng: &mut SplitMix64,
 ) -> Option<Move> {
-    let priority = candidates.iter().map(AzCandidate::proof_priority).max()?;
+    let priority = candidates.iter().map(AbCandidate::proof_priority).max()?;
     let fallback = candidates
         .iter()
         .find(|candidate| candidate.proof_priority() == priority)
@@ -943,8 +840,8 @@ fn choose_selfplay_move(
                 left.proof_priority()
                     .cmp(&right.proof_priority())
                     .then_with(|| {
-                        left.policy
-                            .total_cmp(&right.policy)
+                        left.selection_weight
+                            .total_cmp(&right.selection_weight)
                             .then_with(|| left.q.total_cmp(&right.q))
                     })
             })
@@ -971,37 +868,37 @@ fn choose_selfplay_move(
     fallback
 }
 
-fn temperature_move_weights(candidates: &[AzCandidate], temperature: f32) -> Vec<f32> {
+fn temperature_move_weights(candidates: &[AbCandidate], temperature: f32) -> Vec<f32> {
     let inv_temperature = 1.0 / temperature.max(1e-3);
     let priority = candidates
         .iter()
-        .map(AzCandidate::proof_priority)
+        .map(AbCandidate::proof_priority)
         .max()
         .unwrap_or(0);
-    let max_policy = candidates
+    let max_weight = candidates
         .iter()
         .filter(|candidate| candidate.proof_priority() == priority)
-        .map(|candidate| candidate.policy.max(0.0))
+        .map(|candidate| candidate.selection_weight.max(0.0))
         .fold(0.0f32, f32::max);
     candidates
         .iter()
         .map(|candidate| {
             if candidate.proof_priority() != priority {
                 0.0
-            } else if max_policy > 0.0 {
-                (candidate.policy.max(0.0) / max_policy).powf(inv_temperature)
+            } else if max_weight > 0.0 {
+                (candidate.selection_weight.max(0.0) / max_weight).powf(inv_temperature)
             } else {
-                candidate.prior.max(0.0).powf(inv_temperature)
+                1.0
             }
         })
         .collect()
 }
 
-fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
+fn selection_entropy(candidates: &[AbCandidate]) -> f32 {
     const EPS: f32 = 1e-10;
     let total = candidates
         .iter()
-        .map(|candidate| candidate.policy.max(0.0))
+        .map(|candidate| candidate.selection_weight.max(0.0))
         .sum::<f32>();
     if total <= 0.0 {
         return 0.0;
@@ -1009,15 +906,15 @@ fn policy_entropy(candidates: &[AzCandidate]) -> f32 {
     candidates
         .iter()
         .map(|candidate| {
-            let p = (candidate.policy.max(0.0) / total).max(0.0);
+            let p = (candidate.selection_weight.max(0.0) / total).max(0.0);
             if p <= 0.0 { 0.0 } else { -p * (p + EPS).ln() }
         })
         .sum()
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct AzArenaConfig {
-    pub simulations: usize,
+pub struct AbArenaConfig {
+    pub nodes: usize,
     pub max_plies: usize,
     pub rule60_max_ply: Option<u16>,
     pub games_as_red: usize,
@@ -1027,15 +924,15 @@ pub struct AzArenaConfig {
 }
 
 pub fn play_arena_games_from_positions(
-    candidate: &AzNnue,
-    baseline: &AzNnue,
+    candidate: &AbNnue,
+    baseline: &AbNnue,
     positions: &[Position],
-    config: AzArenaConfig,
-) -> AzArenaReport {
+    config: AbArenaConfig,
+) -> AbArenaReport {
     let snapshots = positions
         .iter()
         .cloned()
-        .map(|position| AzStartSnapshot {
+        .map(|position| AbStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
             phase_ply: 0,
@@ -1046,12 +943,12 @@ pub fn play_arena_games_from_positions(
 }
 
 pub fn play_arena_games_from_snapshots(
-    candidate: &AzNnue,
-    baseline: &AzNnue,
-    snapshots: &[AzStartSnapshot],
-    config: AzArenaConfig,
-) -> AzArenaReport {
-    let mut report = AzArenaReport::default();
+    candidate: &AbNnue,
+    baseline: &AbNnue,
+    snapshots: &[AbStartSnapshot],
+    config: AbArenaConfig,
+) -> AbArenaReport {
+    let mut report = AbArenaReport::default();
     let mut red_scores = Vec::with_capacity(config.games_as_red);
     for game_index in 0..config.games_as_red {
         let mut snapshot = arena_start_snapshot(snapshots, config.start_index + game_index);
@@ -1062,7 +959,7 @@ pub fn play_arena_games_from_snapshots(
             &snapshot.rule_history,
             candidate,
             baseline,
-            config.simulations,
+            config.nodes,
             config.max_plies.saturating_sub(snapshot.phase_ply as usize),
             config.seed ^ (config.start_index + game_index) as u64,
         );
@@ -1092,7 +989,7 @@ pub fn play_arena_games_from_snapshots(
             &snapshot.rule_history,
             baseline,
             candidate,
-            config.simulations,
+            config.nodes,
             config.max_plies.saturating_sub(snapshot.phase_ply as usize),
             config.seed ^ (config.start_index + game_index) as u64,
         );
@@ -1122,10 +1019,10 @@ pub fn play_arena_games_from_snapshots(
     report
 }
 
-fn arena_start_snapshot(snapshots: &[AzStartSnapshot], game_index: usize) -> AzStartSnapshot {
+fn arena_start_snapshot(snapshots: &[AbStartSnapshot], game_index: usize) -> AbStartSnapshot {
     if snapshots.is_empty() {
         let position = Position::startpos();
-        AzStartSnapshot {
+        AbStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
             phase_ply: 0,
@@ -1140,9 +1037,9 @@ fn arena_start_snapshot(snapshots: &[AzStartSnapshot], game_index: usize) -> AzS
 fn play_arena_game(
     initial_position: &Position,
     initial_rule_history: &[RuleHistoryEntry],
-    red_model: &AzNnue,
-    black_model: &AzNnue,
-    simulations: usize,
+    red_model: &AbNnue,
+    black_model: &AbNnue,
+    nodes: usize,
     max_plies: usize,
     _seed: u64,
 ) -> f32 {
@@ -1172,7 +1069,7 @@ fn play_arena_game(
         } else {
             black_model
         };
-        let result = alphabeta::search(&position, &rule_history, legal, model, simulations);
+        let result = alphabeta::search(&position, &rule_history, legal, model, nodes);
         let Some(mv) = result.best_move else {
             return 0.0;
         };
@@ -1210,12 +1107,12 @@ fn play_arena_game(
 mod tests {
     use super::*;
 
-    fn selfplay_test_config(games: usize) -> AzLoopConfig {
-        AzLoopConfig {
+    fn selfplay_test_config(games: usize) -> AbEvolveConfig {
+        AbEvolveConfig {
             games,
             max_plies: 12,
             rule60_max_ply: Some(120),
-            simulations: 64,
+            nodes: 64,
             seed: 20260817,
             workers: 1,
             generation_update: 0,
@@ -1239,26 +1136,26 @@ mod tests {
         assert_eq!(position.legal_moves(), [Move::from_uci("c0a2").unwrap()]);
         let mut config = selfplay_test_config(1);
         config.max_plies = 1;
-        config.simulations = 10_000;
-        config.opening_positions = vec![AzStartSnapshot {
+        config.nodes = 10_000;
+        config.opening_positions = vec![AbStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
             phase_ply: 0,
             generation: 0,
         }]
         .into();
-        let data = generate_selfplay_chunk(&AzNnue::random(4, 7), &config);
+        let data = generate_selfplay_chunk(&AbNnue::random(4, 7), &config);
         assert_eq!(data.samples.len(), 1);
-        assert!(data.samples[0].search_simulations <= 10_000);
-        assert_eq!(data.search_simulations.searches, 1);
+        assert!(data.samples[0].search_nodes <= 10_000);
+        assert_eq!(data.search_nodes.searches, 1);
         assert_eq!(
-            data.search_simulations.simulations_sum,
-            data.samples[0].search_simulations as usize
+            data.search_nodes.nodes_sum,
+            data.samples[0].search_nodes as usize
         );
     }
 
     #[test]
-    fn px0_temperature_uses_full_moves_and_cutoff() {
+    fn selfplay_temperature_uses_full_moves_and_cutoff() {
         let mut config = selfplay_test_config(1);
         config.temperature_start = 0.9;
         config.temperature_endgame = 0.6;
@@ -1275,8 +1172,8 @@ mod tests {
             candidate(Move::new(0, 1), 0.0),
             candidate(Move::new(0, 2), 0.0),
         ];
-        candidates[0].policy = 0.2;
-        candidates[1].policy = 0.8;
+        candidates[0].selection_weight = 0.2;
+        candidates[1].selection_weight = 0.8;
         assert_eq!(temperature_move_weights(&candidates, 1.0), vec![0.25, 1.0]);
         let weights = temperature_move_weights(&candidates, 1.0);
         assert_eq!(weights[0], 0.25);
@@ -1289,15 +1186,12 @@ mod tests {
         config.temperature_cutoff_plies = 40;
         config.temperature_endgame = 0.6;
         assert_eq!(temperature_for_ply(&config, 40), 0.6);
-        assert_eq!(
-            selfplay_search_limits(&config, 40, 0).simulations,
-            config.simulations
-        );
+        assert_eq!(selfplay_search_limits(&config, 40, 0).nodes, config.nodes);
     }
 
     #[test]
     fn terminal_monitoring_distinguishes_checkmate_stalemate_and_rule_blocking() {
-        let mut stats = AzTerminalStats::default();
+        let mut stats = AbTerminalStats::default();
         for (fen, checked) in [
             ("4k4/3R1R3/9/9/4P4/9/9/9/9/4K4 b - - 0 1", false),
             ("4k4/3RRR3/9/9/4P4/9/9/9/9/4K4 b - - 0 1", true),
@@ -1308,7 +1202,7 @@ mod tests {
             stats.record_no_legal_moves(&position);
         }
         stats.record_no_legal_moves(&Position::startpos());
-        let mut merged = AzTerminalStats::default();
+        let mut merged = AbTerminalStats::default();
         merged.add_assign(&stats);
         assert_eq!(merged.no_legal_moves, 3);
         assert_eq!(merged.checkmate, 1);
@@ -1318,10 +1212,10 @@ mod tests {
 
     #[test]
     fn unproven_games_reach_cutoff_without_value_labels() {
-        let model = AzNnue::random(16, 20260907);
+        let model = AbNnue::random(16, 20260907);
         let mut config = selfplay_test_config(4);
         config.max_plies = 1;
-        config.simulations = 2;
+        config.nodes = 2;
         let data = generate_selfplay_chunk(&model, &config);
         assert_eq!(data.terminal.max_plies, 4);
         assert_eq!(data.terminal.search_proven, [0, 0, 0]);
@@ -1330,17 +1224,17 @@ mod tests {
 
     #[test]
     fn proven_mate_keeps_the_training_sample() {
-        let model = AzNnue::random(16, 20260907);
+        let model = AbNnue::random(16, 20260907);
         let position = Position::from_fen(
             "2bak2r1/4a4/4b4/p2R4p/4C1n2/2P1c3P/P1r3P2/4B4/4A4/2BK1A2R w - - 1 1",
         )
         .unwrap();
         let mate = position.parse_uci_move("d6d9").unwrap();
-        let mate_index = dense_move_index(canonical_move(position.side_to_move(), mate));
+        assert!(position.legal_moves().contains(&mate));
         let mut config = selfplay_test_config(1);
-        config.simulations = 1;
+        config.nodes = 1;
         config.mirror_probability = 0.0;
-        config.opening_positions = vec![AzStartSnapshot {
+        config.opening_positions = vec![AbStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
             phase_ply: 0,
@@ -1353,17 +1247,12 @@ mod tests {
         let sample = &data.samples[0];
         assert_eq!(sample.value_wdl, [1.0, 0.0, 0.0]);
         assert_eq!(sample.value_weight, 1.0);
-        let policy = sample
-            .move_indices
-            .iter()
-            .position(|&index| index == mate_index)
-            .unwrap();
-        assert_eq!(sample.policy[policy], 1.0);
+        assert_eq!(sample.root_search_wdl, [1.0, 0.0, 0.0]);
     }
 
     #[test]
     fn mate_on_last_allowed_ply_keeps_terminal_value_supervision() {
-        let mut model = AzNnue::random(16, 20260907);
+        let model = AbNnue::random(16, 20260907);
         let mut position = Position::from_fen(
             "r1baka3/4n4/n3b4/4p3p/1PP3pr1/5RC2/4P1ccP/3CB1N2/5R3/2BAKA3 b - - 3 1",
         )
@@ -1373,14 +1262,12 @@ mod tests {
         history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
         let mate = position.parse_uci_move("f4f9").unwrap();
-        let mate_index = dense_move_index(canonical_move(position.side_to_move(), mate));
-        model.policy_move_bias.fill(-100.0);
-        model.policy_move_bias[mate_index] = 100.0;
+        assert!(position.legal_moves().contains(&mate));
         let mut config = selfplay_test_config(1);
         config.max_plies = 1;
-        config.simulations = 2;
+        config.nodes = 2;
         config.mirror_probability = 0.0;
-        config.opening_positions = vec![AzStartSnapshot {
+        config.opening_positions = vec![AbStartSnapshot {
             position,
             rule_history: history,
             phase_ply: 0,
@@ -1389,10 +1276,7 @@ mod tests {
         .into();
         let data = generate_selfplay_chunk(&model, &config);
         let sample = &data.samples[0];
-        assert_eq!(
-            sample.move_indices[sample.meta.played_index as usize],
-            mate_index
-        );
+        assert_eq!(sample.meta.played_index, sample.meta.best_index);
         assert_eq!(data.red_wins, 1, "terminal={:?}", data.terminal);
         assert_eq!(data.terminal.checkmate + data.terminal.search_proven[0], 1);
         assert_eq!(data.terminal.max_plies, 0);
@@ -1406,7 +1290,7 @@ mod tests {
                 &start.rule_history,
                 &model,
                 &model,
-                config.simulations,
+                config.nodes,
                 config.max_plies,
                 config.seed,
             ),
@@ -1415,33 +1299,28 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_games_keep_policy_but_do_not_train_false_draw_values() {
-        let model = AzNnue::random(16, 20260907);
+    fn cutoff_games_do_not_train_false_draw_values() {
+        let model = AbNnue::random(16, 20260907);
         let mut config = selfplay_test_config(4);
         config.max_plies = 1;
-        config.simulations = 2;
+        config.nodes = 2;
         let data = generate_selfplay_chunk(&model, &config);
         assert_eq!(data.terminal.max_plies, 4);
         assert_eq!(data.terminal.search_no_move, 0);
         assert_eq!(data.draws, 4);
         assert!(!data.samples.is_empty());
         assert!(data.samples.iter().all(|sample| sample.value_weight == 0.0));
-        assert!(
-            data.samples
-                .iter()
-                .all(|sample| sample.policy_weight == 1.0)
-        );
     }
 
     #[test]
     fn selfplay_data_merge_preserves_start_stats() {
-        let mut merged = AzSelfplayData::default();
-        let mut chunk = AzSelfplayData::default();
-        chunk.start_games[AzStartSource::OpeningBook.index()] = 2;
-        chunk.start_phase_ply_sum[AzStartSource::OpeningBook.index()] = 16;
-        chunk.start_age_sum[AzStartSource::OpeningBook.index()] = 6;
-        chunk.start_age_max[AzStartSource::OpeningBook.index()] = 4;
-        chunk.start_temperature_sum[AzStartSource::OpeningBook.index()] = 1.2;
+        let mut merged = AbSelfplayData::default();
+        let mut chunk = AbSelfplayData::default();
+        chunk.start_games[AbStartSource::OpeningBook.index()] = 2;
+        chunk.start_phase_ply_sum[AbStartSource::OpeningBook.index()] = 16;
+        chunk.start_age_sum[AbStartSource::OpeningBook.index()] = 6;
+        chunk.start_age_max[AbStartSource::OpeningBook.index()] = 4;
+        chunk.start_temperature_sum[AbStartSource::OpeningBook.index()] = 1.2;
 
         merged.add_assign(&chunk);
 
@@ -1454,13 +1333,13 @@ mod tests {
 
     #[test]
     fn arena_uncertainty_uses_color_swapped_opening_pairs() {
-        let report = AzArenaReport {
+        let report = AbArenaReport {
             wins: 2,
             losses: 2,
             paired_openings: 2,
             paired_score_sum: 1.0,
             paired_score_sq_sum: 0.5,
-            ..AzArenaReport::default()
+            ..AbArenaReport::default()
         };
         // 两个开局的配对得分为 0.5/0.5；红黑单盘虽各有胜负，先后手抵消后方差为零。
         assert_eq!(report.score_rate(), 0.5);
@@ -1471,13 +1350,13 @@ mod tests {
     fn start_source_distinguishes_standard_and_opening_positions() {
         let config = selfplay_test_config(1);
         let start = choose_selfplay_start(&config, &mut SplitMix64::new(1), 0);
-        assert_eq!(start.source, AzStartSource::Startpos);
+        assert_eq!(start.source, AbStartSource::Startpos);
 
         let mut config = selfplay_test_config(1);
         let position =
             Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/4P4/P1P3P1P/1C5C1/9/RNBAKABNR b")
                 .unwrap();
-        config.opening_positions = vec![AzStartSnapshot {
+        config.opening_positions = vec![AbStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
             phase_ply: 8,
@@ -1485,36 +1364,30 @@ mod tests {
         }]
         .into();
         let start = choose_selfplay_start(&config, &mut SplitMix64::new(1), 0);
-        assert_eq!(start.source, AzStartSource::OpeningBook);
+        assert_eq!(start.source, AbStartSource::OpeningBook);
         assert_eq!(start.phase_ply, 8);
     }
 
-    fn candidate(mv: Move, policy: f32) -> AzCandidate {
-        AzCandidate {
+    fn candidate(mv: Move, selection_weight: f32) -> AbCandidate {
+        AbCandidate {
             mv,
             q: 0.0,
-            raw_prior: policy,
-            prior: policy,
-            policy,
+            selection_weight,
             solved: None,
         }
     }
 
-    fn sample(value: f32, side_sign: f32) -> AzTrainingSample {
-        AzTrainingSample {
-            repetition_flags: Vec::new(),
+    fn sample(value: f32, side_sign: f32) -> AbTrainingSample {
+        AbTrainingSample {
             features: Vec::new(),
-            rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
-            move_indices: Vec::new(),
-            policy: Vec::new(),
+            rule_context: [0.0; crate::ab::RULE_CONTEXT_SIZE],
             value_wdl: scalar_value_to_wdl_target(value),
             root_search_wdl: scalar_value_to_wdl_target(value),
             value,
             side_sign,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            search_simulations: 0,
-            meta: AzSampleMeta::default(),
+            value_weight: 0.0,
+            search_nodes: 0,
+            meta: AbSampleMeta::default(),
         }
     }
 
@@ -1533,6 +1406,28 @@ mod tests {
         assert_eq!(samples[0].value, 1.0);
         assert_eq!(samples[1].value, -1.0);
         assert_eq!(samples[2].value, -1.0);
+    }
+
+    #[test]
+    fn truncated_deep_search_uses_discounted_root_value() {
+        let mut deep = sample(0.0, 1.0);
+        deep.root_search_wdl = [0.7, 0.2, 0.1];
+        deep.value_weight = BOOTSTRAP_VALUE_WEIGHT;
+        let mut shallow = sample(0.0, -1.0);
+        shallow.root_search_wdl = [0.1, 0.2, 0.7];
+        shallow.value_weight = 0.0;
+        let mut samples = [deep, shallow];
+
+        finalize_value_targets(&mut samples, &[None, None], None);
+        assert_eq!(samples[0].value_wdl, [0.7, 0.2, 0.1]);
+        assert!((samples[0].value - 0.6).abs() < 1e-6);
+        assert_eq!(samples[0].value_weight, BOOTSTRAP_VALUE_WEIGHT);
+        assert_eq!(samples[1].value_weight, 0.0);
+
+        finalize_value_targets(&mut samples, &[None, None], Some(1.0));
+        assert_eq!(samples[0].value_weight, 1.0);
+        assert_eq!(samples[1].value_weight, 1.0);
+        assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -1569,48 +1464,25 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_training_sample_mirrors_move_indices() {
+    fn mirrored_training_sample_mirrors_features() {
         let position =
             Position::from_fen("3ak4/9/2n1b4/p3p3p/4R4/2P6/P3P3P/2N1C4/4A4/2BAK3c b").unwrap();
-        let moves = position.legal_moves();
-        let candidates = moves
-            .iter()
-            .take(4)
-            .enumerate()
-            .map(|(index, &mv)| candidate(mv, 1.0 / (index + 2) as f32))
-            .collect::<Vec<_>>();
         let sample = make_training_sample(
             &position,
             &position.initial_rule_history(),
-            &candidates,
             0.0,
             [0.6, 0.3, 0.1],
             true,
-            AzSampleMeta::default(),
+            AbSampleMeta::default(),
             1,
-            1.0,
+            2,
         );
 
         let mirrored_position = position.mirror_files();
-        let mirrored_moves = candidates
-            .iter()
-            .map(|candidate| mirror_file_move(candidate.mv))
-            .collect::<Vec<_>>();
-        let expected = mirrored_moves
-            .iter()
-            .copied()
-            .map(|mv| dense_move_index(canonical_move(mirrored_position.side_to_move(), mv)))
-            .collect::<Vec<_>>();
-
-        assert_eq!(sample.move_indices, expected);
-        let expected_policy = candidates
-            .iter()
-            .map(|candidate| candidate.policy)
-            .collect::<Vec<_>>();
-        let expected_total = expected_policy.iter().sum::<f32>();
-        for (actual, expected) in sample.policy.iter().zip(expected_policy) {
-            assert!((actual - expected / expected_total).abs() < 1e-6);
-        }
+        assert_eq!(
+            sample.features,
+            extract_sparse_features_ab(&mirrored_position)
+        );
         assert_eq!(sample.root_search_wdl, [0.6, 0.3, 0.1]);
     }
 
@@ -1641,11 +1513,11 @@ mod tests {
     }
 
     #[test]
-    fn temperature_weights_remain_finite_for_small_policy_weights() {
-        for policy in [1e-8, 1e-5, 0.01, 0.5, 1.0] {
+    fn temperature_weights_remain_finite_for_small_selection_weights() {
+        for weight in [1e-8, 1e-5, 0.01, 0.5, 1.0] {
             let candidates = vec![
-                candidate(Move::new(0, 1), policy / 2.0),
-                candidate(Move::new(0, 2), policy),
+                candidate(Move::new(0, 1), weight / 2.0),
+                candidate(Move::new(0, 2), weight),
             ];
             for temperature in [0.001, 0.05, 0.6, 0.9, 1.2] {
                 let weights = temperature_move_weights(&candidates, temperature);
@@ -1660,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn temperature_one_samples_directly_from_root_policy() {
+    fn temperature_one_samples_directly_from_root_selection_weights() {
         let candidates = vec![
             candidate(Move::new(0, 1), 0.1),
             candidate(Move::new(0, 2), 1.0),
@@ -1685,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn solver_temperature_excludes_proven_losses_despite_high_policy() {
+    fn solver_temperature_excludes_proven_losses_despite_high_selection_weight() {
         let mut lost = candidate(Move::new(0, 1), 0.99);
         lost.solved = Some(-1);
         let safe = candidate(Move::new(2, 3), 0.01);

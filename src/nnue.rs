@@ -6,11 +6,11 @@ pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
 /// 当前网络仅使用面向行棋方的 canonical 棋子位置，不输入历史步。
 /// 重复、长将、长捉等依赖历史的规则由环境精确处理。
-pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
+pub const AB_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
 
-pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {
+pub fn extract_sparse_features_ab(position: &Position) -> Vec<usize> {
     let mut features = Vec::with_capacity(96);
-    fill_sparse_features_az(position, &mut features);
+    fill_sparse_features_ab(position, &mut features);
     features.sort_unstable();
     features
 }
@@ -18,7 +18,7 @@ pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {
 /// 填充面向走子方的 NNUE 稀疏特征，复用调用方缓冲区。
 ///
 /// 推理只对特征行求和，不依赖特征顺序，因此热路径不做排序，也不产生堆分配。
-/// 需要稳定顺序（例如序列化或测试）时使用 `extract_sparse_features_az`。
+/// 需要稳定顺序（例如序列化或测试）时使用 `extract_sparse_features_ab`。
 /// ?? `perspective` ??????????????? [0,6]???? [7,13]?
 /// ????????????????????????????
 #[inline]
@@ -28,7 +28,7 @@ pub fn piece_absolute_feature_index(perspective: Color, piece: Piece) -> usize {
 }
 
 #[inline]
-pub fn fill_sparse_features_az(position: &Position, features: &mut Vec<usize>) {
+pub fn fill_sparse_features_ab(position: &Position, features: &mut Vec<usize>) {
     features.clear();
     features.reserve(32);
     let side = position.side_to_move();
@@ -66,7 +66,7 @@ pub fn canonical_move(side: Color, mv: Move) -> Move {
     )
 }
 
-pub fn mirror_sparse_features_az_canonical_file(features: &mut [usize]) {
+pub fn mirror_sparse_features_ab_canonical_file(features: &mut [usize]) {
     for feature in features.iter_mut() {
         if *feature < CANONICAL_PIECE_INPUT_SIZE {
             let piece_index = *feature / BOARD_SIZE;
@@ -94,9 +94,9 @@ mod tests {
     }
 
     #[test]
-    fn az_features_use_side_to_move_canonical_coordinates() {
+    fn ab_features_use_side_to_move_canonical_coordinates() {
         let position = Position::from_fen("4k4/9/9/9/4p4/9/9/9/9/4K4 b - - 0 1").unwrap();
-        let features = extract_sparse_features_az(&position);
+        let features = extract_sparse_features_ab(&position);
         let side = position.side_to_move();
         let us_general = piece_absolute_feature_index(
             side,
@@ -120,11 +120,11 @@ mod tests {
     }
 
     #[test]
-    fn az_features_use_only_current_board() {
+    fn ab_features_use_only_current_board() {
         let position = Position::startpos();
-        let features = extract_sparse_features_az(&position);
-        assert_eq!(AZ_NNUE_INPUT_SIZE, 1_260);
-        assert!(features.iter().all(|&feature| feature < AZ_NNUE_INPUT_SIZE));
+        let features = extract_sparse_features_ab(&position);
+        assert_eq!(AB_NNUE_INPUT_SIZE, 1_260);
+        assert!(features.iter().all(|&feature| feature < AB_NNUE_INPUT_SIZE));
         assert_eq!(features.len(), 32);
     }
 }

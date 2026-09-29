@@ -1,13 +1,13 @@
 use candle_core::{Result, Tensor, Var, backprop::GradStore};
 use std::{collections::HashMap, path::Path};
 
-// Px0 tfprocess.py 的 SGD(momentum=0.9, nesterov=True)。Candle SGD 无动量接口。
+// 带 Nesterov 动量的 SGD；Candle SGD 无动量接口。
 const MOMENTUM: f64 = 0.9;
 const MAX_GRAD_NORM: f64 = 10_000.0;
 const WARMUP_STEPS: usize = 250;
 
 #[derive(Debug)]
-pub(super) struct Px0Sgd {
+pub(super) struct MomentumSgd {
     vars: Vec<Var>,
     velocity: Vec<Var>,
     pub steps: usize,
@@ -26,7 +26,7 @@ pub(super) fn learning_rate(base_lr: f64, steps: usize) -> f64 {
     base_lr * factor * warmup
 }
 
-impl Px0Sgd {
+impl MomentumSgd {
     pub fn new(vars: Vec<Var>, base_lr: f64) -> Result<Self> {
         let velocity = vars
             .iter()
@@ -166,7 +166,7 @@ mod tests {
     use super::*;
     use candle_core::Device;
 
-    fn step(opt: &mut Px0Sgd, grad: &[f32]) {
+    fn step(opt: &mut MomentumSgd, grad: &[f32]) {
         let grads = opt.vars[0]
             .broadcast_mul(&Tensor::new(grad, &Device::Cpu).unwrap())
             .unwrap()
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn nesterov_matches_keras_variable_learning_rate_and_clipping() {
         let var = Var::new(&[1f32, -2.], &Device::Cpu).unwrap();
-        let mut opt = Px0Sgd::new(vec![var.clone()], 0.02).unwrap();
+        let mut opt = MomentumSgd::new(vec![var.clone()], 0.02).unwrap();
         let mut expected = [1f64, -2.];
         let mut velocity = [0f64; 2];
         for (n, grad) in [
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn restored_training_matches_uninterrupted_and_rejects_wrong_weights() {
         let var = Var::new(&[1f32, -2.], &Device::Cpu).unwrap();
-        let mut opt = Px0Sgd::new(vec![var.clone()], 0.02).unwrap();
+        let mut opt = MomentumSgd::new(vec![var.clone()], 0.02).unwrap();
         step(&mut opt, &[3., -4.]);
         let dir = std::env::current_dir().unwrap().join("tmp");
         std::fs::create_dir_all(&dir).unwrap();
@@ -229,7 +229,7 @@ mod tests {
         opt.save(&path, 42).unwrap();
         let restored_var =
             Var::new(var.to_vec1::<f32>().unwrap().as_slice(), &Device::Cpu).unwrap();
-        let mut restored = Px0Sgd::new(vec![restored_var.clone()], 0.02).unwrap();
+        let mut restored = MomentumSgd::new(vec![restored_var.clone()], 0.02).unwrap();
         assert!(restored.restore(&path, 43).is_err());
         restored.restore(&path, 42).unwrap();
         assert_eq!(restored.steps, 150_000);

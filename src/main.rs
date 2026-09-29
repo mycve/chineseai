@@ -2,36 +2,32 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-mod az_loop_config;
+mod ab_evolve_config;
 mod training_console;
 
-use az_loop_config::{AzLoopFileConfig, DEFAULT_AZ_LOOP_CONFIG, load_or_create_az_loop_config};
-
-use chineseai::version::AZ_LOOP_PROGRESS_VERSION;
-
-use byteorder::{LittleEndian, WriteBytesExt};
-use chineseai::{
-    az::{
-        AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
-        AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        Px0ReplaySampler, SplitMix64, alphabeta_search, benchmark_training, dense_move_index,
-        evaluate_policy_groups, generate_selfplay_data, play_arena_games_from_positions,
-        policy_target_entropy, train_samples_weighted, train_samples_weighted_owned,
-    },
-    nnue::{AZ_NNUE_INPUT_SIZE, canonical_move, extract_sparse_features_az},
-    pikafish_match::{VsPikafishConfig, run_vs_pikafish},
-    px0_opening_book::Px0OpeningBook,
-    xiangqi::{Move, Position, RuleOutcome},
+use ab_evolve_config::{
+    AbEvolveFileConfig, DEFAULT_AB_EVOLVE_CONFIG, load_or_create_ab_evolve_config,
 };
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use rusqlite::{Connection, params};
+
+use chineseai::version::AB_EVOLVE_PROGRESS_VERSION;
+
+use chineseai::{
+    ab::{
+        AbArenaConfig, AbArenaReport, AbEvolveConfig, AbEvolveReport, AbExperiencePool, AbNnue,
+        AbSearchLimits, AbSelfplayData, AbTrainLossWeights, HOLDOUT_INTERVAL_STEPS, ReplaySampler,
+        SplitMix64, alphabeta_search, generate_selfplay_data, play_arena_games_from_positions,
+        train_samples_weighted_owned,
+    },
+    opening_book::OpeningBook,
+    pikafish_match::{VsPikafishConfig, run_vs_pikafish},
+    xiangqi::Position,
+};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
     fs, io,
-    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -60,228 +56,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    /// Create a random NNUE model.
-    #[command(name = "model-init")]
-    AzInit(AzInitArgs),
-    /// Scale one policy component for structural ablation.
-    #[command(name = "policy-scale")]
-    AzPolicyScale(AzPolicyScaleArgs),
-    /// Benchmark a synthetic training workload.
-    #[command(name = "train-bench")]
-    AzTrainBench(AzTrainBenchArgs),
-    /// Fit a model on a fixed replay snapshot and report future-game validation loss.
-    #[command(name = "replay-fit")]
-    AzReplayFit(AzReplayFitArgs),
-    /// Report start-position policy targets, played moves, and outcomes from a replay snapshot.
-    #[command(name = "replay-opening-stats")]
-    AzReplayOpeningStats(AzReplayOpeningStatsArgs),
-    /// Compare fixed label accuracy across replay position-coverage buckets.
-    #[command(name = "replay-coverage")]
-    AzReplayCoverage(AzReplayCoverageArgs),
     /// Run self-play training from a TOML config.
     #[command(name = "ab-evolve")]
-    AzLoop(AzLoopArgs),
-    /// Evaluate checkpoint non-transitivity and historical regressions.
-    CheckpointCycles(CheckpointCyclesArgs),
+    AbEvolve(AbEvolveArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
-    /// Generate random positions and label them with Pikafish best moves.
-    PikafishLabelRandom(PikafishLabelRandomArgs),
-    /// Generate positions with a trained network, then label them with Pikafish.
-    PikafishLabelSelfplay(PikafishLabelSelfplayArgs),
-    /// Fit several current-network widths on Pikafish labels with equal wall time.
-    PikafishPolicyFit(PikafishPolicyFitArgs),
-    /// Export Pikafish labels as canonical features for PyTorch experiments.
-    PikafishExportTorch(PikafishExportTorchArgs),
     /// Evaluate a model against Pikafish labels stored in SQLite.
     PikafishLabelEval(PikafishLabelEvalArgs),
 }
 
-#[derive(Args, Debug, Clone)]
-struct AzInitArgs {
-    /// Hidden size of the model.
-    #[arg(default_value_t = 64)]
-    hidden: usize,
-    /// Output model path.
-    #[arg(default_value = "model.safetensors")]
-    output: String,
-    /// Random seed.
-    #[arg(default_value_t = 20260409)]
-    seed: u64,
-}
-
-impl AzInitArgs {
-    fn arch(&self) -> chineseai::az::AzNnueArch {
-        chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1))
-    }
-}
-
-#[derive(Args, Debug, Clone)]
-struct AzPolicyScaleArgs {
-    /// Existing model path.
-    input: String,
-    /// Modified model path.
-    output: String,
-    /// Policy component to scale.
-    #[arg(long, value_enum)]
-    component: PolicyComponent,
-    /// Multiplier applied to the selected component.
-    #[arg(long)]
-    scale: f32,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum PolicyComponent {
-    Accumulator,
-    Context,
-    Consequence,
-    MoveBias,
-}
-
 #[derive(Args, Debug)]
-struct AzTrainBenchArgs {
-    /// NNUE model path.
-    model: String,
-    /// Generated sample count.
-    #[arg(default_value_t = 8192)]
-    samples: usize,
-    /// Passes over generated samples.
-    #[arg(default_value_t = 2)]
-    epochs: usize,
-    /// Batch size per optimizer step.
-    #[arg(default_value_t = 1024)]
-    batch_size: usize,
-    /// Learning rate.
-    #[arg(default_value_t = 0.02)]
-    lr: f32,
-    /// Random seed.
-    #[arg(default_value_t = 20260411)]
-    seed: u64,
-}
-
-#[derive(Args, Debug)]
-struct AzReplayFitArgs {
-    /// Replay snapshot produced by ab-evolve.
-    replay: String,
-    /// Output model path.
-    #[arg(long, default_value = "replay-fit.safetensors")]
-    output: String,
-    /// Optional warm-start model; when omitted, initialize a fresh model.
-    #[arg(long)]
-    initial_model: Option<String>,
-    /// Hidden width of the model under test.
-    #[arg(long, default_value_t = 64)]
-    hidden: usize,
-    /// Latest replay samples retained for the experiment.
-    #[arg(long, default_value_t = 300_000)]
-    samples: usize,
-    /// Fraction of complete games reserved from the newest end of the snapshot.
-    #[arg(long, default_value_t = 0.10)]
-    validation_fraction: f32,
-    /// Training passes over the fixed training split.
-    #[arg(long, default_value_t = 2)]
-    epochs: usize,
-    /// Batch size per optimizer step.
-    #[arg(long, default_value_t = 1024)]
-    batch_size: usize,
-    /// Learning rate.
-    #[arg(long, default_value_t = 0.0007)]
-    lr: f32,
-    /// Initialization and shuffle seed.
-    #[arg(long, default_value_t = 20260802)]
-    seed: u64,
-}
-
-#[derive(Args, Debug)]
-struct AzReplayOpeningStatsArgs {
-    /// Replay snapshot produced by ab-evolve.
-    replay: String,
-    /// Rows to display.
-    #[arg(long, default_value_t = 20)]
-    top: usize,
-}
-
-#[derive(Args, Debug)]
-struct AzReplayCoverageArgs {
-    /// Replay snapshot produced by ab-evolve.
-    replay: String,
-    /// Model evaluated on the fixed labels.
-    model: String,
-    /// SQLite label set produced by pikafish-label-random.
-    sqlite: String,
-    /// Latest replay samples retained for the coverage index.
-    #[arg(long, default_value_t = 300_000)]
-    samples: usize,
-    /// Uniformly sampled label rows; 0 uses all rows.
-    #[arg(long, default_value_t = 5_000)]
-    limit: usize,
-    /// Alpha-beta nodes per label position.
-    #[arg(long = "nodes", default_value_t = 64)]
-    simulations: usize,
-    /// Parallel evaluator threads.
-    #[arg(long, default_value_t = 16)]
-    threads: usize,
-    /// Shared sampling and search seed.
-    #[arg(long, default_value_t = 20260923)]
-    seed: u64,
-    /// TSV result path.
-    #[arg(long, default_value = "experiments/replay-coverage.tsv")]
-    output: String,
-}
-
-#[derive(Args, Debug)]
-struct AzLoopArgs {
+struct AbEvolveArgs {
     /// Training config path.
-    #[arg(default_value = DEFAULT_AZ_LOOP_CONFIG)]
+    #[arg(default_value = DEFAULT_AB_EVOLVE_CONFIG)]
     config: String,
     /// Stop after completing this absolute update number and save the model/progress.
     #[arg(long)]
     target_update: Option<usize>,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai checkpoint-cycles checkpoints
-  chineseai checkpoint-cycles checkpoints --contains best --max-models 12 --opening-positions 100
-  chineseai checkpoint-cycles checkpoints --adjacent-only --nodes 400")]
-struct CheckpointCyclesArgs {
-    /// Directory containing checkpoint .safetensors files.
-    directory: String,
-    /// Keep only filenames containing this text; empty keeps every .safetensors file.
-    #[arg(long, default_value = "")]
-    contains: String,
-    /// Evaluate only the latest N checkpoints ordered by the filename's last number; 0 keeps all.
-    #[arg(long, default_value_t = 8)]
-    max_models: usize,
-    /// Minimum numeric update gap between selected checkpoints; 0 disables spacing.
-    #[arg(long, default_value_t = 100)]
-    min_update_gap: u64,
-    /// Test only consecutive checkpoints. This cannot detect three-model cycles.
-    #[arg(long)]
-    adjacent_only: bool,
-    /// Alpha-beta nodes per move.
-    #[arg(short = 's', long = "nodes", default_value_t = 800)]
-    simulations: usize,
-    /// Shuffled Px0 FEN positions; every pair uses the same positions with colors swapped.
-    #[arg(long, default_value_t = 1000)]
-    opening_positions: usize,
-    /// Px0 book.pgn.gz. Empty uses startpos.
-    #[arg(long, default_value = "book.pgn.gz")]
-    opening_book: String,
-    /// Parallel arena workers for each checkpoint pair.
-    #[arg(long, default_value_t = 128)]
-    threads: usize,
-    #[arg(long, default_value_t = 200)]
-    max_plies: usize,
-    /// Minimum score-rate excess over 50% used to report a directed edge or cycle.
-    #[arg(long, default_value_t = 0.02)]
-    cycle_margin: f32,
-    /// One-sided confidence multiplier used by cycle and regression detection.
-    #[arg(long, default_value_t = 1.96)]
-    confidence_z: f32,
-    #[arg(long, default_value_t = 20260823)]
-    seed: u64,
 }
 
 #[derive(Args, Debug)]
@@ -297,8 +88,8 @@ struct VsPikafishArgs {
     /// ChineseAI NNUE model path.
     model: String,
     /// ChineseAI alpha-beta nodes per move.
-    #[arg(short = 's', long = "nodes", default_value = "800")]
-    simulations: Option<usize>,
+    #[arg(long, default_value_t = 10_000)]
+    nodes: usize,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 200)]
     max_plies: usize,
@@ -317,102 +108,12 @@ struct VsPikafishArgs {
     /// Print the final FEN and complete move list for every game.
     #[arg(long)]
     report_games: bool,
-    /// Px0 book.pgn.gz used to generate random start positions. Empty uses startpos.
+    /// Opening book used to generate random start positions. Empty uses startpos.
     #[arg(long, default_value = "book.pgn.gz")]
     opening_book: String,
-    /// Number of shuffled FEN positions to take from the Px0 book.
+    /// Number of shuffled FEN positions to take from the opening book.
     #[arg(long, default_value_t = 1000)]
     opening_positions: usize,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --count 5000 --depth 20 --threads 16
-  chineseai pikafish-label-random ./tools/pikafish-avx2.exe --fens eval/random.fens --sqlite eval/pikafish-selfplay-5000-d20.sqlite")]
-struct PikafishLabelRandomArgs {
-    /// Pikafish UCI executable path.
-    pikafish_exe: String,
-    /// Output FEN list. Existing file is reused unless --regenerate is set.
-    #[arg(long, default_value = "eval/random.fens")]
-    fens: String,
-    /// Output SQLite labels.
-    #[arg(long, default_value = "eval/pikafish-selfplay-5000-d20.sqlite")]
-    sqlite: String,
-    /// Number of unique random positions.
-    #[arg(long, default_value_t = 5000)]
-    count: usize,
-    /// Random seed for FEN generation.
-    #[arg(long, default_value_t = 20260628)]
-    seed: u64,
-    /// Minimum random plies from startpos.
-    #[arg(long, default_value_t = 12)]
-    min_plies: usize,
-    /// Maximum random plies from startpos.
-    #[arg(long, default_value_t = 80)]
-    max_plies: usize,
-    /// Pikafish search depth.
-    #[arg(long, default_value_t = 20)]
-    depth: u32,
-    /// Independent single-threaded Pikafish workers.
-    #[arg(long, default_value_t = 16)]
-    threads: usize,
-    /// Regenerate the FEN file even when it already exists.
-    #[arg(long)]
-    regenerate: bool,
-}
-
-#[derive(Args, Debug)]
-struct PikafishLabelSelfplayArgs {
-    pikafish_exe: String,
-    model: String,
-    #[arg(long, default_value = "eval/selfplay-100000.fens")]
-    fens: String,
-    #[arg(long, default_value = "eval/pikafish-selfplay-100000-d12.sqlite")]
-    sqlite: String,
-    #[arg(long, default_value_t = 100_000)]
-    count: usize,
-    #[arg(long = "nodes", default_value_t = 800)]
-    simulations: usize,
-    #[arg(long, default_value_t = 200)]
-    max_plies: usize,
-    #[arg(long, default_value_t = 16)]
-    workers: usize,
-    #[arg(long, default_value_t = 12)]
-    depth: u32,
-    #[arg(long, default_value_t = 16)]
-    pikafish_threads: usize,
-    #[arg(long, default_value_t = 20260816)]
-    seed: u64,
-}
-
-#[derive(Args, Debug)]
-struct PikafishPolicyFitArgs {
-    sqlite: String,
-    #[arg(long, value_delimiter = ',', default_value = "96,128,160,192")]
-    hidden: Vec<usize>,
-    #[arg(long, default_value_t = 300)]
-    wall_seconds: u64,
-    #[arg(long, default_value_t = 1024)]
-    batch_size: usize,
-    #[arg(long, default_value_t = 0.0007)]
-    lr: f32,
-    #[arg(long, default_value_t = 0.1)]
-    validation_fraction: f32,
-    #[arg(long, default_value = "eval/policy-fit")]
-    output_dir: String,
-    #[arg(long, default_value_t = 20260816)]
-    seed: u64,
-}
-
-#[derive(Args, Debug)]
-struct PikafishExportTorchArgs {
-    sqlite: String,
-    #[arg(long, default_value = "eval/pikafish-policy.bin")]
-    output: String,
-    /// Include up to this many positions from each stored principal variation.
-    #[arg(long, default_value_t = 0)]
-    pv_plies: usize,
 }
 
 #[derive(Args, Debug)]
@@ -425,11 +126,8 @@ struct PikafishLabelEvalArgs {
     /// SQLite labels produced by pikafish-label-random.
     sqlite: String,
     /// Alpha-beta nodes per position.
-    #[arg(short = 's', long = "nodes", default_value_t = 10000)]
-    simulations: usize,
-    /// Maximum alpha-beta depth; 0 uses the default.
-    #[arg(long, default_value_t = 0)]
-    max_depth: usize,
+    #[arg(long, default_value_t = 10_000)]
+    nodes: usize,
     /// Random seed.
     #[arg(long, default_value_t = 20260628)]
     seed: u64,
@@ -444,6 +142,15 @@ struct PikafishLabelEvalArgs {
     output: Option<String>,
 }
 
+fn checkpoint_number(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let digits = name
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .last()?;
+    digits.parse().ok()
+}
+
 fn best_model_path(model_path: &str) -> PathBuf {
     Path::new(model_path)
         .parent()
@@ -452,17 +159,17 @@ fn best_model_path(model_path: &str) -> PathBuf {
         .join("best.safetensors")
 }
 
-fn az_loop_progress_path(config_path: &str) -> PathBuf {
+fn ab_evolve_progress_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.progress"))
 }
 
-fn az_loop_replay_snapshot_path(config_path: &str) -> PathBuf {
+fn ab_evolve_replay_snapshot_path(config_path: &str) -> PathBuf {
     PathBuf::from(format!("{config_path}.replay.lz4"))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AzLoopProgressState {
+struct AbEvolveProgressState {
     format_version: u32,
     next_update: usize,
     nemesis_update: Option<u64>,
@@ -470,10 +177,10 @@ struct AzLoopProgressState {
     generated_samples: u64,
 }
 
-impl Default for AzLoopProgressState {
+impl Default for AbEvolveProgressState {
     fn default() -> Self {
         Self {
-            format_version: AZ_LOOP_PROGRESS_VERSION,
+            format_version: AB_EVOLVE_PROGRESS_VERSION,
             next_update: 1,
             nemesis_update: None,
             generated_games: 0,
@@ -482,12 +189,12 @@ impl Default for AzLoopProgressState {
     }
 }
 
-impl AzLoopProgressState {
+impl AbEvolveProgressState {
     fn normalize(mut self) -> Self {
-        if self.format_version != AZ_LOOP_PROGRESS_VERSION {
+        if self.format_version != AB_EVOLVE_PROGRESS_VERSION {
             panic!(
                 "unsupported AB evolution progress version {}; expected {}",
-                self.format_version, AZ_LOOP_PROGRESS_VERSION
+                self.format_version, AB_EVOLVE_PROGRESS_VERSION
             );
         }
         self.next_update = self.next_update.max(1);
@@ -495,12 +202,12 @@ impl AzLoopProgressState {
     }
 }
 
-fn load_az_loop_progress(config_path: &str) -> AzLoopProgressState {
-    let path = az_loop_progress_path(config_path);
+fn load_ab_evolve_progress(config_path: &str) -> AbEvolveProgressState {
+    let path = ab_evolve_progress_path(config_path);
     let Ok(text) = fs::read_to_string(&path) else {
-        return AzLoopProgressState::default();
+        return AbEvolveProgressState::default();
     };
-    let state = toml::from_str::<AzLoopProgressState>(&text)
+    let state = toml::from_str::<AbEvolveProgressState>(&text)
         .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", path.display()))
         .normalize();
     fs::remove_file(&path).unwrap_or_else(|err| {
@@ -512,8 +219,8 @@ fn load_az_loop_progress(config_path: &str) -> AzLoopProgressState {
     state
 }
 
-fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
-    let path = az_loop_progress_path(config_path);
+fn save_ab_evolve_progress(config_path: &str, state: &AbEvolveProgressState) {
+    let path = ab_evolve_progress_path(config_path);
     fs::write(
         &path,
         toml::to_string_pretty(&state.clone().normalize()).unwrap(),
@@ -521,16 +228,16 @@ fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
     .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", path.display()));
 }
 
-fn save_az_loop_progress_pair(
+fn save_ab_evolve_progress_pair(
     config_path: &str,
     next_update: usize,
     nemesis_update: Option<u64>,
     generated_games: u64,
     generated_samples: u64,
 ) {
-    save_az_loop_progress(
+    save_ab_evolve_progress(
         config_path,
-        &AzLoopProgressState {
+        &AbEvolveProgressState {
             next_update,
             nemesis_update,
             generated_games,
@@ -540,7 +247,7 @@ fn save_az_loop_progress_pair(
     );
 }
 
-fn save_model(model: &AzNnue, path: &Path) {
+fn save_model(model: &AbNnue, path: &Path) {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -556,7 +263,7 @@ fn save_model(model: &AzNnue, path: &Path) {
         .unwrap_or_else(|err| panic!("failed to save model `{}`: {err}", path.display()));
 }
 
-fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
+fn tensorboard_encoded_subdir(config: &AbEvolveFileConfig) -> String {
     fn f32_slug(x: f32) -> String {
         if x == 0.0 {
             return "0".to_string();
@@ -616,7 +323,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     )
 }
 
-fn tensorboard_effective_logdir(config: &AzLoopFileConfig) -> PathBuf {
+fn tensorboard_effective_logdir(config: &AbEvolveFileConfig) -> PathBuf {
     Path::new(&config.tensorboard_logdir).join(tensorboard_encoded_subdir(config))
 }
 
@@ -641,7 +348,7 @@ fn best_checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -
 }
 
 fn save_checkpoint_model(
-    model: &AzNnue,
+    model: &AbNnue,
     model_path: &str,
     checkpoint_dir: &str,
     update: usize,
@@ -655,7 +362,7 @@ fn save_checkpoint_model(
 }
 
 fn save_best_checkpoint_model(
-    model: &AzNnue,
+    model: &AbNnue,
     model_path: &str,
     checkpoint_dir: &str,
     update: usize,
@@ -720,9 +427,9 @@ enum ArenaGateDecision {
 }
 
 fn arena_gate_decision(
-    current: &AzArenaReport,
-    previous: Option<&AzArenaReport>,
-    anchor: Option<&AzArenaReport>,
+    current: &AbArenaReport,
+    previous: Option<&AbArenaReport>,
+    anchor: Option<&AbArenaReport>,
     current_threshold: f32,
     confidence_z: f32,
 ) -> ArenaGateDecision {
@@ -732,7 +439,7 @@ fn arena_gate_decision(
         .into_iter()
         .chain(anchor)
         .any(|report| report.score_rate_upper_bound(z) < 0.50);
-    let mut combined_history = AzArenaReport::default();
+    let mut combined_history = AbArenaReport::default();
     for report in previous.into_iter().chain(anchor) {
         combined_history.add_assign(report);
     }
@@ -801,23 +508,23 @@ fn prune_old_checkpoints(
 }
 
 struct SelfplayBatch {
-    data: AzSelfplayData,
+    data: AbSelfplayData,
 }
 
 struct TrainerEvent {
-    report: AzLoopReport,
-    candidate_model: AzNnue,
+    report: AbEvolveReport,
+    candidate_model: AbNnue,
 }
 
 struct SharedSelfplayModel {
     version: u64,
     learner_update: u32,
-    model: Arc<AzNnue>,
+    model: Arc<AbNnue>,
 }
 
 fn publish_selfplay_model(
     shared_model: &RwLock<SharedSelfplayModel>,
-    model: Arc<AzNnue>,
+    model: Arc<AbNnue>,
     learner_update: usize,
 ) -> u64 {
     let mut shared = shared_model
@@ -831,7 +538,7 @@ fn publish_selfplay_model(
 
 fn publish_on_promotion(
     shared_model: &RwLock<SharedSelfplayModel>,
-    model: Arc<AzNnue>,
+    model: Arc<AbNnue>,
     learner_update: usize,
     decision: ArenaGateDecision,
 ) -> Option<u64> {
@@ -842,7 +549,7 @@ fn publish_on_promotion(
 #[derive(Default)]
 struct PendingTrainingData {
     collection_seconds: f32,
-    selfplay: AzSelfplayData,
+    selfplay: AbSelfplayData,
 }
 
 impl PendingTrainingData {
@@ -851,18 +558,18 @@ impl PendingTrainingData {
     }
 }
 
-fn build_az_loop_config(
-    config: &AzLoopFileConfig,
+fn build_ab_evolve_config(
+    config: &AbEvolveFileConfig,
     seed: u64,
     workers: usize,
     generation_update: u32,
-    opening_positions: &Arc<[chineseai::az::AzStartSnapshot]>,
-) -> AzLoopConfig {
-    AzLoopConfig {
+    opening_positions: &Arc<[chineseai::ab::AbStartSnapshot]>,
+) -> AbEvolveConfig {
+    AbEvolveConfig {
         games: 1,
         max_plies: config.max_plies,
         rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
-        simulations: config.selfplay_nodes,
+        nodes: config.selfplay_nodes,
         seed,
         workers,
         generation_update,
@@ -880,15 +587,14 @@ fn build_az_loop_config(
 fn build_async_training_report(
     pending: PendingTrainingData,
     selfplay_games: usize,
-    stats: chineseai::az::AzTrainStats,
+    stats: chineseai::ab::AbTrainStats,
     learning_rate: f32,
     train_data_len: usize,
     train_seconds: f32,
     pool_samples: usize,
     pool_capacity: usize,
-    replay_window: chineseai::az::AzReplayWindowStats,
-    target_entropy: f32,
-) -> AzLoopReport {
+    replay_window: chineseai::ab::AbReplayWindowStats,
+) -> AbEvolveReport {
     let selfplay_samples = pending.selfplay.samples.len();
     let total_seconds = pending.collection_seconds.max(1.0e-6);
     let train_stat_samples = stats
@@ -897,12 +603,10 @@ fn build_async_training_report(
         .map(|p| p.samples)
         .sum::<usize>()
         .max(1) as f32;
-    let root_policy_entropy =
-        pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
     let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
     let sampled_moves = pending.selfplay.sampled_moves.max(1) as f32;
-    let search_count = pending.selfplay.search_simulations.searches.max(1) as f32;
+    let search_count = pending.selfplay.search_nodes.searches.max(1) as f32;
     let value_pred_mean = stats.value_pred_sum / train_stat_samples;
     let value_target_mean = stats.value_target_sum / train_stat_samples;
     let value_pred_var =
@@ -915,14 +619,14 @@ fn build_async_training_report(
     let value_corr =
         value_cov / (value_pred_var.max(1.0e-12).sqrt() * value_target_var.max(1.0e-12).sqrt());
     let value_calibration = value_cov / value_pred_var.max(1.0e-12);
-    let value_report = |phase_stats: chineseai::az::AzValueMomentStats| {
+    let value_report = |phase_stats: chineseai::ab::AbValueMomentStats| {
         let count = phase_stats.samples.max(1) as f32;
         let pred_mean = phase_stats.pred_sum / count;
         let target_mean = phase_stats.target_sum / count;
         let pred_var = (phase_stats.pred_sq_sum / count - pred_mean * pred_mean).max(0.0);
         let target_var = (phase_stats.target_sq_sum / count - target_mean * target_mean).max(0.0);
         let covariance = phase_stats.pred_target_sum / count - pred_mean * target_mean;
-        chineseai::az::AzPhaseValueReport {
+        chineseai::ab::AbPhaseValueReport {
             samples: phase_stats.samples,
             rmse: (phase_stats.error_sq_sum / count).max(0.0).sqrt(),
             corr: (covariance / (pred_var.max(1.0e-12).sqrt() * target_var.max(1.0e-12).sqrt()))
@@ -948,16 +652,14 @@ fn build_async_training_report(
         pending.selfplay.start_temperature_sum[source]
             / pending.selfplay.start_games[source].max(1) as f32
     });
-    AzLoopReport {
+    AbEvolveReport {
         training_steps: 0,
         training_chunks: 0,
         test_chunks: 0,
         holdout_checks: Vec::new(),
-        cycle_complete: false,
         games: selfplay_games,
         samples: selfplay_samples,
-        avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
-            / search_count,
+        avg_search_nodes: pending.selfplay.search_nodes.nodes_sum as f32 / search_count,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,
@@ -987,32 +689,19 @@ fn build_async_training_report(
         value_calibration,
         phase_value,
         source_phase_value,
-        policy_ce: stats.policy_ce,
-        policy_target_entropy: target_entropy,
-        policy_kl: stats.policy_ce - target_entropy,
-        root_policy_entropy,
         entropy_opening: pending.selfplay.entropy_opening_sum
             / pending.selfplay.entropy_opening_count.max(1) as f32,
         entropy_mid: pending.selfplay.entropy_mid_sum
             / pending.selfplay.entropy_mid_count.max(1) as f32,
-        raw_prior_top1: pending.selfplay.raw_prior_top1_sum / shape_count,
-        raw_prior_top2: pending.selfplay.raw_prior_top2_sum / shape_count,
-        policy_top1: pending.selfplay.policy_top1_sum / shape_count,
-        policy_top2: pending.selfplay.policy_top2_sum / shape_count,
         root_q_gap: pending.selfplay.q_gap_sum / shape_count,
         root_q_top1_abs: pending.selfplay.q_top1_abs_sum / shape_count,
         root_actions: pending.selfplay.root_actions_sum as f32 / shape_count,
-        opening_raw_prior_top1: pending.selfplay.opening_raw_prior_top1_sum / opening_shape_count,
-        opening_raw_prior_top2: pending.selfplay.opening_raw_prior_top2_sum / opening_shape_count,
-        opening_policy_top1: pending.selfplay.opening_policy_top1_sum / opening_shape_count,
-        opening_policy_top2: pending.selfplay.opening_policy_top2_sum / opening_shape_count,
         opening_q_gap: pending.selfplay.opening_q_gap_sum / opening_shape_count,
         opening_q_top1_abs: pending.selfplay.opening_q_top1_abs_sum / opening_shape_count,
         opening_root_actions: pending.selfplay.opening_root_actions_sum as f32
             / opening_shape_count,
         sampled_best_rate: pending.selfplay.sampled_best_moves as f32 / sampled_moves,
         avg_best_played_q_gap: pending.selfplay.best_played_q_gap_sum / sampled_moves,
-        avg_played_top_policy_ratio: pending.selfplay.played_top_policy_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
         avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
         train_seconds,
@@ -1053,10 +742,10 @@ fn build_async_training_report(
 }
 
 struct ArenaThreadConfig {
-    candidate: Arc<AzNnue>,
-    baseline: Arc<AzNnue>,
+    candidate: Arc<AbNnue>,
+    baseline: Arc<AbNnue>,
     eval_starts: ArenaStarts,
-    simulations: usize,
+    nodes: usize,
     max_plies: usize,
     rule60_max_ply: Option<u16>,
     thread_count: usize,
@@ -1076,7 +765,7 @@ impl ArenaStarts {
     }
 }
 
-fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
+fn run_arena_threads(config: ArenaThreadConfig) -> AbArenaReport {
     let games_per_side = if config.eval_starts.len() == 0 {
         1
     } else {
@@ -1095,7 +784,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let candidate = Arc::clone(&config.candidate);
         let baseline = Arc::clone(&config.baseline);
         let eval_starts = config.eval_starts.clone();
-        let simulations = config.simulations;
+        let nodes = config.nodes;
         let max_plies = config.max_plies;
         let rule60_max_ply = config.rule60_max_ply;
         // 由全局开局索引派生每对随机流；结果不应随线程切分变化。
@@ -1103,8 +792,8 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let thread_start_index = start_index;
         start_index += red_games;
         handles.push(thread::spawn(move || {
-            let arena_config = AzArenaConfig {
-                simulations,
+            let arena_config = AbArenaConfig {
+                nodes,
                 max_plies,
                 rule60_max_ply,
                 games_as_red: red_games,
@@ -1123,7 +812,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         }));
     }
 
-    let mut merged = AzArenaReport::default();
+    let mut merged = AbArenaReport::default();
     for handle in handles {
         merged.add_assign(
             &handle
@@ -1135,7 +824,7 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
 }
 
 fn build_arena_start_positions(
-    config: &AzLoopFileConfig,
+    config: &AbEvolveFileConfig,
     update: usize,
 ) -> (Vec<Position>, String) {
     // 每次门控使用新的确定性留出折，避免反复在同一小批局面上选择导致评测过拟合。
@@ -1144,19 +833,19 @@ fn build_arena_start_positions(
     let seed = config.seed
         ^ 0xD1B5_4A32_D192_ED03
         ^ (gate_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut book = Px0OpeningBook::load(&config.arena_opening_book, seed)
-        .unwrap_or_else(|err| panic!("failed to load Px0 arena book: {err}"));
+    let mut book = OpeningBook::load(&config.arena_opening_book, seed)
+        .unwrap_or_else(|err| panic!("failed to load arena book: {err}"));
     let count = book.len();
     let positions = book
         .next_batch(config.arena_openings, 0)
-        .unwrap_or_else(|err| panic!("invalid Px0 arena FEN: {err}"))
+        .unwrap_or_else(|err| panic!("invalid arena FEN: {err}"))
         .into_iter()
         .map(|snapshot| snapshot.position)
         .collect();
     (
         positions,
         format!(
-            "px0(shuffled,count={},book_positions={count})",
+            "book(shuffled,count={},book_positions={count})",
             config.arena_openings
         ),
     )
@@ -1173,282 +862,13 @@ fn main() {
             let _ = Cli::command().print_help();
             std::process::exit(0);
         }
-        Some(CliCommand::AzInit(cmd)) => {
-            let arch = cmd.arch();
-            let output = cmd.output;
-            let seed = cmd.seed;
-            let model = AzNnue::random_with_arch(arch, seed);
-            model.save(&output).unwrap_or_else(|err| {
-                panic!("failed to write `{output}`: {err}");
-            });
-            println!(
-                "aznnue   : initialized (safetensors, format v{})",
-                chineseai::version::MODEL_FORMAT_VERSION
-            );
-            println!("arch     : hidden={}", arch.hidden_size);
-            println!("seed     : {seed}");
-            println!("output   : {output}");
-        }
-        Some(CliCommand::AzPolicyScale(cmd)) => {
-            assert!(
-                cmd.scale.is_finite() && cmd.scale >= 0.0,
-                "policy exact scale must be finite and non-negative"
-            );
-            let mut model = AzNnue::load(&cmd.input)
-                .unwrap_or_else(|err| panic!("failed to load `{}`: {err}", cmd.input));
-            let weights: &mut [f32] = match cmd.component {
-                PolicyComponent::Accumulator => &mut model.policy_accumulator_move,
-                PolicyComponent::Context => &mut model.policy_move_context,
-                PolicyComponent::Consequence => &mut model.policy_consequence_output,
-                PolicyComponent::MoveBias => &mut model.policy_move_bias,
-            };
-            let (rows, nonzero, before_l2) = {
-                let nonzero = weights.iter().filter(|&&weight| weight != 0.0).count();
-                let before_l2 = weights
-                    .iter()
-                    .map(|&weight| f64::from(weight) * f64::from(weight))
-                    .sum::<f64>()
-                    .sqrt();
-                for weight in weights.iter_mut() {
-                    *weight *= cmd.scale;
-                }
-                (weights.len(), nonzero, before_l2)
-            };
-            let after_l2 = before_l2 * f64::from(cmd.scale);
-            model
-                .save(&cmd.output)
-                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", cmd.output));
-            println!("input    : {}", cmd.input);
-            println!("output   : {}", cmd.output);
-            println!("component: {:?}", cmd.component);
-            println!("scale    : {}", cmd.scale);
-            println!("weights  : rows={} nonzero={}", rows, nonzero);
-            println!("l2       : {:.6} -> {:.6}", before_l2, after_l2);
-        }
-        Some(CliCommand::AzTrainBench(cmd)) => {
-            let model_path = cmd.model;
-            let sample_count = cmd.samples.max(1);
-            let epochs = cmd.epochs.max(1);
-            let batch_size = cmd.batch_size.max(1);
-            let lr = cmd.lr.max(0.0);
-            let seed = cmd.seed;
-            let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
-                panic!("failed to load `{model_path}`: {err}");
-            });
-            let started = std::time::Instant::now();
-            let stats = benchmark_training(&mut model, sample_count, epochs, batch_size, lr, seed);
-            let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
-            let processed = (sample_count * epochs) as f64;
-            println!("bench        : training");
-            println!("model        : {model_path}");
-            println!("samples      : {sample_count}");
-            println!("epochs       : {epochs}");
-            println!("batch_size   : {batch_size}");
-            println!("lr             : {lr}");
-            println!("elapsed_ms   : {:.3}", elapsed * 1000.0);
-            println!("processed    : {}", sample_count * epochs);
-            println!("samples/sec  : {:.0}", processed / elapsed);
-            println!("loss         : {:.4}", stats.loss);
-            println!("value_ce     : {:.4}", stats.value_loss);
-            println!("policy_ce    : {:.4}", stats.policy_ce);
-        }
-        Some(CliCommand::AzReplayOpeningStats(cmd)) => {
-            #[derive(Default)]
-            struct MoveStats {
-                target_mass: f64,
-                played: usize,
-                wins: usize,
-                draws: usize,
-                losses: usize,
-                target_q_sum: f64,
-            }
-
-            let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), usize::MAX)
-                .unwrap_or_else(|err| panic!("failed to load replay `{}`: {err}", cmd.replay));
-            let groups = pool.all_sample_groups();
-            let start = Position::startpos();
-            let names = start
-                .legal_moves()
-                .into_iter()
-                .map(|mv| {
-                    (
-                        dense_move_index(canonical_move(start.side_to_move(), mv)),
-                        mv.to_uci(),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let mut stats = HashMap::<usize, MoveStats>::new();
-            let mut start_games = 0usize;
-            for group in &groups {
-                let Some(sample) = group.iter().find(|sample| sample.meta.ply == 0) else {
-                    continue;
-                };
-                start_games += 1;
-                let target_q = sample.value_wdl[0] - sample.value_wdl[2];
-                for (&move_index, &mass) in sample.move_indices.iter().zip(&sample.policy) {
-                    let row = stats.entry(move_index).or_default();
-                    row.target_mass += mass.max(0.0) as f64;
-                    row.target_q_sum += target_q as f64 * mass.max(0.0) as f64;
-                }
-                let played = sample.meta.played_index as usize;
-                let Some(&move_index) = sample.move_indices.get(played) else {
-                    continue;
-                };
-                let row = stats.entry(move_index).or_default();
-                row.played += 1;
-                let result_red = group.last().map_or(0.0, |last| last.value * last.side_sign);
-                if result_red > 0.5 {
-                    row.wins += 1;
-                } else if result_red < -0.5 {
-                    row.losses += 1;
-                } else {
-                    row.draws += 1;
-                }
-            }
-            let mut rows = stats.into_iter().collect::<Vec<_>>();
-            rows.sort_by(|left, right| right.1.target_mass.total_cmp(&left.1.target_mass));
-            println!(
-                "replay-opening: snapshot={} groups={} start_games={}",
-                cmd.replay,
-                groups.len(),
-                start_games
-            );
-            println!("MOVE target% played% games W/D/L score targetQ");
-            for (move_index, row) in rows.into_iter().take(cmd.top.max(1)) {
-                let games = row.wins + row.draws + row.losses;
-                let score = if games == 0 {
-                    0.0
-                } else {
-                    (row.wins as f64 + 0.5 * row.draws as f64) / games as f64
-                };
-                println!(
-                    "{:<5} {:>7.3} {:>7.3} {:>5} {}/{}/{} {:>5.3} {:+.3}",
-                    names.get(&move_index).map_or("?", String::as_str),
-                    100.0 * row.target_mass / start_games.max(1) as f64,
-                    100.0 * row.played as f64 / start_games.max(1) as f64,
-                    games,
-                    row.wins,
-                    row.draws,
-                    row.losses,
-                    score,
-                    row.target_q_sum / row.target_mass.max(f64::EPSILON),
-                );
-            }
-        }
-        Some(CliCommand::AzReplayCoverage(cmd)) => {
-            run_replay_coverage(cmd).expect("replay coverage audit failed");
-        }
-        Some(CliCommand::AzReplayFit(cmd)) => {
-            let capacity = cmd.samples.max(2);
-            let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), capacity)
-                .unwrap_or_else(|err| panic!("failed to load replay `{}`: {err}", cmd.replay));
-            let window = pool.window_stats(5000);
-            let groups = pool.all_sample_groups();
-            drop(pool);
-            let validation_groups = ((groups.len() as f32)
-                * cmd.validation_fraction.clamp(0.01, 0.5))
-            .round()
-            .max(1.0) as usize;
-            let split = groups.len().saturating_sub(validation_groups).max(1);
-            let mut train = Vec::new();
-            let mut validation = Vec::new();
-            for (index, group) in groups.into_iter().enumerate() {
-                if index < split {
-                    train.extend(group);
-                } else {
-                    validation.extend(group);
-                }
-            }
-            let mut model = cmd.initial_model.as_ref().map_or_else(
-                || {
-                    AzNnue::random_with_arch(
-                        chineseai::az::AzNnueArch::with_hidden_size(cmd.hidden.max(1)),
-                        cmd.seed,
-                    )
-                },
-                |path| {
-                    AzNnue::load(path).unwrap_or_else(|err| {
-                        panic!("failed to load initial model `{path}`: {err}")
-                    })
-                },
-            );
-            let arch = model.arch;
-            let weights = AzTrainLossWeights::default();
-            let mut eval_rng = SplitMix64::new(cmd.seed ^ 0xD1B5_4A32_D192_ED03);
-            let baseline = train_samples_weighted(
-                &mut model.clone(),
-                &validation,
-                1,
-                1.0e-12,
-                cmd.batch_size.max(1),
-                &mut eval_rng,
-                weights,
-            )
-            .expect("replay-fit baseline training failed");
-            let mut train_rng = SplitMix64::new(cmd.seed);
-            let started = Instant::now();
-            let trained = train_samples_weighted(
-                &mut model,
-                &train,
-                cmd.epochs.max(1),
-                cmd.lr.max(0.0),
-                cmd.batch_size.max(1),
-                &mut train_rng,
-                weights,
-            )
-            .expect("replay-fit training failed");
-            let train_seconds = started.elapsed().as_secs_f32();
-            let mut final_eval_model = model.clone();
-            let mut final_eval_rng = SplitMix64::new(cmd.seed ^ 0x94D0_49BB_1331_11EB);
-            let validation_stats = train_samples_weighted(
-                &mut final_eval_model,
-                &validation,
-                1,
-                1.0e-12,
-                cmd.batch_size.max(1),
-                &mut final_eval_rng,
-                weights,
-            )
-            .expect("replay-fit validation training failed");
-            let policy_groups = evaluate_policy_groups(&model, &validation);
-            let mut ablated_model = model.clone();
-            ablated_model.policy_consequence_output.fill(0.0);
-            let ablated_groups = evaluate_policy_groups(&ablated_model, &validation);
-            model.save(&cmd.output).unwrap_or_else(|err| {
-                panic!("failed to save replay-fit model `{}`: {err}", cmd.output)
-            });
-            println!("replay-fit : {}", cmd.replay);
-            println!("window     : {:?}", window);
-            println!("arch       : hidden={}", arch.hidden_size);
-            println!(
-                "split      : train={} validation={} games={}",
-                train.len(),
-                validation.len(),
-                split + validation_groups
-            );
-            println!(
-                "baseline   : loss={:.5} value_ce={:.5} policy_ce={:.5}",
-                baseline.loss, baseline.value_loss, baseline.policy_ce
-            );
-            println!(
-                "train      : loss={:.5} value_ce={:.5} policy_ce={:.5} seconds={:.2}",
-                trained.loss, trained.value_loss, trained.policy_ce, train_seconds
-            );
-            println!(
-                "validation : loss={:.5} value_ce={:.5} policy_ce={:.5}",
-                validation_stats.loss, validation_stats.value_loss, validation_stats.policy_ce
-            );
-            println!("groups     : {policy_groups:?}");
-            println!("no-delta   : {ablated_groups:?}");
-            println!("output     : {}", cmd.output);
-        }
-        Some(CliCommand::AzLoop(cmd)) => {
+        Some(CliCommand::AbEvolve(cmd)) => {
             let config_path = cmd.config;
-            let Some(config) = load_or_create_az_loop_config(&config_path) else {
+            let Some(config) = load_or_create_ab_evolve_config(&config_path) else {
                 return;
             };
             let target_update = cmd.target_update.map(|update| update.max(1));
-            let progress_boot = load_az_loop_progress(&config_path);
+            let progress_boot = load_ab_evolve_progress(&config_path);
             let start_update = progress_boot.next_update.max(1);
             let mut arena_nemesis_update = progress_boot.nemesis_update;
             let mut generated_games_total = progress_boot.generated_games;
@@ -1468,7 +888,7 @@ fn main() {
             let model_path = Path::new(&config.model_path);
             let (mut model, resumed_model) = if model_path.exists() {
                 println!("model    : load {}", config.model_path);
-                let model = AzNnue::load(model_path).unwrap_or_else(|err| {
+                let model = AbNnue::load(model_path).unwrap_or_else(|err| {
                     panic!(
                         "refusing to resume incompatible model `{}`: {err}",
                         model_path.display()
@@ -1485,7 +905,7 @@ fn main() {
                 (model, true)
             } else if config.arena_interval > 0 && best_path.exists() {
                 println!("model    : load best `{}` as current", best_path.display());
-                let best = AzNnue::load(&best_path).unwrap_or_else(|err| {
+                let best = AbNnue::load(&best_path).unwrap_or_else(|err| {
                     panic!("failed to load best model `{}`: {err}", best_path.display());
                 });
                 if best.arch != config_arch {
@@ -1499,7 +919,7 @@ fn main() {
                 (best, true)
             } else {
                 println!("model    : init {}", config.model_path);
-                (AzNnue::random_with_arch(config_arch, config.seed), false)
+                (AbNnue::random_with_arch(config_arch, config.seed), false)
             };
             let optimizer_state_path = PathBuf::from(format!("{config_path}.sgd.safetensors"));
             let model_optimizer_path = optimizer_checkpoint_path(model_path);
@@ -1525,7 +945,7 @@ fn main() {
                 if !best_path.exists() {
                     save_model(&selfplay_model, &best_path);
                 }
-                let reference = AzNnue::load(&best_path).unwrap_or_else(|err| {
+                let reference = AbNnue::load(&best_path).unwrap_or_else(|err| {
                     panic!("failed to load best model `{}`: {err}", best_path.display());
                 });
                 if reference.arch != selfplay_model.arch {
@@ -1539,11 +959,11 @@ fn main() {
                 reference
             };
             let initial_selfplay_model = initial_arena_reference_model.clone();
-            let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
+            let replay_snapshot_path = ab_evolve_replay_snapshot_path(&config_path);
             let mut replay_pool =
-                (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
+                (config.replay_capacity > 0).then(|| AbExperiencePool::new(config.replay_capacity));
             if config.replay_capacity > 0 && replay_snapshot_path.exists() {
-                match AzExperiencePool::load_snapshot_lz4(
+                match AbExperiencePool::load_snapshot_lz4(
                     &replay_snapshot_path,
                     config.replay_capacity,
                 ) {
@@ -1582,7 +1002,7 @@ fn main() {
             });
             let mut tb = SummaryWriter::new(&tb_dir);
             println!(
-                "train: config={} update={} sims={} batch={} optimizer=SGD+Nesterov lr={} max_plies={} book={} tensorboard={}",
+                "train: config={} update={} nodes={} batch={} optimizer=SGD+Nesterov lr={} max_plies={} book={} tensorboard={}",
                 config_path,
                 start_update,
                 config.selfplay_nodes,
@@ -1618,16 +1038,14 @@ fn main() {
                 model: Arc::new(initial_selfplay_model),
             }));
             let book_openings = Arc::new(std::sync::Mutex::new(
-                chineseai::px0_opening_book::Px0OpeningBook::load(
-                    &config.selfplay_opening_book,
-                    config.seed,
-                )
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "failed to load Px0 opening book `{}`: {err}",
-                        config.selfplay_opening_book
-                    )
-                }),
+                OpeningBook::load(&config.selfplay_opening_book, config.seed).unwrap_or_else(
+                    |err| {
+                        panic!(
+                            "failed to load opening book `{}`: {err}",
+                            config.selfplay_opening_book
+                        )
+                    },
+                ),
             ));
             let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
             for worker_id in 0..selfplay_worker_count {
@@ -1640,7 +1058,7 @@ fn main() {
                     let mut batch_index = 0usize;
                     let mut local_version = u64::MAX;
                     let mut local_learner_update = 0u32;
-                    let mut local_model: Option<Arc<AzNnue>> = None;
+                    let mut local_model: Option<Arc<AbNnue>> = None;
                     while !selfplay_stop.load(Ordering::SeqCst) {
                         if selfplay_stop.load(Ordering::SeqCst) {
                             break;
@@ -1658,7 +1076,7 @@ fn main() {
                         let batch_seed = selfplay_config.seed
                             ^ ((worker_id as u64).wrapping_add(1) << 32)
                             ^ (batch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                        let mut loop_config = build_az_loop_config(
+                        let mut loop_config = build_ab_evolve_config(
                             &selfplay_config,
                             batch_seed,
                             1,
@@ -1668,9 +1086,9 @@ fn main() {
                         loop_config.games = 4;
                         loop_config.opening_positions = book_openings
                             .lock()
-                            .unwrap_or_else(|_| panic!("Px0 opening book poisoned"))
+                            .unwrap_or_else(|_| panic!("opening book poisoned"))
                             .next_batch(loop_config.games, local_learner_update)
-                            .unwrap_or_else(|err| panic!("invalid Px0 opening: {err}"))
+                            .unwrap_or_else(|err| panic!("invalid opening: {err}"))
                             .into();
                         let data = generate_selfplay_data(
                             local_model
@@ -1693,7 +1111,7 @@ fn main() {
             let collector_config = config.clone();
             let replay_samples_at_start = replay_pool
                 .as_ref()
-                .map(AzExperiencePool::sample_count)
+                .map(AbExperiencePool::sample_count)
                 .unwrap_or(0);
             let collector_warmup_missing = config
                 .train_warmup_samples
@@ -1742,19 +1160,17 @@ fn main() {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
                 let mut train_index = 0usize;
-                let mut replay_sampler = Px0ReplaySampler::partitioned(
+                let mut unlabeled_batches = 0usize;
+                let mut replay_sampler = ReplaySampler::partitioned(
                     trainer_config.shuffle_size,
                     trainer_config.seed,
                     false,
                 );
-                let mut test_sampler = Px0ReplaySampler::partitioned(
+                let mut test_sampler = ReplaySampler::partitioned(
                     (trainer_config.shuffle_size / 10).max(1),
                     trainer_config.seed,
                     true,
                 );
-                let mut cycle_end =
-                    (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS + 1)
-                        * chineseai::az::PX0_CYCLE_STEPS;
                 let min_train_samples = trainer_config.batch_size.max(1);
                 'training: while let Ok(mut pending) = ready_rx.recv() {
                     let pending_games = pending.selfplay.games.len();
@@ -1774,24 +1190,23 @@ fn main() {
                     if pool.sample_count() < min_train_samples {
                         continue;
                     }
-                    let mut rng = chineseai::az::SplitMix64::new(
+                    let mut rng = chineseai::ab::SplitMix64::new(
                         trainer_config.seed
                             ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
                     );
                     let steps_before = trainer_model.training_steps();
                     let train_steps = trainer_config
                         .train_samples_per_update
-                        .div_ceil(trainer_config.batch_size)
-                        .min(cycle_end - steps_before);
+                        .div_ceil(trainer_config.batch_size);
                     let (training_chunks, test_chunks) = pool.partition_chunks(trainer_config.seed);
                     if training_chunks == 0 || test_chunks == 0 {
                         continue;
                     }
-                    let need_test = steps_before.is_multiple_of(chineseai::az::PX0_CYCLE_STEPS)
-                        || steps_before / chineseai::az::PX0_TEST_STEPS
-                            != (steps_before + train_steps) / chineseai::az::PX0_TEST_STEPS;
+                    let need_test = steps_before == 0
+                        || steps_before / HOLDOUT_INTERVAL_STEPS
+                            != (steps_before + train_steps) / HOLDOUT_INTERVAL_STEPS;
                     if need_test {
-                        // 与公开入口相同：估计每个测试chunk约10个SKIP=32后的局面。
+                        // 每个留出分区抽取固定规模样本，评估训练漂移。
                         let count = (test_chunks * 10 / trainer_config.batch_size).max(1)
                             * trainer_config.batch_size;
                         let mut test_rng = SplitMix64::new(
@@ -1810,8 +1225,16 @@ fn main() {
                     if train_data.is_empty() {
                         continue;
                     }
+                    if !train_data.iter().any(|sample| sample.value_weight > 0.0) {
+                        unlabeled_batches += 1;
+                        assert!(
+                            unlabeled_batches < 32,
+                            "32 replay batches had no value targets; increase selfplay_nodes or max_plies"
+                        );
+                        continue;
+                    }
+                    unlabeled_batches = 0;
                     let train_data_len = train_data.len();
-                    let target_entropy = policy_target_entropy(&train_data);
                     let train_update = trainer_start_update.saturating_add(train_index);
                     let current_lr = trainer_config.lr;
                     let train_started = Instant::now();
@@ -1822,9 +1245,8 @@ fn main() {
                         current_lr,
                         trainer_config.batch_size,
                         &mut rng,
-                        AzTrainLossWeights {
+                        AbTrainLossWeights {
                             value: trainer_config.train_value_weight,
-                            policy: trainer_config.train_policy_weight,
                         },
                     )
                     .unwrap_or_else(|err| panic!("training update {} failed: {err}", train_update));
@@ -1832,9 +1254,9 @@ fn main() {
                     let current_lr = trainer_model
                         .last_training_learning_rate()
                         .unwrap_or(current_lr);
-                    if trainer_config.checkpoint_interval > 0
-                        && train_update.is_multiple_of(trainer_config.checkpoint_interval)
-                    {
+                    let checkpoint_due = trainer_config.checkpoint_interval > 0
+                        && train_update.is_multiple_of(trainer_config.checkpoint_interval);
+                    if checkpoint_due {
                         let path = save_checkpoint_model(
                             &trainer_model,
                             &trainer_config.model_path,
@@ -1860,21 +1282,18 @@ fn main() {
                         pool.sample_count(),
                         pool.capacity(),
                         pool.window_stats(trainer_config.replay_recent_games),
-                        target_entropy,
                     );
                     report.training_steps = trainer_model.training_steps();
                     report.training_chunks = training_chunks;
                     report.test_chunks = test_chunks;
                     report.holdout_checks = trainer_model.take_training_checks();
-                    report.cycle_complete = report.training_steps == cycle_end;
-                    if report.cycle_complete {
+                    if checkpoint_due {
                         save_model(&trainer_model, Path::new(&trainer_config.model_path));
                         trainer_model.save_training_state(
                             &optimizer_state_path,
                             train_update.saturating_add(1),
                         )?;
                         pool.save_snapshot_lz4(&trainer_snapshot_path)?;
-                        cycle_end += chineseai::az::PX0_CYCLE_STEPS;
                     }
                     let candidate_model = trainer_model.clone();
                     if trainer_tx
@@ -1904,7 +1323,7 @@ fn main() {
             let mut exited_after_ctrl_c = false;
             let mut exited_after_target_update = false;
             let mut update = start_update;
-            let mut interrupt_save_model: Option<AzNnue> = None;
+            let mut interrupt_save_model: Option<AbNnue> = None;
             let mut interrupt_save_next_update = start_update;
             loop {
                 if interrupted.load(Ordering::SeqCst) {
@@ -1921,70 +1340,8 @@ fn main() {
                             if interrupted.load(Ordering::SeqCst) {
                                 exited_after_ctrl_c = true;
                                 break (
-                                    AzLoopReport {
-                                        games: 0,
-                                        samples: 0,
-                                        red_wins: 0,
-                                        black_wins: 0,
-                                        draws: 0,
-                                        avg_plies: 0.0,
-                                        loss: 0.0,
-                                        learning_rate: 0.0,
-                                        value_loss: 0.0,
-                                        value_mse: 0.0,
-                                        value_pred_mean: 0.0,
-                                        value_target_mean: 0.0,
-                                        value_pred_rms: 0.0,
-                                        value_target_rms: 0.0,
-                                        value_corr: 0.0,
-                                        value_calibration: 0.0,
-                                        policy_ce: 0.0,
-                                        policy_kl: 0.0,
-                                        root_policy_entropy: 0.0,
-                                        entropy_opening: 0.0,
-                                        entropy_mid: 0.0,
-                                        raw_prior_top1: 0.0,
-                                        raw_prior_top2: 0.0,
-                                        policy_top1: 0.0,
-                                        policy_top2: 0.0,
-                                        root_q_gap: 0.0,
-                                        root_q_top1_abs: 0.0,
-                                        root_actions: 0.0,
-                                        opening_raw_prior_top1: 0.0,
-                                        opening_raw_prior_top2: 0.0,
-                                        opening_policy_top1: 0.0,
-                                        opening_policy_top2: 0.0,
-                                        opening_q_gap: 0.0,
-                                        opening_q_top1_abs: 0.0,
-                                        opening_root_actions: 0.0,
-                                        sampled_best_rate: 0.0,
-                                        avg_best_played_q_gap: 0.0,
-                                        avg_played_top_policy_ratio: 0.0,
-                                        avg_best_q: 0.0,
-                                        avg_played_q: 0.0,
-                                        train_seconds: 0.0,
-                                        total_seconds: 0.0,
-                                        games_per_second: 0.0,
-                                        samples_per_second: 0.0,
-                                        train_samples_per_second: 0.0,
-                                        train_samples: 0,
-                                        pool_samples: 0,
-                                        pool_capacity: config.replay_capacity,
-                                        terminal_no_legal_moves: 0,
-                                        terminal_red_general_missing: 0,
-                                        terminal_black_general_missing: 0,
-                                        terminal_rule_draw: 0,
-                                        terminal_rule_draw_natural_limit: 0,
-                                        terminal_rule_draw_insufficient_material: 0,
-                                        terminal_rule_draw_repetition: 0,
-                                        terminal_rule_draw_mutual_long_check: 0,
-                                        terminal_rule_draw_mutual_long_chase: 0,
-                                        terminal_rule_win_red: 0,
-                                        terminal_rule_win_black: 0,
-                                        terminal_max_plies: 0,
-                                        ..AzLoopReport::default()
-                                    },
-                                    AzNnue::random_with_arch(config.arch(), config.seed),
+                                    AbEvolveReport::default(),
+                                    AbNnue::random_with_arch(config.arch(), config.seed),
                                 );
                             }
                         }
@@ -1992,70 +1349,8 @@ fn main() {
                             if interrupted.load(Ordering::SeqCst) {
                                 exited_after_ctrl_c = true;
                                 break (
-                                    AzLoopReport {
-                                        games: 0,
-                                        samples: 0,
-                                        red_wins: 0,
-                                        black_wins: 0,
-                                        draws: 0,
-                                        avg_plies: 0.0,
-                                        loss: 0.0,
-                                        learning_rate: 0.0,
-                                        value_loss: 0.0,
-                                        value_mse: 0.0,
-                                        value_pred_mean: 0.0,
-                                        value_target_mean: 0.0,
-                                        value_pred_rms: 0.0,
-                                        value_target_rms: 0.0,
-                                        value_corr: 0.0,
-                                        value_calibration: 0.0,
-                                        policy_ce: 0.0,
-                                        policy_kl: 0.0,
-                                        root_policy_entropy: 0.0,
-                                        entropy_opening: 0.0,
-                                        entropy_mid: 0.0,
-                                        raw_prior_top1: 0.0,
-                                        raw_prior_top2: 0.0,
-                                        policy_top1: 0.0,
-                                        policy_top2: 0.0,
-                                        root_q_gap: 0.0,
-                                        root_q_top1_abs: 0.0,
-                                        root_actions: 0.0,
-                                        opening_raw_prior_top1: 0.0,
-                                        opening_raw_prior_top2: 0.0,
-                                        opening_policy_top1: 0.0,
-                                        opening_policy_top2: 0.0,
-                                        opening_q_gap: 0.0,
-                                        opening_q_top1_abs: 0.0,
-                                        opening_root_actions: 0.0,
-                                        sampled_best_rate: 0.0,
-                                        avg_best_played_q_gap: 0.0,
-                                        avg_played_top_policy_ratio: 0.0,
-                                        avg_best_q: 0.0,
-                                        avg_played_q: 0.0,
-                                        train_seconds: 0.0,
-                                        total_seconds: 0.0,
-                                        games_per_second: 0.0,
-                                        samples_per_second: 0.0,
-                                        train_samples_per_second: 0.0,
-                                        train_samples: 0,
-                                        pool_samples: 0,
-                                        pool_capacity: config.replay_capacity,
-                                        terminal_no_legal_moves: 0,
-                                        terminal_red_general_missing: 0,
-                                        terminal_black_general_missing: 0,
-                                        terminal_rule_draw: 0,
-                                        terminal_rule_draw_natural_limit: 0,
-                                        terminal_rule_draw_insufficient_material: 0,
-                                        terminal_rule_draw_repetition: 0,
-                                        terminal_rule_draw_mutual_long_check: 0,
-                                        terminal_rule_draw_mutual_long_chase: 0,
-                                        terminal_rule_win_red: 0,
-                                        terminal_rule_win_black: 0,
-                                        terminal_max_plies: 0,
-                                        ..AzLoopReport::default()
-                                    },
-                                    AzNnue::random_with_arch(config.arch(), config.seed),
+                                    AbEvolveReport::default(),
+                                    AbNnue::random_with_arch(config.arch(), config.seed),
                                 );
                             }
                             panic!("training thread exited before update {update}");
@@ -2105,7 +1400,6 @@ fn main() {
                     console.test(check);
                     for (tag, value) in [
                         ("test/loss", check.loss),
-                        ("test/policy_kl", check.policy_kl),
                         ("test/samples", check.samples as f32),
                         ("test/value_samples", check.value_samples as f32),
                     ] {
@@ -2119,7 +1413,6 @@ fn main() {
                 for (tag, value) in [
                     ("train/optimized_loss", report.loss),
                     ("train/wdl_ce", report.value_loss),
-                    ("train/policy_kl", report.policy_kl),
                     ("train/value_rmse", value_rmse),
                     ("train/value_corr", report.value_corr),
                     ("train/value_calibration", report.value_calibration),
@@ -2137,13 +1430,9 @@ fn main() {
                     ("replay/samples", report.pool_samples as f32),
                     ("selfplay/games_total", generated_games_total as f32),
                     ("selfplay/samples_total", generated_samples_total as f32),
-                    (
-                        "selfplay/avg_search_simulations",
-                        report.avg_search_simulations,
-                    ),
+                    ("selfplay/avg_search_nodes", report.avg_search_nodes),
                     ("selfplay/avg_plies", report.avg_plies),
                     ("selfplay/completed_games", completed as f32),
-                    ("selfplay/root_policy_entropy", report.root_policy_entropy),
                     (
                         "truncation/rate",
                         truncated as f32 / report.games.max(1) as f32,
@@ -2236,12 +1525,12 @@ fn main() {
                         let current_positions = arena_start_positions;
                         let candidate = Arc::new(deployed_model.clone());
                         let run_gate_match =
-                            |baseline: Arc<AzNnue>, positions: Vec<Position>, seed_salt: u64| {
+                            |baseline: Arc<AbNnue>, positions: Vec<Position>, seed_salt: u64| {
                                 run_arena_threads(ArenaThreadConfig {
                                     candidate: Arc::clone(&candidate),
                                     baseline,
                                     eval_starts: ArenaStarts::Positions(Arc::new(positions)),
-                                    simulations: config.arena_nodes,
+                                    nodes: config.arena_nodes,
                                     max_plies: config.max_plies,
                                     rule60_max_ply: config
                                         .sixty_move_rule
@@ -2259,7 +1548,7 @@ fn main() {
                         );
                         let load_champion = |index: usize| {
                             let path = &champion_paths[index];
-                            let model = AzNnue::load(path).unwrap_or_else(|err| {
+                            let model = AbNnue::load(path).unwrap_or_else(|err| {
                                 panic!("failed to load champion `{}`: {err}", path.display())
                             });
                             assert_eq!(
@@ -2341,7 +1630,7 @@ fn main() {
                                 .map_or_else(|| "-".into(), |r| format!("{:.3}", r.score_rate())),
                             gate_decision
                         ));
-                        let mut historical_arena = AzArenaReport::default();
+                        let mut historical_arena = AbArenaReport::default();
                         if let Some(report) = previous_arena.as_ref() {
                             historical_arena.add_assign(report);
                         }
@@ -2431,8 +1720,8 @@ fn main() {
                             evaluate_pikafish_labels_parallel(
                                 Arc::new(deployed_model.clone()),
                                 rows,
-                                AzSearchLimits {
-                                    simulations: config.pikafish_label_eval_nodes,
+                                AbSearchLimits {
+                                    nodes: config.pikafish_label_eval_nodes,
                                     max_depth: 0,
                                 },
                                 config.arena_processes,
@@ -2441,7 +1730,7 @@ fn main() {
                         match eval_result {
                             Ok(stats) => {
                                 console.event(format!(
-                                    "pikafish-label {update:04}: sqlite={} evaluated={} legal={} value_labels={} sims={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_mae={:.4} search_value_corr={:.4} search_value_mae={:.4} elapsed={:.1}s",
+                                    "pikafish-label {update:04}: sqlite={} evaluated={} legal={} value_labels={} nodes={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_value_corr={:.4} raw_value_mae={:.4} search_value_corr={:.4} search_value_mae={:.4} elapsed={:.1}s",
                                     config.pikafish_label_eval_sqlite,
                                     stats.count,
                                     stats.legal_bestmove,
@@ -2452,7 +1741,6 @@ fn main() {
                                     100.0 * stats.top2_rate(),
                                     100.0 * stats.top4_rate(),
                                     100.0 * stats.top8_rate(),
-                                    100.0 * stats.prior_top1_rate(),
                                     stats.raw_value_corr(),
                                     stats.raw_value_mae_wdl_q(),
                                     stats.value_corr(),
@@ -2488,12 +1776,6 @@ fn main() {
                                     "pikafish_label/search_top8",
                                     update,
                                     stats.top8_rate(),
-                                );
-                                log_scalar(
-                                    &mut tb,
-                                    "pikafish_label/raw_prior_top1",
-                                    update,
-                                    stats.prior_top1_rate(),
                                 );
                                 log_scalar(
                                     &mut tb,
@@ -2550,8 +1832,8 @@ fn main() {
                 }
                 tb.flush();
                 update = update.saturating_add(1);
-                if report.cycle_complete {
-                    save_az_loop_progress_pair(
+                if checkpoint_saved.is_some() {
+                    save_ab_evolve_progress_pair(
                         &config_path,
                         interrupt_save_next_update,
                         arena_nemesis_update,
@@ -2559,9 +1841,8 @@ fn main() {
                         generated_samples_total,
                     );
                     console.event(format!(
-                        "saved: cycle {} complete; optimizer+replay saved; continuing cycle {} next_update={}",
-                        report.training_steps / chineseai::az::PX0_CYCLE_STEPS,
-                        report.training_steps / chineseai::az::PX0_CYCLE_STEPS + 1,
+                        "saved: checkpoint update={} optimizer+replay saved next_update={}",
+                        update.saturating_sub(1),
                         interrupt_save_next_update,
                     ));
                 }
@@ -2576,7 +1857,7 @@ fn main() {
             stop_requested.store(true, Ordering::SeqCst);
             // 等待线程前持续排空结果队列，避免满队列让训练及产数线程相互等待。
             for event in trainer_rx {
-                if exited_after_ctrl_c {
+                if exited_after_ctrl_c || exited_after_target_update {
                     generated_games_total =
                         generated_games_total.saturating_add(event.report.games as u64);
                     generated_samples_total =
@@ -2601,7 +1882,7 @@ fn main() {
             if exited_after_ctrl_c || exited_after_target_update {
                 if let Some(model) = interrupt_save_model.as_ref() {
                     save_model(model, Path::new(&config.model_path));
-                    save_az_loop_progress_pair(
+                    save_ab_evolve_progress_pair(
                         &config_path,
                         interrupt_save_next_update,
                         arena_nemesis_update,
@@ -2633,7 +1914,7 @@ fn main() {
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
             let model_path = cmd.model;
-            let simulations = cmd.simulations.unwrap_or(10_000).max(1);
+            let nodes = cmd.nodes.max(1);
             let max_plies = cmd.max_plies.max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
@@ -2641,17 +1922,17 @@ fn main() {
             let (start_positions, opening_mode) = if cmd.opening_book.trim().is_empty() {
                 (Vec::new(), "startpos_fallback".to_string())
             } else {
-                let mut book = Px0OpeningBook::load(&cmd.opening_book, cmd.seed)
-                    .unwrap_or_else(|err| panic!("failed to load Px0 opening book: {err}"));
+                let mut book = OpeningBook::load(&cmd.opening_book, cmd.seed)
+                    .unwrap_or_else(|err| panic!("failed to load opening book: {err}"));
                 let positions = book
                     .next_batch(cmd.opening_positions.max(1), 0)
-                    .unwrap_or_else(|err| panic!("invalid Px0 FEN: {err}"))
+                    .unwrap_or_else(|err| panic!("invalid opening FEN: {err}"))
                     .into_iter()
                     .map(|s| s.position)
                     .collect();
                 (
                     positions,
-                    format!("px0(shuffled,book={})", cmd.opening_book),
+                    format!("book(shuffled,source={})", cmd.opening_book),
                 )
             };
             let summary = run_vs_pikafish(
@@ -2662,7 +1943,7 @@ fn main() {
                     pikafish_depth,
                     total_games: games,
                     max_plies,
-                    simulations,
+                    nodes,
                     parallel_games,
                     report_games: cmd.report_games,
                 },
@@ -2702,279 +1983,15 @@ fn main() {
                 summary.chinese_win_by_pikafish_illegal_move,
                 pikafish_depth,
                 max_plies,
-                simulations,
+                nodes,
             );
-        }
-        Some(CliCommand::PikafishLabelRandom(cmd)) => {
-            run_pikafish_label_random(cmd)
-                .unwrap_or_else(|err| panic!("pikafish-label-random failed: {err}"));
-        }
-        Some(CliCommand::PikafishLabelSelfplay(cmd)) => {
-            run_pikafish_label_selfplay(cmd)
-                .unwrap_or_else(|err| panic!("pikafish-label-selfplay failed: {err}"));
-        }
-        Some(CliCommand::PikafishPolicyFit(cmd)) => {
-            run_pikafish_policy_fit(cmd)
-                .unwrap_or_else(|err| panic!("pikafish-policy-fit failed: {err}"));
-        }
-        Some(CliCommand::PikafishExportTorch(cmd)) => {
-            run_pikafish_export_torch(cmd)
-                .unwrap_or_else(|err| panic!("pikafish-export-torch failed: {err}"));
         }
         Some(CliCommand::PikafishLabelEval(cmd)) => {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
         }
-        Some(CliCommand::CheckpointCycles(cmd)) => {
-            run_checkpoint_cycles(cmd)
-                .unwrap_or_else(|err| panic!("checkpoint-cycles failed: {err}"));
-        }
     };
     chineseai::profile::print_report();
-}
-
-fn checkpoint_number(path: &Path) -> Option<u64> {
-    let name = path.file_name()?.to_str()?;
-    let mut last = None;
-    let mut value = 0u64;
-    let mut active = false;
-    for byte in name.bytes() {
-        if byte.is_ascii_digit() {
-            value = value
-                .saturating_mul(10)
-                .saturating_add(u64::from(byte - b'0'));
-            active = true;
-        } else if active {
-            last = Some(value);
-            value = 0;
-            active = false;
-        }
-    }
-    if active { Some(value) } else { last }
-}
-
-fn checkpoint_label(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("<invalid-name>")
-        .to_string()
-}
-
-fn cycle_edge(lower_bounds: &[Vec<Option<f32>>], from: usize, to: usize, margin: f32) -> bool {
-    lower_bounds[from][to].is_some_and(|score| score > 0.5 + margin)
-}
-
-fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
-    let directory = Path::new(&cmd.directory);
-    let mut paths = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "safetensors")
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(&cmd.contains))
-        })
-        .collect::<Vec<_>>();
-    paths.sort_by(|left, right| {
-        checkpoint_number(left)
-            .cmp(&checkpoint_number(right))
-            .then_with(|| checkpoint_label(left).cmp(&checkpoint_label(right)))
-    });
-    if cmd.min_update_gap > 0 {
-        let mut spaced = Vec::new();
-        let mut newest_selected: Option<u64> = None;
-        for path in paths.into_iter().rev() {
-            let number = checkpoint_number(&path);
-            let keep = match (newest_selected, number) {
-                (Some(newer), Some(current)) => newer.saturating_sub(current) >= cmd.min_update_gap,
-                _ => true,
-            };
-            if keep {
-                if number.is_some() {
-                    newest_selected = number;
-                }
-                spaced.push(path);
-            }
-        }
-        spaced.reverse();
-        paths = spaced;
-    }
-    if cmd.max_models > 0 && paths.len() > cmd.max_models {
-        paths.drain(..paths.len() - cmd.max_models);
-    }
-    if paths.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "need at least two matching checkpoints in {}",
-                directory.display()
-            ),
-        ));
-    }
-
-    let (positions, opening_mode) = if cmd.opening_book.trim().is_empty() {
-        (vec![Position::startpos()], "startpos".to_string())
-    } else {
-        let mut book = Px0OpeningBook::load(&cmd.opening_book, cmd.seed)?;
-        let positions = book
-            .next_batch(cmd.opening_positions.max(1), 0)?
-            .into_iter()
-            .map(|s| s.position)
-            .collect();
-        (
-            positions,
-            format!("px0(shuffled,book={})", cmd.opening_book),
-        )
-    };
-    let positions = Arc::new(positions);
-    println!(
-        "checkpoint-cycles: models={} pairs={} min_update_gap={} sims={} games_per_pair={} threads={} opening={} margin={:.3} z={:.2}",
-        paths.len(),
-        if cmd.adjacent_only {
-            paths.len() - 1
-        } else {
-            paths.len() * (paths.len() - 1) / 2
-        },
-        cmd.min_update_gap,
-        cmd.simulations.max(1),
-        positions.len() * 2,
-        cmd.threads.max(1),
-        opening_mode,
-        cmd.cycle_margin.max(0.0),
-        cmd.confidence_z.max(0.0)
-    );
-    for (index, path) in paths.iter().enumerate() {
-        println!("  model[{index}] {}", path.display());
-    }
-    let models = paths
-        .iter()
-        .map(|path| AzNnue::load(path).map(Arc::new))
-        .collect::<io::Result<Vec<_>>>()?;
-    let mut scores = vec![vec![None; models.len()]; models.len()];
-    let mut lower_bounds = vec![vec![None; models.len()]; models.len()];
-    for index in 0..models.len() {
-        scores[index][index] = Some(0.5);
-        lower_bounds[index][index] = Some(0.5);
-    }
-    let started = Instant::now();
-    for newer in 1..models.len() {
-        let older_start = if cmd.adjacent_only { newer - 1 } else { 0 };
-        for older in older_start..newer {
-            let report = run_arena_threads(ArenaThreadConfig {
-                candidate: Arc::clone(&models[newer]),
-                baseline: Arc::clone(&models[older]),
-                eval_starts: ArenaStarts::Positions(Arc::clone(&positions)),
-                simulations: cmd.simulations.max(1),
-                max_plies: cmd.max_plies.max(1),
-                rule60_max_ply: Some(120),
-                thread_count: cmd.threads.max(1),
-                seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
-            });
-            let rate = report.score_rate();
-            let se = report.score_rate_standard_error();
-            let z = cmd.confidence_z.max(0.0);
-            scores[newer][older] = Some(rate);
-            scores[older][newer] = Some(1.0 - rate);
-            lower_bounds[newer][older] = Some(rate - z * se);
-            lower_bounds[older][newer] = Some(1.0 - rate - z * se);
-            println!(
-                "pair {} > {}: W/L/D={}/{}/{} rate={:.4} se={:.4} lcb(z={:.2})={:.4} elo={:+.1}",
-                checkpoint_label(&paths[newer]),
-                checkpoint_label(&paths[older]),
-                report.wins,
-                report.losses,
-                report.draws,
-                rate,
-                se,
-                z,
-                report.score_rate_lower_bound(z),
-                report.elo_diff_vs_even()
-            );
-        }
-    }
-
-    println!("\nSCORE MATRIX — row score against column");
-    print!("{:>4}", "row");
-    for column in 0..models.len() {
-        print!(" {:>7}", column);
-    }
-    println!();
-    for row in 0..models.len() {
-        print!("{:>4}", row);
-        for column in 0..models.len() {
-            match scores[row][column] {
-                Some(score) => print!(" {:>7.3}", score),
-                None => print!(" {:>7}", "-"),
-            }
-        }
-        println!("  {}", checkpoint_label(&paths[row]));
-    }
-
-    let margin = cmd.cycle_margin.max(0.0);
-    let mut cycles = 0usize;
-    if !cmd.adjacent_only {
-        println!("\nNON-TRANSITIVE CYCLES — every edge > {:.3}", 0.5 + margin);
-        for a in 0..models.len() {
-            for b in a + 1..models.len() {
-                for c in b + 1..models.len() {
-                    for &(x, y, z) in &[(a, b, c), (a, c, b)] {
-                        if cycle_edge(&lower_bounds, x, y, margin)
-                            && cycle_edge(&lower_bounds, y, z, margin)
-                            && cycle_edge(&lower_bounds, z, x, margin)
-                        {
-                            cycles += 1;
-                            println!(
-                                "  {} > {} > {} > {}",
-                                checkpoint_label(&paths[x]),
-                                checkpoint_label(&paths[y]),
-                                checkpoint_label(&paths[z]),
-                                checkpoint_label(&paths[x])
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if cycles == 0 {
-            println!("  none");
-        }
-    }
-
-    println!("\nHISTORICAL REGRESSIONS — beats predecessor but loses an older model");
-    let mut regressions = 0usize;
-    for current in 2..models.len() {
-        if !cycle_edge(&lower_bounds, current, current - 1, margin) {
-            continue;
-        }
-        for older in 0..current - 1 {
-            if cycle_edge(&lower_bounds, older, current, margin) {
-                regressions += 1;
-                println!(
-                    "  {} beats {}, but loses to {}",
-                    checkpoint_label(&paths[current]),
-                    checkpoint_label(&paths[current - 1]),
-                    checkpoint_label(&paths[older])
-                );
-            }
-        }
-    }
-    if regressions == 0 {
-        println!("  none");
-    }
-    let elapsed = started.elapsed().as_secs_f32();
-    println!(
-        "\nSUMMARY models={} cycles={} regressions={} elapsed={:.1}s",
-        models.len(),
-        cycles,
-        regressions,
-        elapsed
-    );
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2993,7 +2010,6 @@ struct LabelEvalStats {
     top2_hits: usize,
     top4_hits: usize,
     top8_hits: usize,
-    prior_top1_hits: usize,
     value_pairs: usize,
     value_q_sum: f64,
     target_q_sum: f64,
@@ -3018,7 +2034,6 @@ impl LabelEvalStats {
         self.top2_hits += other.top2_hits;
         self.top4_hits += other.top4_hits;
         self.top8_hits += other.top8_hits;
-        self.prior_top1_hits += other.prior_top1_hits;
         self.value_pairs += other.value_pairs;
         self.value_q_sum += other.value_q_sum;
         self.target_q_sum += other.target_q_sum;
@@ -3053,10 +2068,6 @@ impl LabelEvalStats {
 
     fn top8_rate(&self) -> f32 {
         self.top8_hits as f32 / self.denom()
-    }
-
-    fn prior_top1_rate(&self) -> f32 {
-        self.prior_top1_hits as f32 / self.denom()
     }
 
     fn value_mae_wdl_q(&self) -> f32 {
@@ -3153,201 +2164,8 @@ impl LabelEvalStats {
     }
 }
 
-fn replay_position_signature(features: &[usize]) -> u128 {
-    let mut left = 0xcbf2_9ce4_8422_2325u64;
-    let mut right = 0x9e37_79b9_7f4a_7c15u64;
-    for &feature in features {
-        let value = feature as u64 + 1;
-        left ^= value;
-        left = left.wrapping_mul(0x1000_0000_01b3);
-        right ^= value.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        right = right.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
-    }
-    (u128::from(left) << 64) | u128::from(right)
-}
-
-fn run_replay_coverage(cmd: AzReplayCoverageArgs) -> io::Result<()> {
-    let pool = AzExperiencePool::load_snapshot_lz4(Path::new(&cmd.replay), cmd.samples.max(1))?;
-    let samples = pool.all_samples();
-    let mut coverage = HashMap::<u128, u32>::with_capacity(samples.len());
-    let mut pair_coverage = vec![0u32; AZ_NNUE_INPUT_SIZE * AZ_NNUE_INPUT_SIZE];
-    for sample in &samples {
-        *coverage
-            .entry(replay_position_signature(&sample.features))
-            .or_default() += 1;
-        for (offset, &left) in sample.features.iter().enumerate() {
-            for &right in &sample.features[offset + 1..] {
-                let index = left * AZ_NNUE_INPUT_SIZE + right;
-                pair_coverage[index] = pair_coverage[index].saturating_add(1);
-            }
-        }
-    }
-    let model = Arc::new(AzNnue::load(&cmd.model)?);
-    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
-    let rows = load_pikafish_label_rows(&conn, cmd.limit, cmd.seed).map_err(sqlite_io_error)?;
-    let mut buckets: [Vec<PikafishLabelRow>; 4] = std::array::from_fn(|_| Vec::new());
-    let mut piece_sums = [0usize; 4];
-    let mut rule60_sums = [0usize; 4];
-    let mut structural_by_piece_count: [Vec<(PikafishLabelRow, f64)>; 33] =
-        std::array::from_fn(|_| Vec::new());
-    for row in rows {
-        let position = Position::from_fen(&row.fen).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid label FEN id={}: {err}", row.id),
-            )
-        })?;
-        let features = extract_sparse_features_az(&position);
-        let mut pair_log_sum = 0.0;
-        let mut pair_count = 0usize;
-        for (offset, &left) in features.iter().enumerate() {
-            for &right in &features[offset + 1..] {
-                pair_log_sum += f64::from(pair_coverage[left * AZ_NNUE_INPUT_SIZE + right]).ln_1p();
-                pair_count += 1;
-            }
-        }
-        let structural_score = pair_log_sum / pair_count.max(1) as f64;
-        let count = coverage
-            .get(&replay_position_signature(&features))
-            .copied()
-            .unwrap_or(0);
-        let bucket = match count {
-            0 => 0,
-            1..=2 => 1,
-            3..=9 => 2,
-            _ => 3,
-        };
-        piece_sums[bucket] += features.len();
-        rule60_sums[bucket] += usize::from(position.halfmove_clock());
-        structural_by_piece_count[features.len().min(32)].push((row.clone(), structural_score));
-        buckets[bucket].push(row);
-    }
-
-    let mut structural_buckets: [Vec<PikafishLabelRow>; 4] = std::array::from_fn(|_| Vec::new());
-    let mut structural_piece_sums = [0usize; 4];
-    let mut structural_score_sums = [0.0f64; 4];
-    for (piece_count, mut rows) in structural_by_piece_count.into_iter().enumerate() {
-        rows.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
-        let row_count = rows.len();
-        for (index, (row, score)) in rows.into_iter().enumerate() {
-            let quartile = (index * 4 / row_count.max(1)).min(3);
-            structural_piece_sums[quartile] += piece_count;
-            structural_score_sums[quartile] += score;
-            structural_buckets[quartile].push(row);
-        }
-    }
-
-    let limits = AzSearchLimits {
-        simulations: cmd.simulations.max(1),
-        max_depth: 0,
-    };
-    let names = ["unseen", "seen-1-2", "seen-3-9", "seen-10+"];
-    let path = Path::new(&cmd.output);
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut output = String::from(
-        "analysis\tbucket\tlabel_rows\tavg_pieces\tavg_rule60\tavg_pair_log_count\tevaluated\traw_top1\tsearch_top1\tsearch_top4\traw_value_mae\tsearch_value_mae\n",
-    );
-    println!(
-        "replay-coverage: replay={} samples={} unique_positions={} labels={} sims={}",
-        cmd.replay,
-        samples.len(),
-        coverage.len(),
-        buckets.iter().map(Vec::len).sum::<usize>(),
-        cmd.simulations.max(1)
-    );
-    for (bucket_index, (name, rows)) in names.into_iter().zip(buckets).enumerate() {
-        let row_count = rows.len();
-        let denominator = row_count.max(1) as f64;
-        let avg_pieces = piece_sums[bucket_index] as f64 / denominator;
-        let avg_rule60 = rule60_sums[bucket_index] as f64 / denominator;
-        let stats =
-            evaluate_pikafish_labels_parallel(Arc::clone(&model), rows, limits, cmd.threads)?;
-        println!(
-            "  {name}: rows={} avg_pieces={:.2} avg_rule60={:.2} evaluated={} raw_top1={:.2}% search_top1={:.2}% search_top4={:.2}% raw_value_mae={:.4} search_value_mae={:.4}",
-            row_count,
-            avg_pieces,
-            avg_rule60,
-            stats.count,
-            100.0 * stats.prior_top1_rate(),
-            100.0 * stats.top1_rate(),
-            100.0 * stats.top4_rate(),
-            stats.raw_value_mae_wdl_q(),
-            stats.value_mae_wdl_q(),
-        );
-        use std::fmt::Write as _;
-        writeln!(
-            output,
-            "exact\t{name}\t{}\t{:.6}\t{:.6}\t\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
-            row_count,
-            avg_pieces,
-            avg_rule60,
-            stats.count,
-            stats.prior_top1_rate(),
-            stats.top1_rate(),
-            stats.top4_rate(),
-            stats.raw_value_mae_wdl_q(),
-            stats.value_mae_wdl_q(),
-        )
-        .unwrap();
-    }
-    let structural_names = [
-        "least-covered",
-        "low-covered",
-        "high-covered",
-        "most-covered",
-    ];
-    println!("piece-count-matched structural coverage:");
-    for (bucket_index, (name, rows)) in structural_names
-        .into_iter()
-        .zip(structural_buckets)
-        .enumerate()
-    {
-        let row_count = rows.len();
-        let denominator = row_count.max(1) as f64;
-        let avg_pieces = structural_piece_sums[bucket_index] as f64 / denominator;
-        let avg_score = structural_score_sums[bucket_index] / denominator;
-        let stats =
-            evaluate_pikafish_labels_parallel(Arc::clone(&model), rows, limits, cmd.threads)?;
-        println!(
-            "  {name}: rows={} avg_pieces={:.2} avg_pair_log_count={:.3} evaluated={} raw_top1={:.2}% search_top1={:.2}% search_top4={:.2}% raw_value_mae={:.4} search_value_mae={:.4}",
-            row_count,
-            avg_pieces,
-            avg_score,
-            stats.count,
-            100.0 * stats.prior_top1_rate(),
-            100.0 * stats.top1_rate(),
-            100.0 * stats.top4_rate(),
-            stats.raw_value_mae_wdl_q(),
-            stats.value_mae_wdl_q(),
-        );
-        use std::fmt::Write as _;
-        writeln!(
-            output,
-            "structural\t{name}\t{}\t{:.6}\t\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
-            row_count,
-            avg_pieces,
-            avg_score,
-            stats.count,
-            stats.prior_top1_rate(),
-            stats.top1_rate(),
-            stats.top4_rate(),
-            stats.raw_value_mae_wdl_q(),
-            stats.value_mae_wdl_q(),
-        )
-        .unwrap();
-    }
-    fs::write(path, output)?;
-    println!("output: {}", path.display());
-    Ok(())
-}
-
 fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
-    let model = AzNnue::load(&cmd.model).map_err(|err| {
+    let model = AbNnue::load(&cmd.model).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("failed to load model `{}`: {err}", cmd.model),
@@ -3366,28 +2184,27 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
     let stats = evaluate_pikafish_labels_parallel(
         Arc::new(model),
         rows,
-        AzSearchLimits {
-            simulations: cmd.simulations.max(1),
-            max_depth: cmd.max_depth,
+        AbSearchLimits {
+            nodes: cmd.nodes.max(1),
+            ..AbSearchLimits::default()
         },
         cmd.threads,
     )?;
 
     let elapsed = started.elapsed().as_secs_f32();
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} nodes={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_cal={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_cal={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} nodes={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_value_corr={:.4} raw_value_cal={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_cal={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
         stats.legal_bestmove,
         stats.value_count(),
-        cmd.simulations.max(1),
+        cmd.nodes.max(1),
         cmd.threads.max(1),
         100.0 * stats.top1_rate(),
         100.0 * stats.top2_rate(),
         100.0 * stats.top4_rate(),
         100.0 * stats.top8_rate(),
-        100.0 * stats.prior_top1_rate(),
         stats.raw_value_corr(),
         stats.raw_value_calibration(),
         stats.raw_value_mae_wdl_q(),
@@ -3404,16 +2221,15 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         {
             fs::create_dir_all(parent)?;
         }
-        let header = "model\tsqlite\tevaluated\tlegal_labels\tvalue_labels\tsimulations\traw_prior_top1\traw_value_corr\traw_value_calibration\traw_value_mae\tsearch_top1\tsearch_top2\tsearch_top4\tsearch_top8\tsearch_value_corr\tsearch_value_calibration\tsearch_value_mae\telapsed_seconds\n";
+        let header = "model\tsqlite\tevaluated\tlegal_labels\tvalue_labels\tnodes\traw_value_corr\traw_value_calibration\traw_value_mae\tsearch_top1\tsearch_top2\tsearch_top4\tsearch_top8\tsearch_value_corr\tsearch_value_calibration\tsearch_value_mae\telapsed_seconds\n";
         let row = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.3}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.3}\n",
             cmd.model,
             cmd.sqlite,
             stats.count,
             stats.legal_bestmove,
             stats.value_count(),
-            cmd.simulations.max(1),
-            stats.prior_top1_rate(),
+            cmd.nodes.max(1),
             stats.raw_value_corr(),
             stats.raw_value_calibration(),
             stats.raw_value_mae_wdl_q(),
@@ -3432,9 +2248,9 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
 }
 
 fn evaluate_pikafish_labels(
-    model: &AzNnue,
+    model: &AbNnue,
     rows: &[PikafishLabelRow],
-    search_limits: AzSearchLimits,
+    search_limits: AbSearchLimits,
     mut progress: impl FnMut(usize, usize),
 ) -> io::Result<LabelEvalStats> {
     let mut stats = LabelEvalStats::default();
@@ -3457,49 +2273,41 @@ fn evaluate_pikafish_labels(
             continue;
         }
         stats.legal_bestmove += 1;
-        let raw_value = model.evaluate_value_with_rules(&position, &rule_history, &legal_moves);
+        let raw_value = model.evaluate_value_with_rules(&position, &rule_history);
         stats.push_raw_value_pair(raw_value, row.best_wdl);
         let result = alphabeta_search(
             &position,
             &rule_history,
             legal_moves,
             model,
-            search_limits.simulations,
+            search_limits.nodes,
         );
         stats.count += 1;
         if result.best_move == Some(label_move) {
             stats.top1_hits += 1;
         }
-        let mut by_policy = result.candidates.clone();
-        by_policy.sort_by(|left, right| right.policy.total_cmp(&left.policy));
-        if by_policy
+        let mut by_search_score = result.candidates.clone();
+        by_search_score.sort_by(|left, right| right.q.total_cmp(&left.q));
+        if by_search_score
             .iter()
             .take(2)
             .any(|candidate| candidate.mv == label_move)
         {
             stats.top2_hits += 1;
         }
-        if by_policy
+        if by_search_score
             .iter()
             .take(4)
             .any(|candidate| candidate.mv == label_move)
         {
             stats.top4_hits += 1;
         }
-        if by_policy
+        if by_search_score
             .iter()
             .take(8)
             .any(|candidate| candidate.mv == label_move)
         {
             stats.top8_hits += 1;
-        }
-        if result
-            .candidates
-            .iter()
-            .max_by(|left, right| left.raw_prior.total_cmp(&right.raw_prior))
-            .is_some_and(|candidate| candidate.mv == label_move)
-        {
-            stats.prior_top1_hits += 1;
         }
         stats.push_value_pair(result.value_q, row.best_wdl);
         progress(offset + 1, rows.len());
@@ -3508,9 +2316,9 @@ fn evaluate_pikafish_labels(
 }
 
 fn evaluate_pikafish_labels_parallel(
-    model: Arc<AzNnue>,
+    model: Arc<AbNnue>,
     rows: Vec<PikafishLabelRow>,
-    search_limits: AzSearchLimits,
+    search_limits: AbSearchLimits,
     thread_count: usize,
 ) -> io::Result<LabelEvalStats> {
     if rows.is_empty() {
@@ -3571,691 +2379,6 @@ fn load_pikafish_label_rows(
     Ok(rows)
 }
 
-#[derive(Clone, Debug, Default)]
-struct PikafishPv {
-    multipv: usize,
-    depth: u32,
-    nodes: u64,
-    score_cp: Option<i32>,
-    mate: Option<i32>,
-    wdl: Option<[u16; 3]>,
-    moves: Vec<String>,
-}
-
-struct PikafishLabelUci {
-    child: Child,
-    stdin: BufWriter<std::process::ChildStdin>,
-    stdout: BufReader<std::process::ChildStdout>,
-}
-
-impl PikafishLabelUci {
-    fn spawn(exe: &Path) -> io::Result<Self> {
-        let mut child = Command::new(exe)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = BufWriter::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("pikafish: missing stdin"))?,
-        );
-        let stdout = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| io::Error::other("pikafish: missing stdout"))?,
-        );
-        let mut out = Self {
-            child,
-            stdin,
-            stdout,
-        };
-        out.handshake()?;
-        Ok(out)
-    }
-
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
-        writeln!(self.stdin, "{line}")?;
-        self.stdin.flush()
-    }
-
-    fn read_line_into(&mut self, buf: &mut String) -> io::Result<usize> {
-        buf.clear();
-        self.stdout.read_line(buf)
-    }
-
-    fn handshake(&mut self) -> io::Result<()> {
-        self.write_line("uci")?;
-        self.wait_for("uciok")?;
-        self.write_line("setoption name Threads value 1")?;
-        self.write_line("setoption name Repetition Rule value ChineseRule")?;
-        self.write_line("isready")?;
-        self.wait_for("readyok")
-    }
-
-    fn wait_for(&mut self, token: &str) -> io::Result<()> {
-        let mut buf = String::new();
-        loop {
-            if self.read_line_into(&mut buf)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("pikafish: EOF before {token}"),
-                ));
-            }
-            if buf.trim() == token {
-                return Ok(());
-            }
-        }
-    }
-
-    fn query(&mut self, fen: &str, depth: u32) -> io::Result<(String, Vec<PikafishPv>)> {
-        self.write_line(&format!("position fen {fen}"))?;
-        self.write_line(&format!("go depth {}", depth.max(1)))?;
-        let mut buf = String::new();
-        let mut pvs = Vec::<PikafishPv>::new();
-        loop {
-            if self.read_line_into(&mut buf)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "pikafish: EOF before bestmove",
-                ));
-            }
-            let line = buf.trim();
-            if let Some(rest) = line.strip_prefix("bestmove ") {
-                let bestmove = rest.split_whitespace().next().unwrap_or("").to_string();
-                pvs.sort_by_key(|pv| pv.multipv);
-                return Ok((bestmove, pvs));
-            }
-            if let Some(pv) = parse_pikafish_info_pv(line) {
-                if let Some(slot) = pvs.iter_mut().find(|old| old.multipv == pv.multipv) {
-                    *slot = pv;
-                } else {
-                    pvs.push(pv);
-                }
-            }
-        }
-    }
-
-    fn quit(&mut self) {
-        let _ = self.write_line("quit");
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for PikafishLabelUci {
-    fn drop(&mut self) {
-        self.quit();
-    }
-}
-
-fn parse_pikafish_info_pv(line: &str) -> Option<PikafishPv> {
-    if !line.starts_with("info ") || !line.contains(" pv ") {
-        return None;
-    }
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let mut multipv = 1usize;
-    let mut depth = 0u32;
-    let mut nodes = 0u64;
-    let mut score_cp = None;
-    let mut mate = None;
-    let mut wdl = None;
-    let mut moves = Vec::new();
-    let mut i = 0usize;
-    while i < parts.len() {
-        match parts[i] {
-            "depth" if i + 1 < parts.len() => {
-                depth = parts[i + 1].parse().ok()?;
-                i += 2;
-            }
-            "nodes" if i + 1 < parts.len() => {
-                nodes = parts[i + 1].parse().unwrap_or(0);
-                i += 2;
-            }
-            "multipv" if i + 1 < parts.len() => {
-                multipv = parts[i + 1].parse().ok()?;
-                i += 2;
-            }
-            "score" if i + 2 < parts.len() => {
-                match parts[i + 1] {
-                    "cp" => score_cp = parts[i + 2].parse().ok(),
-                    "mate" => mate = parts[i + 2].parse().ok(),
-                    _ => {}
-                }
-                i += 3;
-            }
-            "wdl" if i + 3 < parts.len() => {
-                wdl = Some([
-                    parts[i + 1].parse().ok()?,
-                    parts[i + 2].parse().ok()?,
-                    parts[i + 3].parse().ok()?,
-                ]);
-                i += 4;
-            }
-            "pv" => {
-                moves.extend(parts[i + 1..].iter().map(|item| (*item).to_string()));
-                break;
-            }
-            _ => i += 1,
-        }
-    }
-    (!moves.is_empty()).then_some(PikafishPv {
-        multipv,
-        depth,
-        nodes,
-        score_cp,
-        mate,
-        wdl,
-        moves,
-    })
-}
-
-fn label_fens_parallel(
-    exe: &Path,
-    fens: &[String],
-    depth: u32,
-    threads: usize,
-) -> io::Result<Vec<(usize, String, Vec<PikafishPv>)>> {
-    let worker_count = threads.max(1).min(fens.len());
-    let fens = Arc::new(fens.to_vec());
-    let exe = Arc::new(exe.to_path_buf());
-    let mut handles = Vec::with_capacity(worker_count);
-    for worker in 0..worker_count {
-        let fens = Arc::clone(&fens);
-        let exe = Arc::clone(&exe);
-        handles.push(thread::spawn(move || -> io::Result<Vec<_>> {
-            let mut engine = PikafishLabelUci::spawn(&exe)?;
-            let mut out = Vec::new();
-            for index in (worker..fens.len()).step_by(worker_count) {
-                let (bestmove, pvs) = engine.query(&fens[index], depth)?;
-                out.push((index, bestmove, pvs));
-            }
-            Ok(out)
-        }));
-    }
-    let mut out = Vec::with_capacity(fens.len());
-    for handle in handles {
-        out.extend(
-            handle
-                .join()
-                .map_err(|_| io::Error::other("Pikafish label worker panicked"))??,
-        );
-    }
-    out.sort_by_key(|row| row.0);
-    Ok(out)
-}
-
-fn run_pikafish_label_random(cmd: PikafishLabelRandomArgs) -> io::Result<()> {
-    let fens_path = Path::new(&cmd.fens);
-    let sqlite_path = Path::new(&cmd.sqlite);
-    if cmd.regenerate || !fens_path.exists() {
-        let fens = generate_random_eval_fens(
-            cmd.count.max(1),
-            cmd.min_plies.min(cmd.max_plies),
-            cmd.min_plies.max(cmd.max_plies),
-            cmd.seed,
-        );
-        if let Some(parent) = fens_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(fens_path, format!("{}\n", fens.join("\n")))?;
-        println!(
-            "pikafish-label-random: generated {} fens -> {}",
-            fens.len(),
-            fens_path.display()
-        );
-    }
-
-    let fens_text = fs::read_to_string(fens_path)?;
-    let fens: Vec<String> = fens_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-        .collect();
-    if fens.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("no FENs in {}", fens_path.display()),
-        ));
-    }
-
-    if let Some(parent) = sqlite_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut conn = Connection::open(sqlite_path).map_err(sqlite_io_error)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS pikafish_labels (
-            id INTEGER PRIMARY KEY,
-            fen TEXT NOT NULL UNIQUE,
-            side_to_move TEXT NOT NULL,
-            depth INTEGER NOT NULL,
-            bestmove TEXT NOT NULL,
-            best_score_cp INTEGER,
-            best_mate INTEGER,
-            wdl_win INTEGER NOT NULL,
-            wdl_draw INTEGER NOT NULL,
-            wdl_loss INTEGER NOT NULL,
-            nodes INTEGER NOT NULL DEFAULT 0,
-            best_pv TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE INDEX IF NOT EXISTS idx_pikafish_labels_bestmove ON pikafish_labels(bestmove);",
-    )
-    .map_err(sqlite_io_error)?;
-    let completed = {
-        let mut stmt = conn
-            .prepare("SELECT fen FROM pikafish_labels WHERE depth >= ?1")
-            .map_err(sqlite_io_error)?;
-        let rows = stmt
-            .query_map([cmd.depth.max(1)], |row| row.get::<_, String>(0))
-            .map_err(sqlite_io_error)?;
-        rows.collect::<Result<HashSet<_>, _>>()
-            .map_err(sqlite_io_error)?
-    };
-    let pending = fens
-        .iter()
-        .enumerate()
-        .filter(|(_, fen)| !completed.contains(*fen))
-        .map(|(index, fen)| (index, fen.clone()))
-        .collect::<Vec<_>>();
-
-    println!(
-        "pikafish-label-random: labeling {} pending of {} positions depth={} workers={}",
-        pending.len(),
-        fens.len(),
-        cmd.depth.max(1),
-        cmd.threads.max(1).min(pending.len().max(1))
-    );
-    let mut done = fens.len() - pending.len();
-    for chunk in pending.chunks(256) {
-        let chunk_fens = chunk.iter().map(|(_, fen)| fen.clone()).collect::<Vec<_>>();
-        let labeled = label_fens_parallel(
-            Path::new(&cmd.pikafish_exe),
-            &chunk_fens,
-            cmd.depth.max(1),
-            cmd.threads,
-        )?;
-        let tx = conn.transaction().map_err(sqlite_io_error)?;
-        for (local_index, bestmove, pvs) in labeled {
-            let (index, fen) = &chunk[local_index];
-            let position = Position::from_fen(fen).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid FEN at {}: {err}", index + 1),
-                )
-            })?;
-            let best = pvs.iter().find(|pv| pv.multipv == 1);
-            let best_pv = best.map(|pv| pv.moves.join(" ")).unwrap_or_default();
-            let side_to_move = match position.side_to_move() {
-                chineseai::xiangqi::Color::Red => "w",
-                chineseai::xiangqi::Color::Black => "b",
-            };
-            let wdl = best.and_then(|pv| pv.wdl).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Pikafish returned no WDL at position {}", index + 1),
-                )
-            })?;
-            tx.execute(
-                "INSERT INTO pikafish_labels (
-                id, fen, side_to_move, depth, bestmove, best_score_cp, best_mate,
-                wdl_win, wdl_draw, wdl_loss, nodes, best_pv, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, CURRENT_TIMESTAMP)
-            ON CONFLICT(fen) DO UPDATE SET
-                side_to_move=excluded.side_to_move,
-                depth=excluded.depth,
-                bestmove=excluded.bestmove,
-                best_score_cp=excluded.best_score_cp,
-                best_mate=excluded.best_mate,
-                wdl_win=excluded.wdl_win,
-                wdl_draw=excluded.wdl_draw,
-                wdl_loss=excluded.wdl_loss,
-                nodes=excluded.nodes,
-                best_pv=excluded.best_pv,
-                updated_at=CURRENT_TIMESTAMP",
-                params![
-                    *index as i64,
-                    fen,
-                    side_to_move,
-                    best.map(|pv| pv.depth).unwrap_or(cmd.depth.max(1)) as i64,
-                    &bestmove,
-                    best.and_then(|pv| pv.score_cp).map(i64::from),
-                    best.and_then(|pv| pv.mate).map(i64::from),
-                    i64::from(wdl[0]),
-                    i64::from(wdl[1]),
-                    i64::from(wdl[2]),
-                    best.map(|pv| pv.nodes as i64).unwrap_or(0),
-                    &best_pv,
-                ],
-            )
-            .map_err(sqlite_io_error)?;
-            done += 1;
-        }
-        tx.commit().map_err(sqlite_io_error)?;
-        println!(
-            "pikafish-label-random: labeled {}/{} -> {}",
-            done,
-            fens.len(),
-            sqlite_path.display()
-        );
-    }
-    Ok(())
-}
-
-fn run_pikafish_label_selfplay(cmd: PikafishLabelSelfplayArgs) -> io::Result<()> {
-    let model = AzNnue::load(&cmd.model)?;
-    let fens_path = Path::new(&cmd.fens);
-    let mut fens = if fens_path.exists() {
-        fs::read_to_string(fens_path)?
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let mut unique = fens.iter().cloned().collect::<HashSet<_>>();
-    let base = AzLoopFileConfig::default();
-    let started = Instant::now();
-    let mut batch = 0u64;
-    while fens.len() < cmd.count.max(1) {
-        let remaining = cmd.count - fens.len();
-        let games = (remaining.div_ceil(cmd.max_plies.max(1))).clamp(1, cmd.workers.max(1) * 2);
-        let mut config = build_az_loop_config(
-            &base,
-            cmd.seed ^ batch.wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            cmd.workers.max(1),
-            0,
-            &Arc::default(),
-        );
-        config.games = games;
-        config.simulations = cmd.simulations.max(1);
-        config.max_plies = cmd.max_plies.max(1);
-        config.record_fens = true;
-        config.mirror_probability = 0.0;
-        let data = generate_selfplay_data(&model, &config);
-        for fen in data.position_fens {
-            if unique.insert(fen.clone()) {
-                fens.push(fen);
-                if fens.len() == cmd.count {
-                    break;
-                }
-            }
-        }
-        batch += 1;
-        if let Some(parent) = fens_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(fens_path, format!("{}\n", fens.join("\n")))?;
-        println!(
-            "pikafish-label-selfplay: sampled {}/{} unique positions, elapsed={:.1}s",
-            fens.len(),
-            cmd.count,
-            started.elapsed().as_secs_f32()
-        );
-    }
-    run_pikafish_label_random(PikafishLabelRandomArgs {
-        pikafish_exe: cmd.pikafish_exe,
-        fens: cmd.fens,
-        sqlite: cmd.sqlite,
-        count: cmd.count,
-        seed: cmd.seed,
-        min_plies: 0,
-        max_plies: cmd.max_plies,
-        depth: cmd.depth,
-        threads: cmd.pikafish_threads,
-        regenerate: false,
-    })
-}
-
-fn load_pikafish_training_samples(path: &str) -> io::Result<Vec<AzTrainingSample>> {
-    let conn = Connection::open(path).map_err(sqlite_io_error)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT fen, bestmove, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id",
-        )
-        .map_err(sqlite_io_error)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                [
-                    row.get::<_, f32>(2)?,
-                    row.get::<_, f32>(3)?,
-                    row.get::<_, f32>(4)?,
-                ],
-            ))
-        })
-        .map_err(sqlite_io_error)?;
-    let mut samples = Vec::new();
-    for row in rows {
-        let (fen, bestmove, mut wdl) = row.map_err(sqlite_io_error)?;
-        let position = Position::from_fen(&fen)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let Some(best) = position.parse_uci_move(&bestmove) else {
-            continue;
-        };
-        let legal = position.legal_moves();
-        let side = position.side_to_move();
-        let move_indices = legal
-            .iter()
-            .map(|&mv| chineseai::az::dense_move_index(canonical_move(side, mv)))
-            .collect::<Vec<_>>();
-        let Some(best_index) = legal.iter().position(|&mv| mv == best) else {
-            continue;
-        };
-        let mut policy = vec![0.0; legal.len()];
-        policy[best_index] = 1.0;
-        let sum = wdl.iter().sum::<f32>().max(1.0);
-        wdl.iter_mut().for_each(|x| *x /= sum);
-        samples.push(AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features: extract_sparse_features_az(&position),
-            rule_context: chineseai::az::rule_context_features(
-                &position,
-                &position.initial_rule_history(),
-            ),
-            move_indices,
-            policy,
-            value_wdl: wdl,
-            root_search_wdl: wdl,
-            value: wdl[0] - wdl[2],
-            side_sign: if side == chineseai::xiangqi::Color::Red {
-                1.0
-            } else {
-                -1.0
-            },
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            search_simulations: 0,
-            meta: AzSampleMeta::default(),
-        });
-    }
-    Ok(samples)
-}
-
-fn run_pikafish_policy_fit(cmd: PikafishPolicyFitArgs) -> io::Result<()> {
-    let mut samples = load_pikafish_training_samples(&cmd.sqlite)?;
-    if samples.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "need at least two labels",
-        ));
-    }
-    let mut rng = SplitMix64::new(cmd.seed);
-    for index in (1..samples.len()).rev() {
-        let other = (rng.next_u64() as usize) % (index + 1);
-        samples.swap(index, other);
-    }
-    let validation_len =
-        ((samples.len() as f32 * cmd.validation_fraction.clamp(0.01, 0.5)) as usize).max(1);
-    let validation = samples.split_off(samples.len() - validation_len);
-    let train = samples;
-    fs::create_dir_all(&cmd.output_dir)?;
-    println!(
-        "policy-fit: train={} validation={} budget={}s/arch",
-        train.len(),
-        validation.len(),
-        cmd.wall_seconds
-    );
-    for &hidden in &cmd.hidden {
-        let mut model = AzNnue::random_with_arch(
-            chineseai::az::AzNnueArch::with_hidden_size(hidden.max(1)),
-            cmd.seed,
-        );
-        let started = Instant::now();
-        let mut processed = 0usize;
-        let mut offset = 0usize;
-        while processed == 0 || started.elapsed() < Duration::from_secs(cmd.wall_seconds.max(1)) {
-            let take = 8192.min(train.len());
-            let batch = (0..take)
-                .map(|i| train[(offset + i) % train.len()].clone())
-                .collect::<Vec<_>>();
-            let mut train_rng = SplitMix64::new(cmd.seed ^ processed as u64 ^ hidden as u64);
-            train_samples_weighted(
-                &mut model,
-                &batch,
-                1,
-                cmd.lr,
-                cmd.batch_size.max(1),
-                &mut train_rng,
-                AzTrainLossWeights::default(),
-            )
-            .map_err(io::Error::other)?;
-            processed += take;
-            offset = (offset + take) % train.len();
-        }
-        let elapsed = started.elapsed().as_secs_f32();
-        let mut eval_model = model.clone();
-        let mut eval_rng = SplitMix64::new(cmd.seed ^ 0xD1B5_4A32_D192_ED03);
-        let stats = train_samples_weighted(
-            &mut eval_model,
-            &validation,
-            1,
-            1e-12,
-            cmd.batch_size.max(1),
-            &mut eval_rng,
-            AzTrainLossWeights::default(),
-        )
-        .map_err(io::Error::other)?;
-        let output = Path::new(&cmd.output_dir).join(format!("h{hidden}.safetensors"));
-        model.save(&output)?;
-        println!(
-            "policy-fit-result: hidden={} seconds={:.2} processed={} samples_per_sec={:.0} validation_policy_ce={:.6} validation_value_ce={:.6} output={}",
-            hidden,
-            elapsed,
-            processed,
-            processed as f32 / elapsed.max(1e-6),
-            stats.policy_ce,
-            stats.value_loss,
-            output.display()
-        );
-    }
-    Ok(())
-}
-
-fn run_pikafish_export_torch(cmd: PikafishExportTorchArgs) -> io::Result<()> {
-    let conn = Connection::open(&cmd.sqlite).map_err(sqlite_io_error)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT fen, best_pv, wdl_win, wdl_draw, wdl_loss FROM pikafish_labels ORDER BY id",
-        )
-        .map_err(sqlite_io_error)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                [
-                    row.get::<_, f32>(2)?,
-                    row.get::<_, f32>(3)?,
-                    row.get::<_, f32>(4)?,
-                ],
-            ))
-        })
-        .map_err(sqlite_io_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sqlite_io_error)?;
-    let output = Path::new(&cmd.output);
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let mut writer = BufWriter::new(fs::File::create(output)?);
-    writer.write_all(b"XQPF")?;
-    writer.write_u32::<LittleEndian>(3)?;
-    writer.write_u32::<LittleEndian>(0)?;
-    let mut exported = 0u32;
-    for (group, (fen, pv, raw_wdl)) in rows.iter().enumerate() {
-        let mut position = Position::from_fen(fen)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let pv = pv
-            .split_whitespace()
-            .take(cmd.pv_plies.max(1))
-            .collect::<Vec<_>>();
-        for (ply, bestmove) in pv.into_iter().enumerate() {
-            if cmd.pv_plies == 0 && ply > 0 {
-                break;
-            }
-            let Some(best_move) = position.parse_uci_move(bestmove) else {
-                break;
-            };
-            let legal = position.legal_moves();
-            let Some(best) = legal.iter().position(|&mv| mv == best_move) else {
-                break;
-            };
-            let side = position.side_to_move();
-            let features = extract_sparse_features_az(&position);
-            let move_indices = legal
-                .iter()
-                .map(|&mv| chineseai::az::dense_move_index(canonical_move(side, mv)))
-                .collect::<Vec<_>>();
-            let sum = raw_wdl.iter().sum::<f32>().max(1.0);
-            let mut wdl = raw_wdl.map(|value| value / sum);
-            if ply % 2 == 1 {
-                wdl.swap(0, 2);
-            }
-            writer.write_u32::<LittleEndian>(group as u32)?;
-            writer.write_u8(ply as u8)?;
-            writer.write_u16::<LittleEndian>(features.len() as u16)?;
-            writer.write_u16::<LittleEndian>(move_indices.len() as u16)?;
-            writer.write_u16::<LittleEndian>(best as u16)?;
-            for value in wdl {
-                writer.write_f32::<LittleEndian>(value)?;
-            }
-            for feature in features {
-                writer.write_u16::<LittleEndian>(feature as u16)?;
-            }
-            for mv in move_indices {
-                writer.write_u16::<LittleEndian>(mv as u16)?;
-            }
-            for &mv in &legal {
-                writer.write_u8(u8::from(position.gives_check_after_move_fast(mv)))?;
-            }
-            exported += 1;
-            position.make_move(best_move);
-        }
-    }
-    writer.flush()?;
-    writer.seek(SeekFrom::Start(8))?;
-    writer.write_u32::<LittleEndian>(exported)?;
-    println!(
-        "pikafish-export-torch: samples={} output={}",
-        exported,
-        output.display()
-    );
-    Ok(())
-}
-
 fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -4263,12 +2386,12 @@ fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
 #[cfg(test)]
 mod reporting_tests {
     use super::*;
-    use chineseai::az::AzSampleMeta;
+    use rusqlite::params;
 
     #[test]
     fn only_promotion_advances_selfplay_champion() {
-        let initial = Arc::new(AzNnue::random(8, 1));
-        let latest = Arc::new(AzNnue::random(8, 2));
+        let initial = Arc::new(AbNnue::random(8, 1));
+        let latest = Arc::new(AbNnue::random(8, 2));
         let shared = RwLock::new(SharedSelfplayModel {
             version: 7,
             learner_update: 6,
@@ -4301,7 +2424,7 @@ mod reporting_tests {
 
     #[test]
     fn progress_roundtrip_preserves_generated_totals() {
-        let state = AzLoopProgressState {
+        let state = AbEvolveProgressState {
             next_update: 17,
             generated_games: 12_345,
             generated_samples: 678_901,
@@ -4309,7 +2432,7 @@ mod reporting_tests {
         };
 
         let text = toml::to_string(&state).unwrap();
-        let loaded = toml::from_str::<AzLoopProgressState>(&text)
+        let loaded = toml::from_str::<AbEvolveProgressState>(&text)
             .unwrap()
             .normalize();
 
@@ -4318,40 +2441,9 @@ mod reporting_tests {
         assert_eq!(loaded.generated_samples, 678_901);
     }
 
-    fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
-        AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features: vec![0],
-            rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
-            move_indices: (0..policy.len()).collect(),
-            policy,
-            value_wdl: [0.0, 1.0, 0.0],
-            root_search_wdl: [0.0, 1.0, 0.0],
-            value: 0.0,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            search_simulations: 2_000,
-            meta: AzSampleMeta {
-                generation_update: generation,
-                ..AzSampleMeta::default()
-            },
-        }
-    }
-
-    #[test]
-    fn policy_entropy_normalizes_targets() {
-        let samples = vec![
-            reporting_sample(10, vec![3.0, 1.0]),
-            reporting_sample(5, vec![2.0, 2.0]),
-        ];
-        let expected = (-(0.75f32 * 0.75f32.ln() + 0.25f32 * 0.25f32.ln()) - 0.5f32.ln()) / 2.0;
-        assert!((policy_target_entropy(&samples) - expected).abs() < 1e-6);
-    }
-
     #[test]
     fn pikafish_label_eval_excludes_rule_terminal_positions() {
-        let model = AzNnue::random(8, 7);
+        let model = AbNnue::random(8, 7);
         let terminal = Position::from_fen("9/4a4/3k5/9/9/9/9/4B4/9/2B1KA3 b").unwrap();
         let rows = vec![
             PikafishLabelRow {
@@ -4370,9 +2462,9 @@ mod reporting_tests {
         let stats = evaluate_pikafish_labels(
             &model,
             &rows,
-            AzSearchLimits {
-                simulations: 4,
-                ..AzSearchLimits::default()
+            AbSearchLimits {
+                nodes: 4,
+                ..AbSearchLimits::default()
             },
             |_, _| {},
         )
@@ -4461,11 +2553,11 @@ mod reporting_tests {
             writeln!(writer, "[FEN \"{}\"]\n{{}}", position.to_fen()).unwrap();
         }
         writer.finish().unwrap();
-        let mut config = AzLoopFileConfig::default();
+        let mut config = AbEvolveFileConfig::default();
         config.arena_opening_book = path.to_string_lossy().into_owned();
         let (positions, mode) = build_arena_start_positions(&config, 20);
         assert_eq!(positions.len() * 2, 2000);
-        assert_eq!(mode, "px0(shuffled,count=1000,book_positions=2)");
+        assert_eq!(mode, "book(shuffled,count=1000,book_positions=2)");
         assert!(
             positions
                 .iter()
@@ -4499,10 +2591,10 @@ mod reporting_tests {
             (1_000, 0, 0)
         );
 
-        let report = |wins, losses| AzArenaReport {
+        let report = |wins, losses| AbArenaReport {
             wins,
             losses,
-            ..AzArenaReport::default()
+            ..AbArenaReport::default()
         };
         let current = report(120, 80);
         let previous = report(100, 100);
@@ -4518,9 +2610,9 @@ mod reporting_tests {
             ArenaGateDecision::Continue
         );
 
-        let all_draws = AzArenaReport {
+        let all_draws = AbArenaReport {
             draws: 200,
-            ..AzArenaReport::default()
+            ..AbArenaReport::default()
         };
         assert_eq!(
             arena_gate_decision(&all_draws, None, None, 0.50, 1.28),
@@ -4553,17 +2645,17 @@ mod reporting_tests {
 
         // Each historical opponent is individually inconclusive, but their
         // combined 800 games prove the same regression seen at update 3760.
-        let previous_split = AzArenaReport {
+        let previous_split = AbArenaReport {
             wins: 141,
             losses: 163,
             draws: 96,
-            ..AzArenaReport::default()
+            ..AbArenaReport::default()
         };
-        let anchor_split = AzArenaReport {
+        let anchor_split = AbArenaReport {
             wins: 147,
             losses: 160,
             draws: 93,
-            ..AzArenaReport::default()
+            ..AbArenaReport::default()
         };
         assert!(previous_split.score_rate_upper_bound(1.28) >= 0.50);
         assert!(anchor_split.score_rate_upper_bound(1.28) >= 0.50);
@@ -4577,58 +2669,5 @@ mod reporting_tests {
             ),
             ArenaGateDecision::Reject
         );
-    }
-}
-
-fn generate_random_eval_fens(
-    count: usize,
-    min_plies: usize,
-    max_plies: usize,
-    seed: u64,
-) -> Vec<String> {
-    let mut rng = SplitMix64::new(seed);
-    let mut seen = HashSet::with_capacity(count * 2);
-    let mut out = Vec::with_capacity(count);
-    let mut attempts = 0usize;
-    let max_attempts = count.saturating_mul(200).max(10_000);
-    while out.len() < count && attempts < max_attempts {
-        attempts += 1;
-        let span = max_plies.saturating_sub(min_plies);
-        let target_plies = min_plies + (rng.next_u64() as usize % (span + 1));
-        if let Some(fen) = random_position_fen(target_plies, &mut rng)
-            && seen.insert(fen.clone())
-        {
-            out.push(fen);
-        }
-    }
-    if out.len() < count {
-        panic!(
-            "only generated {} unique random FENs after {} attempts",
-            out.len(),
-            attempts
-        );
-    }
-    out
-}
-
-fn random_position_fen(target_plies: usize, rng: &mut SplitMix64) -> Option<String> {
-    let mut position = Position::startpos();
-    let mut rule_history = position.initial_rule_history();
-    for _ in 0..target_plies {
-        if position.rule_outcome_with_history(&rule_history).is_some() {
-            return None;
-        }
-        let legal = position.legal_moves_with_rules(&rule_history);
-        if legal.is_empty() {
-            return None;
-        }
-        let mv: Move = legal[(rng.next_u64() as usize) % legal.len()];
-        rule_history.push(position.rule_history_entry_after_move(mv));
-        position.make_move(mv);
-    }
-    match position.rule_outcome_with_history(&rule_history) {
-        Some(RuleOutcome::Draw(_) | RuleOutcome::Win(_)) => None,
-        None if position.legal_moves_with_rules(&rule_history).is_empty() => None,
-        None => Some(position.to_fen()),
     }
 }

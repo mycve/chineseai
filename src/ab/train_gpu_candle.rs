@@ -1,41 +1,41 @@
-use super::px0_sgd::Px0Sgd;
+use super::optimizer::MomentumSgd;
 use candle_core::{Device, Result as CandleResult, Tensor, backprop::GradStore};
 use candle_nn::ops::log_softmax;
 use std::{sync::Arc, thread, time::Instant};
 
 use super::{
-    AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, AzValueMomentStats,
+    AbNnue, AbNnueArch, AbTrainLossWeights, AbTrainStats, AbTrainingSample, AbValueMomentStats,
     WDL_HEAD_SIZE,
-    candle_model::{AzCandleModel, BatchTensors},
+    candle_model::{AbCandleModel, BatchTensors},
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
 
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
-    arch: AzNnueArch,
+    arch: AbNnueArch,
     replica: GpuReplica,
-    optimizer: Px0Sgd,
-    holdout: Option<Arc<Vec<AzTrainingSample>>>,
-    checks: Vec<super::AzHoldoutReport>,
+    optimizer: MomentumSgd,
+    holdout: Option<Arc<Vec<AbTrainingSample>>>,
+    checks: Vec<super::AbHoldoutReport>,
 }
 
 #[derive(Debug)]
 struct GpuReplica {
     device: Device,
-    model: AzCandleModel,
+    model: AbCandleModel,
 }
 
 pub(super) fn train_samples_gpu(
-    model: &mut AzNnue,
-    samples: Arc<Vec<AzTrainingSample>>,
+    model: &mut AbNnue,
+    samples: Arc<Vec<AbTrainingSample>>,
     epochs: usize,
     lr: f32,
     batch_size: usize,
     rng: &mut super::SplitMix64,
-    loss_weights: AzTrainLossWeights,
-) -> CandleResult<AzTrainStats> {
+    loss_weights: AbTrainLossWeights,
+) -> CandleResult<AbTrainStats> {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
-        return Ok(AzTrainStats::default());
+        return Ok(AbTrainStats::default());
     }
 
     if model
@@ -45,7 +45,7 @@ pub(super) fn train_samples_gpu(
     {
         model.gpu_trainer = Some(Box::new(GpuTrainer::new(model, lr)?));
     }
-    let mut stats = AzTrainStats::default();
+    let mut stats = AbTrainStats::default();
     let profile_enabled = train_profile_enabled();
     let mut profile = TrainProfile::default();
     {
@@ -55,9 +55,6 @@ pub(super) fn train_samples_gpu(
             .expect("gpu trainer was initialized");
         let step_chunk = batch_size.max(1);
         trainer.set_learning_rate(lr);
-        if trainer.steps().is_multiple_of(super::PX0_CYCLE_STEPS) {
-            trainer.check_holdout(batch_size, loss_weights)?;
-        }
         for _ in 0..epochs {
             let config = DataLoaderConfig {
                 batch_size: step_chunk,
@@ -68,7 +65,7 @@ pub(super) fn train_samples_gpu(
             };
             let plan = BatchPlan::epoch(samples.len(), &config);
             let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
-            stats = AzTrainStats::default();
+            stats = AbTrainStats::default();
             loop {
                 let wait_started = Instant::now();
                 let Some(batch) = loader.next_packed().map_err(dataloader_error)? else {
@@ -81,7 +78,10 @@ pub(super) fn train_samples_gpu(
                 profile.train_step_seconds += step_started.elapsed().as_secs_f64();
                 profile.add_step(step_profile);
                 stats.add_assign(&batch_stats);
-                if trainer.steps().is_multiple_of(super::PX0_TEST_STEPS) {
+                if trainer
+                    .steps()
+                    .is_multiple_of(super::HOLDOUT_INTERVAL_STEPS)
+                {
                     trainer.check_holdout(batch_size, loss_weights)?;
                 }
                 profile.steps += 1;
@@ -99,7 +99,6 @@ pub(super) fn train_samples_gpu(
             .sum::<usize>()
             .max(1) as f32;
         stats.value_loss /= valid;
-        stats.policy_ce /= denom;
     }
     let trainer = model
         .gpu_trainer
@@ -114,7 +113,7 @@ pub(super) fn train_samples_gpu(
 }
 
 impl GpuTrainer {
-    pub(super) fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
+    pub(super) fn new(model: &AbNnue, lr: f32) -> CandleResult<Self> {
         let replica = match GpuReplica::new(model, 0) {
             Ok(replica) => replica,
             Err(_) => {
@@ -122,7 +121,7 @@ impl GpuTrainer {
                 GpuReplica::new_cpu(model)?
             }
         };
-        let optimizer = Px0Sgd::new(replica.model.all_vars(), lr as f64)?;
+        let optimizer = MomentumSgd::new(replica.model.all_vars(), lr as f64)?;
 
         Ok(Self {
             arch: model.arch,
@@ -133,7 +132,7 @@ impl GpuTrainer {
         })
     }
 
-    fn matches(&self, model: &AzNnue) -> bool {
+    fn matches(&self, model: &AbNnue) -> bool {
         self.arch == model.arch
     }
 
@@ -161,23 +160,23 @@ impl GpuTrainer {
         self.optimizer.steps
     }
 
-    pub(super) fn set_holdout(&mut self, samples: Vec<AzTrainingSample>) {
+    pub(super) fn set_holdout(&mut self, samples: Vec<AbTrainingSample>) {
         self.holdout = (!samples.is_empty()).then(|| Arc::new(samples));
     }
 
-    pub(super) fn take_checks(&mut self) -> Vec<super::AzHoldoutReport> {
+    pub(super) fn take_checks(&mut self) -> Vec<super::AbHoldoutReport> {
         std::mem::take(&mut self.checks)
     }
 
     fn check_holdout(
         &mut self,
         batch_size: usize,
-        weights: AzTrainLossWeights,
+        weights: AbTrainLossWeights,
     ) -> CandleResult<()> {
         let Some(samples) = self.holdout.as_ref() else {
             return Ok(());
         };
-        let mut stats = AzTrainStats::default();
+        let mut stats = AbTrainStats::default();
         for start in (0..samples.len()).step_by(batch_size.max(1)) {
             let ids: Vec<_> = (start..(start + batch_size.max(1)).min(samples.len())).collect();
             let tensors = BatchTensors::from_packed(
@@ -185,23 +184,18 @@ impl GpuTrainer {
                 &self.replica.device,
             )?;
             // 只做forward与统计，不backward、不调用optimizer。
-            let output = self.replica.compute_batch_loss(
-                &tensors,
-                ids.len(),
-                weights.value,
-                weights.policy,
-            )?;
+            let output = self
+                .replica
+                .compute_batch_loss(&tensors, ids.len(), weights.value)?;
             stats.add_assign(&output.stats);
         }
         let valid = stats.phase_value.iter().map(|p| p.samples).sum::<usize>();
-        self.checks.push(super::AzHoldoutReport {
+        self.checks.push(super::AbHoldoutReport {
             step: self.steps(),
             samples: stats.samples,
             value_samples: valid,
             loss: stats.loss / stats.samples.max(1) as f32,
             value_loss: stats.value_loss / valid.max(1) as f32,
-            policy_kl: stats.policy_ce / stats.samples.max(1) as f32
-                - super::policy_target_entropy(samples),
             value_rmse: (stats.value_error_sq_sum / valid.max(1) as f32)
                 .max(0.0)
                 .sqrt(),
@@ -216,16 +210,16 @@ impl GpuTrainer {
     fn train_batch(
         &mut self,
         batch: PackedStepBatch,
-        loss_weights: AzTrainLossWeights,
-    ) -> CandleResult<(AzTrainStats, StepProfile)> {
+        loss_weights: AbTrainLossWeights,
+    ) -> CandleResult<(AbTrainStats, StepProfile)> {
         self.train_batch_single(batch.batch, loss_weights)
     }
 
     fn train_batch_single(
         &mut self,
         batch: PackedBatch,
-        loss_weights: AzTrainLossWeights,
-    ) -> CandleResult<(AzTrainStats, StepProfile)> {
+        loss_weights: AbTrainLossWeights,
+    ) -> CandleResult<(AbTrainStats, StepProfile)> {
         let batch_len = batch.batch_size;
         let output = self
             .replica
@@ -239,22 +233,22 @@ impl GpuTrainer {
         Ok((output.stats, profile))
     }
 
-    fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
+    fn copy_to_model(&self, model: &mut AbNnue) -> CandleResult<()> {
         self.replica.model.copy_to_model(model)
     }
 }
 
 impl GpuReplica {
-    fn new(model: &AzNnue, device_index: usize) -> CandleResult<Self> {
+    fn new(model: &AbNnue, device_index: usize) -> CandleResult<Self> {
         let device = Device::new_cuda(device_index)?;
-        let model = AzCandleModel::from_model(model, &device)?;
+        let model = AbCandleModel::from_model(model, &device)?;
         Ok(Self { device, model })
     }
 
     /// 无可用 CUDA 设备时的 CPU 训练副本。
-    fn new_cpu(model: &AzNnue) -> CandleResult<Self> {
+    fn new_cpu(model: &AbNnue) -> CandleResult<Self> {
         let device = Device::Cpu;
-        let model = AzCandleModel::from_model(model, &device)?;
+        let model = AbCandleModel::from_model(model, &device)?;
         Ok(Self { device, model })
     }
 
@@ -262,7 +256,7 @@ impl GpuReplica {
         &self,
         batch: PackedBatch,
         batch_len: usize,
-        loss_weights: AzTrainLossWeights,
+        loss_weights: AbTrainLossWeights,
     ) -> CandleResult<BatchOutput> {
         profile_sync(&self.device)?;
         let tensor_started = Instant::now();
@@ -270,12 +264,7 @@ impl GpuReplica {
         profile_sync(&self.device)?;
         let tensor_seconds = tensor_started.elapsed().as_secs_f64();
         let loss_started = Instant::now();
-        let output = self.compute_batch_loss(
-            &batch_tensors,
-            batch_len,
-            loss_weights.value,
-            loss_weights.policy,
-        )?;
+        let output = self.compute_batch_loss(&batch_tensors, batch_len, loss_weights.value)?;
         profile_sync(&self.device)?;
         let loss_seconds = loss_started.elapsed().as_secs_f64();
         let backward_started = Instant::now();
@@ -300,7 +289,6 @@ impl GpuReplica {
         batch_tensors: &BatchTensors,
         batch_len: usize,
         value_weight: f32,
-        policy_weight: f32,
     ) -> CandleResult<BatchLossOutput> {
         let forward = self.model.forward(batch_tensors)?;
         let value_log_probs = log_softmax(&forward.value_logits, 1)?;
@@ -313,20 +301,11 @@ impl GpuReplica {
             .gt(0.0)?
             .to_dtype(candle_core::DType::F32)?;
         let value_ce = (&value_ce_per_sample * &valid_value)?.sum_all()?;
-        let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
-        let log_policy = log_softmax(&masked_policy_logits, 1)?;
-        let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
-        let policy_ce_per_sample = policy_ce_per_sample.sum(1)?;
-        let policy_ce = policy_ce_per_sample.sum_all()?;
         let weighted_value_loss = value_ce_per_sample
             .broadcast_mul(&batch_tensors.value_weights)?
             .sum_all()?
             .affine(value_weight.max(0.0) as f64, 0.0)?;
-        let weighted_policy_ce = policy_ce_per_sample
-            .broadcast_mul(&batch_tensors.policy_weights)?
-            .sum_all()?
-            .affine(policy_weight.max(0.0) as f64, 0.0)?;
-        let loss_sum = (weighted_value_loss + weighted_policy_ce)?;
+        let loss_sum = weighted_value_loss;
         let loss_tensor = (&loss_sum / batch_len as f64)?;
         let moments = masked_value_moments(
             &value,
@@ -341,15 +320,11 @@ impl GpuReplica {
         let phase_value = std::array::from_fn(|i| moment_stats(&moments[(i + 1) * 7..(i + 2) * 7]));
         let source_phase_value =
             std::array::from_fn(|i| moment_stats(&moments[(i + 4) * 7..(i + 5) * 7]));
-        let metrics = Tensor::stack(
-            &[loss_sum.detach(), value_ce.detach(), policy_ce.detach()],
-            0,
-        )?
-        .to_vec1::<f32>()?;
-        let stats = AzTrainStats {
+        let metrics =
+            Tensor::stack(&[loss_sum.detach(), value_ce.detach()], 0)?.to_vec1::<f32>()?;
+        let stats = AbTrainStats {
             loss: metrics[0],
             value_loss: metrics[1],
-            policy_ce: metrics[2],
             value_pred_sum: global.pred_sum,
             value_pred_sq_sum: global.pred_sq_sum,
             value_target_sum: global.target_sum,
@@ -393,8 +368,8 @@ fn masked_value_moments(
         .sum(0)
 }
 
-fn moment_stats(values: &[f32]) -> AzValueMomentStats {
-    AzValueMomentStats {
+fn moment_stats(values: &[f32]) -> AbValueMomentStats {
+    AbValueMomentStats {
         samples: values[0].round().max(0.0) as usize,
         pred_sum: values[1],
         pred_sq_sum: values[2],
@@ -411,7 +386,7 @@ fn wdl_probs_to_q(probs: &Tensor) -> CandleResult<Tensor> {
 }
 
 struct BatchOutput {
-    stats: AzTrainStats,
+    stats: AbTrainStats,
     profile: StepProfile,
     grads: GradStore,
 }
@@ -466,7 +441,7 @@ impl TrainProfile {
 
 struct BatchLossOutput {
     loss_tensor: Tensor,
-    stats: AzTrainStats,
+    stats: AbTrainStats,
 }
 
 fn dataloader_worker_count() -> usize {
@@ -499,31 +474,20 @@ mod monitoring_tests {
     #[test]
     fn complete_sgd_batch_resume_keeps_all_model_tensors_and_momentum() {
         let position = crate::xiangqi::Position::startpos();
-        let moves = position.legal_moves();
-        let sample = AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features: crate::nnue::extract_sparse_features_az(&position),
+        let sample = AbTrainingSample {
+            features: crate::nnue::extract_sparse_features_ab(&position),
             rule_context: Default::default(),
-            move_indices: moves
-                .iter()
-                .map(|&mv| crate::az::dense_move_index(mv))
-                .collect(),
-            policy: vec![1.0 / moves.len() as f32; moves.len()],
             value_wdl: [1.0, 0.0, 0.0],
             root_search_wdl: [1.0, 0.0, 0.0],
             value: 1.0,
             side_sign: 1.0,
-            policy_weight: 1.0,
             value_weight: 1.0,
-            search_simulations: 0,
+            search_nodes: 0,
             meta: Default::default(),
         };
         let batch = || PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]);
-        let weights = AzTrainLossWeights {
-            value: 1.0,
-            policy: 1.0,
-        };
-        let mut model = AzNnue::random(16, 20260927);
+        let weights = AbTrainLossWeights { value: 1.0 };
+        let mut model = AbNnue::random(16, 20260927);
         let mut uninterrupted = GpuTrainer::new(&model, 0.02).unwrap();
         eprintln!(
             "SGD batch resume device: {:?}",
@@ -573,38 +537,29 @@ mod monitoring_tests {
     #[test]
     fn masked_samples_do_not_pollute_value_monitoring() {
         let position = crate::xiangqi::Position::startpos();
-        let moves = position.legal_moves();
-        let sample = AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features: crate::nnue::extract_sparse_features_az(&position),
+        let sample = AbTrainingSample {
+            features: crate::nnue::extract_sparse_features_ab(&position),
             rule_context: Default::default(),
-            move_indices: moves
-                .iter()
-                .map(|&mv| crate::az::dense_move_index(mv))
-                .collect(),
-            policy: vec![1.0; moves.len()],
             value_wdl: [0.0, 1.0, 0.0],
             root_search_wdl: [0.0, 1.0, 0.0],
             value: 0.0,
             side_sign: 1.0,
-            policy_weight: 1.0,
             value_weight: 1.0,
-            search_simulations: 0,
+            search_nodes: 0,
             meta: Default::default(),
         };
         let mut masked = sample.clone();
         masked.value = 1.0;
         masked.value_wdl = [1.0, 0.0, 0.0];
         masked.value_weight = 0.0;
-        masked.policy_weight = 0.0;
-        let replica = GpuReplica::new_cpu(&AzNnue::random(16, 20260907)).unwrap();
-        let evaluate = |samples: &[AzTrainingSample]| {
+        let replica = GpuReplica::new_cpu(&AbNnue::random(16, 20260907)).unwrap();
+        let evaluate = |samples: &[AbTrainingSample]| {
             let ids: Vec<_> = (0..samples.len()).collect();
             let batch =
                 BatchTensors::from_packed(PackedBatch::from_indices(samples, &ids), &Device::Cpu)
                     .unwrap();
             replica
-                .compute_batch_loss(&batch, samples.len(), 1.0, 1.0)
+                .compute_batch_loss(&batch, samples.len(), 1.0)
                 .unwrap()
         };
         let baseline = evaluate(&[sample.clone()]);
@@ -651,9 +606,9 @@ mod monitoring_tests {
             .iter()
             .map(|v| v.as_tensor().clone())
             .collect::<Vec<_>>();
-        let optimizer = Px0Sgd::new(replica.model.all_vars(), 0.02).unwrap();
+        let optimizer = MomentumSgd::new(replica.model.all_vars(), 0.02).unwrap();
         let mut trainer = GpuTrainer {
-            arch: AzNnueArch { hidden_size: 16 },
+            arch: AbNnueArch { hidden_size: 16 },
             replica,
             optimizer,
             holdout: None,
@@ -661,13 +616,12 @@ mod monitoring_tests {
         };
         trainer.set_holdout(holdout_samples.clone());
         trainer
-            .check_holdout(1, AzTrainLossWeights::default())
+            .check_holdout(1, AbTrainLossWeights::default())
             .unwrap();
         assert_eq!(trainer.steps(), 0);
         let checks = trainer.take_checks();
         assert_eq!(checks[0].samples, 2);
         assert_eq!(checks[0].value_samples, 1);
-        assert!(checks[0].policy_kl.is_finite());
         for (before, after) in snapshot.iter().zip(trainer.replica.model.all_vars()) {
             assert_eq!(
                 (before - after.as_tensor())
@@ -683,8 +637,8 @@ mod monitoring_tests {
                 0.0
             );
         }
-        trainer.optimizer.steps = super::super::PX0_TEST_STEPS - 1;
-        let mut model = AzNnue::random(16, 20260907);
+        trainer.optimizer.steps = super::super::HOLDOUT_INTERVAL_STEPS - 1;
+        let mut model = AbNnue::random(16, 20260907);
         model.gpu_trainer = Some(Box::new(trainer));
         train_samples_gpu(
             &mut model,
@@ -693,13 +647,16 @@ mod monitoring_tests {
             0.02,
             1,
             &mut super::super::SplitMix64::new(8),
-            AzTrainLossWeights::default(),
+            AbTrainLossWeights::default(),
         )
         .unwrap();
         let checks = model.take_training_checks();
         assert_eq!(checks.len(), 1);
-        assert_eq!(checks[0].step, super::super::PX0_TEST_STEPS);
-        assert_eq!(model.training_steps(), super::super::PX0_TEST_STEPS + 1);
+        assert_eq!(checks[0].step, super::super::HOLDOUT_INTERVAL_STEPS);
+        assert_eq!(
+            model.training_steps(),
+            super::super::HOLDOUT_INTERVAL_STEPS + 1
+        );
     }
     #[test]
     fn fused_moments_match_scalar_reference_on_cpu_and_cuda() {

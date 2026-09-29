@@ -1,5 +1,5 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
-use super::{AzEvalAccumulator, AzEvalScratch, AzNnue};
+use super::{AbEvalAccumulator, AbEvalScratch, AbNnue};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -7,29 +7,27 @@ use std::sync::{
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
-pub struct AzSearchLimits {
-    pub simulations: usize,
+pub struct AbSearchLimits {
+    pub nodes: usize,
     pub max_depth: usize,
 }
-impl Default for AzSearchLimits {
+impl Default for AbSearchLimits {
     fn default() -> Self {
         Self {
-            simulations: 10_000,
+            nodes: 10_000,
             max_depth: 0,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct AzCandidate {
+pub struct AbCandidate {
     pub mv: Move,
     pub q: f32,
-    pub raw_prior: f32,
-    pub prior: f32,
-    pub policy: f32,
+    pub selection_weight: f32,
     pub solved: Option<i8>,
 }
-impl AzCandidate {
+impl AbCandidate {
     pub(crate) fn proof_priority(&self) -> u8 {
         match self.solved {
             Some(1) => 2,
@@ -40,27 +38,27 @@ impl AzCandidate {
 }
 
 #[derive(Clone, Debug)]
-pub struct AzSearchResult {
+pub struct AbSearchResult {
     pub best_move: Option<Move>,
     pub value_q: f32,
     pub value_cp: i32,
     pub value_wdl: [f32; 3],
     pub network_value_wdl: [f32; 3],
     pub best_value_wdl: [f32; 3],
-    pub simulations: usize,
+    pub nodes: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
     pub search_depth_limit: usize,
     pub search_depth_cutoffs: usize,
-    pub candidates: Vec<AzCandidate>,
+    pub candidates: Vec<AbCandidate>,
 }
 
 #[derive(Clone, Debug)]
-pub struct AzSearchControl {
+pub struct AbSearchControl {
     stop: Arc<AtomicBool>,
     deadline: Option<Instant>,
 }
-impl AzSearchControl {
+impl AbSearchControl {
     pub fn new(stop: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
         Self { stop, deadline }
     }
@@ -76,16 +74,16 @@ pub fn cp_from_q(q: f32) -> i32 {
     (q.clamp(-1.0, 1.0) * 1000.0).round() as i32
 }
 
-pub(crate) struct AzUciPv {
+pub(crate) struct AbUciPv {
     pub moves: Vec<Move>,
     pub wdl: [f32; 3],
     pub q: f32,
     pub proven: Option<i8>,
 }
 
-pub(crate) struct AzUciSearchResult {
-    pub search: AzSearchResult,
-    pub variations: Vec<AzUciPv>,
+pub(crate) struct AbUciSearchResult {
+    pub search: AbSearchResult,
+    pub variations: Vec<AbUciPv>,
 }
 use crate::xiangqi::{Color, Move, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
 
@@ -109,7 +107,7 @@ struct TtEntry {
 }
 
 struct Search<'a> {
-    model: &'a AzNnue,
+    model: &'a AbNnue,
     nodes: usize,
     limit: usize,
     exhausted: bool,
@@ -118,8 +116,8 @@ struct Search<'a> {
     killers: Vec<[Option<Move>; 2]>,
     tt: Vec<Option<TtEntry>>,
     hidden_pool: Vec<Vec<f32>>,
-    scratch: AzEvalScratch,
-    control: Option<&'a AzSearchControl>,
+    scratch: AbEvalScratch,
+    control: Option<&'a AbSearchControl>,
 }
 
 impl Search<'_> {
@@ -143,7 +141,7 @@ impl Search<'_> {
         mut alpha: f32,
         beta: f32,
     ) -> f32 {
-        if self.nodes >= self.limit || self.control.is_some_and(AzSearchControl::should_stop) {
+        if self.nodes >= self.limit || self.control.is_some_and(AbSearchControl::should_stop) {
             self.exhausted = true;
             return 0.0;
         }
@@ -157,8 +155,14 @@ impl Search<'_> {
             return -MATE;
         }
         let checked = position.in_check(position.side_to_move());
-        let stand_pat = self.evaluate(position, history, hidden);
-        if remaining == 0 {
+        let stand_pat = if checked {
+            -2.0
+        } else {
+            self.evaluate(position, history, hidden)
+        };
+        // A checked position has no legal stand-pat score. Keep searching evasions
+        // even when the ordinary capture horizon has been reached.
+        if remaining == 0 && !checked {
             return stand_pat;
         }
         if !checked {
@@ -171,10 +175,18 @@ impl Search<'_> {
             .into_iter()
             .filter(|mv| checked || position.is_capture(*mv))
             .collect::<Vec<_>>();
-        tactical.sort_by_key(|mv| position.piece_at(mv.to as usize).is_none());
+        tactical.sort_by_key(|mv| {
+            std::cmp::Reverse(match position.piece_at(mv.to as usize) {
+                Some(victim) => {
+                    let attacker = position.piece_at(mv.from as usize).unwrap();
+                    100 * piece_value(victim.kind) - piece_value(attacker.kind)
+                }
+                None => i64::MIN,
+            })
+        });
         let mut best = if checked { -2.0 } else { stand_pat };
         for mv in tactical {
-            let before_buckets = AzEvalAccumulator::buckets_for_position(position);
+            let before_buckets = AbEvalAccumulator::buckets_for_position(position);
             let mover = position.side_to_move();
             let moved = position.piece_at(mv.from as usize).unwrap();
             let captured = position.piece_at(mv.to as usize);
@@ -182,7 +194,7 @@ impl Search<'_> {
             let mut child_hidden = self.hidden_pool.pop().unwrap_or_default();
             child_hidden.resize(hidden.len(), 0.0);
             child_hidden.copy_from_slice(hidden);
-            AzEvalAccumulator::apply_transition_from_buckets(
+            AbEvalAccumulator::apply_transition_from_buckets(
                 self.model,
                 before_buckets,
                 position,
@@ -196,7 +208,7 @@ impl Search<'_> {
                 position,
                 history,
                 &child_hidden,
-                remaining - 1,
+                remaining.saturating_sub(1),
                 -beta,
                 -alpha,
             );
@@ -225,7 +237,7 @@ impl Search<'_> {
         mut alpha: f32,
         beta: f32,
     ) -> f32 {
-        if self.nodes >= self.limit || self.control.is_some_and(AzSearchControl::should_stop) {
+        if self.nodes >= self.limit || self.control.is_some_and(AbSearchControl::should_stop) {
             self.exhausted = true;
             return 0.0;
         }
@@ -265,7 +277,7 @@ impl Search<'_> {
         let mut best_move = None;
         let mut first = true;
         for (index, mv) in moves.into_iter().enumerate() {
-            let before_buckets = AzEvalAccumulator::buckets_for_position(position);
+            let before_buckets = AbEvalAccumulator::buckets_for_position(position);
             let mover = position.side_to_move();
             let moved = position.piece_at(mv.from as usize).unwrap();
             let captured = position.piece_at(mv.to as usize);
@@ -273,7 +285,7 @@ impl Search<'_> {
             let mut child_hidden = self.hidden_pool.pop().unwrap_or_default();
             child_hidden.resize(hidden.len(), 0.0);
             child_hidden.copy_from_slice(hidden);
-            AzEvalAccumulator::apply_transition_from_buckets(
+            AbEvalAccumulator::apply_transition_from_buckets(
                 self.model,
                 before_buckets,
                 position,
@@ -434,9 +446,9 @@ pub fn search(
     position: &Position,
     history: &[RuleHistoryEntry],
     moves: Vec<Move>,
-    model: &AzNnue,
+    model: &AbNnue,
     node_limit: usize,
-) -> AzSearchResult {
+) -> AbSearchResult {
     search_with_control(
         position,
         history,
@@ -453,13 +465,13 @@ fn search_with_control(
     position: &Position,
     history: &[RuleHistoryEntry],
     moves: Vec<Move>,
-    model: &AzNnue,
+    model: &AbNnue,
     node_limit: usize,
     max_depth: usize,
-    control: Option<&AzSearchControl>,
-    mut progress: impl FnMut(&AzSearchResult),
-) -> AzSearchResult {
-    let root_wdl = model.evaluate_wdl_with_rules(position, history, &moves);
+    control: Option<&AbSearchControl>,
+    mut progress: impl FnMut(&AbSearchResult),
+) -> AbSearchResult {
+    let root_wdl = model.evaluate_wdl_with_rules(position, history);
     let mut engine = Search {
         model,
         nodes: 0,
@@ -470,10 +482,10 @@ fn search_with_control(
         killers: vec![[None; 2]; 128],
         tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
         hidden_pool: Vec::new(),
-        scratch: AzEvalScratch::new(model.arch),
+        scratch: AbEvalScratch::new(model.arch),
         control,
     };
-    let root_hidden = AzEvalAccumulator::new(model, position).into_hidden_sum();
+    let root_hidden = AbEvalAccumulator::new(model, position).into_hidden_sum();
     let mut root_child_hidden = root_hidden.clone();
     let mut scores = moves
         .iter()
@@ -483,9 +495,9 @@ fn search_with_control(
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             root_child_hidden.copy_from_slice(&root_hidden);
-            AzEvalAccumulator::apply_transition_from_buckets(
+            AbEvalAccumulator::apply_transition_from_buckets(
                 model,
-                AzEvalAccumulator::buckets_for_position(position),
+                AbEvalAccumulator::buckets_for_position(position),
                 &next,
                 mv,
                 position.piece_at(mv.from as usize).unwrap(),
@@ -511,7 +523,7 @@ fn search_with_control(
     let mut completed_depth = 1;
     // A complete iteration supplies comparable scores for every root move.
     for depth in 1..=max_depth.max(1) {
-        if control.is_some_and(AzSearchControl::should_stop) {
+        if control.is_some_and(AbSearchControl::should_stop) {
             break;
         }
         let mut trial = vec![0.0; moves.len()];
@@ -524,9 +536,9 @@ fn search_with_control(
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             root_child_hidden.copy_from_slice(&root_hidden);
-            AzEvalAccumulator::apply_transition_from_buckets(
+            AbEvalAccumulator::apply_transition_from_buckets(
                 model,
-                AzEvalAccumulator::buckets_for_position(position),
+                AbEvalAccumulator::buckets_for_position(position),
                 &next,
                 mv,
                 position.piece_at(mv.from as usize).unwrap(),
@@ -583,7 +595,8 @@ fn search_with_control(
             false,
             max_depth,
         ));
-        if scores.iter().any(|&score| score >= MATE) {
+        // A saturated network score is not a proof of mate.
+        if solved.contains(&Some(1)) {
             break;
         }
     }
@@ -625,6 +638,18 @@ fn root_proofs(
         .collect()
 }
 
+fn proof_rank(proof: Option<i8>) -> u8 {
+    match proof {
+        Some(1) => 2,
+        Some(-1) => 0,
+        _ => 1,
+    }
+}
+
+fn proof_score(proof: Option<i8>, score: f32) -> f32 {
+    proof.map_or(score, f32::from)
+}
+
 fn build_result_with_proofs(
     moves: &[Move],
     scores: &[f32],
@@ -634,33 +659,37 @@ fn build_result_with_proofs(
     completed_depth: usize,
     exhausted: bool,
     max_depth: usize,
-) -> AzSearchResult {
+) -> AbSearchResult {
     let has_win = solved.contains(&Some(1));
+    let has_non_loss = solved.iter().any(|proof| *proof != Some(-1));
     let best_index = scores
         .iter()
         .enumerate()
         .max_by(|a, b| {
-            (solved[a.0] == Some(1))
-                .cmp(&(solved[b.0] == Some(1)))
-                .then_with(|| a.1.total_cmp(b.1))
+            proof_rank(solved[a.0])
+                .cmp(&proof_rank(solved[b.0]))
+                .then_with(|| {
+                    proof_score(solved[a.0], *a.1).total_cmp(&proof_score(solved[b.0], *b.1))
+                })
         })
         .map(|(i, _)| i);
-    let best_value = best_index.map_or(0.0, |i| {
-        if solved[i] == Some(1) {
-            MATE
-        } else {
-            scores[i]
-        }
-    });
-    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let best_value = best_index.map_or(0.0, |i| proof_score(solved[i], scores[i]));
+    let max_score = scores
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !has_non_loss || solved[*i] != Some(-1))
+        .map(|(i, &score)| proof_score(solved[i], score))
+        .fold(f32::NEG_INFINITY, f32::max);
     let weights: Vec<f32> = scores
         .iter()
         .enumerate()
         .map(|(i, &s)| {
             if has_win {
                 f32::from(solved[i] == Some(1))
+            } else if has_non_loss && solved[i] == Some(-1) {
+                0.0
             } else {
-                ((s - max_score) * 8.0).exp()
+                ((proof_score(solved[i], s) - max_score) * 8.0).exp()
             }
         })
         .collect();
@@ -668,12 +697,10 @@ fn build_result_with_proofs(
     let candidates = moves
         .iter()
         .enumerate()
-        .map(|(i, &mv)| AzCandidate {
+        .map(|(i, &mv)| AbCandidate {
             mv,
-            q: scores[i],
-            raw_prior: weights[i] / total,
-            prior: weights[i] / total,
-            policy: weights[i] / total,
+            q: proof_score(solved[i], scores[i]),
+            selection_weight: weights[i] / total,
             solved: solved[i],
         })
         .collect();
@@ -684,14 +711,14 @@ fn build_result_with_proofs(
     } else {
         [(best_value + 1.0) * 0.5, 0.0, (1.0 - best_value) * 0.5]
     };
-    AzSearchResult {
+    AbSearchResult {
         best_move: best_index.map(|i| moves[i]),
         value_q: best_value,
         value_cp: cp_from_q(best_value),
         value_wdl: wdl,
         network_value_wdl: root_wdl,
         best_value_wdl: wdl,
-        simulations: nodes,
+        nodes: nodes,
         search_depth_avg: completed_depth as f32,
         search_depth_max: completed_depth,
         search_depth_limit: max_depth,
@@ -700,7 +727,7 @@ fn build_result_with_proofs(
     }
 }
 
-fn uci_report(search: AzSearchResult, multipv: usize) -> AzUciSearchResult {
+fn uci_report(search: AbSearchResult, multipv: usize) -> AbUciSearchResult {
     let mut ranked = search.candidates.iter().collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
         b.proof_priority()
@@ -727,7 +754,7 @@ fn uci_report(search: AzSearchResult, multipv: usize) -> AzUciSearchResult {
             } else {
                 [(q + 1.0) * 0.5, 0.0, (1.0 - q) * 0.5]
             };
-            AzUciPv {
+            AbUciPv {
                 moves: vec![candidate.mv],
                 wdl,
                 q,
@@ -735,25 +762,25 @@ fn uci_report(search: AzSearchResult, multipv: usize) -> AzUciSearchResult {
             }
         })
         .collect();
-    AzUciSearchResult { search, variations }
+    AbUciSearchResult { search, variations }
 }
 
 pub(crate) fn search_uci(
     position: &Position,
     history: Vec<RuleHistoryEntry>,
     root_moves: Vec<Move>,
-    model: &AzNnue,
-    limits: AzSearchLimits,
-    control: &AzSearchControl,
+    model: &AbNnue,
+    limits: AbSearchLimits,
+    control: &AbSearchControl,
     multipv: usize,
-    mut progress: impl FnMut(&AzUciSearchResult),
-) -> AzUciSearchResult {
+    mut progress: impl FnMut(&AbUciSearchResult),
+) -> AbUciSearchResult {
     let search = search_with_control(
         position,
         &history,
         root_moves,
         model,
-        limits.simulations,
+        limits.nodes,
         if limits.max_depth == 0 {
             64
         } else {
@@ -771,16 +798,25 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
-    fn bounded_search_returns_legal_move_and_policy() {
+    fn bounded_search_returns_legal_move_and_selection_weights() {
         let position = Position::startpos();
         let history = position.initial_rule_history();
         let moves = position.legal_moves_with_rules(&history);
-        let model = AzNnue::random(16, 7);
+        let model = AbNnue::random(16, 7);
         let result = search(&position, &history, moves.clone(), &model, 64);
         assert!(moves.contains(&result.best_move.unwrap()));
-        assert!(result.simulations <= 64);
+        assert!(result.nodes <= 64);
         assert_eq!(result.candidates.len(), moves.len());
-        assert!((result.candidates.iter().map(|c| c.policy).sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!(
+            (result
+                .candidates
+                .iter()
+                .map(|c| c.selection_weight)
+                .sum::<f32>()
+                - 1.0)
+                .abs()
+                < 1e-5
+        );
         assert_eq!(
             result.best_move,
             search(&position, &history, moves, &model, 64).best_move
@@ -796,7 +832,7 @@ mod tests {
         let original = position.clone();
         let mut history = position.initial_rule_history();
         let original_history = history.clone();
-        let model = AzNnue::random(16, 11);
+        let model = AbNnue::random(16, 11);
         let mut engine = Search {
             model: &model,
             nodes: 0,
@@ -807,10 +843,10 @@ mod tests {
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
-            scratch: AzEvalScratch::new(model.arch),
+            scratch: AbEvalScratch::new(model.arch),
             control: None,
         };
-        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
         let _ = engine.quiescence(&mut position, &mut history, &hidden, 4, -2.0, 2.0);
         assert_eq!(position, original);
         assert_eq!(history, original_history);
@@ -822,11 +858,11 @@ mod tests {
         let position = Position::startpos();
         let history = position.initial_rule_history();
         let moves = position.legal_moves_with_rules(&history);
-        let model = AzNnue::random(16, 13);
+        let model = AbNnue::random(16, 13);
         let stop = Arc::new(AtomicBool::new(false));
-        let control = AzSearchControl::new(Arc::clone(&stop), None);
-        let limits = AzSearchLimits {
-            simulations: 64,
+        let control = AbSearchControl::new(Arc::clone(&stop), None);
+        let limits = AbSearchLimits {
+            nodes: 64,
             max_depth: 2,
             ..Default::default()
         };
@@ -841,7 +877,7 @@ mod tests {
             |_| {},
         );
         assert_eq!(result.variations.len(), 4);
-        assert!(result.search.simulations <= 64);
+        assert!(result.search.nodes <= 64);
         assert!(
             result
                 .variations
@@ -863,7 +899,7 @@ mod tests {
             1,
             |_| {},
         );
-        assert_eq!(stopped.search.simulations, 0);
+        assert_eq!(stopped.search.nodes, 0);
         assert!(stopped.search.best_move.is_some());
     }
 
@@ -871,7 +907,7 @@ mod tests {
     fn transposition_score_requires_identical_rule_history() {
         let mut position = Position::startpos();
         let history = position.initial_rule_history();
-        let model = AzNnue::random(16, 19);
+        let model = AbNnue::random(16, 19);
         let mut engine = Search {
             model: &model,
             nodes: 0,
@@ -882,7 +918,7 @@ mod tests {
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
-            scratch: AzEvalScratch::new(model.arch),
+            scratch: AbEvalScratch::new(model.arch),
             control: None,
         };
         let slot = (position.hash() as usize) & (TT_SIZE - 1);
@@ -895,7 +931,7 @@ mod tests {
             best_move: None,
         });
         let mut same_history = history.clone();
-        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
         assert_eq!(
             engine.negamax(&mut position, &mut same_history, &hidden, 2, 0, -2.0, 2.0),
             0.777
@@ -920,15 +956,61 @@ mod tests {
         let position = Position::startpos();
         let history = position.initial_rule_history();
         let moves = position.legal_moves_with_rules(&history);
-        let model = AzNnue::random(16, 23);
+        let model = AbNnue::random(16, 23);
         let result = search(&position, &history, moves.clone(), &model, 4_000);
-        assert!(result.simulations <= 4_000);
+        assert!(result.nodes <= 4_000);
         assert!(moves.contains(&result.best_move.unwrap()));
         assert!(
             result
                 .candidates
                 .iter()
-                .all(|candidate| candidate.policy.is_finite() && candidate.policy >= 0.0)
+                .all(|candidate| candidate.selection_weight.is_finite()
+                    && candidate.selection_weight >= 0.0)
         );
+    }
+
+    #[test]
+    fn proven_loss_cannot_outrank_unproven_move_or_receive_selection_weight() {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let chosen = &moves[..2];
+        let result = build_result_with_proofs(
+            chosen,
+            &[0.9, -0.4],
+            &[Some(-1), None],
+            [0.3, 0.4, 0.3],
+            3,
+            2,
+            false,
+            4,
+        );
+        assert_eq!(result.best_move, Some(chosen[1]));
+        assert_eq!(result.candidates[0].selection_weight, 0.0);
+        assert_eq!(result.candidates[1].selection_weight, 1.0);
+        assert_eq!(result.candidates[0].q, -1.0);
+    }
+
+    #[test]
+    fn checked_quiescence_searches_evasions_at_capture_horizon() {
+        let mut position = Position::from_fen("4k4/9/9/9/9/9/9/9/4r4/4K4 w - - 0 1").unwrap();
+        let mut history = position.initial_rule_history();
+        assert!(position.in_check(position.side_to_move()));
+        let model = AbNnue::random(16, 29);
+        let mut engine = Search {
+            model: &model,
+            nodes: 0,
+            limit: 128,
+            exhausted: false,
+            quiescence_nodes: 0,
+            history_scores: [[0; 90]; 90],
+            killers: vec![[None; 2]; 128],
+            tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+            hidden_pool: Vec::new(),
+            scratch: AbEvalScratch::new(model.arch),
+            control: None,
+        };
+        let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let _ = engine.quiescence(&mut position, &mut history, &hidden, 0, -2.0, 2.0);
+        assert!(engine.quiescence_nodes > 1);
     }
 }

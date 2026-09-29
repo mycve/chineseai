@@ -1,6 +1,5 @@
-use crate::az::{
-    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchResult, SplitMix64, cp_from_q,
-    search_uci,
+use crate::ab::{
+    AbNnue, AbSearchControl, AbSearchLimits, AbUciSearchResult, cp_from_q, search_uci,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
@@ -9,27 +8,21 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
+const MAX_UCI_NODES: usize = u32::MAX as usize - 1;
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const DEFAULT_SIMULATIONS: usize = 10_000;
-const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
+const DEFAULT_NODES: usize = 10_000;
 
 #[derive(Clone)]
 struct UciState {
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
-    model: Option<Arc<AzNnue>>,
-    simulations: usize,
-    threads: usize,
-    opening_temp_plies: usize,
-    opening_temperature: f32,
-    game_ply: Option<usize>,
+    model: Option<Arc<AbNnue>>,
+    nodes: usize,
     sixty_move_rule: bool,
     rule60_max_ply: u16,
-    seed: u64,
     multipv: usize,
 }
 
@@ -40,14 +33,9 @@ impl Default for UciState {
             rule_history: Position::startpos().initial_rule_history(),
             eval_file: "best.safetensors".into(),
             model: None,
-            simulations: DEFAULT_SIMULATIONS,
-            threads: 1,
-            opening_temp_plies: 0,
-            opening_temperature: DEFAULT_OPENING_TEMPERATURE,
-            game_ply: Some(0),
+            nodes: DEFAULT_NODES,
             sixty_move_rule: true,
             rule60_max_ply: 120,
-            seed: 20260409,
             multipv: 1,
         }
     }
@@ -95,8 +83,6 @@ pub fn run_uci() {
                 state.position = Position::startpos();
                 apply_rule_options(&mut state);
                 state.rule_history = state.position.initial_rule_history();
-                state.game_ply = Some(0);
-                state.seed = 20260409;
             }
             Some("setoption") => {
                 stop_active_search(&mut active_search);
@@ -108,7 +94,7 @@ pub fn run_uci() {
             }
             Some("go") => {
                 stop_active_search(&mut active_search);
-                active_search = Some(start_go(line, &mut state));
+                active_search = start_go(line, &mut state);
             }
             Some("stop") => stop_active_search(&mut active_search),
             Some("quit") => {
@@ -131,31 +117,29 @@ fn print_uci_id() {
     println!("id name ChineseAI AB-NNUE");
     println!("id author ChineseAI");
     println!("option name EvalFile type string default best.safetensors");
-    println!("option name SearchNodes type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
-    println!("option name Threads type spin default 1 min 1 max 1");
+    println!("option name SearchNodes type spin default {DEFAULT_NODES} min 1 max 100000000");
     println!("option name MultiPV type spin default 1 min 1 max 64");
-    println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
-    println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name Sixty Move Rule type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
     println!("uciok");
     flush();
 }
 
-fn ensure_model(state: &mut UciState) {
+fn ensure_model(state: &mut UciState) -> bool {
     if state.model.is_some() {
-        return;
+        return true;
     }
-    state.model = Some(Arc::new(AzNnue::load(&state.eval_file).unwrap_or_else(
-        |err| {
-            println!(
-                "info string failed to load {}, using random model: {}",
-                state.eval_file, err
-            );
+    match AbNnue::load(&state.eval_file) {
+        Ok(model) => {
+            state.model = Some(Arc::new(model));
+            true
+        }
+        Err(err) => {
+            println!("info string failed to load {}: {}", state.eval_file, err);
             flush();
-            AzNnue::random(128, state.seed)
-        },
-    )));
+            false
+        }
+    }
 }
 
 fn handle_setoption(line: &str, state: &mut UciState) {
@@ -183,24 +167,7 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.model = None;
         }
         "searchnodes" => {
-            state.simulations = value.parse::<usize>().unwrap_or(state.simulations).max(1);
-        }
-        "threads" => {
-            let _ = value;
-            state.threads = 1;
-        }
-        "openingtempplies" => {
-            state.opening_temp_plies = value
-                .parse::<usize>()
-                .unwrap_or(state.opening_temp_plies)
-                .min(1000);
-        }
-        "openingtemperature" => {
-            if let Ok(temperature) = value.parse::<f32>()
-                && temperature.is_finite()
-            {
-                state.opening_temperature = temperature.clamp(0.0, 2.0);
-            }
+            state.nodes = value.parse::<usize>().unwrap_or(state.nodes).max(1);
         }
         "sixty move rule" => {
             state.sixty_move_rule = value.eq_ignore_ascii_case("true");
@@ -226,16 +193,15 @@ fn apply_rule_options(state: &mut UciState) {
 fn handle_position(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     let moves_index = tokens.iter().position(|token| *token == "moves");
-    let (mut position, base_ply) = match tokens.get(1) {
-        Some(&"startpos") => (Position::startpos(), Some(0)),
+    let mut position = match tokens.get(1) {
+        Some(&"startpos") => Position::startpos(),
         Some(&"fen") => {
             let fen = tokens[2..moves_index.unwrap_or(tokens.len())].join(" ");
             let Ok(position) = Position::from_fen(&fen) else {
                 println!("info string invalid position FEN");
                 return;
             };
-            let base_ply = fen_game_ply(&fen, position.side_to_move());
-            (position, base_ply)
+            position
         }
         _ => return,
     };
@@ -247,19 +213,8 @@ fn handle_position(line: &str, state: &mut UciState) {
             return;
         }
     }
-    state.game_ply = base_ply.map(|ply| ply.saturating_add(history.len() - 1));
     state.position = position;
     state.rule_history = history;
-}
-
-fn fen_game_ply(fen: &str, side: Color) -> Option<usize> {
-    let fullmove = fen.split_whitespace().nth(5)?.parse::<usize>().ok()?;
-    Some(
-        fullmove
-            .checked_sub(1)?
-            .saturating_mul(2)
-            .saturating_add(usize::from(side == Color::Black)),
-    )
 }
 
 fn apply_uci_moves(
@@ -384,15 +339,18 @@ fn time_budget_ms(params: &GoParams, side: Color) -> Option<u64> {
     Some(target_ms.clamp(1, maximum_ms).min(MAX_UCI_TIME_MS))
 }
 
-fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
-    ensure_model(state);
+fn start_go(line: &str, state: &mut UciState) -> Option<ActiveSearch> {
+    if !ensure_model(state) {
+        println!("bestmove 0000");
+        flush();
+        return None;
+    }
     let params = parse_go(line);
     let snapshot = state.clone();
-    state.seed = state.seed.wrapping_add(1);
     let stop = Arc::new(AtomicBool::new(false));
     let search_stop = Arc::clone(&stop);
     let handle = thread::spawn(move || run_go_search(snapshot, params, search_stop));
-    ActiveSearch { stop, handle }
+    Some(ActiveSearch { stop, handle })
 }
 
 fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
@@ -423,14 +381,14 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
 
     let budget_ms = time_budget_ms(&params, state.position.side_to_move());
     let has_time_control = budget_ms.is_some() || params.infinite;
-    let simulations = uci_simulation_limit(&params, state.simulations, has_time_control);
+    let nodes = uci_node_limit(&params, state.nodes, has_time_control);
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
-    let control = AzSearchControl::new(Arc::clone(&stop), deadline);
-    println!("info string searchparams mode=alphabeta nodes={simulations}");
+    let control = AbSearchControl::new(Arc::clone(&stop), deadline);
+    println!("info string searchparams mode=alphabeta nodes={nodes}");
     flush();
     let mut last_score_source = None;
-    let mut report_progress = |progress: &AzUciSearchResult| {
+    let mut report_progress = |progress: &AbUciSearchResult| {
         if let Some(proven) = high_score_source(progress) {
             if last_score_source != Some(proven) {
                 print_high_score_source(progress, proven);
@@ -445,10 +403,10 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         state.rule_history.clone(),
         legal,
         model,
-        AzSearchLimits {
-            simulations,
+        AbSearchLimits {
+            nodes,
             max_depth: params.depth.unwrap_or(0),
-            ..AzSearchLimits::default()
+            ..AbSearchLimits::default()
         },
         &control,
         state.multipv,
@@ -466,39 +424,13 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
     match result.best_move {
         Some(mv) => {
-            let chosen = if state
-                .game_ply
-                .is_some_and(|ply| ply < state.opening_temp_plies)
-                && state.opening_temperature > 0.0
-            {
-                let entropy = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |time| time.as_nanos() as u64);
-                choose_opening_move(
-                    &result.candidates,
-                    mv,
-                    state.opening_temperature,
-                    state.seed ^ entropy,
-                )
-            } else {
-                mv
-            };
             print_search_info(&report, started);
-            if chosen != mv {
-                println!(
-                    "info string openingtemp ply={} temperature={:.2} searchbest={} sampled={}",
-                    state.game_ply.unwrap_or(0),
-                    state.opening_temperature,
-                    mv,
-                    chosen
-                );
-            }
-            println!("bestmove {chosen}");
+            println!("bestmove {mv}");
         }
         None => {
             println!(
                 "info depth 1 nodes {} time {} score cp {}",
-                result.simulations,
+                result.nodes,
                 started.elapsed().as_millis(),
                 result.value_cp
             );
@@ -508,18 +440,18 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     flush();
 }
 
-fn uci_simulation_limit(params: &GoParams, configured: usize, has_time_control: bool) -> usize {
+fn uci_node_limit(params: &GoParams, configured: usize, has_time_control: bool) -> usize {
     let requested = params.nodes.unwrap_or(if params.infinite {
-        MAX_UCI_SIMULATIONS
+        MAX_UCI_NODES
     } else if has_time_control {
-        MAX_UCI_SIMULATIONS
+        MAX_UCI_NODES
     } else {
         configured.max(1)
     });
-    requested.clamp(1, MAX_UCI_SIMULATIONS)
+    requested.clamp(1, MAX_UCI_NODES)
 }
 
-fn high_score_source(report: &AzUciSearchResult) -> Option<bool> {
+fn high_score_source(report: &AbUciSearchResult) -> Option<bool> {
     report
         .variations
         .first()
@@ -527,7 +459,7 @@ fn high_score_source(report: &AzUciSearchResult) -> Option<bool> {
         .map(|pv| pv.proven.is_some())
 }
 
-fn print_high_score_source(report: &AzUciSearchResult, proven: bool) {
+fn print_high_score_source(report: &AbUciSearchResult, proven: bool) {
     println!(
         "info string high score q={:.3} source={}",
         report.variations[0].q,
@@ -539,10 +471,10 @@ fn print_high_score_source(report: &AzUciSearchResult, proven: bool) {
     );
 }
 
-fn print_search_info(report: &AzUciSearchResult, started: Instant) {
+fn print_search_info(report: &AbUciSearchResult, started: Instant) {
     let result = &report.search;
     let elapsed_ms = started.elapsed().as_millis();
-    let nps = result.simulations as u128 * 1000 / elapsed_ms.max(1);
+    let nps = result.nodes as u128 * 1000 / elapsed_ms.max(1);
     for (index, pv) in report.variations.iter().enumerate() {
         let wdl = uci_wdl(pv.wdl);
         let moves = pv
@@ -556,7 +488,7 @@ fn print_search_info(report: &AzUciSearchResult, started: Instant) {
             result.search_depth_avg.round() as usize,
             result.search_depth_max,
             index + 1,
-            result.simulations,
+            result.nodes,
             nps,
             elapsed_ms,
             cp_from_q(pv.q),
@@ -569,7 +501,7 @@ fn print_search_info(report: &AzUciSearchResult, started: Instant) {
     if report.variations.is_empty() {
         println!(
             "info depth 0 nodes {} time {} score cp {}",
-            result.simulations, elapsed_ms, result.value_cp
+            result.nodes, elapsed_ms, result.value_cp
         );
     }
 }
@@ -586,50 +518,6 @@ fn flush() {
     let _ = io::stdout().flush();
 }
 
-fn choose_opening_move(
-    candidates: &[AzCandidate],
-    best: Move,
-    temperature: f32,
-    seed: u64,
-) -> Move {
-    let priority = candidates
-        .iter()
-        .map(AzCandidate::proof_priority)
-        .max()
-        .unwrap_or(0);
-    let max_policy = candidates
-        .iter()
-        .filter(|candidate| candidate.proof_priority() == priority)
-        .map(|candidate| candidate.policy.max(0.0))
-        .fold(0.0_f32, f32::max);
-    if max_policy <= 0.0 || temperature <= 0.0 {
-        return best;
-    }
-    let exponent = 1.0 / temperature;
-    let weight = |candidate: &AzCandidate| {
-        if candidate.proof_priority() != priority {
-            return 0.0;
-        }
-        let policy_ratio = candidate.policy.max(0.0) / max_policy;
-        if policy_ratio < 0.25 {
-            0.0
-        } else {
-            policy_ratio.powf(exponent)
-        }
-    };
-    let total = candidates.iter().map(&weight).sum::<f32>();
-    let mut rng = SplitMix64::new(seed);
-    let mut ticket = rng.unit_f32() * total;
-    for candidate in candidates {
-        let candidate_weight = weight(candidate);
-        if ticket < candidate_weight {
-            return candidate.mv;
-        }
-        ticket -= candidate_weight;
-    }
-    best
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,11 +525,16 @@ mod tests {
     #[test]
     fn state_defaults_use_the_single_uci_default_source() {
         let state = UciState::default();
-        assert_eq!(state.simulations, DEFAULT_SIMULATIONS);
+        assert_eq!(state.nodes, DEFAULT_NODES);
         assert_eq!(state.eval_file, "best.safetensors");
-        assert_eq!(state.opening_temp_plies, 0);
-        assert_eq!(state.opening_temperature, DEFAULT_OPENING_TEMPERATURE);
-        assert_eq!(state.game_ply, Some(0));
+    }
+
+    #[test]
+    fn missing_model_never_falls_back_to_random_weights() {
+        let mut state = UciState::default();
+        state.eval_file = "missing-ab-model.safetensors".into();
+        assert!(!ensure_model(&mut state));
+        assert!(state.model.is_none());
     }
 
     #[test]
@@ -677,26 +570,20 @@ mod tests {
     #[test]
     fn infinite_analysis_runs_until_stop_or_explicit_nodes() {
         let infinite = parse_go("go infinite");
-        assert_eq!(
-            uci_simulation_limit(&infinite, 10_000, true),
-            MAX_UCI_SIMULATIONS
-        );
+        assert_eq!(uci_node_limit(&infinite, 10_000, true), MAX_UCI_NODES);
 
         let explicit = parse_go("go infinite nodes 100000000");
-        assert_eq!(uci_simulation_limit(&explicit, 10_000, true), 100_000_000);
+        assert_eq!(uci_node_limit(&explicit, 10_000, true), 100_000_000);
 
         let timed = parse_go("go movetime 1000");
-        assert_eq!(
-            uci_simulation_limit(&timed, 10_000, true),
-            MAX_UCI_SIMULATIONS
-        );
+        assert_eq!(uci_node_limit(&timed, 10_000, true), MAX_UCI_NODES);
     }
 
     #[test]
     fn search_node_limit_is_configurable() {
         let mut state = UciState::default();
         handle_setoption("setoption name SearchNodes value 4096", &mut state);
-        assert_eq!(state.simulations, 4096);
+        assert_eq!(state.nodes, 4096);
     }
 
     #[test]
@@ -752,67 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_temperature_tracks_game_ply() {
-        let mut state = UciState::default();
-        handle_setoption("setoption name OpeningTempPlies value 20", &mut state);
-        handle_setoption("setoption name OpeningTemperature value 1.2", &mut state);
-        assert_eq!(state.opening_temp_plies, 20);
-        assert_eq!(state.opening_temperature, 1.2);
-
-        handle_position("position startpos moves b2e2 b9c7", &mut state);
-        assert_eq!(state.game_ply, Some(2));
-        handle_position(
-            "position fen rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 11",
-            &mut state,
-        );
-        assert_eq!(state.game_ply, Some(20));
-        handle_position(
-            &format!("position fen {}", crate::xiangqi::STARTPOS_FEN),
-            &mut state,
-        );
-        assert_eq!(state.game_ply, None);
-    }
-
-    #[test]
-    fn opening_temperature_samples_only_policy_moves() {
-        let best = Move::new(0, 1);
-        let alternate = Move::new(0, 2);
-        let candidates = [
-            AzCandidate {
-                mv: best,
-                q: 0.0,
-                raw_prior: 0.0,
-                prior: 0.0,
-                policy: 0.8,
-                solved: None,
-            },
-            AzCandidate {
-                mv: alternate,
-                q: 0.0,
-                raw_prior: 0.0,
-                prior: 0.0,
-                policy: 0.2,
-                solved: None,
-            },
-            AzCandidate {
-                mv: Move::new(0, 3),
-                q: 0.0,
-                raw_prior: 0.0,
-                prior: 0.0,
-                policy: 0.0,
-                solved: None,
-            },
-        ];
-        assert_eq!(choose_opening_move(&candidates, best, 0.0, 1), best);
-        let alternates = (0..1000)
-            .map(|seed| choose_opening_move(&candidates, best, 1.0, seed))
-            .inspect(|mv| assert!(*mv == best || *mv == alternate))
-            .filter(|mv| *mv == alternate)
-            .count();
-        assert!((100..300).contains(&alternates));
-    }
-
-    #[test]
     fn uci_import_preserves_repetition_history_for_value_evaluation() {
         let mut position = Position::from_fen(
             "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1",
@@ -826,6 +652,6 @@ mod tests {
 
         assert_eq!(history.len(), moves.len() + 1);
         assert_eq!(position.side_to_move(), Color::Black);
-        assert!(crate::az::rule_context_features(&position, &history)[1] > 0.0);
+        assert!(crate::ab::rule_context_features(&position, &history)[1] > 0.0);
     }
 }

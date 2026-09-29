@@ -1,13 +1,13 @@
-use chineseai::az::AzNnueArch;
-use chineseai::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
+use chineseai::ab::AbNnueArch;
+use chineseai::version::AB_EVOLVE_CONFIG_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
 
-pub const DEFAULT_AZ_LOOP_CONFIG: &str = "chineseai.ab-evolve.toml";
+pub const DEFAULT_AB_EVOLVE_CONFIG: &str = "chineseai.ab-evolve.toml";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct AzLoopFileConfig {
+pub struct AbEvolveFileConfig {
     pub format_version: u32,
     pub model_path: String,
     pub selfplay_nodes: usize,
@@ -33,7 +33,6 @@ pub struct AzLoopFileConfig {
     pub train_samples_per_update: usize,
     pub mirror_probability: f32,
     pub train_value_weight: f32,
-    pub train_policy_weight: f32,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -51,10 +50,10 @@ pub struct AzLoopFileConfig {
     pub tensorboard_logdir: String,
 }
 
-impl Default for AzLoopFileConfig {
+impl Default for AbEvolveFileConfig {
     fn default() -> Self {
         Self {
-            format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
+            format_version: AB_EVOLVE_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
             selfplay_nodes: 10_000,
             selfplay_samples_per_update: 120_000,
@@ -79,7 +78,6 @@ impl Default for AzLoopFileConfig {
             train_samples_per_update: 120_000,
             mirror_probability: 0.5,
             train_value_weight: 1.0,
-            train_policy_weight: 1.0,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 50,
@@ -99,7 +97,7 @@ impl Default for AzLoopFileConfig {
     }
 }
 
-impl AzLoopFileConfig {
+impl AbEvolveFileConfig {
     pub fn to_file_text(&self) -> String {
         let mut out = String::new();
         macro_rules! line {
@@ -135,7 +133,6 @@ impl AzLoopFileConfig {
         line!(train_samples_per_update);
         line!(mirror_probability);
         line!(train_value_weight);
-        line!(train_policy_weight);
         line!(checkpoint_interval);
         line!(checkpoint_dir, string);
         line!(max_checkpoints);
@@ -158,14 +155,14 @@ impl AzLoopFileConfig {
         let config = toml::from_str::<Self>(text)
             .unwrap_or_else(|err| panic!("invalid ab-evolve TOML config: {err}"));
         assert_eq!(
-            config.format_version, AZ_LOOP_CONFIG_FORMAT_VERSION,
+            config.format_version, AB_EVOLVE_CONFIG_FORMAT_VERSION,
             "unsupported ab-evolve config format"
         );
         config.normalize()
     }
 
-    pub fn arch(&self) -> AzNnueArch {
-        AzNnueArch {
+    pub fn arch(&self) -> AbNnueArch {
+        AbNnueArch {
             hidden_size: self.hidden_size,
         }
     }
@@ -192,7 +189,6 @@ impl AzLoopFileConfig {
         self.train_samples_per_update = self.train_samples_per_update.max(1);
         self.mirror_probability = self.mirror_probability.clamp(0.0, 1.0);
         self.train_value_weight = self.train_value_weight.max(0.0);
-        self.train_policy_weight = self.train_policy_weight.max(0.0);
         self.max_checkpoints = self.max_checkpoints.max(1);
         self.arena_processes = self.arena_processes.max(1);
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
@@ -205,9 +201,9 @@ impl AzLoopFileConfig {
     }
 }
 
-pub fn load_or_create_az_loop_config(path: &str) -> Option<AzLoopFileConfig> {
+pub fn load_or_create_ab_evolve_config(path: &str) -> Option<AbEvolveFileConfig> {
     if !Path::new(path).exists() {
-        fs::write(path, AzLoopFileConfig::default().to_file_text())
+        fs::write(path, AbEvolveFileConfig::default().to_file_text())
             .unwrap_or_else(|err| panic!("failed to create `{path}`: {err}"));
         println!("created config: {path}");
         println!("edit it, then run: chineseai ab-evolve {path}");
@@ -215,7 +211,7 @@ pub fn load_or_create_az_loop_config(path: &str) -> Option<AzLoopFileConfig> {
     }
     let text =
         fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read `{path}`: {err}"));
-    Some(AzLoopFileConfig::parse(&text))
+    Some(AbEvolveFileConfig::parse(&text))
 }
 
 #[cfg(test)]
@@ -224,8 +220,8 @@ mod tests {
 
     #[test]
     fn new_config_roundtrips_with_node_budgets() {
-        let text = AzLoopFileConfig::default().to_file_text();
-        let config = AzLoopFileConfig::parse(&text);
+        let text = AbEvolveFileConfig::default().to_file_text();
+        let config = AbEvolveFileConfig::parse(&text);
         assert_eq!(config.selfplay_nodes, 10_000);
         assert_eq!(config.arena_nodes, 10_000);
         assert_eq!(config.arena_openings, 1000);
@@ -237,7 +233,7 @@ mod tests {
 
     #[test]
     fn normalize_keeps_training_and_arena_live() {
-        let mut config = AzLoopFileConfig::default();
+        let mut config = AbEvolveFileConfig::default();
         config.replay_capacity = 0;
         config.train_samples_per_update = 0;
         config.arena_openings = 0;

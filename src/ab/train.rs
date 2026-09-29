@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use super::{AzNnue, AzTrainLossWeights, AzTrainStats, AzTrainingSample, SplitMix64};
+use super::{AbNnue, AbTrainLossWeights, AbTrainStats, AbTrainingSample, SplitMix64};
 
 pub fn train_samples(
-    model: &mut AzNnue,
-    samples: &[AzTrainingSample],
+    model: &mut AbNnue,
+    samples: &[AbTrainingSample],
     epochs: usize,
     lr: f32,
     batch_size: usize,
     rng: &mut SplitMix64,
-) -> Result<AzTrainStats, String> {
+) -> Result<AbTrainStats, String> {
     train_samples_weighted(
         model,
         samples,
@@ -17,19 +17,19 @@ pub fn train_samples(
         lr,
         batch_size,
         rng,
-        AzTrainLossWeights::default(),
+        AbTrainLossWeights::default(),
     )
 }
 
 pub fn train_samples_weighted(
-    model: &mut AzNnue,
-    samples: &[AzTrainingSample],
+    model: &mut AbNnue,
+    samples: &[AbTrainingSample],
     epochs: usize,
     lr: f32,
     batch_size: usize,
     rng: &mut SplitMix64,
-    loss_weights: AzTrainLossWeights,
-) -> Result<AzTrainStats, String> {
+    loss_weights: AbTrainLossWeights,
+) -> Result<AbTrainStats, String> {
     train_samples_weighted_shared(
         model,
         Arc::new(samples.to_vec()),
@@ -42,14 +42,14 @@ pub fn train_samples_weighted(
 }
 
 pub fn train_samples_weighted_owned(
-    model: &mut AzNnue,
-    samples: Vec<AzTrainingSample>,
+    model: &mut AbNnue,
+    samples: Vec<AbTrainingSample>,
     epochs: usize,
     lr: f32,
     batch_size: usize,
     rng: &mut SplitMix64,
-    loss_weights: AzTrainLossWeights,
-) -> Result<AzTrainStats, String> {
+    loss_weights: AbTrainLossWeights,
+) -> Result<AbTrainStats, String> {
     train_samples_weighted_shared(
         model,
         Arc::new(samples),
@@ -62,13 +62,13 @@ pub fn train_samples_weighted_owned(
 }
 
 pub fn train_samples_weighted_shared(
-    model: &mut AzNnue,
-    samples: Arc<Vec<AzTrainingSample>>,
+    model: &mut AbNnue,
+    samples: Arc<Vec<AbTrainingSample>>,
     epochs: usize,
     lr: f32,
     batch_size: usize,
     rng: &mut SplitMix64,
-    loss_weights: AzTrainLossWeights,
-) -> Result<AzTrainStats, String> {
+    loss_weights: AbTrainLossWeights,
+) -> Result<AbTrainStats, String> {
     super::train_gpu::train_samples_gpu(model, samples, epochs, lr, batch_size, rng, loss_weights)
 }

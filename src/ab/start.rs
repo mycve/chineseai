@@ -1,7 +1,7 @@
 use crate::xiangqi::{Position, RuleHistoryEntry};
 
 #[derive(Clone, Debug)]
-pub struct AzStartSnapshot {
+pub struct AbStartSnapshot {
     pub position: Position,
     pub rule_history: Vec<RuleHistoryEntry>,
     pub phase_ply: u16,

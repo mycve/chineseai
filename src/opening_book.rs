@@ -1,6 +1,6 @@
-//! Px0 官方 book.pgn.gz 是 FEN 标签加空注释的局面集合。
+//! FEN 标签和空注释组成的压缩 PGN 开局局面集合。
 use crate::{
-    az::{AzStartSnapshot, SplitMix64},
+    ab::{AbStartSnapshot, SplitMix64},
     xiangqi::Position,
 };
 use flate2::read::GzDecoder;
@@ -10,13 +10,13 @@ use std::{
     path::Path,
 };
 
-pub struct Px0OpeningBook {
+pub struct OpeningBook {
     fens: Vec<String>,
     order: Vec<usize>,
     cursor: usize,
 }
 
-impl Px0OpeningBook {
+impl OpeningBook {
     pub fn load(path: impl AsRef<Path>, seed: u64) -> io::Result<Self> {
         Self::read(BufReader::new(GzDecoder::new(File::open(path)?)), seed)
     }
@@ -34,12 +34,12 @@ impl Px0OpeningBook {
             } else if !line.is_empty() && line != "{}" {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Px0 FEN 开局库包含不支持的内容",
+                    "FEN 开局库包含不支持的内容",
                 ));
             }
         }
         if fens.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Px0 开局库为空"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "开局库为空"));
         }
         let mut order: Vec<_> = (0..fens.len()).collect();
         let mut rng = SplitMix64::new(seed);
@@ -62,7 +62,7 @@ impl Px0OpeningBook {
         &mut self,
         count: usize,
         generation: u32,
-    ) -> io::Result<Vec<AzStartSnapshot>> {
+    ) -> io::Result<Vec<AbStartSnapshot>> {
         let mut snapshots = Vec::with_capacity(count);
         for _ in 0..count {
             if self.cursor == self.order.len() {
@@ -72,7 +72,7 @@ impl Px0OpeningBook {
             let position = Position::from_fen(fen)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let rule_history = position.initial_rule_history();
-            snapshots.push(AzStartSnapshot {
+            snapshots.push(AbStartSnapshot {
                 position,
                 rule_history,
                 phase_ply: 0,
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     #[ignore = "需要官方 book.pgn.gz"]
     fn official_book_loads_and_supplies_valid_fens() {
-        let mut book = Px0OpeningBook::load("book.pgn.gz", 7).unwrap();
+        let mut book = OpeningBook::load("book.pgn.gz", 7).unwrap();
         assert_eq!(book.len(), 3_210_663);
         for start in book.next_batch(1024, 0).unwrap() {
             assert!(!start.position.legal_moves().is_empty());
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn shuffled_fens_are_used_once_per_cycle_without_invented_history() {
         let input = b"[FEN \"4k4/9/9/9/9/9/9/9/4P4/4K4 w\"]\n{}\n[FEN \"4k4/9/9/9/9/9/9/4P4/9/4K4 b\"]\n{}\n";
-        let mut book = Px0OpeningBook::read(&input[..], 7).unwrap();
+        let mut book = OpeningBook::read(&input[..], 7).unwrap();
         let batch = book.next_batch(2, 3).unwrap();
         assert_ne!(batch[0].position.to_fen(), batch[1].position.to_fen());
         assert!(

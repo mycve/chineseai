@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, alphabeta_search};
+use crate::ab::{AbNnue, alphabeta_search};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 #[derive(Clone, Debug, Default)]
@@ -40,7 +40,7 @@ pub struct VsPikafishConfig {
     pub pikafish_depth: u32,
     pub total_games: usize,
     pub max_plies: usize,
-    pub simulations: usize,
+    pub nodes: usize,
     pub parallel_games: usize,
     pub report_games: bool,
 }
@@ -69,7 +69,7 @@ struct GameConfig {
     chinese_plays_red: bool,
     pikafish_depth: u32,
     max_plies: usize,
-    simulations: usize,
+    nodes: usize,
 }
 
 struct ExternalUci {
@@ -239,7 +239,7 @@ fn terminal_before_side_selects(
 }
 
 fn play_one_game(
-    model: &AzNnue,
+    model: &AbNnue,
     external: &mut ExternalUci,
     initial_position: &Position,
     config: GameConfig,
@@ -268,13 +268,8 @@ fn play_one_game(
             || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let search = alphabeta_search(
-                &position,
-                &rule_history,
-                legal.clone(),
-                model,
-                config.simulations,
-            );
+            let search =
+                alphabeta_search(&position, &rule_history, legal.clone(), model, config.nodes);
             let Some(mv) = search.best_move else {
                 return Ok((
                     match side {
@@ -338,7 +333,7 @@ pub fn run_vs_pikafish(
     start_positions: &[Position],
     config: VsPikafishConfig,
 ) -> std::io::Result<VsPikafishResult> {
-    let model = Arc::new(AzNnue::load(chinese_model_path).map_err(|e| {
+    let model = Arc::new(AbNnue::load(chinese_model_path).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("load chinese model `{}`: {e}", chinese_model_path.display()),
@@ -378,7 +373,7 @@ pub fn run_vs_pikafish(
                             chinese_plays_red: chinese_red,
                             pikafish_depth: config.pikafish_depth,
                             max_plies: config.max_plies,
-                            simulations: config.simulations,
+                            nodes: config.nodes,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));
