@@ -5,7 +5,7 @@
 pub const MODEL_FORMAT_VERSION: f32 = 37.0;
 /// ???replay????????
 pub const REPLAY_FILE_VERSION: u32 = 41;
-/// az-loop ?????TOML??????
-pub const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 30;
-/// az-loop ?????????
+/// AB evolution TOML config format.
+pub const AZ_LOOP_CONFIG_FORMAT_VERSION: u32 = 31;
+/// AB evolution progress format.
 pub const AZ_LOOP_PROGRESS_VERSION: u32 = 8;

@@ -325,26 +325,10 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
-fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
+fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, _seed: u64) -> AzSearchLimits {
     AzSearchLimits {
         simulations: config.simulations.max(1),
-        seed,
-        cpuct: config.cpuct,
-        cpuct_at_root: config.cpuct_at_root,
-        cpuct_base: config.cpuct_base,
-        cpuct_factor: config.cpuct_factor,
-        cpuct_base_at_root: config.cpuct_base_at_root,
-        cpuct_factor_at_root: config.cpuct_factor_at_root,
         max_depth: 0,
-        root_dirichlet_alpha: config.root_dirichlet_alpha,
-        root_exploration_fraction: config.root_exploration_fraction,
-        fpu_value: config.fpu_value,
-        fpu_value_at_root: config.fpu_value_at_root,
-        fpu_absolute_at_root: config.fpu_absolute_at_root,
-        minimum_kldgain_per_node: config.minimum_kldgain_per_node,
-        policy_softmax_temp: config.policy_softmax_temp,
-        draw_score: config.draw_score,
-        value_scale: 1.0,
     }
 }
 
@@ -1054,18 +1038,6 @@ pub struct AzArenaConfig {
     pub games_as_black: usize,
     pub start_index: usize,
     pub seed: u64,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub fpu_absolute_at_root: bool,
-    pub minimum_kldgain_per_node: f32,
-    pub draw_score: f32,
-    pub policy_softmax_temp: f32,
 }
 
 pub fn play_arena_games_from_positions(
@@ -1107,18 +1079,6 @@ pub fn play_arena_games_from_snapshots(
             config.simulations,
             config.max_plies.saturating_sub(snapshot.phase_ply as usize),
             config.seed ^ (config.start_index + game_index) as u64,
-            config.cpuct,
-            config.cpuct_at_root,
-            config.cpuct_base,
-            config.cpuct_factor,
-            config.cpuct_base_at_root,
-            config.cpuct_factor_at_root,
-            config.fpu_value,
-            config.fpu_value_at_root,
-            config.fpu_absolute_at_root,
-            config.minimum_kldgain_per_node,
-            config.draw_score,
-            config.policy_softmax_temp,
         );
         match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1149,18 +1109,6 @@ pub fn play_arena_games_from_snapshots(
             config.simulations,
             config.max_plies.saturating_sub(snapshot.phase_ply as usize),
             config.seed ^ (config.start_index + game_index) as u64,
-            config.cpuct,
-            config.cpuct_at_root,
-            config.cpuct_base,
-            config.cpuct_factor,
-            config.cpuct_base_at_root,
-            config.cpuct_factor_at_root,
-            config.fpu_value,
-            config.fpu_value_at_root,
-            config.fpu_absolute_at_root,
-            config.minimum_kldgain_per_node,
-            config.draw_score,
-            config.policy_softmax_temp,
         );
         let black_score = match outcome.total_cmp(&0.0) {
             std::cmp::Ordering::Greater => {
@@ -1211,18 +1159,6 @@ fn play_arena_game(
     simulations: usize,
     max_plies: usize,
     _seed: u64,
-    _cpuct: f32,
-    _cpuct_at_root: f32,
-    _cpuct_base: f32,
-    _cpuct_factor: f32,
-    _cpuct_base_at_root: f32,
-    _cpuct_factor_at_root: f32,
-    _fpu_value: f32,
-    _fpu_value_at_root: f32,
-    _fpu_absolute_at_root: bool,
-    _minimum_kldgain_per_node: f32,
-    _draw_score: f32,
-    _policy_softmax_temp: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut rule_history = initial_rule_history.to_vec();
@@ -1303,20 +1239,6 @@ mod tests {
             temperature_endgame: 0.0,
             temperature_decay_delay_plies: 0,
             temperature_decay_plies: 0,
-            cpuct: 0.65,
-            cpuct_at_root: 1.5,
-            cpuct_base: 19652.0,
-            cpuct_factor: 1.5,
-            cpuct_base_at_root: 19652.0,
-            cpuct_factor_at_root: 1.5,
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            fpu_value: 0.30,
-            fpu_value_at_root: 0.20,
-            fpu_absolute_at_root: false,
-            minimum_kldgain_per_node: 0.0,
-            draw_score: 0.0,
-            policy_softmax_temp: 1.0,
             opening_positions: Default::default(),
             mirror_probability: 0.0,
             record_fens: false,
@@ -1333,7 +1255,6 @@ mod tests {
         let mut config = selfplay_test_config(1);
         config.max_plies = 1;
         config.simulations = 10_000;
-        config.minimum_kldgain_per_node = 0.00005;
         config.opening_positions = vec![AzStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
@@ -1383,15 +1304,14 @@ mod tests {
     }
 
     #[test]
-    fn selfplay_keeps_noise_after_temperature_cutoff() {
+    fn selfplay_uses_node_budget_after_temperature_cutoff() {
         let mut config = selfplay_test_config(1);
         config.temperature_cutoff_plies = 40;
         config.temperature_endgame = 0.6;
-        config.root_exploration_fraction = 0.1;
         assert_eq!(temperature_for_ply(&config, 40), 0.6);
         assert_eq!(
-            selfplay_search_limits(&config, 40, 0).root_exploration_fraction,
-            0.1
+            selfplay_search_limits(&config, 40, 0).simulations,
+            config.simulations
         );
     }
 
@@ -1509,18 +1429,6 @@ mod tests {
                 config.simulations,
                 config.max_plies,
                 config.seed,
-                config.cpuct,
-                config.cpuct_at_root,
-                config.cpuct_base,
-                config.cpuct_factor,
-                config.cpuct_base_at_root,
-                config.cpuct_factor_at_root,
-                config.fpu_value,
-                config.fpu_value_at_root,
-                config.fpu_absolute_at_root,
-                config.minimum_kldgain_per_node,
-                config.draw_score,
-                config.policy_softmax_temp,
             ),
             1.0
         );

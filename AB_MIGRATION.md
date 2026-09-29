@@ -1,9 +1,7 @@
-# αβ 自博弈分支
+# αβ 自博弈进化
 
-`codex/alphabeta-selfplay-promotion` 将训练循环的自博弈和候选网络晋级赛改为同一套 NNUE 评估的 αβ 搜索。搜索采用迭代加深、主变搜索、吃子及历史着法排序和叶节点静态搜索；局面使用走棋与撤回，按现有象棋规则历史判定终局。
+在 `codex/alphabeta-selfplay-promotion` 分支运行 `chineseai ab-evolve`。首次运行生成 `chineseai.ab-evolve.toml`；编辑后再次运行。`selfplay_nodes` 和 `arena_nodes` 分别限制每步自博弈搜索和晋级赛搜索的节点数。旧版配置不再兼容，请使用新生成的格式 31 配置。
 
-配置中的 `simulations` 和 `arena_simulations` 现在分别表示每步自博弈和晋级赛的最大搜索节点数；原 MCTS 的 `cpuct`、Dirichlet 噪声、FPU、KLD 参数不作用于这两条路径。当前训练样本的策略标签由根走法搜索分数归一化得到。
+自博弈使用当前冠军网络和 αβ 搜索产生样本，训练器据此更新候选网络。每隔 `arena_interval` 次更新，候选网络与冠军进行配对对局；只有达到 `arena_promotion_rate` 和置信区间要求才保存为新冠军，并交给自博弈线程。未晋级的候选仍可继续训练。`best.safetensors` 是默认 UCI 对弈模型。
 
-训练模型作为候选网络持续更新；自博弈线程只在配对晋级赛通过置信区间门槛后切换到晋级网络。候选模型、优化器及经验池仍按既有周期保存。UCI 默认读取晋级模型 `best.safetensors`，也使用 αβ 搜索；`SearchNodes` 指定默认节点上限，`go nodes`、`go depth`、时限和 `stop` 控制搜索。多 PV 当前只返回根着法，不延伸完整主变。
-
-本实现是可运行的 αβ 迁移基础，并不包含 Pikafish 的静态交换评估、置换表、空步剪枝和残局库，因此搜索强度及速度不能直接等同于 Pikafish。置换表的局面键需包含完整规则历史，否则长将、长捉与循环局面可能错误复用搜索结果。
+搜索采用迭代加深、主变搜索、着法排序和叶节点静态搜索；局面走棋与撤回沿用象棋规则历史。策略训练标签由根着法搜索分数归一化得到。UCI 的 `SearchNodes`、`go nodes`、`go depth`、时限和 `stop` 可控制搜索。当前多 PV 只报告根着法。

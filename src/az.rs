@@ -6,7 +6,6 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 mod alphabeta;
-mod alphazero;
 pub(crate) use alphabeta::{AzUciSearchResult, search_uci};
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
@@ -48,13 +47,8 @@ use crate::xiangqi::{
     piece_kind_index,
 };
 
-pub use alphazero::{
-    AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,
-    alphazero_search, alphazero_search_external_root_controlled_with_progress,
-    alphazero_search_trace_with_rules, alphazero_search_with_rules,
-    alphazero_search_with_rules_controlled, alphazero_search_with_rules_controlled_with_progress,
-    cp_from_q,
-};
+pub use alphabeta::search as alphabeta_search;
+pub use alphabeta::{AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, cp_from_q};
 pub use play::{
     AzArenaConfig, AzArenaReport, AzSelfplayData, AzTerminalStats, generate_selfplay_data,
     play_arena_games_from_positions, play_arena_games_from_snapshots,
@@ -272,7 +266,7 @@ impl Default for AzNnueArch {
     }
 }
 pub(super) struct AzEvalScratch {
-    // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
+    // NNUE 热路径复用特征存储，避免每个搜索节点分配并排序 Vec。
     features: Vec<usize>,
     hidden: Vec<f32>,
     policy_context: Vec<f32>,
@@ -614,21 +608,6 @@ pub struct AzLoopConfig {
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    /// 每个根走法的固定 Dirichlet alpha，0 关闭噪声。
-    pub root_dirichlet_alpha: f32,
-    pub root_exploration_fraction: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub fpu_absolute_at_root: bool,
-    pub minimum_kldgain_per_node: f32,
-    pub draw_score: f32,
-    pub policy_softmax_temp: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,
     pub mirror_probability: f32,
     pub record_fens: bool,
@@ -1126,7 +1105,7 @@ impl AzNnue {
         let rule_context_hidden = vec![0.0; RULE_CONTEXT_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
         // Start value-neutral. A random value head can evaluate startpos as a
-        // large red/black advantage before any training, and MCTS amplifies
+        // large red/black advantage before any training, and search amplifies
         // that noise into the first self-play dataset.
         let value_head_hidden = (0..VALUE_HEAD_SIZE * hidden_size)
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))

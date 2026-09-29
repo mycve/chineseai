@@ -1,4 +1,4 @@
-//! UCI match runner: ChineseAI (AZ-NNUE search) vs Pikafish.
+//! UCI match runner: ChineseAI (NNUE alpha-beta search) vs Pikafish.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use crate::az::{AzNnue, AzSearchLimits, alphazero_search_with_rules};
+use crate::az::{AzNnue, alphabeta_search};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 #[derive(Clone, Debug, Default)]
@@ -41,17 +41,7 @@ pub struct VsPikafishConfig {
     pub total_games: usize,
     pub max_plies: usize,
     pub simulations: usize,
-    pub seed: u64,
     pub parallel_games: usize,
-    pub cpuct: f32,
-    pub cpuct_at_root: f32,
-    pub cpuct_base: f32,
-    pub cpuct_factor: f32,
-    pub cpuct_base_at_root: f32,
-    pub cpuct_factor_at_root: f32,
-    pub fpu_value: f32,
-    pub fpu_value_at_root: f32,
-    pub policy_softmax_temp: f32,
     pub report_games: bool,
 }
 
@@ -80,16 +70,6 @@ struct GameConfig {
     pikafish_depth: u32,
     max_plies: usize,
     simulations: usize,
-    seed: u64,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    cpuct_base: f32,
-    cpuct_factor: f32,
-    cpuct_base_at_root: f32,
-    cpuct_factor_at_root: f32,
-    fpu_value: f32,
-    fpu_value_at_root: f32,
-    policy_softmax_temp: f32,
 }
 
 struct ExternalUci {
@@ -270,7 +250,6 @@ fn play_one_game(
     let mut rule_history = position.initial_rule_history();
     let mut moves_uci: Vec<String> = Vec::new();
     let mut ply_count = 0usize;
-    let mut seed = config.seed;
 
     loop {
         if let Some(end) =
@@ -289,33 +268,13 @@ fn play_one_game(
             || (!config.chinese_plays_red && side == Color::Black);
 
         if chinese_to_move {
-            let search = alphazero_search_with_rules(
+            let search = alphabeta_search(
                 &position,
-                Some(rule_history.clone()),
-                Some(legal.clone()),
+                &rule_history,
+                legal.clone(),
                 model,
-                AzSearchLimits {
-                    simulations: config.simulations,
-                    seed,
-                    cpuct: config.cpuct,
-                    cpuct_at_root: config.cpuct_at_root,
-                    cpuct_base: config.cpuct_base,
-                    cpuct_factor: config.cpuct_factor,
-                    cpuct_base_at_root: config.cpuct_base_at_root,
-                    cpuct_factor_at_root: config.cpuct_factor_at_root,
-                    max_depth: 0,
-                    root_dirichlet_alpha: 0.0,
-                    root_exploration_fraction: 0.0,
-                    fpu_value: config.fpu_value,
-                    fpu_value_at_root: config.fpu_value_at_root,
-                    fpu_absolute_at_root: true,
-                    minimum_kldgain_per_node: 0.0,
-                    policy_softmax_temp: config.policy_softmax_temp,
-                    draw_score: 0.0,
-                    value_scale: 1.0,
-                },
+                config.simulations,
             );
-            seed = seed.wrapping_add(1);
             let Some(mv) = search.best_move else {
                 return Ok((
                     match side {
@@ -420,17 +379,6 @@ pub fn run_vs_pikafish(
                             pikafish_depth: config.pikafish_depth,
                             max_plies: config.max_plies,
                             simulations: config.simulations,
-                            seed: config.seed
-                                ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                            cpuct: config.cpuct,
-                            cpuct_at_root: config.cpuct_at_root,
-                            cpuct_base: config.cpuct_base,
-                            cpuct_factor: config.cpuct_factor,
-                            cpuct_base_at_root: config.cpuct_base_at_root,
-                            cpuct_factor_at_root: config.cpuct_factor_at_root,
-                            fpu_value: config.fpu_value,
-                            fpu_value_at_root: config.fpu_value_at_root,
-                            policy_softmax_temp: config.policy_softmax_temp,
                         },
                     )?;
                     games.push((game_index, chinese_red, end, final_fen, position_command));

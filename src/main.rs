@@ -14,10 +14,9 @@ use chineseai::{
     az::{
         AzArenaConfig, AzArenaReport, AzExperiencePool, AzLoopConfig, AzLoopReport, AzNnue,
         AzSampleMeta, AzSearchLimits, AzSelfplayData, AzTrainLossWeights, AzTrainingSample,
-        Px0ReplaySampler, SplitMix64, alphazero_search, alphazero_search_trace_with_rules,
-        alphazero_search_with_rules, benchmark_training, dense_move_index, evaluate_policy_groups,
-        generate_selfplay_data, play_arena_games_from_positions, policy_target_entropy,
-        train_samples_weighted, train_samples_weighted_owned,
+        Px0ReplaySampler, SplitMix64, alphabeta_search, benchmark_training, dense_move_index,
+        evaluate_policy_groups, generate_selfplay_data, play_arena_games_from_positions,
+        policy_target_entropy, train_samples_weighted, train_samples_weighted_owned,
     },
     nnue::{AZ_NNUE_INPUT_SIZE, canonical_move, extract_sparse_features_az},
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
@@ -51,8 +50,8 @@ const DEFAULT_VS_PIKAFISH_PARALLEL_GAMES: usize = 128;
 #[command(
     name = "chineseai",
     version,
-    about = "ChineseAI AZ-NNUE search and training tools",
-    long_about = "ChineseAI AZ-NNUE search and training tools."
+    about = "ChineseAI alpha-beta NNUE evolution tools",
+    long_about = "ChineseAI alpha-beta NNUE evolution tools."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,23 +60,26 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    /// Create a random AZ-NNUE model.
+    /// Create a random NNUE model.
+    #[command(name = "model-init")]
     AzInit(AzInitArgs),
     /// Scale one policy component for structural ablation.
+    #[command(name = "policy-scale")]
     AzPolicyScale(AzPolicyScaleArgs),
-    /// Search one position and print policy/debug details.
-    AzSearch(AzSearchArgs),
-    /// Benchmark fixed-position search speed.
-    AzBench(AzBenchArgs),
     /// Benchmark a synthetic training workload.
+    #[command(name = "train-bench")]
     AzTrainBench(AzTrainBenchArgs),
     /// Fit a model on a fixed replay snapshot and report future-game validation loss.
+    #[command(name = "replay-fit")]
     AzReplayFit(AzReplayFitArgs),
     /// Report start-position policy targets, played moves, and outcomes from a replay snapshot.
+    #[command(name = "replay-opening-stats")]
     AzReplayOpeningStats(AzReplayOpeningStatsArgs),
     /// Compare fixed label accuracy across replay position-coverage buckets.
+    #[command(name = "replay-coverage")]
     AzReplayCoverage(AzReplayCoverageArgs),
     /// Run self-play training from a TOML config.
+    #[command(name = "ab-evolve")]
     AzLoop(AzLoopArgs),
     /// Evaluate checkpoint non-transitivity and historical regressions.
     CheckpointCycles(CheckpointCyclesArgs),
@@ -136,105 +138,9 @@ enum PolicyComponent {
     MoveBias,
 }
 
-#[derive(Args, Debug, Clone)]
-#[command(after_long_help = "\
-Examples:
-  chineseai az-search model.safetensors
-  chineseai az-search model.safetensors 50000 1.5 --top 12 startpos
-  chineseai az-search model.safetensors 10000 --trace-move b0c2 --verify-top 3 startpos")]
-struct AzSearchArgs {
-    /// AZ-NNUE model path.
-    model: String,
-    /// Number of MCTS simulations.
-    #[arg(default_value_t = 800)]
-    simulations: usize,
-    /// Non-root PUCT init.
-    #[arg(default_value_t = 1.0)]
-    cpuct: f32,
-    /// Root PUCT init.
-    #[arg(long, default_value_t = 1.9)]
-    cpuct_at_root: f32,
-    /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.23)]
-    fpu_value: f32,
-    /// Root absolute first-play urgency.
-    #[arg(long, default_value_t = 1.0)]
-    fpu_value_at_root: f32,
-    /// Divisor applied to policy logits before root search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.4)]
-    policy_softmax_temp: f32,
-    /// Dynamic PUCT base.
-    #[arg(long, default_value_t = 38739.0)]
-    cpuct_base: f32,
-    /// Dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 3.894)]
-    cpuct_factor: f32,
-    /// Root dynamic PUCT base.
-    #[arg(long, default_value_t = 38739.0)]
-    cpuct_base_at_root: f32,
-    /// Root dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 3.894)]
-    cpuct_factor_at_root: f32,
-    /// Maximum search depth in plies below root; 0 keeps the MCTX default (simulations).
-    #[arg(long, default_value_t = 0)]
-    max_depth: usize,
-    /// Draw value in Q = W - L + draw_score * D.
-    #[arg(long, default_value_t = 0.0)]
-    draw_score: f32,
-    /// Scale non-terminal network values during search; 0 isolates policy priors.
-    #[arg(long, default_value_t = 1.0)]
-    value_scale: f32,
-    /// Independently re-search this many top-visited root moves after making each move.
-    #[arg(long, default_value_t = 0)]
-    verify_top: usize,
-    /// Independently re-search specific root moves (repeat the option for multiple moves).
-    #[arg(long = "verify-move")]
-    verify_moves: Vec<String>,
-    /// Restrict the root search to these legal moves (repeat for multiple moves).
-    #[arg(long = "root-move")]
-    root_moves: Vec<String>,
-    /// Print the most-visited continuation below this root move with network leaf values.
-    #[arg(long = "trace-move")]
-    trace_move: Option<String>,
-    /// Simulations for every independent child verification; 0 uses the root simulation count.
-    #[arg(long, default_value_t = 0)]
-    verify_sims: usize,
-    /// Candidate rows to display, sorted by visits; 0 displays every legal root move.
-    #[arg(long, default_value_t = 20)]
-    top: usize,
-    /// Apply legal UCI moves before searching; repeat for a move sequence.
-    #[arg(long = "move")]
-    moves: Vec<String>,
-    /// FEN string, or startpos if omitted.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    fen: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-#[command(after_long_help = "\
-Examples:
-  chineseai az-bench model.safetensors 512 100 1.5 startpos
-  chineseai az-bench model.safetensors 512 100 1.5 startpos")]
-struct AzBenchArgs {
-    /// AZ-NNUE model path.
-    model: String,
-    /// Simulations per search.
-    #[arg(default_value_t = 800)]
-    simulations: usize,
-    /// Number of repeated searches.
-    #[arg(default_value_t = 100)]
-    repeat: usize,
-    /// PUCT constant for AlphaZero search.
-    #[arg(default_value_t = 1.0)]
-    cpuct: f32,
-    /// FEN string, or startpos if omitted.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    fen: Vec<String>,
-}
-
 #[derive(Args, Debug)]
 struct AzTrainBenchArgs {
-    /// AZ-NNUE model path.
+    /// NNUE model path.
     model: String,
     /// Generated sample count.
     #[arg(default_value_t = 8192)]
@@ -255,7 +161,7 @@ struct AzTrainBenchArgs {
 
 #[derive(Args, Debug)]
 struct AzReplayFitArgs {
-    /// Replay snapshot produced by az-loop.
+    /// Replay snapshot produced by ab-evolve.
     replay: String,
     /// Output model path.
     #[arg(long, default_value = "replay-fit.safetensors")]
@@ -288,7 +194,7 @@ struct AzReplayFitArgs {
 
 #[derive(Args, Debug)]
 struct AzReplayOpeningStatsArgs {
-    /// Replay snapshot produced by az-loop.
+    /// Replay snapshot produced by ab-evolve.
     replay: String,
     /// Rows to display.
     #[arg(long, default_value_t = 20)]
@@ -297,7 +203,7 @@ struct AzReplayOpeningStatsArgs {
 
 #[derive(Args, Debug)]
 struct AzReplayCoverageArgs {
-    /// Replay snapshot produced by az-loop.
+    /// Replay snapshot produced by ab-evolve.
     replay: String,
     /// Model evaluated on the fixed labels.
     model: String,
@@ -309,8 +215,8 @@ struct AzReplayCoverageArgs {
     /// Uniformly sampled label rows; 0 uses all rows.
     #[arg(long, default_value_t = 5_000)]
     limit: usize,
-    /// Search simulations per label position.
-    #[arg(long, default_value_t = 64)]
+    /// Alpha-beta nodes per label position.
+    #[arg(long = "nodes", default_value_t = 64)]
     simulations: usize,
     /// Parallel evaluator threads.
     #[arg(long, default_value_t = 16)]
@@ -338,7 +244,7 @@ struct AzLoopArgs {
 Examples:
   chineseai checkpoint-cycles checkpoints
   chineseai checkpoint-cycles checkpoints --contains best --max-models 12 --opening-positions 100
-  chineseai checkpoint-cycles checkpoints --adjacent-only --simulations 400")]
+  chineseai checkpoint-cycles checkpoints --adjacent-only --nodes 400")]
 struct CheckpointCyclesArgs {
     /// Directory containing checkpoint .safetensors files.
     directory: String,
@@ -354,8 +260,8 @@ struct CheckpointCyclesArgs {
     /// Test only consecutive checkpoints. This cannot detect three-model cycles.
     #[arg(long)]
     adjacent_only: bool,
-    /// MCTS simulations per move.
-    #[arg(short = 's', long, default_value_t = 800)]
+    /// Alpha-beta nodes per move.
+    #[arg(short = 's', long = "nodes", default_value_t = 800)]
     simulations: usize,
     /// Shuffled Px0 FEN positions; every pair uses the same positions with colors swapped.
     #[arg(long, default_value_t = 1000)]
@@ -382,44 +288,17 @@ struct CheckpointCyclesArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai vs-pikafish ./tools/pikafish model.safetensors
-  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --simulations 192
+  chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --nodes 192
   chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5
   chineseai vs-pikafish ./tools/pikafish model.safetensors --opening-book book.pgn.gz")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
-    /// ChineseAI AZ-NNUE model path.
+    /// ChineseAI NNUE model path.
     model: String,
-    /// ChineseAI MCTS simulations per move.
-    #[arg(short = 's', long, default_value = "800")]
+    /// ChineseAI alpha-beta nodes per move.
+    #[arg(short = 's', long = "nodes", default_value = "800")]
     simulations: Option<usize>,
-    /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.0)]
-    cpuct: f32,
-    /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 1.9)]
-    cpuct_at_root: f32,
-    /// ChineseAI dynamic PUCT base.
-    #[arg(long, default_value_t = 38739.0)]
-    cpuct_base: f32,
-    /// ChineseAI dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 3.894)]
-    cpuct_factor: f32,
-    /// ChineseAI root dynamic PUCT base.
-    #[arg(long, default_value_t = 38739.0)]
-    cpuct_base_at_root: f32,
-    /// ChineseAI root dynamic PUCT growth factor.
-    #[arg(long, default_value_t = 3.894)]
-    cpuct_factor_at_root: f32,
-    /// ChineseAI non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.23)]
-    fpu_value: f32,
-    /// ChineseAI root first-play urgency reduction.
-    #[arg(long, default_value_t = 1.0)]
-    fpu_value_at_root: f32,
-    /// Divisor applied to ChineseAI policy logits before search.
-    #[arg(long, default_value_t = 1.4)]
-    policy_softmax_temp: f32,
     /// Draw after this many plies.
     #[arg(long, default_value_t = 200)]
     max_plies: usize,
@@ -493,7 +372,7 @@ struct PikafishLabelSelfplayArgs {
     sqlite: String,
     #[arg(long, default_value_t = 100_000)]
     count: usize,
-    #[arg(long, default_value_t = 800)]
+    #[arg(long = "nodes", default_value_t = 800)]
     simulations: usize,
     #[arg(long, default_value_t = 200)]
     max_plies: usize,
@@ -539,31 +418,16 @@ struct PikafishExportTorchArgs {
 #[derive(Args, Debug)]
 #[command(after_long_help = "\
 Examples:
-  chineseai pikafish-label-eval model.safetensors eval/pikafish-selfplay-5000-d20.sqlite --simulations 64")]
+  chineseai pikafish-label-eval model.safetensors eval/pikafish-selfplay-5000-d20.sqlite --nodes 10000")]
 struct PikafishLabelEvalArgs {
-    /// ChineseAI AZ-NNUE model path.
+    /// ChineseAI NNUE model path.
     model: String,
     /// SQLite labels produced by pikafish-label-random.
     sqlite: String,
-    /// ChineseAI MCTS simulations per position.
-    #[arg(short = 's', long, default_value_t = 6000)]
+    /// Alpha-beta nodes per position.
+    #[arg(short = 's', long = "nodes", default_value_t = 10000)]
     simulations: usize,
-    /// ChineseAI PUCT constant.
-    #[arg(long, default_value_t = 1.0)]
-    cpuct: f32,
-    /// ChineseAI root PUCT constant.
-    #[arg(long, default_value_t = 1.9)]
-    cpuct_at_root: f32,
-    /// Non-root first-play urgency reduction.
-    #[arg(long, default_value_t = 0.23)]
-    fpu_value: f32,
-    /// Root absolute first-play urgency.
-    #[arg(long, default_value_t = 1.0)]
-    fpu_value_at_root: f32,
-    /// Divisor applied to policy logits before search; above 1 flattens priors.
-    #[arg(long, default_value_t = 1.4)]
-    policy_softmax_temp: f32,
-    /// Maximum search depth in plies below root; 0 keeps the MCTS default.
+    /// Maximum alpha-beta depth; 0 uses the default.
     #[arg(long, default_value_t = 0)]
     max_depth: usize,
     /// Random seed.
@@ -622,7 +486,7 @@ impl AzLoopProgressState {
     fn normalize(mut self) -> Self {
         if self.format_version != AZ_LOOP_PROGRESS_VERSION {
             panic!(
-                "unsupported AZ loop progress version {}; expected {}",
+                "unsupported AB evolution progress version {}; expected {}",
                 self.format_version, AZ_LOOP_PROGRESS_VERSION
             );
         }
@@ -708,12 +572,8 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     }
 
     let encoded = format!(
-        concat!(
-            "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
-            "shuf{}_rrw{}_sgd09nesterov_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_rc{}_",
-            "tspu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
-        ),
-        config.simulations,
+        "ab{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_shuf{}_rrw{}_tb{}_teg{}_tdd{}_tde{}_rc{}_tspu{}_mp{}_cpi{}_ai{}_an{}_sd{}",
+        config.selfplay_nodes,
         config.selfplay_samples_per_update,
         config.batch_size,
         f32_slug(config.lr),
@@ -724,11 +584,6 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         config.workers,
         config.shuffle_size,
         config.replay_recent_games,
-        f32_slug(config.cpuct),
-        f32_slug(config.cpuct_at_root),
-        f32_slug(config.fpu_value),
-        f32_slug(config.fpu_value_at_root),
-        f32_slug(config.policy_softmax_temp),
         f32_slug(config.temperature_start),
         f32_slug(config.temperature_endgame),
         config.temperature_decay_delay_plies,
@@ -738,12 +593,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
         f32_slug(config.mirror_probability),
         config.checkpoint_interval,
         config.arena_interval,
-        config.arena_simulations,
-        f32_slug(config.arena_cpuct),
-        f32_slug(config.arena_cpuct_at_root),
-        f32_slug(config.arena_policy_softmax_temp),
-        f32_slug(config.root_dirichlet_alpha),
-        f32_slug(config.root_exploration_fraction),
+        config.arena_nodes,
         config.seed,
     );
     if encoded.len() <= 180 {
@@ -757,7 +607,7 @@ fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     }
     format!(
         "sim{}_bs{}_lr{}_h{}_sd{}_cfg{:016x}",
-        config.simulations,
+        config.selfplay_nodes,
         config.batch_size,
         f32_slug(config.lr),
         config.hidden_size,
@@ -1002,7 +852,7 @@ fn build_az_loop_config(
         games: 1,
         max_plies: config.max_plies,
         rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
-        simulations: config.simulations,
+        simulations: config.selfplay_nodes,
         seed,
         workers,
         generation_update,
@@ -1012,20 +862,6 @@ fn build_az_loop_config(
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
-        cpuct: config.cpuct,
-        cpuct_at_root: config.cpuct_at_root,
-        cpuct_base: config.cpuct_base,
-        cpuct_factor: config.cpuct_factor,
-        cpuct_base_at_root: config.cpuct_base_at_root,
-        cpuct_factor_at_root: config.cpuct_factor_at_root,
-        root_dirichlet_alpha: config.root_dirichlet_alpha,
-        root_exploration_fraction: config.root_exploration_fraction,
-        fpu_value: config.fpu_value,
-        fpu_value_at_root: config.fpu_value_at_root,
-        fpu_absolute_at_root: config.fpu_absolute_at_root,
-        minimum_kldgain_per_node: config.minimum_kldgain_per_node,
-        draw_score: config.draw_score,
-        policy_softmax_temp: config.policy_softmax_temp,
         opening_positions: Arc::clone(opening_positions),
         mirror_probability: config.mirror_probability,
         record_fens: false,
@@ -1214,16 +1050,6 @@ struct ArenaThreadConfig {
     simulations: usize,
     max_plies: usize,
     rule60_max_ply: Option<u16>,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    cpuct_base: f32,
-    cpuct_factor: f32,
-    cpuct_base_at_root: f32,
-    cpuct_factor_at_root: f32,
-    fpu_value: f32,
-    fpu_value_at_root: f32,
-    draw_score: f32,
-    policy_softmax_temp: f32,
     thread_count: usize,
     seed: u64,
 }
@@ -1263,16 +1089,6 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
         let simulations = config.simulations;
         let max_plies = config.max_plies;
         let rule60_max_ply = config.rule60_max_ply;
-        let cpuct = config.cpuct;
-        let cpuct_at_root = config.cpuct_at_root;
-        let cpuct_base = config.cpuct_base;
-        let cpuct_factor = config.cpuct_factor;
-        let cpuct_base_at_root = config.cpuct_base_at_root;
-        let cpuct_factor_at_root = config.cpuct_factor_at_root;
-        let fpu_value = config.fpu_value;
-        let fpu_value_at_root = config.fpu_value_at_root;
-        let draw_score = config.draw_score;
-        let policy_softmax_temp = config.policy_softmax_temp;
         // 由全局开局索引派生每对随机流；结果不应随线程切分变化。
         let seed = config.seed;
         let thread_start_index = start_index;
@@ -1286,18 +1102,6 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                 games_as_black: black_games,
                 start_index: thread_start_index,
                 seed,
-                cpuct,
-                cpuct_at_root,
-                cpuct_base,
-                cpuct_factor,
-                cpuct_base_at_root,
-                cpuct_factor_at_root,
-                fpu_value,
-                fpu_value_at_root,
-                fpu_absolute_at_root: true,
-                minimum_kldgain_per_node: 0.0,
-                draw_score,
-                policy_softmax_temp,
             };
             match eval_starts {
                 ArenaStarts::Positions(positions) => play_arena_games_from_positions(
@@ -1346,113 +1150,8 @@ fn build_arena_start_positions(
     )
 }
 
-fn fixed_az_search_limits(
-    simulations: usize,
-    seed: u64,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    max_depth: usize,
-    policy_softmax_temp: f32,
-) -> AzSearchLimits {
-    AzSearchLimits {
-        simulations,
-        seed,
-        cpuct,
-        cpuct_at_root,
-        cpuct_base: 38739.0,
-        cpuct_factor: 3.894,
-        cpuct_base_at_root: 38739.0,
-        cpuct_factor_at_root: 3.894,
-        max_depth,
-        root_dirichlet_alpha: 0.0,
-        root_exploration_fraction: 0.0,
-        fpu_value: 0.23,
-        fpu_value_at_root: 1.0,
-        fpu_absolute_at_root: true,
-        minimum_kldgain_per_node: 0.0,
-        policy_softmax_temp: policy_softmax_temp.max(1.0e-3),
-        draw_score: 0.0,
-        value_scale: 1.0,
-    }
-}
-
 fn log_scalar(writer: &mut SummaryWriter, tag: &str, step: usize, value: f32) {
     writer.add_scalar(tag, value, step);
-}
-
-fn print_az_search_candidates(result: &chineseai::az::AzSearchResult, top: usize) {
-    let mut candidates = result.candidates.iter().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        right
-            .visits
-            .cmp(&left.visits)
-            .then_with(|| right.policy.total_cmp(&left.policy))
-            .then_with(|| right.q.total_cmp(&left.q))
-    });
-    let shown = if top == 0 {
-        candidates.len()
-    } else {
-        top.min(candidates.len())
-    };
-    println!(
-        "\nCANDIDATES — visits descending ({shown}/{})",
-        candidates.len()
-    );
-    println!("    #  B  MOVE      VISITS  VISIT P       Q      CP       NET P      TREE P");
-    println!("  ---- --  -------  --------  -------  ------  ------  ----------  ----------");
-    for (rank, candidate) in candidates.into_iter().take(shown).enumerate() {
-        let best = if Some(candidate.mv) == result.best_move {
-            "*"
-        } else {
-            " "
-        };
-        println!(
-            "  {:>4}  {}  {:<7}  {:>8}  {:>6.2}%  {:>+6.3}  {:>+6}  {:>9.5}  {:>9.5}",
-            rank + 1,
-            best,
-            candidate.mv,
-            candidate.visits,
-            candidate.policy * 100.0,
-            candidate.q,
-            chineseai::az::cp_from_q(candidate.q),
-            candidate.raw_prior,
-            candidate.prior,
-        );
-    }
-}
-
-fn print_az_search_trace(trace_move: Move, trace: &[chineseai::az::AzSearchTraceStep]) {
-    println!(
-        "\nPRINCIPAL TRACE — root {trace_move}, {} plies",
-        trace.len()
-    );
-    if trace.is_empty() {
-        println!("  Root move was not expanded.");
-        return;
-    }
-    println!(
-        "  PLY  MOVE      VISITS       Q     PRIOR  CHECK  EXPANDED    CHILD Q       CHILD W/D/L"
-    );
-    println!(
-        "  ---  -------  --------  ------  --------  -----  --------  --------  ------------------"
-    );
-    for step in trace {
-        println!(
-            "  {:>3}  {:<7}  {:>8}  {:>+6.3}  {:>7.5}  {:>5}  {:>8}  {:>+8.3}  {:>5.1}%/{:>5.1}%/{:>5.1}%",
-            step.ply,
-            step.mv,
-            step.visits,
-            step.q,
-            step.prior,
-            if step.gives_check { "yes" } else { "no" },
-            if step.child_expanded { "yes" } else { "no" },
-            step.child_value,
-            step.child_value_wdl[0] * 100.0,
-            step.child_value_wdl[1] * 100.0,
-            step.child_value_wdl[2] * 100.0,
-        );
-        println!("       fen: {}", step.child_fen);
-    }
 }
 
 fn main() {
@@ -1513,299 +1212,6 @@ fn main() {
             println!("scale    : {}", cmd.scale);
             println!("weights  : rows={} nonzero={}", rows, nonzero);
             println!("l2       : {:.6} -> {:.6}", before_l2, after_l2);
-        }
-        Some(CliCommand::AzSearch(cmd)) => {
-            let model_path = cmd.model;
-            let simulations = cmd.simulations.max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
-            let fen = cmd.fen.join(" ");
-            let mut position = parse_position(&fen);
-            let mut rule_history = position.initial_rule_history();
-            for text in &cmd.moves {
-                let mv = position.parse_uci_move(text).unwrap_or_else(|| {
-                    panic!("invalid or illegal --move `{text}` for this position")
-                });
-                rule_history.push(position.rule_history_entry_after_move(mv));
-                position.make_move(mv);
-            }
-            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
-                panic!("failed to load `{model_path}`: {err}");
-            });
-            let search_limits = AzSearchLimits {
-                simulations,
-                seed: 0,
-                cpuct,
-                cpuct_at_root,
-                cpuct_base: cmd.cpuct_base.max(1.0),
-                cpuct_factor: cmd.cpuct_factor.max(0.0),
-                cpuct_base_at_root: cmd.cpuct_base_at_root.max(1.0),
-                cpuct_factor_at_root: cmd.cpuct_factor_at_root.max(0.0),
-                max_depth: cmd.max_depth,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value: cmd.fpu_value.max(0.0),
-                fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
-                fpu_absolute_at_root: true,
-                minimum_kldgain_per_node: 0.0,
-                policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
-                draw_score: cmd.draw_score.clamp(-1.0, 1.0),
-                value_scale: cmd.value_scale.clamp(0.0, 1.0),
-            };
-            let root_moves = if cmd.root_moves.is_empty() {
-                None
-            } else {
-                Some(
-                    cmd.root_moves
-                        .iter()
-                        .map(|text| {
-                            position.parse_uci_move(text).unwrap_or_else(|| {
-                                panic!("invalid or illegal --root-move `{text}` for this position")
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            };
-            let trace_move = cmd.trace_move.as_deref().map(|text| {
-                position
-                    .parse_uci_move(text)
-                    .unwrap_or_else(|| panic!("invalid or illegal --trace-move `{text}`"))
-            });
-            let search_started = Instant::now();
-            let (result, trace) = if let Some(trace_move) = trace_move {
-                alphazero_search_trace_with_rules(
-                    &position,
-                    Some(rule_history.clone()),
-                    root_moves,
-                    &model,
-                    search_limits,
-                    trace_move,
-                )
-            } else {
-                (
-                    alphazero_search_with_rules(
-                        &position,
-                        Some(rule_history.clone()),
-                        root_moves,
-                        &model,
-                        search_limits,
-                    ),
-                    Vec::new(),
-                )
-            };
-            let search_elapsed = search_started.elapsed();
-            let mut by_visits = result.candidates.clone();
-            by_visits.sort_by(|left, right| {
-                right
-                    .visits
-                    .cmp(&left.visits)
-                    .then_with(|| right.policy.total_cmp(&left.policy))
-                    .then_with(|| right.q.total_cmp(&left.q))
-            });
-            let visited_actions = by_visits
-                .iter()
-                .filter(|candidate| candidate.visits > 0)
-                .count();
-            let elapsed_seconds = search_elapsed.as_secs_f64().max(f64::EPSILON);
-            let best_move = result
-                .best_move
-                .map(|mv| mv.to_string())
-                .unwrap_or_else(|| "(none)".into());
-            println!("AZ SEARCH");
-            println!("=========");
-            println!("\nPOSITION");
-            println!("  FEN          {}", position.to_fen());
-            println!("  Side         {:?}", position.side_to_move());
-            println!(
-                "  Applied      {}",
-                if cmd.moves.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    cmd.moves.join(" ")
-                }
-            );
-            println!(
-                "  Root moves   {}",
-                if cmd.root_moves.is_empty() {
-                    "all legal".to_string()
-                } else {
-                    cmd.root_moves.join(" ")
-                }
-            );
-            println!("\nCONFIGURATION");
-            println!("  Model        {model_path}");
-            println!("  Simulations  {simulations}");
-            println!(
-                "  PUCT         non-root={cpuct:.3} root={cpuct_at_root:.3} base={:.1}/{:.1} factor={:.3}/{:.3}",
-                search_limits.cpuct_base,
-                search_limits.cpuct_base_at_root,
-                search_limits.cpuct_factor,
-                search_limits.cpuct_factor_at_root
-            );
-            println!(
-                "  FPU reduce   non-root={:.3} root={:.3}",
-                search_limits.fpu_value, search_limits.fpu_value_at_root
-            );
-            println!("  Policy temp  {:.3}", search_limits.policy_softmax_temp);
-            println!("  Draw score   {:.3}", search_limits.draw_score);
-            println!("\nRESULT");
-            println!("  Best move    {best_move}");
-            println!(
-                "  Search value Q={:+.4}  CP={:+}  W/D/L={:.2}%/{:.2}%/{:.2}%",
-                result.value_q,
-                result.value_cp,
-                result.value_wdl[0] * 100.0,
-                result.value_wdl[1] * 100.0,
-                result.value_wdl[2] * 100.0
-            );
-            println!(
-                "  Network WDL  {:.2}%/{:.2}%/{:.2}%",
-                result.network_value_wdl[0] * 100.0,
-                result.network_value_wdl[1] * 100.0,
-                result.network_value_wdl[2] * 100.0
-            );
-            println!(
-                "  Root actions {} legal, {} visited",
-                result.candidates.len(),
-                visited_actions
-            );
-            println!(
-                "  Depth        avg={:.2} max={} limit={} cutoffs={}",
-                result.search_depth_avg,
-                result.search_depth_max,
-                result.search_depth_limit,
-                result.search_depth_cutoffs
-            );
-            println!(
-                "  Performance  {:.3} ms, {:.0} simulations/s",
-                search_elapsed.as_secs_f64() * 1000.0,
-                result.simulations as f64 / elapsed_seconds
-            );
-            print_az_search_candidates(&result, cmd.top);
-            if let Some(trace_move) = trace_move {
-                print_az_search_trace(trace_move, &trace);
-            }
-            let verify_sims = if cmd.verify_sims == 0 {
-                simulations
-            } else {
-                cmd.verify_sims
-            };
-            let mut verify_moves = by_visits
-                .iter()
-                .take(cmd.verify_top)
-                .map(|candidate| candidate.mv)
-                .collect::<Vec<_>>();
-            for text in &cmd.verify_moves {
-                let mv = position.parse_uci_move(text).unwrap_or_else(|| {
-                    panic!("invalid or illegal --verify-move `{text}` for this position")
-                });
-                if !verify_moves.contains(&mv) {
-                    verify_moves.push(mv);
-                }
-            }
-            if !verify_moves.is_empty() {
-                println!("\nCHILD VERIFICATION — {verify_sims} simulations each");
-                println!(
-                    "  MOVE     VISITS   ROOT Q     NN Q   DEEP Q       ΔQ      CP  OPPONENT REPLY"
-                );
-                println!(
-                    "  -------  -------  -------  -------  -------  -------  ------  --------------"
-                );
-            }
-            for mv in verify_moves {
-                let Some(root_candidate) = result.candidates.iter().find(|item| item.mv == mv)
-                else {
-                    println!("  {mv:<7}  unavailable at root");
-                    continue;
-                };
-                let mut child_rule_history = rule_history.clone();
-                child_rule_history.push(position.rule_history_entry_after_move(mv));
-                let mut child = position.clone();
-                child.make_move(mv);
-                let child_legal = child.legal_moves_with_rules(&child_rule_history);
-                let child_nn_q =
-                    model.evaluate_value_with_rules(&child, &child_rule_history, &child_legal);
-                let mut verify_limits = search_limits;
-                verify_limits.simulations = verify_sims.max(1);
-                verify_limits.seed = 0;
-                let verified = alphazero_search_with_rules(
-                    &child,
-                    Some(child_rule_history),
-                    Some(child_legal),
-                    &model,
-                    verify_limits,
-                );
-                let verified_root_q = -verified.value_q;
-                let verified_root_cp = -verified.value_cp;
-                println!(
-                    "  {:<7}  {:>7}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+7.3}  {:>+6}  {}",
-                    mv,
-                    root_candidate.visits,
-                    root_candidate.q,
-                    -child_nn_q,
-                    verified_root_q,
-                    verified_root_q - root_candidate.q,
-                    verified_root_cp,
-                    verified
-                        .best_move
-                        .map(|best| best.to_string())
-                        .unwrap_or_else(|| "(none)".into())
-                );
-            }
-        }
-        Some(CliCommand::AzBench(cmd)) => {
-            let model_path = cmd.model;
-            let simulations = cmd.simulations.max(1);
-            let repeat = cmd.repeat.max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let fen = cmd.fen.join(" ");
-            let position = parse_position(&fen);
-            let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
-                panic!("failed to load `{model_path}`: {err}");
-            });
-
-            let _ = alphazero_search(
-                &position,
-                &model,
-                fixed_az_search_limits(simulations, 0, cpuct, cpuct, 0, 1.4),
-            );
-
-            let started = std::time::Instant::now();
-            let mut total_sims = 0usize;
-            let mut best_move = None;
-            for iteration in 0..repeat {
-                let result = alphazero_search(
-                    &position,
-                    &model,
-                    fixed_az_search_limits(simulations, iteration as u64, cpuct, cpuct, 0, 1.4),
-                );
-                total_sims += result.simulations;
-                best_move = result.best_move;
-            }
-            let elapsed = started.elapsed();
-            let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
-            println!("bench        : fixed-search");
-            println!("model        : {model_path}");
-            println!("arch         : hidden={}", model.arch.hidden_size);
-            println!("fen          : {}", position.to_fen());
-            println!("sims/search  : {simulations}");
-            println!("repeat       : {repeat}");
-            println!("search       : alphazero");
-            println!("simd         : {}", chineseai::az::inference_simd_backend());
-            println!("cpuct        : {cpuct}");
-            println!("total_sims   : {total_sims}");
-            println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
-            println!(
-                "ms/search    : {:.3}",
-                elapsed.as_secs_f64() * 1000.0 / repeat as f64
-            );
-            println!("sims/sec     : {:.0}", total_sims as f64 / elapsed_secs);
-            println!(
-                "last_bestmove: {}",
-                best_move
-                    .map(|mv| mv.to_string())
-                    .unwrap_or_else(|| "(none)".into())
-            );
         }
         Some(CliCommand::AzTrainBench(cmd)) => {
             let model_path = cmd.model;
@@ -2167,7 +1573,7 @@ fn main() {
                 "train: config={} update={} sims={} batch={} optimizer=SGD+Nesterov lr={} max_plies={} book={} tensorboard={}",
                 config_path,
                 start_update,
-                config.simulations,
+                config.selfplay_nodes,
                 config.batch_size,
                 config.lr,
                 config.max_plies,
@@ -2823,21 +2229,11 @@ fn main() {
                                     candidate: Arc::clone(&candidate),
                                     baseline,
                                     eval_starts: ArenaStarts::Positions(Arc::new(positions)),
-                                    simulations: config.arena_simulations,
+                                    simulations: config.arena_nodes,
                                     max_plies: config.max_plies,
                                     rule60_max_ply: config
                                         .sixty_move_rule
                                         .then_some(config.rule60_max_ply),
-                                    cpuct: config.arena_cpuct,
-                                    cpuct_at_root: config.arena_cpuct_at_root,
-                                    cpuct_base: config.cpuct_base,
-                                    cpuct_factor: config.cpuct_factor,
-                                    cpuct_base_at_root: config.cpuct_base_at_root,
-                                    cpuct_factor_at_root: config.cpuct_factor_at_root,
-                                    fpu_value: 0.23,
-                                    fpu_value_at_root: 1.0,
-                                    draw_score: config.draw_score,
-                                    policy_softmax_temp: config.arena_policy_softmax_temp,
                                     thread_count: config.arena_processes,
                                     seed: config.seed
                                         ^ (update as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -3023,26 +2419,8 @@ fn main() {
                                 Arc::new(deployed_model.clone()),
                                 rows,
                                 AzSearchLimits {
-                                    simulations: config.pikafish_label_eval_simulations,
-                                    seed: config.seed
-                                        ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
-                                    cpuct: config.pikafish_label_eval_cpuct,
-                                    cpuct_at_root: config.pikafish_label_eval_cpuct_at_root,
-                                    cpuct_base: config.cpuct_base,
-                                    cpuct_factor: config.cpuct_factor,
-                                    cpuct_base_at_root: config.cpuct_base_at_root,
-                                    cpuct_factor_at_root: config.cpuct_factor_at_root,
-                                    max_depth: config.max_plies,
-                                    root_dirichlet_alpha: 0.0,
-                                    root_exploration_fraction: 0.0,
-                                    fpu_value: 0.23,
-                                    fpu_value_at_root: 1.0,
-                                    fpu_absolute_at_root: true,
-                                    minimum_kldgain_per_node: 0.0,
-                                    policy_softmax_temp: config
-                                        .pikafish_label_eval_policy_softmax_temp,
-                                    draw_score: config.draw_score,
-                                    value_scale: 1.0,
+                                    simulations: config.pikafish_label_eval_nodes,
+                                    max_depth: 0,
                                 },
                                 config.arena_processes,
                             )
@@ -3055,7 +2433,7 @@ fn main() {
                                     stats.count,
                                     stats.legal_bestmove,
                                     stats.value_count(),
-                                    config.pikafish_label_eval_simulations,
+                                    config.pikafish_label_eval_nodes,
                                     config.arena_processes,
                                     100.0 * stats.top1_rate(),
                                     100.0 * stats.top2_rate(),
@@ -3242,16 +2620,7 @@ fn main() {
         Some(CliCommand::VsPikafish(cmd)) => {
             let pikafish_exe = cmd.pikafish_exe;
             let model_path = cmd.model;
-            let simulations = cmd.simulations.unwrap_or(800).max(1);
-            let cpuct = cmd.cpuct.max(0.0);
-            let cpuct_at_root = cmd.cpuct_at_root.max(0.0);
-            let cpuct_base = cmd.cpuct_base.max(1.0);
-            let cpuct_factor = cmd.cpuct_factor.max(0.0);
-            let cpuct_base_at_root = cmd.cpuct_base_at_root.max(1.0);
-            let cpuct_factor_at_root = cmd.cpuct_factor_at_root.max(0.0);
-            let fpu_value = cmd.fpu_value.max(0.0);
-            let fpu_value_at_root = cmd.fpu_value_at_root.max(0.0);
-            let policy_softmax_temp = cmd.policy_softmax_temp.max(1.0e-3);
+            let simulations = cmd.simulations.unwrap_or(10_000).max(1);
             let max_plies = cmd.max_plies.max(1);
             let pikafish_depth = cmd.pikafish_depth.max(1);
             let games = cmd.games.max(1);
@@ -3281,17 +2650,7 @@ fn main() {
                     total_games: games,
                     max_plies,
                     simulations,
-                    seed: cmd.seed,
                     parallel_games,
-                    cpuct,
-                    cpuct_at_root,
-                    cpuct_base,
-                    cpuct_factor,
-                    cpuct_base_at_root,
-                    cpuct_factor_at_root,
-                    fpu_value,
-                    fpu_value_at_root,
-                    policy_softmax_temp,
                     report_games: cmd.report_games,
                 },
             )
@@ -3311,7 +2670,7 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphazero games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} sims={} cpuct={}/{} base={}/{} factor={}/{} fpu={}/{} policy_temp={}",
+                "vs-pikafish: model={} search=alphabeta games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} nodes={}",
                 model_path,
                 summary.total_games,
                 start_positions.len(),
@@ -3331,15 +2690,6 @@ fn main() {
                 pikafish_depth,
                 max_plies,
                 simulations,
-                cpuct,
-                cpuct_at_root,
-                cpuct_base,
-                cpuct_base_at_root,
-                cpuct_factor,
-                cpuct_factor_at_root,
-                fpu_value,
-                fpu_value_at_root,
-                policy_softmax_temp
             );
         }
         Some(CliCommand::PikafishLabelRandom(cmd)) => {
@@ -3509,16 +2859,6 @@ fn run_checkpoint_cycles(cmd: CheckpointCyclesArgs) -> io::Result<()> {
                 simulations: cmd.simulations.max(1),
                 max_plies: cmd.max_plies.max(1),
                 rule60_max_ply: Some(120),
-                cpuct: 0.9,
-                cpuct_at_root: 2.0,
-                cpuct_base: 38739.0,
-                cpuct_factor: 3.894,
-                cpuct_base_at_root: 38739.0,
-                cpuct_factor_at_root: 3.894,
-                fpu_value: 0.23,
-                fpu_value_at_root: 1.0,
-                draw_score: 0.0,
-                policy_softmax_temp: 1.4,
                 thread_count: cmd.threads.max(1),
                 seed: cmd.seed ^ ((newer as u64) << 32) ^ older as u64,
             });
@@ -3884,7 +3224,10 @@ fn run_replay_coverage(cmd: AzReplayCoverageArgs) -> io::Result<()> {
         }
     }
 
-    let limits = fixed_az_search_limits(cmd.simulations.max(1), cmd.seed, 0.9, 2.0, 0, 1.4);
+    let limits = AzSearchLimits {
+        simulations: cmd.simulations.max(1),
+        max_depth: 0,
+    };
     let names = ["unseen", "seen-1-2", "seen-3-9", "seen-10+"];
     let path = Path::new(&cmd.output);
     if let Some(parent) = path
@@ -4011,24 +3354,15 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         Arc::new(model),
         rows,
         AzSearchLimits {
-            fpu_value: cmd.fpu_value.max(0.0),
-            fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
-            fpu_absolute_at_root: true,
-            ..fixed_az_search_limits(
-                cmd.simulations.max(1),
-                cmd.seed,
-                cmd.cpuct.max(0.0),
-                cmd.cpuct_at_root.max(0.0),
-                cmd.max_depth,
-                cmd.policy_softmax_temp,
-            )
+            simulations: cmd.simulations.max(1),
+            max_depth: cmd.max_depth,
         },
         cmd.threads,
     )?;
 
     let elapsed = started.elapsed().as_secs_f32();
     println!(
-        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} sims={} threads={} cpuct={}/{} fpu={}/{} policy_temp={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_cal={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_cal={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
+        "pikafish-label-eval: model={} sqlite={} evaluated={} legal_labels={} value_labels={} nodes={} threads={} search_top1={:.3}% search_top2={:.3}% search_top4={:.3}% search_top8={:.3}% raw_prior_top1={:.3}% raw_value_corr={:.4} raw_value_cal={:.4} raw_value_mae_wdl_q={:.4} search_value_corr={:.4} search_value_cal={:.4} search_value_mae_wdl_q={:.4} elapsed={:.1}s",
         cmd.model,
         cmd.sqlite,
         stats.count,
@@ -4036,11 +3370,6 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
         stats.value_count(),
         cmd.simulations.max(1),
         cmd.threads.max(1),
-        cmd.cpuct,
-        cmd.cpuct_at_root,
-        cmd.fpu_value,
-        cmd.fpu_value_at_root,
-        cmd.policy_softmax_temp,
         100.0 * stats.top1_rate(),
         100.0 * stats.top2_rate(),
         100.0 * stats.top4_rate(),
@@ -4117,13 +3446,12 @@ fn evaluate_pikafish_labels(
         stats.legal_bestmove += 1;
         let raw_value = model.evaluate_value_with_rules(&position, &rule_history, &legal_moves);
         stats.push_raw_value_pair(raw_value, row.best_wdl);
-        let result = alphazero_search(
+        let result = alphabeta_search(
             &position,
+            &rule_history,
+            legal_moves,
             model,
-            AzSearchLimits {
-                seed: search_limits.seed ^ row.id as u64,
-                ..search_limits
-            },
+            search_limits.simulations,
         );
         stats.count += 1;
         if result.best_move == Some(label_move) {
@@ -4967,22 +4295,6 @@ mod reporting_tests {
         assert_eq!(loaded.generated_samples, 678_901);
     }
 
-    #[test]
-    fn az_search_defaults_match_px0_match_settings() {
-        let cli =
-            Cli::try_parse_from(["chineseai", "az-search", "model.safetensors", "3200"]).unwrap();
-        let Some(CliCommand::AzSearch(args)) = cli.command else {
-            panic!("expected az-search command");
-        };
-        assert_eq!(args.cpuct, 1.0);
-        assert_eq!(args.cpuct_at_root, 1.9);
-        assert_eq!(args.cpuct_factor, 3.894);
-        assert_eq!(args.cpuct_factor_at_root, 3.894);
-        assert_eq!(args.fpu_value, 0.23);
-        assert_eq!(args.fpu_value_at_root, 1.0);
-        assert_eq!(args.policy_softmax_temp, 1.4);
-    }
-
     fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         AzTrainingSample {
             repetition_flags: Vec::new(),
@@ -5295,15 +4607,5 @@ fn random_position_fen(target_plies: usize, rng: &mut SplitMix64) -> Option<Stri
         Some(RuleOutcome::Draw(_) | RuleOutcome::Win(_)) => None,
         None if position.legal_moves_with_rules(&rule_history).is_empty() => None,
         None => Some(position.to_fen()),
-    }
-}
-
-fn parse_position(text: &str) -> Position {
-    if text.trim().is_empty() || text == "startpos" {
-        Position::startpos()
-    } else {
-        Position::from_fen(text).unwrap_or_else(|err| {
-            panic!("invalid FEN `{text}`: {err}");
-        })
     }
 }

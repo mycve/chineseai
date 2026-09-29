@@ -1,5 +1,81 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
-use super::{AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult, cp_from_q};
+use super::AzNnue;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Instant;
+
+#[derive(Clone, Copy, Debug)]
+pub struct AzSearchLimits {
+    pub simulations: usize,
+    pub max_depth: usize,
+}
+impl Default for AzSearchLimits {
+    fn default() -> Self {
+        Self {
+            simulations: 10_000,
+            max_depth: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AzCandidate {
+    pub mv: Move,
+    pub visits: u32,
+    pub q: f32,
+    pub raw_prior: f32,
+    pub prior: f32,
+    pub policy: f32,
+    pub solved: Option<i8>,
+}
+impl AzCandidate {
+    pub(crate) fn proof_priority(&self) -> u8 {
+        match self.solved {
+            Some(1) => 2,
+            Some(-1) => 0,
+            _ => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AzSearchResult {
+    pub best_move: Option<Move>,
+    pub value_q: f32,
+    pub value_cp: i32,
+    pub value_wdl: [f32; 3],
+    pub network_value_wdl: [f32; 3],
+    pub best_value_wdl: [f32; 3],
+    pub simulations: usize,
+    pub search_depth_avg: f32,
+    pub search_depth_max: usize,
+    pub search_depth_limit: usize,
+    pub search_depth_cutoffs: usize,
+    pub candidates: Vec<AzCandidate>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AzSearchControl {
+    stop: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+impl AzSearchControl {
+    pub fn new(stop: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
+        Self { stop, deadline }
+    }
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+pub fn cp_from_q(q: f32) -> i32 {
+    (q.clamp(-1.0, 1.0) * 1000.0).round() as i32
+}
 
 pub(crate) struct AzUciPv {
     pub moves: Vec<Move>,
@@ -168,7 +244,7 @@ fn outcome_value(outcome: RuleOutcome, side: Color) -> f32 {
     }
 }
 
-pub(super) fn search(
+pub fn search(
     position: &Position,
     history: &[RuleHistoryEntry],
     moves: Vec<Move>,
