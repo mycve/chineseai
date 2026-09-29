@@ -112,7 +112,7 @@ struct Search<'a> {
     limit: usize,
     exhausted: bool,
     quiescence_nodes: usize,
-    history_scores: [[u32; 90]; 90],
+    history_scores: [[i32; 90]; 90],
     killers: Vec<[Option<Move>; 2]>,
     tt: Vec<Option<TtEntry>>,
     hidden_pool: Vec<Vec<f32>>,
@@ -276,6 +276,8 @@ impl Search<'_> {
         let mut best = -2.0f32;
         let mut best_move = None;
         let mut first = true;
+        let mut searched_quiets = [None; 32];
+        let mut quiet_count = 0;
         for (index, mv) in moves.into_iter().enumerate() {
             let before_buckets = AbEvalAccumulator::buckets_for_position(position);
             let mover = position.side_to_move();
@@ -295,12 +297,13 @@ impl Search<'_> {
                 &mut child_hidden,
             );
             history.push(position.rule_history_entry_after_moved(mover, mv, captured));
-            let reduction = usize::from(
-                depth >= 3
-                    && index >= 4
-                    && !checked
-                    && captured.is_none()
-                    && !position.in_check(position.side_to_move()),
+            let gives_check = position.in_check(position.side_to_move());
+            let quiet = captured.is_none();
+            let reduction = quiet_reduction(
+                depth,
+                index,
+                self.history_scores[mv.from as usize][mv.to as usize],
+                checked || gives_check || !quiet,
             );
             let mut score = if first {
                 -self.negamax(
@@ -357,9 +360,12 @@ impl Search<'_> {
             }
             alpha = alpha.max(best);
             if alpha >= beta {
-                if captured.is_none() {
-                    let history = &mut self.history_scores[mv.from as usize][mv.to as usize];
-                    *history = history.saturating_add((depth * depth) as u32);
+                if quiet {
+                    let bonus = (depth * depth).min(1024) as i32;
+                    for &failed in searched_quiets[..quiet_count].iter().flatten() {
+                        update_history(&mut self.history_scores, failed, -bonus);
+                    }
+                    update_history(&mut self.history_scores, mv, bonus);
                     let killer_slot = ply.min(self.killers.len() - 1);
                     let killers = &mut self.killers[killer_slot];
                     if killers[0] != Some(mv) {
@@ -368,6 +374,10 @@ impl Search<'_> {
                     }
                 }
                 break;
+            }
+            if quiet && quiet_count < searched_quiets.len() {
+                searched_quiets[quiet_count] = Some(mv);
+                quiet_count += 1;
             }
             first = false;
         }
@@ -416,6 +426,21 @@ impl Search<'_> {
         }
         self.history_scores[mv.from as usize][mv.to as usize] as i64
     }
+}
+
+const HISTORY_LIMIT: i32 = 16_384;
+
+fn update_history(history: &mut [[i32; 90]; 90], mv: Move, bonus: i32) {
+    let entry = &mut history[mv.from as usize][mv.to as usize];
+    *entry += bonus - *entry * bonus.abs() / HISTORY_LIMIT;
+}
+
+fn quiet_reduction(depth: usize, move_index: usize, history: i32, tactical: bool) -> usize {
+    if tactical || depth < 3 || move_index < 4 {
+        return 0;
+    }
+    let extra = usize::from(depth >= 7 && move_index >= 12 && history < 0);
+    (1 + extra).min(depth - 2)
 }
 
 fn piece_value(kind: PieceKind) -> i64 {
@@ -796,6 +821,30 @@ pub(crate) fn search_uci(
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn history_bonus_and_malus_stay_bounded() {
+        let mv = Position::startpos().legal_moves()[0];
+        let mut history = [[0; 90]; 90];
+        for _ in 0..1_000 {
+            update_history(&mut history, mv, 1024);
+        }
+        let positive = history[mv.from as usize][mv.to as usize];
+        assert!(positive > 0 && positive <= HISTORY_LIMIT);
+        for _ in 0..2_000 {
+            update_history(&mut history, mv, -1024);
+        }
+        let negative = history[mv.from as usize][mv.to as usize];
+        assert!(negative < 0 && negative >= -HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn late_quiet_reduction_respects_tactics_and_history() {
+        assert_eq!(quiet_reduction(7, 20, -100, true), 0);
+        assert_eq!(quiet_reduction(2, 20, -100, false), 0);
+        assert_eq!(quiet_reduction(7, 20, 100, false), 1);
+        assert_eq!(quiet_reduction(7, 20, -100, false), 2);
+    }
 
     #[test]
     fn bounded_search_returns_legal_move_and_selection_weights() {

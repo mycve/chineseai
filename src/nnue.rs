@@ -19,8 +19,8 @@ pub fn extract_sparse_features_ab(position: &Position) -> Vec<usize> {
 ///
 /// 推理只对特征行求和，不依赖特征顺序，因此热路径不做排序，也不产生堆分配。
 /// 需要稳定顺序（例如序列化或测试）时使用 `extract_sparse_features_ab`。
-/// ?? `perspective` ??????????????? [0,6]???? [7,13]?
-/// ????????????????????????????
+/// 将棋子映射到当前视角的 14 个通道：[0, 6] 是己方，[7, 13] 是对方。
+/// 这里只转换颜色和棋种，坐标由 `canonical_square` 单独转换。
 #[inline]
 pub fn piece_absolute_feature_index(perspective: Color, piece: Piece) -> usize {
     let base = if piece.color == perspective { 0 } else { 7 };

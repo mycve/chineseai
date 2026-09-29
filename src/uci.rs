@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 const MAX_UCI_NODES: usize = u32::MAX as usize - 1;
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_NODES: usize = 10_000;
+const MAX_SEARCH_NODES_OPTION: usize = 100_000_000;
+const DEFAULT_MOVE_OVERHEAD_MS: u64 = 10;
 
 #[derive(Clone)]
 struct UciState {
@@ -24,6 +26,8 @@ struct UciState {
     sixty_move_rule: bool,
     rule60_max_ply: u16,
     multipv: usize,
+    show_wdl: bool,
+    move_overhead_ms: u64,
 }
 
 impl Default for UciState {
@@ -37,6 +41,8 @@ impl Default for UciState {
             sixty_move_rule: true,
             rule60_max_ply: 120,
             multipv: 1,
+            show_wdl: false,
+            move_overhead_ms: DEFAULT_MOVE_OVERHEAD_MS,
         }
     }
 }
@@ -119,6 +125,10 @@ fn print_uci_id() {
     println!("option name EvalFile type string default best.safetensors");
     println!("option name SearchNodes type spin default {DEFAULT_NODES} min 1 max 100000000");
     println!("option name MultiPV type spin default 1 min 1 max 64");
+    println!(
+        "option name Move Overhead type spin default {DEFAULT_MOVE_OVERHEAD_MS} min 0 max 5000"
+    );
+    println!("option name UCI_ShowWDL type check default false");
     println!("option name Sixty Move Rule type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
     println!("uciok");
@@ -144,10 +154,15 @@ fn ensure_model(state: &mut UciState) -> bool {
 
 fn handle_setoption(line: &str, state: &mut UciState) {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
-    let Some(name_index) = tokens.iter().position(|token| *token == "name") else {
+    let Some(name_index) = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("name"))
+    else {
         return;
     };
-    let value_index = tokens.iter().position(|token| *token == "value");
+    let value_index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("value"));
     let name_end = value_index.unwrap_or(tokens.len());
     let name = tokens[name_index + 1..name_end]
         .join(" ")
@@ -167,11 +182,25 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.model = None;
         }
         "searchnodes" => {
-            state.nodes = value.parse::<usize>().unwrap_or(state.nodes).max(1);
+            if let Ok(nodes) = value.parse::<usize>() {
+                state.nodes = nodes.clamp(1, MAX_SEARCH_NODES_OPTION);
+            }
+        }
+        "move overhead" => {
+            if let Ok(milliseconds) = value.parse::<u64>() {
+                state.move_overhead_ms = milliseconds.min(5_000);
+            }
+        }
+        "uci_showwdl" => {
+            if let Some(enabled) = parse_uci_bool(&value) {
+                state.show_wdl = enabled;
+            }
         }
         "sixty move rule" => {
-            state.sixty_move_rule = value.eq_ignore_ascii_case("true");
-            apply_rule_options(state);
+            if let Some(enabled) = parse_uci_bool(&value) {
+                state.sixty_move_rule = enabled;
+                apply_rule_options(state);
+            }
         }
         "rule60maxply" => {
             state.rule60_max_ply = value
@@ -181,6 +210,16 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             apply_rule_options(state);
         }
         _ => {}
+    }
+}
+
+fn parse_uci_bool(value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -321,9 +360,13 @@ fn is_go_keyword(token: &str) -> bool {
     )
 }
 
-fn time_budget_ms(params: &GoParams, side: Color) -> Option<u64> {
+fn time_budget_ms(params: &GoParams, side: Color, overhead_ms: u64) -> Option<u64> {
     if let Some(move_time_ms) = params.move_time_ms {
-        return Some(move_time_ms.clamp(1, MAX_UCI_TIME_MS));
+        return Some(
+            move_time_ms
+                .saturating_sub(overhead_ms)
+                .clamp(1, MAX_UCI_TIME_MS),
+        );
     }
     if params.infinite {
         return None;
@@ -332,7 +375,7 @@ fn time_budget_ms(params: &GoParams, side: Color) -> Option<u64> {
         Color::Red => (params.wtime_ms?, params.winc_ms),
         Color::Black => (params.btime_ms?, params.binc_ms),
     };
-    let usable_ms = remaining_ms.max(1);
+    let usable_ms = remaining_ms.saturating_sub(overhead_ms).max(1);
     let moves = params.moves_to_go.unwrap_or(24).max(1);
     let target_ms = usable_ms / moves + increment_ms.saturating_mul(3) / 4;
     let maximum_ms = (usable_ms / 5).max(1);
@@ -379,7 +422,11 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         return;
     }
 
-    let budget_ms = time_budget_ms(&params, state.position.side_to_move());
+    let budget_ms = time_budget_ms(
+        &params,
+        state.position.side_to_move(),
+        state.move_overhead_ms,
+    );
     let has_time_control = budget_ms.is_some() || params.infinite;
     let nodes = uci_node_limit(&params, state.nodes, has_time_control);
     let started = Instant::now();
@@ -395,7 +442,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                 last_score_source = Some(proven);
             }
         }
-        print_search_info(progress, started);
+        print_search_info(progress, started, state.show_wdl);
         flush();
     };
     let report = search_uci(
@@ -424,7 +471,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
     match result.best_move {
         Some(mv) => {
-            print_search_info(&report, started);
+            print_search_info(&report, started, state.show_wdl);
             println!("bestmove {mv}");
         }
         None => {
@@ -471,7 +518,7 @@ fn print_high_score_source(report: &AbUciSearchResult, proven: bool) {
     );
 }
 
-fn print_search_info(report: &AbUciSearchResult, started: Instant) {
+fn print_search_info(report: &AbUciSearchResult, started: Instant, show_wdl: bool) {
     let result = &report.search;
     let elapsed_ms = started.elapsed().as_millis();
     let nps = result.nodes as u128 * 1000 / elapsed_ms.max(1);
@@ -483,8 +530,13 @@ fn print_search_info(report: &AbUciSearchResult, started: Instant) {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(" ");
+        let wdl_text = if show_wdl {
+            format!(" wdl {} {} {}", wdl[0], wdl[1], wdl[2])
+        } else {
+            String::new()
+        };
         println!(
-            "info depth {} seldepth {} multipv {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
+            "info depth {} seldepth {} multipv {} nodes {} nps {} time {} score cp {}{} pv {}",
             result.search_depth_avg.round() as usize,
             result.search_depth_max,
             index + 1,
@@ -492,9 +544,7 @@ fn print_search_info(report: &AbUciSearchResult, started: Instant) {
             nps,
             elapsed_ms,
             cp_from_q(pv.q),
-            wdl[0],
-            wdl[1],
-            wdl[2],
+            wdl_text,
             moves,
         );
     }
@@ -557,14 +607,15 @@ mod tests {
     #[test]
     fn movetime_uses_exact_budget_and_clock_budget_is_bounded() {
         let move_time = parse_go("go movetime 1000");
-        assert_eq!(time_budget_ms(&move_time, Color::Red), Some(1_000));
+        assert_eq!(time_budget_ms(&move_time, Color::Red, 0), Some(1_000));
+        assert_eq!(time_budget_ms(&move_time, Color::Red, 10), Some(990));
 
         let clock = parse_go("go wtime 60000 btime 30000 winc 1000 binc 0 movestogo 20");
-        assert_eq!(time_budget_ms(&clock, Color::Red), Some(3_750));
-        assert_eq!(time_budget_ms(&clock, Color::Black), Some(1_500));
+        assert_eq!(time_budget_ms(&clock, Color::Red, 0), Some(3_750));
+        assert_eq!(time_budget_ms(&clock, Color::Black, 0), Some(1_500));
 
         let infinite = parse_go("go infinite");
-        assert_eq!(time_budget_ms(&infinite, Color::Red), None);
+        assert_eq!(time_budget_ms(&infinite, Color::Red, 10), None);
     }
 
     #[test]
@@ -584,6 +635,23 @@ mod tests {
         let mut state = UciState::default();
         handle_setoption("setoption name SearchNodes value 4096", &mut state);
         assert_eq!(state.nodes, 4096);
+        handle_setoption("setoption name SearchNodes value 999999999", &mut state);
+        assert_eq!(state.nodes, MAX_SEARCH_NODES_OPTION);
+    }
+
+    #[test]
+    fn pikafish_style_uci_options_are_parsed_and_validated() {
+        let mut state = UciState::default();
+        assert!(!state.show_wdl);
+        assert_eq!(state.move_overhead_ms, 10);
+        handle_setoption("setoption name UCI_ShowWDL value true", &mut state);
+        handle_setoption("setoption name Move Overhead value 23", &mut state);
+        assert!(state.show_wdl);
+        assert_eq!(state.move_overhead_ms, 23);
+        handle_setoption("setoption NAME UCI_ShowWDL VALUE invalid", &mut state);
+        assert!(state.show_wdl);
+        handle_setoption("setoption name UCI_ShowWDL value false", &mut state);
+        assert!(!state.show_wdl);
     }
 
     #[test]

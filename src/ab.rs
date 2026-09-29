@@ -1885,4 +1885,44 @@ mod tests {
         let full = model.evaluate_value_with_rules(&position, &history);
         assert!((incremental - full).abs() < 1.0e-6);
     }
+
+    #[test]
+    fn incremental_accumulator_tracks_legal_game() {
+        let model = AbNnue::random(64, 17);
+        let mut position = Position::startpos();
+        let mut hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let mut scratch = AbEvalScratch::new(model.arch);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for _ in 0..80 {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mv = moves[seed as usize % moves.len()];
+            let moved = position.piece_at(mv.from as usize).unwrap();
+            let captured = position.piece_at(mv.to as usize);
+            let buckets = AbEvalAccumulator::buckets_for_position(&position);
+            position.make_move(mv);
+            AbEvalAccumulator::apply_transition_from_buckets(
+                &model,
+                buckets,
+                &position,
+                mv,
+                moved,
+                captured,
+                &mut hidden,
+            );
+            let refreshed = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
+            for (&incremental, &full) in hidden.iter().zip(&refreshed) {
+                assert!((incremental - full).abs() < 1.0e-4);
+            }
+            let incremental =
+                model.evaluate_incremental_value_with_rules(&position, &[], &hidden, &mut scratch);
+            let full = model.evaluate_value_with_rules(&position, &[]);
+            assert!((incremental - full).abs() < 1.0e-5);
+        }
+    }
 }
