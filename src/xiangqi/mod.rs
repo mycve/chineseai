@@ -25,6 +25,12 @@ use geom::{
 use hash::{SIDE_TO_MOVE_KEY, color_hash_index, zobrist_piece_key};
 use types::{CheckerInfo, MoveGenMode, PositionState};
 
+#[derive(Clone, Copy, Debug)]
+pub struct NullUndo {
+    side_to_move: Color,
+    hash: u64,
+}
+
 impl Default for Position {
     fn default() -> Self {
         Self::startpos()
@@ -354,6 +360,22 @@ impl Position {
             self.halfmove_clock.saturating_add(1)
         };
         undo
+    }
+
+    /// 搜索用空着：不移动棋子，也不推进真实规则计数或历史。
+    pub fn make_null_move(&mut self) -> NullUndo {
+        let undo = NullUndo {
+            side_to_move: self.side_to_move,
+            hash: self.hash,
+        };
+        self.side_to_move = self.side_to_move.opposite();
+        self.hash ^= SIDE_TO_MOVE_KEY;
+        undo
+    }
+
+    pub fn unmake_null_move(&mut self, undo: NullUndo) {
+        self.side_to_move = undo.side_to_move;
+        self.hash = undo.hash;
     }
 
     pub fn unmake_move(&mut self, mv: Move, undo: Undo) {

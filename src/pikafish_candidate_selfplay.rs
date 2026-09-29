@@ -61,7 +61,7 @@ pub fn generate(
     let mut writer = BufWriter::new(File::create(output)?);
     writeln!(
         writer,
-        "game\tply\tfen\tbestmove\tscore_cp\tred_result\ttermination"
+        "game\tply\tfen\tbestmove\tscore_cp\tred_result\ttermination\tsource"
     )?;
     let mut report = CandidateSelfplayReport::default();
     let mut random = config.seed;
@@ -130,7 +130,7 @@ pub fn generate(
         for (ply, fen, bestmove, score_cp) in &samples {
             writeln!(
                 writer,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\tcandidate",
                 game + 1,
                 ply,
                 fen,

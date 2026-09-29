@@ -137,6 +137,132 @@ pub struct PikafishNet {
     stacks: Vec<Stack>,
 }
 
+/// 搜索中复用的量化特征累加器。按上一评估局面与新局面的活跃特征集合做差，
+/// 因而 make/unmake 后仍可直接评估任意祖先或兄弟节点。
+#[derive(Debug)]
+pub struct PikafishEvalCache {
+    psq: [Vec<usize>; 2],
+    threats: [Vec<usize>; 2],
+    psq_next: [Vec<usize>; 2],
+    threats_next: [Vec<usize>; 2],
+    accumulators: [Vec<i16>; 2],
+    initialized: bool,
+}
+
+impl Default for PikafishEvalCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PikafishEvalCache {
+    pub fn new() -> Self {
+        Self {
+            psq: [Vec::new(), Vec::new()],
+            threats: [Vec::new(), Vec::new()],
+            psq_next: [Vec::new(), Vec::new()],
+            threats_next: [Vec::new(), Vec::new()],
+            accumulators: [vec![0; WIDTH], vec![0; WIDTH]],
+            initialized: false,
+        }
+    }
+
+    pub fn evaluate_split(
+        &mut self,
+        net: &PikafishNet,
+        position: &Position,
+    ) -> Result<(i32, i32), String> {
+        let side = position.side_to_move();
+        let bucket = pikafish::layer_stack_bucket(position);
+        let mut transformed = [0_u8; WIDTH];
+        let mut psqt = [0_i32; 2];
+        let (red_threats, black_threats) = self.threats_next.split_at_mut(1);
+        super::full_threats::fill_threat_features_both(
+            position,
+            &mut red_threats[0],
+            &mut black_threats[0],
+        )
+        .ok_or("invalid FullThreats position")?;
+        // 缓存槽位固定为红、黑视角；输出顺序仍由行棋方决定。
+        for (output_idx, perspective) in [side, side.opposite()].into_iter().enumerate() {
+            let slot = if perspective == Color::Red { 0 } else { 1 };
+            let psq = &mut self.psq_next[slot];
+            let threats = &mut self.threats_next[slot];
+            psq.clear();
+            pikafish::fill_psq_features(position, perspective, psq)
+                .ok_or("invalid HalfKAv2_hm position")?;
+            psq.sort_unstable();
+            threats.sort_unstable();
+            let acc = &mut self.accumulators[slot];
+            if !self.initialized {
+                acc.copy_from_slice(&net.ft_bias);
+            }
+            update_features(acc, &mut self.psq[slot], psq, &net.psq_weights);
+            update_features(acc, &mut self.threats[slot], threats, &net.threat_weights);
+            for &index in &self.psq[slot] {
+                psqt[output_idx] += net.psq_psqt[index * BUCKETS + bucket];
+            }
+            for &index in &self.threats[slot] {
+                psqt[output_idx] += net.threat_psqt[index * BUCKETS + bucket];
+            }
+            for i in 0..WIDTH / 2 {
+                let a = acc[i].clamp(0, 255) as u32;
+                let b = acc[i + WIDTH / 2].clamp(0, 255) as u32;
+                transformed[output_idx * WIDTH / 2 + i] = (a * b / 512) as u8;
+            }
+        }
+        self.initialized = true;
+        Ok(net.forward_transformed(&transformed, bucket, psqt))
+    }
+
+    pub fn evaluate_scaled(
+        &mut self,
+        net: &PikafishNet,
+        position: &Position,
+        rule60_count: u16,
+    ) -> Result<i32, String> {
+        let (psqt, positional) = self.evaluate_split(net, position)?;
+        Ok(scale_evaluation_latest(
+            psqt + positional,
+            0,
+            position,
+            rule60_count,
+        ))
+    }
+}
+
+fn update_features(acc: &mut [i16], old: &mut Vec<usize>, new: &mut Vec<usize>, weights: &[u8]) {
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        if old[i] < new[j] {
+            subtract_feature(acc, weights, old[i]);
+            i += 1;
+        } else if old[i] > new[j] {
+            add_feature(acc, weights, new[j]);
+            j += 1;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+    for &index in &old[i..] {
+        subtract_feature(acc, weights, index);
+    }
+    for &index in &new[j..] {
+        add_feature(acc, weights, index);
+    }
+    std::mem::swap(old, new);
+}
+
+fn subtract_feature(acc: &mut [i16], weights: &[u8], index: usize) {
+    for (value, weight) in acc
+        .iter_mut()
+        .zip(&weights[index * WIDTH..(index + 1) * WIDTH])
+    {
+        *value = value.wrapping_sub((*weight as i8) as i16);
+    }
+}
+
 impl PikafishNet {
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -215,8 +341,17 @@ impl PikafishNet {
                 transformed[perspective_idx * WIDTH / 2 + i] = (a * b / 512) as u8;
             }
         }
+        Ok(self.forward_transformed(&transformed, bucket, psqt))
+    }
+
+    fn forward_transformed(
+        &self,
+        transformed: &[u8; WIDTH],
+        bucket: usize,
+        psqt: [i32; 2],
+    ) -> (i32, i32) {
         let stack = &self.stacks[bucket];
-        let fc0 = affine(&transformed, &stack.b0, &stack.w0, 32);
+        let fc0 = affine(transformed, &stack.b0, &stack.w0, 32);
         let mut ac0 = [0_u8; 64];
         activation_pair(&fc0, &mut ac0, 7);
         let fc1 = affine(&ac0, &stack.b1, &stack.w1, 32);
@@ -228,7 +363,7 @@ impl PikafishNet {
         let positional =
             affine(&ac2, &[stack.b2], &stack.w2, 1)[0].wrapping_add(fc0[30].wrapping_sub(fc0[31]));
         let positional = (positional as i64 * (600 * 16) / (128 * 64 * 2)) as i32;
-        Ok((((psqt[0] - psqt[1]) / 2) / 16, positional / 16))
+        (((psqt[0] - psqt[1]) / 2) / 16, positional / 16)
     }
 
     /// 当前官方源码的静态评估，返回行棋方内部 Value。
@@ -460,5 +595,102 @@ mod tests {
         assert_eq!(net.evaluate(&position).unwrap(), 97);
         assert_eq!(net.evaluate_scaled(&position, 0).unwrap(), 114);
         assert_eq!(net.evaluate_scaled(&position, 60).unwrap(), 86);
+    }
+
+    #[test]
+    fn incremental_matches_full_across_legal_make_unmake() {
+        let path = Path::new("tools/pikafish.nnue");
+        if !path.exists() {
+            return;
+        }
+        let net = PikafishNet::load(path).unwrap();
+        let mut cache = PikafishEvalCache::new();
+        let mut position = Position::startpos();
+        let mut history = Vec::new();
+        let mut state = 0x9e37_79b9_u64;
+        for _ in 0..80 {
+            assert_eq!(
+                cache.evaluate_split(&net, &position).unwrap(),
+                net.evaluate_split(&position).unwrap()
+            );
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mv = moves[(state as usize) % moves.len()];
+            let undo = position.make_move(mv);
+            history.push((mv, undo));
+        }
+        while let Some((mv, undo)) = history.pop() {
+            position.unmake_move(mv, undo);
+            assert_eq!(
+                cache.evaluate_split(&net, &position).unwrap(),
+                net.evaluate_split(&position).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NNUE phase timing"]
+    fn profile_quantized_evaluation_phases() {
+        let path = Path::new("tools/pikafish.nnue");
+        if !path.exists() {
+            return;
+        }
+        let net = PikafishNet::load(path).unwrap();
+        let mut position = Position::startpos();
+        let mut positions = Vec::new();
+        for ply in 0..80 {
+            positions.push(position.clone());
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            position.make_move(legal[(ply * 37 + 11) % legal.len()]);
+        }
+        let mut red = Vec::new();
+        let mut black = Vec::new();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            for position in &positions {
+                super::super::full_threats::fill_threat_features_both(
+                    position, &mut red, &mut black,
+                )
+                .unwrap();
+                std::hint::black_box((&red, &black));
+            }
+        }
+        let threats = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            for position in &positions {
+                pikafish::fill_psq_features(position, Color::Red, &mut red).unwrap();
+                pikafish::fill_psq_features(position, Color::Black, &mut black).unwrap();
+                std::hint::black_box((&red, &black));
+            }
+        }
+        let psq = start.elapsed();
+        let mut cache = PikafishEvalCache::new();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            for position in &positions {
+                std::hint::black_box(cache.evaluate_split(&net, position).unwrap());
+            }
+        }
+        let cached = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            for position in &positions {
+                std::hint::black_box(net.evaluate_split(position).unwrap());
+            }
+        }
+        let full = start.elapsed();
+        eprintln!(
+            "NNUE 20x{} positions: threat={threats:?} psq={psq:?} cached={cached:?} full={full:?}",
+            positions.len()
+        );
     }
 }

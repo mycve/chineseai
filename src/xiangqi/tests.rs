@@ -18,6 +18,31 @@ fn full_fen_preserves_rule60_clock() {
 }
 
 #[test]
+fn null_move_flips_only_side_and_hash_then_restores_position() {
+    for fen in [
+        STARTPOS_FEN,
+        "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b - - 57 1",
+        // 空着是局面操作，是否允许剪枝由搜索层判定。
+        "4k4/3R1R3/9/9/9/9/9/9/9/3K5 b - - 120 1",
+        "3RkR3/9/2N6/9/9/9/9/9/9/3K5 b - - 120 1",
+    ] {
+        let mut position = Position::from_fen(fen).unwrap();
+        let original = position.clone();
+        let undo = position.make_null_move();
+        assert_eq!(position.side_to_move(), original.side_to_move().opposite());
+        assert_eq!(
+            position.hash(),
+            original.hash() ^ super::hash::SIDE_TO_MOVE_KEY
+        );
+        assert_eq!(position.hash(), position.compute_hash());
+        assert_eq!(position.halfmove_clock(), original.halfmove_clock());
+        position.unmake_null_move(undo);
+        assert_eq!(position, original);
+        assert_eq!(position.to_fen(), original.to_fen());
+    }
+}
+
+#[test]
 fn soldier_move_does_not_reset_rule60_clock() {
     let mut position = Position::from_fen(
         "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 57 1",

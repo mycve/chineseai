@@ -221,14 +221,11 @@ pub fn fill_threat_features(
     let (_, mirror) = super::pikafish::feature_bucket(position, perspective)?;
     output.clear();
     output.reserve(64);
-    for from in 0..BOARD_SIZE {
-        let Some(attacker) = position.piece_at(from) else {
-            continue;
-        };
-        for to in 0..BOARD_SIZE {
-            let Some(attacked) = position.piece_at(to) else {
-                continue;
-            };
+    let occupied = (0..BOARD_SIZE)
+        .filter_map(|square| position.piece_at(square).map(|piece| (square, piece)))
+        .collect::<Vec<_>>();
+    for &(from, attacker) in &occupied {
+        for &(to, attacked) in &occupied {
             if attacks(
                 position,
                 attacker.kind,
@@ -246,9 +243,153 @@ pub fn fill_threat_features(
     Some(())
 }
 
+/// 两个视角共享一次攻击关系遍历；输出顺序与分别调用上面的函数完全相同。
+pub(super) fn fill_threat_features_both(
+    position: &Position,
+    red: &mut Vec<usize>,
+    black: &mut Vec<usize>,
+) -> Option<()> {
+    let (_, red_mirror) = super::pikafish::feature_bucket(position, Color::Red)?;
+    let (_, black_mirror) = super::pikafish::feature_bucket(position, Color::Black)?;
+    red.clear();
+    black.clear();
+    red.reserve(64);
+    black.reserve(64);
+    let occupied = (0..BOARD_SIZE)
+        .filter_map(|square| position.piece_at(square).map(|piece| (square, piece)))
+        .collect::<Vec<_>>();
+    for &(from, attacker) in &occupied {
+        for &(to, attacked) in &occupied {
+            if attacks(
+                position,
+                attacker.kind,
+                attacker.color,
+                native(from),
+                native(to),
+            ) {
+                if let Some(index) =
+                    threat_index(Color::Red, attacker, from, to, attacked, red_mirror)
+                {
+                    red.push(index);
+                }
+                if let Some(index) =
+                    threat_index(Color::Black, attacker, from, to, attacked, black_mirror)
+                {
+                    black.push(index);
+                }
+            }
+        }
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_features(position: &Position, perspective: Color, output: &mut Vec<usize>) {
+        let (_, mirror) = super::super::pikafish::feature_bucket(position, perspective).unwrap();
+        output.clear();
+        for from in 0..BOARD_SIZE {
+            let Some(attacker) = position.piece_at(from) else {
+                continue;
+            };
+            for to in 0..BOARD_SIZE {
+                let Some(attacked) = position.piece_at(to) else {
+                    continue;
+                };
+                if attacks(
+                    position,
+                    attacker.kind,
+                    attacker.color,
+                    native(from),
+                    native(to),
+                ) {
+                    if let Some(index) =
+                        threat_index(perspective, attacker, from, to, attacked, mirror)
+                    {
+                        output.push(index);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn occupied_pairs_match_original_random_legal_positions() {
+        let mut position = Position::startpos();
+        let mut random = 0x1234_5678_9abc_def0_u64;
+        let mut positions = Vec::new();
+        for _ in 0..100 {
+            positions.push(position.clone());
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            position.make_move(legal[(random as usize) % legal.len()]);
+        }
+        let mut reference = Vec::new();
+        let mut optimized = Vec::new();
+        let mut red = Vec::new();
+        let mut black = Vec::new();
+        for position in &positions {
+            fill_threat_features_both(position, &mut red, &mut black).unwrap();
+            for perspective in [Color::Red, Color::Black] {
+                reference_features(position, perspective, &mut reference);
+                fill_threat_features(position, perspective, &mut optimized).unwrap();
+                assert_eq!(
+                    optimized,
+                    reference,
+                    "{} {perspective:?}",
+                    position.to_fen()
+                );
+                assert_eq!(
+                    if perspective == Color::Red {
+                        &red
+                    } else {
+                        &black
+                    },
+                    &reference,
+                    "shared attack pass: {} {perspective:?}",
+                    position.to_fen()
+                );
+            }
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            for position in &positions {
+                for perspective in [Color::Red, Color::Black] {
+                    reference_features(position, perspective, &mut reference);
+                    std::hint::black_box(&reference);
+                }
+            }
+        }
+        let original = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            for position in &positions {
+                for perspective in [Color::Red, Color::Black] {
+                    fill_threat_features(position, perspective, &mut optimized).unwrap();
+                    std::hint::black_box(&optimized);
+                }
+            }
+        }
+        let separate = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            for position in &positions {
+                fill_threat_features_both(position, &mut red, &mut black).unwrap();
+                std::hint::black_box((&red, &black));
+            }
+        }
+        eprintln!(
+            "FullThreats both perspectives: old={original:?}, occupied={separate:?}, shared={:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn static_dimension_and_startpos() {

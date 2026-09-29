@@ -1,7 +1,7 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
 use super::pikafish_candle::{PikafishExample, PikafishModel};
 use super::{AbEvalAccumulator, AbEvalScratch, AbNnue};
-use crate::nnue::pikafish_file::PikafishNet;
+use crate::nnue::pikafish_file::{PikafishEvalCache, PikafishNet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -48,6 +48,7 @@ pub struct AbSearchResult {
     pub network_value_wdl: [f32; 3],
     pub best_value_wdl: [f32; 3],
     pub nodes: usize,
+    pub quiescence_nodes: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
     /// Deepest visited ply, including quiescence; UCI `seldepth` is ply + 1.
@@ -113,6 +114,9 @@ struct TtEntry {
 }
 
 trait ValueModel {
+    fn pikafish_net(&self) -> Option<&PikafishNet> {
+        None
+    }
     fn root_hidden(&self, position: &Position) -> Vec<f32>;
     fn transition(
         &self,
@@ -217,7 +221,8 @@ impl ValueModel for PikafishModel {
         if !raw.is_finite() {
             return Err("Pikafish evaluation is non-finite".to_owned());
         }
-        Ok((raw / 600.0).tanh())
+        // Training targets already use tanh(cp / 600); forward returns q.
+        Ok(raw.clamp(-1.0, 1.0))
     }
     fn root_wdl(
         &self,
@@ -235,6 +240,9 @@ impl ValueModel for PikafishModel {
 }
 
 impl ValueModel for PikafishNet {
+    fn pikafish_net(&self) -> Option<&PikafishNet> {
+        Some(self)
+    }
     fn root_hidden(&self, _position: &Position) -> Vec<f32> {
         Vec::new()
     }
@@ -286,6 +294,7 @@ struct Search<'a, M: ValueModel + ?Sized> {
     tt: Vec<Option<TtEntry>>,
     hidden_pool: Vec<Vec<f32>>,
     scratch: Option<AbEvalScratch>,
+    pikafish_cache: Option<PikafishEvalCache>,
     error: Option<String>,
     control: Option<&'a AbSearchControl>,
 }
@@ -297,10 +306,17 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         history: &[RuleHistoryEntry],
         hidden: &[f32],
     ) -> f32 {
-        match self
-            .model
-            .evaluate(position, history, hidden, &mut self.scratch)
+        let result = if let (Some(net), Some(cache)) =
+            (self.model.pikafish_net(), self.pikafish_cache.as_mut())
         {
+            cache
+                .evaluate_scaled(net, position, position.rule60_count_with_history(history))
+                .map(|cp| (cp as f32 / 600.0).tanh())
+        } else {
+            self.model
+                .evaluate(position, history, hidden, &mut self.scratch)
+        };
+        match result {
             Ok(value) => value.clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE),
             Err(error) => {
                 self.error = Some(error);
@@ -368,38 +384,59 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             })
         });
         let mut best = if checked { -2.0 } else { stand_pat };
+        let recapture_square = history.last().and_then(|entry| entry.mv.map(|mv| mv.to));
         for mv in tactical {
             if !checked {
                 let attacker = position.piece_at(mv.from as usize).unwrap();
                 let victim = position.piece_at(mv.to as usize).unwrap();
+                let gives_check = position.gives_check_after_move_fast(mv);
+                // A generous material upper bound. Recaptures and checks are
+                // exempt because they can change the tactical sequence even
+                // when their immediate material gain looks small.
+                if q_capture_prunable(
+                    stand_pat,
+                    alpha,
+                    piece_value(victim.kind),
+                    gives_check,
+                    recapture_square == Some(mv.to),
+                ) {
+                    continue;
+                }
                 // Pikafish qsearch discards losing captures below its SEE
                 // threshold. Run the slower legal-exchange search only when
                 // the captured piece cannot already pay for the attacker.
                 if victim.kind != PieceKind::General
                     && piece_value(attacker.kind) > piece_value(victim.kind) + 106
                 {
-                    let (gain, gives_check) = static_exchange_gain(position, mv);
-                    if gain < -106 && !gives_check {
+                    let (gain, _) = static_exchange_gain(position, mv);
+                    if gain < -106 && !gives_check && recapture_square != Some(mv.to) {
                         continue;
                     }
                 }
             }
-            let before_buckets = AbEvalAccumulator::buckets_for_position(position);
+            let before_buckets = self
+                .model
+                .pikafish_net()
+                .is_none()
+                .then(|| AbEvalAccumulator::buckets_for_position(position));
             let mover = position.side_to_move();
             let moved = position.piece_at(mv.from as usize).unwrap();
             let captured = position.piece_at(mv.to as usize);
             let undo = position.make_move(mv);
-            let mut child_hidden = self.hidden_pool.pop().unwrap_or_default();
-            child_hidden.resize(hidden.len(), 0.0);
-            child_hidden.copy_from_slice(hidden);
-            self.model.transition(
-                before_buckets,
-                position,
-                mv,
-                moved,
-                captured,
-                &mut child_hidden,
-            );
+            let mut child_hidden = Vec::new();
+            if let Some(before_buckets) = before_buckets {
+                child_hidden = self.hidden_pool.pop().unwrap_or_default();
+                child_hidden.resize(hidden.len(), 0.0);
+                child_hidden.copy_from_slice(hidden);
+                self.model.transition(
+                    before_buckets,
+                    position,
+                    mv,
+                    moved,
+                    captured,
+                    &mut child_hidden,
+                );
+            }
             history.push(position.rule_history_entry_after_moved(mover, mv, captured));
             let score = -self.quiescence(
                 position,
@@ -412,7 +449,9 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             );
             history.pop();
             position.unmake_move(mv, undo);
-            self.hidden_pool.push(child_hidden);
+            if before_buckets.is_some() {
+                self.hidden_pool.push(child_hidden);
+            }
             if self.exhausted {
                 return 0.0;
             }
@@ -432,8 +471,26 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         hidden: &[f32],
         depth: usize,
         ply: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> f32 {
+        self.negamax_inner(
+            position, history, hidden, depth, ply, alpha, beta, false, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn negamax_inner(
+        &mut self,
+        position: &mut Position,
+        history: &mut Vec<RuleHistoryEntry>,
+        hidden: &[f32],
+        depth: usize,
+        ply: usize,
         mut alpha: f32,
         beta: f32,
+        previous_was_null: bool,
+        null_enabled: bool,
     ) -> f32 {
         if depth == 0 {
             // The frontier is one quiescence node, not a negamax node plus a
@@ -456,7 +513,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             entry.key == position.hash() && entry.history.as_slice() == history.as_slice()
         });
         let tt_move = cached.and_then(|entry| entry.best_move);
-        if let Some(entry) = cached.filter(|entry| entry.depth >= depth) {
+        if let Some(entry) = cached.filter(|entry| null_enabled && entry.depth >= depth) {
             match entry.bound {
                 Bound::Exact => return entry.value,
                 Bound::Lower if entry.value >= beta => return entry.value,
@@ -470,6 +527,66 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         }
         let original_alpha = alpha;
         let checked = position.in_check(position.side_to_move());
+        // Search an isolated pass only at a non-PV cut node. The real position
+        // has already passed terminal and legal-move checks above. A pass is
+        // not a Xiangqi move, so its descendants need a fresh rule anchor.
+        if null_move_eligible(
+            position,
+            history,
+            depth,
+            alpha,
+            beta,
+            checked,
+            previous_was_null,
+            null_enabled,
+        ) {
+            let static_eval = self.evaluate(position, history, hidden);
+            if self.exhausted {
+                return 0.0;
+            }
+            if static_eval >= beta + 0.10 {
+                let undo = position.make_null_move();
+                let mut null_history = position.initial_rule_history();
+                let reduced_depth = depth.saturating_sub(3);
+                let null_score = -self.negamax_inner(
+                    position,
+                    &mut null_history,
+                    hidden,
+                    reduced_depth,
+                    ply + 1,
+                    -beta,
+                    -beta + 0.0001,
+                    true,
+                    true,
+                );
+                position.unmake_null_move(undo);
+                if self.exhausted {
+                    return 0.0;
+                }
+                if null_score >= beta && null_score < 0.9 {
+                    // A real-move verification excludes recursive null cutoffs,
+                    // which protects zugzwang and forced quiet defenses.
+                    let verified = self.negamax_inner(
+                        position,
+                        history,
+                        hidden,
+                        depth - 1,
+                        ply,
+                        beta - 0.0001,
+                        beta,
+                        false,
+                        false,
+                    );
+                    if self.exhausted {
+                        return 0.0;
+                    }
+                    if verified >= beta {
+                        return verified;
+                    }
+                }
+            }
+        }
+        let major_material = depth <= 2 && has_major_material(position, position.side_to_move());
         moves.sort_by_key(|&mv| {
             std::cmp::Reverse(self.move_order_score(position, mv, tt_move, ply))
         });
@@ -479,25 +596,56 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         let mut searched_quiets = [None; 32];
         let mut quiet_count = 0;
         for (index, mv) in moves.into_iter().enumerate() {
-            let before_buckets = AbEvalAccumulator::buckets_for_position(position);
+            let before_buckets = self
+                .model
+                .pikafish_net()
+                .is_none()
+                .then(|| AbEvalAccumulator::buckets_for_position(position));
             let mover = position.side_to_move();
             let moved = position.piece_at(mv.from as usize).unwrap();
             let captured = position.piece_at(mv.to as usize);
             let undo = position.make_move(mv);
-            let mut child_hidden = self.hidden_pool.pop().unwrap_or_default();
-            child_hidden.resize(hidden.len(), 0.0);
-            child_hidden.copy_from_slice(hidden);
-            self.model.transition(
-                before_buckets,
-                position,
-                mv,
-                moved,
-                captured,
-                &mut child_hidden,
-            );
+            let mut child_hidden = Vec::new();
+            if let Some(before_buckets) = before_buckets {
+                child_hidden = self.hidden_pool.pop().unwrap_or_default();
+                child_hidden.resize(hidden.len(), 0.0);
+                child_hidden.copy_from_slice(hidden);
+                self.model.transition(
+                    before_buckets,
+                    position,
+                    mv,
+                    moved,
+                    captured,
+                    &mut child_hidden,
+                );
+            }
             history.push(position.rule_history_entry_after_moved(mover, mv, captured));
             let gives_check = position.in_check(position.side_to_move());
             let quiet = captured.is_none();
+            // Shallow late-move pruning applies only after at least one legal
+            // move has been searched. Checks and captures must still be tried:
+            // Xiangqi has many forcing cannon and rook continuations.
+            if beta - alpha <= 0.001
+                && major_material
+                && !checked
+                && !gives_check
+                && quiet
+                && best > -0.9
+                && late_move_prunable(
+                    depth,
+                    index,
+                    self.history_scores[mv.from as usize][mv.to as usize],
+                    Some(mv) == tt_move
+                        || self.killers[ply.min(self.killers.len() - 1)].contains(&Some(mv)),
+                )
+            {
+                history.pop();
+                position.unmake_move(mv, undo);
+                if before_buckets.is_some() {
+                    self.hidden_pool.push(child_hidden);
+                }
+                continue;
+            }
             let reduction = quiet_reduction(
                 depth,
                 index,
@@ -505,7 +653,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                 checked || gives_check || !quiet,
             );
             let mut score = if first {
-                -self.negamax(
+                -self.negamax_inner(
                     position,
                     history,
                     &child_hidden,
@@ -513,9 +661,11 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                     ply + 1,
                     -beta,
                     -alpha,
+                    false,
+                    null_enabled,
                 )
             } else {
-                -self.negamax(
+                -self.negamax_inner(
                     position,
                     history,
                     &child_hidden,
@@ -523,10 +673,12 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                     ply + 1,
                     -alpha - 0.0001,
                     -alpha,
+                    false,
+                    null_enabled,
                 )
             };
             if reduction != 0 && !self.exhausted && score > alpha {
-                score = -self.negamax(
+                score = -self.negamax_inner(
                     position,
                     history,
                     &child_hidden,
@@ -534,10 +686,12 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                     ply + 1,
                     -alpha - 0.0001,
                     -alpha,
+                    false,
+                    null_enabled,
                 );
             }
             if !first && !self.exhausted && score > alpha && score < beta {
-                score = -self.negamax(
+                score = -self.negamax_inner(
                     position,
                     history,
                     &child_hidden,
@@ -545,11 +699,15 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                     ply + 1,
                     -beta,
                     -alpha,
+                    false,
+                    null_enabled,
                 );
             }
             history.pop();
             position.unmake_move(mv, undo);
-            self.hidden_pool.push(child_hidden);
+            if before_buckets.is_some() {
+                self.hidden_pool.push(child_hidden);
+            }
             if self.exhausted {
                 return 0.0;
             }
@@ -640,6 +798,73 @@ fn quiet_reduction(depth: usize, move_index: usize, history: i32, tactical: bool
     }
     let extra = usize::from(depth >= 7 && move_index >= 12 && history < 0);
     (1 + extra).min(depth - 2)
+}
+
+fn late_move_prunable(depth: usize, move_index: usize, history: i32, priority: bool) -> bool {
+    !priority
+        && history <= 0
+        && match depth {
+            1 => move_index >= 20,
+            2 => move_index >= 32,
+            _ => false,
+        }
+}
+
+fn has_major_material(position: &Position, color: Color) -> bool {
+    (0..90).any(|sq| {
+        position.piece_at(sq).is_some_and(|piece| {
+            piece.color == color
+                && matches!(
+                    piece.kind,
+                    PieceKind::Rook | PieceKind::Cannon | PieceKind::Horse
+                )
+        })
+    })
+}
+
+fn null_move_eligible(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    depth: usize,
+    alpha: f32,
+    beta: f32,
+    checked: bool,
+    previous_was_null: bool,
+    null_enabled: bool,
+) -> bool {
+    depth >= 3
+        && null_enabled
+        && !previous_was_null
+        && !checked
+        && beta - alpha <= 0.001
+        && beta > -0.9
+        && beta < 0.9
+        && position.rule60_max_ply().is_none_or(|limit| {
+            position
+                .rule60_count_with_history(history)
+                .saturating_add(20)
+                < limit
+        })
+        && has_major_material(position, position.side_to_move())
+}
+
+fn q_delta_upper_bound(stand_pat: f32, victim_cp: i64) -> f32 {
+    let base_cp = stand_pat.clamp(-0.95, 0.95).atanh() * 600.0;
+    ((base_cp + victim_cp as f32 + 300.0) / 600.0).tanh()
+}
+
+fn q_capture_prunable(
+    stand_pat: f32,
+    alpha: f32,
+    victim_cp: i64,
+    gives_check: bool,
+    recapture: bool,
+) -> bool {
+    !gives_check
+        && !recapture
+        && stand_pat > -0.9
+        && alpha < 0.9
+        && q_delta_upper_bound(stand_pat, victim_cp) <= alpha
 }
 
 fn piece_value(kind: PieceKind) -> i64 {
@@ -804,6 +1029,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
         tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
         hidden_pool: Vec::new(),
         scratch: model.scratch(),
+        pikafish_cache: model.pikafish_net().map(|_| PikafishEvalCache::new()),
         error: None,
         control,
     };
@@ -817,14 +1043,16 @@ fn search_with_model<M: ValueModel + ?Sized>(
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             root_child_hidden.copy_from_slice(&root_hidden);
-            model.transition(
-                AbEvalAccumulator::buckets_for_position(position),
-                &next,
-                mv,
-                position.piece_at(mv.from as usize).unwrap(),
-                captured,
-                &mut root_child_hidden,
-            );
+            if model.pikafish_net().is_none() {
+                model.transition(
+                    AbEvalAccumulator::buckets_for_position(position),
+                    &next,
+                    mv,
+                    position.piece_at(mv.from as usize).unwrap(),
+                    captured,
+                    &mut root_child_hidden,
+                );
+            }
             let mut line = history.to_vec();
             line.push(next.rule_history_entry_after_moved(mover, mv, captured));
             if let Some(outcome) = next.rule_outcome_with_history(&line) {
@@ -862,14 +1090,16 @@ fn search_with_model<M: ValueModel + ?Sized>(
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             root_child_hidden.copy_from_slice(&root_hidden);
-            model.transition(
-                AbEvalAccumulator::buckets_for_position(position),
-                &next,
-                mv,
-                position.piece_at(mv.from as usize).unwrap(),
-                captured,
-                &mut root_child_hidden,
-            );
+            if model.pikafish_net().is_none() {
+                model.transition(
+                    AbEvalAccumulator::buckets_for_position(position),
+                    &next,
+                    mv,
+                    position.piece_at(mv.from as usize).unwrap(),
+                    captured,
+                    &mut root_child_hidden,
+                );
+            }
             let mut line = history.to_vec();
             line.push(next.rule_history_entry_after_moved(mover, mv, captured));
             let (low, high) = if root_pvs {
@@ -930,6 +1160,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
             &solved,
             root_wdl,
             engine.nodes,
+            engine.quiescence_nodes,
             completed_depth,
             engine.selective_depth,
             false,
@@ -949,6 +1180,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
         &solved,
         root_wdl,
         engine.nodes,
+        engine.quiescence_nodes,
         completed_depth,
         engine.selective_depth,
         engine.exhausted,
@@ -1000,6 +1232,7 @@ fn build_result_with_proofs(
     solved: &[Option<i8>],
     root_wdl: [f32; 3],
     nodes: usize,
+    quiescence_nodes: usize,
     completed_depth: usize,
     selective_depth: usize,
     exhausted: bool,
@@ -1064,6 +1297,7 @@ fn build_result_with_proofs(
         network_value_wdl: root_wdl,
         best_value_wdl: wdl,
         nodes: nodes,
+        quiescence_nodes,
         search_depth_avg: completed_depth as f32,
         search_depth_max: completed_depth,
         selective_depth,
@@ -1179,6 +1413,10 @@ mod tests {
     fn pikafish_value_model_uses_shared_search() {
         let model = PikafishModel::new(&candle_core::Device::Cpu).unwrap();
         let position = Position::startpos();
+        let example = PikafishExample::from_position(&position).unwrap();
+        let raw = model.forward(&[example]).unwrap().to_vec2::<f32>().unwrap()[0][0];
+        let evaluated = ValueModel::evaluate(&model, &position, &[], &[], &mut None).unwrap();
+        assert!((evaluated - raw.clamp(-1.0, 1.0)).abs() < 1e-6);
         let result = search_pikafish_model(
             &position,
             &[],
@@ -1191,6 +1429,7 @@ mod tests {
         .unwrap();
         assert!(result.best_move.is_some());
         assert!(result.nodes <= 64);
+        assert!(result.quiescence_nodes <= result.nodes);
         assert!(result.value_q.is_finite());
     }
 
@@ -1216,6 +1455,83 @@ mod tests {
         assert_eq!(quiet_reduction(2, 20, -100, false), 0);
         assert_eq!(quiet_reduction(7, 20, 100, false), 1);
         assert_eq!(quiet_reduction(7, 20, -100, false), 2);
+    }
+
+    #[test]
+    fn shallow_late_move_pruning_preserves_priority_and_deeper_nodes() {
+        assert!(!late_move_prunable(1, 19, 0, false));
+        assert!(late_move_prunable(1, 20, 0, false));
+        assert!(!late_move_prunable(2, 32, 1, false));
+        assert!(!late_move_prunable(2, 32, 0, true));
+        assert!(!late_move_prunable(3, 100, 0, false));
+    }
+
+    #[test]
+    fn qsearch_delta_preserves_checks_recaptures_and_mate_ranges() {
+        assert!(q_capture_prunable(-0.5, 0.4, 100, false, false));
+        assert!(!q_capture_prunable(-0.5, 0.4, 100, true, false));
+        assert!(!q_capture_prunable(-0.5, 0.4, 100, false, true));
+        assert!(!q_capture_prunable(-0.95, 0.4, 100, false, false));
+        assert!(!q_capture_prunable(-0.5, 0.95, 100, false, false));
+    }
+
+    #[test]
+    fn null_move_requires_safe_non_pv_dynamic_position() {
+        let start = Position::startpos();
+        let history = start.initial_rule_history();
+        let allowed = |position: &Position,
+                       history: &[RuleHistoryEntry],
+                       depth,
+                       alpha,
+                       beta,
+                       checked,
+                       previous,
+                       enabled| {
+            null_move_eligible(
+                position, history, depth, alpha, beta, checked, previous, enabled,
+            )
+        };
+        assert!(allowed(
+            &start, &history, 3, 0.1, 0.1001, false, false, true
+        ));
+        assert!(!allowed(
+            &start, &history, 2, 0.1, 0.1001, false, false, true
+        ));
+        assert!(!allowed(&start, &history, 3, -2.0, 2.0, false, false, true));
+        assert!(!allowed(
+            &start, &history, 3, 0.1, 0.1001, true, false, true
+        ));
+        assert!(!allowed(
+            &start, &history, 3, 0.1, 0.1001, false, true, true
+        ));
+        assert!(!allowed(
+            &start, &history, 3, 0.1, 0.1001, false, false, false
+        ));
+        let bare = Position::from_fen("4k4/9/9/9/4p4/9/4P4/9/9/4K4 w - - 0 1").unwrap();
+        assert!(!allowed(
+            &bare,
+            &bare.initial_rule_history(),
+            3,
+            0.1,
+            0.1001,
+            false,
+            false,
+            true
+        ));
+        let late = Position::from_fen(
+            "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 110 1",
+        )
+        .unwrap();
+        assert!(!allowed(
+            &late,
+            &late.initial_rule_history(),
+            3,
+            0.1,
+            0.1001,
+            false,
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -1266,6 +1582,7 @@ mod tests {
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
+            pikafish_cache: None,
             error: None,
             control: None,
         };
@@ -1295,6 +1612,7 @@ mod tests {
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
+            pikafish_cache: None,
             error: None,
             control: None,
         };
@@ -1440,6 +1758,7 @@ mod tests {
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
+            pikafish_cache: None,
             error: None,
             control: None,
         };
@@ -1504,6 +1823,7 @@ mod tests {
             3,
             2,
             2,
+            2,
             false,
             4,
         );
@@ -1531,6 +1851,7 @@ mod tests {
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
+            pikafish_cache: None,
             error: None,
             control: None,
         };

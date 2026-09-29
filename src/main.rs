@@ -19,11 +19,12 @@ use chineseai::{
         train_samples_weighted_owned,
     },
     opening_book::OpeningBook,
+    pikafish_candidate_arena::{CandidateArenaConfig, play_paired},
     pikafish_candidate_selfplay::{
         CandidateSelfplayConfig, generate as generate_candidate_selfplay,
     },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
-    pikafish_pretrain::{PretrainConfig, train_teacher_tsv},
+    pikafish_pretrain::{PretrainConfig, train_candidate_results_tsv, train_teacher_tsv},
     pikafish_selfplay::{SelfplayConfig, generate as generate_pikafish_selfplay},
     uci_tournament::{TournamentConfig, run as run_uci_tournament},
     xiangqi::Position,
@@ -73,8 +74,12 @@ enum CliCommand {
     PikafishSelfplay(PikafishSelfplayArgs),
     /// Pretrain the Pikafish-shaped floating model from search scores.
     PikafishPretrain(PikafishPretrainArgs),
+    /// Train the Pikafish-shaped floating model from completed candidate self-play outcomes.
+    PikafishTrainSelfplay(PikafishPretrainArgs),
     /// Generate AB self-play using ChineseAI's Pikafish-shaped value network.
     PikafishCandidateSelfplay(PikafishCandidateSelfplayArgs),
+    /// Compare a candidate and champion on paired openings; publish only after passing the gate.
+    PikafishCandidateArena(PikafishCandidateArenaArgs),
     /// Play paired timed UCI matches from distinct opening-book positions.
     #[command(name = "uci-tournament")]
     UciTournament(UciTournamentArgs),
@@ -130,8 +135,35 @@ struct PikafishCandidateSelfplayArgs {
 }
 
 #[derive(Args, Debug)]
+struct PikafishCandidateArenaArgs {
+    #[arg(long)]
+    candidate: PathBuf,
+    #[arg(long)]
+    champion: PathBuf,
+    #[arg(long, default_value = "book.pgn.gz")]
+    opening_book: PathBuf,
+    #[arg(long, default_value_t = 100)]
+    pairs: usize,
+    #[arg(long, default_value_t = 10_000)]
+    nodes: usize,
+    #[arg(long, default_value_t = 8)]
+    max_depth: usize,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 0.55)]
+    promotion_rate: f32,
+    #[arg(long, default_value_t = 1.96)]
+    confidence_z: f32,
+    #[arg(long, default_value_t = 20260930)]
+    seed: u64,
+    /// Create this new checkpoint only when the candidate passes the promotion gate.
+    #[arg(long)]
+    promote_output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 struct PikafishPretrainArgs {
-    /// TSV produced by `pikafish-selfplay`.
+    /// Source-tagged TSV produced by the corresponding self-play command.
     #[arg(long)]
     input: PathBuf,
     /// ChineseAI f32 checkpoint; this is not a Pikafish .nnue file.
@@ -2157,6 +2189,36 @@ fn main() {
                 cmd.output.display()
             );
         }
+        Some(CliCommand::PikafishTrainSelfplay(cmd)) => {
+            let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+            let model = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
+                .unwrap_or_else(|err| panic!("pikafish-train-selfplay model init failed: {err}"));
+            if cmd.resume && cmd.output.exists() {
+                model
+                    .load(&cmd.output)
+                    .unwrap_or_else(|err| panic!("pikafish-train-selfplay resume failed: {err}"));
+            }
+            let report = train_candidate_results_tsv(
+                &model,
+                &cmd.input,
+                &cmd.output,
+                PretrainConfig {
+                    batch_size: cmd.batch_size,
+                    max_samples: cmd.max_samples,
+                    learning_rate: cmd.learning_rate,
+                },
+            )
+            .unwrap_or_else(|err| panic!("pikafish-train-selfplay failed: {err}"));
+            println!(
+                "pikafish-train-selfplay: samples={} skipped_unknown={} skipped_features={} steps={} mean_loss={:.6} output={}",
+                report.used_samples,
+                report.skipped_unknown_results,
+                report.skipped_unsupported_features,
+                report.steps,
+                report.mean_loss,
+                cmd.output.display()
+            );
+        }
         Some(CliCommand::PikafishCandidateSelfplay(cmd)) => {
             let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
             let model =
@@ -2187,6 +2249,87 @@ fn main() {
                 report.truncated,
                 report.positions,
                 cmd.output.display()
+            );
+        }
+        Some(CliCommand::PikafishCandidateArena(cmd)) => {
+            let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+            let candidate = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
+                .unwrap_or_else(|err| panic!("candidate model init failed: {err}"));
+            candidate
+                .load(&cmd.candidate)
+                .unwrap_or_else(|err| panic!("candidate model load failed: {err}"));
+            let champion = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
+                .unwrap_or_else(|err| panic!("champion model init failed: {err}"));
+            champion
+                .load(&cmd.champion)
+                .unwrap_or_else(|err| panic!("champion model load failed: {err}"));
+            let mut book = OpeningBook::load(&cmd.opening_book, cmd.seed)
+                .unwrap_or_else(|err| panic!("arena opening book failed: {err}"));
+            let mut openings = Vec::with_capacity(cmd.pairs);
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..cmd.pairs.saturating_mul(100) {
+                if openings.len() == cmd.pairs {
+                    break;
+                }
+                let position = book
+                    .next_batch(1, 0)
+                    .unwrap_or_else(|err| panic!("arena opening failed: {err}"))
+                    .remove(0)
+                    .position;
+                if seen.insert(position.to_fen()) {
+                    openings.push(position);
+                }
+            }
+            let result = play_paired(
+                &candidate,
+                &champion,
+                &openings,
+                CandidateArenaConfig {
+                    pairs: cmd.pairs,
+                    nodes: cmd.nodes,
+                    max_depth: cmd.max_depth,
+                    max_plies: cmd.max_plies,
+                    promotion_rate: cmd.promotion_rate,
+                    confidence_z: cmd.confidence_z,
+                },
+            )
+            .unwrap_or_else(|err| panic!("candidate arena failed: {err}"));
+            let mut published = false;
+            if result.decision
+                == chineseai::pikafish_candidate_arena::CandidateArenaDecision::Promote
+            {
+                if let Some(path) = &cmd.promote_output {
+                    if let Some(parent) = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                    {
+                        fs::create_dir_all(parent)
+                            .unwrap_or_else(|err| panic!("promotion directory failed: {err}"));
+                    }
+                    let mut source = fs::File::open(&cmd.candidate)
+                        .unwrap_or_else(|err| panic!("promotion source failed: {err}"));
+                    let mut dest = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                        .unwrap_or_else(|err| panic!("promotion destination failed: {err}"));
+                    io::copy(&mut source, &mut dest)
+                        .unwrap_or_else(|err| panic!("promotion copy failed: {err}"));
+                    published = true;
+                }
+            }
+            println!(
+                "pikafish-candidate-arena: pairs={} games={} W/L/D={}/{}/{} score={:.3} confidence=[{:.3},{:.3}] decision={:?} published={}",
+                result.report.paired_openings,
+                result.report.total_games(),
+                result.report.wins,
+                result.report.losses,
+                result.report.draws,
+                result.report.score_rate(),
+                result.lower_bound,
+                result.upper_bound,
+                result.decision,
+                published
             );
         }
         Some(CliCommand::UciTournament(cmd)) => {

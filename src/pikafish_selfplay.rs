@@ -185,7 +185,7 @@ pub fn generate(
     let mut out = BufWriter::new(File::create(output)?);
     writeln!(
         out,
-        "game\tply\tfen\tbestmove\tscore_cp\tred_result\ttermination"
+        "game\tply\tfen\tbestmove\tscore_cp\tred_result\ttermination\tsource"
     )?;
     let mut summary = SelfplaySummary::default();
     let mut random = config.seed;
@@ -246,7 +246,7 @@ pub fn generate(
         for (ply, fen, bestmove, score_cp) in &samples {
             writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\tpikafish",
                 game + 1,
                 ply,
                 fen,
