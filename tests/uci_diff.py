@@ -72,8 +72,10 @@ class Engine:
         # eval is a non-standard UCI extension. The ready marker drains its output.
         self.send("isready")
         evaluation = self.until(lambda line: line == "readyok")
-        self.send(f"go depth {depth}")
-        search = self.until(lambda line: line.startswith("bestmove "))
+        search = []
+        if depth > 0:
+            self.send(f"go depth {depth}")
+            search = self.until(lambda line: line.startswith("bestmove "))
         info = [line for line in search if line.startswith("info ") and SCORE.search(line)]
         score_line = info[-1] if info else ""
         score = SCORE.search(score_line)
@@ -89,7 +91,7 @@ class Engine:
             "score_type": score.group(1) if score else None,
             "score": int(score.group(2)) if score else None,
             "nodes": int(nodes.group(1)) if nodes else None,
-            "bestmove": search[-1].split()[1],
+            "bestmove": search[-1].split()[1] if search else None,
         }
 
     def close(self):
@@ -115,6 +117,9 @@ def main():
     parser.add_argument("--pikafish-nnue", type=Path, required=True)
     parser.add_argument("--fens", type=Path, help="UTF-8 file with one FEN or UCI position command per line")
     parser.add_argument("--depths", type=int, nargs="+", default=[1, 2])
+    parser.add_argument("--eval-only", action="store_true", help="compare raw NNUE integers without search")
+    parser.add_argument("--require-internal-equal", action="store_true", help="exit nonzero if any raw evaluation differs or is absent")
+    parser.add_argument("--allow-unavailable", action="store_true", help="allow positions where an engine does not report a raw value, such as check")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
     for path in (args.chineseai, args.pikafish, args.chineseai_nnue, args.pikafish_nnue):
@@ -131,16 +136,23 @@ def main():
             Engine(args.chineseai, args.chineseai_nnue, args.timeout),
             Engine(args.pikafish, args.pikafish_nnue, args.timeout),
         ]
+        mismatch = 0
+        unavailable = 0
         for entry in positions:
             position = entry if entry.startswith("position ") else f"position fen {entry}"
-            for depth in args.depths:
+            for depth in ([0] if args.eval_only else args.depths):
                 left, right = (engine.probe(position, depth) for engine in engines)
+                internal_equal = (left["eval_internal_units"] == right["eval_internal_units"]
+                                  if left["eval_internal_units"] is not None
+                                  and right["eval_internal_units"] is not None else None)
+                if internal_equal is False:
+                    mismatch += 1
+                elif internal_equal is None:
+                    unavailable += 1
                 print(json.dumps({
                     "position": position, "requested_depth": depth,
                     "chineseai": left, "pikafish": right,
-                    "internal_equal": (left["eval_internal_units"] == right["eval_internal_units"]
-                                       if left["eval_internal_units"] is not None
-                                       and right["eval_internal_units"] is not None else None),
+                    "internal_equal": internal_equal,
                     "score_equal": (left["score"] is not None and right["score"] is not None
                                     and (left["score_type"], left["score"]) ==
                                     (right["score_type"], right["score"])),
@@ -148,6 +160,8 @@ def main():
                                     if left["nodes"] is not None and right["nodes"] is not None else None),
                     "bestmove_equal": left["bestmove"] == right["bestmove"],
                 }, ensure_ascii=False))
+        if args.require_internal_equal and (mismatch or (unavailable and not args.allow_unavailable)):
+            raise SystemExit(f"raw NNUE mismatch in {mismatch} probe(s), unavailable in {unavailable}")
     finally:
         for engine in engines:
             engine.close()

@@ -358,6 +358,20 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         });
         let mut best = if checked { -2.0 } else { stand_pat };
         for mv in tactical {
+            if !checked {
+                let attacker = position.piece_at(mv.from as usize).unwrap();
+                let victim = position.piece_at(mv.to as usize).unwrap();
+                // Only consider large material sacrifices. Legal recaptures
+                // account for cannon screens, horse legs and pinned pieces.
+                if victim.kind != PieceKind::General
+                    && piece_value(attacker.kind) > piece_value(victim.kind) + 200
+                {
+                    let (gain, gives_check) = static_exchange_gain(position, mv);
+                    if gain < -200 && !gives_check {
+                        continue;
+                    }
+                }
+            }
             let before_buckets = AbEvalAccumulator::buckets_for_position(position);
             let mover = position.side_to_move();
             let moved = position.piece_at(mv.from as usize).unwrap();
@@ -409,6 +423,11 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         mut alpha: f32,
         beta: f32,
     ) -> f32 {
+        if depth == 0 {
+            // The frontier is one quiescence node, not a negamax node plus a
+            // second quiescence node at the same position.
+            return self.quiescence(position, history, hidden, 6, ply, alpha, beta);
+        }
         if self.nodes >= self.limit || self.control.is_some_and(AbSearchControl::should_stop) {
             self.exhausted = true;
             return 0.0;
@@ -416,10 +435,6 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         self.nodes += 1;
         if let Some(outcome) = position.rule_outcome_with_history(history) {
             return terminal_value(outcome, position.side_to_move(), ply);
-        }
-        if depth == 0 {
-            // Quiescence also checks legal-move exhaustion before static evaluation.
-            return self.quiescence(position, history, hidden, 6, ply, alpha, beta);
         }
         // Chinese perpetual-check/chase adjudication depends on the whole path.
         // A board hash alone is never sufficient for a score cutoff.
@@ -625,6 +640,46 @@ fn piece_value(kind: PieceKind) -> i64 {
     }
 }
 
+/// Material result of an optional legal recapture sequence on one square.
+/// This deliberately uses the move generator instead of duplicating Xiangqi
+/// attack geometry; it is slower than Pikafish's bitboard SEE but respects
+/// cannon screens, horse legs and king safety.
+fn static_exchange_gain(position: &mut Position, mv: Move) -> (i64, bool) {
+    let target = mv.to;
+    let captured = position.piece_at(target as usize).unwrap();
+    let undo = position.make_move(mv);
+    let gives_check = position.in_check(position.side_to_move());
+    let gain = piece_value(captured.kind) - best_exchange_reply(position, target, 16);
+    position.unmake_move(mv, undo);
+    (gain, gives_check)
+}
+
+fn best_exchange_reply(position: &mut Position, target: u8, remaining: usize) -> i64 {
+    if remaining == 0 || !position.has_general(position.side_to_move()) {
+        return 0;
+    }
+    let Some(victim) = position.piece_at(target as usize) else {
+        return 0;
+    };
+    let captures = position
+        .legal_moves()
+        .into_iter()
+        .filter(|mv| mv.to == target)
+        .collect::<Vec<_>>();
+    let mut best = 0;
+    for mv in captures {
+        let undo = position.make_move(mv);
+        let reply = if victim.kind == PieceKind::General {
+            0
+        } else {
+            best_exchange_reply(position, target, remaining - 1)
+        };
+        position.unmake_move(mv, undo);
+        best = best.max(piece_value(victim.kind) - reply);
+    }
+    best
+}
+
 fn outcome_value(outcome: RuleOutcome, side: Color) -> f32 {
     match outcome {
         RuleOutcome::Draw(_) => 0.0,
@@ -680,7 +735,7 @@ fn search_with_control(
     progress: impl FnMut(&AbSearchResult),
 ) -> AbSearchResult {
     search_with_model(
-        position, history, moves, model, node_limit, max_depth, control, progress,
+        position, history, moves, model, node_limit, max_depth, control, false, progress,
     )
     .expect("AB NNUE evaluation failed")
 }
@@ -707,6 +762,7 @@ pub fn search_pikafish_model(
             limits.max_depth
         },
         None,
+        false,
         |_| {},
     )
 }
@@ -719,6 +775,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
     node_limit: usize,
     max_depth: usize,
     control: Option<&AbSearchControl>,
+    root_pvs: bool,
     mut progress: impl FnMut(&AbSearchResult),
 ) -> Result<AbSearchResult, String> {
     let root_wdl = model.root_wdl(position, history)?;
@@ -782,6 +839,8 @@ fn search_with_model<M: ValueModel + ?Sized>(
         let mut trial = vec![0.0; moves.len()];
         let mut order = (0..moves.len()).collect::<Vec<_>>();
         order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        let mut root_alpha = -2.0f32;
+        let mut first_root = true;
         for index in order {
             let mv = moves[index];
             let mut next = position.clone();
@@ -799,7 +858,13 @@ fn search_with_model<M: ValueModel + ?Sized>(
             );
             let mut line = history.to_vec();
             line.push(next.rule_history_entry_after_moved(mover, mv, captured));
-            let (low, high) = if depth >= 3 {
+            let (low, high) = if root_pvs {
+                if first_root {
+                    (-2.0, 2.0)
+                } else {
+                    (root_alpha, root_alpha + 0.0001)
+                }
+            } else if depth >= 3 {
                 (
                     (scores[index] - 0.20).max(-2.0),
                     (scores[index] + 0.20).min(2.0),
@@ -816,7 +881,13 @@ fn search_with_model<M: ValueModel + ?Sized>(
                 -high,
                 -low,
             );
-            if !engine.exhausted && (value <= low || value >= high) {
+            if !engine.exhausted
+                && if root_pvs {
+                    !first_root && value > root_alpha
+                } else {
+                    value <= low || value >= high
+                }
+            {
                 value = -engine.negamax(
                     &mut next,
                     &mut line,
@@ -831,6 +902,8 @@ fn search_with_model<M: ValueModel + ?Sized>(
             if engine.exhausted {
                 break;
             }
+            root_alpha = root_alpha.max(value);
+            first_root = false;
         }
         if engine.exhausted {
             break;
@@ -1072,6 +1145,7 @@ fn search_uci_with_model<M: ValueModel + ?Sized>(
             limits.max_depth.min(64)
         },
         Some(control),
+        multipv == 1,
         |snapshot| progress(&uci_report(snapshot.clone(), multipv)),
     )
     .expect("NNUE evaluation failed");
@@ -1181,6 +1255,101 @@ mod tests {
         assert_eq!(position, original);
         assert_eq!(history, original_history);
         assert!(engine.quiescence_nodes > 1);
+    }
+
+    #[test]
+    fn depth_zero_counts_each_quiescence_node_once() {
+        let mut position = Position::startpos();
+        let mut history = position.initial_rule_history();
+        let model = AbNnue::random(16, 31);
+        let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let mut engine = Search {
+            model: &model,
+            nodes: 0,
+            limit: 256,
+            exhausted: false,
+            quiescence_nodes: 0,
+            history_scores: [[0; 90]; 90],
+            killers: vec![[None; 2]; 128],
+            tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+            hidden_pool: Vec::new(),
+            scratch: Some(AbEvalScratch::new(model.arch)),
+            error: None,
+            control: None,
+        };
+        let _ = engine.negamax(&mut position, &mut history, &hidden, 0, 0, -2.0, 2.0);
+        assert_eq!(engine.nodes, engine.quiescence_nodes);
+        assert!(engine.nodes > 0);
+    }
+
+    #[test]
+    fn root_pvs_keeps_best_move_and_uses_fewer_nodes() {
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let moves = position.legal_moves_with_rules(&history);
+        let model = AbNnue::random(16, 37);
+        let full = search_with_model(
+            &position,
+            &history,
+            moves.clone(),
+            &model,
+            100_000,
+            2,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let pvs = search_with_model(
+            &position,
+            &history,
+            moves,
+            &model,
+            100_000,
+            2,
+            None,
+            true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(pvs.best_move, full.best_move);
+        assert!((pvs.value_q - full.value_q).abs() < 1e-5);
+        assert!(pvs.nodes < full.nodes, "{} >= {}", pvs.nodes, full.nodes);
+    }
+
+    #[test]
+    fn see_respects_cannon_screen_and_restores_position() {
+        let mut position = Position::from_fen("3k5/9/4r4/9/9/4p4/9/4P4/9/2K1C4 w - - 0 1").unwrap();
+        let original = position.clone();
+        let mv = position.parse_uci_move("e0e4").unwrap();
+        assert!(position.legal_moves().contains(&mv));
+        let (gain, check) = static_exchange_gain(&mut position, mv);
+        assert_eq!(gain, 100 - 450);
+        assert!(!check);
+        assert_eq!(position, original);
+        let without_screen = Position::from_fen("3k5/9/4r4/9/9/4p4/9/9/9/2K1C4 w - - 0 1").unwrap();
+        assert!(!without_screen.legal_moves().contains(&mv));
+    }
+
+    #[test]
+    fn see_respects_horse_leg_blocker() {
+        let open = Position::from_fen("4k4/9/9/9/6n2/4p4/9/9/9/3KR4 w - - 0 1").unwrap();
+        let blocked = Position::from_fen("4k4/9/9/9/5pn2/4p4/9/9/9/3KR4 w - - 0 1").unwrap();
+        let mv = open.parse_uci_move("e0e4").unwrap();
+        assert!(open.legal_moves().contains(&mv));
+        let mut open = open;
+        let mut blocked = blocked;
+        assert_eq!(static_exchange_gain(&mut open, mv).0, 100 - 900);
+        assert_eq!(static_exchange_gain(&mut blocked, mv).0, 100);
+    }
+
+    #[test]
+    fn see_identifies_checking_material_sacrifice() {
+        let mut position = Position::from_fen("4k4/9/4r4/9/9/4p4/9/4P4/9/3KC4 w - - 0 1").unwrap();
+        let mv = position.parse_uci_move("e0e4").unwrap();
+        let (gain, gives_check) = static_exchange_gain(&mut position, mv);
+        assert!(gain < -200);
+        assert!(gives_check);
     }
 
     #[test]

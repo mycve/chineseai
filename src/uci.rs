@@ -2,7 +2,7 @@ use crate::ab::{
     AbNnue, AbSearchControl, AbSearchLimits, AbUciSearchResult, cp_from_q, search_uci,
     search_uci_pikafish,
 };
-use crate::nnue::pikafish_file::PikafishNet;
+use crate::nnue::pikafish_file::{PikafishNet, internal_units_from_q};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
 use std::sync::{
@@ -472,7 +472,15 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AbSearchControl::new(Arc::clone(&stop), deadline);
-    println!("info string searchparams mode=alphabeta nodes={nodes} score_scale=ChineseAI-q1000");
+    let pikafish_score = matches!(model, UciModel::Pikafish(_));
+    println!(
+        "info string searchparams mode=alphabeta nodes={nodes} score_scale={}",
+        if pikafish_score {
+            "Pikafish-internal"
+        } else {
+            "ChineseAI-q1000"
+        }
+    );
     flush();
     let mut last_score_source = None;
     let mut report_progress = |progress: &AbUciSearchResult| {
@@ -482,7 +490,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                 last_score_source = Some(proven);
             }
         }
-        print_search_info(progress, started, state.show_wdl);
+        print_search_info(progress, started, state.show_wdl, pikafish_score);
         flush();
     };
     let limits = AbSearchLimits {
@@ -524,7 +532,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     }
     match result.best_move {
         Some(mv) => {
-            print_search_info(&report, started, state.show_wdl);
+            print_search_info(&report, started, state.show_wdl, pikafish_score);
             println!("bestmove {mv}");
         }
         None => {
@@ -532,7 +540,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
                 "info depth 1 nodes {} time {} score cp {}",
                 result.nodes,
                 started.elapsed().as_millis(),
-                result.value_cp
+                uci_score_from_q(result.value_q, pikafish_score)
             );
             println!("bestmove 0000");
         }
@@ -571,7 +579,20 @@ fn print_high_score_source(report: &AbUciSearchResult, proven: bool) {
     );
 }
 
-fn print_search_info(report: &AbUciSearchResult, started: Instant, show_wdl: bool) {
+fn uci_score_from_q(q: f32, pikafish_score: bool) -> i32 {
+    if pikafish_score {
+        internal_units_from_q(q)
+    } else {
+        cp_from_q(q)
+    }
+}
+
+fn print_search_info(
+    report: &AbUciSearchResult,
+    started: Instant,
+    show_wdl: bool,
+    pikafish_score: bool,
+) {
     let result = &report.search;
     let elapsed_ms = started.elapsed().as_millis();
     let nps = result.nodes as u128 * 1000 / elapsed_ms.max(1);
@@ -596,7 +617,7 @@ fn print_search_info(report: &AbUciSearchResult, started: Instant, show_wdl: boo
             result.nodes,
             nps,
             elapsed_ms,
-            cp_from_q(pv.q),
+            uci_score_from_q(pv.q, pikafish_score),
             wdl_text,
             moves,
         );
@@ -604,7 +625,9 @@ fn print_search_info(report: &AbUciSearchResult, started: Instant, show_wdl: boo
     if report.variations.is_empty() {
         println!(
             "info depth 0 nodes {} time {} score cp {}",
-            result.nodes, elapsed_ms, result.value_cp
+            result.nodes,
+            elapsed_ms,
+            uci_score_from_q(result.value_q, pikafish_score)
         );
     }
 }

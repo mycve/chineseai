@@ -14,6 +14,12 @@ const THREAT: usize = pikafish::THREAT_INPUTS;
 const WIDTH: usize = pikafish::TRANSFORMER_WIDTH;
 const BUCKETS: usize = pikafish::LAYER_STACKS;
 
+/// 将搜索使用的有界 q 分数还原为 Pikafish UCI `score cp` 的内部单位。
+/// Pikafish 的搜索信息直接输出内部 Value；`eval` 追踪里的换算值另有定义。
+pub fn internal_units_from_q(q: f32) -> i32 {
+    ((q.clamp(-0.95, 0.95).atanh() * 600.0).round()) as i32
+}
+
 #[derive(Debug)]
 struct Stack {
     b0: Vec<i32>,
@@ -24,7 +30,7 @@ struct Stack {
     w2: Vec<u8>,
 }
 
-/// 文件以官方格式完整解析后才构造；评价值以行棋方视角的棋子分返回。
+/// 文件以官方格式完整解析后才构造；评价值以行棋方视角的内部 Value 单位返回。
 #[derive(Debug)]
 pub struct PikafishNet {
     pub description: String,
@@ -265,6 +271,14 @@ mod tests {
         assert_eq!(transformer_hash(), 0x23f4_7eb0);
         assert_eq!(stack_hash(), 0x6333_7116);
         assert_eq!(network_hash(), 0x40c7_0fa6);
+    }
+
+    #[test]
+    fn search_q_returns_internal_score_units() {
+        for raw in [-600_i32, -97, 0, 97, 600] {
+            let q = (raw as f32 / 600.0).tanh();
+            assert_eq!(internal_units_from_q(q), raw);
+        }
     }
 
     #[test]
