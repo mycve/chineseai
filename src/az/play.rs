@@ -325,8 +325,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     merged
 }
 
-fn selfplay_search_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSearchLimits {
-    let explore = config.temperature_cutoff_plies == 0 || ply < config.temperature_cutoff_plies;
+fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
     AzSearchLimits {
         simulations: config.simulations.max(1),
         seed,
@@ -338,14 +337,11 @@ fn selfplay_search_limits(config: &AzLoopConfig, ply: usize, seed: u64) -> AzSea
         cpuct_factor_at_root: config.cpuct_factor_at_root,
         max_depth: 0,
         root_dirichlet_alpha: config.root_dirichlet_alpha,
-        root_exploration_fraction: if explore {
-            config.root_exploration_fraction
-        } else {
-            0.0
-        },
+        root_exploration_fraction: config.root_exploration_fraction,
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         fpu_absolute_at_root: config.fpu_absolute_at_root,
+        minimum_kldgain_per_node: config.minimum_kldgain_per_node,
         policy_softmax_temp: config.policy_softmax_temp,
         draw_score: config.draw_score,
         value_scale: 1.0,
@@ -1075,6 +1071,7 @@ pub struct AzArenaConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub fpu_absolute_at_root: bool,
+    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
 }
@@ -1127,6 +1124,7 @@ pub fn play_arena_games_from_snapshots(
             config.fpu_value,
             config.fpu_value_at_root,
             config.fpu_absolute_at_root,
+            config.minimum_kldgain_per_node,
             config.draw_score,
             config.policy_softmax_temp,
         );
@@ -1168,6 +1166,7 @@ pub fn play_arena_games_from_snapshots(
             config.fpu_value,
             config.fpu_value_at_root,
             config.fpu_absolute_at_root,
+            config.minimum_kldgain_per_node,
             config.draw_score,
             config.policy_softmax_temp,
         );
@@ -1229,6 +1228,7 @@ fn play_arena_game(
     fpu_value: f32,
     fpu_value_at_root: f32,
     fpu_absolute_at_root: bool,
+    minimum_kldgain_per_node: f32,
     draw_score: f32,
     policy_softmax_temp: f32,
 ) -> f32 {
@@ -1278,6 +1278,7 @@ fn play_arena_game(
                 fpu_value,
                 fpu_value_at_root,
                 fpu_absolute_at_root,
+                minimum_kldgain_per_node,
                 policy_softmax_temp,
                 draw_score,
                 value_scale: 1.0,
@@ -1346,6 +1347,7 @@ mod tests {
             fpu_value: 0.30,
             fpu_value_at_root: 0.20,
             fpu_absolute_at_root: false,
+            minimum_kldgain_per_node: 0.0,
             draw_score: 0.0,
             policy_softmax_temp: 1.0,
             opening_positions: Default::default(),
@@ -1355,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_budget_selfplay_records_actual_visits() {
+    fn px0_kld_selfplay_records_actual_visits() {
         let mut position =
             Position::from_fen("4k1b2/4a4/4ba3/p8/4cN3/3n2N1P/c8/4C4/4A4/2B1KAB2 b").unwrap();
         let checking_move = position.parse_uci_move("a3a0").unwrap();
@@ -1363,7 +1365,8 @@ mod tests {
         assert_eq!(position.legal_moves(), [Move::from_uci("c0a2").unwrap()]);
         let mut config = selfplay_test_config(1);
         config.max_plies = 1;
-        config.simulations = 400;
+        config.simulations = 10_000;
+        config.minimum_kldgain_per_node = 0.00005;
         config.opening_positions = vec![AzStartSnapshot {
             rule_history: position.initial_rule_history(),
             position,
@@ -1410,22 +1413,15 @@ mod tests {
     }
 
     #[test]
-    fn selfplay_exploration_stops_at_cutoff() {
+    fn selfplay_keeps_noise_after_temperature_cutoff() {
         let mut config = selfplay_test_config(1);
-        config.temperature_start = 0.9;
-        config.temperature_endgame = 0.0;
         config.temperature_cutoff_plies = 40;
+        config.temperature_endgame = 0.6;
         config.root_exploration_fraction = 0.1;
-
-        assert_eq!(temperature_for_ply(&config, 39), 0.9);
-        assert_eq!(temperature_for_ply(&config, 40), 0.0);
-        assert_eq!(
-            selfplay_search_limits(&config, 39, 0).root_exploration_fraction,
-            0.1
-        );
+        assert_eq!(temperature_for_ply(&config, 40), 0.6);
         assert_eq!(
             selfplay_search_limits(&config, 40, 0).root_exploration_fraction,
-            0.0
+            0.1
         );
     }
 
@@ -1552,6 +1548,7 @@ mod tests {
                 config.fpu_value,
                 config.fpu_value_at_root,
                 config.fpu_absolute_at_root,
+                config.minimum_kldgain_per_node,
                 config.draw_score,
                 config.policy_softmax_temp,
             ),

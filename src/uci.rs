@@ -554,6 +554,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             fpu_value: state.fpu_value,
             fpu_value_at_root: state.fpu_value_at_root,
             fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.0,
             policy_softmax_temp: state.policy_softmax_temp,
             draw_score: state.draw_score,
             value_scale: 1.0,

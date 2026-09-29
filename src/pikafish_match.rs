@@ -309,6 +309,7 @@ fn play_one_game(
                     fpu_value: config.fpu_value,
                     fpu_value_at_root: config.fpu_value_at_root,
                     fpu_absolute_at_root: true,
+                    minimum_kldgain_per_node: 0.0,
                     policy_softmax_temp: config.policy_softmax_temp,
                     draw_score: 0.0,
                     value_scale: 1.0,

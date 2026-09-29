@@ -42,6 +42,7 @@ pub struct AzSearchLimits {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub fpu_absolute_at_root: bool,
+    pub minimum_kldgain_per_node: f32,
     /// Divisor applied to policy logits before softmax. Values above 1 flatten priors.
     pub policy_softmax_temp: f32,
     pub draw_score: f32,
@@ -51,7 +52,7 @@ pub struct AzSearchLimits {
 impl Default for AzSearchLimits {
     fn default() -> Self {
         Self {
-            simulations: 400,
+            simulations: 10_000,
             seed: 0,
             cpuct: DEFAULT_CPUCT,
             cpuct_at_root: DEFAULT_CPUCT_AT_ROOT,
@@ -65,6 +66,7 @@ impl Default for AzSearchLimits {
             fpu_value: 0.23,
             fpu_value_at_root: 1.0,
             fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.0,
             policy_softmax_temp: 1.4,
             draw_score: 0.0,
             value_scale: 1.0,
@@ -176,11 +178,14 @@ pub fn alphazero_search_trace_with_rules(
     );
     let root = tree.root;
     tree.expand(root);
+    let mut stopper = KldGainStopper::default();
     let mut used = 0;
     for _ in 0..limits.simulations {
         tree.simulate(root, 0);
         used += 1;
-        if tree.nodes[root].solved.is_some() {
+        if tree.nodes[root].solved.is_some()
+            || stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
+        {
             break;
         }
     }
@@ -297,6 +302,7 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
     }
 
     let mut used = 0usize;
+    let mut kld_stopper = KldGainStopper::default();
     let mut last_progress = Instant::now();
     {
         crate::scope_profile!("az.search.simulations");
@@ -306,7 +312,9 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             }
             tree.simulate(root, 0);
             used += 1;
-            if tree.nodes[root].solved.is_some() {
+            if tree.nodes[root].solved.is_some()
+                || kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
+            {
                 break;
             }
             if used % SEARCH_PROGRESS_POLL_SIMULATIONS == 0
@@ -381,10 +389,13 @@ pub(super) fn alphazero_search_with_rules_reusing(
     } else {
         crate::scope_profile!("az.search.simulations");
         let mut used = 0;
+        let mut kld_stopper = KldGainStopper::default();
         for _ in 0..limits.simulations {
             tree.simulate(root, 0);
             used += 1;
-            if tree.nodes[root].solved.is_some() {
+            if tree.nodes[root].solved.is_some()
+                || kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
+            {
                 break;
             }
         }
@@ -393,6 +404,42 @@ pub(super) fn alphazero_search_with_rules_reusing(
     let result = tree.search_result(used);
     tree.recycle_into(workspace);
     result
+}
+
+#[derive(Default)]
+struct KldGainStopper {
+    previous: Vec<u32>,
+    total: u32,
+}
+
+impl KldGainStopper {
+    fn should_stop(&mut self, tree: &AzTree<'_>, threshold: f32) -> bool {
+        if threshold <= 0.0 {
+            return false;
+        }
+        let total = tree.nodes[tree.root].visits;
+        if total < self.total.saturating_add(200) {
+            return false;
+        }
+        let children = tree.node_children(tree.root);
+        let mut gain = 0.0f64;
+        if self.total > 0 {
+            for (previous, child) in self.previous.iter().zip(children) {
+                if *previous > 0 {
+                    let old_p = *previous as f64 / self.total as f64;
+                    let new_p = child.visits as f64 / total as f64;
+                    gain += old_p * (old_p / new_p).ln();
+                }
+            }
+            if gain / ((total - self.total) as f64) < threshold as f64 {
+                return true;
+            }
+        }
+        self.previous.clear();
+        self.previous.extend(children.iter().map(|child| child.visits));
+        self.total = total;
+        false
+    }
 }
 
 pub fn cp_from_q(q: f32) -> i32 {
@@ -1789,13 +1836,42 @@ mod tests {
     }
 
     #[test]
-    fn fixed_budget_is_executed_by_all_search_paths() {
+    fn kld_stopper_stops_stable_distribution_and_keeps_changing_distribution() {
+        let position = Position::startpos();
+        let model = AzNnue::random(4, 7);
+        let moves = position.legal_moves()[..2].to_vec();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            Some(moves),
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.expand(tree.root);
+        let mut stopper = KldGainStopper::default();
+        tree.node_children_mut(tree.root)[0].visits = 100;
+        tree.node_children_mut(tree.root)[1].visits = 100;
+        tree.nodes[tree.root].visits = 200;
+        assert!(!stopper.should_stop(&tree, 0.00005));
+        tree.node_children_mut(tree.root)[0].visits = 300;
+        tree.nodes[tree.root].visits = 400;
+        assert!(!stopper.should_stop(&tree, 0.00005));
+        tree.node_children_mut(tree.root)[0].visits = 450;
+        tree.node_children_mut(tree.root)[1].visits = 150;
+        tree.nodes[tree.root].visits = 600;
+        assert!(stopper.should_stop(&tree, 0.00005));
+        assert!(!stopper.should_stop(&tree, 0.0));
+    }
+
+    #[test]
+    fn px0_kld_stopping_is_executed_by_all_search_paths() {
         let position = Position::startpos();
         let history = position.initial_rule_history();
         let mv = position.legal_moves()[0];
         let model = AzNnue::random(4, 7);
         let limits = AzSearchLimits {
-            simulations: 400,
+            simulations: 10_000,
+            minimum_kldgain_per_node: 0.00005,
             ..AzSearchLimits::default()
         };
         let ordinary = alphazero_search_with_rules(
@@ -1826,6 +1902,18 @@ mod tests {
             assert_eq!(result.simulations, 400);
             assert_eq!(result.candidates[0].visits, 400);
         }
+        let fixed_budget = alphazero_search_with_rules(
+            &position,
+            None,
+            Some(vec![mv]),
+            &model,
+            AzSearchLimits {
+                simulations: 512,
+                minimum_kldgain_per_node: 0.0,
+                ..limits
+            },
+        );
+        assert_eq!(fixed_budget.simulations, 512);
     }
 
     #[test]
