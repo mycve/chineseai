@@ -5,10 +5,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-#[path = "uci_search.rs"]
-mod uci_search;
-pub(crate) use uci_search::{AzUciSearchResult, search_uci};
-
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, POLICY_ACCUMULATOR_RANK, SplitMix64,
     color_index, rule_context_features,
@@ -143,7 +139,7 @@ impl AzSearchControl {
         Self { stop, deadline }
     }
 
-    fn should_stop(&self) -> bool {
+    pub(crate) fn should_stop(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
             || self
                 .deadline

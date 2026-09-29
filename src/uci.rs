@@ -12,16 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_UCI_SIMULATIONS: usize = u32::MAX as usize - 1;
-// MCTS 会保留整棵搜索树，`go infinite` 必须限制单棵树规模以免 GUI 长时间分析 OOM。
 const MAX_UCI_TIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const DEFAULT_SIMULATIONS: usize = 800;
-const DEFAULT_CPUCT: f32 = 1.0;
-const DEFAULT_CPUCT_AT_ROOT: f32 = 1.9;
-const DEFAULT_CPUCT_BASE: f32 = 38_739.0;
-const DEFAULT_CPUCT_FACTOR: f32 = 3.894;
-const DEFAULT_FPU_VALUE: f32 = 0.23;
-const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
-const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
+const DEFAULT_SIMULATIONS: usize = 10_000;
 const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 
 #[derive(Clone)]
@@ -32,19 +24,9 @@ struct UciState {
     model: Option<Arc<AzNnue>>,
     simulations: usize,
     threads: usize,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    cpuct_base: f32,
-    cpuct_factor: f32,
-    cpuct_base_at_root: f32,
-    cpuct_factor_at_root: f32,
-    fpu_value: f32,
-    fpu_value_at_root: f32,
-    policy_softmax_temp: f32,
     opening_temp_plies: usize,
     opening_temperature: f32,
     game_ply: Option<usize>,
-    draw_score: f32,
     sixty_move_rule: bool,
     rule60_max_ply: u16,
     seed: u64,
@@ -56,23 +38,13 @@ impl Default for UciState {
         Self {
             position: Position::startpos(),
             rule_history: Position::startpos().initial_rule_history(),
-            eval_file: "model.safetensors".into(),
+            eval_file: "best.safetensors".into(),
             model: None,
             simulations: DEFAULT_SIMULATIONS,
             threads: 1,
-            cpuct: DEFAULT_CPUCT,
-            cpuct_at_root: DEFAULT_CPUCT_AT_ROOT,
-            cpuct_base: DEFAULT_CPUCT_BASE,
-            cpuct_factor: DEFAULT_CPUCT_FACTOR,
-            cpuct_base_at_root: DEFAULT_CPUCT_BASE,
-            cpuct_factor_at_root: DEFAULT_CPUCT_FACTOR,
-            fpu_value: DEFAULT_FPU_VALUE,
-            fpu_value_at_root: DEFAULT_FPU_VALUE_AT_ROOT,
-            policy_softmax_temp: DEFAULT_POLICY_SOFTMAX_TEMP,
             opening_temp_plies: 0,
             opening_temperature: DEFAULT_OPENING_TEMPERATURE,
             game_ply: Some(0),
-            draw_score: 0.0,
             sixty_move_rule: true,
             rule60_max_ply: 120,
             seed: 20260409,
@@ -156,24 +128,14 @@ fn stop_active_search(active_search: &mut Option<ActiveSearch>) {
 }
 
 fn print_uci_id() {
-    println!("id name ChineseAI AZ-NNUE");
+    println!("id name ChineseAI AB-NNUE");
     println!("id author ChineseAI");
-    println!("option name EvalFile type string default model.safetensors");
-    println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
+    println!("option name EvalFile type string default best.safetensors");
+    println!("option name SearchNodes type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name MultiPV type spin default 1 min 1 max 64");
-    println!("option name Cpuct type string default {DEFAULT_CPUCT}");
-    println!("option name CpuctAtRoot type string default {DEFAULT_CPUCT_AT_ROOT}");
-    println!("option name CpuctBase type string default {DEFAULT_CPUCT_BASE}");
-    println!("option name CpuctFactor type string default {DEFAULT_CPUCT_FACTOR}");
-    println!("option name CpuctBaseAtRoot type string default {DEFAULT_CPUCT_BASE}");
-    println!("option name CpuctFactorAtRoot type string default {DEFAULT_CPUCT_FACTOR}");
-    println!("option name FpuValue type string default {DEFAULT_FPU_VALUE}");
-    println!("option name FpuValueAtRoot type string default {DEFAULT_FPU_VALUE_AT_ROOT}");
-    println!("option name PolicySoftmaxTemp type string default {DEFAULT_POLICY_SOFTMAX_TEMP}");
     println!("option name OpeningTempPlies type spin default 0 min 0 max 1000");
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
-    println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
     println!("uciok");
@@ -220,51 +182,12 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.eval_file = value;
             state.model = None;
         }
-        "simulations" => {
+        "searchnodes" => {
             state.simulations = value.parse::<usize>().unwrap_or(state.simulations).max(1);
         }
         "threads" => {
             let _ = value;
             state.threads = 1;
-        }
-        "cpuct" => {
-            state.cpuct = value.parse::<f32>().unwrap_or(state.cpuct).max(0.0);
-        }
-        "cpuctatroot" => {
-            state.cpuct_at_root = value.parse::<f32>().unwrap_or(state.cpuct_at_root).max(0.0);
-        }
-        "cpuctbase" => {
-            state.cpuct_base = value.parse::<f32>().unwrap_or(state.cpuct_base).max(1.0);
-        }
-        "cpuctfactor" => {
-            state.cpuct_factor = value.parse::<f32>().unwrap_or(state.cpuct_factor).max(0.0);
-        }
-        "cpuctbaseatroot" => {
-            state.cpuct_base_at_root = value
-                .parse::<f32>()
-                .unwrap_or(state.cpuct_base_at_root)
-                .max(1.0);
-        }
-        "cpuctfactoratroot" => {
-            state.cpuct_factor_at_root = value
-                .parse::<f32>()
-                .unwrap_or(state.cpuct_factor_at_root)
-                .max(0.0);
-        }
-        "fpuvalue" => {
-            state.fpu_value = value.parse::<f32>().unwrap_or(state.fpu_value).max(0.0);
-        }
-        "fpuvalueatroot" => {
-            state.fpu_value_at_root = value
-                .parse::<f32>()
-                .unwrap_or(state.fpu_value_at_root)
-                .max(0.0);
-        }
-        "policysoftmaxtemp" => {
-            state.policy_softmax_temp = value
-                .parse::<f32>()
-                .unwrap_or(state.policy_softmax_temp)
-                .max(1.0e-3);
         }
         "openingtempplies" => {
             state.opening_temp_plies = value
@@ -278,12 +201,6 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             {
                 state.opening_temperature = temperature.clamp(0.0, 2.0);
             }
-        }
-        "drawscore" => {
-            state.draw_score = value
-                .parse::<f32>()
-                .unwrap_or(state.draw_score)
-                .clamp(-1.0, 1.0);
         }
         "sixty move rule" => {
             state.sixty_move_rule = value.eq_ignore_ascii_case("true");
@@ -510,18 +427,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let started = Instant::now();
     let deadline = budget_ms.map(|budget| started + Duration::from_millis(budget));
     let control = AzSearchControl::new(Arc::clone(&stop), deadline);
-    println!(
-        "info string searchparams cpuct={:.4}/{:.4} base={:.1}/{:.1} factor={:.4}/{:.4} fpu={:.4}/{:.4} policytemp={:.4}",
-        state.cpuct,
-        state.cpuct_at_root,
-        state.cpuct_base,
-        state.cpuct_base_at_root,
-        state.cpuct_factor,
-        state.cpuct_factor_at_root,
-        state.fpu_value,
-        state.fpu_value_at_root,
-        state.policy_softmax_temp
-    );
+    println!("info string searchparams mode=alphabeta nodes={simulations}");
     flush();
     let mut last_score_source = None;
     let mut report_progress = |progress: &AzUciSearchResult| {
@@ -541,23 +447,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         model,
         AzSearchLimits {
             simulations,
-            seed: state.seed,
-            cpuct: state.cpuct,
-            cpuct_at_root: state.cpuct_at_root,
-            cpuct_base: state.cpuct_base,
-            cpuct_factor: state.cpuct_factor,
-            cpuct_base_at_root: state.cpuct_base_at_root,
-            cpuct_factor_at_root: state.cpuct_factor_at_root,
             max_depth: params.depth.unwrap_or(0),
-            root_dirichlet_alpha: 0.0,
-            root_exploration_fraction: 0.0,
-            fpu_value: state.fpu_value,
-            fpu_value_at_root: state.fpu_value_at_root,
-            fpu_absolute_at_root: true,
-            minimum_kldgain_per_node: 0.0,
-            policy_softmax_temp: state.policy_softmax_temp,
-            draw_score: state.draw_score,
-            value_scale: 1.0,
+            ..AzSearchLimits::default()
         },
         &control,
         state.multipv,
@@ -748,15 +639,7 @@ mod tests {
     fn state_defaults_use_the_single_uci_default_source() {
         let state = UciState::default();
         assert_eq!(state.simulations, DEFAULT_SIMULATIONS);
-        assert_eq!(state.cpuct, DEFAULT_CPUCT);
-        assert_eq!(state.cpuct_at_root, DEFAULT_CPUCT_AT_ROOT);
-        assert_eq!(state.cpuct_base, DEFAULT_CPUCT_BASE);
-        assert_eq!(state.cpuct_factor, DEFAULT_CPUCT_FACTOR);
-        assert_eq!(state.cpuct_base_at_root, DEFAULT_CPUCT_BASE);
-        assert_eq!(state.cpuct_factor_at_root, DEFAULT_CPUCT_FACTOR);
-        assert_eq!(state.fpu_value, DEFAULT_FPU_VALUE);
-        assert_eq!(state.fpu_value_at_root, DEFAULT_FPU_VALUE_AT_ROOT);
-        assert_eq!(state.policy_softmax_temp, DEFAULT_POLICY_SOFTMAX_TEMP);
+        assert_eq!(state.eval_file, "best.safetensors");
         assert_eq!(state.opening_temp_plies, 0);
         assert_eq!(state.opening_temperature, DEFAULT_OPENING_TEMPERATURE);
         assert_eq!(state.game_ply, Some(0));
@@ -811,10 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_softmax_temperature_is_configurable() {
+    fn search_node_limit_is_configurable() {
         let mut state = UciState::default();
-        handle_setoption("setoption name PolicySoftmaxTemp value 1.5", &mut state);
-        assert_eq!(state.policy_softmax_temp, 1.5);
+        handle_setoption("setoption name SearchNodes value 4096", &mut state);
+        assert_eq!(state.simulations, 4096);
     }
 
     #[test]

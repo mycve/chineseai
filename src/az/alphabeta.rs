@@ -1,5 +1,17 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
-use super::{AzCandidate, AzNnue, AzSearchResult, cp_from_q};
+use super::{AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzSearchResult, cp_from_q};
+
+pub(crate) struct AzUciPv {
+    pub moves: Vec<Move>,
+    pub wdl: [f32; 3],
+    pub q: f32,
+    pub proven: Option<i8>,
+}
+
+pub(crate) struct AzUciSearchResult {
+    pub search: AzSearchResult,
+    pub variations: Vec<AzUciPv>,
+}
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry, RuleOutcome};
 
 const MATE: f32 = 1.0;
@@ -9,6 +21,9 @@ struct Search<'a> {
     nodes: usize,
     limit: usize,
     exhausted: bool,
+    quiescence_nodes: usize,
+    history_scores: [[u32; 90]; 90],
+    control: Option<&'a AzSearchControl>,
 }
 
 impl Search<'_> {
@@ -18,15 +33,73 @@ impl Search<'_> {
             .clamp(-1.0, 1.0)
     }
 
+    fn quiescence(
+        &mut self,
+        position: &mut Position,
+        history: &mut Vec<RuleHistoryEntry>,
+        remaining: usize,
+        mut alpha: f32,
+        beta: f32,
+    ) -> f32 {
+        if self.nodes >= self.limit || self.control.is_some_and(AzSearchControl::should_stop) {
+            self.exhausted = true;
+            return 0.0;
+        }
+        self.nodes += 1;
+        self.quiescence_nodes += 1;
+        if let Some(outcome) = position.rule_outcome_with_history(history) {
+            return outcome_value(outcome, position.side_to_move());
+        }
+        let moves = position.legal_moves_with_rules(history);
+        if moves.is_empty() {
+            return -MATE;
+        }
+        let checked = position.in_check(position.side_to_move());
+        let stand_pat = self.evaluate(position, history, &moves);
+        if remaining == 0 {
+            return stand_pat;
+        }
+        if !checked {
+            if stand_pat >= beta {
+                return stand_pat;
+            }
+            alpha = alpha.max(stand_pat);
+        }
+        let mut tactical = moves
+            .into_iter()
+            .filter(|mv| checked || position.is_capture(*mv))
+            .collect::<Vec<_>>();
+        tactical.sort_by_key(|mv| position.piece_at(mv.to as usize).is_none());
+        let mut best = if checked { -2.0 } else { stand_pat };
+        for mv in tactical {
+            let mover = position.side_to_move();
+            let captured = position.piece_at(mv.to as usize);
+            let undo = position.make_move(mv);
+            history.push(position.rule_history_entry_after_moved(mover, mv, captured));
+            let score = -self.quiescence(position, history, remaining - 1, -beta, -alpha);
+            history.pop();
+            position.unmake_move(mv, undo);
+            if self.exhausted {
+                return 0.0;
+            }
+            best = best.max(score);
+            alpha = alpha.max(best);
+            if alpha >= beta {
+                break;
+            }
+        }
+        best
+    }
+
     fn negamax(
         &mut self,
-        position: &Position,
+        position: &mut Position,
         history: &mut Vec<RuleHistoryEntry>,
         depth: usize,
         mut alpha: f32,
         beta: f32,
     ) -> f32 {
-        if self.nodes >= self.limit {
+        if self.nodes >= self.limit || self.control.is_some_and(AzSearchControl::should_stop) {
             self.exhausted = true;
             return 0.0;
         }
@@ -39,26 +112,44 @@ impl Search<'_> {
             return -MATE;
         }
         if depth == 0 {
-            return self.evaluate(position, history, &moves);
+            // The legal-move check above keeps stalemate and checkmate exact.
+            return self.quiescence(position, history, 6, alpha, beta);
         }
-        moves.sort_by_key(|mv| position.piece_at(mv.to as usize).is_none());
+        moves.sort_by_key(|mv| {
+            let capture = position.piece_at(mv.to as usize).is_some();
+            let history = self.history_scores[mv.from as usize][mv.to as usize];
+            (!capture, std::cmp::Reverse(history))
+        });
         let mut best = -2.0f32;
+        let mut first = true;
         for mv in moves {
-            let mut next = position.clone();
             let mover = position.side_to_move();
             let captured = position.piece_at(mv.to as usize);
-            next.make_move(mv);
-            history.push(next.rule_history_entry_after_moved(mover, mv, captured));
-            let score = -self.negamax(&next, history, depth - 1, -beta, -alpha);
+            let undo = position.make_move(mv);
+            history.push(position.rule_history_entry_after_moved(mover, mv, captured));
+            let mut score = if first {
+                -self.negamax(position, history, depth - 1, -beta, -alpha)
+            } else {
+                -self.negamax(position, history, depth - 1, -alpha - 0.0001, -alpha)
+            };
+            if !first && !self.exhausted && score > alpha && score < beta {
+                score = -self.negamax(position, history, depth - 1, -beta, -alpha);
+            }
             history.pop();
+            position.unmake_move(mv, undo);
             if self.exhausted {
                 return 0.0;
             }
             best = best.max(score);
             alpha = alpha.max(best);
             if alpha >= beta {
+                if captured.is_none() {
+                    let history = &mut self.history_scores[mv.from as usize][mv.to as usize];
+                    *history = history.saturating_add((depth * depth) as u32);
+                }
                 break;
             }
+            first = false;
         }
         best
     }
@@ -84,26 +175,81 @@ pub(super) fn search(
     model: &AzNnue,
     node_limit: usize,
 ) -> AzSearchResult {
+    search_with_control(
+        position,
+        history,
+        moves,
+        model,
+        node_limit,
+        16,
+        None,
+        |_| {},
+    )
+}
+
+fn search_with_control(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    moves: Vec<Move>,
+    model: &AzNnue,
+    node_limit: usize,
+    max_depth: usize,
+    control: Option<&AzSearchControl>,
+    mut progress: impl FnMut(&AzSearchResult),
+) -> AzSearchResult {
     let root_wdl = model.evaluate_wdl_with_rules(position, history, &moves);
     let mut engine = Search {
         model,
         nodes: 0,
-        limit: node_limit.max(moves.len() + 1),
+        limit: node_limit.max(1),
         exhausted: false,
+        quiescence_nodes: 0,
+        history_scores: [[0; 90]; 90],
+        control,
     };
-    let mut scores = vec![0.0; moves.len()];
-    let mut completed_depth = 0;
-    // A complete iteration supplies comparable scores for every root move.
-    for depth in 1..=16 {
-        let mut trial = vec![0.0; moves.len()];
-        for (index, &mv) in moves.iter().enumerate() {
+    let mut scores = moves
+        .iter()
+        .map(|&mv| {
             let mut next = position.clone();
             let mover = position.side_to_move();
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             let mut line = history.to_vec();
             line.push(next.rule_history_entry_after_moved(mover, mv, captured));
-            trial[index] = -engine.negamax(&next, &mut line, depth - 1, -2.0, 2.0);
+            if let Some(outcome) = next.rule_outcome_with_history(&line) {
+                -outcome_value(outcome, next.side_to_move())
+            } else {
+                let replies = next.legal_moves_with_rules(&line);
+                if replies.is_empty() {
+                    MATE
+                } else {
+                    -model
+                        .evaluate_value_with_rules(&next, &line, &replies)
+                        .clamp(-1.0, 1.0)
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let solved = root_proofs(position, history, &moves);
+    // The initial child evaluations form a complete one-ply fallback.
+    let mut completed_depth = 1;
+    // A complete iteration supplies comparable scores for every root move.
+    for depth in 1..=max_depth.max(1) {
+        if control.is_some_and(AzSearchControl::should_stop) {
+            break;
+        }
+        let mut trial = vec![0.0; moves.len()];
+        let mut order = (0..moves.len()).collect::<Vec<_>>();
+        order.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        for index in order {
+            let mv = moves[index];
+            let mut next = position.clone();
+            let mover = position.side_to_move();
+            let captured = position.piece_at(mv.to as usize);
+            next.make_move(mv);
+            let mut line = history.to_vec();
+            line.push(next.rule_history_entry_after_moved(mover, mv, captured));
+            trial[index] = -engine.negamax(&mut next, &mut line, depth - 1, -2.0, 2.0);
             if engine.exhausted {
                 break;
             }
@@ -113,11 +259,38 @@ pub(super) fn search(
         }
         scores = trial;
         completed_depth = depth;
+        progress(&build_result_with_proofs(
+            &moves,
+            &scores,
+            &solved,
+            root_wdl,
+            engine.nodes,
+            completed_depth,
+            false,
+            max_depth,
+        ));
         if scores.iter().any(|&score| score >= MATE) {
             break;
         }
     }
-    let solved: Vec<Option<i8>> = moves
+    build_result_with_proofs(
+        &moves,
+        &scores,
+        &solved,
+        root_wdl,
+        engine.nodes,
+        completed_depth,
+        engine.exhausted,
+        max_depth,
+    )
+}
+
+fn root_proofs(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    moves: &[Move],
+) -> Vec<Option<i8>> {
+    moves
         .iter()
         .map(|&mv| {
             let mut next = position.clone();
@@ -135,7 +308,19 @@ pub(super) fn search(
                     .map(|outcome| -(outcome_value(outcome, next.side_to_move()) as i8))
             }
         })
-        .collect();
+        .collect()
+}
+
+fn build_result_with_proofs(
+    moves: &[Move],
+    scores: &[f32],
+    solved: &[Option<i8>],
+    root_wdl: [f32; 3],
+    nodes: usize,
+    completed_depth: usize,
+    exhausted: bool,
+    max_depth: usize,
+) -> AzSearchResult {
     let has_win = solved.contains(&Some(1));
     let best_index = scores
         .iter()
@@ -193,18 +378,84 @@ pub(super) fn search(
         value_wdl: wdl,
         network_value_wdl: root_wdl,
         best_value_wdl: wdl,
-        simulations: engine.nodes,
+        simulations: nodes,
         search_depth_avg: completed_depth as f32,
         search_depth_max: completed_depth,
-        search_depth_limit: 16,
-        search_depth_cutoffs: usize::from(engine.exhausted),
+        search_depth_limit: max_depth,
+        search_depth_cutoffs: usize::from(exhausted),
         candidates,
     }
+}
+
+fn uci_report(search: AzSearchResult, multipv: usize) -> AzUciSearchResult {
+    let mut ranked = search.candidates.iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.proof_priority()
+            .cmp(&a.proof_priority())
+            .then_with(|| b.q.total_cmp(&a.q))
+    });
+    if let Some(best) = search.best_move
+        && let Some(index) = ranked.iter().position(|candidate| candidate.mv == best)
+    {
+        let chosen = ranked.remove(index);
+        ranked.insert(0, chosen);
+    }
+    let variations = ranked
+        .into_iter()
+        .take(multipv.max(1))
+        .map(|candidate| {
+            let q = candidate.q;
+            let wdl = if let Some(proven) = candidate.solved {
+                match proven {
+                    1 => [1.0, 0.0, 0.0],
+                    -1 => [0.0, 0.0, 1.0],
+                    _ => [0.0, 1.0, 0.0],
+                }
+            } else {
+                [(q + 1.0) * 0.5, 0.0, (1.0 - q) * 0.5]
+            };
+            AzUciPv {
+                moves: vec![candidate.mv],
+                wdl,
+                q,
+                proven: candidate.solved,
+            }
+        })
+        .collect();
+    AzUciSearchResult { search, variations }
+}
+
+pub(crate) fn search_uci(
+    position: &Position,
+    history: Vec<RuleHistoryEntry>,
+    root_moves: Vec<Move>,
+    model: &AzNnue,
+    limits: AzSearchLimits,
+    control: &AzSearchControl,
+    multipv: usize,
+    mut progress: impl FnMut(&AzUciSearchResult),
+) -> AzUciSearchResult {
+    let search = search_with_control(
+        position,
+        &history,
+        root_moves,
+        model,
+        limits.simulations,
+        if limits.max_depth == 0 {
+            64
+        } else {
+            limits.max_depth.min(64)
+        },
+        Some(control),
+        |snapshot| progress(&uci_report(snapshot.clone(), multipv)),
+    );
+    uci_report(search, multipv)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
     fn bounded_search_returns_legal_move_and_policy() {
@@ -221,5 +472,80 @@ mod tests {
             result.best_move,
             search(&position, &history, moves, &model, 64).best_move
         );
+    }
+
+    #[test]
+    fn quiescence_restores_board_and_rule_history() {
+        let mut position = Position::from_fen(
+            "2bak2r1/4a4/4b4/p2R4p/4C1n2/2P1c3P/P1r3P2/4B4/4A4/2BK1A2R w - - 1 1",
+        )
+        .unwrap();
+        let original = position.clone();
+        let mut history = position.initial_rule_history();
+        let original_history = history.clone();
+        let model = AzNnue::random(16, 11);
+        let mut engine = Search {
+            model: &model,
+            nodes: 0,
+            limit: 256,
+            exhausted: false,
+            quiescence_nodes: 0,
+            history_scores: [[0; 90]; 90],
+            control: None,
+        };
+        let _ = engine.quiescence(&mut position, &mut history, 4, -2.0, 2.0);
+        assert_eq!(position, original);
+        assert_eq!(history, original_history);
+        assert!(engine.quiescence_nodes > 1);
+    }
+
+    #[test]
+    fn uci_search_honors_stop_and_multipv() {
+        let position = Position::startpos();
+        let history = position.initial_rule_history();
+        let moves = position.legal_moves_with_rules(&history);
+        let model = AzNnue::random(16, 13);
+        let stop = Arc::new(AtomicBool::new(false));
+        let control = AzSearchControl::new(Arc::clone(&stop), None);
+        let limits = AzSearchLimits {
+            simulations: 64,
+            max_depth: 2,
+            ..Default::default()
+        };
+        let result = search_uci(
+            &position,
+            history.clone(),
+            moves.clone(),
+            &model,
+            limits,
+            &control,
+            4,
+            |_| {},
+        );
+        assert_eq!(result.variations.len(), 4);
+        assert!(result.search.simulations <= 64);
+        assert!(
+            result
+                .variations
+                .iter()
+                .all(|pv| moves.contains(&pv.moves[0]))
+        );
+        assert_eq!(
+            result.variations[0].moves[0],
+            result.search.best_move.unwrap()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stopped = search_uci(
+            &position,
+            history,
+            moves,
+            &model,
+            limits,
+            &control,
+            1,
+            |_| {},
+        );
+        assert_eq!(stopped.search.simulations, 0);
+        assert!(stopped.search.best_move.is_some());
     }
 }
