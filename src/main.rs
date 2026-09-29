@@ -2120,7 +2120,7 @@ fn main() {
                 }
                 reference
             };
-            let initial_selfplay_model = selfplay_model;
+            let initial_selfplay_model = initial_arena_reference_model.clone();
             let replay_snapshot_path = az_loop_replay_snapshot_path(&config_path);
             let mut replay_pool =
                 (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
@@ -2320,7 +2320,6 @@ fn main() {
             let trainer_config = config.clone();
             let trainer_start_update = start_update;
             let trainer_snapshot_path = replay_snapshot_path.clone();
-            let trainer_shared_model = Arc::clone(&shared_model);
             let trainer_handle = thread::spawn(move || -> io::Result<()> {
                 let mut trainer_model = model;
                 let mut trainer_pool = replay_pool;
@@ -2460,11 +2459,6 @@ fn main() {
                         cycle_end += chineseai::az::PX0_CYCLE_STEPS;
                     }
                     let candidate_model = trainer_model.clone();
-                    publish_selfplay_model(
-                        &trainer_shared_model,
-                        Arc::new(candidate_model.clone()),
-                        train_update,
-                    );
                     if trainer_tx
                         .send(TrainerEvent {
                             report,
@@ -2904,6 +2898,11 @@ fn main() {
                         }
                         if promoted {
                             arena_reference_model = deployed_model.clone();
+                            publish_selfplay_model(
+                                &shared_model,
+                                Arc::new(deployed_model.clone()),
+                                update,
+                            );
                             let best_checkpoint = save_best_checkpoint_model(
                                 &deployed_model,
                                 &config.model_path,

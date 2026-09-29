@@ -8,11 +8,11 @@ use crate::nnue::{
 };
 use crate::xiangqi::{Color, Move, Position, RuleDrawReason, RuleHistoryEntry, RuleOutcome};
 
-use super::alphazero::{AzSearchWorkspace, alphazero_search_with_rules_reusing};
+use super::alphabeta;
 use super::{
     AzCandidate, AzLoopConfig, AzNnue, AzSampleMeta, AzSearchLimits, AzStartSnapshot,
-    AzStartSource, AzTrainingSample, SplitMix64, alphazero_search_with_rules, dense_move_index,
-    normalize_wdl_target, rule_context_features, scalar_value_to_wdl_target,
+    AzStartSource, AzTrainingSample, SplitMix64, dense_move_index, normalize_wdl_target,
+    rule_context_features, scalar_value_to_wdl_target,
 };
 
 fn outcome_index(result_red: f32) -> usize {
@@ -432,7 +432,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
     let mut search_simulations = AzSearchSimulationStats::default();
-    let mut search_workspace = AzSearchWorkspace::new(model);
 
     for game_index in 0..config.games {
         let start = choose_selfplay_start(config, &mut rng, game_index);
@@ -483,14 +482,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             );
             let search = {
                 crate::scope_profile!("az.selfplay.search");
-                alphazero_search_with_rules_reusing(
-                    &position,
-                    &rule_history,
-                    legal,
-                    model,
-                    limits,
-                    &mut search_workspace,
-                )
+                alphabeta::search(&position, &rule_history, legal, model, limits.simulations)
             };
             search_simulations.simulations_sum += search.simulations;
             crate::scope_profile!("az.selfplay.post_search");
@@ -1218,19 +1210,19 @@ fn play_arena_game(
     black_model: &AzNnue,
     simulations: usize,
     max_plies: usize,
-    seed: u64,
-    cpuct: f32,
-    cpuct_at_root: f32,
-    cpuct_base: f32,
-    cpuct_factor: f32,
-    cpuct_base_at_root: f32,
-    cpuct_factor_at_root: f32,
-    fpu_value: f32,
-    fpu_value_at_root: f32,
-    fpu_absolute_at_root: bool,
-    minimum_kldgain_per_node: f32,
-    draw_score: f32,
-    policy_softmax_temp: f32,
+    _seed: u64,
+    _cpuct: f32,
+    _cpuct_at_root: f32,
+    _cpuct_base: f32,
+    _cpuct_factor: f32,
+    _cpuct_base_at_root: f32,
+    _cpuct_factor_at_root: f32,
+    _fpu_value: f32,
+    _fpu_value_at_root: f32,
+    _fpu_absolute_at_root: bool,
+    _minimum_kldgain_per_node: f32,
+    _draw_score: f32,
+    _policy_softmax_temp: f32,
 ) -> f32 {
     let mut position = initial_position.clone();
     let mut rule_history = initial_rule_history.to_vec();
@@ -1244,7 +1236,7 @@ fn play_arena_game(
             RuleOutcome::Win(Color::Black) => -1.0,
         };
     }
-    for ply in 0..max_plies {
+    for _ply in 0..max_plies {
         let legal = position.legal_moves_with_rules(&rule_history);
         if legal.is_empty() {
             return if position.side_to_move() == Color::Red {
@@ -1258,32 +1250,7 @@ fn play_arena_game(
         } else {
             black_model
         };
-        let result = alphazero_search_with_rules(
-            &position,
-            Some(rule_history.clone()),
-            Some(legal),
-            model,
-            AzSearchLimits {
-                simulations,
-                seed: seed ^ ((ply as u64) << 32),
-                cpuct,
-                cpuct_at_root,
-                cpuct_base,
-                cpuct_factor,
-                cpuct_base_at_root,
-                cpuct_factor_at_root,
-                max_depth: 0,
-                root_dirichlet_alpha: 0.0,
-                root_exploration_fraction: 0.0,
-                fpu_value,
-                fpu_value_at_root,
-                fpu_absolute_at_root,
-                minimum_kldgain_per_node,
-                policy_softmax_temp,
-                draw_score,
-                value_scale: 1.0,
-            },
-        );
+        let result = alphabeta::search(&position, &rule_history, legal, model, simulations);
         let Some(mv) = result.best_move else {
             return 0.0;
         };
@@ -1357,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn px0_kld_selfplay_records_actual_visits() {
+    fn alphabeta_selfplay_records_bounded_nodes() {
         let mut position =
             Position::from_fen("4k1b2/4a4/4ba3/p8/4cN3/3n2N1P/c8/4C4/4A4/2B1KAB2 b").unwrap();
         let checking_move = position.parse_uci_move("a3a0").unwrap();
@@ -1376,9 +1343,12 @@ mod tests {
         .into();
         let data = generate_selfplay_chunk(&AzNnue::random(4, 7), &config);
         assert_eq!(data.samples.len(), 1);
-        assert_eq!(data.samples[0].search_simulations, 400);
+        assert!(data.samples[0].search_simulations <= 10_000);
         assert_eq!(data.search_simulations.searches, 1);
-        assert_eq!(data.search_simulations.simulations_sum, 400);
+        assert_eq!(
+            data.search_simulations.simulations_sum,
+            data.samples[0].search_simulations as usize
+        );
     }
 
     #[test]

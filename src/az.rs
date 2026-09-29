@@ -5,6 +5,7 @@ use std::sync::Arc;
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
+mod alphabeta;
 mod alphazero;
 pub(crate) use alphazero::{AzUciSearchResult, search_uci};
 #[cfg(any(
