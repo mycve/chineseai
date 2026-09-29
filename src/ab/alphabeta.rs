@@ -88,6 +88,8 @@ pub(crate) struct AbUciSearchResult {
 use crate::xiangqi::{Color, Move, PieceKind, Position, RuleHistoryEntry, RuleOutcome};
 
 const MATE: f32 = 1.0;
+const MAX_STATIC_SCORE: f32 = 0.95;
+const MATE_PLY_PENALTY: f32 = 0.001;
 const TT_SIZE: usize = 1 << 15;
 
 #[derive(Clone, Copy)]
@@ -129,7 +131,7 @@ impl Search<'_> {
     ) -> f32 {
         self.model
             .evaluate_incremental_value_with_rules(position, history, hidden, &mut self.scratch)
-            .clamp(-1.0, 1.0)
+            .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE)
     }
 
     fn quiescence(
@@ -138,6 +140,7 @@ impl Search<'_> {
         history: &mut Vec<RuleHistoryEntry>,
         hidden: &[f32],
         remaining: usize,
+        ply: usize,
         mut alpha: f32,
         beta: f32,
     ) -> f32 {
@@ -148,11 +151,11 @@ impl Search<'_> {
         self.nodes += 1;
         self.quiescence_nodes += 1;
         if let Some(outcome) = position.rule_outcome_with_history(history) {
-            return outcome_value(outcome, position.side_to_move());
+            return terminal_value(outcome, position.side_to_move(), ply);
         }
         let moves = position.legal_moves_with_rules(history);
         if moves.is_empty() {
-            return -MATE;
+            return mated_at(ply);
         }
         let checked = position.in_check(position.side_to_move());
         let stand_pat = if checked {
@@ -209,6 +212,7 @@ impl Search<'_> {
                 history,
                 &child_hidden,
                 remaining.saturating_sub(1),
+                ply + 1,
                 -beta,
                 -alpha,
             );
@@ -243,11 +247,11 @@ impl Search<'_> {
         }
         self.nodes += 1;
         if let Some(outcome) = position.rule_outcome_with_history(history) {
-            return outcome_value(outcome, position.side_to_move());
+            return terminal_value(outcome, position.side_to_move(), ply);
         }
         if depth == 0 {
             // Quiescence also checks legal-move exhaustion before static evaluation.
-            return self.quiescence(position, history, hidden, 6, alpha, beta);
+            return self.quiescence(position, history, hidden, 6, ply, alpha, beta);
         }
         // Chinese perpetual-check/chase adjudication depends on the whole path.
         // A board hash alone is never sufficient for a score cutoff.
@@ -266,7 +270,7 @@ impl Search<'_> {
         }
         let mut moves = position.legal_moves_with_rules(history);
         if moves.is_empty() {
-            return -MATE;
+            return mated_at(ply);
         }
         let original_alpha = alpha;
         let checked = position.in_check(position.side_to_move());
@@ -464,6 +468,18 @@ fn outcome_value(outcome: RuleOutcome, side: Color) -> f32 {
                 -MATE
             }
         }
+    }
+}
+
+fn mated_at(ply: usize) -> f32 {
+    -MATE + MATE_PLY_PENALTY * ply.min(40) as f32
+}
+
+fn terminal_value(outcome: RuleOutcome, side: Color, ply: usize) -> f32 {
+    match outcome {
+        RuleOutcome::Draw(_) => 0.0,
+        RuleOutcome::Win(winner) if winner == side => -mated_at(ply),
+        RuleOutcome::Win(_) => mated_at(ply),
     }
 }
 
@@ -896,7 +912,7 @@ mod tests {
             control: None,
         };
         let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
-        let _ = engine.quiescence(&mut position, &mut history, &hidden, 4, -2.0, 2.0);
+        let _ = engine.quiescence(&mut position, &mut history, &hidden, 4, 1, -2.0, 2.0);
         assert_eq!(position, original);
         assert_eq!(history, original_history);
         assert!(engine.quiescence_nodes > 1);
@@ -1059,7 +1075,14 @@ mod tests {
             control: None,
         };
         let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
-        let _ = engine.quiescence(&mut position, &mut history, &hidden, 0, -2.0, 2.0);
+        let _ = engine.quiescence(&mut position, &mut history, &hidden, 0, 1, -2.0, 2.0);
         assert!(engine.quiescence_nodes > 1);
+    }
+
+    #[test]
+    fn mate_distance_prefers_faster_wins_and_slower_losses() {
+        assert!(-mated_at(1) > -mated_at(3));
+        assert!(mated_at(3) > mated_at(1));
+        assert!(-mated_at(40) > MAX_STATIC_SCORE);
     }
 }

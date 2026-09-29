@@ -20,6 +20,7 @@ use chineseai::{
     },
     opening_book::OpeningBook,
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
+    pikafish_selfplay::{SelfplayConfig, generate as generate_pikafish_selfplay},
     xiangqi::Position,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -63,6 +64,32 @@ enum CliCommand {
     VsPikafish(VsPikafishArgs),
     /// Evaluate a model against Pikafish labels stored in SQLite.
     PikafishLabelEval(PikafishLabelEvalArgs),
+    /// Bootstrap search data with Pikafish playing both colors using one NNUE.
+    PikafishSelfplay(PikafishSelfplayArgs),
+}
+
+#[derive(Args, Debug)]
+struct PikafishSelfplayArgs {
+    /// Pikafish UCI binary.
+    #[arg(long, default_value = "tools/pikafish.exe")]
+    exe: PathBuf,
+    /// NNUE file loaded through Pikafish EvalFile.
+    #[arg(long, default_value = "tools/pikafish.nnue")]
+    nnue: PathBuf,
+    /// Output TSV path.
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    games: usize,
+    #[arg(long, default_value_t = 4)]
+    depth: u32,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    /// Deterministic random opening plies, excluded from training rows.
+    #[arg(long, default_value_t = 2)]
+    opening_plies: usize,
+    #[arg(long, default_value_t = 20260930)]
+    seed: u64,
 }
 
 #[derive(Args, Debug)]
@@ -79,12 +106,16 @@ struct AbEvolveArgs {
 #[command(after_long_help = "\
 Examples:
   chineseai vs-pikafish ./tools/pikafish model.safetensors
+  chineseai vs-pikafish ./tools/pikafish.exe model.safetensors --pikafish-nnue ./tools/pikafish.nnue
   chineseai vs-pikafish ./tools/pikafish checkpoints/update-0620-model.safetensors --nodes 192
   chineseai vs-pikafish ./tools/pikafish model.safetensors --pikafish-depth 10 --games 40 --parallel-games 5
   chineseai vs-pikafish ./tools/pikafish model.safetensors --opening-book book.pgn.gz")]
 struct VsPikafishArgs {
     /// Pikafish UCI executable path.
     pikafish_exe: String,
+    /// Optional Pikafish .nnue file loaded by Pikafish via UCI EvalFile.
+    #[arg(long)]
+    pikafish_nnue: Option<String>,
     /// ChineseAI NNUE model path.
     model: String,
     /// ChineseAI alpha-beta nodes per move.
@@ -1937,6 +1968,7 @@ fn main() {
             };
             let summary = run_vs_pikafish(
                 Path::new(&pikafish_exe),
+                cmd.pikafish_nnue.as_deref().map(Path::new),
                 Path::new(&model_path),
                 &start_positions,
                 VsPikafishConfig {
@@ -1964,8 +1996,9 @@ fn main() {
                 );
             }
             println!(
-                "vs-pikafish: model={} search=alphabeta games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} nodes={}",
+                "vs-pikafish: model={} pikafish_nnue={} search=alphabeta games={} fens={} opening={} parallel={} chinese W/L/D={}/{}/{} (as_red={} as_black={}) win_reasons(general_capture={} checkmate_no_legal_moves={} rule={} pikafish_no_bestmove={} pikafish_invalid_move={} pikafish_illegal_move={}) | pikafish_depth={} max_plies={} nodes={}",
                 model_path,
+                cmd.pikafish_nnue.as_deref().unwrap_or("engine-default"),
                 summary.total_games,
                 start_positions.len(),
                 opening_mode,
@@ -1989,6 +2022,30 @@ fn main() {
         Some(CliCommand::PikafishLabelEval(cmd)) => {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
+        }
+        Some(CliCommand::PikafishSelfplay(cmd)) => {
+            let summary = generate_pikafish_selfplay(
+                &cmd.exe,
+                &cmd.nnue,
+                &cmd.output,
+                SelfplayConfig {
+                    games: cmd.games,
+                    depth: cmd.depth,
+                    max_plies: cmd.max_plies,
+                    opening_plies: cmd.opening_plies,
+                    seed: cmd.seed,
+                },
+            )
+            .unwrap_or_else(|err| panic!("pikafish-selfplay failed: {err}"));
+            println!(
+                "pikafish-selfplay: games={} decisive={} draws={} truncated={} positions={} output={}",
+                summary.games,
+                summary.decisive,
+                summary.draws,
+                summary.truncated,
+                summary.positions,
+                cmd.output.display()
+            );
         }
     };
     chineseai::profile::print_report();

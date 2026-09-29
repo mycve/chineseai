@@ -10,6 +10,12 @@
 
 网络借鉴稀疏特征累加与王桶变化时刷新的做法，搜索叶节点只计算价值头，并复用增量缓冲。当前模型是项目自己的浮点 WDL 价值单头结构，模型文件使用 safetensors；不兼容 Pikafish 的量化 `.nnue` 文件。搜索剪枝仍需通过象棋规则、节点预算和训练推理一致性测试逐项验证。
 
+最新 Pikafish 网络的精确维度、权重表和训练接线验收见 [PIKAFISH_NNUE_DESIGN.md](PIKAFISH_NNUE_DESIGN.md)。已建立 HalfKAv2_hm 特征编号和可微分桶层的基础测试；FullThreats、完整特征变换器及训练器尚未接入，因此当前 `ab-evolve` 仍训练本项目原有价值网络。
+
+对照测试可让 Pikafish 自己加载其权重：`chineseai vs-pikafish tools/pikafish.exe best.safetensors --pikafish-nnue tools/pikafish.nnue --games 2 --parallel-games 1 --opening-book ""`。程序通过 UCI `EvalFile` 设置该文件，执行一次深度 1 的预检搜索，并核对 Pikafish 报告的实际加载路径；随后才开始对局。`best.safetensors` 始终由 ChineseAI 自己加载与训练，Pikafish 的 `.nnue` 只用于对手测试，可在测试结束后删除。
+
+还可运行 `chineseai pikafish-selfplay --games 1 --depth 4 --output target/fast/pikafish-selfplay.tsv` 生成 Pikafish 同权重双边自博弈的 FEN、搜索着法与结果。开局随机步不写入样本；截断对局结果为 `?`，不得当作和棋标签。此数据入口用于新网络训练前的采集验证，当前尚未接入 `ab-evolve` 的候选网络训练与晋级。
+
 与 Pikafish 的实现对应关系：搜索采用有界历史分数、失败安静着惩罚及保守的历史相关 LMR；当前参数是本项目的启发式，尚未经过大规模对局调参。UCI 支持 `UCI_ShowWDL` 和 `Move Overhead`，同时保留项目专用的 `EvalFile`、`SearchNodes` 与象棋规则选项。Pikafish 的 `Threads`、`Hash`、`Ponder` 暂无对应的完整执行机制，当前引擎不声明这些选项。网络的王桶及双视角增量累加参考其特征处理思路，但当前浮点特征、价值头与训练格式均为独立实现；模型不能直接互换。
 
 参考源码：[Pikafish 搜索](https://github.com/official-pikafish/Pikafish/blob/master/src/search.cpp)、[Pikafish 网络结构](https://github.com/official-pikafish/Pikafish/blob/master/src/nnue/nnue_architecture.h)、[Pikafish 特征](https://github.com/official-pikafish/Pikafish/blob/master/src/nnue/features/half_ka_v2_hm.h)、[Stockfish 搜索](https://github.com/official-stockfish/Stockfish/blob/master/src/search.cpp)。

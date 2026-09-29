@@ -1,7 +1,7 @@
 //! UCI match runner: ChineseAI (NNUE alpha-beta search) vs Pikafish.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -114,9 +114,10 @@ impl ExternalUci {
         self.stdout.read_line(buf)
     }
 
-    fn handshake(&mut self) -> std::io::Result<()> {
+    fn handshake(&mut self, nnue_path: Option<&Path>) -> std::io::Result<()> {
         self.write_line("uci")?;
         let mut buf = String::new();
+        let mut has_eval_file = false;
         loop {
             if self.read_line_into(&mut buf)? == 0 {
                 return Err(std::io::Error::new(
@@ -127,6 +128,15 @@ impl ExternalUci {
             if buf.trim() == "uciok" {
                 break;
             }
+            has_eval_file |= buf.starts_with("option name EvalFile type string");
+        }
+        if let Some(path) = nnue_path {
+            if !has_eval_file {
+                return Err(std::io::Error::other(
+                    "pikafish: UCI EvalFile option missing",
+                ));
+            }
+            self.write_line(&format!("setoption name EvalFile value {}", path.display()))?;
         }
         self.write_line("isready")?;
         loop {
@@ -138,6 +148,35 @@ impl ExternalUci {
             }
             if buf.trim() == "readyok" {
                 break;
+            }
+        }
+        if let Some(path) = nnue_path {
+            // Pikafish verifies the network when search starts, not at `isready`.
+            self.write_line("position startpos")?;
+            self.write_line("go depth 1")?;
+            let mut verified = false;
+            loop {
+                if self.read_line_into(&mut buf)? == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "pikafish: EOF before NNUE verification",
+                    ));
+                }
+                let line = buf.trim();
+                if let Some(loaded) = line.strip_prefix("info string NNUE evaluation using ") {
+                    verified = loaded
+                        .strip_prefix(path.to_string_lossy().as_ref())
+                        .is_some_and(|rest| rest.starts_with(" ("));
+                }
+                if line.starts_with("bestmove ") {
+                    if !verified {
+                        return Err(std::io::Error::other(format!(
+                            "pikafish: did not confirm loading NNUE `{}`",
+                            path.display()
+                        )));
+                    }
+                    break;
+                }
             }
         }
         Ok(())
@@ -329,6 +368,7 @@ fn play_one_game(
 /// Each worker keeps one UCI child alive and plays multiple assigned games.
 pub fn run_vs_pikafish(
     pikafish_exe: &Path,
+    pikafish_nnue: Option<&Path>,
     chinese_model_path: &Path,
     start_positions: &[Position],
     config: VsPikafishConfig,
@@ -341,6 +381,7 @@ pub fn run_vs_pikafish(
     })?);
 
     let pikafish_path = pikafish_exe.to_path_buf();
+    let pikafish_nnue: Option<PathBuf> = pikafish_nnue.map(std::fs::canonicalize).transpose()?;
     let parallel = config.parallel_games.max(1).min(config.total_games);
     let start_positions = Arc::new(start_positions.to_vec());
 
@@ -352,12 +393,13 @@ pub fn run_vs_pikafish(
     let mut handles = Vec::with_capacity(parallel);
     for worker_id in 0..parallel {
         let exe = pikafish_path.clone();
+        let nnue = pikafish_nnue.clone();
         let m = Arc::clone(&model);
         let positions = Arc::clone(&start_positions);
         handles.push(thread::spawn(
             move || -> std::io::Result<Vec<(usize, bool, GameEnd, String, String)>> {
                 let mut ext = ExternalUci::spawn(&exe)?;
-                ext.handshake()?;
+                ext.handshake(nnue.as_deref())?;
                 let mut games = Vec::new();
                 for game_index in (worker_id..config.total_games).step_by(parallel) {
                     let chinese_red = game_index % 2 == 0;
