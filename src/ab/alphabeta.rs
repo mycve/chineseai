@@ -50,6 +50,8 @@ pub struct AbSearchResult {
     pub nodes: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
+    /// Deepest visited ply, including quiescence; UCI `seldepth` is ply + 1.
+    pub selective_depth: usize,
     pub search_depth_limit: usize,
     pub search_depth_cutoffs: usize,
     pub candidates: Vec<AbCandidate>,
@@ -249,11 +251,15 @@ impl ValueModel for PikafishNet {
     fn evaluate(
         &self,
         position: &Position,
-        _history: &[RuleHistoryEntry],
+        history: &[RuleHistoryEntry],
         _hidden: &[f32],
         _scratch: &mut Option<AbEvalScratch>,
     ) -> Result<f32, String> {
-        Ok((self.evaluate(position)? as f32 / 600.0).tanh())
+        Ok(
+            (self.evaluate_scaled(position, position.rule60_count_with_history(history))? as f32
+                / 600.0)
+                .tanh(),
+        )
     }
     fn root_wdl(
         &self,
@@ -274,6 +280,7 @@ struct Search<'a, M: ValueModel + ?Sized> {
     limit: usize,
     exhausted: bool,
     quiescence_nodes: usize,
+    selective_depth: usize,
     history_scores: [[i32; 90]; 90],
     killers: Vec<[Option<Move>; 2]>,
     tt: Vec<Option<TtEntry>>,
@@ -319,6 +326,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         }
         self.nodes += 1;
         self.quiescence_nodes += 1;
+        self.selective_depth = self.selective_depth.max(ply);
         if let Some(outcome) = position.rule_outcome_with_history(history) {
             return terminal_value(outcome, position.side_to_move(), ply);
         }
@@ -361,13 +369,14 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             if !checked {
                 let attacker = position.piece_at(mv.from as usize).unwrap();
                 let victim = position.piece_at(mv.to as usize).unwrap();
-                // Only consider large material sacrifices. Legal recaptures
-                // account for cannon screens, horse legs and pinned pieces.
+                // Pikafish qsearch discards losing captures below its SEE
+                // threshold. Run the slower legal-exchange search only when
+                // the captured piece cannot already pay for the attacker.
                 if victim.kind != PieceKind::General
-                    && piece_value(attacker.kind) > piece_value(victim.kind) + 200
+                    && piece_value(attacker.kind) > piece_value(victim.kind) + 106
                 {
                     let (gain, gives_check) = static_exchange_gain(position, mv);
-                    if gain < -200 && !gives_check {
+                    if gain < -106 && !gives_check {
                         continue;
                     }
                 }
@@ -433,6 +442,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             return 0.0;
         }
         self.nodes += 1;
+        self.selective_depth = self.selective_depth.max(ply);
         if let Some(outcome) = position.rule_outcome_with_history(history) {
             return terminal_value(outcome, position.side_to_move(), ply);
         }
@@ -785,6 +795,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
         limit: node_limit.max(1),
         exhausted: false,
         quiescence_nodes: 0,
+        selective_depth: 0,
         history_scores: [[0; 90]; 90],
         killers: vec![[None; 2]; 128],
         tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
@@ -917,6 +928,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
             root_wdl,
             engine.nodes,
             completed_depth,
+            engine.selective_depth,
             false,
             max_depth,
         ));
@@ -935,6 +947,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
         root_wdl,
         engine.nodes,
         completed_depth,
+        engine.selective_depth,
         engine.exhausted,
         max_depth,
     ))
@@ -985,6 +998,7 @@ fn build_result_with_proofs(
     root_wdl: [f32; 3],
     nodes: usize,
     completed_depth: usize,
+    selective_depth: usize,
     exhausted: bool,
     max_depth: usize,
 ) -> AbSearchResult {
@@ -1049,6 +1063,7 @@ fn build_result_with_proofs(
         nodes: nodes,
         search_depth_avg: completed_depth as f32,
         search_depth_max: completed_depth,
+        selective_depth,
         search_depth_limit: max_depth,
         search_depth_cutoffs: usize::from(exhausted),
         candidates,
@@ -1242,6 +1257,7 @@ mod tests {
             limit: 256,
             exhausted: false,
             quiescence_nodes: 0,
+            selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
@@ -1255,6 +1271,7 @@ mod tests {
         assert_eq!(position, original);
         assert_eq!(history, original_history);
         assert!(engine.quiescence_nodes > 1);
+        assert!(engine.selective_depth > 1);
     }
 
     #[test]
@@ -1269,6 +1286,7 @@ mod tests {
             limit: 256,
             exhausted: false,
             quiescence_nodes: 0,
+            selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
@@ -1413,6 +1431,7 @@ mod tests {
             limit: 10_000,
             exhausted: false,
             quiescence_nodes: 0,
+            selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
@@ -1481,6 +1500,7 @@ mod tests {
             [0.3, 0.4, 0.3],
             3,
             2,
+            2,
             false,
             4,
         );
@@ -1502,6 +1522,7 @@ mod tests {
             limit: 128,
             exhausted: false,
             quiescence_nodes: 0,
+            selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),

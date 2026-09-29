@@ -179,10 +179,16 @@ fn print_static_eval(state: &mut UciState) {
         return;
     }
     match state.model.as_ref().unwrap() {
-        UciModel::Pikafish(model) => match model.evaluate(&state.position) {
-            Ok(raw) => println!("NNUE evaluation: {raw:+} (internal units)"),
-            Err(error) => println!("info string eval failed: {error}"),
-        },
+        UciModel::Pikafish(model) => {
+            if state.position.in_check(state.position.side_to_move()) {
+                println!("Final evaluation: none (in check)");
+            } else {
+                match model.evaluate(&state.position) {
+                    Ok(raw) => println!("NNUE evaluation: {raw:+} (internal units)"),
+                    Err(error) => println!("info string eval failed: {error}"),
+                }
+            }
+        }
         UciModel::Native(model) => {
             let wdl = model.evaluate_wdl_with_rules(&state.position, &state.rule_history);
             let cp = (((wdl[0] - wdl[2]).clamp(-1.0, 1.0)) * 1000.0).round() as i32;
@@ -612,7 +618,7 @@ fn print_search_info(
         println!(
             "info depth {} seldepth {} multipv {} nodes {} nps {} time {} score cp {}{} pv {}",
             result.search_depth_avg.round() as usize,
-            result.search_depth_max,
+            result.selective_depth,
             index + 1,
             result.nodes,
             nps,

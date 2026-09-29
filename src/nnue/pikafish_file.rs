@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::nnue::pikafish;
-use crate::xiangqi::Position;
+use crate::xiangqi::{Color, PieceKind, Position};
 
 const VERSION: u32 = 0x6a44_8afa;
 const MAGIC: &[u8] = b"COMPRESSED_LEB128";
@@ -18,6 +18,101 @@ const BUCKETS: usize = pikafish::LAYER_STACKS;
 /// Pikafish 的搜索信息直接输出内部 Value；`eval` 追踪里的换算值另有定义。
 pub fn internal_units_from_q(q: f32) -> i32 {
     ((q.clamp(-0.95, 0.95).atanh() * 600.0).round()) as i32
+}
+
+// Pikafish types.h, identical in local release 4c17cee and later b562d6a.
+const PIECE_VALUES: [i32; 7] = [0, 219, 187, 720, 1305, 773, 144];
+
+fn material_values(position: &Position) -> (i32, i32, i32) {
+    let mut red = 0;
+    let mut black = 0;
+    let mut wdl_material = 0;
+    for sq in 0..90 {
+        if let Some(piece) = position.piece_at(sq) {
+            let (value, wdl) = match piece.kind {
+                PieceKind::General => (PIECE_VALUES[0], 0),
+                PieceKind::Advisor => (PIECE_VALUES[1], 2),
+                PieceKind::Elephant => (PIECE_VALUES[2], 3),
+                PieceKind::Horse => (PIECE_VALUES[3], 5),
+                PieceKind::Rook => (PIECE_VALUES[4], 10),
+                PieceKind::Cannon => (PIECE_VALUES[5], 5),
+                PieceKind::Soldier => (PIECE_VALUES[6], 1),
+            };
+            match piece.color {
+                Color::Red => red += value,
+                Color::Black => black += value,
+            }
+            wdl_material += wdl;
+        }
+    }
+    (red, black, wdl_material)
+}
+
+/// 当前 master `scale_evaluation`：返回行棋方视角的内部 Value。
+/// `rule60_count` 取自搜索历史；只用 FEN 时可传 `position.halfmove_clock()`。
+pub fn scale_evaluation_latest(
+    nnue: i32,
+    optimism: i32,
+    position: &Position,
+    rule60_count: u16,
+) -> i32 {
+    let (red, black, _) = material_values(position);
+    let se = if position.side_to_move() == Color::Red {
+        red - black
+    } else {
+        black - red
+    };
+    let se_norm = se * 1024 / (se.abs() + 1024);
+    let nnue_norm = nnue * 1024 / (nnue.abs() + 1024);
+    let alignment = se_norm * nnue_norm / 512;
+    let base_eval = nnue + nnue * alignment / 65_536 + optimism * alignment / 16_384;
+    let mut v = (base_eval as i64 * (80_030 + red + black) as i64 / 80_030) as i32;
+    v -= v * i32::from(rule60_count) / 244;
+    v.clamp(-31_753, 31_753)
+}
+
+/// 本地 2026-09-06 发布版使用的静态评估缩放。对应官方 commit `4c17cee`。
+pub fn scale_evaluation_release(
+    psqt: i32,
+    positional: i32,
+    optimism: i32,
+    position: &Position,
+    rule60_count: u16,
+) -> i32 {
+    let complexity = (psqt - positional).abs();
+    let optimism = optimism + (i64::from(optimism) * i64::from(complexity) / 467) as i32;
+    let nnue = psqt + positional;
+    let nnue = nnue - (i64::from(nnue) * i64::from(complexity) / 11_698) as i32;
+    let mut major_material = 0;
+    for sq in 0..90 {
+        if let Some(piece) = position.piece_at(sq) {
+            if matches!(
+                piece.kind,
+                PieceKind::Rook | PieceKind::Cannon | PieceKind::Horse
+            ) {
+                major_material += match piece.kind {
+                    PieceKind::Rook => 1305,
+                    PieceKind::Cannon => 773,
+                    _ => 720,
+                };
+            }
+        }
+    }
+    let mut v = nnue
+        + ((i64::from(nnue) * i64::from(major_material) + i64::from(optimism) * 13_371) / 36_220)
+            as i32;
+    v -= v * i32::from(rule60_count) / 244;
+    v.clamp(-31_753, 31_753)
+}
+
+/// 公开源码 `b562d6a` 的 `UCIEngine::to_cp`，及 9/6 发布版的 `eval` 换算。
+/// 本地自报 2026-09-25 的二进制 `eval` 输出与此源码不符，不能用于其换算对照。
+/// 搜索 `score cp` 直接输出内部 Value，不使用这个换算。
+pub fn normalized_cp(value: i32, position: &Position) -> i32 {
+    let (_, _, material) = material_values(position);
+    let m = material.clamp(17, 110) as f64 / 65.0;
+    let a = ((220.598_913_65 * m - 810.357_304_30) * m + 928.681_851_98) * m + 79.839_554_23;
+    (100.0 * f64::from(value) / a).round() as i32
 }
 
 #[derive(Debug)]
@@ -88,6 +183,12 @@ impl PikafishNet {
     }
 
     pub fn evaluate(&self, position: &Position) -> Result<i32, String> {
+        self.evaluate_split(position)
+            .map(|(psqt, positional)| psqt + positional)
+    }
+
+    /// 发布版评估需要分开的 PSQT 和 positional 分量。
+    pub fn evaluate_split(&self, position: &Position) -> Result<(i32, i32), String> {
         let side = position.side_to_move();
         let bucket = pikafish::layer_stack_bucket(position);
         let mut transformed = [0_u8; WIDTH];
@@ -127,7 +228,24 @@ impl PikafishNet {
         let positional =
             affine(&ac2, &[stack.b2], &stack.w2, 1)[0].wrapping_add(fc0[30].wrapping_sub(fc0[31]));
         let positional = (positional as i64 * (600 * 16) / (128 * 64 * 2)) as i32;
-        Ok(((psqt[0] - psqt[1]) / 2) / 16 + positional / 16)
+        Ok((((psqt[0] - psqt[1]) / 2) / 16, positional / 16))
+    }
+
+    /// 当前官方源码的静态评估，返回行棋方内部 Value。
+    pub fn evaluate_scaled(&self, position: &Position, rule60_count: u16) -> Result<i32, String> {
+        self.evaluate(position)
+            .map(|nnue| scale_evaluation_latest(nnue, 0, position, rule60_count))
+    }
+
+    /// 2026-09-06 发布版的缩放算法，仅用于旧版对照。
+    pub fn evaluate_scaled_release(
+        &self,
+        position: &Position,
+        rule60_count: u16,
+    ) -> Result<i32, String> {
+        self.evaluate_split(position).map(|(psqt, positional)| {
+            scale_evaluation_release(psqt, positional, 0, position, rule60_count)
+        })
     }
 }
 
@@ -306,5 +424,41 @@ mod tests {
             println!("{move_uci:?}: {actual} expected {expected}");
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn september_6_trace_final_evaluation() {
+        let path = Path::new("tools/pikafish.nnue");
+        if !path.exists() {
+            return;
+        }
+        let net = PikafishNet::load(path).unwrap();
+        let mut position = Position::startpos();
+        let initial = net.evaluate_scaled_release(&position, 0).unwrap();
+        assert_eq!(initial, 126);
+        assert_eq!(normalized_cp(initial, &position), 32);
+        assert_eq!(
+            normalized_cp(
+                net.evaluate_scaled_release(&position, 60).unwrap(),
+                &position
+            ),
+            24
+        );
+        position.make_move(position.parse_uci_move("h2e2").unwrap());
+        let child = net.evaluate_scaled_release(&position, 1).unwrap();
+        assert_eq!(normalized_cp(-child, &position), 31);
+    }
+
+    #[test]
+    fn september_22_source_scale() {
+        let path = Path::new("tools/pikafish.nnue");
+        if !path.exists() {
+            return;
+        }
+        let net = PikafishNet::load(path).unwrap();
+        let position = Position::startpos();
+        assert_eq!(net.evaluate(&position).unwrap(), 97);
+        assert_eq!(net.evaluate_scaled(&position, 0).unwrap(), 114);
+        assert_eq!(net.evaluate_scaled(&position, 60).unwrap(), 86);
     }
 }

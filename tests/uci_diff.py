@@ -16,8 +16,10 @@ from pathlib import Path
 SCORE = re.compile(r"\bscore\s+(cp|mate)\s+(-?\d+)")
 DEPTH = re.compile(r"\bdepth\s+(\d+)")
 NODES = re.compile(r"\bnodes\s+(\d+)")
+PV = re.compile(r"\bpv\s+(.+)$")
+SELDEPTH = re.compile(r"\bseldepth\s+(\d+)")
 INTERNAL = re.compile(r"NNUE evaluation:?\s+([+-]?\d+)\s*\((?:side to move, )?internal units\)")
-FINAL = re.compile(r"Final evaluation\s+([+-]?\d+(?:\.\d+)?)")
+FINAL = re.compile(r"Final evaluation:?\s+([+-]?\d+(?:\.\d+)?)")
 STARTPOS = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
 
 
@@ -63,7 +65,7 @@ class Engine:
             if done(line):
                 return result
 
-    def probe(self, position: str, depth: int):
+    def probe(self, position: str, depth: int, searchmoves: list[str]):
         self.send("ucinewgame")
         self.send(position)
         self.send("isready")
@@ -74,13 +76,16 @@ class Engine:
         evaluation = self.until(lambda line: line == "readyok")
         search = []
         if depth > 0:
-            self.send(f"go depth {depth}")
+            suffix = " searchmoves " + " ".join(searchmoves) if searchmoves else ""
+            self.send(f"go depth {depth}{suffix}")
             search = self.until(lambda line: line.startswith("bestmove "))
         info = [line for line in search if line.startswith("info ") and SCORE.search(line)]
         score_line = info[-1] if info else ""
         score = SCORE.search(score_line)
         observed_depth = DEPTH.search(score_line)
         nodes = NODES.search(score_line)
+        pv = PV.search(score_line)
+        seldepth = SELDEPTH.search(score_line)
         internal = next((INTERNAL.search(line) for line in evaluation if INTERNAL.search(line)), None)
         final = next((FINAL.search(line) for line in evaluation if FINAL.search(line)), None)
         return {
@@ -91,6 +96,8 @@ class Engine:
             "score_type": score.group(1) if score else None,
             "score": int(score.group(2)) if score else None,
             "nodes": int(nodes.group(1)) if nodes else None,
+            "seldepth": int(seldepth.group(1)) if seldepth else None,
+            "pv": pv.group(1) if pv else None,
             "bestmove": search[-1].split()[1] if search else None,
         }
 
@@ -117,6 +124,7 @@ def main():
     parser.add_argument("--pikafish-nnue", type=Path, required=True)
     parser.add_argument("--fens", type=Path, help="UTF-8 file with one FEN or UCI position command per line")
     parser.add_argument("--depths", type=int, nargs="+", default=[1, 2])
+    parser.add_argument("--searchmoves", nargs="+", default=[], help="restrict both engines to the same root moves")
     parser.add_argument("--eval-only", action="store_true", help="compare raw NNUE integers without search")
     parser.add_argument("--require-internal-equal", action="store_true", help="exit nonzero if any raw evaluation differs or is absent")
     parser.add_argument("--allow-unavailable", action="store_true", help="allow positions where an engine does not report a raw value, such as check")
@@ -141,7 +149,7 @@ def main():
         for entry in positions:
             position = entry if entry.startswith("position ") else f"position fen {entry}"
             for depth in ([0] if args.eval_only else args.depths):
-                left, right = (engine.probe(position, depth) for engine in engines)
+                left, right = (engine.probe(position, depth, args.searchmoves) for engine in engines)
                 internal_equal = (left["eval_internal_units"] == right["eval_internal_units"]
                                   if left["eval_internal_units"] is not None
                                   and right["eval_internal_units"] is not None else None)
@@ -150,7 +158,7 @@ def main():
                 elif internal_equal is None:
                     unavailable += 1
                 print(json.dumps({
-                    "position": position, "requested_depth": depth,
+                    "position": position, "requested_depth": depth, "searchmoves": args.searchmoves,
                     "chineseai": left, "pikafish": right,
                     "internal_equal": internal_equal,
                     "score_equal": (left["score"] is not None and right["score"] is not None

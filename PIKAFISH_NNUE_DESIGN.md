@@ -1,6 +1,6 @@
 # Pikafish NNUE 权重结构与训练接线
 
-基准源码固定为 `official-pikafish/Pikafish@b562d6aeac5401879e973dc53ddb56053f07bb6a`。不要根据不断变化的 `master` 直接推断文件兼容性。这里记录训练态浮点张量的**目标形状**；导出的量化 `.nnue` 还需要遵守官方的版本、结构哈希、排列和压缩编码。
+网络结构基准源码固定为 `official-pikafish/Pikafish@b562d6aeac5401879e973dc53ddb56053f07bb6a`。本地 `tools/pikafish.exe` 现自报 `Pikafish 2026-09-25`，公开仓库没有可核实的对应发布或提交；它作为黑箱实测基准，搜索静态评估实现以已公开的较新源码为依据。旧 9 月 6 日发布版公式仅保留在独立 API 中。这里记录训练态浮点张量的**目标形状**；导出的量化 `.nnue` 还需要遵守官方的版本、结构哈希、排列和压缩编码。
 
 | 部件 | 官方推理结构 | 训练态目标 |
 | --- | --- | --- |
@@ -22,6 +22,6 @@
 
 当前 `AbNnue` 仍是 1,260 输入、256 默认隐藏维、WDL 输出的独立模型，不能把它的更新称作 Pikafish 结构训练。`tools/pikafish.nnue` 通过 Pikafish 进程的 `EvalFile` 选项参与对照测试，不进入 ChineseAI 训练器。
 
-本地测试权重是 Zstandard 压缩文件。用户更新后，解压文件头的网络版本为 `0x6A448AFA`，与固定源码版本一致。ChineseAI 已完整解析结构哈希、压缩权重与量化层。一局自博弈的 48 个局面中，Pikafish 对 44 个非被将军局面报告了原始 NNUE 内部整数值，ChineseAI 与其 **44/44 完全一致**；其余 4 个局面官方 `eval` 输出 `none (in check)`，不计入数值比较。可用 `tests/uci_diff.py --eval-only --require-internal-equal --allow-unavailable` 批量复核。此结果验证当前权重的加载和已测局面的网络推理，不证明搜索剪枝一致。搜索分值的 UCI 显示已改用 Pikafish 内部单位；UCI 单 PV 根部已接入窄窗 PVS，训练及 MultiPV 的全根评分语义保留。初始局面 depth 1 现为 ChineseAI 95 内部单位、45 节点，Pikafish 22、53；depth 2 分别为 129、392 对 98、108。静态搜索已加入保守的合法回吃 SEE，仍需对齐静态评估调节、浅层剪枝、排序和节点口径。自训练权重从自己的浮点权重开始，后续导出时还需完整兼容性验证。
+本地权重是 Zstandard 压缩文件，网络版本为 `0x6A448AFA`。ChineseAI 已完整解析结构哈希、压缩权重与量化层。一局自博弈的 48 个局面中，新二进制对 44 个非被将军局面报告原始 NNUE 整数值，ChineseAI 与其 **44/44 一致**；其余 4 个局面 `eval` 输出 `none (in check)`。搜索分值采用内部单位；单 PV 根部已用窄窗 PVS，静态搜索有保守合法回吃 SEE。新二进制的最终评估换算与当前公开源码不同，ChineseAI UCI 只输出已验证的原始 NNUE 值。初始局面 depth 1：ChineseAI 111 分、45 节点、`h2e2`，新二进制 5 分、53 节点、`b2e2`；depth 2：150 分、392 节点、`h0g2`，对 165 分、108 节点、`b2e2`。这些差异表明搜索静态评估与剪枝尚未对齐，不能把权重前向数值一致当成剪枝一致。自训练权重仍需兼容量化导出与晋级验证。
 
 源码：[网络层](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/nnue_architecture.h)、[特征变换器](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/nnue_feature_transformer.h)、[HalfKAv2_hm](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/features/half_ka_v2_hm.cpp)、[FullThreats](https://github.com/official-pikafish/Pikafish/blob/b562d6aeac5401879e973dc53ddb56053f07bb6a/src/nnue/features/full_threats.cpp)。
