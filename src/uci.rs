@@ -597,13 +597,12 @@ fn choose_opening_move(
         .map(AzCandidate::proof_priority)
         .max()
         .unwrap_or(0);
-    let max_visits = candidates
+    let max_policy = candidates
         .iter()
         .filter(|candidate| candidate.proof_priority() == priority)
-        .map(|candidate| candidate.visits)
-        .max()
-        .unwrap_or(0);
-    if max_visits == 0 || temperature <= 0.0 {
+        .map(|candidate| candidate.policy.max(0.0))
+        .fold(0.0_f32, f32::max);
+    if max_policy <= 0.0 || temperature <= 0.0 {
         return best;
     }
     let exponent = 1.0 / temperature;
@@ -611,11 +610,11 @@ fn choose_opening_move(
         if candidate.proof_priority() != priority {
             return 0.0;
         }
-        let visit_ratio = candidate.visits as f32 / max_visits as f32;
-        if visit_ratio < 0.25 {
+        let policy_ratio = candidate.policy.max(0.0) / max_policy;
+        if policy_ratio < 0.25 {
             0.0
         } else {
-            visit_ratio.powf(exponent)
+            policy_ratio.powf(exponent)
         }
     };
     let total = candidates.iter().map(&weight).sum::<f32>();
@@ -775,13 +774,12 @@ mod tests {
     }
 
     #[test]
-    fn opening_temperature_samples_only_visited_moves() {
+    fn opening_temperature_samples_only_policy_moves() {
         let best = Move::new(0, 1);
         let alternate = Move::new(0, 2);
         let candidates = [
             AzCandidate {
                 mv: best,
-                visits: 80,
                 q: 0.0,
                 raw_prior: 0.0,
                 prior: 0.0,
@@ -790,7 +788,6 @@ mod tests {
             },
             AzCandidate {
                 mv: alternate,
-                visits: 20,
                 q: 0.0,
                 raw_prior: 0.0,
                 prior: 0.0,
@@ -799,7 +796,6 @@ mod tests {
             },
             AzCandidate {
                 mv: Move::new(0, 3),
-                visits: 19,
                 q: 0.0,
                 raw_prior: 0.0,
                 prior: 0.0,

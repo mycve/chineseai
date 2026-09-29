@@ -209,7 +209,7 @@ pub struct AzSelfplayData {
     pub policy_top2_sum: f32,
     pub q_gap_sum: f32,
     pub q_top1_abs_sum: f32,
-    pub visited_actions_sum: usize,
+    pub root_actions_sum: usize,
     pub shape_count: usize,
     pub opening_raw_prior_top1_sum: f32,
     pub opening_raw_prior_top2_sum: f32,
@@ -217,12 +217,12 @@ pub struct AzSelfplayData {
     pub opening_policy_top2_sum: f32,
     pub opening_q_gap_sum: f32,
     pub opening_q_top1_abs_sum: f32,
-    pub opening_visited_actions_sum: usize,
+    pub opening_root_actions_sum: usize,
     pub opening_shape_count: usize,
     pub sampled_moves: usize,
     pub sampled_best_moves: usize,
     pub best_played_q_gap_sum: f32,
-    pub played_top_visit_ratio_sum: f32,
+    pub played_top_policy_ratio_sum: f32,
     pub best_q_sum: f32,
     pub played_q_sum: f32,
     pub terminal: AzTerminalStats,
@@ -259,7 +259,7 @@ impl AzSelfplayData {
         self.policy_top2_sum += other.policy_top2_sum;
         self.q_gap_sum += other.q_gap_sum;
         self.q_top1_abs_sum += other.q_top1_abs_sum;
-        self.visited_actions_sum += other.visited_actions_sum;
+        self.root_actions_sum += other.root_actions_sum;
         self.shape_count += other.shape_count;
         self.opening_raw_prior_top1_sum += other.opening_raw_prior_top1_sum;
         self.opening_raw_prior_top2_sum += other.opening_raw_prior_top2_sum;
@@ -267,12 +267,12 @@ impl AzSelfplayData {
         self.opening_policy_top2_sum += other.opening_policy_top2_sum;
         self.opening_q_gap_sum += other.opening_q_gap_sum;
         self.opening_q_top1_abs_sum += other.opening_q_top1_abs_sum;
-        self.opening_visited_actions_sum += other.opening_visited_actions_sum;
+        self.opening_root_actions_sum += other.opening_root_actions_sum;
         self.opening_shape_count += other.opening_shape_count;
         self.sampled_moves += other.sampled_moves;
         self.sampled_best_moves += other.sampled_best_moves;
         self.best_played_q_gap_sum += other.best_played_q_gap_sum;
-        self.played_top_visit_ratio_sum += other.played_top_visit_ratio_sum;
+        self.played_top_policy_ratio_sum += other.played_top_policy_ratio_sum;
         self.best_q_sum += other.best_q_sum;
         self.played_q_sum += other.played_q_sum;
         self.terminal.add_assign(&other.terminal);
@@ -398,7 +398,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut policy_top2_sum = 0.0f32;
     let mut q_gap_sum = 0.0f32;
     let mut q_top1_abs_sum = 0.0f32;
-    let mut visited_actions_sum = 0usize;
+    let mut root_actions_sum = 0usize;
     let mut shape_count = 0usize;
     let mut opening_raw_prior_top1_sum = 0.0f32;
     let mut opening_raw_prior_top2_sum = 0.0f32;
@@ -406,12 +406,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
     let mut opening_policy_top2_sum = 0.0f32;
     let mut opening_q_gap_sum = 0.0f32;
     let mut opening_q_top1_abs_sum = 0.0f32;
-    let mut opening_visited_actions_sum = 0usize;
+    let mut opening_root_actions_sum = 0usize;
     let mut opening_shape_count = 0usize;
     let mut sampled_moves = 0usize;
     let mut sampled_best_moves = 0usize;
     let mut best_played_q_gap_sum = 0.0f32;
-    let mut played_top_visit_ratio_sum = 0.0f32;
+    let mut played_top_policy_ratio_sum = 0.0f32;
     let mut best_q_sum = 0.0f32;
     let mut played_q_sum = 0.0f32;
     let mut terminal = AzTerminalStats::default();
@@ -486,7 +486,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             policy_top2_sum += shape.policy_top2;
             q_gap_sum += shape.q_gap;
             q_top1_abs_sum += shape.q_top1_abs;
-            visited_actions_sum += shape.visited_actions;
+            root_actions_sum += shape.root_actions;
             shape_count += 1;
             entropy_all_sum += entropy;
             entropy_all_count += 1;
@@ -499,7 +499,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 opening_policy_top2_sum += shape.policy_top2;
                 opening_q_gap_sum += shape.q_gap;
                 opening_q_top1_abs_sum += shape.q_top1_abs;
-                opening_visited_actions_sum += shape.visited_actions;
+                opening_root_actions_sum += shape.root_actions;
                 opening_shape_count += 1;
             } else {
                 entropy_mid_sum += entropy;
@@ -507,21 +507,11 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
             let temperature = temperature_for_ply(config, ply);
             let mv_opt = if temperature <= 1e-6 {
-                search.best_move.or_else(|| {
-                    choose_selfplay_move(
-                        &search.candidates,
-                        temperature,
-                        config.temperature_visit_offset,
-                        &mut rng,
-                    )
-                })
+                search
+                    .best_move
+                    .or_else(|| choose_selfplay_move(&search.candidates, temperature, &mut rng))
             } else {
-                choose_selfplay_move(
-                    &search.candidates,
-                    temperature,
-                    config.temperature_visit_offset,
-                    &mut rng,
-                )
+                choose_selfplay_move(&search.candidates, temperature, &mut rng)
             };
             let Some(mv) = mv_opt else {
                 terminal.search_no_move += 1;
@@ -540,16 +530,20 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             sampled_moves += 1;
             sampled_best_moves += usize::from(move_meta.best_index == move_meta.played_index);
             best_played_q_gap_sum += (move_meta.best_q - move_meta.played_q).max(0.0);
-            let top_visits = search
+            let top_policy = search
                 .candidates
                 .iter()
-                .map(|candidate| candidate.visits)
-                .max()
-                .unwrap_or(0);
-            played_top_visit_ratio_sum += if top_visits == 0 {
+                .map(|candidate| candidate.policy.max(0.0))
+                .fold(0.0f32, f32::max);
+            let played_policy = search
+                .candidates
+                .iter()
+                .find(|candidate| candidate.mv == mv)
+                .map_or(0.0, |candidate| candidate.policy.max(0.0));
+            played_top_policy_ratio_sum += if top_policy == 0.0 {
                 0.0
             } else {
-                move_meta.played_visits as f32 / top_visits as f32
+                played_policy / top_policy
             };
             best_q_sum += move_meta.best_q;
             played_q_sum += move_meta.played_q;
@@ -683,7 +677,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         policy_top2_sum,
         q_gap_sum,
         q_top1_abs_sum,
-        visited_actions_sum,
+        root_actions_sum,
         shape_count,
         opening_raw_prior_top1_sum,
         opening_raw_prior_top2_sum,
@@ -691,12 +685,12 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         opening_policy_top2_sum,
         opening_q_gap_sum,
         opening_q_top1_abs_sum,
-        opening_visited_actions_sum,
+        opening_root_actions_sum,
         opening_shape_count,
         sampled_moves,
         sampled_best_moves,
         best_played_q_gap_sum,
-        played_top_visit_ratio_sum,
+        played_top_policy_ratio_sum,
         best_q_sum,
         played_q_sum,
         terminal,
@@ -711,20 +705,20 @@ struct PolicyShapeStats {
     policy_top2: f32,
     q_gap: f32,
     q_top1_abs: f32,
-    visited_actions: usize,
+    root_actions: usize,
 }
 
 fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
     let mut raw_top = [0.0f32; 2];
     let mut policy_top = [0.0f32; 2];
     let mut q_top = [f32::NEG_INFINITY; 2];
-    let mut visited_actions = 0usize;
+    let mut root_actions = 0usize;
     for candidate in candidates {
         insert_top2(candidate.raw_prior.max(0.0), &mut raw_top);
         insert_top2(candidate.policy.max(0.0), &mut policy_top);
-        if candidate.visits > 0 {
+        if candidate.policy > 0.0 {
             insert_top2(candidate.q, &mut q_top);
-            visited_actions += 1;
+            root_actions += 1;
         }
     }
     let q_gap = if q_top[1].is_finite() {
@@ -744,7 +738,7 @@ fn policy_shape_stats(candidates: &[AzCandidate]) -> PolicyShapeStats {
         policy_top2: policy_top[0] + policy_top[1],
         q_gap,
         q_top1_abs,
-        visited_actions,
+        root_actions,
     }
 }
 
@@ -838,7 +832,6 @@ fn root_search_meta(
         .max_by(|(_, left), (_, right)| left.q.total_cmp(&right.q))
     {
         meta.best_q = best.q;
-        meta.best_visits = best.visits;
         meta.best_index = best_index.min(u16::MAX as usize) as u16;
     }
     meta
@@ -859,7 +852,6 @@ fn move_search_meta(
         .find(|(_, candidate)| candidate.mv == mv)
     {
         meta.played_q = played.q;
-        meta.played_visits = played.visits;
         meta.played_index = played_index.min(u16::MAX as usize) as u16;
     }
     meta
@@ -937,7 +929,6 @@ fn temperature_opening_plies(config: &AzLoopConfig) -> usize {
 fn choose_selfplay_move(
     candidates: &[AzCandidate],
     temperature: f32,
-    visit_offset: f32,
     rng: &mut SplitMix64,
 ) -> Option<Move> {
     let priority = candidates.iter().map(AzCandidate::proof_priority).max()?;
@@ -954,13 +945,13 @@ fn choose_selfplay_move(
                     .then_with(|| {
                         left.policy
                             .total_cmp(&right.policy)
-                            .then_with(|| left.visits.cmp(&right.visits))
+                            .then_with(|| left.q.total_cmp(&right.q))
                     })
             })
             .map(|candidate| candidate.mv);
     }
 
-    let weights = temperature_move_weights(candidates, temperature, visit_offset);
+    let weights = temperature_move_weights(candidates, temperature);
     let total = candidates
         .iter()
         .zip(&weights)
@@ -980,30 +971,25 @@ fn choose_selfplay_move(
     fallback
 }
 
-fn temperature_move_weights(
-    candidates: &[AzCandidate],
-    temperature: f32,
-    visit_offset: f32,
-) -> Vec<f32> {
+fn temperature_move_weights(candidates: &[AzCandidate], temperature: f32) -> Vec<f32> {
     let inv_temperature = 1.0 / temperature.max(1e-3);
     let priority = candidates
         .iter()
         .map(AzCandidate::proof_priority)
         .max()
         .unwrap_or(0);
-    let max_visits = candidates
+    let max_policy = candidates
         .iter()
         .filter(|candidate| candidate.proof_priority() == priority)
-        .map(|c| (c.visits as f32 + visit_offset).max(0.0))
+        .map(|candidate| candidate.policy.max(0.0))
         .fold(0.0f32, f32::max);
     candidates
         .iter()
         .map(|candidate| {
             if candidate.proof_priority() != priority {
                 0.0
-            } else if max_visits > 0.0 {
-                ((candidate.visits as f32 + visit_offset).max(0.0) / max_visits)
-                    .powf(inv_temperature)
+            } else if max_policy > 0.0 {
+                (candidate.policy.max(0.0) / max_policy).powf(inv_temperature)
             } else {
                 candidate.prior.max(0.0).powf(inv_temperature)
             }
@@ -1235,7 +1221,6 @@ mod tests {
             generation_update: 0,
             temperature_start: 0.0,
             temperature_cutoff_plies: 0,
-            temperature_visit_offset: 0.0,
             temperature_endgame: 0.0,
             temperature_decay_delay_plies: 0,
             temperature_decay_plies: 0,
@@ -1287,19 +1272,14 @@ mod tests {
         assert_eq!(temperature_for_ply(&config, 78), 0.6);
         assert_eq!(temperature_for_ply(&config, 200), 0.6);
         let mut candidates = vec![
-            candidate_q(Move::new(0, 1), 0, 0.0),
-            candidate_q(Move::new(0, 2), 0, 0.0),
+            candidate(Move::new(0, 1), 0.0),
+            candidate(Move::new(0, 2), 0.0),
         ];
-        candidates[0].prior = 0.2;
-        candidates[1].prior = 0.8;
-        assert_eq!(
-            temperature_move_weights(&candidates, 1.0, -0.8),
-            vec![0.2, 0.8]
-        );
-        candidates[0].visits = 1;
-        candidates[1].visits = 2;
-        let weights = temperature_move_weights(&candidates, 1.0, -0.8);
-        assert!((weights[0] - 1.0 / 6.0).abs() < 1e-6);
+        candidates[0].policy = 0.2;
+        candidates[1].policy = 0.8;
+        assert_eq!(temperature_move_weights(&candidates, 1.0), vec![0.25, 1.0]);
+        let weights = temperature_move_weights(&candidates, 1.0);
+        assert_eq!(weights[0], 0.25);
         assert_eq!(weights[1], 1.0);
     }
 
@@ -1512,23 +1492,10 @@ mod tests {
     fn candidate(mv: Move, policy: f32) -> AzCandidate {
         AzCandidate {
             mv,
-            visits: (policy * 100.0) as u32,
             q: 0.0,
             raw_prior: policy,
             prior: policy,
             policy,
-            solved: None,
-        }
-    }
-
-    fn candidate_q(mv: Move, visits: u32, q: f32) -> AzCandidate {
-        AzCandidate {
-            mv,
-            visits,
-            q,
-            raw_prior: 0.0,
-            prior: 0.0,
-            policy: 0.0,
             solved: None,
         }
     }
@@ -1674,14 +1641,14 @@ mod tests {
     }
 
     #[test]
-    fn temperature_weights_remain_finite_for_large_visit_counts() {
-        for visits in [65, 85, 65_535, 85_000, u32::MAX] {
+    fn temperature_weights_remain_finite_for_small_policy_weights() {
+        for policy in [1e-8, 1e-5, 0.01, 0.5, 1.0] {
             let candidates = vec![
-                candidate_q(Move::new(0, 1), visits / 2, 0.0),
-                candidate_q(Move::new(0, 2), visits, 0.0),
+                candidate(Move::new(0, 1), policy / 2.0),
+                candidate(Move::new(0, 2), policy),
             ];
             for temperature in [0.001, 0.05, 0.6, 0.9, 1.2] {
-                let weights = temperature_move_weights(&candidates, temperature, -0.8);
+                let weights = temperature_move_weights(&candidates, temperature);
                 assert!(
                     weights
                         .iter()
@@ -1693,13 +1660,13 @@ mod tests {
     }
 
     #[test]
-    fn temperature_one_samples_directly_from_visit_counts() {
+    fn temperature_one_samples_directly_from_root_policy() {
         let candidates = vec![
-            candidate_q(Move::new(0, 1), 1, 0.0),
-            candidate_q(Move::new(0, 2), 10, 0.0),
+            candidate(Move::new(0, 1), 0.1),
+            candidate(Move::new(0, 2), 1.0),
         ];
 
-        let weights = temperature_move_weights(&candidates, 1.0, 0.0);
+        let weights = temperature_move_weights(&candidates, 1.0);
 
         assert_eq!(weights, vec![0.1, 1.0]);
     }
@@ -1718,20 +1685,19 @@ mod tests {
     }
 
     #[test]
-    fn solver_temperature_excludes_proven_losses_despite_old_visits() {
+    fn solver_temperature_excludes_proven_losses_despite_high_policy() {
         let mut lost = candidate(Move::new(0, 1), 0.99);
-        lost.visits = u32::MAX;
         lost.solved = Some(-1);
         let safe = candidate(Move::new(2, 3), 0.01);
         let moves = [lost, safe];
         let mut rng = SplitMix64::new(20260927);
         for temperature in [0.0, 0.05, 0.9, 1.2] {
             if temperature > 0.0 {
-                assert_eq!(temperature_move_weights(&moves, temperature, -0.8)[0], 0.0);
+                assert_eq!(temperature_move_weights(&moves, temperature)[0], 0.0);
             }
             for _ in 0..128 {
                 assert_eq!(
-                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng),
+                    choose_selfplay_move(&moves, temperature, &mut rng),
                     Some(moves[1].mv)
                 );
             }
@@ -1747,11 +1713,11 @@ mod tests {
         let mut rng = SplitMix64::new(20260927);
         for temperature in [0.0, 0.05, 0.9, 1.2] {
             if temperature > 0.0 {
-                assert_eq!(temperature_move_weights(&moves, temperature, -0.8)[0], 0.0);
+                assert_eq!(temperature_move_weights(&moves, temperature)[0], 0.0);
             }
             for _ in 0..128 {
                 assert_eq!(
-                    choose_selfplay_move(&moves, temperature, -0.8, &mut rng),
+                    choose_selfplay_move(&moves, temperature, &mut rng),
                     Some(moves[1].mv)
                 );
             }
@@ -1766,7 +1732,7 @@ mod tests {
         let moves = [lost, safe];
         let mut rng = SplitMix64::new(20260927);
         assert_eq!(
-            choose_selfplay_move(&moves, 0.9, -0.8, &mut rng),
+            choose_selfplay_move(&moves, 0.9, &mut rng),
             Some(moves[1].mv)
         );
     }

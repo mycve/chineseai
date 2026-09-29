@@ -829,6 +829,16 @@ fn publish_selfplay_model(
     shared.version
 }
 
+fn publish_on_promotion(
+    shared_model: &RwLock<SharedSelfplayModel>,
+    model: Arc<AzNnue>,
+    learner_update: usize,
+    decision: ArenaGateDecision,
+) -> Option<u64> {
+    (decision == ArenaGateDecision::Promote)
+        .then(|| publish_selfplay_model(shared_model, model, learner_update))
+}
+
 #[derive(Default)]
 struct PendingTrainingData {
     collection_seconds: f32,
@@ -858,7 +868,6 @@ fn build_az_loop_config(
         generation_update,
         temperature_start: config.temperature_start,
         temperature_cutoff_plies: config.temperature_cutoff_plies,
-        temperature_visit_offset: config.temperature_visit_offset,
         temperature_endgame: config.temperature_endgame,
         temperature_decay_delay_plies: config.temperature_decay_delay_plies,
         temperature_decay_plies: config.temperature_decay_plies,
@@ -888,7 +897,7 @@ fn build_async_training_report(
         .map(|p| p.samples)
         .sum::<usize>()
         .max(1) as f32;
-    let root_visit_entropy =
+    let root_policy_entropy =
         pending.selfplay.entropy_all_sum / pending.selfplay.entropy_all_count.max(1) as f32;
     let shape_count = pending.selfplay.shape_count.max(1) as f32;
     let opening_shape_count = pending.selfplay.opening_shape_count.max(1) as f32;
@@ -981,7 +990,7 @@ fn build_async_training_report(
         policy_ce: stats.policy_ce,
         policy_target_entropy: target_entropy,
         policy_kl: stats.policy_ce - target_entropy,
-        root_visit_entropy,
+        root_policy_entropy,
         entropy_opening: pending.selfplay.entropy_opening_sum
             / pending.selfplay.entropy_opening_count.max(1) as f32,
         entropy_mid: pending.selfplay.entropy_mid_sum
@@ -992,18 +1001,18 @@ fn build_async_training_report(
         policy_top2: pending.selfplay.policy_top2_sum / shape_count,
         root_q_gap: pending.selfplay.q_gap_sum / shape_count,
         root_q_top1_abs: pending.selfplay.q_top1_abs_sum / shape_count,
-        visited_actions: pending.selfplay.visited_actions_sum as f32 / shape_count,
+        root_actions: pending.selfplay.root_actions_sum as f32 / shape_count,
         opening_raw_prior_top1: pending.selfplay.opening_raw_prior_top1_sum / opening_shape_count,
         opening_raw_prior_top2: pending.selfplay.opening_raw_prior_top2_sum / opening_shape_count,
         opening_policy_top1: pending.selfplay.opening_policy_top1_sum / opening_shape_count,
         opening_policy_top2: pending.selfplay.opening_policy_top2_sum / opening_shape_count,
         opening_q_gap: pending.selfplay.opening_q_gap_sum / opening_shape_count,
         opening_q_top1_abs: pending.selfplay.opening_q_top1_abs_sum / opening_shape_count,
-        opening_visited_actions: pending.selfplay.opening_visited_actions_sum as f32
+        opening_root_actions: pending.selfplay.opening_root_actions_sum as f32
             / opening_shape_count,
         sampled_best_rate: pending.selfplay.sampled_best_moves as f32 / sampled_moves,
         avg_best_played_q_gap: pending.selfplay.best_played_q_gap_sum / sampled_moves,
-        avg_played_top_visit_ratio: pending.selfplay.played_top_visit_ratio_sum / sampled_moves,
+        avg_played_top_policy_ratio: pending.selfplay.played_top_policy_ratio_sum / sampled_moves,
         avg_best_q: pending.selfplay.best_q_sum / sampled_moves,
         avg_played_q: pending.selfplay.played_q_sum / sampled_moves,
         train_seconds,
@@ -1139,14 +1148,17 @@ fn build_arena_start_positions(
         .unwrap_or_else(|err| panic!("failed to load Px0 arena book: {err}"));
     let count = book.len();
     let positions = book
-        .next_batch(1000, 0)
+        .next_batch(config.arena_openings, 0)
         .unwrap_or_else(|err| panic!("invalid Px0 arena FEN: {err}"))
         .into_iter()
         .map(|snapshot| snapshot.position)
         .collect();
     (
         positions,
-        format!("px0(shuffled,count=1000,book_positions={count})"),
+        format!(
+            "px0(shuffled,count={},book_positions={count})",
+            config.arena_openings
+        ),
     )
 }
 
@@ -1928,7 +1940,7 @@ fn main() {
                                         value_calibration: 0.0,
                                         policy_ce: 0.0,
                                         policy_kl: 0.0,
-                                        root_visit_entropy: 0.0,
+                                        root_policy_entropy: 0.0,
                                         entropy_opening: 0.0,
                                         entropy_mid: 0.0,
                                         raw_prior_top1: 0.0,
@@ -1937,17 +1949,17 @@ fn main() {
                                         policy_top2: 0.0,
                                         root_q_gap: 0.0,
                                         root_q_top1_abs: 0.0,
-                                        visited_actions: 0.0,
+                                        root_actions: 0.0,
                                         opening_raw_prior_top1: 0.0,
                                         opening_raw_prior_top2: 0.0,
                                         opening_policy_top1: 0.0,
                                         opening_policy_top2: 0.0,
                                         opening_q_gap: 0.0,
                                         opening_q_top1_abs: 0.0,
-                                        opening_visited_actions: 0.0,
+                                        opening_root_actions: 0.0,
                                         sampled_best_rate: 0.0,
                                         avg_best_played_q_gap: 0.0,
-                                        avg_played_top_visit_ratio: 0.0,
+                                        avg_played_top_policy_ratio: 0.0,
                                         avg_best_q: 0.0,
                                         avg_played_q: 0.0,
                                         train_seconds: 0.0,
@@ -1999,7 +2011,7 @@ fn main() {
                                         value_calibration: 0.0,
                                         policy_ce: 0.0,
                                         policy_kl: 0.0,
-                                        root_visit_entropy: 0.0,
+                                        root_policy_entropy: 0.0,
                                         entropy_opening: 0.0,
                                         entropy_mid: 0.0,
                                         raw_prior_top1: 0.0,
@@ -2008,17 +2020,17 @@ fn main() {
                                         policy_top2: 0.0,
                                         root_q_gap: 0.0,
                                         root_q_top1_abs: 0.0,
-                                        visited_actions: 0.0,
+                                        root_actions: 0.0,
                                         opening_raw_prior_top1: 0.0,
                                         opening_raw_prior_top2: 0.0,
                                         opening_policy_top1: 0.0,
                                         opening_policy_top2: 0.0,
                                         opening_q_gap: 0.0,
                                         opening_q_top1_abs: 0.0,
-                                        opening_visited_actions: 0.0,
+                                        opening_root_actions: 0.0,
                                         sampled_best_rate: 0.0,
                                         avg_best_played_q_gap: 0.0,
-                                        avg_played_top_visit_ratio: 0.0,
+                                        avg_played_top_policy_ratio: 0.0,
                                         avg_best_q: 0.0,
                                         avg_played_q: 0.0,
                                         train_seconds: 0.0,
@@ -2131,7 +2143,7 @@ fn main() {
                     ),
                     ("selfplay/avg_plies", report.avg_plies),
                     ("selfplay/completed_games", completed as f32),
-                    ("selfplay/visit_policy_entropy", report.root_visit_entropy),
+                    ("selfplay/root_policy_entropy", report.root_policy_entropy),
                     (
                         "truncation/rate",
                         truncated as f32 / report.games.max(1) as f32,
@@ -2293,12 +2305,6 @@ fn main() {
                             }
                         }
                         if promoted {
-                            arena_reference_model = deployed_model.clone();
-                            publish_selfplay_model(
-                                &shared_model,
-                                Arc::new(deployed_model.clone()),
-                                update,
-                            );
                             let best_checkpoint = save_best_checkpoint_model(
                                 &deployed_model,
                                 &config.model_path,
@@ -2307,7 +2313,14 @@ fn main() {
                             );
                             save_model(&deployed_model, &best_path);
                             champion_paths.push(best_checkpoint.clone());
+                            arena_reference_model = deployed_model.clone();
                         }
+                        publish_on_promotion(
+                            &shared_model,
+                            Arc::new(deployed_model.clone()),
+                            update,
+                            gate_decision,
+                        );
 
                         console.arena(format!(
                             "arena {update:04}: games={} W/L/D={}/{}/{} score={:.3} ci={:.3}..{:.3} previous={} anchor={} decision={:?}",
@@ -3457,28 +3470,23 @@ fn evaluate_pikafish_labels(
         if result.best_move == Some(label_move) {
             stats.top1_hits += 1;
         }
-        let mut by_visits = result.candidates.clone();
-        by_visits.sort_by(|left, right| {
-            right
-                .visits
-                .cmp(&left.visits)
-                .then_with(|| right.policy.total_cmp(&left.policy))
-        });
-        if by_visits
+        let mut by_policy = result.candidates.clone();
+        by_policy.sort_by(|left, right| right.policy.total_cmp(&left.policy));
+        if by_policy
             .iter()
             .take(2)
             .any(|candidate| candidate.mv == label_move)
         {
             stats.top2_hits += 1;
         }
-        if by_visits
+        if by_policy
             .iter()
             .take(4)
             .any(|candidate| candidate.mv == label_move)
         {
             stats.top4_hits += 1;
         }
-        if by_visits
+        if by_policy
             .iter()
             .take(8)
             .any(|candidate| candidate.mv == label_move)
@@ -4258,7 +4266,7 @@ mod reporting_tests {
     use chineseai::az::AzSampleMeta;
 
     #[test]
-    fn learner_publish_advances_actor_without_arena_decision() {
+    fn only_promotion_advances_selfplay_champion() {
         let initial = Arc::new(AzNnue::random(8, 1));
         let latest = Arc::new(AzNnue::random(8, 2));
         let shared = RwLock::new(SharedSelfplayModel {
@@ -4267,10 +4275,25 @@ mod reporting_tests {
             model: initial,
         });
 
-        let version = publish_selfplay_model(&shared, Arc::clone(&latest), 8);
+        assert_eq!(
+            publish_on_promotion(&shared, Arc::clone(&latest), 8, ArenaGateDecision::Continue),
+            None
+        );
+        assert_eq!(
+            publish_on_promotion(&shared, Arc::clone(&latest), 8, ArenaGateDecision::Reject),
+            None
+        );
+        {
+            let unchanged = shared.read().unwrap();
+            assert_eq!(unchanged.version, 7);
+            assert_eq!(unchanged.learner_update, 6);
+            assert!(!Arc::ptr_eq(&unchanged.model, &latest));
+        }
+        let version =
+            publish_on_promotion(&shared, Arc::clone(&latest), 8, ArenaGateDecision::Promote);
         let published = shared.read().unwrap();
 
-        assert_eq!(version, 8);
+        assert_eq!(version, Some(8));
         assert_eq!(published.version, 8);
         assert_eq!(published.learner_update, 8);
         assert!(Arc::ptr_eq(&published.model, &latest));

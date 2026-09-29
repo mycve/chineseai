@@ -243,7 +243,7 @@ pub struct AzNnueArch {
 
 impl AzNnueArch {
     pub const fn default_const() -> Self {
-        Self { hidden_size: 64 }
+        Self { hidden_size: 256 }
     }
 
     pub const fn with_hidden_size(hidden_size: usize) -> Self {
@@ -274,7 +274,6 @@ pub(super) struct AzEvalScratch {
     policy_piece_square_scores: Vec<f32>,
     value_head: Vec<f32>,
     logits: Vec<f32>,
-    priors: Vec<f32>,
 }
 
 impl AzEvalScratch {
@@ -288,20 +287,6 @@ impl AzEvalScratch {
             policy_piece_square_scores: Vec::new(),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             logits: Vec::with_capacity(192),
-            priors: Vec::with_capacity(192),
-        }
-    }
-
-    pub(super) fn empty() -> Self {
-        Self {
-            features: Vec::new(),
-            hidden: Vec::new(),
-            policy_context: Vec::new(),
-            policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
-            policy_piece_square_scores: Vec::new(),
-            value_head: Vec::new(),
-            logits: Vec::new(),
-            priors: Vec::new(),
         }
     }
 }
@@ -313,6 +298,14 @@ pub(super) struct AzEvalAccumulator {
 }
 
 impl AzEvalAccumulator {
+    /// 在 make_move 前捕获两个视角的将帅桶；可避免为增量更新克隆整个棋盘。
+    pub(super) fn buckets_for_position(position: &Position) -> [(usize, usize); 2] {
+        [
+            canonical_buckets_for_perspective(position, Color::Red),
+            canonical_buckets_for_perspective(position, Color::Black),
+        ]
+    }
+
     pub(super) fn new(model: &AzNnue, position: &Position) -> Self {
         let mut accumulator = Self {
             hidden_sum: vec![0.0; model.hidden_size * 2],
@@ -360,12 +353,32 @@ impl AzEvalAccumulator {
         captured: Option<Piece>,
         hidden_sum: &mut [f32],
     ) {
+        Self::apply_transition_from_buckets(
+            model,
+            Self::buckets_for_position(before),
+            after,
+            mv,
+            moved,
+            captured,
+            hidden_sum,
+        );
+    }
+
+    pub(super) fn apply_transition_from_buckets(
+        model: &AzNnue,
+        before_buckets: [(usize, usize); 2],
+        after: &Position,
+        mv: Move,
+        moved: Piece,
+        captured: Option<Piece>,
+        hidden_sum: &mut [f32],
+    ) {
         debug_assert_eq!(hidden_sum.len(), model.hidden_size * 2);
         for perspective in [Color::Red, Color::Black] {
             let start = color_index(perspective) * model.hidden_size;
-            Self::apply_transition_for_perspective(
+            Self::apply_transition_for_perspective_from_buckets(
                 model,
-                before,
+                before_buckets[color_index(perspective)],
                 after,
                 mv,
                 moved,
@@ -376,9 +389,9 @@ impl AzEvalAccumulator {
         }
     }
 
-    pub(super) fn apply_transition_for_perspective(
+    fn apply_transition_for_perspective_from_buckets(
         model: &AzNnue,
-        before: &Position,
+        before_buckets: (usize, usize),
         after: &Position,
         mv: Move,
         moved: Piece,
@@ -386,7 +399,6 @@ impl AzEvalAccumulator {
         perspective: Color,
         hidden: &mut [f32],
     ) {
-        let before_buckets = canonical_buckets_for_perspective(before, perspective);
         let after_buckets = canonical_buckets_for_perspective(after, perspective);
         if before_buckets != after_buckets {
             // 将帅移动会改变所有棋子的王桶结构项，少见且必须完整刷新。
@@ -604,7 +616,6 @@ pub struct AzLoopConfig {
     pub generation_update: u32,
     pub temperature_start: f32,
     pub temperature_cutoff_plies: usize,
-    pub temperature_visit_offset: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
@@ -647,7 +658,7 @@ pub struct AzLoopReport {
     pub policy_ce: f32,
     pub policy_target_entropy: f32,
     pub policy_kl: f32,
-    pub root_visit_entropy: f32,
+    pub root_policy_entropy: f32,
     pub entropy_opening: f32,
     pub entropy_mid: f32,
     pub raw_prior_top1: f32,
@@ -656,17 +667,17 @@ pub struct AzLoopReport {
     pub policy_top2: f32,
     pub root_q_gap: f32,
     pub root_q_top1_abs: f32,
-    pub visited_actions: f32,
+    pub root_actions: f32,
     pub opening_raw_prior_top1: f32,
     pub opening_raw_prior_top2: f32,
     pub opening_policy_top1: f32,
     pub opening_policy_top2: f32,
     pub opening_q_gap: f32,
     pub opening_q_top1_abs: f32,
-    pub opening_visited_actions: f32,
+    pub opening_root_actions: f32,
     pub sampled_best_rate: f32,
     pub avg_best_played_q_gap: f32,
-    pub avg_played_top_visit_ratio: f32,
+    pub avg_played_top_policy_ratio: f32,
     pub avg_best_q: f32,
     pub avg_played_q: f32,
     pub train_seconds: f32,
@@ -977,6 +988,7 @@ pub struct AzSampleMeta {
     pub root_q: f32,
     pub best_q: f32,
     pub played_q: f32,
+    /// Legacy PX0 replay metadata; AB self-play records zero to preserve snapshot encoding.
     pub best_visits: u32,
     pub played_visits: u32,
     pub best_index: u16,
@@ -1329,16 +1341,58 @@ impl AzNnue {
         &self,
         position: &Position,
         history: &[crate::xiangqi::RuleHistoryEntry],
-        moves: &[Move],
+        _moves: &[Move],
     ) -> f32 {
         let mut scratch = AzEvalScratch::new(self.arch);
-        self.evaluate_with_scratch_output(
+        self.evaluate_value_only_with_scratch(
             position,
-            moves,
             &rule_context_features(position, history),
             &mut scratch,
         )
-        .value
+    }
+
+    /// 搜索叶节点只需要胜负值，跳过策略头和走法编码。
+    pub(super) fn evaluate_incremental_value_with_rules(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        accumulator_hidden: &[f32],
+        scratch: &mut AzEvalScratch,
+    ) -> f32 {
+        let hidden = if accumulator_hidden.len() == self.hidden_size {
+            accumulator_hidden
+        } else {
+            AzEvalAccumulator::hidden_for_slice(
+                accumulator_hidden,
+                self.hidden_size,
+                position.side_to_move(),
+            )
+        };
+        scratch.hidden.resize(self.hidden_size, 0.0);
+        scratch.hidden.copy_from_slice(hidden);
+        self.add_rule_context_to_hidden(
+            &rule_context_features(position, history),
+            &mut scratch.hidden,
+        );
+        relu_in_place(&mut scratch.hidden);
+        rms_norm_in_place(&mut scratch.hidden);
+        self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
+            .1
+    }
+
+    fn evaluate_value_only_with_scratch(
+        &self,
+        position: &Position,
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) -> f32 {
+        fill_sparse_features_az(position, &mut scratch.features);
+        self.input_embedding_linear_into(&scratch.features, &mut scratch.hidden);
+        self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
+        relu_in_place(&mut scratch.hidden);
+        rms_norm_in_place(&mut scratch.hidden);
+        self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
+            .1
     }
 
     pub fn evaluate_wdl_with_rules(
@@ -1415,45 +1469,6 @@ impl AzNnue {
         };
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         scratch.features = features;
-        AzEvalOutput { value_wdl, value }
-    }
-
-    pub(super) fn evaluate_incremental_with_scratch_output(
-        &self,
-        position: &Position,
-        accumulator_hidden: &[f32],
-        policy_accumulator: &[f32; POLICY_ACCUMULATOR_RANK],
-        moves: &[Move],
-        repetition_flags: &[u8],
-        rule_context: &[f32; RULE_CONTEXT_SIZE],
-        scratch: &mut AzEvalScratch,
-    ) -> AzEvalOutput {
-        crate::scope_profile!("az.evaluate_incremental_with_scratch");
-        scratch.hidden.resize(self.hidden_size, 0.0);
-        let hidden = if accumulator_hidden.len() == self.hidden_size {
-            accumulator_hidden
-        } else {
-            AzEvalAccumulator::hidden_for_slice(
-                accumulator_hidden,
-                self.hidden_size,
-                position.side_to_move(),
-            )
-        };
-        scratch.hidden.copy_from_slice(hidden);
-        self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
-        scratch
-            .policy_accumulator_context
-            .copy_from_slice(policy_accumulator);
-        {
-            crate::scope_profile!("az.eval.activation_norm");
-            relu_in_place(&mut scratch.hidden);
-            rms_norm_in_place(&mut scratch.hidden);
-        }
-        let (value_wdl, value) = {
-            crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
-        };
-        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         AzEvalOutput { value_wdl, value }
     }
 
@@ -2818,8 +2833,19 @@ mod tests {
             let mv = position.legal_moves()[0];
             let moved = position.piece_at(mv.from as usize).unwrap();
             let captured = position.piece_at(mv.to as usize);
+            let buckets = AzEvalAccumulator::buckets_for_position(&position);
             let before = position.clone();
             position.make_move(mv);
+            let mut from_buckets = hidden.clone();
+            AzEvalAccumulator::apply_transition_from_buckets(
+                &model,
+                buckets,
+                &position,
+                mv,
+                moved,
+                captured,
+                &mut from_buckets,
+            );
             AzEvalAccumulator::apply_transition_to_hidden(
                 &model,
                 &before,
@@ -2830,10 +2856,70 @@ mod tests {
                 &mut hidden,
             );
             let refreshed = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+            assert_eq!(from_buckets, hidden);
             for (&incremental, &full) in hidden.iter().zip(&refreshed) {
                 assert!((incremental - full).abs() < 2.0e-5);
             }
         }
+    }
+
+    #[test]
+    fn search_value_paths_match_full_network() {
+        let mut model = AzNnue::random(128, 20260929);
+        for (i, weight) in model.value_head_output.iter_mut().enumerate() {
+            *weight = (i as f32 * 0.13).sin() * 0.04;
+        }
+        let mut position = Position::startpos();
+        let mut scratch = AzEvalScratch::new(model.arch);
+        for _ in 0..12 {
+            let moves = position.legal_moves();
+            let expected = model
+                .evaluate_with_scratch_output(
+                    &position,
+                    &moves,
+                    &[0.0; RULE_CONTEXT_SIZE],
+                    &mut scratch,
+                )
+                .value;
+            let direct = model.evaluate_value_with_rules(&position, &[], &moves);
+            let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+            let incremental =
+                model.evaluate_incremental_value_with_rules(&position, &[], &hidden, &mut scratch);
+            assert!((direct - expected).abs() < 1.0e-6);
+            assert!((incremental - expected).abs() < 1.0e-6);
+            position.make_move(moves[0]);
+        }
+    }
+
+    #[test]
+    fn incremental_value_matches_full_with_repetition_context() {
+        let mut model = AzNnue::random(128, 20260930);
+        model.rule_context_hidden.fill(0.02);
+        for (i, weight) in model.value_head_output.iter_mut().enumerate() {
+            *weight = (i as f32 * 0.07).cos() * 0.05;
+        }
+        let mut position =
+            Position::from_fen("2bak4/4a4/2ncb2c1/p3p2CP/9/1N1RP4/P5r2/4C4/9/2BAKA3 b - - 0 1")
+                .unwrap();
+        let mut history = position.initial_rule_history();
+        for _ in 0..2 {
+            for text in ["c7b5", "d4d5", "b5c7", "d5d4"] {
+                let mv = position.parse_uci_move(text).unwrap();
+                history.push(position.rule_history_entry_after_move(mv));
+                position.make_move(mv);
+            }
+        }
+        let context = rule_context_features(&position, &history);
+        assert!(context[1] > 0.0, "expected a repeated board hash");
+        let moves = position.legal_moves();
+        let mut scratch = AzEvalScratch::new(model.arch);
+        let expected = model
+            .evaluate_with_scratch_output(&position, &moves, &context, &mut scratch)
+            .value;
+        let hidden = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
+        let actual =
+            model.evaluate_incremental_value_with_rules(&position, &history, &hidden, &mut scratch);
+        assert!((expected - actual).abs() < 1.0e-6);
     }
 
     #[test]
@@ -3160,7 +3246,10 @@ mod tests {
     #[test]
     fn aznnue_safetensors_roundtrip_matches_weights() {
         let model = AzNnue::random(16, 42);
-        let path = std::env::temp_dir().join("chineseai_test_aznnue_roundtrip.safetensors");
+        let path = std::env::temp_dir().join(format!(
+            "chineseai_test_aznnue_roundtrip_{}.safetensors",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         model.save(&path).unwrap();
         let loaded = AzNnue::load(&path).unwrap();
@@ -3197,7 +3286,10 @@ mod tests {
 
     #[test]
     fn replay_pool_lz4_snapshot_roundtrip() {
-        let path = std::env::temp_dir().join("chineseai_test_replay_roundtrip.replay.lz4");
+        let path = std::env::temp_dir().join(format!(
+            "chineseai_test_replay_roundtrip_{}.replay.lz4",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let pool = super::replay_pool_test_fixture();
         pool.save_snapshot_lz4(&path).unwrap();

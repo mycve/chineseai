@@ -22,7 +22,6 @@ pub struct AzLoopFileConfig {
     pub workers: usize,
     pub temperature_start: f32,
     pub temperature_cutoff_plies: usize,
-    pub temperature_visit_offset: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
@@ -40,6 +39,7 @@ pub struct AzLoopFileConfig {
     pub max_checkpoints: usize,
     pub arena_interval: usize,
     pub arena_nodes: usize,
+    pub arena_openings: usize,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_processes: usize,
@@ -63,12 +63,11 @@ impl Default for AzLoopFileConfig {
             max_plies: 450,
             sixty_move_rule: true,
             rule60_max_ply: 120,
-            hidden_size: 64,
+            hidden_size: 256,
             seed: 20260420,
             workers: 0,
             temperature_start: 0.9,
             temperature_cutoff_plies: 78,
-            temperature_visit_offset: -0.8,
             temperature_endgame: 0.6,
             temperature_decay_delay_plies: 40,
             temperature_decay_plies: 120,
@@ -86,6 +85,7 @@ impl Default for AzLoopFileConfig {
             max_checkpoints: 50,
             arena_interval: 20,
             arena_nodes: 10_000,
+            arena_openings: 1000,
             arena_promotion_rate: 0.5,
             arena_promotion_confidence_z: 1.96,
             arena_processes: 128,
@@ -124,7 +124,6 @@ impl AzLoopFileConfig {
         line!(workers);
         line!(temperature_start);
         line!(temperature_cutoff_plies);
-        line!(temperature_visit_offset);
         line!(temperature_endgame);
         line!(temperature_decay_delay_plies);
         line!(temperature_decay_plies);
@@ -142,6 +141,7 @@ impl AzLoopFileConfig {
         line!(max_checkpoints);
         line!(arena_interval);
         line!(arena_nodes);
+        line!(arena_openings);
         line!(arena_promotion_rate);
         line!(arena_promotion_confidence_z);
         line!(arena_processes);
@@ -186,6 +186,7 @@ impl AzLoopFileConfig {
         self.temperature_decay_delay_plies = self.temperature_decay_delay_plies.min(self.max_plies);
         self.temperature_decay_plies = self.temperature_decay_plies.min(self.max_plies);
         self.replay_recent_games = self.replay_recent_games.max(1);
+        self.replay_capacity = self.replay_capacity.max(self.batch_size);
         self.shuffle_size = self.shuffle_size.max(1);
         self.train_warmup_samples = self.train_warmup_samples.max(1);
         self.train_samples_per_update = self.train_samples_per_update.max(1);
@@ -197,6 +198,7 @@ impl AzLoopFileConfig {
         self.arena_promotion_rate = self.arena_promotion_rate.clamp(0.0, 1.0);
         self.arena_promotion_confidence_z = self.arena_promotion_confidence_z.max(0.0);
         self.arena_nodes = self.arena_nodes.max(1);
+        self.arena_openings = self.arena_openings.max(1);
         self.arena_interval = self.arena_interval.max(1);
         self.pikafish_label_eval_nodes = self.pikafish_label_eval_nodes.max(1);
         self
@@ -226,7 +228,24 @@ mod tests {
         let config = AzLoopFileConfig::parse(&text);
         assert_eq!(config.selfplay_nodes, 10_000);
         assert_eq!(config.arena_nodes, 10_000);
+        assert_eq!(config.arena_openings, 1000);
+        assert_eq!(config.hidden_size, 256);
         assert!(text.contains("selfplay_nodes = 10000"));
         assert!(text.contains("arena_nodes = 10000"));
+        assert!(text.contains("arena_openings = 1000"));
+    }
+
+    #[test]
+    fn normalize_keeps_training_and_arena_live() {
+        let mut config = AzLoopFileConfig::default();
+        config.replay_capacity = 0;
+        config.train_samples_per_update = 0;
+        config.arena_openings = 0;
+        config.arena_interval = 0;
+        let config = config.normalize();
+        assert!(config.replay_capacity >= config.batch_size);
+        assert_eq!(config.train_samples_per_update, 1);
+        assert_eq!(config.arena_openings, 1);
+        assert_eq!(config.arena_interval, 1);
     }
 }
