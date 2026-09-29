@@ -37,8 +37,6 @@ struct Args {
     discover_min_best_cp: i32,
     #[arg(long)]
     search_config: Option<String>,
-    #[arg(long)]
-    minimum_kldgain_per_node: Option<f32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -86,13 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fpu_value,
             fpu_value_at_root,
             fpu_absolute_at_root,
-            minimum_kldgain_per_node,
             policy_softmax_temp,
             draw_score
         );
-    }
-    if let Some(value) = args.minimum_kldgain_per_node {
-        base_limits.minimum_kldgain_per_node = value;
     }
     let model = AzNnue::load(&args.model)?;
     let text = fs::read_to_string(&args.trajectories)?;

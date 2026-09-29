@@ -6,7 +6,7 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 mod alphazero;
-pub(crate) use alphazero::{AzUciSearchCache, AzUciSearchResult, search_uci};
+pub(crate) use alphazero::{AzUciSearchResult, search_uci};
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl")),
@@ -1153,7 +1153,6 @@ pub struct AzLoopConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub fpu_absolute_at_root: bool,
-    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,

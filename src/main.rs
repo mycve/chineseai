@@ -1031,7 +1031,6 @@ fn build_az_loop_config(
         fpu_value: config.fpu_value,
         fpu_value_at_root: config.fpu_value_at_root,
         fpu_absolute_at_root: config.fpu_absolute_at_root,
-        minimum_kldgain_per_node: config.minimum_kldgain_per_node,
         draw_score: config.draw_score,
         policy_softmax_temp: config.policy_softmax_temp,
         opening_positions: Arc::clone(opening_positions),
@@ -1303,7 +1302,6 @@ fn run_arena_threads(config: ArenaThreadConfig) -> AzArenaReport {
                 fpu_value,
                 fpu_value_at_root,
                 fpu_absolute_at_root: true,
-                minimum_kldgain_per_node: 0.0,
                 draw_score,
                 policy_softmax_temp,
             };
@@ -1377,7 +1375,6 @@ fn fixed_az_search_limits(
         fpu_value: 0.23,
         fpu_value_at_root: 1.0,
         fpu_absolute_at_root: true,
-        minimum_kldgain_per_node: 0.0,
         policy_softmax_temp: policy_softmax_temp.max(1.0e-3),
         draw_score: 0.0,
         value_scale: 1.0,
@@ -1569,7 +1566,6 @@ fn main() {
                 fpu_value: cmd.fpu_value.max(0.0),
                 fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
                 fpu_absolute_at_root: true,
-                minimum_kldgain_per_node: 0.0,
                 policy_softmax_temp: cmd.policy_softmax_temp.max(1.0e-3),
                 draw_score: cmd.draw_score.clamp(-1.0, 1.0),
                 value_scale: cmd.value_scale.clamp(0.0, 1.0),
@@ -3061,7 +3057,6 @@ fn main() {
                                     fpu_value: 0.23,
                                     fpu_value_at_root: 1.0,
                                     fpu_absolute_at_root: true,
-                                    minimum_kldgain_per_node: 0.0,
                                     policy_softmax_temp: config
                                         .pikafish_label_eval_policy_softmax_temp,
                                     draw_score: config.draw_score,
@@ -4037,7 +4032,6 @@ fn run_pikafish_label_eval(cmd: PikafishLabelEvalArgs) -> io::Result<()> {
             fpu_value: cmd.fpu_value.max(0.0),
             fpu_value_at_root: cmd.fpu_value_at_root.max(0.0),
             fpu_absolute_at_root: true,
-            minimum_kldgain_per_node: 0.0,
             ..fixed_az_search_limits(
                 cmd.simulations.max(1),
                 cmd.seed,

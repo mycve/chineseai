@@ -1,11 +1,11 @@
 use crate::az::{
-    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchCache, AzUciSearchResult,
-    SplitMix64, cp_from_q, search_uci,
+    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchResult, SplitMix64, cp_from_q,
+    search_uci,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -49,7 +49,6 @@ struct UciState {
     rule60_max_ply: u16,
     seed: u64,
     multipv: usize,
-    tree_cache: Arc<Mutex<AzUciSearchCache>>,
 }
 
 impl Default for UciState {
@@ -78,7 +77,6 @@ impl Default for UciState {
             rule60_max_ply: 120,
             seed: 20260409,
             multipv: 1,
-            tree_cache: Arc::new(Mutex::new(AzUciSearchCache::default())),
         }
     }
 }
@@ -122,7 +120,6 @@ pub fn run_uci() {
             }
             Some("ucinewgame") => {
                 stop_active_search(&mut active_search);
-                state.tree_cache.lock().unwrap().clear();
                 state.position = Position::startpos();
                 apply_rule_options(&mut state);
                 state.rule_history = state.position.initial_rule_history();
@@ -212,10 +209,6 @@ fn handle_setoption(line: &str, state: &mut UciState) {
     let value = value_index
         .map(|index| tokens[index + 1..].join(" "))
         .unwrap_or_default();
-
-    if name != "multipv" {
-        state.tree_cache.lock().unwrap().clear();
-    }
 
     match name.as_str() {
         "multipv" => {
@@ -561,21 +554,15 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             fpu_value: state.fpu_value,
             fpu_value_at_root: state.fpu_value_at_root,
             fpu_absolute_at_root: true,
-            minimum_kldgain_per_node: 0.0,
             policy_softmax_temp: state.policy_softmax_temp,
             draw_score: state.draw_score,
             value_scale: 1.0,
         },
         &control,
-        &mut state.tree_cache.lock().unwrap(),
         state.multipv,
-        params.searchmoves.is_empty(),
         &mut report_progress,
     );
     let result = &report.search;
-    if report.reused_visits > 0 {
-        println!("info string tree reused visits={}", report.reused_visits);
-    }
     if let Some(proven) = high_score_source(&report) {
         if last_score_source != Some(proven) {
             print_high_score_source(&report, proven);
