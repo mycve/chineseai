@@ -23,6 +23,7 @@ pub struct TournamentConfig {
     pub opening_positions: usize,
     pub parallel_games: usize,
     pub movetime_ms: u64,
+    pub depth: Option<usize>,
     pub max_plies: usize,
     pub seed: u64,
     pub output: PathBuf,
@@ -50,6 +51,28 @@ struct GameRecord {
     moves: String,
     chinese_ms: u128,
     pikafish_ms: u128,
+    chinese_depth_sum: usize,
+    pikafish_depth_sum: usize,
+    chinese_nodes: u64,
+    pikafish_nodes: u64,
+    chinese_moves: usize,
+    pikafish_moves: usize,
+}
+
+struct SearchReply {
+    bestmove: String,
+    depth: usize,
+    nodes: u64,
+}
+
+fn info_number(line: &str, key: &str) -> Option<u64> {
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == key {
+            return words.next()?.parse().ok();
+        }
+    }
+    None
 }
 
 struct Engine {
@@ -100,6 +123,11 @@ impl Engine {
             )));
         }
         engine.send(&format!("setoption name EvalFile value {}", nnue.display()))?;
+        // ChineseAI applies SearchNodes even to `go depth`; avoid silently
+        // cutting off the fixed-depth comparison at its 10k default.
+        if name == "ChineseAI" {
+            engine.send("setoption name SearchNodes value 100000000")?;
+        }
         engine.send("isready")?;
         let mut loaded = false;
         engine.until(Duration::from_secs(60), |line| {
@@ -155,19 +183,48 @@ impl Engine {
             }
         }
     }
-    fn bestmove(&mut self, fen: &str, moves: &[String], movetime_ms: u64) -> io::Result<String> {
+    fn bestmove(
+        &mut self,
+        fen: &str,
+        moves: &[String],
+        movetime_ms: u64,
+        depth: Option<usize>,
+    ) -> io::Result<SearchReply> {
         let mut command = format!("position fen {fen}");
         if !moves.is_empty() {
             command.push_str(" moves ");
             command.push_str(&moves.join(" "));
         }
         self.send(&command)?;
-        self.send(&format!("go movetime {movetime_ms}"))?;
+        self.send(&match depth {
+            Some(depth) => format!("go depth {depth}"),
+            None => format!("go movetime {movetime_ms}"),
+        })?;
+        let mut reached_depth = 0;
+        let mut nodes = 0;
         let line = self.until(
-            Duration::from_millis(movetime_ms.saturating_mul(10).max(15_000)),
-            |line| line.starts_with("bestmove "),
+            Duration::from_millis(if depth.is_some() {
+                60_000
+            } else {
+                movetime_ms.saturating_mul(10).max(15_000)
+            }),
+            |line| {
+                if line.starts_with("info depth ") {
+                    if let Some(value) = info_number(line, "depth") {
+                        reached_depth = value as usize;
+                    }
+                    if let Some(value) = info_number(line, "nodes") {
+                        nodes = value;
+                    }
+                }
+                line.starts_with("bestmove ")
+            },
         )?;
-        Ok(line.split_whitespace().nth(1).unwrap_or("0000").to_owned())
+        Ok(SearchReply {
+            bestmove: line.split_whitespace().nth(1).unwrap_or("0000").to_owned(),
+            depth: reached_depth,
+            nodes,
+        })
     }
 }
 
@@ -194,6 +251,12 @@ fn play(
     let mut moves = Vec::<String>::new();
     let mut chinese_ms = 0_u128;
     let mut pikafish_ms = 0_u128;
+    let mut chinese_depth_sum = 0;
+    let mut pikafish_depth_sum = 0;
+    let mut chinese_nodes = 0;
+    let mut pikafish_nodes = 0;
+    let mut chinese_moves = 0;
+    let mut pikafish_moves = 0;
     let mut result = "draw";
     let reason;
     loop {
@@ -246,14 +309,25 @@ fn play(
             &mut *pika
         };
         let started = Instant::now();
-        let response = engine.bestmove(&start_fen, &moves, config.movetime_ms);
+        let response = engine.bestmove(&start_fen, &moves, config.movetime_ms, config.depth);
         if chinese_turn {
             chinese_ms += started.elapsed().as_millis();
         } else {
             pikafish_ms += started.elapsed().as_millis();
         }
         let token = match response {
-            Ok(token) => token,
+            Ok(reply) => {
+                if chinese_turn {
+                    chinese_depth_sum += reply.depth;
+                    chinese_nodes += reply.nodes;
+                    chinese_moves += 1;
+                } else {
+                    pikafish_depth_sum += reply.depth;
+                    pikafish_nodes += reply.nodes;
+                    pikafish_moves += 1;
+                }
+                reply.bestmove
+            }
             Err(error) => {
                 result = "abnormal";
                 reason = format!("engine_error: {}: {error}", engine.name);
@@ -286,6 +360,12 @@ fn play(
         moves: moves.join(" "),
         chinese_ms,
         pikafish_ms,
+        chinese_depth_sum,
+        pikafish_depth_sum,
+        chinese_nodes,
+        pikafish_nodes,
+        chinese_moves,
+        pikafish_moves,
     })
 }
 
@@ -337,7 +417,7 @@ pub fn run(config: TournamentConfig) -> io::Result<TournamentReport> {
     let mut output = BufWriter::new(File::create(&config.output)?);
     writeln!(
         output,
-        "game\topening\tchinese_color\tresult\treason\tplies\tchinese_ms\tpikafish_ms\tstart_fen\tfinal_fen\tmoves"
+        "game\topening\tchinese_color\tresult\treason\tplies\tchinese_ms\tpikafish_ms\tchinese_avg_depth\tpikafish_avg_depth\tchinese_nodes\tpikafish_nodes\tstart_fen\tfinal_fen\tmoves"
     )?;
     output.flush()?;
     let (tx, rx) = mpsc::channel::<io::Result<GameRecord>>();
@@ -406,7 +486,7 @@ pub fn run(config: TournamentConfig) -> io::Result<TournamentReport> {
         let game = received?;
         writeln!(
             output,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
             game.index,
             game.opening,
             if game.chinese_red { "red" } else { "black" },
@@ -415,6 +495,10 @@ pub fn run(config: TournamentConfig) -> io::Result<TournamentReport> {
             game.plies,
             game.chinese_ms,
             game.pikafish_ms,
+            game.chinese_depth_sum as f64 / game.chinese_moves.max(1) as f64,
+            game.pikafish_depth_sum as f64 / game.pikafish_moves.max(1) as f64,
+            game.chinese_nodes,
+            game.pikafish_nodes,
             game.start_fen,
             game.final_fen,
             game.moves

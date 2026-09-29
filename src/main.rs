@@ -97,6 +97,9 @@ struct UciTournamentArgs {
     parallel_games: usize,
     #[arg(long, default_value_t = 500)]
     movetime_ms: u64,
+    /// Use the same fixed search depth for both engines instead of movetime.
+    #[arg(long)]
+    depth: Option<usize>,
     #[arg(long, default_value_t = 200)]
     max_plies: usize,
     #[arg(long, default_value_t = 20260930)]
@@ -2195,6 +2198,7 @@ fn main() {
                 opening_positions: cmd.opening_positions,
                 parallel_games: cmd.parallel_games,
                 movetime_ms: cmd.movetime_ms,
+                depth: cmd.depth,
                 max_plies: cmd.max_plies,
                 seed: cmd.seed,
                 output: cmd.output.clone(),

@@ -65,7 +65,7 @@ class Engine:
             if done(line):
                 return result
 
-    def probe(self, position: str, depth: int, searchmoves: list[str]):
+    def probe(self, position: str, depth: int | None, searchmoves: list[str], movetime_ms: int | None):
         self.send("ucinewgame")
         self.send(position)
         self.send("isready")
@@ -75,10 +75,14 @@ class Engine:
         self.send("isready")
         evaluation = self.until(lambda line: line == "readyok")
         search = []
-        if depth > 0:
+        elapsed_ms = None
+        if depth is not None and depth > 0 or movetime_ms is not None:
             suffix = " searchmoves " + " ".join(searchmoves) if searchmoves else ""
-            self.send(f"go depth {depth}{suffix}")
+            command = f"go movetime {movetime_ms}" if movetime_ms is not None else f"go depth {depth}"
+            started = time.monotonic()
+            self.send(command + suffix)
             search = self.until(lambda line: line.startswith("bestmove "))
+            elapsed_ms = round((time.monotonic() - started) * 1000)
         info = [line for line in search if line.startswith("info ") and SCORE.search(line)]
         score_line = info[-1] if info else ""
         score = SCORE.search(score_line)
@@ -96,6 +100,7 @@ class Engine:
             "score_type": score.group(1) if score else None,
             "score": int(score.group(2)) if score else None,
             "nodes": int(nodes.group(1)) if nodes else None,
+            "wall_ms": elapsed_ms,
             "seldepth": int(seldepth.group(1)) if seldepth else None,
             "pv": pv.group(1) if pv else None,
             "bestmove": search[-1].split()[1] if search else None,
@@ -124,6 +129,7 @@ def main():
     parser.add_argument("--pikafish-nnue", type=Path, required=True)
     parser.add_argument("--fens", type=Path, help="UTF-8 file with one FEN or UCI position command per line")
     parser.add_argument("--depths", type=int, nargs="+", default=[1, 2])
+    parser.add_argument("--movetime-ms", type=int, help="time both engines per move instead of fixed depth")
     parser.add_argument("--searchmoves", nargs="+", default=[], help="restrict both engines to the same root moves")
     parser.add_argument("--eval-only", action="store_true", help="compare raw NNUE integers without search")
     parser.add_argument("--require-internal-equal", action="store_true", help="exit nonzero if any raw evaluation differs or is absent")
@@ -148,8 +154,8 @@ def main():
         unavailable = 0
         for entry in positions:
             position = entry if entry.startswith("position ") else f"position fen {entry}"
-            for depth in ([0] if args.eval_only else args.depths):
-                left, right = (engine.probe(position, depth, args.searchmoves) for engine in engines)
+            for depth in ([0] if args.eval_only else [None] if args.movetime_ms else args.depths):
+                left, right = (engine.probe(position, depth, args.searchmoves, args.movetime_ms if not args.eval_only else None) for engine in engines)
                 internal_equal = (left["eval_internal_units"] == right["eval_internal_units"]
                                   if left["eval_internal_units"] is not None
                                   and right["eval_internal_units"] is not None else None)
@@ -158,7 +164,7 @@ def main():
                 elif internal_equal is None:
                     unavailable += 1
                 print(json.dumps({
-                    "position": position, "requested_depth": depth, "searchmoves": args.searchmoves,
+                    "position": position, "requested_depth": depth, "movetime_ms": args.movetime_ms, "searchmoves": args.searchmoves,
                     "chineseai": left, "pikafish": right,
                     "internal_equal": internal_equal,
                     "score_equal": (left["score"] is not None and right["score"] is not None

@@ -252,8 +252,7 @@ impl Position {
         self.collect_legal_moves(false, self.in_check(self.side_to_move))
     }
 
-    #[cfg(test)]
-    pub(super) fn legal_capture_moves(&self) -> Vec<Move> {
+    pub(crate) fn legal_capture_moves(&self) -> Vec<Move> {
         self.collect_legal_moves(true, self.in_check(self.side_to_move))
     }
 

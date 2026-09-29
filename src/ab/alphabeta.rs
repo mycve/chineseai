@@ -330,11 +330,18 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         if let Some(outcome) = position.rule_outcome_with_history(history) {
             return terminal_value(outcome, position.side_to_move(), ply);
         }
-        let moves = position.legal_moves_with_rules(history);
-        if moves.is_empty() {
+        let checked = position.in_check(position.side_to_move());
+        let mut tactical = if checked {
+            position.legal_moves_with_rules(history)
+        } else {
+            // A capture changes the board material, so it cannot repeat a
+            // previous position. Avoid generating and rule-checking every
+            // quiet move at each quiescence node.
+            position.legal_capture_moves()
+        };
+        if tactical.is_empty() && (checked || position.legal_moves_with_rules(history).is_empty()) {
             return mated_at(ply);
         }
-        let checked = position.in_check(position.side_to_move());
         let stand_pat = if checked {
             -2.0
         } else {
@@ -351,10 +358,6 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             }
             alpha = alpha.max(stand_pat);
         }
-        let mut tactical = moves
-            .into_iter()
-            .filter(|mv| checked || position.is_capture(*mv))
-            .collect::<Vec<_>>();
         tactical.sort_by_key(|mv| {
             std::cmp::Reverse(match position.piece_at(mv.to as usize) {
                 Some(victim) => {
@@ -1534,6 +1537,29 @@ mod tests {
         let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
         let _ = engine.quiescence(&mut position, &mut history, &hidden, 0, 1, -2.0, 2.0);
         assert!(engine.quiescence_nodes > 1);
+    }
+
+    #[test]
+    fn capture_generator_matches_filtered_legal_moves_on_playout() {
+        let mut position = Position::startpos();
+        let mut seed = 0x5eed_u64;
+        for _ in 0..160 {
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            let filtered = legal
+                .iter()
+                .copied()
+                .filter(|mv| position.is_capture(*mv))
+                .collect::<Vec<_>>();
+            let captures = position.legal_capture_moves();
+            assert_eq!(captures.len(), filtered.len(), "{}", position.to_fen());
+            assert!(captures.iter().all(|mv| filtered.contains(mv)));
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mv = legal[(seed as usize) % legal.len()];
+            position.make_move(mv);
+        }
     }
 
     #[test]
