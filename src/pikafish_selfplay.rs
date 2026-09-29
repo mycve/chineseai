@@ -114,7 +114,7 @@ impl Engine {
         Ok(line.trim().to_owned())
     }
 
-    fn bestmove(&mut self, moves: &[String], depth: u32) -> io::Result<String> {
+    fn bestmove(&mut self, moves: &[String], depth: u32) -> io::Result<(String, Option<i32>)> {
         let mut command = "position startpos".to_owned();
         if !moves.is_empty() {
             command.push_str(" moves ");
@@ -122,12 +122,35 @@ impl Engine {
         }
         self.send(&command)?;
         self.send(&format!("go depth {depth}"))?;
+        let mut score_cp = None;
         loop {
-            if let Some(token) = self.read()?.strip_prefix("bestmove ") {
-                return Ok(token.split_whitespace().next().unwrap_or("").to_owned());
+            let line = self.read()?;
+            if let Some(score) = info_score_cp(&line) {
+                score_cp = Some(score);
+            }
+            if let Some(token) = line.strip_prefix("bestmove ") {
+                return Ok((
+                    token.split_whitespace().next().unwrap_or("").to_owned(),
+                    score_cp,
+                ));
             }
         }
     }
+}
+
+fn info_score_cp(line: &str) -> Option<i32> {
+    if !line.starts_with("info ") {
+        return None;
+    }
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "score" {
+            return (words.next()? == "cp")
+                .then(|| words.next()?.parse().ok())
+                .flatten();
+        }
+    }
+    None
 }
 
 impl Drop for Engine {
@@ -160,7 +183,10 @@ pub fn generate(
     }
     let mut engine = Engine::spawn(exe, nnue)?;
     let mut out = BufWriter::new(File::create(output)?);
-    writeln!(out, "game\tply\tfen\tbestmove\tred_result\ttermination")?;
+    writeln!(
+        out,
+        "game\tply\tfen\tbestmove\tscore_cp\tred_result\ttermination"
+    )?;
     let mut summary = SelfplaySummary::default();
     let mut random = config.seed;
     for game in 0..config.games {
@@ -201,7 +227,7 @@ pub fn generate(
             let mv = if is_opening {
                 legal[(next_random(&mut random) as usize) % legal.len()]
             } else {
-                let token = engine.bestmove(&moves, config.depth)?;
+                let (token, score_cp) = engine.bestmove(&moves, config.depth)?;
                 let parsed = position.parse_uci_move(&token).ok_or_else(|| {
                     io::Error::other(format!("Pikafish invalid bestmove {token}"))
                 })?;
@@ -210,21 +236,22 @@ pub fn generate(
                         "Pikafish illegal bestmove {token}"
                     )));
                 }
-                samples.push((moves.len(), position.to_fen(), token));
+                samples.push((moves.len(), position.to_fen(), token, score_cp));
                 parsed
             };
             history.push(position.rule_history_entry_after_move(mv));
             position.make_move(mv);
             moves.push(mv.to_uci());
         };
-        for (ply, fen, bestmove) in &samples {
+        for (ply, fen, bestmove, score_cp) in &samples {
             writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 game + 1,
                 ply,
                 fen,
                 bestmove,
+                score_cp.map_or("?".to_owned(), |score| score.to_string()),
                 result,
                 termination
             )?;
@@ -239,4 +266,19 @@ pub fn generate(
     }
     out.flush()?;
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::info_score_cp;
+
+    #[test]
+    fn parse_latest_cp_score_without_treating_mate_as_cp() {
+        assert_eq!(
+            info_score_cp("info depth 4 score cp -37 nodes 128"),
+            Some(-37)
+        );
+        assert_eq!(info_score_cp("info depth 7 score mate 3 nodes 128"), None);
+        assert_eq!(info_score_cp("bestmove a0a1"), None);
+    }
 }

@@ -8,6 +8,9 @@ pub const V2_KING_BUCKETS: usize = 9;
 /// 重复、长将、长捉等依赖历史的规则由环境精确处理。
 pub const AB_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
 
+#[path = "nnue/full_threats.rs"]
+mod full_threats;
+
 /// Pikafish 当前 HalfKAv2_hm + FullThreats 网络的权重形状。
 /// 这些常量是训练格式约束；现有 AB 模型仍使用上面的独立特征编码。
 pub mod pikafish {
@@ -18,6 +21,7 @@ pub mod pikafish {
     pub const PSQ_FEATURES_PER_BUCKET: usize = 689;
     pub const PSQ_INPUTS: usize = KING_BUCKETS * ATTACK_BUCKETS * PSQ_FEATURES_PER_BUCKET;
     pub const THREAT_INPUTS: usize = 45_547;
+    pub use super::full_threats::{fill_threat_features, threat_index};
     pub const TRANSFORMER_WIDTH: usize = 1_024;
     pub const TRANSFORMED_PER_PERSPECTIVE: usize = TRANSFORMER_WIDTH / 2;
     pub const NETWORK_INPUTS: usize = TRANSFORMER_WIDTH;
@@ -117,7 +121,7 @@ pub mod pikafish {
         color + KINDS.iter().position(|kind| *kind == piece.kind).unwrap()
     }
 
-    fn valid_square(plane: usize, square: usize) -> bool {
+    pub(super) fn valid_square(plane: usize, square: usize) -> bool {
         let rank = square / 9;
         let file = square % 9;
         let black = plane >= 7;

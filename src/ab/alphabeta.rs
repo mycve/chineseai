@@ -1,4 +1,5 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
+use super::pikafish_candle::{PikafishExample, PikafishModel};
 use super::{AbEvalAccumulator, AbEvalScratch, AbNnue};
 use std::sync::{
     Arc,
@@ -108,8 +109,130 @@ struct TtEntry {
     best_move: Option<Move>,
 }
 
-struct Search<'a> {
-    model: &'a AbNnue,
+trait ValueModel {
+    fn root_hidden(&self, position: &Position) -> Vec<f32>;
+    fn transition(
+        &self,
+        before_buckets: [(usize, usize); 2],
+        after: &Position,
+        mv: Move,
+        moved: crate::xiangqi::Piece,
+        captured: Option<crate::xiangqi::Piece>,
+        hidden: &mut [f32],
+    );
+    fn evaluate(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        hidden: &[f32],
+        scratch: &mut Option<AbEvalScratch>,
+    ) -> Result<f32, String>;
+    fn root_wdl(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+    ) -> Result<[f32; 3], String>;
+    fn scratch(&self) -> Option<AbEvalScratch>;
+}
+
+impl ValueModel for AbNnue {
+    fn root_hidden(&self, position: &Position) -> Vec<f32> {
+        AbEvalAccumulator::new(self, position).into_hidden_sum()
+    }
+    fn transition(
+        &self,
+        before_buckets: [(usize, usize); 2],
+        after: &Position,
+        mv: Move,
+        moved: crate::xiangqi::Piece,
+        captured: Option<crate::xiangqi::Piece>,
+        hidden: &mut [f32],
+    ) {
+        AbEvalAccumulator::apply_transition_from_buckets(
+            self,
+            before_buckets,
+            after,
+            mv,
+            moved,
+            captured,
+            hidden,
+        );
+    }
+    fn evaluate(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+        hidden: &[f32],
+        scratch: &mut Option<AbEvalScratch>,
+    ) -> Result<f32, String> {
+        Ok(self.evaluate_incremental_value_with_rules(
+            position,
+            history,
+            hidden,
+            scratch.as_mut().unwrap(),
+        ))
+    }
+    fn root_wdl(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+    ) -> Result<[f32; 3], String> {
+        Ok(self.evaluate_wdl_with_rules(position, history))
+    }
+    fn scratch(&self) -> Option<AbEvalScratch> {
+        Some(AbEvalScratch::new(self.arch))
+    }
+}
+
+impl ValueModel for PikafishModel {
+    fn root_hidden(&self, _position: &Position) -> Vec<f32> {
+        Vec::new()
+    }
+    fn transition(
+        &self,
+        _before_buckets: [(usize, usize); 2],
+        _after: &Position,
+        _mv: Move,
+        _moved: crate::xiangqi::Piece,
+        _captured: Option<crate::xiangqi::Piece>,
+        _hidden: &mut [f32],
+    ) {
+    }
+    fn evaluate(
+        &self,
+        position: &Position,
+        _history: &[RuleHistoryEntry],
+        _hidden: &[f32],
+        _scratch: &mut Option<AbEvalScratch>,
+    ) -> Result<f32, String> {
+        let example = PikafishExample::from_position(position)
+            .ok_or_else(|| "Pikafish feature extraction failed".to_owned())?;
+        let raw = self
+            .forward(&[example])
+            .and_then(|output| output.to_vec2::<f32>())
+            .map_err(|error| error.to_string())?[0][0];
+        if !raw.is_finite() {
+            return Err("Pikafish evaluation is non-finite".to_owned());
+        }
+        Ok((raw / 600.0).tanh())
+    }
+    fn root_wdl(
+        &self,
+        position: &Position,
+        history: &[RuleHistoryEntry],
+    ) -> Result<[f32; 3], String> {
+        let q = self
+            .evaluate(position, history, &[], &mut None)?
+            .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+        Ok([(1.0 + q) * 0.5, 0.0, (1.0 - q) * 0.5])
+    }
+    fn scratch(&self) -> Option<AbEvalScratch> {
+        None
+    }
+}
+
+struct Search<'a, M: ValueModel + ?Sized> {
+    model: &'a M,
     nodes: usize,
     limit: usize,
     exhausted: bool,
@@ -118,20 +241,29 @@ struct Search<'a> {
     killers: Vec<[Option<Move>; 2]>,
     tt: Vec<Option<TtEntry>>,
     hidden_pool: Vec<Vec<f32>>,
-    scratch: AbEvalScratch,
+    scratch: Option<AbEvalScratch>,
+    error: Option<String>,
     control: Option<&'a AbSearchControl>,
 }
 
-impl Search<'_> {
+impl<M: ValueModel + ?Sized> Search<'_, M> {
     fn evaluate(
         &mut self,
         position: &Position,
         history: &[RuleHistoryEntry],
         hidden: &[f32],
     ) -> f32 {
-        self.model
-            .evaluate_incremental_value_with_rules(position, history, hidden, &mut self.scratch)
-            .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE)
+        match self
+            .model
+            .evaluate(position, history, hidden, &mut self.scratch)
+        {
+            Ok(value) => value.clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE),
+            Err(error) => {
+                self.error = Some(error);
+                self.exhausted = true;
+                0.0
+            }
+        }
     }
 
     fn quiescence(
@@ -197,8 +329,7 @@ impl Search<'_> {
             let mut child_hidden = self.hidden_pool.pop().unwrap_or_default();
             child_hidden.resize(hidden.len(), 0.0);
             child_hidden.copy_from_slice(hidden);
-            AbEvalAccumulator::apply_transition_from_buckets(
-                self.model,
+            self.model.transition(
                 before_buckets,
                 position,
                 mv,
@@ -291,8 +422,7 @@ impl Search<'_> {
             let mut child_hidden = self.hidden_pool.pop().unwrap_or_default();
             child_hidden.resize(hidden.len(), 0.0);
             child_hidden.copy_from_slice(hidden);
-            AbEvalAccumulator::apply_transition_from_buckets(
-                self.model,
+            self.model.transition(
                 before_buckets,
                 position,
                 mv,
@@ -510,9 +640,51 @@ fn search_with_control(
     node_limit: usize,
     max_depth: usize,
     control: Option<&AbSearchControl>,
-    mut progress: impl FnMut(&AbSearchResult),
+    progress: impl FnMut(&AbSearchResult),
 ) -> AbSearchResult {
-    let root_wdl = model.evaluate_wdl_with_rules(position, history);
+    search_with_model(
+        position, history, moves, model, node_limit, max_depth, control, progress,
+    )
+    .expect("AB NNUE evaluation failed")
+}
+
+/// Search a trainable Pikafish-layout model with the same AB/PVS/TT path.
+/// Full-position Candle evaluation is intentionally used until an incremental
+/// transformer implementation is available.
+pub fn search_pikafish_model(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    model: &PikafishModel,
+    limits: AbSearchLimits,
+) -> Result<AbSearchResult, String> {
+    let moves = position.legal_moves_with_rules(history);
+    search_with_model(
+        position,
+        history,
+        moves,
+        model,
+        limits.nodes,
+        if limits.max_depth == 0 {
+            16
+        } else {
+            limits.max_depth
+        },
+        None,
+        |_| {},
+    )
+}
+
+fn search_with_model<M: ValueModel + ?Sized>(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    moves: Vec<Move>,
+    model: &M,
+    node_limit: usize,
+    max_depth: usize,
+    control: Option<&AbSearchControl>,
+    mut progress: impl FnMut(&AbSearchResult),
+) -> Result<AbSearchResult, String> {
+    let root_wdl = model.root_wdl(position, history)?;
     let mut engine = Search {
         model,
         nodes: 0,
@@ -523,10 +695,11 @@ fn search_with_control(
         killers: vec![[None; 2]; 128],
         tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
         hidden_pool: Vec::new(),
-        scratch: AbEvalScratch::new(model.arch),
+        scratch: model.scratch(),
+        error: None,
         control,
     };
-    let root_hidden = AbEvalAccumulator::new(model, position).into_hidden_sum();
+    let root_hidden = model.root_hidden(position);
     let mut root_child_hidden = root_hidden.clone();
     let mut scores = moves
         .iter()
@@ -536,8 +709,7 @@ fn search_with_control(
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             root_child_hidden.copy_from_slice(&root_hidden);
-            AbEvalAccumulator::apply_transition_from_buckets(
-                model,
+            model.transition(
                 AbEvalAccumulator::buckets_for_position(position),
                 &next,
                 mv,
@@ -559,6 +731,9 @@ fn search_with_control(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(error) = engine.error.take() {
+        return Err(error);
+    }
     let solved = root_proofs(position, history, &moves);
     // The initial child evaluations form a complete one-ply fallback.
     let mut completed_depth = 1;
@@ -577,8 +752,7 @@ fn search_with_control(
             let captured = position.piece_at(mv.to as usize);
             next.make_move(mv);
             root_child_hidden.copy_from_slice(&root_hidden);
-            AbEvalAccumulator::apply_transition_from_buckets(
-                model,
+            model.transition(
                 AbEvalAccumulator::buckets_for_position(position),
                 &next,
                 mv,
@@ -641,7 +815,10 @@ fn search_with_control(
             break;
         }
     }
-    build_result_with_proofs(
+    if let Some(error) = engine.error {
+        return Err(error);
+    }
+    Ok(build_result_with_proofs(
         &moves,
         &scores,
         &solved,
@@ -650,7 +827,7 @@ fn search_with_control(
         completed_depth,
         engine.exhausted,
         max_depth,
-    )
+    ))
 }
 
 fn root_proofs(
@@ -839,6 +1016,25 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
+    fn pikafish_value_model_uses_shared_search() {
+        let model = PikafishModel::new(&candle_core::Device::Cpu).unwrap();
+        let position = Position::startpos();
+        let result = search_pikafish_model(
+            &position,
+            &[],
+            &model,
+            AbSearchLimits {
+                nodes: 64,
+                max_depth: 2,
+            },
+        )
+        .unwrap();
+        assert!(result.best_move.is_some());
+        assert!(result.nodes <= 64);
+        assert!(result.value_q.is_finite());
+    }
+
+    #[test]
     fn history_bonus_and_malus_stay_bounded() {
         let mv = Position::startpos().legal_moves()[0];
         let mut history = [[0; 90]; 90];
@@ -908,7 +1104,8 @@ mod tests {
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
-            scratch: AbEvalScratch::new(model.arch),
+            scratch: Some(AbEvalScratch::new(model.arch)),
+            error: None,
             control: None,
         };
         let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();
@@ -983,7 +1180,8 @@ mod tests {
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
-            scratch: AbEvalScratch::new(model.arch),
+            scratch: Some(AbEvalScratch::new(model.arch)),
+            error: None,
             control: None,
         };
         let slot = (position.hash() as usize) & (TT_SIZE - 1);
@@ -1071,7 +1269,8 @@ mod tests {
             killers: vec![[None; 2]; 128],
             tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
             hidden_pool: Vec::new(),
-            scratch: AbEvalScratch::new(model.arch),
+            scratch: Some(AbEvalScratch::new(model.arch)),
+            error: None,
             control: None,
         };
         let hidden = AbEvalAccumulator::new(&model, &position).into_hidden_sum();

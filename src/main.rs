@@ -19,7 +19,11 @@ use chineseai::{
         train_samples_weighted_owned,
     },
     opening_book::OpeningBook,
+    pikafish_candidate_selfplay::{
+        CandidateSelfplayConfig, generate as generate_candidate_selfplay,
+    },
     pikafish_match::{VsPikafishConfig, run_vs_pikafish},
+    pikafish_pretrain::{PretrainConfig, train_teacher_tsv},
     pikafish_selfplay::{SelfplayConfig, generate as generate_pikafish_selfplay},
     xiangqi::Position,
 };
@@ -66,6 +70,50 @@ enum CliCommand {
     PikafishLabelEval(PikafishLabelEvalArgs),
     /// Bootstrap search data with Pikafish playing both colors using one NNUE.
     PikafishSelfplay(PikafishSelfplayArgs),
+    /// Pretrain the Pikafish-shaped floating model from search scores.
+    PikafishPretrain(PikafishPretrainArgs),
+    /// Generate AB self-play using ChineseAI's Pikafish-shaped value network.
+    PikafishCandidateSelfplay(PikafishCandidateSelfplayArgs),
+}
+
+#[derive(Args, Debug)]
+struct PikafishCandidateSelfplayArgs {
+    /// ChineseAI f32 checkpoint produced by pikafish-pretrain.
+    #[arg(long)]
+    model: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    games: usize,
+    #[arg(long, default_value_t = 64)]
+    nodes: usize,
+    #[arg(long, default_value_t = 2)]
+    max_depth: usize,
+    #[arg(long, default_value_t = 200)]
+    max_plies: usize,
+    #[arg(long, default_value_t = 2)]
+    opening_plies: usize,
+    #[arg(long, default_value_t = 20260930)]
+    seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct PikafishPretrainArgs {
+    /// TSV produced by `pikafish-selfplay`.
+    #[arg(long)]
+    input: PathBuf,
+    /// ChineseAI f32 checkpoint; this is not a Pikafish .nnue file.
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 8)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 1024)]
+    max_samples: usize,
+    #[arg(long, default_value_t = 1.0e-4)]
+    learning_rate: f64,
+    /// Resume from the output checkpoint when it already exists.
+    #[arg(long)]
+    resume: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2044,6 +2092,68 @@ fn main() {
                 summary.draws,
                 summary.truncated,
                 summary.positions,
+                cmd.output.display()
+            );
+        }
+        Some(CliCommand::PikafishPretrain(cmd)) => {
+            let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+            let model = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
+                .unwrap_or_else(|err| panic!("pikafish-pretrain model init failed: {err}"));
+            if cmd.resume && cmd.output.exists() {
+                model
+                    .load(&cmd.output)
+                    .unwrap_or_else(|err| panic!("pikafish-pretrain resume failed: {err}"));
+            }
+            let report = train_teacher_tsv(
+                &model,
+                &cmd.input,
+                &cmd.output,
+                PretrainConfig {
+                    batch_size: cmd.batch_size,
+                    max_samples: cmd.max_samples,
+                    learning_rate: cmd.learning_rate,
+                },
+            )
+            .unwrap_or_else(|err| panic!("pikafish-pretrain failed: {err}"));
+            println!(
+                "pikafish-pretrain: samples={} skipped_unknown={} skipped_features={} steps={} mean_loss={:.6} output={}",
+                report.used_samples,
+                report.skipped_unknown_scores,
+                report.skipped_unsupported_features,
+                report.steps,
+                report.mean_loss,
+                cmd.output.display()
+            );
+        }
+        Some(CliCommand::PikafishCandidateSelfplay(cmd)) => {
+            let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+            let model =
+                chineseai::ab::pikafish_candle::PikafishModel::new(&device).unwrap_or_else(|err| {
+                    panic!("pikafish-candidate-selfplay model init failed: {err}")
+                });
+            model
+                .load(&cmd.model)
+                .unwrap_or_else(|err| panic!("pikafish-candidate-selfplay load failed: {err}"));
+            let report = generate_candidate_selfplay(
+                &model,
+                &cmd.output,
+                CandidateSelfplayConfig {
+                    games: cmd.games,
+                    nodes: cmd.nodes,
+                    max_depth: cmd.max_depth,
+                    max_plies: cmd.max_plies,
+                    opening_plies: cmd.opening_plies,
+                    seed: cmd.seed,
+                },
+            )
+            .unwrap_or_else(|err| panic!("pikafish-candidate-selfplay failed: {err}"));
+            println!(
+                "pikafish-candidate-selfplay: games={} decisive={} draws={} truncated={} positions={} output={}",
+                report.games,
+                report.decisive,
+                report.draws,
+                report.truncated,
+                report.positions,
                 cmd.output.display()
             );
         }

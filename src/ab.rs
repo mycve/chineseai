@@ -18,6 +18,7 @@ mod candle_model;
 mod dataloader;
 mod fused_feature_pool;
 mod optimizer;
+pub mod pikafish_candle;
 mod play;
 mod replay;
 mod start;
@@ -42,6 +43,7 @@ use crate::xiangqi::{
 };
 
 pub use alphabeta::search as alphabeta_search;
+pub use alphabeta::search_pikafish_model;
 pub use alphabeta::{AbCandidate, AbSearchControl, AbSearchLimits, AbSearchResult, cp_from_q};
 pub use play::{
     AbArenaConfig, AbArenaReport, AbSelfplayData, AbTerminalStats, generate_selfplay_data,
