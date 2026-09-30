@@ -49,7 +49,6 @@ pub struct AzLoopFileConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub fpu_absolute_at_root: bool,
-    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub selfplay_opening_book: String,
@@ -88,7 +87,7 @@ impl Default for AzLoopFileConfig {
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
-            simulations: 10_000,
+            simulations: 3000,
             inference_batch_size: 1,
             selfplay_samples_per_update: 120000,
             lr: 0.02,
@@ -117,7 +116,6 @@ impl Default for AzLoopFileConfig {
             fpu_value: 0.49,
             fpu_value_at_root: 1.0,
             fpu_absolute_at_root: true,
-            minimum_kldgain_per_node: 0.00005,
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
             selfplay_opening_book: "book.pgn.gz".into(),
@@ -182,7 +180,6 @@ impl AzLoopFileConfig {
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
         line!("inference_batch_size", self.inference_batch_size);
-        line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
         line!("temperature_cutoff_plies", self.temperature_cutoff_plies);
@@ -321,7 +318,6 @@ impl AzLoopFileConfig {
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.inference_batch_size = self.inference_batch_size.clamp(1, 32);
-        self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
 
         self.replay_recent_games = self.replay_recent_games.max(1);
@@ -358,7 +354,7 @@ mod tests {
         let expected = AzLoopFileConfig::default();
         assert_eq!(config.selfplay_opening_book, "book.pgn.gz");
         assert_eq!(config.arena_opening_book, "book.pgn.gz");
-        assert_eq!(config.simulations, 10_000);
+        assert_eq!(config.simulations, 3000);
         assert_eq!(config.cpuct, expected.cpuct);
         assert_eq!(config.root_dirichlet_alpha, 0.12);
         assert_eq!(config.temperature_cutoff_plies, 78);
@@ -402,7 +398,7 @@ mod tests {
         assert!(text.contains("draw_score = 0.0\n"));
         assert!(text.contains("policy_softmax_temp = 1.45\n"));
         assert!(!text.contains("value_target_search_q_mix"));
-        assert!(text.contains("simulations = 10000\n"));
+        assert!(text.contains("simulations = 3000\n"));
         assert!(!text.contains("low_simulations"));
         assert!(!text.contains("low_simulation_probability"));
         assert!(!text.contains("low_simulation_policy_weight"));

@@ -634,7 +634,6 @@ pub struct AzLoopConfig {
     pub fpu_value: f32,
     pub fpu_value_at_root: f32,
     pub fpu_absolute_at_root: bool,
-    pub minimum_kldgain_per_node: f32,
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub opening_positions: Arc<[AzStartSnapshot]>,
