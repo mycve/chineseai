@@ -27,6 +27,8 @@ const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 #[derive(Clone)]
 struct UciState {
     root_batch: bool,
+    root_batch_tactics: bool,
+    root_batch_depth: usize,
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
@@ -56,6 +58,8 @@ impl Default for UciState {
     fn default() -> Self {
         Self {
             root_batch: true,
+            root_batch_tactics: true,
+            root_batch_depth: 4,
             position: Position::startpos(),
             rule_history: Position::startpos().initial_rule_history(),
             eval_file: "model.safetensors".into(),
@@ -162,6 +166,8 @@ fn print_uci_id() {
     println!("id author ChineseAI");
     println!("option name EvalFile type string default model.safetensors");
     println!("option name RootBatch type check default true");
+    println!("option name RootBatchTactics type check default true");
+    println!("option name RootBatchDepth type spin default 4 min 2 max 8");
     println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name MultiPV type spin default 1 min 1 max 64");
@@ -214,6 +220,16 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         .unwrap_or_default();
 
     match name.as_str() {
+        "rootbatchdepth" => {
+            if let Ok(value) = value.parse::<usize>() {
+                state.root_batch_depth = value.clamp(2, 8);
+            }
+        }
+        "rootbatchtactics" => {
+            if let Ok(value) = value.parse::<bool>() {
+                state.root_batch_tactics = value;
+            }
+        }
         "rootbatch" => {
             if let Ok(value) = value.parse::<bool>() {
                 state.root_batch = value;
@@ -549,6 +565,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         model,
         AzSearchLimits {
             root_batch: state.root_batch,
+            root_batch_tactics: state.root_batch_tactics,
+            root_batch_depth: state.root_batch_depth,
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,

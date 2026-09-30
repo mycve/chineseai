@@ -1356,6 +1356,8 @@ fn fixed_az_search_limits(
 ) -> AzSearchLimits {
     AzSearchLimits {
         root_batch: true,
+        root_batch_tactics: true,
+        root_batch_depth: 4,
         simulations,
         seed,
         cpuct,
@@ -1535,6 +1537,8 @@ fn main() {
             });
             let search_limits = AzSearchLimits {
                 root_batch: true,
+                root_batch_tactics: true,
+                root_batch_depth: 4,
                 simulations,
                 seed: 0,
                 cpuct,
@@ -3027,6 +3031,8 @@ fn main() {
                                 rows,
                                 AzSearchLimits {
                                     root_batch: true,
+                                    root_batch_tactics: true,
+                                    root_batch_depth: 4,
                                     simulations: config.pikafish_label_eval_simulations,
                                     seed: config.seed
                                         ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
