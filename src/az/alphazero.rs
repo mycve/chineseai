@@ -25,13 +25,8 @@ const INITIAL_TREE_NODE_CAPACITY: usize = 4_096;
 const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AzSearchLimits {
-    /// 根节点合法两步局面统一组成 batch，推理后正常执行 PUCT。
-    pub root_batch: bool,
-    /// 在完整两层之后，额外批量评估吃子、将军和全部应将。
-    pub root_batch_tactics: bool,
-    /// 战术 batch 的最大总层数；前两层始终完整展开。
-    pub root_batch_depth: usize,
-    /// 完成根节点预扩展后，正常 PUCT 的模拟次数。
+    /// 每次收集的 MCTS 叶子数，1 使用原始逐次搜索。
+    pub inference_batch_size: usize,
     pub simulations: usize,
     pub seed: u64,
     pub cpuct: f32,
@@ -59,9 +54,7 @@ pub struct AzSearchLimits {
 impl Default for AzSearchLimits {
     fn default() -> Self {
         Self {
-            root_batch: true,
-            root_batch_tactics: true,
-            root_batch_depth: 4,
+            inference_batch_size: 1,
             simulations: 10_000,
             seed: 0,
             cpuct: DEFAULT_CPUCT,
@@ -112,8 +105,6 @@ fn proof_priority(solved: Option<i8>) -> u8 {
 
 #[derive(Clone, Debug)]
 pub struct AzSearchResult {
-    pub root_batch_size: usize,
-    pub root_batch_visits: usize,
     pub best_move: Option<Move>,
     pub value_q: f32,
     pub value_cp: i32,
@@ -189,7 +180,7 @@ pub fn alphazero_search_trace_with_rules(
         limits,
     );
     let root = tree.root;
-    tree.prepare_root_batch();
+    tree.expand(tree.root);
     let mut stopper = KldGainStopper::default();
     let mut used = 0;
     for _ in 0..limits.simulations {
@@ -293,13 +284,11 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
     let root = tree.root;
     {
         crate::scope_profile!("az.search.root_expand");
-        tree.prepare_root_batch();
+        tree.expand(tree.root);
     }
     if tree.nodes[root].children_len == 0 {
         let value_q = wdl_utility(tree.nodes[root].value_wdl, tree.draw_score);
         return AzSearchResult {
-            root_batch_size: 0,
-            root_batch_visits: 0,
             best_move: None,
             value_q,
             value_cp: cp_from_q(value_q),
@@ -396,7 +385,7 @@ pub(super) fn alphazero_search_with_rules_reusing(
     let root = tree.root;
     {
         crate::scope_profile!("az.search.root_expand");
-        tree.prepare_root_batch();
+        tree.expand(tree.root);
     }
     let used = if tree.nodes[root].children_len == 0 {
         0
@@ -461,27 +450,8 @@ pub fn cp_from_q(q: f32) -> i32 {
     (q.clamp(-1.0, 1.0) * 1000.0).round() as i32
 }
 
-#[derive(Default)]
-struct RootBatch {
-    nodes: Vec<usize>,
-    hidden: Vec<f32>,
-    contexts: Vec<f32>,
-    paths: Vec<RootBatchPath>,
-}
-
-struct RootBatchPath {
-    node: usize,
-    edge: usize,
-    parent_path: usize,
-    depth: usize,
-}
-
 struct AzTree<'a> {
-    root_batch: bool,
-    root_batch_depth: usize,
-    root_batch_active: bool,
-    root_batch_size: usize,
-    root_batch_visits: usize,
+    inference_batch_size: usize,
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
@@ -568,186 +538,6 @@ impl AzChild {
 }
 
 impl<'a> AzTree<'a> {
-    fn prepare_root_batch(&mut self) {
-        self.root_batch_active = self.root_batch;
-        self.expand(self.root);
-        if !self.root_batch || self.nodes[self.root].solved.is_some() {
-            self.root_batch_active = false;
-            return;
-        }
-        let mut batch = RootBatch::default();
-        // 所有输入先收集完，再统一 batch 推理；路径以父索引共享，避免逐叶复制。
-        for index in 0..self.node_children(self.root).len() {
-            let node = self.ensure_child_node(self.root, index);
-            self.collect_root_batch_branch(node, index, usize::MAX, 1, &mut batch);
-        }
-        let outputs = self
-            .model
-            .evaluate_incremental_value_batch(&batch.hidden, &batch.contexts);
-        self.root_batch_size = outputs.len();
-        for (index, mut eval) in batch.nodes.into_iter().zip(outputs) {
-            eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
-            eval.value *= self.value_scale;
-            let node = &mut self.nodes[index];
-            node.value = eval.value;
-            node.value_wdl = eval.value_wdl;
-            node.value_cached = true;
-        }
-        // 保留每层真实评估，逐层翻转视角回传；不使用 min/max 聚合。
-        for path in &batch.paths {
-            if path.depth == 1 && self.nodes[path.node].solved.is_none() {
-                continue;
-            }
-            let mut eval = self.node_eval(path.node);
-            self.add_node_visit(path.node, eval);
-            let mut current = path;
-            loop {
-                eval = AzEvalOutput {
-                    value_wdl: flip_wdl(eval.value_wdl),
-                    value: -eval.value,
-                };
-                let parent = self.nodes[current.node].parent as usize;
-                let edge = &mut self.node_children_mut(parent)[current.edge];
-                edge.visits += 1;
-                add_wdl(&mut edge.value_wdl_sum, eval.value_wdl);
-                self.add_node_visit(parent, eval);
-                if current.parent_path == usize::MAX {
-                    break;
-                }
-                current = &batch.paths[current.parent_path];
-            }
-            self.record_leaf_depth(path.depth, false);
-            self.root_batch_visits += 1;
-        }
-        // 第一层正常补 policy/value；更深节点在 PUCT 到达时只补 policy。
-        let history_len = self.rule_history_scratch.len();
-        for index in 0..self.node_children(self.root).len() {
-            let node = self.node_children(self.root)[index].child_node().unwrap();
-            self.rule_history_scratch
-                .push(self.nodes[node].rule_entry.unwrap());
-            self.expand(node);
-            self.rule_history_scratch.truncate(history_len);
-        }
-        for path in batch.paths.iter().rev() {
-            self.update_solved(path.node);
-        }
-        self.update_solved(self.root);
-        self.root_batch_active = false;
-    }
-
-    fn collect_root_batch_branch(
-        &mut self,
-        node: usize,
-        edge: usize,
-        parent_path: usize,
-        depth: usize,
-        batch: &mut RootBatch,
-    ) {
-        let path = batch.paths.len();
-        batch.paths.push(RootBatchPath {
-            node,
-            edge,
-            parent_path,
-            depth,
-        });
-        let history_len = self.rule_history_scratch.len();
-        self.rule_history_scratch
-            .push(self.nodes[node].rule_entry.unwrap());
-        let moves = self.collect_batch_node(
-            node,
-            depth >= 2,
-            &mut batch.nodes,
-            &mut batch.hidden,
-            &mut batch.contexts,
-        );
-        if self.nodes[node].solved.is_none() && depth < self.root_batch_depth {
-            let selected: Vec<usize> = if depth == 1 {
-                (0..self.node_children(node).len()).collect()
-            } else {
-                let position = &self.nodes[node].position;
-                let evasion = self.nodes[node].rule_entry.unwrap().gives_check;
-                let selected: Vec<_> = moves
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &(mv, _))| {
-                        (evasion
-                            || position.is_capture(mv)
-                            || position.gives_check_after_move_fast(mv))
-                        .then_some(i)
-                    })
-                    .collect();
-                if !selected.is_empty() {
-                    // 留下全部合法边；安静着法仍可由后续 PUCT 选择。
-                    self.set_node_children(
-                        node,
-                        moves.into_iter().map(|(mv, _)| AzChild {
-                            mv,
-                            prior: 0.0,
-                            visits: 0,
-                            value_wdl_sum: [0.0; 3],
-                            child: NO_CHILD,
-                        }),
-                    );
-                }
-                selected
-            };
-            for index in selected {
-                let child = self.ensure_child_node(node, index);
-                self.collect_root_batch_branch(child, index, path, depth + 1, batch);
-            }
-        }
-        self.rule_history_scratch.truncate(history_len);
-    }
-
-    fn collect_batch_node(
-        &mut self,
-        index: usize,
-        evaluate: bool,
-        nodes: &mut Vec<usize>,
-        hidden: &mut Vec<f32>,
-        contexts: &mut Vec<f32>,
-    ) -> Vec<(Move, bool)> {
-        let terminal = terminal_value(&self.nodes[index].position, &self.rule_history_scratch);
-        let moves = if terminal.is_none() {
-            self.nodes[index]
-                .position
-                .legal_moves_with_rules_and_repetition(&self.rule_history_scratch)
-        } else {
-            Vec::new()
-        };
-        if terminal.is_some() || moves.is_empty() {
-            let value = terminal.unwrap_or(-1.0);
-            let node = &mut self.nodes[index];
-            node.value = value;
-            node.value_wdl = scalar_terminal_wdl(value);
-            node.solved = Some(value as i8);
-            node.value_cached = true;
-            node.expanded = true;
-            return Vec::new();
-        }
-        if !evaluate {
-            self.set_node_children(
-                index,
-                moves.into_iter().map(|(mv, _)| AzChild {
-                    mv,
-                    prior: 0.0,
-                    visits: 0,
-                    value_wdl_sum: [0.0; 3],
-                    child: NO_CHILD,
-                }),
-            );
-            return Vec::new();
-        }
-        let start = self.nodes[index].accumulator_offset as usize;
-        hidden.extend_from_slice(&self.accumulator_arena[start..start + self.model.hidden_size]);
-        contexts.extend_from_slice(&rule_context_features(
-            &self.nodes[index].position,
-            &self.rule_history_scratch,
-        ));
-        nodes.push(index);
-        moves
-    }
-
     fn search_result(&self, simulations: usize) -> AzSearchResult {
         let root_node = &self.nodes[self.root];
         let root_children = self.node_children(self.root);
@@ -795,8 +585,6 @@ impl<'a> AzTree<'a> {
             .map(|child_index| root_children[child_index].mv)
             .or_else(|| candidates.first().map(|candidate| candidate.mv));
         AzSearchResult {
-            root_batch_size: self.root_batch_size,
-            root_batch_visits: self.root_batch_visits,
             best_move,
             value_q: searched_value,
             value_cp: cp_from_q(searched_value),
@@ -971,15 +759,7 @@ impl<'a> AzTree<'a> {
         });
         Self {
             nodes,
-            root_batch: limits.root_batch,
-            root_batch_depth: if limits.root_batch_tactics {
-                limits.root_batch_depth.clamp(2, 8)
-            } else {
-                2
-            },
-            root_batch_active: false,
-            root_batch_size: 0,
-            root_batch_visits: 0,
+            inference_batch_size: limits.inference_batch_size.clamp(1, 32),
             children,
             accumulator_arena,
             root_policy_accumulators,
@@ -1257,16 +1037,6 @@ impl<'a> AzTree<'a> {
         self.nodes[node_index].expanded = true;
         self.nodes[node_index].value_cached = true;
         if let Some(index) = self.immediate_mate_child(node_index) {
-            if self.root_batch_active {
-                let child = self.ensure_child_node(node_index, index);
-                let history_len = self.rule_history_scratch.len();
-                self.rule_history_scratch
-                    .push(self.nodes[child].rule_entry.unwrap());
-                self.expand(child);
-                self.rule_history_scratch.truncate(history_len);
-                self.update_solved(node_index);
-                return self.node_eval(node_index);
-            }
             let mut depth = 1;
             let mut parent = node_index;
             while parent != self.root {
@@ -2021,329 +1791,6 @@ mod tests {
 
     const HIDDEN_MATE_FEN: &str =
         "2bak2r1/4a4/4b4/p2R4p/4C1n2/2P1c3P/P1r3P2/4B4/4A4/2BK1A2R w - - 1 1";
-
-    #[test]
-    fn root_batch_matches_scalar_values_and_real_backpropagation() {
-        let position = Position::startpos();
-        let history = position.initial_rule_history();
-        let mut model = AzNnue::random(16, 811);
-        for (i, weight) in model.rule_context_hidden.iter_mut().enumerate() {
-            *weight = (i as f32 % 9.0 - 4.0) * 0.013;
-        }
-        let limits = AzSearchLimits {
-            draw_score: 0.4,
-            value_scale: 0.65,
-            root_batch_tactics: false,
-            ..AzSearchLimits::default()
-        };
-        let mut tree = AzTree::new(position.clone(), history.clone(), None, &model, limits);
-        tree.prepare_root_batch();
-        let mut count = 0;
-        for child in tree.node_children(tree.root) {
-            let node = child.child_node().unwrap();
-            let after = &tree.nodes[node].position;
-            let mut branch_history = history.clone();
-            branch_history.push(tree.nodes[node].rule_entry.unwrap());
-            let mut expected_sum = [0.0; 3];
-            for reply in tree.node_children(node) {
-                let leaf = reply.child_node().unwrap();
-                let leaf_position = &tree.nodes[leaf].position;
-                let mut leaf_history = branch_history.clone();
-                leaf_history.push(tree.nodes[leaf].rule_entry.unwrap());
-                let moves = leaf_position
-                    .legal_moves_with_rules_and_repetition(&leaf_history)
-                    .into_iter()
-                    .map(|(mv, _)| mv)
-                    .collect::<Vec<_>>();
-                let expected = scale_wdl_value(
-                    model.evaluate_wdl_with_rules(leaf_position, &leaf_history, &moves),
-                    limits.value_scale,
-                );
-                for i in 0..3 {
-                    assert!((tree.nodes[leaf].value_wdl[i] - expected[i]).abs() < 1e-4);
-                    expected_sum[i] += expected[i];
-                }
-                assert_eq!(reply.visits, 1);
-                assert_eq!(tree.nodes[leaf].visits, 1);
-                assert!(tree.nodes[leaf].value_cached);
-                assert!(!tree.nodes[leaf].expanded);
-                assert_eq!(tree.nodes[leaf].children_len, 0);
-                count += 1;
-            }
-            assert_eq!(child.visits as usize, tree.node_children(node).len());
-            assert_eq!(child.visits, tree.nodes[node].visits);
-            for i in 0..3 {
-                assert!((child.value_wdl_sum[i] - expected_sum[i]).abs() < 1e-3);
-            }
-            assert!(tree.nodes[node].expanded);
-            assert_eq!(after.side_to_move(), position.side_to_move().opposite());
-        }
-        assert_eq!(tree.root_batch_size, count);
-        assert_eq!(tree.root_batch_visits, count);
-        assert_eq!(tree.nodes[tree.root].visits as usize, count);
-        assert_eq!(tree.rule_history_scratch.len(), history.len());
-    }
-
-    #[test]
-    fn root_batch_tactics_keeps_quiet_moves_and_backpropagates_third_ply() {
-        let position = Position::startpos();
-        let history = position.initial_rule_history();
-        let model = AzNnue::random(16, 815);
-        let mut tree = AzTree::new(
-            position.clone(),
-            history.clone(),
-            None,
-            &model,
-            AzSearchLimits {
-                root_batch_depth: 3,
-                ..AzSearchLimits::default()
-            },
-        );
-        tree.prepare_root_batch();
-        let mut rows = 0;
-        let mut captures = 0;
-        let mut checks = 0;
-        let mut quiet = 0;
-        for root_edge in tree.node_children(tree.root) {
-            let parent = root_edge.child_node().unwrap();
-            let mut root_sum = [0.0; 3];
-            let mut root_visits = 0;
-            for reply in tree.node_children(parent) {
-                let leaf = reply.child_node().unwrap();
-                let board = &tree.nodes[leaf].position;
-                let mut leaf_history = history.clone();
-                leaf_history.push(tree.nodes[parent].rule_entry.unwrap());
-                leaf_history.push(tree.nodes[leaf].rule_entry.unwrap());
-                let legal = board.legal_moves_with_rules_and_repetition(&leaf_history);
-                let mut expected_sum = tree.nodes[leaf].value_wdl;
-                let mut visits = 1;
-                rows += 1;
-                for (i, &(mv, _)) in legal.iter().enumerate() {
-                    // 用实际走子后的攻击检查独立验证快速将军筛选。
-                    let mut next = board.clone();
-                    let captured = board.piece_at(mv.to as usize);
-                    let mover = board.side_to_move();
-                    next.make_move(mv);
-                    let checking = next.in_check(next.side_to_move());
-                    let tactical = captured.is_some() || checking || board.in_check(mover);
-                    let child = tree.node_children(leaf).get(i);
-                    if !tactical {
-                        quiet += 1;
-                        assert!(child.is_none_or(|edge| edge.child_node().is_none()));
-                        continue;
-                    }
-                    captures += usize::from(captured.is_some());
-                    checks += usize::from(checking && captured.is_none());
-                    assert_eq!(tree.node_children(leaf).len(), legal.len());
-                    let edge = child.unwrap();
-                    assert_eq!(edge.mv, mv);
-                    let node = edge.child_node().unwrap();
-                    let mut next_history = leaf_history.clone();
-                    next_history.push(next.rule_history_entry_after_moved(mover, mv, captured));
-                    let moves = next.legal_moves_with_rules(&next_history);
-                    let expected = model.evaluate_wdl_with_rules(&next, &next_history, &moves);
-                    for i in 0..3 {
-                        assert!((tree.nodes[node].value_wdl[i] - expected[i]).abs() < 1e-4);
-                        assert!((edge.value_wdl_sum[i] - flip_wdl(expected)[i]).abs() < 1e-4);
-                        expected_sum[i] += flip_wdl(expected)[i];
-                    }
-                    assert_eq!(edge.visits, 1);
-                    assert_eq!(tree.nodes[node].visits, 1);
-                    assert_eq!(tree.nodes[node].children_len, 0);
-                    assert!(!tree.nodes[node].expanded);
-                    visits += 1;
-                    rows += 1;
-                }
-                assert_eq!(reply.visits, visits);
-                assert_eq!(tree.nodes[leaf].visits, visits);
-                assert!(!tree.nodes[leaf].expanded);
-                for i in 0..3 {
-                    assert!((tree.nodes[leaf].value_wdl_sum[i] - expected_sum[i]).abs() < 1e-3);
-                    assert!((reply.value_wdl_sum[i] - flip_wdl(expected_sum)[i]).abs() < 1e-3);
-                    root_sum[i] += expected_sum[i];
-                }
-                root_visits += visits;
-            }
-            assert_eq!(root_edge.visits, root_visits);
-            for i in 0..3 {
-                assert!((root_edge.value_wdl_sum[i] - root_sum[i]).abs() < 1e-2);
-            }
-        }
-        assert!(captures > 0 && checks > 0 && quiet > 0);
-        assert_eq!(tree.root_batch_size, rows);
-        assert_eq!(tree.root_batch_visits, rows);
-        assert_eq!(tree.nodes[tree.root].visits as usize, rows);
-        assert_eq!(tree.rule_history_scratch.len(), history.len());
-    }
-
-    #[test]
-    fn root_batch_deeper_tactics_preserves_values_visits_and_depth() {
-        let position = Position::startpos();
-        let history = position.initial_rule_history();
-        let model = AzNnue::random(16, 816);
-        let mut tree = AzTree::new(
-            position.clone(),
-            history.clone(),
-            Some(vec![position.parse_uci_move("b2b9").unwrap()]),
-            &model,
-            AzSearchLimits {
-                root_batch_depth: 4,
-                ..AzSearchLimits::default()
-            },
-        );
-        tree.prepare_root_batch();
-        let mut reached_four = false;
-        let mut evaluated = 0;
-        for index in 0..tree.nodes.len() {
-            let mut entries = Vec::new();
-            let mut node = index;
-            while tree.nodes[node].parent != NO_CHILD {
-                entries.push(tree.nodes[node].rule_entry.unwrap());
-                node = tree.nodes[node].parent as usize;
-            }
-            let depth = entries.len();
-            assert!(depth <= 4);
-            if depth < 2 || tree.nodes[index].visits == 0 {
-                continue;
-            }
-            reached_four |= depth == 4;
-            evaluated += 1;
-            let visits: u32 = tree
-                .node_children(index)
-                .iter()
-                .map(|edge| edge.visits)
-                .sum();
-            assert_eq!(tree.nodes[index].visits, 1 + visits);
-            if tree.nodes[index].solved.is_none() {
-                let mut full_history = history.clone();
-                full_history.extend(entries.into_iter().rev());
-                let board = &tree.nodes[index].position;
-                let moves = board.legal_moves_with_rules(&full_history);
-                let expected = model.evaluate_wdl_with_rules(board, &full_history, &moves);
-                let mut sum = expected;
-                for edge in tree.node_children(index) {
-                    for i in 0..3 {
-                        sum[i] += edge.value_wdl_sum[i];
-                    }
-                }
-                for i in 0..3 {
-                    assert!((tree.nodes[index].value_wdl[i] - expected[i]).abs() < 1e-4);
-                    assert!((tree.nodes[index].value_wdl_sum[i] - sum[i]).abs() < 1e-3);
-                }
-            }
-        }
-        assert!(reached_four);
-        assert_eq!(tree.root_batch_visits, evaluated);
-        assert_eq!(tree.nodes[tree.root].visits as usize, evaluated);
-        assert_eq!(tree.rule_history_scratch.len(), history.len());
-    }
-
-    #[test]
-    fn root_batch_precedes_the_unchanged_puct_simulation_target() {
-        let position = Position::startpos();
-        let model = AzNnue::random(16, 812);
-        let mut tree = AzTree::new(
-            position.clone(),
-            position.initial_rule_history(),
-            None,
-            &model,
-            AzSearchLimits::default(),
-        );
-        tree.prepare_root_batch();
-        let batch_visits = tree.root_batch_visits;
-        let result = alphazero_search(
-            &position,
-            &model,
-            AzSearchLimits {
-                simulations: 9,
-                ..AzSearchLimits::default()
-            },
-        );
-        assert_eq!(result.root_batch_visits, batch_visits);
-        assert_eq!(result.simulations, 9);
-        assert_eq!(
-            result
-                .candidates
-                .iter()
-                .map(|c| c.visits as usize)
-                .sum::<usize>(),
-            batch_visits + result.simulations
-        );
-        let short = alphazero_search(
-            &position,
-            &model,
-            AzSearchLimits {
-                simulations: 1,
-                ..AzSearchLimits::default()
-            },
-        );
-        assert_eq!(short.simulations, 1);
-    }
-
-    #[test]
-    fn root_batch_cached_leaf_only_fills_policy_and_keeps_visits() {
-        let position = Position::startpos();
-        let model = AzNnue::random(16, 813);
-        let mut tree = AzTree::new(
-            position.clone(),
-            position.initial_rule_history(),
-            None,
-            &model,
-            AzSearchLimits {
-                root_batch_tactics: false,
-                ..AzSearchLimits::default()
-            },
-        );
-        tree.prepare_root_batch();
-        let parent = tree.node_children(tree.root)[0].child_node().unwrap();
-        let leaf = tree.node_children(parent)[0].child_node().unwrap();
-        tree.nodes[leaf].value = 0.7;
-        tree.nodes[leaf].value_wdl = [0.8, 0.1, 0.1];
-        tree.rule_history_scratch
-            .push(tree.nodes[parent].rule_entry.unwrap());
-        tree.rule_history_scratch
-            .push(tree.nodes[leaf].rule_entry.unwrap());
-        let eval = tree.expand(leaf);
-        assert_eq!(eval.value_wdl, [0.8, 0.1, 0.1]);
-        assert_eq!(tree.nodes[leaf].visits, 1);
-        assert!(tree.nodes[leaf].children_len > 0);
-        assert!(
-            (tree
-                .node_children(leaf)
-                .iter()
-                .map(|edge| edge.prior)
-                .sum::<f32>()
-                - 1.0)
-                .abs()
-                < 1e-5
-        );
-    }
-
-    #[test]
-    fn root_batch_finishes_before_puct_stop_is_applied() {
-        let position = Position::startpos();
-        let model = AzNnue::random(16, 814);
-        let control = AzSearchControl::new(Arc::new(AtomicBool::new(true)), None);
-        let result = alphazero_search_with_rules_controlled(
-            &position,
-            None,
-            None,
-            &model,
-            AzSearchLimits::default(),
-            Some(&control),
-        );
-        assert!(result.root_batch_size > 0);
-        assert!(result.root_batch_visits > 0);
-        assert_eq!(result.simulations, 0);
-        assert_eq!(
-            result
-                .candidates
-                .iter()
-                .map(|edge| edge.visits as usize)
-                .sum::<usize>(),
-            result.root_batch_visits
-        );
-    }
 
     #[test]
     fn expansion_proves_immediate_mate_without_prior_visits() {

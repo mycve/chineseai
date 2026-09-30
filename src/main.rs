@@ -1355,9 +1355,7 @@ fn fixed_az_search_limits(
     policy_softmax_temp: f32,
 ) -> AzSearchLimits {
     AzSearchLimits {
-        root_batch: true,
-        root_batch_tactics: true,
-        root_batch_depth: 4,
+        inference_batch_size: 1,
         simulations,
         seed,
         cpuct,
@@ -1536,9 +1534,7 @@ fn main() {
                 panic!("failed to load `{model_path}`: {err}");
             });
             let search_limits = AzSearchLimits {
-                root_batch: true,
-                root_batch_tactics: true,
-                root_batch_depth: 4,
+                inference_batch_size: 1,
                 simulations,
                 seed: 0,
                 cpuct,
@@ -3030,9 +3026,7 @@ fn main() {
                                 Arc::new(deployed_model.clone()),
                                 rows,
                                 AzSearchLimits {
-                                    root_batch: true,
-                                    root_batch_tactics: true,
-                                    root_batch_depth: 4,
+                                    inference_batch_size: 1,
                                     simulations: config.pikafish_label_eval_simulations,
                                     seed: config.seed
                                         ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
