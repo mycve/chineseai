@@ -716,7 +716,7 @@ impl<'a> AzTree<'a> {
         });
         Self {
             nodes,
-            inference_batch_size: limits.inference_batch_size.clamp(1, 32),
+            inference_batch_size: limits.inference_batch_size.clamp(1, 64),
             leaf_batch: batch_search::LeafBatchScratch::default(),
             children,
             accumulator_arena,

@@ -161,7 +161,7 @@ fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
     println!("option name EvalFile type string default model.safetensors");
-    println!("option name InferenceBatchSize type spin default 1 min 1 max 32");
+    println!("option name InferenceBatchSize type spin default 1 min 1 max 64");
     println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name MultiPV type spin default 1 min 1 max 64");
@@ -216,7 +216,7 @@ fn handle_setoption(line: &str, state: &mut UciState) {
     match name.as_str() {
         "inferencebatchsize" => {
             if let Ok(value) = value.parse::<usize>() {
-                state.inference_batch_size = value.clamp(1, 32);
+                state.inference_batch_size = value.clamp(1, 64);
             }
         }
         "multipv" => {

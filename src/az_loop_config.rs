@@ -179,11 +179,12 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
+        writeln!(out, "# 自博弈每步的固定模拟预算；终局证明或外部停止可提前结束。\n# 单树叶子推理 batch：1..64；与训练 batch_size 独立。\n# 修改后重启 az-loop 生效。").unwrap();
+        line!("simulations", self.simulations);
         line!("inference_batch_size", self.inference_batch_size);
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
         line!("temperature_cutoff_plies", self.temperature_cutoff_plies);
-        line!("simulations", self.simulations);
         line!(
             "selfplay_samples_per_update",
             self.selfplay_samples_per_update
@@ -317,7 +318,7 @@ impl AzLoopFileConfig {
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
-        self.inference_batch_size = self.inference_batch_size.clamp(1, 32);
+        self.inference_batch_size = self.inference_batch_size.clamp(1, 64);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
 
         self.replay_recent_games = self.replay_recent_games.max(1);
