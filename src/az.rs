@@ -398,15 +398,32 @@ impl AzEvalAccumulator {
             Self::refresh_perspective(model, after, perspective, hidden);
             return;
         }
-        add_canonical_piece_contribution(
-            model,
-            hidden,
-            perspective,
-            before_buckets,
-            mv.from as usize,
-            moved,
-            -1.0,
-        );
+        // 王桶未变时，走子棋子的棋种和将帅关联项相互抵消。
+        let from = canonical_square_for(perspective, mv.from as usize);
+        let to = canonical_square_for(perspective, mv.to as usize);
+        let piece_index = piece_absolute_feature_index(perspective, moved);
+        for (table, from_row, to_row) in [
+            (
+                &model.input_hidden,
+                piece_index * BOARD_SIZE + from,
+                piece_index * BOARD_SIZE + to,
+            ),
+            (
+                &model.input_rank_hidden,
+                from / BOARD_FILES,
+                to / BOARD_FILES,
+            ),
+            (
+                &model.input_file_hidden,
+                from % BOARD_FILES,
+                to % BOARD_FILES,
+            ),
+        ] {
+            if from_row != to_row {
+                add_scaled_feature_row(hidden, table, model.hidden_size, from_row, -1.0);
+                add_scaled_feature_row(hidden, table, model.hidden_size, to_row, 1.0);
+            }
+        }
         if let Some(captured) = captured {
             add_canonical_piece_contribution(
                 model,
@@ -418,15 +435,6 @@ impl AzEvalAccumulator {
                 -1.0,
             );
         }
-        add_canonical_piece_contribution(
-            model,
-            hidden,
-            perspective,
-            after_buckets,
-            mv.to as usize,
-            moved,
-            1.0,
-        );
     }
 
     pub(super) fn hidden_for_slice(hidden_sum: &[f32], hidden_size: usize, side: Color) -> &[f32] {
@@ -1856,14 +1864,28 @@ impl AzNnue {
             *accumulator = self.policy_accumulator(after, perspective);
             return;
         }
-        self.add_policy_piece(
-            accumulator,
-            perspective,
-            before_buckets,
-            mv.from as usize,
-            moved,
-            -1,
-        );
+        let from = canonical_square_for(perspective, mv.from as usize);
+        let to = canonical_square_for(perspective, mv.to as usize);
+        let piece_index = piece_absolute_feature_index(perspective, moved);
+        for (from_row, to_row) in [
+            (
+                piece_index * BOARD_SIZE + from,
+                piece_index * BOARD_SIZE + to,
+            ),
+            (
+                POLICY_ACCUMULATOR_RANK_OFFSET + from / BOARD_FILES,
+                POLICY_ACCUMULATOR_RANK_OFFSET + to / BOARD_FILES,
+            ),
+            (
+                POLICY_ACCUMULATOR_FILE_OFFSET + from % BOARD_FILES,
+                POLICY_ACCUMULATOR_FILE_OFFSET + to % BOARD_FILES,
+            ),
+        ] {
+            if from_row != to_row {
+                self.add_policy_row(accumulator, from_row, -1);
+                self.add_policy_row(accumulator, to_row, 1);
+            }
+        }
         if let Some(captured) = captured {
             self.add_policy_piece(
                 accumulator,
@@ -1874,14 +1896,6 @@ impl AzNnue {
                 -1,
             );
         }
-        self.add_policy_piece(
-            accumulator,
-            perspective,
-            after_buckets,
-            mv.to as usize,
-            moved,
-            1,
-        );
     }
 
     fn add_policy_piece(

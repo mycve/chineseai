@@ -597,12 +597,18 @@ impl Position {
 
     pub fn legal_moves(&self) -> Vec<Move> {
         crate::scope_profile!("xiangqi.legal_moves");
-        self.collect_legal_moves(false, self.in_check(self.side_to_move))
+        self.collect_legal_moves(false, self.in_check(self.side_to_move), false)
+    }
+
+    pub fn has_legal_move(&self) -> bool {
+        !self
+            .collect_legal_moves(false, self.in_check(self.side_to_move), true)
+            .is_empty()
     }
 
     #[cfg(test)]
     pub(super) fn legal_capture_moves(&self) -> Vec<Move> {
-        self.collect_legal_moves(true, self.in_check(self.side_to_move))
+        self.collect_legal_moves(true, self.in_check(self.side_to_move), false)
     }
 
     #[cfg(test)]
@@ -1156,7 +1162,12 @@ impl Position {
         moves
     }
 
-    fn collect_legal_moves(&self, captures_only: bool, in_check: bool) -> Vec<Move> {
+    fn collect_legal_moves(
+        &self,
+        captures_only: bool,
+        in_check: bool,
+        stop_after_first: bool,
+    ) -> Vec<Move> {
         crate::scope_profile!("xiangqi.collect_legal_moves");
         let mut moves = if in_check {
             crate::scope_profile!("xiangqi.pseudo_legal_moves");
@@ -1194,6 +1205,9 @@ impl Position {
                 if !requires_safety_check {
                     moves[legal_len] = mv;
                     legal_len += 1;
+                    if stop_after_first {
+                        break;
+                    }
                     continue;
                 }
 
@@ -1205,6 +1219,9 @@ impl Position {
                     legal_len += 1;
                 }
                 work.unmake_move_board_only(mv, captured);
+                if stop_after_first && legal_len > 0 {
+                    break;
+                }
             }
         }
 

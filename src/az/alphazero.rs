@@ -1010,11 +1010,15 @@ impl<'a> AzTree<'a> {
             }
             let mut reply = position.clone();
             reply.make_move(child.mv);
-            if !reply.legal_moves().is_empty() {
+            if reply.has_legal_move() {
                 continue;
             }
             let mut history = self.rule_history_scratch.clone();
-            history.push(position.rule_history_entry_after_move(child.mv));
+            history.push(reply.rule_history_entry_after_moved(
+                position.side_to_move(),
+                child.mv,
+                position.piece_at(child.mv.to as usize),
+            ));
             match reply.rule_outcome_with_history(&history) {
                 None => return Some(index),
                 Some(RuleOutcome::Win(side)) if side == position.side_to_move() => {
