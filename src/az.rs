@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Shape, Tensor, Var};
+use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 mod alphazero;
@@ -1535,50 +1535,48 @@ impl AzNnue {
         &self,
         board_hidden: &[f32],
         rule_context: &[f32],
-    ) -> candle_core::Result<Vec<AzEvalOutput>> {
+    ) -> Vec<AzEvalOutput> {
         let rows = board_hidden.len() / self.hidden_size;
         if rows == 0 {
-            return Ok(Vec::new());
+            return Vec::new();
         }
-        let device = &Device::Cpu;
-        let board = Tensor::from_slice(board_hidden, (rows, self.hidden_size), device)?;
-        let rules = Tensor::from_slice(rule_context, (rows, RULE_CONTEXT_SIZE), device)?;
-        let rule_weights = Tensor::from_slice(
-            &self.rule_context_hidden,
-            (RULE_CONTEXT_SIZE, self.hidden_size),
-            device,
-        )?;
-        let hidden = (board + rules.matmul(&rule_weights)?)?.relu()?;
-        let rms = hidden
-            .sqr()?
-            .mean_keepdim(1)?
-            .affine(1.0, RMS_NORM_EPS as f64)?
-            .sqrt()?;
-        let hidden = hidden.broadcast_div(&rms)?;
-        let head_weights = Tensor::from_slice(
+        assert_eq!(rule_context.len(), rows * RULE_CONTEXT_SIZE);
+        let mut hidden = board_hidden.to_vec();
+        for (row, context) in hidden
+            .chunks_exact_mut(self.hidden_size)
+            .zip(rule_context.chunks_exact(RULE_CONTEXT_SIZE))
+        {
+            self.add_rule_context_to_hidden(context.try_into().unwrap(), row);
+            relu_in_place(row);
+            rms_norm_in_place(row);
+        }
+        let mut head = linear_batch(
+            &hidden,
+            self.hidden_size,
             &self.value_head_hidden,
-            (VALUE_HEAD_SIZE, self.hidden_size),
-            device,
-        )?;
-        let bias = Tensor::from_slice(&self.value_head_bias, VALUE_HEAD_SIZE, device)?;
-        let head = hidden
-            .matmul(&head_weights.t()?)?
-            .broadcast_add(&bias)?
-            .relu()?;
-        let output_weights = Tensor::from_slice(
+            VALUE_HEAD_SIZE,
+        );
+        for row in head.chunks_exact_mut(VALUE_HEAD_SIZE) {
+            for (value, bias) in row.iter_mut().zip(&self.value_head_bias) {
+                *value = (*value + bias).max(0.0);
+            }
+        }
+        let logits = linear_batch(
+            &head,
+            VALUE_HEAD_SIZE,
             &self.value_head_output,
-            (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
-            device,
-        )?;
-        let logits = head.matmul(&output_weights.t()?)?;
-        let probs = candle_nn::ops::softmax(&logits, 1)?.to_vec2::<f32>()?;
-        Ok(probs
-            .into_iter()
-            .map(|row| AzEvalOutput {
-                value_wdl: [row[0], row[1], row[2]],
-                value: row[0] - row[2],
+            WDL_HEAD_SIZE,
+        );
+        logits
+            .chunks_exact(WDL_HEAD_SIZE)
+            .map(|row| {
+                let value_wdl = softmax_fixed3([row[0], row[1], row[2]]);
+                AzEvalOutput {
+                    value_wdl,
+                    value: value_wdl[0] - value_wdl[2],
+                }
             })
-            .collect())
+            .collect()
     }
 
     fn evaluate_policy_with_scratch(
@@ -2218,6 +2216,40 @@ pub(super) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_H
     } else {
         [0.0, 1.0, 0.0]
     }
+}
+
+/// 每个搜索 worker 内只使用一个矩阵内核线程，避免与自对弈外层并行嵌套。
+fn linear_batch(input: &[f32], input_size: usize, weights: &[f32], output_size: usize) -> Vec<f32> {
+    let rows = input.len() / input_size;
+    assert_eq!(input.len(), rows * input_size);
+    assert_eq!(weights.len(), output_size * input_size);
+    let mut output = vec![0.0; rows * output_size];
+    // 输入为 [rows, input_size]，权重为 [output_size, input_size]；右矩阵使用转置步长。
+    // 三个连续切片的长度已验证，输出独占且与两个输入不重叠。
+    unsafe {
+        gemm::gemm(
+            rows,
+            output_size,
+            input_size,
+            output.as_mut_ptr(),
+            1,
+            output_size as isize,
+            false,
+            input.as_ptr(),
+            1,
+            input_size as isize,
+            weights.as_ptr(),
+            input_size as isize,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::None,
+        );
+    }
+    output
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {

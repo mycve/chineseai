@@ -588,8 +588,7 @@ impl<'a> AzTree<'a> {
         self.rule_history_scratch.truncate(history_len);
         let outputs = self
             .model
-            .evaluate_incremental_value_batch(&hidden, &contexts)
-            .expect("根节点 batch 价值推理失败");
+            .evaluate_incremental_value_batch(&hidden, &contexts);
         self.root_batch_size = outputs.len();
         for (index, mut eval) in batch_nodes.into_iter().zip(outputs) {
             eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
@@ -672,17 +671,17 @@ impl<'a> AzTree<'a> {
             node.expanded = true;
             return;
         }
-        self.set_node_children(
-            index,
-            moves.into_iter().map(|(mv, _)| AzChild {
-                mv,
-                prior: 0.0,
-                visits: 0,
-                value_wdl_sum: [0.0; 3],
-                child: NO_CHILD,
-            }),
-        );
         if !evaluate {
+            self.set_node_children(
+                index,
+                moves.into_iter().map(|(mv, _)| AzChild {
+                    mv,
+                    prior: 0.0,
+                    visits: 0,
+                    value_wdl_sum: [0.0; 3],
+                    child: NO_CHILD,
+                }),
+            );
             return;
         }
         let start = self.nodes[index].accumulator_offset as usize;
@@ -2007,6 +2006,7 @@ mod tests {
                 assert_eq!(tree.nodes[leaf].visits, 1);
                 assert!(tree.nodes[leaf].value_cached);
                 assert!(!tree.nodes[leaf].expanded);
+                assert_eq!(tree.nodes[leaf].children_len, 0);
                 count += 1;
             }
             assert_eq!(child.visits as usize, tree.node_children(node).len());
@@ -2085,11 +2085,10 @@ mod tests {
             .push(tree.nodes[parent].rule_entry.unwrap());
         tree.rule_history_scratch
             .push(tree.nodes[leaf].rule_entry.unwrap());
-        let children_offset = tree.nodes[leaf].children_offset;
         let eval = tree.expand(leaf);
         assert_eq!(eval.value_wdl, [0.8, 0.1, 0.1]);
         assert_eq!(tree.nodes[leaf].visits, 1);
-        assert_eq!(tree.nodes[leaf].children_offset, children_offset);
+        assert!(tree.nodes[leaf].children_len > 0);
         assert!(
             (tree
                 .node_children(leaf)
