@@ -1004,6 +1004,8 @@ fn build_az_loop_config(
         rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
         simulations: config.simulations,
         inference_batch_size: config.inference_batch_size,
+        root_tactics_depth: config.root_tactics_depth,
+        root_tactics_weight: config.root_tactics_weight,
         seed,
         workers,
         generation_update,
@@ -1355,6 +1357,8 @@ fn fixed_az_search_limits(
 ) -> AzSearchLimits {
     AzSearchLimits {
         inference_batch_size: 1,
+        root_tactics_depth: 0,
+        root_tactics_weight: 0.5,
         simulations,
         seed,
         cpuct,
@@ -1533,6 +1537,8 @@ fn main() {
             });
             let search_limits = AzSearchLimits {
                 inference_batch_size: 1,
+                root_tactics_depth: 0,
+                root_tactics_weight: 0.5,
                 simulations,
                 seed: 0,
                 cpuct,
@@ -3024,6 +3030,8 @@ fn main() {
                                 rows,
                                 AzSearchLimits {
                                     inference_batch_size: 1,
+                                    root_tactics_depth: 0,
+                                    root_tactics_weight: 0.5,
                                     simulations: config.pikafish_label_eval_simulations,
                                     seed: config.seed
                                         ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),

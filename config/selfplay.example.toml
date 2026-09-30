@@ -8,6 +8,9 @@ temperature_cutoff_plies = 78
 simulations = 800
 # 单树叶子推理 batch，范围 1..64；与训练 batch_size 独立。
 inference_batch_size = 24
+# 独立根战术延伸：0 关闭，1..8；评分权重 0..1，随真实访问增多衰减。
+root_tactics_depth = 8
+root_tactics_weight = 0.5
 selfplay_samples_per_update = 120000
 lr = 0.02
 batch_size = 2048

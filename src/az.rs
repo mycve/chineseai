@@ -613,6 +613,10 @@ pub struct AzLoopConfig {
     pub rule60_max_ply: Option<u16>,
     pub simulations: usize,
     pub inference_batch_size: usize,
+    /// 根战术延伸最大深度（含根走法），0 关闭，最大 8。
+    pub root_tactics_depth: usize,
+    /// 独立战术评分的参考权重，不计入真实访问。
+    pub root_tactics_weight: f32,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,

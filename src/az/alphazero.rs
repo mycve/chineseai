@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 #[path = "batch_search.rs"]
 mod batch_search;
+#[path = "root_tactics.rs"]
+mod root_tactics;
 #[path = "uci_search.rs"]
 mod uci_search;
 pub(crate) use uci_search::{AzUciSearchResult, search_uci};
@@ -29,6 +31,10 @@ const INITIAL_CHILDREN_PER_NODE_ESTIMATE: usize = 8;
 pub struct AzSearchLimits {
     /// 每次收集的 MCTS 叶子数，1 使用原始逐次搜索。
     pub inference_batch_size: usize,
+    /// 根战术延伸最大深度（含根走法），0 关闭，最大 8。
+    pub root_tactics_depth: usize,
+    /// 独立战术评分的参考权重，不计入真实访问。
+    pub root_tactics_weight: f32,
     pub simulations: usize,
     pub seed: u64,
     pub cpuct: f32,
@@ -56,6 +62,8 @@ impl Default for AzSearchLimits {
     fn default() -> Self {
         Self {
             inference_batch_size: 1,
+            root_tactics_depth: 0,
+            root_tactics_weight: 0.5,
             simulations: 3000,
             seed: 0,
             cpuct: DEFAULT_CPUCT,
@@ -403,7 +411,11 @@ pub fn cp_from_q(q: f32) -> i32 {
 
 struct AzTree<'a> {
     inference_batch_size: usize,
+    root_tactics_depth: usize,
+    root_tactics_weight: f32,
     leaf_batch: batch_search::LeafBatchScratch,
+    root_tactics_ready: bool,
+    root_tactics_q: Vec<f32>,
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
@@ -717,6 +729,10 @@ impl<'a> AzTree<'a> {
         Self {
             nodes,
             inference_batch_size: limits.inference_batch_size.clamp(1, 64),
+            root_tactics_depth: limits.root_tactics_depth.min(8),
+            root_tactics_weight: limits.root_tactics_weight.clamp(0.0, 1.0),
+            root_tactics_ready: false,
+            root_tactics_q: Vec::new(),
             leaf_batch: batch_search::LeafBatchScratch::default(),
             children,
             accumulator_arena,
@@ -1392,7 +1408,17 @@ impl<'a> AzTree<'a> {
             {
                 continue;
             }
-            let score = self.child_score(child, draw_score, fpu_value, parent_visits_sqrt, cpuct);
+            let tactical_q = (node_index == self.root)
+                .then(|| self.root_tactics_q.get(index).copied())
+                .flatten();
+            let score = self.child_score(
+                child,
+                draw_score,
+                fpu_value,
+                parent_visits_sqrt,
+                cpuct,
+                tactical_q,
+            );
             if best.is_none_or(|(_, best_prior, best_score)| {
                 score.total_cmp(&best_score).is_gt()
                     || (score.total_cmp(&best_score).is_eq()
@@ -1453,6 +1479,7 @@ impl<'a> AzTree<'a> {
         fpu_value: f32,
         parent_visits_sqrt: f32,
         cpuct: f32,
+        tactical_q: Option<f32>,
     ) -> f32 {
         let visits = child.visits + child.virtual_visits;
         let q = if child.virtual_visits > 0 {
@@ -1463,6 +1490,15 @@ impl<'a> AzTree<'a> {
             self.child_q(child, draw_score)
         } else {
             fpu_value
+        };
+        // 战术参考仅影响根选路，不改写任何真实或虚拟访问统计。
+        let q = match tactical_q {
+            Some(t) if self.child_solved(child).is_none() => {
+                let alpha = self.root_tactics_weight;
+                let sum = if visits > 0 { q * visits as f32 } else { 0.0 };
+                (sum + alpha * t) / (visits as f32 + alpha)
+            }
+            _ => q,
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + visits as f32);
         q + u

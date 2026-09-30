@@ -296,6 +296,8 @@ fn play_one_game(
                 model,
                 AzSearchLimits {
                     inference_batch_size: 1,
+                    root_tactics_depth: 0,
+                    root_tactics_weight: 0.5,
                     simulations: config.simulations,
                     seed,
                     cpuct: config.cpuct,

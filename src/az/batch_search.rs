@@ -25,6 +25,12 @@ impl AzTree<'_> {
         if remaining == 0 || control.is_some_and(AzSearchControl::should_stop) {
             return 0;
         }
+        if !self.root_tactics_ready {
+            self.prepare_root_tactics(control);
+            if control.is_some_and(AzSearchControl::should_stop) {
+                return 0;
+            }
+        }
         if self.inference_batch_size == 1 || self.nodes[self.root].solved.is_some() {
             self.simulate(self.root, 0);
             return 1;

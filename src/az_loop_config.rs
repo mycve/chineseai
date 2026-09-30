@@ -22,6 +22,10 @@ pub struct AzLoopFileConfig {
     pub model_path: String,
     pub simulations: usize,
     pub inference_batch_size: usize,
+    /// 根战术延伸最大深度（含根走法），0 关闭，最大 8。
+    pub root_tactics_depth: usize,
+    /// 独立战术评分的参考权重，不计入真实访问。
+    pub root_tactics_weight: f32,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub batch_size: usize,
@@ -89,6 +93,8 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 3000,
             inference_batch_size: 1,
+            root_tactics_depth: 0,
+            root_tactics_weight: 0.5,
             selfplay_samples_per_update: 120000,
             lr: 0.02,
             batch_size: 2048,
@@ -182,6 +188,13 @@ impl AzLoopFileConfig {
         writeln!(out, "# 自博弈每步的固定模拟预算；终局证明或外部停止可提前结束。\n# 单树叶子推理 batch：1..64；与训练 batch_size 独立。\n# 修改后重启 az-loop 生效。").unwrap();
         line!("simulations", self.simulations);
         line!("inference_batch_size", self.inference_batch_size);
+        writeln!(
+            out,
+            "# 独立根战术参考：深度 0 关闭，1..8；权重 0..1，不增加 MCTS 访问。"
+        )
+        .unwrap();
+        line!("root_tactics_depth", self.root_tactics_depth);
+        line!("root_tactics_weight", f(self.root_tactics_weight));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
         line!("temperature_cutoff_plies", self.temperature_cutoff_plies);
@@ -318,6 +331,8 @@ impl AzLoopFileConfig {
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
+        self.root_tactics_depth = self.root_tactics_depth.min(8);
+        self.root_tactics_weight = self.root_tactics_weight.clamp(0.0, 1.0);
         self.inference_batch_size = self.inference_batch_size.clamp(1, 64);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
 
@@ -370,6 +385,22 @@ mod tests {
         };
         let restored: AzLoopFileConfig = toml::from_str(&config.to_file_text()).unwrap();
         assert_eq!(restored.root_dirichlet_alpha, 0.12);
+    }
+
+    #[test]
+    fn root_tactics_controls_roundtrip_and_clamp() {
+        let config = AzLoopFileConfig {
+            root_tactics_depth: 8,
+            root_tactics_weight: 0.5,
+            ..AzLoopFileConfig::default()
+        };
+        let restored = AzLoopFileConfig::parse(&config.to_file_text());
+        assert_eq!(restored.root_tactics_depth, 8);
+        assert_eq!(restored.root_tactics_weight, 0.5);
+        let restored =
+            AzLoopFileConfig::parse("root_tactics_depth = 99\nroot_tactics_weight = 2.0\n");
+        assert_eq!(restored.root_tactics_depth, 8);
+        assert_eq!(restored.root_tactics_weight, 1.0);
     }
 
     #[test]

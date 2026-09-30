@@ -27,6 +27,8 @@ const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 #[derive(Clone)]
 struct UciState {
     inference_batch_size: usize,
+    root_tactics_depth: usize,
+    root_tactics_weight: f32,
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
@@ -56,6 +58,8 @@ impl Default for UciState {
     fn default() -> Self {
         Self {
             inference_batch_size: 1,
+            root_tactics_depth: 0,
+            root_tactics_weight: 0.5,
             position: Position::startpos(),
             rule_history: Position::startpos().initial_rule_history(),
             eval_file: "model.safetensors".into(),
@@ -161,6 +165,8 @@ fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
     println!("option name EvalFile type string default model.safetensors");
+    println!("option name RootTacticsDepth type spin default 0 min 0 max 8");
+    println!("option name RootTacticsWeight type string default 0.5");
     println!("option name InferenceBatchSize type spin default 1 min 1 max 64");
     println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
@@ -214,6 +220,18 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         .unwrap_or_default();
 
     match name.as_str() {
+        "roottacticsdepth" => {
+            if let Ok(value) = value.parse::<usize>() {
+                state.root_tactics_depth = value.min(8);
+            }
+        }
+        "roottacticsweight" => {
+            if let Ok(value) = value.parse::<f32>() {
+                if value.is_finite() {
+                    state.root_tactics_weight = value.clamp(0.0, 1.0);
+                }
+            }
+        }
         "inferencebatchsize" => {
             if let Ok(value) = value.parse::<usize>() {
                 state.inference_batch_size = value.clamp(1, 64);
@@ -549,6 +567,8 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         model,
         AzSearchLimits {
             inference_batch_size: state.inference_batch_size,
+            root_tactics_depth: state.root_tactics_depth,
+            root_tactics_weight: state.root_tactics_weight,
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,

@@ -328,6 +328,8 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
 fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
     AzSearchLimits {
         inference_batch_size: config.inference_batch_size,
+        root_tactics_depth: config.root_tactics_depth,
+        root_tactics_weight: config.root_tactics_weight,
         simulations: config.simulations.max(1),
         seed,
         cpuct: config.cpuct,
@@ -1261,6 +1263,8 @@ fn play_arena_game(
             model,
             AzSearchLimits {
                 inference_batch_size: 1,
+                root_tactics_depth: 0,
+                root_tactics_weight: 0.5,
                 simulations,
                 seed: seed ^ ((ply as u64) << 32),
                 cpuct,
@@ -1323,6 +1327,8 @@ mod tests {
             max_plies: 12,
             rule60_max_ply: Some(120),
             inference_batch_size: 1,
+            root_tactics_depth: 0,
+            root_tactics_weight: 0.5,
             simulations: 64,
             seed: 20260817,
             workers: 1,
