@@ -21,6 +21,7 @@ pub struct AzLoopFileConfig {
     pub format_version: u32,
     pub model_path: String,
     pub simulations: usize,
+    pub inference_batch_size: usize,
     pub selfplay_samples_per_update: usize,
     pub lr: f32,
     pub batch_size: usize,
@@ -88,6 +89,7 @@ impl Default for AzLoopFileConfig {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
             simulations: 10_000,
+            inference_batch_size: 1,
             selfplay_samples_per_update: 120000,
             lr: 0.02,
             batch_size: 2048,
@@ -179,6 +181,7 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
+        line!("inference_batch_size", self.inference_batch_size);
         line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
@@ -317,6 +320,7 @@ impl AzLoopFileConfig {
         self.fpu_value = self.fpu_value.max(0.0);
         self.fpu_value_at_root = self.fpu_value_at_root.max(0.0);
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
+        self.inference_batch_size = self.inference_batch_size.clamp(1, 32);
         self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
 

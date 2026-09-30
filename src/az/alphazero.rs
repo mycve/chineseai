@@ -5,6 +5,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "batch_search.rs"]
+mod batch_search;
 #[path = "uci_search.rs"]
 mod uci_search;
 pub(crate) use uci_search::{AzUciSearchResult, search_uci};
@@ -183,9 +185,8 @@ pub fn alphazero_search_trace_with_rules(
     tree.expand(tree.root);
     let mut stopper = KldGainStopper::default();
     let mut used = 0;
-    for _ in 0..limits.simulations {
-        tree.simulate(root, 0);
-        used += 1;
+    while used < limits.simulations {
+        used += tree.simulate_batch(limits.simulations - used, None);
         if tree.nodes[root].solved.is_some()
             || stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
         {
@@ -309,12 +310,11 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
     let mut last_progress = Instant::now();
     {
         crate::scope_profile!("az.search.simulations");
-        for _ in 0..limits.simulations {
+        while used < limits.simulations {
             if control.is_some_and(AzSearchControl::should_stop) {
                 break;
             }
-            tree.simulate(root, 0);
-            used += 1;
+            used += tree.simulate_batch(limits.simulations - used, control);
             if tree.nodes[root].solved.is_some()
                 || kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
             {
@@ -393,9 +393,8 @@ pub(super) fn alphazero_search_with_rules_reusing(
         crate::scope_profile!("az.search.simulations");
         let mut used = 0;
         let mut kld_stopper = KldGainStopper::default();
-        for _ in 0..limits.simulations {
-            tree.simulate(root, 0);
-            used += 1;
+        while used < limits.simulations {
+            used += tree.simulate_batch(limits.simulations - used, None);
             if tree.nodes[root].solved.is_some()
                 || kld_stopper.should_stop(&tree, limits.minimum_kldgain_per_node)
             {
@@ -452,6 +451,7 @@ pub fn cp_from_q(q: f32) -> i32 {
 
 struct AzTree<'a> {
     inference_batch_size: usize,
+    leaf_batch: batch_search::LeafBatchScratch,
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
@@ -488,6 +488,7 @@ struct AzTree<'a> {
 #[derive(Clone)]
 struct AzNode {
     value_cached: bool,
+    pending: bool,
     position: Position,
     accumulator_offset: u32,
     policy_accumulator: [f32; POLICY_ACCUMULATOR_RANK],
@@ -497,6 +498,7 @@ struct AzNode {
     children_offset: u32,
     children_len: u16,
     visits: u32,
+    virtual_visits: u32,
     value_wdl_sum: [f32; 3],
     value: f32,
     value_wdl: [f32; 3],
@@ -512,6 +514,7 @@ struct AzChild {
     mv: Move,
     prior: f32,
     visits: u32,
+    virtual_visits: u32,
     value_wdl_sum: [f32; 3],
     child: u32,
 }
@@ -741,6 +744,7 @@ impl<'a> AzTree<'a> {
             root_policy_accumulators[color_index(position.side_to_move())];
         nodes.push(AzNode {
             value_cached: false,
+            pending: false,
             position,
             accumulator_offset: root_accumulator_offset as u32,
             policy_accumulator: root_policy_accumulator,
@@ -750,6 +754,7 @@ impl<'a> AzTree<'a> {
             children_offset: 0,
             children_len: 0,
             visits: 0,
+            virtual_visits: 0,
             value_wdl_sum: [0.0; 3],
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
@@ -760,6 +765,7 @@ impl<'a> AzTree<'a> {
         Self {
             nodes,
             inference_batch_size: limits.inference_batch_size.clamp(1, 32),
+            leaf_batch: batch_search::LeafBatchScratch::default(),
             children,
             accumulator_arena,
             root_policy_accumulators,
@@ -856,6 +862,10 @@ impl<'a> AzTree<'a> {
     }
 
     fn expand(&mut self, node_index: usize) -> AzEvalOutput {
+        self.expand_with_hidden(node_index, None)
+    }
+
+    fn expand_with_hidden(&mut self, node_index: usize, hidden: Option<&[f32]>) -> AzEvalOutput {
         crate::scope_profile!("az.search.expand");
         if self.nodes[node_index].expanded {
             return self.node_eval(node_index);
@@ -945,15 +955,26 @@ impl<'a> AzTree<'a> {
             let context =
                 rule_context_features(&self.nodes[node_index].position, &self.rule_history_scratch);
             if value_cached {
-                self.model.evaluate_incremental_policy_with_scratch(
-                    &self.nodes[node_index].position,
-                    &self.accumulator_arena[accumulator_start..accumulator_end],
-                    &self.nodes[node_index].policy_accumulator,
-                    &moves,
-                    &repetition_flags,
-                    &context,
-                    &mut self.eval_scratch,
-                );
+                if let Some(hidden) = hidden {
+                    self.model.evaluate_policy_from_normalized_hidden(
+                        &self.nodes[node_index].position,
+                        hidden,
+                        &self.nodes[node_index].policy_accumulator,
+                        &moves,
+                        &repetition_flags,
+                        &mut self.eval_scratch,
+                    );
+                } else {
+                    self.model.evaluate_incremental_policy_with_scratch(
+                        &self.nodes[node_index].position,
+                        &self.accumulator_arena[accumulator_start..accumulator_end],
+                        &self.nodes[node_index].policy_accumulator,
+                        &moves,
+                        &repetition_flags,
+                        &context,
+                        &mut self.eval_scratch,
+                    );
+                }
                 self.node_eval(node_index)
             } else {
                 self.model.evaluate_incremental_with_scratch_output(
@@ -1021,6 +1042,7 @@ impl<'a> AzTree<'a> {
                                 mv,
                                 prior,
                                 visits: 0,
+                                virtual_visits: 0,
                                 value_wdl_sum: [0.0; 3],
                                 child: NO_CHILD,
                             }),
@@ -1251,6 +1273,7 @@ impl<'a> AzTree<'a> {
             let child_node = self.nodes.len();
             self.nodes.push(AzNode {
                 value_cached: false,
+                pending: false,
                 position: child_position,
                 accumulator_offset: u32::try_from(child_accumulator_offset)
                     .expect("MCTS accumulator arena exceeds compact offset range"),
@@ -1262,6 +1285,7 @@ impl<'a> AzTree<'a> {
                 children_offset: 0,
                 children_len: 0,
                 visits: 0,
+                virtual_visits: 0,
                 value_wdl_sum: [0.0; 3],
                 value: 0.0,
                 value_wdl: [0.0, 1.0, 0.0],
@@ -1378,20 +1402,24 @@ impl<'a> AzTree<'a> {
     }
 
     fn select_child(&self, node_index: usize) -> usize {
+        self.select_available_child(node_index, false).unwrap_or(0)
+    }
+
+    fn select_available_child(&self, node_index: usize, avoid_pending: bool) -> Option<usize> {
         let node = &self.nodes[node_index];
         let children = self.node_children(node_index);
         if let Some(index) = children
             .iter()
             .position(|child| self.child_solved(child) == Some(1))
         {
-            return index;
+            return Some(index);
         }
         let priority = children
             .iter()
             .map(|child| self.child_priority(child))
             .max()
             .unwrap_or(0);
-        let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
+        let parent_visits_sqrt = ((node.visits + node.virtual_visits).max(1) as f32).sqrt();
         let is_root = node_index == self.root;
         let draw_score = self.node_draw_score(node_index);
         let fpu_reduction = if is_root {
@@ -1404,10 +1432,12 @@ impl<'a> AzTree<'a> {
         } else {
             alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score)
         };
-        let cpuct = self.compute_cpuct(node.visits, is_root);
+        let cpuct = self.compute_cpuct(node.visits + node.virtual_visits, is_root);
         let mut best: Option<(usize, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
-            if self.child_priority(child) != priority {
+            if self.child_priority(child) != priority
+                || (avoid_pending && child.child_node().is_some_and(|i| self.nodes[i].pending))
+            {
                 continue;
             }
             let score = self.child_score(child, draw_score, fpu_value, parent_visits_sqrt, cpuct);
@@ -1419,7 +1449,7 @@ impl<'a> AzTree<'a> {
                 best = Some((index, child.prior, score));
             }
         }
-        best.map(|(index, _, _)| index).unwrap_or(0)
+        best.map(|(index, _, _)| index)
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
@@ -1472,12 +1502,17 @@ impl<'a> AzTree<'a> {
         parent_visits_sqrt: f32,
         cpuct: f32,
     ) -> f32 {
-        let q = if child.visits > 0 {
+        let visits = child.visits + child.virtual_visits;
+        let q = if child.virtual_visits > 0 {
+            (child.value_wdl_sum[0] - child.value_wdl_sum[2] + draw_score * child.value_wdl_sum[1]
+                - child.virtual_visits as f32)
+                / visits as f32
+        } else if child.visits > 0 {
             self.child_q(child, draw_score)
         } else {
             fpu_value
         };
-        let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
+        let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + visits as f32);
         q + u
     }
 
@@ -2104,6 +2139,7 @@ mod tests {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
             visits: 0,
+            virtual_visits: 0,
             value_wdl_sum: [0.0; 3],
             child: NO_CHILD,
         };
@@ -2138,6 +2174,7 @@ mod tests {
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
             visits: 4,
+            virtual_visits: 0,
             value_wdl_sum: [1.0, 2.0, 1.0],
             child: NO_CHILD,
         };
@@ -2371,6 +2408,7 @@ mod tests {
                     mv: legal[0],
                     prior: 0.10,
                     visits: 1,
+                    virtual_visits: 0,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     child: NO_CHILD,
                 },
@@ -2378,6 +2416,7 @@ mod tests {
                     mv: legal[1],
                     prior: 0.90,
                     visits: 1,
+                    virtual_visits: 0,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     child: NO_CHILD,
                 },
@@ -2456,6 +2495,7 @@ mod tests {
                     mv: legal[0],
                     prior: 0.25,
                     visits: 1,
+                    virtual_visits: 0,
                     value_wdl_sum: [0.0, 1.0, 0.0],
                     child: NO_CHILD,
                 },
@@ -2463,6 +2503,7 @@ mod tests {
                     mv: legal[1],
                     prior: 0.75,
                     visits: 0,
+                    virtual_visits: 0,
                     value_wdl_sum: [0.0; 3],
                     child: NO_CHILD,
                 },

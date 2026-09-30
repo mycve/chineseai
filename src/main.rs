@@ -1003,6 +1003,7 @@ fn build_az_loop_config(
         max_plies: config.max_plies,
         rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
         simulations: config.simulations,
+        inference_batch_size: config.inference_batch_size,
         seed,
         workers,
         generation_update,

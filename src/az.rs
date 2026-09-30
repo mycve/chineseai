@@ -612,6 +612,7 @@ pub struct AzLoopConfig {
     pub max_plies: usize,
     pub rule60_max_ply: Option<u16>,
     pub simulations: usize,
+    pub inference_batch_size: usize,
     pub seed: u64,
     pub workers: usize,
     pub generation_update: u32,
@@ -1504,6 +1505,23 @@ impl AzNnue {
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
     }
 
+    pub(super) fn evaluate_policy_from_normalized_hidden(
+        &self,
+        position: &Position,
+        hidden: &[f32],
+        policy_accumulator: &[f32; POLICY_ACCUMULATOR_RANK],
+        moves: &[Move],
+        repetition_flags: &[u8],
+        scratch: &mut AzEvalScratch,
+    ) {
+        scratch.hidden.clear();
+        scratch.hidden.extend_from_slice(hidden);
+        scratch
+            .policy_accumulator_context
+            .copy_from_slice(policy_accumulator);
+        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
+    }
+
     fn prepare_incremental_hidden(
         &self,
         position: &Position,
@@ -1530,18 +1548,17 @@ impl AzNnue {
         }
     }
 
-    /// 所有行在同一次矩阵前向中评估；输入为增量累加器，不计算 policy。
+    /// 批量评估 value，输入就地转为归一化 hidden，供后续 policy 复用。
     pub(super) fn evaluate_incremental_value_batch(
         &self,
-        board_hidden: &[f32],
+        hidden: &mut [f32],
         rule_context: &[f32],
     ) -> Vec<AzEvalOutput> {
-        let rows = board_hidden.len() / self.hidden_size;
+        let rows = hidden.len() / self.hidden_size;
         if rows == 0 {
             return Vec::new();
         }
         assert_eq!(rule_context.len(), rows * RULE_CONTEXT_SIZE);
-        let mut hidden = board_hidden.to_vec();
         for (row, context) in hidden
             .chunks_exact_mut(self.hidden_size)
             .zip(rule_context.chunks_exact(RULE_CONTEXT_SIZE))
@@ -1551,7 +1568,7 @@ impl AzNnue {
             rms_norm_in_place(row);
         }
         let mut head = linear_batch(
-            &hidden,
+            hidden,
             self.hidden_size,
             &self.value_head_hidden,
             VALUE_HEAD_SIZE,

@@ -327,7 +327,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
 
 fn selfplay_search_limits(config: &AzLoopConfig, _ply: usize, seed: u64) -> AzSearchLimits {
     AzSearchLimits {
-        inference_batch_size: 1,
+        inference_batch_size: config.inference_batch_size,
         simulations: config.simulations.max(1),
         seed,
         cpuct: config.cpuct,
@@ -1328,6 +1328,7 @@ mod tests {
             games,
             max_plies: 12,
             rule60_max_ply: Some(120),
+            inference_batch_size: 1,
             simulations: 64,
             seed: 20260817,
             workers: 1,

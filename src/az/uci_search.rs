@@ -142,15 +142,18 @@ pub(crate) fn search_uci(
     let mut used = 0;
     let mut last_progress = Instant::now();
     if tree.nodes[0].children_len > 0 {
-        for _ in 0..limits.simulations {
+        while used < limits.simulations {
             if control.should_stop() {
                 break;
             }
             if tree.nodes.len() >= MAX_UCI_TREE_NODES {
                 tree.compact_uci_tree(MAX_UCI_TREE_NODES / 2);
             }
-            tree.simulate(0, 0);
-            used += 1;
+            let completed = tree.simulate_batch(limits.simulations - used, Some(control));
+            if completed == 0 {
+                break;
+            }
+            used += completed;
             if tree.nodes[0].solved.is_some() {
                 break;
             }
