@@ -295,6 +295,7 @@ fn play_one_game(
                 Some(legal.clone()),
                 model,
                 AzSearchLimits {
+                    root_batch: true,
                     simulations: config.simulations,
                     seed,
                     cpuct: config.cpuct,

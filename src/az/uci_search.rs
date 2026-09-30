@@ -138,7 +138,7 @@ pub(crate) fn search_uci(
 ) -> AzUciSearchResult {
     let mut tree = AzTree::new(position.clone(), history, Some(root_moves), model, limits);
     tree.adjudicate_root_rules = false;
-    tree.expand(0);
+    tree.prepare_root_batch();
     let mut used = 0;
     let mut last_progress = Instant::now();
     if tree.nodes[0].children_len > 0 {

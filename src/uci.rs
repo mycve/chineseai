@@ -26,6 +26,7 @@ const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 
 #[derive(Clone)]
 struct UciState {
+    root_batch: bool,
     position: Position,
     rule_history: Vec<RuleHistoryEntry>,
     eval_file: String,
@@ -54,6 +55,7 @@ struct UciState {
 impl Default for UciState {
     fn default() -> Self {
         Self {
+            root_batch: true,
             position: Position::startpos(),
             rule_history: Position::startpos().initial_rule_history(),
             eval_file: "model.safetensors".into(),
@@ -159,6 +161,7 @@ fn print_uci_id() {
     println!("id name ChineseAI AZ-NNUE");
     println!("id author ChineseAI");
     println!("option name EvalFile type string default model.safetensors");
+    println!("option name RootBatch type check default true");
     println!("option name Simulations type spin default {DEFAULT_SIMULATIONS} min 1 max 100000000");
     println!("option name Threads type spin default 1 min 1 max 1");
     println!("option name MultiPV type spin default 1 min 1 max 64");
@@ -211,6 +214,11 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         .unwrap_or_default();
 
     match name.as_str() {
+        "rootbatch" => {
+            if let Ok(value) = value.parse::<bool>() {
+                state.root_batch = value;
+            }
+        }
         "multipv" => {
             if let Ok(value) = value.parse::<usize>() {
                 state.multipv = value.clamp(1, 64);
@@ -540,6 +548,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         legal,
         model,
         AzSearchLimits {
+            root_batch: state.root_batch,
             simulations,
             seed: state.seed,
             cpuct: state.cpuct,
@@ -569,6 +578,9 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             print_high_score_source(&report, proven);
         }
     }
+    // 搜索证明终局也必须先把最终评分和 PV 发给 GUI，不能等 stop 才发布。
+    print_search_info(&report, started);
+    flush();
     // 无限分析在收到 stop 前不发 bestmove；证明终局后等待。
     while params.infinite && !stop.load(Ordering::Relaxed) {
         thread::park_timeout(Duration::from_millis(10));
@@ -592,7 +604,6 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             } else {
                 mv
             };
-            print_search_info(&report, started);
             if chosen != mv {
                 println!(
                     "info string openingtemp ply={} temperature={:.2} searchbest={} sampled={}",
@@ -650,6 +661,12 @@ fn print_high_score_source(report: &AzUciSearchResult, proven: bool) {
 
 fn print_search_info(report: &AzUciSearchResult, started: Instant) {
     let result = &report.search;
+    if result.root_batch_size > 0 {
+        println!(
+            "info string rootbatch rows={} visits={}",
+            result.root_batch_size, result.root_batch_visits
+        );
+    }
     let elapsed_ms = started.elapsed().as_millis();
     let nps = result.simulations as u128 * 1000 / elapsed_ms.max(1);
     for (index, pv) in report.variations.iter().enumerate() {
@@ -662,8 +679,8 @@ fn print_search_info(report: &AzUciSearchResult, started: Instant) {
             .join(" ");
         println!(
             "info depth {} seldepth {} multipv {} nodes {} nps {} time {} score cp {} wdl {} {} {} pv {}",
-            result.search_depth_avg.round() as usize,
-            result.search_depth_max,
+            (result.search_depth_avg.round() as usize).max(1),
+            result.search_depth_max.max(pv.moves.len()),
             index + 1,
             result.simulations,
             nps,

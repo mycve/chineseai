@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Shape, Var};
+use candle_core::{DType, Device, Shape, Tensor, Var};
 use candle_nn::VarMap;
 
 mod alphazero;
@@ -1457,6 +1457,60 @@ impl AzNnue {
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_incremental_with_scratch");
+        let output = self.evaluate_incremental_value_with_scratch_output(
+            position,
+            accumulator_hidden,
+            rule_context,
+            scratch,
+        );
+        scratch
+            .policy_accumulator_context
+            .copy_from_slice(policy_accumulator);
+        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
+        output
+    }
+
+    pub(super) fn evaluate_incremental_value_with_scratch_output(
+        &self,
+        position: &Position,
+        accumulator_hidden: &[f32],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        crate::scope_profile!("az.evaluate_incremental_value_only");
+        self.prepare_incremental_hidden(position, accumulator_hidden, rule_context, scratch);
+        let (value_wdl, value) = {
+            crate::scope_profile!("az.eval.value_head");
+            self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
+        };
+        AzEvalOutput { value_wdl, value }
+    }
+
+    pub(super) fn evaluate_incremental_policy_with_scratch(
+        &self,
+        position: &Position,
+        accumulator_hidden: &[f32],
+        policy_accumulator: &[f32; POLICY_ACCUMULATOR_RANK],
+        moves: &[Move],
+        repetition_flags: &[u8],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) {
+        crate::scope_profile!("az.evaluate_incremental_policy_only");
+        self.prepare_incremental_hidden(position, accumulator_hidden, rule_context, scratch);
+        scratch
+            .policy_accumulator_context
+            .copy_from_slice(policy_accumulator);
+        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
+    }
+
+    fn prepare_incremental_hidden(
+        &self,
+        position: &Position,
+        accumulator_hidden: &[f32],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) {
         scratch.hidden.resize(self.hidden_size, 0.0);
         let hidden = if accumulator_hidden.len() == self.hidden_size {
             accumulator_hidden
@@ -1469,20 +1523,62 @@ impl AzNnue {
         };
         scratch.hidden.copy_from_slice(hidden);
         self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
-        scratch
-            .policy_accumulator_context
-            .copy_from_slice(policy_accumulator);
         {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
         }
-        let (value_wdl, value) = {
-            crate::scope_profile!("az.eval.value_head");
-            self.value_wdl_from_hidden_into(&scratch.hidden, &mut scratch.value_head)
-        };
-        self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
-        AzEvalOutput { value_wdl, value }
+    }
+
+    /// 所有行在同一次矩阵前向中评估；输入为增量累加器，不计算 policy。
+    pub(super) fn evaluate_incremental_value_batch(
+        &self,
+        board_hidden: &[f32],
+        rule_context: &[f32],
+    ) -> candle_core::Result<Vec<AzEvalOutput>> {
+        let rows = board_hidden.len() / self.hidden_size;
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let device = &Device::Cpu;
+        let board = Tensor::from_slice(board_hidden, (rows, self.hidden_size), device)?;
+        let rules = Tensor::from_slice(rule_context, (rows, RULE_CONTEXT_SIZE), device)?;
+        let rule_weights = Tensor::from_slice(
+            &self.rule_context_hidden,
+            (RULE_CONTEXT_SIZE, self.hidden_size),
+            device,
+        )?;
+        let hidden = (board + rules.matmul(&rule_weights)?)?.relu()?;
+        let rms = hidden
+            .sqr()?
+            .mean_keepdim(1)?
+            .affine(1.0, RMS_NORM_EPS as f64)?
+            .sqrt()?;
+        let hidden = hidden.broadcast_div(&rms)?;
+        let head_weights = Tensor::from_slice(
+            &self.value_head_hidden,
+            (VALUE_HEAD_SIZE, self.hidden_size),
+            device,
+        )?;
+        let bias = Tensor::from_slice(&self.value_head_bias, VALUE_HEAD_SIZE, device)?;
+        let head = hidden
+            .matmul(&head_weights.t()?)?
+            .broadcast_add(&bias)?
+            .relu()?;
+        let output_weights = Tensor::from_slice(
+            &self.value_head_output,
+            (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+            device,
+        )?;
+        let logits = head.matmul(&output_weights.t()?)?;
+        let probs = candle_nn::ops::softmax(&logits, 1)?.to_vec2::<f32>()?;
+        Ok(probs
+            .into_iter()
+            .map(|row| AzEvalOutput {
+                value_wdl: [row[0], row[1], row[2]],
+                value: row[0] - row[2],
+            })
+            .collect())
     }
 
     fn evaluate_policy_with_scratch(
