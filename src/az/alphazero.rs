@@ -1320,17 +1320,6 @@ impl<'a> AzTree<'a> {
     fn select_child(&self, node_index: usize) -> usize {
         let node = &self.nodes[node_index];
         let children = self.node_children(node_index);
-        if let Some(index) = children
-            .iter()
-            .position(|child| self.child_solved(child) == Some(1))
-        {
-            return index;
-        }
-        let priority = children
-            .iter()
-            .map(|child| self.child_priority(child))
-            .max()
-            .unwrap_or(0);
         let parent_visits_sqrt = (node.visits.max(1) as f32).sqrt();
         let is_root = node_index == self.root;
         let draw_score = self.node_draw_score(node_index);
@@ -1345,21 +1334,38 @@ impl<'a> AzTree<'a> {
             alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score)
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
-        let mut best: Option<(usize, f32, f32)> = None;
+        // 一趟同时取"证明优先级 → PUCT 分数 → 先验"的字典序最大值。
+        // 原实现先扫一遍找已证明胜的子节点、再扫一遍求最高优先级、最后在最高
+        // 优先级里比分数，每个子节点要查三次 `child_solved`（每次都随机访问
+        // `self.nodes`）。`proof_priority` 把 `Some(1)` 映到最高的 2，所以
+        // "第一个已证明胜的子节点"就是"第一个 priority == 2"，顺序语义不变。
+        let mut best: Option<(usize, u8, f32, f32)> = None;
         for (index, child) in children.iter().enumerate() {
-            if self.child_priority(child) != priority {
-                continue;
+            let solved = self.child_solved(child);
+            let priority = proof_priority(solved);
+            if priority == 2 {
+                return index;
             }
-            let score = self.child_score(child, draw_score, fpu_value, parent_visits_sqrt, cpuct);
-            if best.is_none_or(|(_, best_prior, best_score)| {
-                score.total_cmp(&best_score).is_gt()
-                    || (score.total_cmp(&best_score).is_eq()
-                        && child.prior.total_cmp(&best_prior).is_gt())
-            }) {
-                best = Some((index, child.prior, score));
+            let score = self.child_score_with_solved(
+                child,
+                solved,
+                draw_score,
+                fpu_value,
+                parent_visits_sqrt,
+                cpuct,
+            );
+            let replace = best.is_none_or(|(_, best_priority, best_prior, best_score)| {
+                priority > best_priority
+                    || (priority == best_priority
+                        && (score.total_cmp(&best_score).is_gt()
+                            || (score.total_cmp(&best_score).is_eq()
+                                && child.prior.total_cmp(&best_prior).is_gt())))
+            });
+            if replace {
+                best = Some((index, priority, child.prior, score));
             }
         }
-        best.map(|(index, _, _)| index).unwrap_or(0)
+        best.map(|(index, _, _, _)| index).unwrap_or(0)
     }
 
     fn best_root_child(&self, node_index: usize) -> Option<usize> {
@@ -1404,16 +1410,21 @@ impl<'a> AzTree<'a> {
         init + factor * ((visits as f32 + base) / base).ln()
     }
 
-    fn child_score(
+    /// 子节点的 PUCT 分数；`solved` 由调用方传入，避免重复随机访问 `self.nodes`。
+    fn child_score_with_solved(
         &self,
         child: &AzChild,
+        solved: Option<i8>,
         draw_score: f32,
         fpu_value: f32,
         parent_visits_sqrt: f32,
         cpuct: f32,
     ) -> f32 {
         let q = if child.visits > 0 {
-            self.child_q(child, draw_score)
+            solved.map_or_else(
+                || child.q(draw_score),
+                |value| wdl_utility(scalar_terminal_wdl(value as f32), draw_score),
+            )
         } else {
             fpu_value
         };
