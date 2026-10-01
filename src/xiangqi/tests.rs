@@ -1107,3 +1107,62 @@ fn checkmate_precedes_natural_move_limit() {
         Some(RuleOutcome::Win(Color::Red)),
     );
 }
+
+/// 合法性过滤的快路径必须和 `make_move_board_only` + `in_check` 逐着一致。
+///
+/// 快路径的前提是"当前不在被将军状态"，此时只有 `from` 空出来可能让国王挨打，
+/// 而且新增的占用只可能挡线、不可能造出攻击。这里对随机对局里每一步非国王着法
+/// 逐着对拍，覆盖面大于实际走快路径的场合（实际只对落在 safety mask 里的着法走）。
+#[test]
+fn vacate_attack_check_matches_make_unmake() {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut compared = 0usize;
+    for _game in 0..12 {
+        let mut position = Position::startpos();
+        for ply in 0..240 {
+            let side = position.side_to_move();
+            if let Some(king_sq) = position.find_general(side) {
+                let enemy = side.opposite();
+                let unblock = position.leaper_unblock_mask(king_sq, enemy);
+                let checked = position.in_check(side);
+                for &mv in &position.legal_moves() {
+                    let from = mv.from as usize;
+                    if checked || from == king_sq {
+                        continue;
+                    }
+                    let mut work = position.clone();
+                    let fast = !position.king_attacked_after_vacating(
+                        king_sq,
+                        side,
+                        enemy,
+                        from,
+                        mv.to as usize,
+                        unblock,
+                        &mut work,
+                    );
+                    let mut reference_work = position.clone();
+                    let captured = reference_work.make_move_board_only(mv);
+                    let reference = !reference_work.in_check(side);
+                    reference_work.unmake_move_board_only(mv, captured);
+                    assert_eq!(
+                        fast,
+                        reference,
+                        "game {_game} ply {ply} mv {mv} fen {}",
+                        position.to_fen()
+                    );
+                    compared += 1;
+                }
+            }
+            let legal = position.legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            position.make_move(legal[(state as usize) % legal.len()]);
+        }
+    }
+    assert!(compared > 40000, "compare count too small: {compared}");
+    println!("vacate-vs-make_unmake comparisons: {compared}");
+}

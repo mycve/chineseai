@@ -1174,6 +1174,16 @@ impl Position {
         let safety_check_from_mask = (!in_check)
             .then(|| self.safety_check_from_mask_when_not_in_check(self.side_to_move))
             .unwrap_or(u128::MAX);
+        // 不在被将军状态时，落子只会让 `from` 变空；`to` 的占用状态不变
+        // （己方子落到 `to`，或被吃的敌子被同格的己方子替换），而增加占用只能挡线、
+        // 不可能造出攻击。因此"这步是否会暴露国王"只取决于 `from` 空出来之后
+        // 国王是否挨打——不需要 make/unmake，也不需要重扫全部攻击者。
+        let side = self.side_to_move();
+        let enemy = side.opposite();
+        let fast = (!in_check)
+            .then(|| self.find_general(side))
+            .flatten()
+            .map(|king_sq| (king_sq, self.leaper_unblock_mask(king_sq, enemy)));
 
         {
             crate::scope_profile!("xiangqi.legal_filter");
@@ -1197,19 +1207,154 @@ impl Position {
                     continue;
                 }
 
-                let captured = work.make_move_board_only(mv);
-                if !work.in_check(self.side_to_move)
-                    && (!needs_capture_filter || self.is_capture(mv))
-                {
+                let safe_after_move = match fast {
+                    // 国王自己走子时不能用这条捷径（走完国王换了格子）。
+                    Some((king_sq, unblock)) if from != king_sq => !self
+                        .king_attacked_after_vacating(king_sq, side, enemy, from, to, unblock, &mut work),
+                    _ => {
+                        let captured = work.make_move_board_only(mv);
+                        let ok = !work.in_check(side);
+                        work.unmake_move_board_only(mv, captured);
+                        ok
+                    }
+                };
+                if safe_after_move && (!needs_capture_filter || self.is_capture(mv)) {
                     moves[legal_len] = mv;
                     legal_len += 1;
                 }
-                work.unmake_move_board_only(mv, captured);
             }
         }
 
         moves.truncate(legal_len);
         moves
+    }
+
+    /// `from` 空出来之后，敌方的马腿/象眼是否会被松开；只有这些格子需要重扫 leaper。
+    fn leaper_unblock_mask(&self, king_sq: usize, enemy: Color) -> u128 {
+        let file = file_of(king_sq) as i32;
+        let rank = rank_of(king_sq) as i32;
+        let mut mask = 0u128;
+        for ((leg_df, leg_dr), (move_df, move_dr)) in HORSE_STEPS {
+            let Some(square) = offset_square(file, rank, -move_df, -move_dr) else {
+                continue;
+            };
+            if matches!(
+                self.board[square],
+                Some(Piece {
+                    color,
+                    kind: PieceKind::Horse
+                }) if color == enemy
+            ) {
+                if let Some(leg) = offset_square(
+                    file_of(square) as i32,
+                    rank_of(square) as i32,
+                    leg_df,
+                    leg_dr,
+                ) {
+                    mask |= 1u128 << leg;
+                }
+            }
+        }
+        for ((eye_df, eye_dr), (move_df, move_dr)) in ELEPHANT_STEPS {
+            let Some(square) = offset_square(file, rank, -move_df, -move_dr) else {
+                continue;
+            };
+            if matches!(
+                self.board[square],
+                Some(Piece {
+                    color,
+                    kind: PieceKind::Elephant
+                }) if color == enemy
+            ) {
+                if let Some(eye) = offset_square(
+                    file_of(square) as i32,
+                    rank_of(square) as i32,
+                    eye_df,
+                    eye_dr,
+                ) {
+                    mask |= 1u128 << eye;
+                }
+            }
+        }
+        mask
+    }
+
+    /// `from` 空出来、`to` 落下己方子之后，国王是否被攻击。
+    /// 前提：当前不在被将军状态，且 `from` 不是国王的格子。
+    ///
+    /// 两处占用变化都要考虑：`from` 变空可能松开直线或马腿/象眼；
+    /// `to` 由空变满可能**给敌方炮造出一个炮架**（0 个挡子 → 1 个挡子），
+    /// 所以不能只算 `from`。
+    #[allow(clippy::too_many_arguments)]
+    fn king_attacked_after_vacating(
+        &self,
+        king_sq: usize,
+        side: Color,
+        enemy: Color,
+        from: usize,
+        to: usize,
+        unblock: u128,
+        work: &mut Position,
+    ) -> bool {
+        // 直线子与飞将：沿四个方向从国王向外走，把 `from` 当作空格、把 `to` 当作己方子。
+        let king_file = file_of(king_sq) as i32;
+        let king_rank = rank_of(king_sq) as i32;
+        for (df, dr) in ORTHOGONAL_STEPS {
+            let mut seen_screen = false;
+            let mut nf = king_file + df;
+            let mut nr = king_rank + dr;
+            while inside_board(nf, nr) {
+                let sq = index(nf as usize, nr as usize);
+                if sq != from {
+                    // `to` 一格走完一定由己方子占据：原本是空格则新落下，
+                    // 原本是敌子则被吃掉替换。两种情况都必须按己方子读，
+                    // 否则会把被吃掉的敌车当成还在攻击。
+                    let occupant = if sq == to {
+                        Some(Piece {
+                            color: side,
+                            kind: PieceKind::Soldier,
+                        })
+                    } else {
+                        self.board[sq]
+                    };
+                    if let Some(piece) = occupant {
+                        if !seen_screen {
+                            if piece.color == enemy {
+                                if piece.kind == PieceKind::Rook {
+                                    return true;
+                                }
+                                if piece.kind == PieceKind::General && df == 0 {
+                                    return true;
+                                }
+                            }
+                            seen_screen = true;
+                        } else if piece.color == enemy && piece.kind == PieceKind::Cannon {
+                            return true;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                nf += df;
+                nr += dr;
+            }
+        }
+        // 马腿/象眼：只有 `from` 恰好是那条腿/眼时才可能从"挡住"变成"松开"。
+        if unblock & (1u128 << from) != 0 {
+            let saved_from = work.board[from];
+            let saved_to = work.board[to];
+            work.board[from] = None;
+            // 走完之后 `to` 一定由己方子占据（含吃掉敌子的情况）。
+            work.board[to] = Some(Piece {
+                color: side,
+                kind: PieceKind::Soldier,
+            });
+            let attacked = work.is_square_attacked_by_leapers(king_sq, enemy);
+            work.board[from] = saved_from;
+            work.board[to] = saved_to;
+            return attacked;
+        }
+        false
     }
 
     fn safety_check_from_mask_when_not_in_check(&self, color: Color) -> u128 {
@@ -2153,6 +2298,14 @@ impl Position {
         }
         false
     }
+}
+
+/// 从棋盘坐标加上偏移得到格子；越界返回 `None`。
+#[inline]
+fn offset_square(file: i32, rank: i32, df: i32, dr: i32) -> Option<usize> {
+    let file = file + df;
+    let rank = rank + dr;
+    inside_board(file, rank).then(|| index(file as usize, rank as usize))
 }
 
 const ORTHOGONAL_STEPS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
