@@ -1,4 +1,4 @@
-use crate::version::REPLAY_FILE_VERSION;
+use crate::infra::version::REPLAY_FILE_VERSION;
 
 use std::collections::VecDeque;
 use std::fs;

@@ -11,7 +11,7 @@ pub(crate) fn run(cmd: AzInitArgs) {
     });
     println!(
         "aznnue   : initialized (safetensors, format v{})",
-        chineseai::version::MODEL_FORMAT_VERSION
+        chineseai::infra::version::MODEL_FORMAT_VERSION
     );
     println!("arch     : hidden={}", arch.hidden_size);
     println!("seed     : {seed}");

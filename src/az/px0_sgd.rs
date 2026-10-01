@@ -87,7 +87,7 @@ impl Px0Sgd {
             Tensor::new(
                 &[
                     1i64,
-                    crate::version::MODEL_FORMAT_VERSION as i64,
+                    crate::infra::version::MODEL_FORMAT_VERSION as i64,
                     self.steps as i64,
                     next_update as i64,
                 ],
@@ -119,7 +119,7 @@ impl Px0Sgd {
         let rates = get("base_lr")?.to_vec1::<f64>()?;
         if state.len() != 4
             || state[0] != 1
-            || state[1] != crate::version::MODEL_FORMAT_VERSION as i64
+            || state[1] != crate::infra::version::MODEL_FORMAT_VERSION as i64
             || state[2] < 0
             || state[3] != next_update as i64
             || rates.len() != 2

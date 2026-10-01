@@ -1,8 +1,8 @@
-use crate::az_loop_config::AzLoopFileConfig;
+use crate::cli::az_loop_config::AzLoopFileConfig;
 use chineseai::az::{
     AzArenaConfig, AzArenaReport, AzNnue, SplitMix64, play_arena_games_from_positions,
 };
-use chineseai::px0_opening_book::Px0OpeningBook;
+use chineseai::pikafish::opening_book::Px0OpeningBook;
 use chineseai::xiangqi::Position;
 use std::{sync::Arc, thread};
 

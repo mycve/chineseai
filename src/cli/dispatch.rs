@@ -23,5 +23,5 @@ pub(crate) fn run() {
         }
         Some(CliCommand::VsPikafish(cmd)) => vs_pikafish::run(cmd),
     }
-    chineseai::profile::print_report();
+    chineseai::infra::profile::print_report();
 }

@@ -1,4 +1,4 @@
-use crate::az_loop_config::AzLoopFileConfig;
+use crate::cli::az_loop_config::AzLoopFileConfig;
 use chineseai::az::AzNnue;
 use std::{
     fs, io,

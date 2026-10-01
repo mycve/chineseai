@@ -19,10 +19,11 @@ mod dataloader;
 mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
+pub mod nnue;
 mod play;
 pub mod px0_data;
 mod px0_policy_map;
-#[path = "az/px0_sgd.rs"]
+#[path = "px0_sgd.rs"]
 mod px0_sgd;
 mod replay;
 mod start;
@@ -33,14 +34,14 @@ mod train_gpu;
     all(target_os = "linux", not(target_env = "musl")),
     target_os = "windows",
 ))]
-#[path = "az/train_gpu_candle.rs"]
+#[path = "train_gpu_candle.rs"]
 mod train_gpu_candle;
 
-use crate::nnue::{
+use crate::az::nnue::{
     AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, canonical_square, fill_sparse_features_az,
     piece_absolute_feature_index,
 };
-use crate::version::MODEL_FORMAT_VERSION;
+use crate::infra::version::MODEL_FORMAT_VERSION;
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, color_index,
     piece_kind_index,
@@ -3435,7 +3436,7 @@ mod tests {
         let position = Position::startpos();
         let moves = position.legal_moves();
         let sample = AzTrainingSample {
-            features: crate::nnue::extract_sparse_features_az(&position),
+            features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             move_indices: moves
                 .iter()
@@ -3690,7 +3691,7 @@ mod tests {
                 &mut scratch,
             );
         }
-        crate::profile::print_report();
+        crate::infra::profile::print_report();
     }
 
     #[test]

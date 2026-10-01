@@ -5,7 +5,7 @@ use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 use super::{
     DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE,
 };
-use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 
 const MOVE_BITS: u32 = 12;
 const FEATURE_BITS: u32 = 11;

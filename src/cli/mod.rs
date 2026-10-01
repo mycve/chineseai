@@ -2,10 +2,12 @@ mod args;
 mod az_bench;
 mod az_init;
 mod az_loop;
+mod az_loop_config;
 mod az_policy_scale;
 mod az_search;
 mod dispatch;
 mod reporting;
+mod training_console;
 mod vs_pikafish;
 
 #[cfg(test)]
@@ -30,7 +32,7 @@ pub(crate) use az_loop::selfplay::{SharedSelfplayModel, publish_selfplay_model};
 #[cfg(test)]
 pub(crate) use clap::Parser;
 #[cfg(test)]
-pub(crate) use crate::az_loop_config::AzLoopFileConfig;
+pub(crate) use crate::cli::az_loop_config::AzLoopFileConfig;
 #[cfg(test)]
 pub(crate) use chineseai::az::{AzArenaReport, AzNnue, AzSearchLimits, policy_target_entropy};
 #[cfg(test)]

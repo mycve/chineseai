@@ -1,5 +1,5 @@
 use chineseai::az::AzNnueArch;
-use chineseai::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
+use chineseai::infra::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
-use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::{BOARD_SIZE, Color, Position};
 
 use super::{

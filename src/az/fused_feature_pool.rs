@@ -5,7 +5,7 @@ use candle_core::{CpuStorage, CustomOp2, CustomOp3, Layout, Result, Shape, Tenso
 use super::{
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
 };
-use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::BOARD_SIZE;
 
 pub(super) const PADDING_ITEM: u32 = u32::MAX;

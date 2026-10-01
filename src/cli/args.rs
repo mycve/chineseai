@@ -1,4 +1,4 @@
-use crate::az_loop_config::DEFAULT_AZ_LOOP_CONFIG;
+use crate::cli::az_loop_config::DEFAULT_AZ_LOOP_CONFIG;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const DEFAULT_VS_PIKAFISH_DEPTH: u32 = 10;

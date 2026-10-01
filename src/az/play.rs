@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::nnue::{
+use crate::az::nnue::{
     canonical_move, extract_sparse_features_az, mirror_file_move,
     mirror_sparse_features_az_canonical_file,
 };
@@ -313,7 +313,7 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
                 worker_config.workers = 1;
                 worker_config.seed ^= (worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let chunk = generate_selfplay_chunk(&shared_model, &worker_config);
-                crate::profile::flush_thread();
+                crate::infra::profile::flush_thread();
                 chunk
             })
             .collect::<Vec<_>>()

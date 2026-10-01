@@ -3,11 +3,11 @@ pub(crate) mod checkpoints;
 pub(crate) mod config;
 pub(crate) mod selfplay;
 
-use crate::az_loop_config::load_or_create_az_loop_config;
+use crate::cli::az_loop_config::load_or_create_az_loop_config;
 use crate::cli::args::*;
 use crate::cli::az_loop::{arena::*, checkpoints::*, config::*, selfplay::*};
 use crate::cli::reporting::*;
-use crate::training_console;
+use crate::cli::training_console;
 use chineseai::az::{
     AzArenaReport, AzExperiencePool, AzLoopReport, AzNnue, AzSearchLimits, AzTrainLossWeights,
     Px0ReplaySampler, SplitMix64, generate_selfplay_data, policy_target_entropy,
@@ -204,7 +204,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         model: Arc::new(initial_selfplay_model),
     }));
     let book_openings = Arc::new(std::sync::Mutex::new(
-        chineseai::px0_opening_book::Px0OpeningBook::load(
+        chineseai::pikafish::opening_book::Px0OpeningBook::load(
             &config.selfplay_opening_book,
             config.seed,
         )

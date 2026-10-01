@@ -1,6 +1,6 @@
-use crate::az_loop_config::AzLoopFileConfig;
+use crate::cli::az_loop_config::AzLoopFileConfig;
 use chineseai::az::AzLoopConfig;
-use chineseai::version::AZ_LOOP_PROGRESS_VERSION;
+use chineseai::infra::version::AZ_LOOP_PROGRESS_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,

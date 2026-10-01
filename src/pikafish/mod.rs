@@ -1,5 +1,7 @@
 //! UCI match runner: ChineseAI (AZ-NNUE search) vs Pikafish.
 
+pub mod opening_book;
+
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};

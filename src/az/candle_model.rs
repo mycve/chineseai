@@ -11,7 +11,7 @@ use super::{
     fused_policy::fused_policy,
     fused_sparse_policy::{sparse_policy, tactical_policy},
 };
-use crate::nnue::AZ_NNUE_INPUT_SIZE;
+use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 
 const RMS_NORM_EPS: f64 = 1.0e-6;
 
@@ -521,7 +521,7 @@ mod tests {
             policy_consequence_features, policy_sparse_capture_index, policy_sparse_factor_indices,
             policy_sparse_main_index,
         },
-        nnue::extract_sparse_features_az,
+        az::nnue::extract_sparse_features_az,
         xiangqi::Position,
     };
 

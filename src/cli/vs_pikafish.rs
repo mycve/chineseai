@@ -1,7 +1,7 @@
 use crate::cli::args::*;
 use chineseai::{
-    pikafish_match::{VsPikafishConfig, run_vs_pikafish},
-    px0_opening_book::Px0OpeningBook,
+    pikafish::{VsPikafishConfig, run_vs_pikafish},
+    pikafish::opening_book::Px0OpeningBook,
 };
 use std::path::Path;
 

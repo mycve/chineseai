@@ -1,6 +1,6 @@
 //! Px0 V6 / input format 1 数据读取与固定验证集蒸馏评测。
 use super::*;
-use crate::nnue::extract_sparse_features_az;
+use crate::az::nnue::extract_sparse_features_az;
 use crate::xiangqi::RuleHistoryEntry;
 use flate2::read::GzDecoder;
 use std::{

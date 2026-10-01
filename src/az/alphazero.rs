@@ -1748,7 +1748,7 @@ mod tests {
         let position = Position::from_fen(HIDDEN_MATE_FEN).unwrap();
         let mut model = AzNnue::random(16, 7);
         let mate = position.parse_uci_move("d6d9").unwrap();
-        model.policy_move_bias[super::super::dense_move_index(crate::nnue::canonical_move(
+        model.policy_move_bias[super::super::dense_move_index(crate::az::nnue::canonical_move(
             position.side_to_move(),
             mate,
         ))] = -100.0;

@@ -132,6 +132,6 @@ pub fn flush_thread() {}
 macro_rules! scope_profile {
     ($name:literal) => {
         #[cfg(feature = "profile")]
-        let _scope_profile_guard = $crate::profile::ScopeTimer::new($name);
+        let _scope_profile_guard = $crate::infra::profile::ScopeTimer::new($name);
     };
 }
