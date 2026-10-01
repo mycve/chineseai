@@ -22,7 +22,7 @@ Pikafish 稀疏层使用手写 CPU/CUDA 融合算子，直接累加特征行并�
 
 本机 Ryzen 9 9950X、Windows、`fast` 构建的同权重对照见 [benchmarks/pikafish-fused-20261001.json](benchmarks/pikafish-fused-20261001.json)。八个固定局面的串行 128 节点搜索从约 0.350 秒降至 0.012 秒，约快 29 倍，最佳着全部一致，价值最大误差约 `1.34e-7`。16 worker 的预提取特征评估从约 4 万次/秒升至 278 万次/秒。固定局面会复用缓存，这些数字不代表 Linux 服务器长期对局吞吐或棋力增长；服务器的 `%system` 必须重新采样验证。
 
-128 物理核心服务器的正式长跑配置见 [configs/pikafish-evolve-128c.toml](configs/pikafish-evolve-128c.toml)：96 个自博弈 worker、24 个测评 worker，单步预算分别为 8192 和 32768 节点，512 对晋级开局、200 万局面回放。它使用 `runs/pikafish-evolve-128c-temperature` 新目录，并从当前 `runs/pikafish-evolve/best.safetensors` 继承冠军；没有该文件时应删除 `seed_model` 或填写已有的本项目浮点权重。启动命令为 `RAYON_NUM_THREADS=8 target/fast/chineseai pikafish-evolve configs/pikafish-evolve-128c.toml`；该环境变量约束全局 Rayon 辅助线程，不改变配置中独立创建的自博弈和测评线程数。这份配置提高搜索和训练投入，不承诺顶级棋力：当前约 5000 条教师数据、有限自博弈以及尚未对齐强引擎的搜索，不能支撑这种承诺。应扩大经过核验的教师局面数据，并持续通过与强引擎交换红黑、固定预算的对局检验绝对棋力；内部冠军晋级只表示相对增长。
+128 物理核心服务器的正式长跑配置见 [configs/pikafish-evolve-128c.toml](configs/pikafish-evolve-128c.toml)：96 个自博弈 worker、24 个测评 worker，单步预算分别为 8192 和 32768 节点，512 对晋级开局、200 万局面回放。它使用 `runs/pikafish-evolve-128c-temperature` 新目录，默认先从教师数据库预训练；已有本项目浮点冠军时，可取消配置中 `seed_model` 的注释并填写实际存在的权重路径。启动命令为 `RAYON_NUM_THREADS=8 target/fast/chineseai pikafish-evolve configs/pikafish-evolve-128c.toml`；该环境变量约束全局 Rayon 辅助线程，不改变配置中独立创建的自博弈和测评线程数。这份配置提高搜索和训练投入，不承诺顶级棋力：当前约 5000 条教师数据、有限自博弈以及尚未对齐强引擎的搜索，不能支撑这种承诺。应扩大经过核验的教师局面数据，并持续通过与强引擎交换红黑、固定预算的对局检验绝对棋力；内部冠军晋级只表示相对增长。
 
 ## 原有 AbNnue 模型
 

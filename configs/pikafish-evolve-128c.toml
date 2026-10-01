@@ -1,7 +1,8 @@
 # 128 物理核心 / 256 逻辑 CPU：正式长跑配置，不是烟雾测试。
-# 更改搜索和训练参数需要新目录；从当前冠军继承浮点权重。
+# 更改搜索和训练参数需要新目录；默认从教师数据库预训练。
 output_dir = "runs/pikafish-evolve-128c-temperature"
-seed_model = "runs/pikafish-evolve/best.safetensors"
+# 若已有本项目浮点冠军权重，可取消注释并填写实际存在的路径。
+# seed_model = "runs/pikafish-evolve/best.safetensors"
 # 当前可用教师库只有约 5000 条；bootstrap_samples 不会凭空增加数据。
 bootstrap_sqlite = "eval/pikafish-selfplay-5000-d20.sqlite"
 bootstrap_samples = 5000

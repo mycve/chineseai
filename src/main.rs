@@ -2163,13 +2163,19 @@ fn main() {
         }
         Some(CliCommand::PikafishEvolve(cmd)) => {
             let config = chineseai::pikafish_evolve::EvolveConfig::load_or_create(&cmd.config)
-                .unwrap_or_else(|err| panic!("Pikafish evolution config failed: {err}"));
+                .unwrap_or_else(|err| {
+                    eprintln!("Pikafish evolution config failed: {err}");
+                    std::process::exit(1);
+                });
             let result = if cmd.stop {
                 chineseai::pikafish_evolve::request_stop(&config)
             } else {
                 chineseai::pikafish_evolve::run(config, cmd.target_update)
             };
-            result.unwrap_or_else(|err| panic!("Pikafish evolution failed: {err}"));
+            if let Err(err) = result {
+                eprintln!("Pikafish evolution failed: {err}");
+                std::process::exit(1);
+            }
         }
         Some(CliCommand::PikafishLabelEval(cmd)) => {
             run_pikafish_label_eval(cmd)

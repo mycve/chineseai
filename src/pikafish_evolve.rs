@@ -97,6 +97,15 @@ fn io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+fn path_error(label: &str, path: &Path, error: impl std::fmt::Display) -> io::Error {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    io_error(format!("{label} {}：{error}", absolute.display()))
+}
+
 impl EvolveConfig {
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
         let config: Self = if path.exists() {
@@ -140,6 +149,24 @@ impl EvolveConfig {
             return Err(io_error(
                 "训练参数必须为正；晋级至少 8 对开局、得分门槛 >=0.5、置信 z>=1.96",
             ));
+        }
+        Ok(())
+    }
+
+    fn check_inputs(&self) -> io::Result<()> {
+        let check = |label, path: &Path| {
+            File::open(path)
+                .map(drop)
+                .map_err(|error| path_error(label, path, error))
+        };
+        check("无法读取 opening_book", &self.opening_book)?;
+        if !self.output_dir.join("progress.toml").exists() {
+            if let Some(path) = &self.seed_model {
+                check("无法读取 seed_model", path)?;
+            }
+            if let Some(path) = &self.bootstrap_sqlite {
+                check("无法读取 bootstrap_sqlite", path)?;
+            }
         }
         Ok(())
     }
@@ -668,7 +695,9 @@ fn submit_arena(
 /// CPU 自博弈持续供数，GPU 更新与后台晋级独立推进；只发布通过门槛的固定快照。
 pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()> {
     config.validate()?;
-    fs::create_dir_all(&config.output_dir)?;
+    config.check_inputs()?;
+    fs::create_dir_all(&config.output_dir)
+        .map_err(|error| path_error("无法创建 output_dir", &config.output_dir, error))?;
     let dir = &config.output_dir;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -693,7 +722,8 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         config.selfplay_workers, config.arena_workers, config.queue_games
     );
     let learner = PikafishModel::new(&device).map_err(io_error)?;
-    let mut opening_book = OpeningBook::load(&config.opening_book, config.seed)?;
+    let mut opening_book = OpeningBook::load(&config.opening_book, config.seed)
+        .map_err(|error| path_error("加载 opening_book 失败", &config.opening_book, error))?;
     let (mut state, mut replay, reference, champion) = if dir.join("progress.toml").exists() {
         let mut state: Progress =
             toml::from_str(&fs::read_to_string(dir.join("progress.toml"))?).map_err(io_error)?;
@@ -709,14 +739,24 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         state.config = config.clone();
         learner
             .load(&checkpoint(dir, state.cycle))
-            .map_err(io_error)?;
-        let reference = PikafishCpuModel::load(&checkpoint(dir, 0)).map_err(io_error)?;
+            .map_err(|error| {
+                path_error("加载训练权重失败", &checkpoint(dir, state.cycle), error)
+            })?;
+        let reference = PikafishCpuModel::load(&checkpoint(dir, 0))
+            .map_err(|error| path_error("加载基准权重失败", &checkpoint(dir, 0), error))?;
         let reference = Arc::new(reference);
         let champion = if state.champion_cycle == 0 {
             Arc::clone(&reference)
         } else {
-            let model =
-                PikafishCpuModel::load(&checkpoint(dir, state.champion_cycle)).map_err(io_error)?;
+            let model = PikafishCpuModel::load(&checkpoint(dir, state.champion_cycle)).map_err(
+                |error| {
+                    path_error(
+                        "加载冠军权重失败",
+                        &checkpoint(dir, state.champion_cycle),
+                        error,
+                    )
+                },
+            )?;
             Arc::new(model)
         };
         let replay = load_replay(&dir.join(format!("replay-{:06}.tsv", state.cycle)))?;
@@ -731,7 +771,9 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         (state, replay, reference, champion)
     } else {
         if let Some(seed) = &config.seed_model {
-            learner.load(seed).map_err(io_error)?;
+            learner
+                .load(seed)
+                .map_err(|error| path_error("加载 seed_model 失败", seed, error))?;
         }
         learner.save(&checkpoint(dir, 0)).map_err(io_error)?;
         let reference = Arc::new(learner.cpu_snapshot().map_err(io_error)?);
@@ -1089,6 +1131,40 @@ mod tests {
         config.arena_pairs = 2;
         assert!(config.validate().is_err());
     }
+    #[test]
+    fn startup_checks_inputs_before_initialization() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("evolve-inputs-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let book = dir.join("book.pgn.gz");
+        let seed = dir.join("missing-seed.safetensors");
+        let database = dir.join("missing-teacher.sqlite");
+        let mut config = EvolveConfig {
+            output_dir: dir.join("run"),
+            opening_book: book.clone(),
+            seed_model: Some(seed.clone()),
+            bootstrap_sqlite: Some(database.clone()),
+            ..Default::default()
+        };
+        let error = config.check_inputs().unwrap_err().to_string();
+        assert!(error.contains("opening_book") && error.contains(&book.display().to_string()));
+        fs::write(&book, [])?;
+        let error = config.check_inputs().unwrap_err().to_string();
+        assert!(error.contains("seed_model") && error.contains(&seed.display().to_string()));
+        config.seed_model = None;
+        let error = config.check_inputs().unwrap_err().to_string();
+        assert!(
+            error.contains("bootstrap_sqlite") && error.contains(&database.display().to_string())
+        );
+        config.bootstrap_sqlite = None;
+        config.check_inputs()?;
+        fs::create_dir_all(&config.output_dir)?;
+        fs::write(config.output_dir.join("progress.toml"), [])?;
+        config.seed_model = Some(seed);
+        config.bootstrap_sqlite = Some(database);
+        config.check_inputs()?;
+        fs::remove_dir_all(dir)
+    }
+
     #[test]
     fn only_evidence_of_improvement_can_promote() {
         use crate::ab::AbArenaReport;
