@@ -34,6 +34,9 @@ tikv-jemallocator = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 candle-core = { version = "0.10.2", features = ["cuda"] }
+# Windows 上没有 jemalloc（见 main.rs 的 cfg），用 mimalloc 承担同样的角色：
+# 自博弈有 16+ 个 rayon 线程持续分配 MCTS 节点与累加器，默认分配器的锁竞争很值钱。
+mimalloc = "0.1"
 
 [profile.release]
 lto = "fat"
