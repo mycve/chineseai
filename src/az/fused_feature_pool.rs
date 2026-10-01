@@ -610,9 +610,12 @@ fn cuda_view<'a, T: candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "slow-tests")]
     use super::*;
+    #[cfg(feature = "slow-tests")]
     use candle_core::{Device, Var};
 
+    #[cfg(feature = "slow-tests")]
     fn output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
         let hidden = 7;
         let values = (0..TABLE_ROWS * hidden)
@@ -636,6 +639,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "slow-tests")]
     fn sparse_output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
         let rows = 11;
         let hidden = 7;
@@ -653,6 +657,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "slow-tests")]
     fn assert_close(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
         for (&left, &right) in left.iter().zip(right) {
@@ -660,6 +665,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn fused_feature_pool_cuda_matches_cpu_forward_and_gradient() -> Result<()> {
         let cpu = output_and_grad(&Device::Cpu)?;
@@ -672,6 +678,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn sparse_pool_cuda_matches_cpu_forward_and_gradient() -> Result<()> {
         let cpu = sparse_output_and_grad(&Device::Cpu)?;

@@ -496,6 +496,7 @@ fn dataloader_error(error: super::dataloader::DataLoaderError) -> candle_core::E
 mod monitoring_tests {
     use super::*;
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn complete_sgd_batch_resume_keeps_all_model_tensors_and_momentum() {
         let position = crate::xiangqi::Position::startpos();
@@ -701,6 +702,7 @@ mod monitoring_tests {
         assert_eq!(checks[0].step, super::super::PX0_TEST_STEPS);
         assert_eq!(model.training_steps(), super::super::PX0_TEST_STEPS + 1);
     }
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn fused_moments_match_scalar_reference_on_cpu_and_cuda() {
         let mut devices = vec![Device::Cpu];

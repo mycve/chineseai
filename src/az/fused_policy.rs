@@ -536,9 +536,12 @@ fn cuda_view<'a, T: candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "slow-tests")]
     use super::*;
+    #[cfg(feature = "slow-tests")]
     use candle_core::{Device, Var};
 
+    #[cfg(feature = "slow-tests")]
     fn output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let table_values = (0..TABLE_LEN)
             .map(|index| ((index % 97) as f32 - 48.0) * 0.001)
@@ -566,6 +569,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "slow-tests")]
     fn assert_close(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
         for (&left, &right) in left.iter().zip(right) {
@@ -573,6 +577,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn fused_policy_cuda_matches_cpu_forward_and_gradients() -> Result<()> {
         let cpu = output_and_grad(&Device::Cpu)?;

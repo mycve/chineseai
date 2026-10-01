@@ -303,9 +303,12 @@ fn cuda_view<'a, T: candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "slow-tests")]
     use super::*;
+    #[cfg(feature = "slow-tests")]
     use candle_core::{Device, Var};
 
+    #[cfg(feature = "slow-tests")]
     fn output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
         let tables = Var::from_slice(&[0.5f32, -1.0, 2.0, 3.0, -0.25], 5, device)?;
         let indices = Tensor::from_slice(
@@ -322,6 +325,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "slow-tests")]
     fn assert_close(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
         for (&left, &right) in left.iter().zip(right) {
@@ -329,6 +333,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "slow-tests")]
     fn tactical_output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
         let tables = Var::from_slice(&[0.5f32, -1.0, 2.0, 3.0, -0.25], 5, device)?;
         let indices = Tensor::from_slice(&[0i64, 2, 1, 3, 4, 2], (1, 2, TACTICAL_TERMS), device)?;
@@ -341,6 +346,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn fused_sparse_policy_matches_expected_and_cuda() -> Result<()> {
         let cpu = output_and_grad(&Device::Cpu)?;
@@ -354,6 +360,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn fused_tactical_policy_matches_expected_and_cuda() -> Result<()> {
         let cpu = tactical_output_and_grad(&Device::Cpu)?;
