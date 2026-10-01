@@ -50,10 +50,6 @@ impl Position {
         captured: Option<super::Piece>,
     ) -> RuleHistoryEntry {
         crate::scope_profile!("xiangqi.rule_history_after_moved");
-        let chased_mask = {
-            crate::scope_profile!("xiangqi.rule_history.chased_origin");
-            self.chased_masks_by_origin(mover, mv.to as usize)
-        };
         let gives_check = {
             crate::scope_profile!("xiangqi.rule_history.gives_check");
             self.in_check(self.side_to_move)
@@ -63,7 +59,9 @@ impl Position {
             side_to_move: self.side_to_move,
             mover: Some(mover),
             gives_check,
-            chased_mask,
+            // 逐着只记录被移动棋子的攻击变化会漏掉"被发现的攻击"（例如拆炮架），
+            // 因此重复判定统一按完整局面回滚重算，见 `recompute_cycle_chases`。
+            chased_mask: 0,
             mv: Some(mv),
             captured,
             rule60_clock: self.halfmove_clock,
@@ -79,10 +77,9 @@ impl Position {
             return Some(RuleOutcome::Win(Color::Red));
         }
         let outcome = if let Some(entries) = repetition_cycle(history) {
+            // 逐着记录不带捉子掩码，重复判定必须按完整局面回滚重算。
             let exact_entries = self.recompute_cycle_chases(entries);
-            Some(adjudicate_repetition(
-                exact_entries.as_deref().unwrap_or(entries),
-            ))
+            Some(adjudicate_repetition(&exact_entries))
         } else if self
             .rule60_max_ply
             .is_some_and(|max_ply| self.rule60_count_with_history(history) >= max_ply)
@@ -268,41 +265,6 @@ impl Position {
         square_mask
     }
 
-    fn chased_masks_by_origin(&self, color: Color, origin: usize) -> u128 {
-        crate::scope_profile!("xiangqi.chased_mask_by");
-        let Some(piece) = self.board[origin].filter(|piece| piece.color == color) else {
-            return 0;
-        };
-        if matches!(piece.kind, PieceKind::General | PieceKind::Soldier) {
-            return 0;
-        }
-        let mut captures = Vec::with_capacity(8);
-        self.gen_piece_moves(origin, piece, MoveGenMode::Captures, &mut captures);
-        let mut work = self.clone();
-        work.side_to_move = color;
-
-        let mut square_mask = 0u128;
-        for mv in captures {
-            let target = mv.to as usize;
-            let Some(target_piece) = self.board[target] else {
-                continue;
-            };
-            if !self.is_chase_target_piece(target_piece, color, target) {
-                continue;
-            }
-            if !self.is_effective_chase(target_piece, target, origin) {
-                continue;
-            }
-            let captured = work.make_move_board_only(mv);
-            let legal = !work.in_check(color);
-            work.unmake_move_board_only(mv, captured);
-            if legal {
-                square_mask |= 1u128 << target;
-            }
-        }
-        square_mask
-    }
-
     fn is_chase_target_piece(&self, piece: super::Piece, attacker: Color, sq: usize) -> bool {
         if piece.color == attacker {
             return false;
@@ -436,21 +398,28 @@ impl Position {
         Some(RuleOutcome::Draw(RuleDrawReason::InsufficientMaterial))
     }
 
-    fn recompute_cycle_chases(
-        &self,
-        entries: &[RuleHistoryEntry],
-    ) -> Option<Vec<RuleHistoryEntry>> {
+    /// 重算一段真实走子历史里每一步的捉子掩码。
+    ///
+    /// 逐着记录的 `chased_masks_by_origin` 只覆盖被移动棋子的攻击变化，会漏掉
+    /// "被发现的攻击"（例如拆炮架后另一子开始捉子），所以只有从当前局面回滚到
+    /// 区间起点、再逐着重放求差才准确。历史里为对齐插入的锚点
+    /// （`mv` 与 `mover` 同时为 `None`）不产生走子，直接跳过。
+    pub fn recompute_cycle_chases(&self, entries: &[RuleHistoryEntry]) -> Vec<RuleHistoryEntry> {
         let mut position = self.clone();
         for entry in entries.iter().rev() {
-            let mv = entry.mv?;
+            let (Some(mv), Some(mover)) = (entry.mv, entry.mover) else {
+                continue;
+            };
             position.unmake_move_board_only(mv, entry.captured);
-            position.side_to_move = entry.mover?;
+            position.side_to_move = mover;
         }
 
         let mut exact = Vec::with_capacity(entries.len());
         for &entry in entries {
-            let mv = entry.mv?;
-            let mover = entry.mover?;
+            let (Some(mv), Some(mover)) = (entry.mv, entry.mover) else {
+                exact.push(entry);
+                continue;
+            };
             let before = position.chased_masks_by(mover);
             let captured = position.make_move_board_only(mv);
             debug_assert_eq!(captured, entry.captured);
@@ -461,7 +430,7 @@ impl Position {
                 ..entry
             });
         }
-        Some(exact)
+        exact
     }
 }
 
@@ -587,11 +556,13 @@ mod tests {
         let before = position.chased_masks_by(Color::Red);
         let mv = position.parse_uci_move("a2b2").unwrap();
         let recorded = position.rule_history_entry_after_move(mv);
-        assert_eq!(recorded.chased_mask & (1u128 << horse), 0);
+        // 逐着记录的捉子掩码不再保存（恒为 0）：只扫描被移动棋子会漏掉这类攻击。
+        assert_eq!(recorded.chased_mask, 0);
         position.make_move(mv);
         let after = position.chased_masks_by(Color::Red);
         assert_ne!((after & !before) & (1u128 << horse), 0);
-        let exact = position.recompute_cycle_chases(&[recorded]).unwrap();
+        // 按完整局面回滚重算才能发现"拆炮架后被发现的攻击"。
+        let exact = position.recompute_cycle_chases(&[recorded]);
         assert_ne!(exact[0].chased_mask & (1u128 << horse), 0);
     }
 

@@ -1467,6 +1467,10 @@ pub fn rule_context_features(
         (matches, last_match.map_or(history.len(), |index| index + 1))
     });
     let cycle = &history[cycle_start.min(history.len())..];
+    // 逐着记录不再保存捉子掩码（只扫描被移动棋子会漏掉被发现的攻击），
+    // 这里按完整局面回滚重算，语义与旧版一致。
+    let exact_cycle = position.recompute_cycle_chases(cycle);
+    let cycle = exact_cycle.as_slice();
     let side = position.side_to_move();
     let cycle_count = |color: Color, predicate: fn(&crate::xiangqi::RuleHistoryEntry) -> bool| {
         cycle
