@@ -47,7 +47,7 @@ pub struct EvolveConfig {
     pub arena_nodes: usize,
     pub max_depth: usize,
     pub max_plies: usize,
-    pub opening_plies: usize,
+    pub temperature: crate::pikafish_candidate_selfplay::SelfplayTemperature,
     pub replay_capacity: usize,
     pub train_samples_per_update: usize,
     pub batch_size: usize,
@@ -63,7 +63,7 @@ pub struct EvolveConfig {
 impl Default for EvolveConfig {
     fn default() -> Self {
         Self {
-            output_dir: "runs/pikafish-evolve".into(),
+            output_dir: "runs/pikafish-evolve-temperature".into(),
             seed_model: None,
             bootstrap_sqlite: Some("eval/pikafish-selfplay-5000-d20.sqlite".into()),
             bootstrap_samples: 2048,
@@ -78,7 +78,7 @@ impl Default for EvolveConfig {
             arena_nodes: 256,
             max_depth: 8,
             max_plies: 600,
-            opening_plies: 2,
+            temperature: Default::default(),
             replay_capacity: 50_000,
             train_samples_per_update: 2048,
             batch_size: 16,
@@ -111,6 +111,7 @@ impl EvolveConfig {
     }
 
     fn validate(&self) -> io::Result<()> {
+        self.temperature.validate()?;
         if [
             self.games_per_update,
             self.selfplay_workers,
@@ -129,7 +130,6 @@ impl EvolveConfig {
         ]
         .contains(&0)
             || self.arena_pairs < 8
-            || self.opening_plies >= self.max_plies
             || !self.learning_rate.is_finite()
             || self.learning_rate <= 0.0
             || !self.promotion_rate.is_finite()
@@ -701,7 +701,7 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         saved.selfplay_workers = config.selfplay_workers;
         saved.arena_workers = config.arena_workers;
         saved.queue_games = config.queue_games;
-        if state.version != 2 || saved != config {
+        if state.version != 3 || saved != config {
             return Err(io_error(
                 "进度格式或训练参数不一致；只允许续训时调整 worker 数和队列容量",
             ));
@@ -741,7 +741,7 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
                 .map(Position::to_fen)
                 .collect();
         let state = Progress {
-            version: 2,
+            version: 3,
             config: config.clone(),
             cycle: 0,
             update: 0,
@@ -1160,7 +1160,7 @@ mod tests {
             },
         ];
         let mut state = Progress {
-            version: 2,
+            version: 3,
             config: EvolveConfig::default(),
             cycle: 2,
             update: 2,

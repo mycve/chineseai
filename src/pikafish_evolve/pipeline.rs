@@ -158,7 +158,7 @@ impl SelfplayService {
                                     nodes: config.selfplay_nodes,
                                     max_depth: config.max_depth,
                                     max_plies: config.max_plies,
-                                    opening_plies: config.opening_plies,
+                                    temperature: config.temperature,
                                     seed: config.seed ^ id.wrapping_mul(0x9E3779B97F4A7C15),
                                 },
                                 &stop,
@@ -337,7 +337,6 @@ mod tests {
         config.selfplay_nodes = 8;
         config.max_depth = 1;
         config.max_plies = 8;
-        config.opening_plies = 0;
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PipelineStats::default());
         let book = Arc::new(Mutex::new(OpeningBook::load(&path, 1)?));

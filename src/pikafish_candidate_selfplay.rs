@@ -7,10 +7,58 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::{
-    ab::{AbSearchLimits, pikafish_candle::PikafishCpuModel, search_pikafish_model},
-    xiangqi::{Color, Position, RuleOutcome},
+use rand::{
+    SeedableRng,
+    distr::{Distribution, weighted::WeightedIndex},
+    rngs::StdRng,
 };
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ab::{AbCandidate, AbSearchLimits, pikafish_candle::PikafishCpuModel, search_pikafish_model},
+    xiangqi::{Color, Move, Position, RuleOutcome},
+};
+
+/// 温度单位是网络 q，概率为 exp((q - q_max) / T)。plies 从开局库起点算半回合。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, clap::Args)]
+#[serde(default, deny_unknown_fields)]
+pub struct SelfplayTemperature {
+    #[arg(long = "temperature-start", default_value_t = 0.05)]
+    pub start: f32,
+    #[arg(long = "temperature-end", default_value_t = 0.005)]
+    pub end: f32,
+    #[arg(long = "temperature-plies", default_value_t = 60)]
+    pub plies: usize,
+}
+impl Default for SelfplayTemperature {
+    fn default() -> Self {
+        Self {
+            start: 0.05,
+            end: 0.005,
+            plies: 60,
+        }
+    }
+}
+impl SelfplayTemperature {
+    pub fn validate(&self) -> io::Result<()> {
+        if !self.start.is_finite()
+            || !self.end.is_finite()
+            || self.end < 0.0
+            || self.start < self.end
+            || self.plies == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "温度必须有限且 0 <= end <= start；plies 必须为正",
+            ));
+        }
+        Ok(())
+    }
+    fn at(&self, ply: usize) -> f32 {
+        let progress = ply.min(self.plies) as f64 / self.plies as f64;
+        (self.start as f64 + (self.end as f64 - self.start as f64) * progress) as f32
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateSelfplayConfig {
@@ -18,7 +66,7 @@ pub struct CandidateSelfplayConfig {
     pub nodes: usize,
     pub max_depth: usize,
     pub max_plies: usize,
-    pub opening_plies: usize,
+    pub temperature: SelfplayTemperature,
     pub seed: u64,
 }
 
@@ -35,7 +83,7 @@ pub struct CandidateSelfplayReport {
 pub struct SelfplaySample {
     pub ply: usize,
     pub fen: String,
-    pub bestmove: String,
+    pub playedmove: String,
     pub score_cp: i32,
     pub side: Color,
 }
@@ -82,10 +130,11 @@ pub fn play_game(
     stop: &AtomicBool,
     mut on_search: impl FnMut(usize),
 ) -> io::Result<SelfplayGame> {
+    config.temperature.validate()?;
     let mut position = start;
     let mut history = position.initial_rule_history();
     let mut samples = Vec::new();
-    let mut random = config.seed;
+    let mut random = StdRng::seed_from_u64(config.seed);
     let mut search_nodes = 0;
     let (red_result, termination) = loop {
         if stop.load(Ordering::Relaxed) {
@@ -121,36 +170,36 @@ pub fn play_game(
         if history.len().saturating_sub(1) >= config.max_plies {
             break (None, "max_plies");
         }
-        let mv = if history.len().saturating_sub(1) < config.opening_plies {
-            legal[next_random(&mut random) as usize % legal.len()]
-        } else {
-            let search = search_pikafish_model(
-                &position,
-                &history,
-                model,
-                AbSearchLimits {
-                    nodes: config.nodes,
-                    max_depth: config.max_depth,
-                },
-            )
-            .map_err(io::Error::other)?;
-            search_nodes += search.nodes;
-            on_search(search.nodes);
-            let mv = search
-                .best_move
-                .ok_or_else(|| io::Error::other("AB search returned no bestmove"))?;
-            if !legal.contains(&mv) {
-                return Err(io::Error::other("AB search returned illegal bestmove"));
-            }
-            samples.push(SelfplaySample {
-                ply: history.len() - 1,
-                fen: position.to_fen(),
-                bestmove: mv.to_uci(),
-                score_cp: q_to_training_cp(search.value_q),
-                side: position.side_to_move(),
-            });
-            mv
-        };
+        let ply = history.len() - 1;
+        let search = search_pikafish_model(
+            &position,
+            &history,
+            model,
+            AbSearchLimits {
+                nodes: config.nodes,
+                max_depth: config.max_depth,
+            },
+        )
+        .map_err(io::Error::other)?;
+        search_nodes += search.nodes;
+        on_search(search.nodes);
+        let candidate = sample_candidate(
+            &search.candidates,
+            search.best_move,
+            config.temperature.at(ply),
+            &mut random,
+        )?;
+        let mv = candidate.mv;
+        if !legal.contains(&mv) {
+            return Err(io::Error::other("AB search returned illegal move"));
+        }
+        samples.push(SelfplaySample {
+            ply,
+            fen: position.to_fen(),
+            playedmove: mv.to_uci(),
+            score_cp: q_to_training_cp(candidate.q),
+            side: position.side_to_move(),
+        });
         history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     };
@@ -162,12 +211,45 @@ pub fn play_game(
     })
 }
 
-fn next_random(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
+fn sample_candidate<'a>(
+    candidates: &'a [AbCandidate],
+    best_move: Option<Move>,
+    temperature: f32,
+    random: &mut StdRng,
+) -> io::Result<&'a AbCandidate> {
+    if temperature == 0.0 {
+        return candidates
+            .iter()
+            .find(|candidate| Some(candidate.mv) == best_move)
+            .ok_or_else(|| io::Error::other("AB search returned no bestmove"));
+    }
+    let has_win = candidates
+        .iter()
+        .any(|candidate| candidate.solved == Some(1));
+    let has_non_loss = candidates
+        .iter()
+        .any(|candidate| candidate.solved != Some(-1));
+    let eligible: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            if has_win {
+                candidate.solved == Some(1)
+            } else {
+                !has_non_loss || candidate.solved != Some(-1)
+            }
+        })
+        .collect();
+    let max = eligible
+        .iter()
+        .map(|candidate| candidate.q as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let distribution = WeightedIndex::new(
+        eligible
+            .iter()
+            .map(|candidate| ((candidate.q as f64 - max) / temperature as f64).exp()),
+    )
+    .map_err(io::Error::other)?;
+    Ok(eligible[distribution.sample(random)])
 }
 
 fn q_to_training_cp(q: f32) -> i32 {
@@ -208,7 +290,7 @@ pub fn generate_from_openings(
     let mut writer = BufWriter::new(File::create(output)?);
     writeln!(
         writer,
-        "game\tply\tfen\tbestmove\tscore_cp\tred_result\ttermination\tsource"
+        "game\tply\tfen\tplayedmove\tscore_cp\tred_result\ttermination\tsource"
     )?;
     let mut report = CandidateSelfplayReport::default();
     for game in 0..config.games {
@@ -237,7 +319,7 @@ pub fn generate_from_openings(
                 game + 1,
                 sample.ply,
                 sample.fen,
-                sample.bestmove,
+                sample.playedmove,
                 sample.score_cp,
                 result,
                 game_data.termination
@@ -262,6 +344,166 @@ mod tests {
     use super::q_to_training_cp;
     use crate::pikafish_pretrain::cp_to_value;
 
+    use super::*;
+    fn choices(scores: &[(f32, Option<i8>)]) -> Vec<AbCandidate> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, &(q, solved))| AbCandidate {
+                mv: Move {
+                    from: 0,
+                    to: (i + 1) as u8,
+                },
+                q,
+                selection_weight: 0.0,
+                solved,
+            })
+            .collect()
+    }
+    #[test]
+    fn temperature_schedule_validates_and_anneals() {
+        let schedule = SelfplayTemperature::default();
+        schedule.validate().unwrap();
+        assert_eq!(schedule.at(0), 0.05);
+        assert!((schedule.at(30) - 0.0275).abs() < 1e-7);
+        assert_eq!(schedule.at(60), 0.005);
+        assert_eq!(schedule.at(1000), 0.005);
+        for (start, end, plies) in [
+            (f32::NAN, 0., 1),
+            (f32::INFINITY, 0., 1),
+            (0.1, -0.1, 1),
+            (0.1, 0.2, 1),
+            (0.1, 0., 0),
+        ] {
+            assert!(
+                SelfplayTemperature { start, end, plies }
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn softmax_frequencies_match_scores_and_seed_is_repeatable() {
+        let candidates = choices(&[(0.2, None), (0.1, None)]);
+        let best = Some(candidates[0].mv);
+        let mut random = StdRng::seed_from_u64(123);
+        let mut worse = 0;
+        for _ in 0..50000 {
+            if sample_candidate(&candidates, best, 0.1, &mut random)
+                .unwrap()
+                .mv
+                == candidates[1].mv
+            {
+                worse += 1;
+            }
+        }
+        let expected = 1.0 / (1.0 + 1f64.exp());
+        assert!((worse as f64 / 50000.0 - expected).abs() < 0.01);
+        let sequence = |seed| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            (0..100)
+                .map(|_| {
+                    sample_candidate(&candidates, best, 0.1, &mut rng)
+                        .unwrap()
+                        .mv
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sequence(123), sequence(123));
+        assert_ne!(sequence(123), sequence(456));
+    }
+    #[test]
+    fn temperature_respects_proofs_and_cold_sampling_is_stable() {
+        let mut random = StdRng::seed_from_u64(9);
+        let candidates = choices(&[(0.1, None), (0.9, Some(-1))]);
+        for _ in 0..100 {
+            assert_eq!(
+                sample_candidate(&candidates, Some(candidates[0].mv), 1000., &mut random)
+                    .unwrap()
+                    .mv,
+                candidates[0].mv
+            );
+        }
+        let candidates = choices(&[(0.1, Some(1)), (0.9, None), (0.8, Some(-1))]);
+        for _ in 0..100 {
+            assert_eq!(
+                sample_candidate(&candidates, Some(candidates[0].mv), 1000., &mut random)
+                    .unwrap()
+                    .mv,
+                candidates[0].mv
+            );
+        }
+        let candidates = choices(&[(-0.95, None), (0.95, None)]);
+        for temperature in [0., 1e-30] {
+            assert_eq!(
+                sample_candidate(
+                    &candidates,
+                    Some(candidates[1].mv),
+                    temperature,
+                    &mut random
+                )
+                .unwrap()
+                .mv,
+                candidates[1].mv
+            );
+        }
+        let candidates = choices(&[(-1., Some(-1)), (-1., Some(-1))]);
+        assert!(sample_candidate(&candidates, Some(candidates[0].mv), 0.05, &mut random).is_ok());
+        assert!(sample_candidate(&[], None, 0.05, &mut random).is_err());
+    }
+    #[test]
+    fn every_selfplay_move_is_searched_and_truncation_has_no_mc_labels() -> io::Result<()> {
+        let model = crate::ab::pikafish_candle::PikafishModel::new(&candle_core::Device::Cpu)
+            .map_err(io::Error::other)?
+            .cpu_snapshot()
+            .map_err(io::Error::other)?;
+        let config = CandidateSelfplayConfig {
+            games: 1,
+            nodes: 64,
+            max_depth: 2,
+            max_plies: 2,
+            temperature: SelfplayTemperature::default(),
+            seed: 77,
+        };
+        let mut searched = Vec::new();
+        let game = play_game(
+            &model,
+            Position::startpos(),
+            config,
+            &AtomicBool::new(false),
+            |nodes| searched.push(nodes),
+        )?;
+        assert_eq!(searched.len(), 2);
+        assert!(searched.iter().all(|&nodes| nodes > 0));
+        assert_eq!(game.samples.len(), 2);
+        assert_eq!(game.termination, "max_plies");
+        assert_eq!(game.labels().count(), 0);
+        for sample in &game.samples {
+            let position = Position::from_fen(&sample.fen).map_err(io::Error::other)?;
+            assert!(
+                position
+                    .legal_moves()
+                    .iter()
+                    .any(|mv| mv.to_uci() == sample.playedmove)
+            );
+        }
+        let repeated = play_game(
+            &model,
+            Position::startpos(),
+            config,
+            &AtomicBool::new(false),
+            |_| {},
+        )?;
+        let moves = |game: &SelfplayGame| {
+            game.samples
+                .iter()
+                .map(|sample| sample.playedmove.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(moves(&game), moves(&repeated));
+        Ok(())
+    }
+
     #[test]
     fn incomplete_games_publish_no_labels_and_completed_labels_follow_color() {
         use super::{SelfplayGame, SelfplaySample};
@@ -271,14 +513,14 @@ mod tests {
                 SelfplaySample {
                     ply: 0,
                     fen: Position::startpos().to_fen(),
-                    bestmove: "h2e2".into(),
+                    playedmove: "h2e2".into(),
                     score_cp: 100,
                     side: Color::Red,
                 },
                 SelfplaySample {
                     ply: 1,
                     fen: String::new(),
-                    bestmove: "h7e7".into(),
+                    playedmove: "h7e7".into(),
                     score_cp: -100,
                     side: Color::Black,
                 },

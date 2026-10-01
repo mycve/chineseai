@@ -6,21 +6,23 @@
 
 自博弈、GPU 训练与晋级测评重叠执行：`selfplay_workers` 个 CPU worker 使用共享的不可变冠军快照，自博弈结果经 `queue_games` 容量的内存队列进入 FIFO 回放池；队列满时 worker 等待。训练器随机抽样更新候选，独立测评服务使用 `arena_workers` 个 worker 并行完成交换红黑的配对晋级赛。测评固定候选快照，训练继续推进；晋级发布的是实际通过测评的那份快照。一个进程包含这些工作线程，worker 数量不等于进程数量。本机配置为 12 个自博弈 worker、4 个测评 worker。
 
-Pikafish 稀疏层使用手写 CPU/CUDA 融合算子，直接累加特征行并在反向传播时汇总梯度，不生成 `index_select` 的特征矩阵。一个训练批次的两个视角一起处理，全连接层按 16 个网络桶合批执行，重复特征会重复累加，空特征输出零。搜索使用普通只读数组权重，worker 的累加器按特征差集加减、换边时交换双视角，每 32 次评估全量刷新以限制浮点误差；叶节点不创建 Candle 张量或访问共享张量锁。置换表保持原有 32768 个哈希槽和完整规则历史校验，只分配访问过的条目，并在线程内复用条目及历史缓冲。已有权重和版本 2 进度可直接续训。
+Pikafish 稀疏层使用手写 CPU/CUDA 融合算子，直接累加特征行并在反向传播时汇总梯度，不生成 `index_select` 的特征矩阵。一个训练批次的两个视角一起处理，全连接层按 16 个网络桶合批执行，重复特征会重复累加，空特征输出零。搜索使用普通只读数组权重，worker 的累加器按特征差集加减、换边时交换双视角，每 32 次评估全量刷新以限制浮点误差；叶节点不创建 Candle 张量或访问共享张量锁。置换表保持原有 32768 个哈希槽和完整规则历史校验，只分配访问过的条目，并在线程内复用条目及历史缓冲。浮点权重格式保持不变；当前温度探索进度使用版本 3，旧随机步配置需使用新输出目录并通过 `seed_model` 继承冠军。
 
 性能检查可运行 `cargo run --profile fast --example pikafish_perf -- --model runs/pikafish-evolve/best.safetensors --workers 128 --iterations 2000`。输出 JSON 包含预提取特征后的评估吞吐和八个固定局面的 128 节点搜索耗时、最佳着及价值。比较改动时必须使用同一权重、硬件和参数。Linux 内核开销用 `pidstat -u -w -t -p PID 1 5` 与 `vmstat 1 6` 同时采样；`vmstat` 首行是开机平均，线程级 `pidstat` 才能观察全部 worker 的上下文切换。
+
+从开局库选起点后，每步都进行 αβ 搜索，再按根着回传分数采样实走着：`p(a) ∝ exp((q(a)-q_max)/T)`。`[temperature]` 配置 `start=0.05`、`end=0.005`、`plies=60`，温度在前 60 个半回合线性下降，随后保持 `end`；温度数值按网络 q 的尺度设置，尚未经过棋力对照调优，不能与访问次数温度的数值直接比较；设 `start=end=0` 即全部贪心，设 `end=0` 则后期贪心。取消了均匀随机开局步，也不对独立叶节点直接抽签。存在已证实必胜着时只采样必胜着；存在非必败着时不采样已证实必败着。晋级和固定基准测评保持最佳着。候选 TSV 的 `playedmove` 和 `score_cp` 记录实走着及其搜索分数，所有已搜索局面都可使用终局 MC 标签训练。AlphaZero 原论文按 MCTS 根访问数生成选着分布，当前实现按 αβ 回传 q 分数生成分布，两者不是同一搜索算法：[官方论文](https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/alphazero-shedding-new-light-on-chess-shogi-and-go/alphazero_preprint.pdf)。
 
 真实终局结果才进入训练，截断不计和棋。候选仅在对冠军得分的置信下界超过 `promotion_rate`、并且对固定初始模型没有显著退步时晋级；未晋级的候选继续训练。每局标记其冠军代数，超过 `max_champion_lag` 的队列结果丢弃，已进入回放的历史标签保留。训练使用无动量 SGD，权重、固定学习率、回放、开局游标和待完成测评一同保存；下次同一命令自动恢复，未完成测评用原权重和原开局重跑。启动目录锁防止两个训练进程同时写同一输出目录。
 
 默认使用本地 `eval/pikafish-selfplay-5000-d20.sqlite` 做一次教师评分预训练，此后使用自博弈终局标签。要完全从零自博弈，删除配置中的 `bootstrap_sqlite`；已有本项目 Pikafish 浮点权重可以通过 `seed_model` 初始化，不能填写官方量化 `.nnue` 或旧 `AbNnue` 权重。初始基准在预训练前固定，故首次晋级可能包含教师预训练带来的提升；这不能单独证明后续纯自博弈持续增长。
 
-`runs/pikafish-evolve/dashboard.html` 每 30 秒刷新，显示候选比赛得分、训练损失和冠军代数，曲线只显示通过晋级的冠军对固定初始模型的实测得分。`metrics.csv` 提供每次比赛的得分及置信区间。区间按配对开局计算，是逐次区间；长期重复测评不代表全程错误率控制。得分不是绝对 Elo，损失下降也不能代替棋力测评。固定基准及其开局在续训时保留，且这些开局不作为自博弈起点。每次晋级赛重新抽取开局，搜索预算保持固定。
+输出目录的 `dashboard.html` 每 30 秒刷新，显示候选比赛得分、训练损失和冠军代数，曲线只显示通过晋级的冠军对固定初始模型的实测得分。`metrics.csv` 提供每次比赛的得分及置信区间。区间按配对开局计算，是逐次区间；长期重复测评不代表全程错误率控制。得分不是绝对 Elo，损失下降也不能代替棋力测评。固定基准及其开局在续训时保留，且这些开局不作为自博弈起点。每次晋级赛重新抽取开局，搜索预算保持固定。
 
 `--target-update N` 在完成第 N 次训练更新后保存退出；`target/fast/chineseai pikafish-evolve --stop` 请求后台进程保存后停止，前台可按 Ctrl+C。停止会在当前搜索返回后生效，未完成对局不入训练。续训允许调整 `selfplay_workers`、`arena_workers`、`queue_games`；其余训练参数必须保持一致，更改时使用新的 `output_dir`。输出目录中的 `best.safetensors` 由 UCI 的 `EvalFile` 直接加载，UCI 自动识别新浮点网络的格式。旧 `ab-evolve` 的默认模型及配置仍独立保存。
 
 本机 Ryzen 9 9950X、Windows、`fast` 构建的同权重对照见 [benchmarks/pikafish-fused-20261001.json](benchmarks/pikafish-fused-20261001.json)。八个固定局面的串行 128 节点搜索从约 0.350 秒降至 0.012 秒，约快 29 倍，最佳着全部一致，价值最大误差约 `1.34e-7`。16 worker 的预提取特征评估从约 4 万次/秒升至 278 万次/秒。固定局面会复用缓存，这些数字不代表 Linux 服务器长期对局吞吐或棋力增长；服务器的 `%system` 必须重新采样验证。
 
-128 物理核心服务器的正式长跑配置见 [configs/pikafish-evolve-128c.toml](configs/pikafish-evolve-128c.toml)：96 个自博弈 worker、24 个测评 worker，单步预算分别为 8192 和 32768 节点，512 对晋级开局、200 万局面回放。它使用新目录，并从当前 `runs/pikafish-evolve/best.safetensors` 继承冠军；没有该文件时应删除 `seed_model` 或填写已有的本项目浮点权重。启动命令为 `RAYON_NUM_THREADS=8 target/fast/chineseai pikafish-evolve configs/pikafish-evolve-128c.toml`；该环境变量约束全局 Rayon 辅助线程，不改变配置中独立创建的自博弈和测评线程数。这份配置提高搜索和训练投入，不承诺顶级棋力：当前约 5000 条教师数据、有限自博弈以及尚未对齐强引擎的搜索，不能支撑这种承诺。应扩大经过核验的教师局面数据，并持续通过与强引擎交换红黑、固定预算的对局检验绝对棋力；内部冠军晋级只表示相对增长。
+128 物理核心服务器的正式长跑配置见 [configs/pikafish-evolve-128c.toml](configs/pikafish-evolve-128c.toml)：96 个自博弈 worker、24 个测评 worker，单步预算分别为 8192 和 32768 节点，512 对晋级开局、200 万局面回放。它使用 `runs/pikafish-evolve-128c-temperature` 新目录，并从当前 `runs/pikafish-evolve/best.safetensors` 继承冠军；没有该文件时应删除 `seed_model` 或填写已有的本项目浮点权重。启动命令为 `RAYON_NUM_THREADS=8 target/fast/chineseai pikafish-evolve configs/pikafish-evolve-128c.toml`；该环境变量约束全局 Rayon 辅助线程，不改变配置中独立创建的自博弈和测评线程数。这份配置提高搜索和训练投入，不承诺顶级棋力：当前约 5000 条教师数据、有限自博弈以及尚未对齐强引擎的搜索，不能支撑这种承诺。应扩大经过核验的教师局面数据，并持续通过与强引擎交换红黑、固定预算的对局检验绝对棋力；内部冠军晋级只表示相对增长。
 
 ## 原有 AbNnue 模型
 

@@ -130,8 +130,8 @@ struct PikafishCandidateSelfplayArgs {
     max_depth: usize,
     #[arg(long, default_value_t = 200)]
     max_plies: usize,
-    #[arg(long, default_value_t = 2)]
-    opening_plies: usize,
+    #[command(flatten)]
+    temperature: chineseai::pikafish_candidate_selfplay::SelfplayTemperature,
     #[arg(long, default_value_t = 20260930)]
     seed: u64,
 }
@@ -2270,7 +2270,7 @@ fn main() {
                     nodes: cmd.nodes,
                     max_depth: cmd.max_depth,
                     max_plies: cmd.max_plies,
-                    opening_plies: cmd.opening_plies,
+                    temperature: cmd.temperature,
                     seed: cmd.seed,
                 },
             )

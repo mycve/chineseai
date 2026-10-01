@@ -1,6 +1,6 @@
 # 128 物理核心 / 256 逻辑 CPU：正式长跑配置，不是烟雾测试。
 # 更改搜索和训练参数需要新目录；从当前冠军继承浮点权重。
-output_dir = "runs/pikafish-evolve-128c"
+output_dir = "runs/pikafish-evolve-128c-temperature"
 seed_model = "runs/pikafish-evolve/best.safetensors"
 # 当前可用教师库只有约 5000 条；bootstrap_samples 不会凭空增加数据。
 bootstrap_sqlite = "eval/pikafish-selfplay-5000-d20.sqlite"
@@ -19,7 +19,6 @@ selfplay_nodes = 8192
 arena_nodes = 32768
 max_depth = 64
 max_plies = 600
-opening_plies = 8
 
 # FIFO 保存局面样本数量，games_per_update 计完整终局数。
 games_per_update = 256
@@ -36,3 +35,10 @@ promotion_rate = 0.51
 confidence_z = 1.96
 seed = 20261001
 cuda = true
+
+# 开局库起点后的每步均先搜索，再按根着回传 q 分数采样。
+# 60 个半回合内线性降温，之后保持较低温度；end=0 时后期贪心。
+[temperature]
+start = 0.05
+end = 0.005
+plies = 60
