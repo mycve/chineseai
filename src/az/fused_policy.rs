@@ -581,10 +581,10 @@ mod tests {
     #[test]
     fn fused_policy_cuda_matches_cpu_forward_and_gradients() -> Result<()> {
         let cpu = output_and_grad(&Device::Cpu)?;
-        let Ok(cuda) = Device::new_cuda(0) else {
+        let Some(cuda) = crate::az::cuda_test_device::shared_cuda_device() else {
             return Ok(());
         };
-        let gpu = output_and_grad(&cuda)?;
+        let gpu = output_and_grad(cuda)?;
         assert_close(&cpu.0, &gpu.0);
         assert_close(&cpu.1, &gpu.1);
         assert_close(&cpu.2, &gpu.2);

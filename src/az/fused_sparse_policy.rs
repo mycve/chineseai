@@ -352,8 +352,8 @@ mod tests {
         let cpu = output_and_grad(&Device::Cpu)?;
         assert_close(&cpu.0, &[6.75, 0.75]);
         assert_close(&cpu.1, &[3.5, 1.0, 4.0, 1.5, 0.5]);
-        if let Ok(device) = Device::new_cuda(0) {
-            let cuda = output_and_grad(&device)?;
+        if let Some(device) = crate::az::cuda_test_device::shared_cuda_device() {
+            let cuda = output_and_grad(device)?;
             assert_close(&cpu.0, &cuda.0);
             assert_close(&cpu.1, &cuda.1);
         }
@@ -366,8 +366,8 @@ mod tests {
         let cpu = tactical_output_and_grad(&Device::Cpu)?;
         assert_close(&cpu.0, &[1.5, 4.75]);
         assert_close(&cpu.1, &[2.0, 2.0, 1.5, -0.5, -0.5]);
-        if let Ok(device) = Device::new_cuda(0) {
-            let cuda = tactical_output_and_grad(&device)?;
+        if let Some(device) = crate::az::cuda_test_device::shared_cuda_device() {
+            let cuda = tactical_output_and_grad(device)?;
             assert_close(&cpu.0, &cuda.0);
             assert_close(&cpu.1, &cuda.1);
         }

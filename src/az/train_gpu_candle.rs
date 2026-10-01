@@ -246,6 +246,18 @@ impl GpuTrainer {
 
 impl GpuReplica {
     fn new(model: &AzNnue, device_index: usize) -> CandleResult<Self> {
+        // slow-tests 下复用进程内共享的 CUDA 设备：每个测试各建一次 context 会让 candle
+        // 重复 JIT 编译 kernel（约 10s/测试）。该分支只在 test + slow-tests 下编译，
+        // 生产构建与默认测试构建仍走下面的 `Device::new_cuda(device_index)`。
+        #[cfg(all(test, feature = "slow-tests"))]
+        if device_index == 0 {
+            let Some(device) = crate::az::cuda_test_device::shared_cuda_device() else {
+                candle_core::bail!("no usable CUDA device")
+            };
+            let device = device.clone();
+            let model = AzCandleModel::from_model(model, &device)?;
+            return Ok(Self { device, model });
+        }
         let device = Device::new_cuda(device_index)?;
         let model = AzCandleModel::from_model(model, &device)?;
         Ok(Self { device, model })
@@ -706,8 +718,8 @@ mod monitoring_tests {
     #[test]
     fn fused_moments_match_scalar_reference_on_cpu_and_cuda() {
         let mut devices = vec![Device::Cpu];
-        if let Ok(cuda) = Device::new_cuda(0) {
-            devices.push(cuda);
+        if let Some(cuda) = crate::az::cuda_test_device::shared_cuda_device() {
+            devices.push(cuda.clone());
         }
         for device in devices {
             for n in [1, 7, 257] {

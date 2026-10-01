@@ -10,6 +10,9 @@ mod arch;
 ))]
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
+// slow-tests 的 CUDA 对照测试共用同一个设备，避免每个测试重复 JIT 编译 kernel。
+#[cfg(all(test, feature = "slow-tests"))]
+mod cuda_test_device;
 mod dataloader;
 mod fused_feature_pool;
 mod fused_policy;

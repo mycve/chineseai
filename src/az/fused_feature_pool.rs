@@ -669,10 +669,10 @@ mod tests {
     #[test]
     fn fused_feature_pool_cuda_matches_cpu_forward_and_gradient() -> Result<()> {
         let cpu = output_and_grad(&Device::Cpu)?;
-        let Ok(cuda) = Device::new_cuda(0) else {
+        let Some(cuda) = crate::az::cuda_test_device::shared_cuda_device() else {
             return Ok(());
         };
-        let gpu = output_and_grad(&cuda)?;
+        let gpu = output_and_grad(cuda)?;
         assert_close(&cpu.0, &gpu.0);
         assert_close(&cpu.1, &gpu.1);
         Ok(())
@@ -682,10 +682,10 @@ mod tests {
     #[test]
     fn sparse_pool_cuda_matches_cpu_forward_and_gradient() -> Result<()> {
         let cpu = sparse_output_and_grad(&Device::Cpu)?;
-        let Ok(cuda) = Device::new_cuda(0) else {
+        let Some(cuda) = crate::az::cuda_test_device::shared_cuda_device() else {
             return Ok(());
         };
-        let gpu = sparse_output_and_grad(&cuda)?;
+        let gpu = sparse_output_and_grad(cuda)?;
         assert_close(&cpu.0, &gpu.0);
         assert_close(&cpu.1, &gpu.1);
         Ok(())
