@@ -215,7 +215,7 @@ impl ValueModel for PikafishModel {
         let example = PikafishExample::from_position(position)
             .ok_or_else(|| "Pikafish feature extraction failed".to_owned())?;
         let raw = self
-            .forward(&[example])
+            .forward_inference(&[example])
             .and_then(|output| output.to_vec2::<f32>())
             .map_err(|error| error.to_string())?[0][0];
         if !raw.is_finite() {
@@ -1365,6 +1365,21 @@ pub(crate) fn search_uci_pikafish(
     history: Vec<RuleHistoryEntry>,
     root_moves: Vec<Move>,
     model: &PikafishNet,
+    limits: AbSearchLimits,
+    control: &AbSearchControl,
+    multipv: usize,
+    progress: impl FnMut(&AbUciSearchResult),
+) -> AbUciSearchResult {
+    search_uci_with_model(
+        position, history, root_moves, model, limits, control, multipv, progress,
+    )
+}
+
+pub(crate) fn search_uci_pikafish_float(
+    position: &Position,
+    history: Vec<RuleHistoryEntry>,
+    root_moves: Vec<Move>,
+    model: &PikafishModel,
     limits: AbSearchLimits,
     control: &AbSearchControl,
     multipv: usize,

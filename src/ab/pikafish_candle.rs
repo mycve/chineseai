@@ -135,6 +135,15 @@ impl PikafishModel {
     /// `clamp(a,0,255) * clamp(b,0,255) / 512` 定义；进入浮点 FC 前
     /// 再除以 128，避免随机初始化时双激活分支饱和。
     pub fn forward(&self, examples: &[PikafishExample]) -> Result<Tensor> {
+        self.forward_mode(examples, true)
+    }
+
+    /// 搜索不构建反向图，避免每个叶节点创建训练图和变量依赖。
+    pub fn forward_inference(&self, examples: &[PikafishExample]) -> Result<Tensor> {
+        self.forward_mode(examples, false)
+    }
+
+    fn forward_mode(&self, examples: &[PikafishExample], training: bool) -> Result<Tensor> {
         if examples.is_empty() {
             candle_core::bail!("empty Pikafish batch");
         }
@@ -147,16 +156,16 @@ impl PikafishModel {
             let mut psqt_values = Vec::with_capacity(2);
             for side in 0..2 {
                 let psq_acc = sparse_sum(
-                    self.transformer_psq.as_tensor(),
+                    &weight(&self.transformer_psq, training),
                     &example.psq[side],
                     self.shape.psq_features,
                 )?;
                 let threat_acc = sparse_sum(
-                    self.transformer_threat.as_tensor(),
+                    &weight(&self.transformer_threat, training),
                     &example.threats[side],
                     self.shape.threat_features,
                 )?;
-                let acc = (self.transformer_bias.as_tensor() + psq_acc + threat_acc)?;
+                let acc = (weight(&self.transformer_bias, training) + psq_acc + threat_acc)?;
                 let a = acc
                     .narrow(0, 0, TRANSFORMER_WIDTH / 2)?
                     .clamp(0f32, 255f32)?;
@@ -165,12 +174,12 @@ impl PikafishModel {
                     .clamp(0f32, 255f32)?;
                 perspectives.push((a * b)?.affine(1.0 / (512.0 * 128.0), 0.0)?);
                 let psqt = sparse_sum(
-                    self.psqt.as_tensor(),
+                    &weight(&self.psqt, training),
                     &example.psq[side],
                     self.shape.psq_features,
                 )?;
                 let threat_psqt = sparse_sum(
-                    self.threat_psqt.as_tensor(),
+                    &weight(&self.threat_psqt, training),
                     &example.threats[side],
                     self.shape.threat_features,
                 )?;
@@ -179,7 +188,8 @@ impl PikafishModel {
             }
             let transformed = Tensor::cat(&[&perspectives[0], &perspectives[1]], 0)?
                 .reshape((1, TRANSFORMER_WIDTH))?;
-            let stack_out = self.stacks[example.layer_stack].forward(&transformed)?;
+            let stack_out =
+                self.stacks[example.layer_stack].forward_mode(&transformed, training)?;
             let psqt_delta = ((&psqt_values[0] - &psqt_values[1])? / 2.0)?.reshape((1, 1))?;
             outputs.push((stack_out + psqt_delta)?);
         }
@@ -198,6 +208,34 @@ impl PikafishModel {
             vars.extend(stack.vars().into_iter().cloned());
         }
         vars
+    }
+
+    /// 创建独立变量的不可变快照，不重复随机初始化；多个搜索 worker 共享这份快照。
+    pub fn snapshot(&self, device: &Device) -> Result<Self> {
+        let copy = |value: &Var| Var::from_tensor(&value.as_tensor().detach().to_device(device)?);
+        let stacks = self
+            .stacks
+            .iter()
+            .map(|stack| {
+                Ok(PikafishStack {
+                    fc0_weight: copy(&stack.fc0_weight)?,
+                    fc0_bias: copy(&stack.fc0_bias)?,
+                    fc1_weight: copy(&stack.fc1_weight)?,
+                    fc1_bias: copy(&stack.fc1_bias)?,
+                    fc2_weight: copy(&stack.fc2_weight)?,
+                    fc2_bias: copy(&stack.fc2_bias)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            shape: self.shape,
+            transformer_bias: copy(&self.transformer_bias)?,
+            transformer_psq: copy(&self.transformer_psq)?,
+            transformer_threat: copy(&self.transformer_threat)?,
+            psqt: copy(&self.psqt)?,
+            threat_psqt: copy(&self.threat_psqt)?,
+            stacks,
+        })
     }
 
     fn named_vars(&self) -> BTreeMap<String, Var> {
@@ -261,6 +299,14 @@ impl PikafishModel {
     }
 }
 
+fn weight(value: &Var, training: bool) -> Tensor {
+    if training {
+        value.as_tensor().clone()
+    } else {
+        value.as_tensor().detach()
+    }
+}
+
 fn sparse_sum(table: &Tensor, indices: &[usize], rows: usize) -> Result<Tensor> {
     if indices.iter().any(|&index| index >= rows) {
         candle_core::bail!("Pikafish feature out of range");
@@ -299,18 +345,22 @@ impl PikafishStack {
     /// 输入为两个视角各 512 维的乘积变换结果，形状 `[batch, 1024]`。
     /// 双激活分支和 fc0 的末两维差值跳连跟随当前 Pikafish 架构。
     pub fn forward(&self, transformed: &Tensor) -> Result<Tensor> {
+        self.forward_mode(transformed, true)
+    }
+
+    fn forward_mode(&self, transformed: &Tensor, training: bool) -> Result<Tensor> {
         let fc0 = transformed
-            .matmul(self.fc0_weight.as_tensor())?
-            .broadcast_add(self.fc0_bias.as_tensor())?;
+            .matmul(&weight(&self.fc0_weight, training))?
+            .broadcast_add(&weight(&self.fc0_bias, training))?;
         let ac0 = paired_activation(&fc0, 1.0)?;
         let fc1 = ac0
-            .matmul(self.fc1_weight.as_tensor())?
-            .broadcast_add(self.fc1_bias.as_tensor())?;
+            .matmul(&weight(&self.fc1_weight, training))?
+            .broadcast_add(&weight(&self.fc1_bias, training))?;
         let ac1 = paired_activation(&fc1, 1.0)?;
         let features = Tensor::cat(&[&ac0, &ac1], 1)?;
         let output = features
-            .matmul(self.fc2_weight.as_tensor())?
-            .broadcast_add(self.fc2_bias.as_tensor())?;
+            .matmul(&weight(&self.fc2_weight, training))?
+            .broadcast_add(&weight(&self.fc2_bias, training))?;
         let skip = (fc0.narrow(1, FC_WIDTH - 2, 1)? - fc0.narrow(1, FC_WIDTH - 1, 1)?)?;
         output + skip
     }
@@ -398,6 +448,40 @@ mod tests {
                 .all(|var| gradients.get(var).is_some())
         );
         assert!(nonzero_gradient(&model.stacks[7].fc0_weight)?);
+        Ok(())
+    }
+
+    #[test]
+    fn inference_matches_training_and_snapshot_survives_updates() -> Result<()> {
+        let model = PikafishModel::with_shape(
+            PikafishShape {
+                psq_features: 8,
+                threat_features: 8,
+            },
+            &Device::Cpu,
+        )?;
+        let example = PikafishExample {
+            psq: [vec![1, 2], vec![3]],
+            threats: [vec![1], vec![2]],
+            psqt_bucket: 4,
+            layer_stack: 7,
+        };
+        let examples = [example];
+        let trained = model.forward(&examples)?.to_vec2::<f32>()?[0][0];
+        let inference = model.forward_inference(&examples)?;
+        assert!((trained - inference.to_vec2::<f32>()?[0][0]).abs() < 1e-6);
+        let gradients = inference.sum_all()?.backward()?;
+        assert!(model.vars().iter().all(|var| gradients.get(var).is_none()));
+        let snapshot = model.snapshot(&Device::Cpu)?;
+        model.stacks[7]
+            .fc2_bias
+            .set(&Tensor::full(0.7f32, 1, &Device::Cpu)?)?;
+        assert!(
+            (snapshot.forward_inference(&examples)?.to_vec2::<f32>()?[0][0] - trained).abs() < 1e-6
+        );
+        assert!(
+            (model.forward_inference(&examples)?.to_vec2::<f32>()?[0][0] - trained).abs() > 0.6
+        );
         Ok(())
     }
 

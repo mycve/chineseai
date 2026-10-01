@@ -1,0 +1,26 @@
+# 新 Pikafish 浮点网络自动进化：GPU 训练，CPU 搜索。
+output_dir = "runs/pikafish-evolve"
+bootstrap_sqlite = "eval/pikafish-selfplay-5000-d20.sqlite"
+bootstrap_samples = 2048
+bootstrap_epochs = 4
+opening_book = "book.pgn.gz"
+games_per_update = 8
+selfplay_workers = 12
+arena_workers = 4
+queue_games = 24
+max_champion_lag = 1
+selfplay_nodes = 128
+arena_nodes = 128
+max_depth = 8
+max_plies = 600
+opening_plies = 2
+replay_capacity = 50000
+train_samples_per_update = 2048
+batch_size = 16
+learning_rate = 0.001
+arena_interval = 5
+arena_pairs = 32
+promotion_rate = 0.55
+confidence_z = 1.96
+seed = 20261001
+cuda = true

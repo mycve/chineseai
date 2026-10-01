@@ -1,10 +1,11 @@
+use crate::ab::pikafish_candle::{PikafishExample, PikafishModel};
 use crate::ab::{
     AbNnue, AbSearchControl, AbSearchLimits, AbUciSearchResult, cp_from_q, search_uci,
-    search_uci_pikafish,
+    search_uci_pikafish, search_uci_pikafish_float,
 };
 use crate::nnue::pikafish_file::{PikafishNet, internal_units_from_q};
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -22,6 +23,7 @@ const DEFAULT_MOVE_OVERHEAD_MS: u64 = 10;
 enum UciModel {
     Native(Arc<AbNnue>),
     Pikafish(Arc<PikafishNet>),
+    PikafishFloat(Arc<PikafishModel>),
 }
 
 #[derive(Clone)]
@@ -147,6 +149,34 @@ fn print_uci_id() {
     flush();
 }
 
+fn load_float_or_native(path: &str) -> Result<UciModel, String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut length = [0; 8];
+    file.read_exact(&mut length)
+        .map_err(|error| error.to_string())?;
+    let size = u64::from_le_bytes(length);
+    if size > 1_048_576 {
+        return Err("safetensors header too large".into());
+    }
+    let mut header = vec![0; size as usize];
+    file.read_exact(&mut header)
+        .map_err(|error| error.to_string())?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&header).map_err(|error| error.to_string())?;
+    if metadata.get("transformer.psq").is_some() {
+        let model =
+            PikafishModel::new(&candle_core::Device::Cpu).map_err(|error| error.to_string())?;
+        model
+            .load(std::path::Path::new(path))
+            .map_err(|error| error.to_string())?;
+        Ok(UciModel::PikafishFloat(Arc::new(model)))
+    } else {
+        AbNnue::load(path)
+            .map(|model| UciModel::Native(Arc::new(model)))
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn ensure_model(state: &mut UciState) -> bool {
     if state.model.is_some() {
         return true;
@@ -155,9 +185,7 @@ fn ensure_model(state: &mut UciState) -> bool {
         PikafishNet::load(std::path::Path::new(&state.eval_file))
             .map(|model| UciModel::Pikafish(Arc::new(model)))
     } else {
-        AbNnue::load(&state.eval_file)
-            .map(|model| UciModel::Native(Arc::new(model)))
-            .map_err(|error| error.to_string())
+        load_float_or_native(&state.eval_file)
     };
     match loaded {
         Ok(model) => {
@@ -193,6 +221,23 @@ fn print_static_eval(state: &mut UciState) {
             let wdl = model.evaluate_wdl_with_rules(&state.position, &state.rule_history);
             let cp = (((wdl[0] - wdl[2]).clamp(-1.0, 1.0)) * 1000.0).round() as i32;
             println!("info string ChineseAI native static value: {cp:+} project cp");
+        }
+        UciModel::PikafishFloat(model) => {
+            let value = PikafishExample::from_position(&state.position)
+                .ok_or_else(|| "feature extraction failed".to_string())
+                .and_then(|example| {
+                    model
+                        .forward_inference(&[example])
+                        .and_then(|x| x.to_vec2::<f32>())
+                        .map_err(|error| error.to_string())
+                });
+            match value {
+                Ok(value) => println!(
+                    "info string ChineseAI Pikafish float value: {:+} project cp",
+                    cp_from_q(value[0][0].clamp(-1.0, 1.0))
+                ),
+                Err(error) => println!("info string eval failed: {error}"),
+            }
         }
     }
     flush();
@@ -516,6 +561,16 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             &mut report_progress,
         ),
         UciModel::Pikafish(model) => search_uci_pikafish(
+            &state.position,
+            state.rule_history.clone(),
+            legal,
+            model,
+            limits,
+            &control,
+            state.multipv,
+            &mut report_progress,
+        ),
+        UciModel::PikafishFloat(model) => search_uci_pikafish_float(
             &state.position,
             state.rule_history.clone(),
             legal,

@@ -19,7 +19,7 @@ use chineseai::{
         train_samples_weighted_owned,
     },
     opening_book::OpeningBook,
-    pikafish_candidate_arena::{CandidateArenaConfig, play_paired},
+    pikafish_candidate_arena::{CandidateArenaConfig, play_paired_parallel_with_stop},
     pikafish_candidate_selfplay::{
         CandidateSelfplayConfig, generate as generate_candidate_selfplay,
     },
@@ -66,6 +66,8 @@ enum CliCommand {
     /// Run self-play training from a TOML config.
     #[command(name = "ab-evolve")]
     AbEvolve(AbEvolveArgs),
+    /// Continuously evolve the Pikafish-shaped network with replay and gated promotion.
+    PikafishEvolve(PikafishEvolveArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
     /// Evaluate a model against Pikafish labels stored in SQLite.
@@ -144,6 +146,8 @@ struct PikafishCandidateArenaArgs {
     opening_book: PathBuf,
     #[arg(long, default_value_t = 100)]
     pairs: usize,
+    #[arg(long, default_value_t = 4)]
+    workers: usize,
     #[arg(long, default_value_t = 10_000)]
     nodes: usize,
     #[arg(long, default_value_t = 8)]
@@ -212,6 +216,20 @@ struct AbEvolveArgs {
     /// Stop after completing this absolute update number and save the model/progress.
     #[arg(long)]
     target_update: Option<usize>,
+    /// Use the Pikafish-shaped floating network and its evolution configuration.
+    #[arg(long)]
+    pikafish: bool,
+}
+
+#[derive(Args, Debug)]
+struct PikafishEvolveArgs {
+    #[arg(default_value = chineseai::pikafish_evolve::DEFAULT_CONFIG)]
+    config: PathBuf,
+    #[arg(long)]
+    target_update: Option<usize>,
+    /// Ask the running trainer to save its state and stop.
+    #[arg(long, conflicts_with = "target_update")]
+    stop: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1006,6 +1024,18 @@ fn main() {
             std::process::exit(0);
         }
         Some(CliCommand::AbEvolve(cmd)) => {
+            if cmd.pikafish {
+                let path = if cmd.config == DEFAULT_AB_EVOLVE_CONFIG {
+                    Path::new(chineseai::pikafish_evolve::DEFAULT_CONFIG)
+                } else {
+                    Path::new(&cmd.config)
+                };
+                let config = chineseai::pikafish_evolve::EvolveConfig::load_or_create(path)
+                    .unwrap_or_else(|err| panic!("Pikafish evolution config failed: {err}"));
+                chineseai::pikafish_evolve::run(config, cmd.target_update)
+                    .unwrap_or_else(|err| panic!("Pikafish evolution failed: {err}"));
+                return;
+            }
             let config_path = cmd.config;
             let Some(config) = load_or_create_ab_evolve_config(&config_path) else {
                 return;
@@ -2131,6 +2161,16 @@ fn main() {
                 nodes,
             );
         }
+        Some(CliCommand::PikafishEvolve(cmd)) => {
+            let config = chineseai::pikafish_evolve::EvolveConfig::load_or_create(&cmd.config)
+                .unwrap_or_else(|err| panic!("Pikafish evolution config failed: {err}"));
+            let result = if cmd.stop {
+                chineseai::pikafish_evolve::request_stop(&config)
+            } else {
+                chineseai::pikafish_evolve::run(config, cmd.target_update)
+            };
+            result.unwrap_or_else(|err| panic!("Pikafish evolution failed: {err}"));
+        }
         Some(CliCommand::PikafishLabelEval(cmd)) => {
             run_pikafish_label_eval(cmd)
                 .unwrap_or_else(|err| panic!("pikafish-label-eval failed: {err}"));
@@ -2252,7 +2292,7 @@ fn main() {
             );
         }
         Some(CliCommand::PikafishCandidateArena(cmd)) => {
-            let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+            let device = candle_core::Device::Cpu;
             let candidate = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
                 .unwrap_or_else(|err| panic!("candidate model init failed: {err}"));
             candidate
@@ -2280,7 +2320,8 @@ fn main() {
                     openings.push(position);
                 }
             }
-            let result = play_paired(
+            let arena_started = Instant::now();
+            let result = play_paired_parallel_with_stop(
                 &candidate,
                 &champion,
                 &openings,
@@ -2292,6 +2333,9 @@ fn main() {
                     promotion_rate: cmd.promotion_rate,
                     confidence_z: cmd.confidence_z,
                 },
+                cmd.workers,
+                &AtomicBool::new(false),
+                |_, _| {},
             )
             .unwrap_or_else(|err| panic!("candidate arena failed: {err}"));
             let mut published = false;
@@ -2319,7 +2363,7 @@ fn main() {
                 }
             }
             println!(
-                "pikafish-candidate-arena: pairs={} games={} W/L/D={}/{}/{} score={:.3} confidence=[{:.3},{:.3}] decision={:?} published={}",
+                "pikafish-candidate-arena: pairs={} games={} W/L/D={}/{}/{} score={:.3} confidence=[{:.3},{:.3}] decision={:?} published={} workers={} seconds={:.3}",
                 result.report.paired_openings,
                 result.report.total_games(),
                 result.report.wins,
@@ -2329,7 +2373,9 @@ fn main() {
                 result.lower_bound,
                 result.upper_bound,
                 result.decision,
-                published
+                published,
+                cmd.workers,
+                arena_started.elapsed().as_secs_f64()
             );
         }
         Some(CliCommand::UciTournament(cmd)) => {

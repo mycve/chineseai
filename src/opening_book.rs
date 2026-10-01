@@ -58,6 +58,14 @@ impl OpeningBook {
         self.fens.len()
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn seek(&mut self, cursor: usize) {
+        self.cursor = cursor % self.order.len();
+    }
+
     pub fn next_batch(
         &mut self,
         count: usize,

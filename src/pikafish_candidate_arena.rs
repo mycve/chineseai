@@ -4,6 +4,9 @@ use crate::{
     ab::{AbArenaReport, AbSearchLimits, pikafish_candle::PikafishModel, search_pikafish_model},
     xiangqi::{Color, Position, RuleOutcome},
 };
+use rayon::prelude::*;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateArenaConfig {
@@ -39,6 +42,37 @@ pub fn play_paired(
     openings: &[Position],
     config: CandidateArenaConfig,
 ) -> Result<CandidateArenaResult, String> {
+    play_paired_with_stop(
+        candidate,
+        champion,
+        openings,
+        config,
+        &AtomicBool::new(false),
+        |_, _| {},
+    )
+}
+
+pub fn play_paired_with_stop(
+    candidate: &PikafishModel,
+    champion: &PikafishModel,
+    openings: &[Position],
+    config: CandidateArenaConfig,
+    stop: &AtomicBool,
+    progress: impl FnMut(usize, &AbArenaReport) + Send,
+) -> Result<CandidateArenaResult, String> {
+    play_paired_parallel_with_stop(candidate, champion, openings, config, 1, stop, progress)
+}
+
+/// 各开局配对独立调度，红黑两局全部完成后才加入统计。
+pub fn play_paired_parallel_with_stop(
+    candidate: &PikafishModel,
+    champion: &PikafishModel,
+    openings: &[Position],
+    config: CandidateArenaConfig,
+    workers: usize,
+    stop: &AtomicBool,
+    progress: impl FnMut(usize, &AbArenaReport) + Send,
+) -> Result<CandidateArenaResult, String> {
     if config.pairs == 0 || config.nodes == 0 || config.max_depth == 0 || config.max_plies == 0 {
         return Err("pairs, nodes, max_depth and max_plies must be positive".into());
     }
@@ -50,18 +84,30 @@ pub fn play_paired(
         return Err("invalid promotion rate or confidence z".into());
     }
     validate_openings(openings, config.pairs)?;
-    let mut report = AbArenaReport::default();
-    for pair in 0..config.pairs {
-        let opening = openings[pair].clone();
-        let red = play_game(&opening, candidate, champion, config)?;
-        let black = play_game(&opening, champion, candidate, config)?;
-        add_game(&mut report, red, true);
-        add_game(&mut report, -black, false);
-        let pair_score = (outcome_score(red) + outcome_score(-black)) / 2.0;
-        report.paired_openings += 1;
-        report.paired_score_sum += pair_score;
-        report.paired_score_sq_sum += pair_score * pair_score;
+    if workers == 0 {
+        return Err("arena workers must be positive".into());
     }
+    let report = parallel_pairs(
+        config.pairs,
+        workers,
+        |pair| {
+            if stop.load(Ordering::Relaxed) {
+                return Err("arena interrupted".into());
+            }
+            let mut report = AbArenaReport::default();
+            let opening = openings[pair].clone();
+            let red = play_game(&opening, candidate, champion, config, stop)?;
+            let black = play_game(&opening, champion, candidate, config, stop)?;
+            add_game(&mut report, red, true);
+            add_game(&mut report, -black, false);
+            let pair_score = (outcome_score(red) + outcome_score(-black)) / 2.0;
+            report.paired_openings = 1;
+            report.paired_score_sum = pair_score;
+            report.paired_score_sq_sum = pair_score * pair_score;
+            Ok(report)
+        },
+        progress,
+    )?;
     let decision = decide(&report, config.promotion_rate, config.confidence_z);
     let (lower_bound, upper_bound) = paired_score_bounds(&report, config.confidence_z);
     Ok(CandidateArenaResult {
@@ -70,6 +116,36 @@ pub fn play_paired(
         upper_bound,
         decision,
     })
+}
+
+fn parallel_pairs(
+    count: usize,
+    workers: usize,
+    play: impl Fn(usize) -> Result<AbArenaReport, String> + Sync,
+    progress: impl FnMut(usize, &AbArenaReport) + Send,
+) -> Result<AbArenaReport, String> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers.min(count))
+        .thread_name(|i| format!("pikafish-arena-{i}"))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let accumulated = Mutex::new((AbArenaReport::default(), progress));
+    pool.install(|| {
+        (0..count).into_par_iter().try_for_each(|pair| {
+            let result = play(pair)?;
+            let mut state = accumulated
+                .lock()
+                .map_err(|_| "arena report poisoned".to_string())?;
+            state.0.add_assign(&result);
+            let report = state.0;
+            (state.1)(report.paired_openings, &report);
+            Ok::<_, String>(())
+        })
+    })?;
+    Ok(accumulated
+        .into_inner()
+        .map_err(|_| "arena report poisoned".to_string())?
+        .0)
 }
 
 fn validate_openings(openings: &[Position], pairs: usize) -> Result<(), String> {
@@ -166,10 +242,14 @@ fn play_game(
     red: &PikafishModel,
     black: &PikafishModel,
     config: CandidateArenaConfig,
+    stop: &AtomicBool,
 ) -> Result<f32, String> {
     let mut position = opening.clone();
     let mut history = position.initial_rule_history();
     for _ in 0..config.max_plies {
+        if stop.load(Ordering::Relaxed) {
+            return Err("arena interrupted".into());
+        }
         if let Some(result) = position.rule_outcome_with_history(&history) {
             return Ok(outcome_value(result));
         }
@@ -258,6 +338,110 @@ mod tests {
         report.paired_score_sum = 0.0;
         report.paired_score_sq_sum = 0.0;
         assert_eq!(decide(&report, 0.5, 1.96), CandidateArenaDecision::Reject);
+    }
+
+    #[test]
+    fn bounded_parallel_pairs_aggregate_once_and_propagate_errors() {
+        use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+        let barrier = Arc::new(Barrier::new(4));
+        let entered = AtomicUsize::new(0);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let report = parallel_pairs(
+            16,
+            4,
+            |_| {
+                let live = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(live, Ordering::SeqCst);
+                if entered.fetch_add(1, Ordering::SeqCst) < 4 {
+                    barrier.wait();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(AbArenaReport {
+                    draws: 2,
+                    paired_openings: 1,
+                    paired_score_sum: 0.5,
+                    paired_score_sq_sum: 0.25,
+                    ..AbArenaReport::default()
+                })
+            },
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+        assert_eq!((report.total_games(), report.paired_openings), (32, 16));
+        assert_eq!(report.paired_score_sum, 8.0);
+        assert!(
+            parallel_pairs(
+                16,
+                4,
+                |pair| if pair == 3 {
+                    Err("failed game".into())
+                } else {
+                    Ok(AbArenaReport::default())
+                },
+                |_, _| {}
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parallel_real_games_have_the_same_score_as_serial() {
+        let model = PikafishModel::new(&candle_core::Device::Cpu).unwrap();
+        let openings: Vec<_> = (0..9)
+            .filter(|&file| file != 3)
+            .map(|file| {
+                let rank = format!(
+                    "{}R{}",
+                    if file > 0 {
+                        file.to_string()
+                    } else {
+                        String::new()
+                    },
+                    if file < 8 {
+                        (8 - file).to_string()
+                    } else {
+                        String::new()
+                    }
+                );
+                Position::from_fen(&format!("3k5/9/9/9/9/9/9/{rank}/9/4K4 w - - 119 1")).unwrap()
+            })
+            .collect();
+        let config = CandidateArenaConfig {
+            pairs: 8,
+            nodes: 16,
+            max_depth: 1,
+            max_plies: 8,
+            promotion_rate: 0.55,
+            confidence_z: 1.96,
+        };
+        let serial = play_paired(&model, &model, &openings, config).unwrap();
+        let parallel = play_paired_parallel_with_stop(
+            &model,
+            &model,
+            &openings,
+            config,
+            4,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                serial.report.wins,
+                serial.report.losses,
+                serial.report.draws
+            ),
+            (
+                parallel.report.wins,
+                parallel.report.losses,
+                parallel.report.draws
+            )
+        );
+        assert_eq!(serial.decision, parallel.decision);
+        assert_eq!(serial.lower_bound, parallel.lower_bound);
     }
 
     #[test]

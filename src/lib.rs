@@ -2,6 +2,7 @@ pub mod ab;
 pub mod nnue;
 pub mod pikafish_candidate_arena;
 pub mod pikafish_candidate_selfplay;
+pub mod pikafish_evolve;
 pub mod pikafish_match;
 pub mod pikafish_pretrain;
 pub mod pikafish_selfplay;

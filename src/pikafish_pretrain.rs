@@ -68,7 +68,7 @@ fn parse_row(line: &str, fen_col: usize, score_col: usize) -> io::Result<Option<
     Ok(Some((position, cp_to_value(score_cp))))
 }
 
-fn parse_result_row(
+pub(crate) fn parse_result_row(
     line: &str,
     fen_col: usize,
     result_col: usize,
@@ -104,7 +104,7 @@ fn parse_result_row(
     Ok(Some((position, target)))
 }
 
-fn train_batch(
+pub(crate) fn train_batch(
     model: &PikafishModel,
     optimizer: &mut SGD,
     examples: &[PikafishExample],

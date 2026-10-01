@@ -6,7 +6,9 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 mod alphabeta;
-pub(crate) use alphabeta::{AbUciSearchResult, search_uci, search_uci_pikafish};
+pub(crate) use alphabeta::{
+    AbUciSearchResult, search_uci, search_uci_pikafish, search_uci_pikafish_float,
+};
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl")),
