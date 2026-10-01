@@ -12,7 +12,6 @@ use super::train_gpu_candle as candle;
 ))]
 pub(super) use candle::GpuTrainer;
 
-/// ??? GPU ???????????? `String` ??????????
 #[cfg(any(
     all(feature = "gpu-train", not(target_os = "macos")),
     all(target_os = "linux", not(target_env = "musl")),
