@@ -1258,13 +1258,6 @@ pub struct AzPhaseValueReport {
     pub calibration: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AzTrainBenchmark {
-    pub loss: f32,
-    pub value_loss: f32,
-    pub policy_ce: f32,
-}
-
 #[derive(Clone, Debug)]
 pub struct AzTrainingSample {
     pub features: Vec<usize>,
@@ -2758,69 +2751,6 @@ impl AzNnue {
             ));
         }
         Ok(())
-    }
-}
-
-pub fn benchmark_training(
-    model: &mut AzNnue,
-    sample_count: usize,
-    epochs: usize,
-    batch_size: usize,
-    lr: f32,
-    seed: u64,
-) -> AzTrainBenchmark {
-    let mut rng = SplitMix64::new(seed);
-    let mut samples = Vec::with_capacity(sample_count);
-    for index in 0..sample_count {
-        let feature_count = 24 + (rng.next_u64() as usize % 16);
-        let mut features = Vec::with_capacity(feature_count);
-        for _ in 0..feature_count {
-            features.push((rng.next_u64() as usize) % AZ_NNUE_INPUT_SIZE);
-        }
-        features.sort_unstable();
-        features.dedup();
-
-        let value = rng.unit_f32() * 2.0 - 1.0;
-        let move_count = 12 + (rng.next_u64() as usize % 24);
-        let mut move_indices = Vec::with_capacity(move_count);
-        while move_indices.len() < move_count {
-            let candidate = (rng.next_u64() as usize) % DENSE_MOVE_SPACE;
-            if !move_indices.contains(&candidate) {
-                move_indices.push(candidate);
-            }
-        }
-        let mut policy = (0..move_count)
-            .map(|_| rng.unit_f32().max(1e-6))
-            .collect::<Vec<_>>();
-        let policy_sum = policy.iter().sum::<f32>().max(1e-6);
-        for value in &mut policy {
-            *value /= policy_sum;
-        }
-        samples.push(AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features,
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
-            move_indices,
-            policy,
-            value_wdl: scalar_value_to_wdl_target(value),
-            root_search_wdl: scalar_value_to_wdl_target(value),
-            value,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            search_simulations: 0,
-            meta: AzSampleMeta::default(),
-        });
-        if index + 1 == sample_count {
-            break;
-        }
-    }
-    let stats = train_samples(model, &samples, epochs, lr, batch_size, &mut rng)
-        .unwrap_or_else(|err| panic!("training failed: {err}"));
-    AzTrainBenchmark {
-        loss: stats.loss,
-        value_loss: stats.value_loss,
-        policy_ce: stats.policy_ce,
     }
 }
 
