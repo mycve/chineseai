@@ -37,7 +37,6 @@ pub struct Champion {
 }
 
 pub struct GeneratedGame {
-    pub id: u64,
     pub generation: usize,
     pub game: SelfplayGame,
 }
@@ -169,11 +168,7 @@ impl SelfplayService {
                                 },
                             );
                             stats.active_selfplay.fetch_sub(1, Ordering::Relaxed);
-                            let result = game.map(|game| GeneratedGame {
-                                id,
-                                generation,
-                                game,
-                            });
+                            let result = game.map(|game| GeneratedGame { generation, game });
                             stats.generated_games.fetch_add(1, Ordering::Relaxed);
                             let failed = result.is_err();
                             if !send(&results, &stop, result) || failed {

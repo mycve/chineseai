@@ -555,6 +555,28 @@ fn runtime_status(
     )
 }
 
+fn collection_status(metric: &Metric, config: &EvolveConfig, elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    let rate = if seconds > 0.0 {
+        metric.games as f64 * 60.0 / seconds
+    } else {
+        0.0
+    };
+    format!(
+        "采集 {}：{}/{} ({:.0}%) · 终局 {} / 截断 {} · 新样本 {} · 等待 {:.0}s · 平均 {:.1} 局/分 · 过期丢弃 {}",
+        metric.cycle,
+        metric.games,
+        config.games_per_update,
+        metric.games as f64 * 100.0 / config.games_per_update as f64,
+        metric.completed,
+        metric.truncated,
+        metric.new_samples,
+        seconds,
+        rate,
+        metric.discarded_stale_games
+    )
+}
+
 fn receive_arena(
     service: &ArenaService,
     shared: &RwLock<Champion>,
@@ -871,15 +893,39 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         }
         let waiting = Instant::now();
         let mut last_status = Instant::now() - Duration::from_secs(2);
+        let mut last_log = Instant::now();
+        let mut last_nodes = stats.search_nodes.load(Ordering::Relaxed);
+        println!(
+            "开始采集 {cycle}：目标 {} 局，自博弈 {} workers；每 10 秒汇总",
+            config.games_per_update, config.selfplay_workers
+        );
         while metric.games < config.games_per_update && !stop.load(Ordering::Relaxed) {
             receive_arena(&arena, &shared, &mut state, dir)?;
             if last_status.elapsed() >= Duration::from_secs(1) {
                 set_status(
                     dir,
                     &state.metrics,
-                    &runtime_status(&stats, &selfplay, &config, state.update),
+                    &format!(
+                        "{} · {}",
+                        collection_status(&metric, &config, waiting.elapsed()),
+                        runtime_status(&stats, &selfplay, &config, state.update)
+                    ),
                 )?;
                 last_status = Instant::now();
+            }
+            if last_log.elapsed() >= Duration::from_secs(10) {
+                let nodes = stats.search_nodes.load(Ordering::Relaxed);
+                println!(
+                    "{} · 搜索 {}/{} workers ({:.0} 节点/s) · 队列 {}/{}",
+                    collection_status(&metric, &config, waiting.elapsed()),
+                    stats.active_selfplay.load(Ordering::Relaxed),
+                    config.selfplay_workers,
+                    nodes.saturating_sub(last_nodes) as f64 / last_log.elapsed().as_secs_f64(),
+                    selfplay.results.len(),
+                    config.queue_games
+                );
+                last_nodes = nodes;
+                last_log = Instant::now();
             }
             match selfplay.results.recv_timeout(Duration::from_millis(100)) {
                 Ok(result) => {
@@ -913,16 +959,6 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
                             replay.pop_front();
                         }
                     }
-                    println!(
-                        "收集循环 {cycle} {}/{}：game={} source_generation={} 终局={} 截断={} 新样本={}",
-                        metric.games,
-                        config.games_per_update,
-                        generated.id,
-                        generated.generation,
-                        metric.completed,
-                        metric.truncated,
-                        metric.new_samples
-                    );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -930,6 +966,7 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
                 }
             }
         }
+        println!("{}", collection_status(&metric, &config, waiting.elapsed()));
         metric.data_wait_seconds = waiting.elapsed().as_secs_f64();
         metric.replay_samples = replay.len();
         if metric.new_samples > 0 && !stop.load(Ordering::Relaxed) {
@@ -974,9 +1011,14 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         metric.peak_selfplay_workers = stats.peak_selfplay.load(Ordering::Relaxed);
         metric.queue_depth = selfplay.results.len();
         println!(
-            "更新 {}：loss={:?} GPU训练={:.2}s 数据等待={:.2}s 训练期间CPU搜索={}节点 并行峰值={} 测评重叠={}",
+            "更新 {}：loss={} 训练样本={} 回放={} GPU训练={:.2}s 数据等待={:.2}s 训练期间CPU搜索={}节点 并行峰值={} 测评重叠={}",
             state.update,
-            metric.loss,
+            metric
+                .loss
+                .map(|loss| format!("{loss:.6}"))
+                .unwrap_or_else(|| "—".into()),
+            metric.trained_samples,
+            metric.replay_samples,
             metric.training_seconds,
             metric.data_wait_seconds,
             metric.search_nodes_during_training,
