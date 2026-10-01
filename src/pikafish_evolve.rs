@@ -198,12 +198,16 @@ pub struct Metric {
     pub champion_wins: usize,
     pub champion_losses: usize,
     pub champion_draws: usize,
+    #[serde(default)]
+    pub champion_truncated: usize,
     pub reference_score: Option<f32>,
     pub reference_lower: Option<f32>,
     pub reference_upper: Option<f32>,
     pub reference_wins: usize,
     pub reference_losses: usize,
     pub reference_draws: usize,
+    #[serde(default)]
+    pub reference_truncated: usize,
     pub decision: String,
     pub seconds: f64,
     pub data_wait_seconds: f64,
@@ -536,7 +540,20 @@ fn runtime_status(
     data: &SelfplayService,
     config: &EvolveConfig,
     update: usize,
+    pending: Option<&PendingArena>,
 ) -> String {
+    let arena = match pending {
+        Some(candidate) => format!(
+            "候选 update={} · {} · 新候选等待本轮结束",
+            candidate.update,
+            if stats.arena_active.load(Ordering::Relaxed) {
+                "进行中"
+            } else {
+                "等待提交结果"
+            }
+        ),
+        None => "空闲".into(),
+    };
     format!(
         "更新 {update} · 自博弈 {}/{} 个 worker 在搜索，结果队列 {}/{} · 已生成 {} 局、{} 搜索节点 · 后台测评 {}，已完成 {}/{} 对",
         stats.active_selfplay.load(Ordering::Relaxed),
@@ -545,11 +562,7 @@ fn runtime_status(
         config.queue_games,
         stats.generated_games.load(Ordering::Relaxed),
         stats.search_nodes.load(Ordering::Relaxed),
-        if stats.arena_active.load(Ordering::Relaxed) {
-            "进行中"
-        } else {
-            "空闲"
-        },
+        arena,
         stats.arena_pairs.load(Ordering::Relaxed),
         config.arena_pairs * 2
     )
@@ -597,40 +610,41 @@ fn receive_arena(
             update: pending.update,
             generation: state.generation,
             seconds,
-            decision: "测评截断，保留冠军".into(),
             ..Metric::default()
         };
-        if let Some(current) = current {
-            metric.score = Some(current.report.score_rate());
-            metric.lower = Some(current.lower_bound);
-            metric.upper = Some(current.upper_bound);
-            metric.champion_wins = current.report.wins;
-            metric.champion_losses = current.report.losses;
-            metric.champion_draws = current.report.draws;
-            if let Some(anchor) = anchor {
-                metric.reference_score = Some(anchor.report.score_rate());
-                metric.reference_lower = Some(anchor.lower_bound);
-                metric.reference_upper = Some(anchor.upper_bound);
-                metric.reference_wins = anchor.report.wins;
-                metric.reference_losses = anchor.report.losses;
-                metric.reference_draws = anchor.report.draws;
-                metric.decision = format!("{:?}", current.decision);
-                if pending.champion_generation != state.generation {
-                    metric.decision = "旧冠军测评结果，不晋级".into();
-                } else if promotion(&current, &anchor) {
-                    state.generation += 1;
-                    state.champion_cycle = pending.cycle;
-                    metric.generation = state.generation;
-                    metric.decision = "晋级".into();
-                    let mut champion = shared.write().map_err(|_| io_error("冠军锁损坏"))?;
-                    *champion = Champion {
-                        generation: state.generation,
-                        model: candidate,
-                    };
-                } else if anchor.upper_bound < 0.5 {
-                    metric.decision = "固定基准退步，拒绝晋级".into();
-                }
-            }
+        metric.completed = current.report.total_games() + anchor.report.total_games();
+        metric.truncated = current.truncated_games + anchor.truncated_games;
+        metric.games = metric.completed + metric.truncated;
+        metric.score = (current.report.total_games() > 0).then(|| current.report.score_rate());
+        metric.lower = Some(current.lower_bound);
+        metric.upper = Some(current.upper_bound);
+        metric.champion_wins = current.report.wins;
+        metric.champion_losses = current.report.losses;
+        metric.champion_draws = current.report.draws;
+        metric.champion_truncated = current.truncated_games;
+        metric.reference_score =
+            (anchor.report.total_games() > 0).then(|| anchor.report.score_rate());
+        metric.reference_lower = Some(anchor.lower_bound);
+        metric.reference_upper = Some(anchor.upper_bound);
+        metric.reference_wins = anchor.report.wins;
+        metric.reference_losses = anchor.report.losses;
+        metric.reference_draws = anchor.report.draws;
+        metric.reference_truncated = anchor.truncated_games;
+        metric.decision = format!("{:?}", current.decision);
+        if pending.champion_generation != state.generation {
+            metric.decision = "旧冠军测评结果，不晋级".into();
+        } else if promotion(&current, &anchor) {
+            state.generation += 1;
+            state.champion_cycle = pending.cycle;
+            metric.generation = state.generation;
+            metric.decision = "晋级".into();
+            let mut champion = shared.write().map_err(|_| io_error("冠军锁损坏"))?;
+            *champion = Champion {
+                generation: state.generation,
+                model: candidate,
+            };
+        } else if anchor.upper_bound < 0.5 {
+            metric.decision = "固定基准退步，拒绝晋级".into();
         }
         println!(
             "后台晋级 update={}：得分={} CI={}..{} 基准={} 决定={}；冠军第 {} 代",
@@ -908,7 +922,13 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
                     &format!(
                         "{} · {}",
                         collection_status(&metric, &config, waiting.elapsed()),
-                        runtime_status(&stats, &selfplay, &config, state.update)
+                        runtime_status(
+                            &stats,
+                            &selfplay,
+                            &config,
+                            state.update,
+                            state.pending_arena.as_ref()
+                        )
                     ),
                 )?;
                 last_status = Instant::now();
@@ -975,7 +995,13 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
                 &state.metrics,
                 &format!(
                     "GPU 更新候选；{} · 回放 {}",
-                    runtime_status(&stats, &selfplay, &config, state.update),
+                    runtime_status(
+                        &stats,
+                        &selfplay,
+                        &config,
+                        state.update,
+                        state.pending_arena.as_ref()
+                    ),
                     replay.len()
                 ),
             )?;
@@ -1003,7 +1029,12 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         if metric.trained_samples > 0 {
             state.update += 1;
         } else {
-            metric.decision = "无终局标签，跳过训练".into();
+            metric.decision = if stop.load(Ordering::Relaxed) {
+                "停止请求，跳过训练"
+            } else {
+                "无终局标签，跳过训练"
+            }
+            .into();
         }
         metric.update = state.update;
         metric.generation = state.generation;
@@ -1100,6 +1131,29 @@ fn optional(value: Option<f32>) -> String {
     value.map(|x| format!("{x:.4}")).unwrap_or_default()
 }
 
+fn arena_score_cell(
+    score: Option<f32>,
+    lower: Option<f32>,
+    upper: Option<f32>,
+    wins: usize,
+    losses: usize,
+    draws: usize,
+    truncated: usize,
+    arena: bool,
+) -> String {
+    if !arena {
+        return String::new();
+    }
+    format!(
+        "{}<br><small>胜/负/和/未决={wins}/{losses}/{draws}/{truncated}<br>区间 {}–{}</small>",
+        score
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "无终局".into()),
+        optional(lower),
+        optional(upper)
+    )
+}
+
 fn set_status(dir: &Path, metrics: &[Metric], status: &str) -> io::Result<()> {
     atomic_write(&dir.join("status.txt"), status)?;
     render_metrics(dir, metrics)
@@ -1115,7 +1169,7 @@ fn render_metrics(dir: &Path, metrics: &[Metric]) -> io::Result<()> {
             if item.kind == "arena" { "测评" } else { "训练" }, item.update, item.generation, item.peak_selfplay_workers,
             item.completed, item.truncated, item.replay_samples,
             item.loss.map(|x| format!("{x:.5}")).unwrap_or_else(|| "—".into()), item.search_nodes_during_training,
-            if item.trained_during_arena { "是" } else { "—" }, optional(item.score), optional(item.reference_score), item.decision));
+            if item.trained_during_arena { "是" } else { "—" }, arena_score_cell(item.score, item.lower, item.upper, item.champion_wins, item.champion_losses, item.champion_draws, item.champion_truncated, item.kind == "arena"), arena_score_cell(item.reference_score, item.reference_lower, item.reference_upper, item.reference_wins, item.reference_losses, item.reference_draws, item.reference_truncated, item.kind == "arena"), item.decision));
         if item.decision == "晋级" {
             if let Some(score) = item.reference_score {
                 points.push((item.cycle, score));
@@ -1145,7 +1199,7 @@ fn render_metrics(dir: &Path, metrics: &[Metric]) -> io::Result<()> {
 <style>body{{font:16px system-ui;background:#101926;color:#e4edf7;margin:40px auto;max-width:1100px;padding:0 20px}}h1{{color:#70dbc1}}small,p{{color:#aabbd0}}svg{{width:100%;background:#172437;border-radius:12px}}table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{padding:10px;border-bottom:1px solid #2b3c51;text-align:left}}.scroll{{overflow:auto}}a{{color:#70dbc1}}</style>
 <h1>象棋自动进化 · 冠军第 {generation} 代</h1><p>{status}</p><p>曲线仅显示通过晋级的冠军，对固定初始模型的实际比赛得分。起点 0.5 是自身对比基线，尚未晋级时只有起点。每 30 秒刷新。</p>
 <svg viewBox="0 0 800 300"><text x="5" y="35" fill="#aabbd0">1.0</text><text x="5" y="155" fill="#aabbd0">0.5</text><text x="5" y="275" fill="#aabbd0">0.0</text><path d="M40 150H760" stroke="#51647e" stroke-dasharray="6 6"/><circle cx="40" cy="150" r="4" fill="#70dbc1"/><polyline points="{polyline}" fill="none" stroke="#70dbc1" stroke-width="3"/></svg>
-<p>晋级要求：冠军赛得分置信下界超过门槛，且固定基准无显著退步；截断不计和棋。候选得分见表格，候选训练损失下降不代表棋力上涨。重复测评的置信区间是逐次区间，不是全程错误率保证。</p>
+<p>晋级要求：冠军赛得分置信下界超过门槛，且固定基准无显著退步；截断记为未决，整批继续；置信下界将未决视为负、上界视为胜。表格得分仅统计终局，候选训练损失下降不代表棋力上涨。重复测评的置信区间是逐次区间，不是全程错误率保证。</p>
 <div class="scroll"><table><thead><tr><th>事件</th><th>更新</th><th>冠军代数</th><th>并行峰值</th><th>终局/截断</th><th>回放</th><th>Loss</th><th>训练时搜索节点</th><th>训练/测评重叠</th><th>对冠军得分</th><th>对基准得分</th><th>决定</th></tr></thead><tbody>{rows}</tbody></table></div><p><a href="metrics.csv">下载完整比赛记录与置信区间</a></p></html>"##
     );
     atomic_write(
@@ -1208,10 +1262,46 @@ mod tests {
     }
 
     #[test]
+    fn arena_dashboard_preserves_counts_and_uncertainty() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("arena-dashboard-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let metric = Metric {
+            kind: "arena".into(),
+            completed: 15,
+            truncated: 1,
+            champion_wins: 15,
+            champion_truncated: 1,
+            score: Some(1.),
+            lower: Some(0.6),
+            upper: Some(1.),
+            decision: "Inconclusive".into(),
+            ..Default::default()
+        };
+        render_metrics(&dir, &[metric.clone()])?;
+        let html = fs::read_to_string(dir.join("dashboard.html"))?;
+        assert!(html.contains("<td>15/1</td>"));
+        assert!(html.contains("胜/负/和/未决=15/0/0/1"));
+        assert!(html.contains("区间 0.6000–1.0000"));
+        let mut old = toml::to_string(&metric).map_err(io_error)?;
+        old = old
+            .lines()
+            .filter(|line| {
+                !line.starts_with("champion_truncated") && !line.starts_with("reference_truncated")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let restored: Metric = toml::from_str(&old).map_err(io_error)?;
+        assert_eq!(restored.champion_wins, 15);
+        assert_eq!(restored.champion_truncated, 0);
+        fs::remove_dir_all(dir)
+    }
+
+    #[test]
     fn only_evidence_of_improvement_can_promote() {
         use crate::ab::AbArenaReport;
         let result = |decision, lower, upper| CandidateArenaResult {
             report: AbArenaReport::default(),
+            truncated_games: 0,
             lower_bound: lower,
             upper_bound: upper,
             decision,

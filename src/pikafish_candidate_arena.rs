@@ -29,13 +29,14 @@ pub enum CandidateArenaDecision {
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateArenaResult {
     pub report: AbArenaReport,
+    pub truncated_games: usize,
     pub lower_bound: f32,
     pub upper_bound: f32,
     pub decision: CandidateArenaDecision,
 }
 
 /// `openings` 中的每个局面先由候选执红、再由候选执黑。
-/// 每对使用不同开局，未终局的截断对局返回错误，避免当成和棋晋级。
+/// 每对使用不同开局；截断保留为未决，继续比赛，并用最不利/最有利结果包住晋级区间。
 pub fn play_paired(
     candidate: &PikafishCpuModel,
     champion: &PikafishCpuModel,
@@ -63,7 +64,7 @@ pub fn play_paired_with_stop(
     play_paired_parallel_with_stop(candidate, champion, openings, config, 1, stop, progress)
 }
 
-/// 各开局配对独立调度，红黑两局全部完成后才加入统计。
+/// 各开局配对独立调度，红黑两局均结束（终局或截断）后加入统计。
 pub fn play_paired_parallel_with_stop(
     candidate: &PikafishCpuModel,
     champion: &PikafishCpuModel,
@@ -87,57 +88,99 @@ pub fn play_paired_parallel_with_stop(
     if workers == 0 {
         return Err("arena workers must be positive".into());
     }
-    let report = parallel_pairs(
+    let tally = parallel_pairs(
         config.pairs,
         workers,
         |pair| {
             if stop.load(Ordering::Relaxed) {
                 return Err("arena interrupted".into());
             }
-            let mut report = AbArenaReport::default();
             let opening = openings[pair].clone();
             let red = play_game(&opening, candidate, champion, config, stop)?;
             let black = play_game(&opening, champion, candidate, config, stop)?;
-            add_game(&mut report, red, true);
-            add_game(&mut report, -black, false);
-            let pair_score = (outcome_score(red) + outcome_score(-black)) / 2.0;
-            report.paired_openings = 1;
-            report.paired_score_sum = pair_score;
-            report.paired_score_sq_sum = pair_score * pair_score;
-            Ok(report)
+            Ok(pair_tally(red, black))
         },
         progress,
     )?;
-    let decision = decide(&report, config.promotion_rate, config.confidence_z);
-    let (lower_bound, upper_bound) = paired_score_bounds(&report, config.confidence_z);
+    let report = tally.report;
+    let (lower_bound, upper_bound) = tally.bounds(config.confidence_z);
+    let decision = if report.paired_openings < 2 {
+        CandidateArenaDecision::Inconclusive
+    } else if lower_bound > config.promotion_rate {
+        CandidateArenaDecision::Promote
+    } else if upper_bound < config.promotion_rate {
+        CandidateArenaDecision::Reject
+    } else {
+        CandidateArenaDecision::Inconclusive
+    };
     Ok(CandidateArenaResult {
         report,
+        truncated_games: tally.truncated,
         lower_bound,
         upper_bound,
         decision,
     })
 }
 
+#[derive(Default, Clone, Copy)]
+struct ArenaTally {
+    report: AbArenaReport,
+    truncated: usize,
+}
+impl From<AbArenaReport> for ArenaTally {
+    fn from(report: AbArenaReport) -> Self {
+        Self {
+            report,
+            truncated: 0,
+        }
+    }
+}
+impl ArenaTally {
+    fn bounds(&self, z: f32) -> (f32, f32) {
+        let lower = paired_score_bounds(&self.report, z).0;
+        let mut optimistic = self.report;
+        optimistic.paired_score_sum += self.truncated as f32 * 0.5;
+        (lower, paired_score_bounds(&optimistic, z).1)
+    }
+}
+fn pair_tally(red: Option<f32>, black: Option<f32>) -> ArenaTally {
+    let mut tally = ArenaTally::default();
+    let mut score = 0.;
+    for (value, candidate_red) in [(red, true), (black.map(|v| -v), false)] {
+        if let Some(value) = value {
+            add_game(&mut tally.report, value, candidate_red);
+            score += outcome_score(value) * 0.5;
+        } else {
+            tally.truncated += 1;
+        }
+    }
+    tally.report.paired_openings = 1;
+    tally.report.paired_score_sum = score;
+    tally.report.paired_score_sq_sum = score * score;
+    tally
+}
+
 fn parallel_pairs(
     count: usize,
     workers: usize,
-    play: impl Fn(usize) -> Result<AbArenaReport, String> + Sync,
+    play: impl Fn(usize) -> Result<ArenaTally, String> + Sync,
     progress: impl FnMut(usize, &AbArenaReport) + Send,
-) -> Result<AbArenaReport, String> {
+) -> Result<ArenaTally, String> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers.min(count))
         .thread_name(|i| format!("pikafish-arena-{i}"))
         .build()
         .map_err(|error| error.to_string())?;
-    let accumulated = Mutex::new((AbArenaReport::default(), progress));
+    let accumulated = Mutex::new((ArenaTally::default(), progress));
     pool.install(|| {
         (0..count).into_par_iter().try_for_each(|pair| {
             let result = play(pair)?;
             let mut state = accumulated
                 .lock()
                 .map_err(|_| "arena report poisoned".to_string())?;
-            state.0.add_assign(&result);
-            let report = state.0;
+            state.0.report.add_assign(&result.report);
+            state.0.truncated += result.truncated;
+            let report = state.0.report;
             (state.1)(report.paired_openings, &report);
             Ok::<_, String>(())
         })
@@ -243,7 +286,7 @@ fn play_game(
     black: &PikafishCpuModel,
     config: CandidateArenaConfig,
     stop: &AtomicBool,
-) -> Result<f32, String> {
+) -> Result<Option<f32>, String> {
     let mut position = opening.clone();
     let mut history = position.initial_rule_history();
     for _ in 0..config.max_plies {
@@ -251,15 +294,15 @@ fn play_game(
             return Err("arena interrupted".into());
         }
         if let Some(result) = position.rule_outcome_with_history(&history) {
-            return Ok(outcome_value(result));
+            return Ok(Some(outcome_value(result)));
         }
         let legal = position.legal_moves_with_rules(&history);
         if legal.is_empty() {
-            return Ok(if position.side_to_move() == Color::Red {
+            return Ok(Some(if position.side_to_move() == Color::Red {
                 -1.0
             } else {
                 1.0
-            });
+            }));
         }
         let model = if position.side_to_move() == Color::Red {
             red
@@ -282,23 +325,23 @@ fn play_game(
         history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
         if !position.has_general(Color::Red) {
-            return Ok(-1.0);
+            return Ok(Some(-1.0));
         }
         if !position.has_general(Color::Black) {
-            return Ok(1.0);
+            return Ok(Some(1.0));
         }
     }
     if let Some(outcome) = position.rule_outcome_with_history(&history) {
-        return Ok(outcome_value(outcome));
+        return Ok(Some(outcome_value(outcome)));
     }
     if position.legal_moves_with_rules(&history).is_empty() {
-        return Ok(if position.side_to_move() == Color::Red {
+        return Ok(Some(if position.side_to_move() == Color::Red {
             -1.0
         } else {
             1.0
-        });
+        }));
     }
-    Err("arena game reached max_plies without result".into())
+    Ok(None)
 }
 
 fn outcome_value(outcome: RuleOutcome) -> f32 {
@@ -364,11 +407,13 @@ mod tests {
                     paired_score_sum: 0.5,
                     paired_score_sq_sum: 0.25,
                     ..AbArenaReport::default()
-                })
+                }
+                .into())
             },
             |_, _| {},
         )
         .unwrap();
+        let report = report.report;
         assert_eq!(peak.load(Ordering::SeqCst), 4);
         assert_eq!((report.total_games(), report.paired_openings), (32, 16));
         assert_eq!(report.paired_score_sum, 8.0);
@@ -379,7 +424,7 @@ mod tests {
                 |pair| if pair == 3 {
                     Err("failed game".into())
                 } else {
-                    Ok(AbArenaReport::default())
+                    Ok(AbArenaReport::default().into())
                 },
                 |_, _| {}
             )
@@ -445,6 +490,75 @@ mod tests {
         );
         assert_eq!(serial.decision, parallel.decision);
         assert_eq!(serial.lower_bound, parallel.lower_bound);
+    }
+
+    #[test]
+    fn truncated_pair_keeps_finished_game_and_remaining_pairs() {
+        let mut callbacks = Vec::new();
+        let tally = parallel_pairs(
+            8,
+            4,
+            |pair| {
+                Ok(if pair == 0 {
+                    pair_tally(Some(1.), None)
+                } else {
+                    pair_tally(Some(1.), Some(-1.))
+                })
+            },
+            |completed, report| callbacks.push((completed, report.total_games())),
+        )
+        .unwrap();
+        assert_eq!(tally.report.paired_openings, 8);
+        assert_eq!(tally.report.wins, 15);
+        assert_eq!(tally.report.total_games(), 15);
+        assert_eq!(tally.truncated, 1);
+        assert_eq!(callbacks.last(), Some(&(8, 15)));
+        let (lower, upper) = tally.bounds(1.96);
+        let completed = ArenaTally {
+            report: AbArenaReport {
+                wins: 16,
+                paired_openings: 8,
+                paired_score_sum: 8.,
+                ..Default::default()
+            },
+            truncated: 0,
+        };
+        assert!(lower < completed.bounds(1.96).0);
+        assert_eq!(upper, completed.bounds(1.96).1);
+    }
+
+    #[test]
+    fn unresolved_games_neither_draw_nor_disappear() {
+        let model = crate::ab::pikafish_candle::PikafishModel::new(&candle_core::Device::Cpu)
+            .unwrap()
+            .cpu_snapshot()
+            .unwrap();
+        let start = Position::startpos();
+        let mut next = start.clone();
+        next.make_move(next.legal_moves()[0]);
+        let config = CandidateArenaConfig {
+            pairs: 2,
+            nodes: 16,
+            max_depth: 1,
+            max_plies: 1,
+            promotion_rate: 0.55,
+            confidence_z: 1.96,
+        };
+        let result = play_paired_parallel_with_stop(
+            &model,
+            &model,
+            &[start, next],
+            config,
+            2,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.report.paired_openings, 2);
+        assert_eq!(result.report.total_games(), 0);
+        assert_eq!(result.truncated_games, 4);
+        assert_eq!((result.lower_bound, result.upper_bound), (0., 1.));
+        assert_eq!(result.decision, CandidateArenaDecision::Inconclusive);
     }
 
     #[test]

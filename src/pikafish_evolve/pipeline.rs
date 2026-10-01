@@ -196,7 +196,7 @@ pub struct ArenaTask {
 
 pub struct ArenaOutcome {
     pub pending: PendingArena,
-    pub result: Result<(Option<CandidateArenaResult>, Option<CandidateArenaResult>), String>,
+    pub result: Result<(CandidateArenaResult, CandidateArenaResult), String>,
     pub seconds: f64,
     pub candidate: Arc<PikafishCpuModel>,
 }
@@ -242,7 +242,7 @@ impl ArenaService {
                     };
                     let run =
                         |opponent: &PikafishCpuModel, openings: &[Position], offset: usize| {
-                            match play_paired_parallel_with_stop(
+                            play_paired_parallel_with_stop(
                                 &task.candidate,
                                 opponent,
                                 openings,
@@ -252,21 +252,10 @@ impl ArenaService {
                                 |pair, _| {
                                     stats.arena_pairs.store(pair + offset, Ordering::Relaxed);
                                 },
-                            ) {
-                                Ok(result) => Ok(Some(result)),
-                                Err(message)
-                                    if message == "arena game reached max_plies without result" =>
-                                {
-                                    Ok(None)
-                                }
-                                Err(message) => Err(message),
-                            }
+                            )
                         };
                     let result = (|| {
                         let current = run(&task.champion, &task.openings, 0)?;
-                        if current.is_none() {
-                            return Ok((None, None));
-                        }
                         let anchor = run(&reference, &reference_openings, config.arena_pairs)?;
                         Ok((current, anchor))
                     })();
@@ -308,6 +297,67 @@ mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
     use std::{fs, io::Write};
+
+    #[test]
+    fn truncated_champion_match_still_runs_reference_match() -> io::Result<()> {
+        let model = Arc::new(
+            crate::ab::pikafish_candle::PikafishModel::new(&candle_core::Device::Cpu)
+                .map_err(io_error)?
+                .cpu_snapshot()
+                .map_err(io_error)?,
+        );
+        let start = Position::startpos();
+        let mut next = start.clone();
+        next.make_move(next.legal_moves()[0]);
+        let openings = vec![start, next];
+        let config = EvolveConfig {
+            arena_pairs: 2,
+            arena_nodes: 16,
+            arena_workers: 2,
+            max_depth: 1,
+            max_plies: 1,
+            ..Default::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(PipelineStats::default());
+        let service = ArenaService::start(
+            &config,
+            Arc::clone(&model),
+            openings.clone(),
+            Arc::clone(&stop),
+            Arc::clone(&stats),
+        )?;
+        service
+            .tasks
+            .send(ArenaTask {
+                pending: PendingArena {
+                    cycle: 1,
+                    update: 1,
+                    champion_cycle: 0,
+                    champion_generation: 0,
+                    openings: openings.iter().map(Position::to_fen).collect(),
+                },
+                candidate: Arc::clone(&model),
+                champion: model,
+                openings,
+            })
+            .map_err(io_error)?;
+        let outcome = service
+            .results
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(io_error)?;
+        let (current, reference) = outcome.result.map_err(io_error)?;
+        for result in [current, reference] {
+            assert_eq!(result.report.paired_openings, 2);
+            assert_eq!(result.truncated_games, 4);
+            assert_eq!(result.report.total_games(), 0);
+            assert_eq!((result.lower_bound, result.upper_bound), (0., 1.));
+        }
+        assert_eq!(stats.arena_pairs.load(Ordering::Relaxed), 4);
+        assert!(!stats.arena_active.load(Ordering::Relaxed));
+        drop(service);
+        Ok(())
+    }
 
     #[test]
     fn full_result_queue_applies_backpressure_and_shutdown_joins_workers() -> io::Result<()> {
