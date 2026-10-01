@@ -1,7 +1,7 @@
 //! 项目自有 Pikafish 形状网络的配对开局晋级赛。
 
 use crate::{
-    ab::{AbArenaReport, AbSearchLimits, pikafish_candle::PikafishModel, search_pikafish_model},
+    ab::{AbArenaReport, AbSearchLimits, pikafish_candle::PikafishCpuModel, search_pikafish_model},
     xiangqi::{Color, Position, RuleOutcome},
 };
 use rayon::prelude::*;
@@ -37,8 +37,8 @@ pub struct CandidateArenaResult {
 /// `openings` 中的每个局面先由候选执红、再由候选执黑。
 /// 每对使用不同开局，未终局的截断对局返回错误，避免当成和棋晋级。
 pub fn play_paired(
-    candidate: &PikafishModel,
-    champion: &PikafishModel,
+    candidate: &PikafishCpuModel,
+    champion: &PikafishCpuModel,
     openings: &[Position],
     config: CandidateArenaConfig,
 ) -> Result<CandidateArenaResult, String> {
@@ -53,8 +53,8 @@ pub fn play_paired(
 }
 
 pub fn play_paired_with_stop(
-    candidate: &PikafishModel,
-    champion: &PikafishModel,
+    candidate: &PikafishCpuModel,
+    champion: &PikafishCpuModel,
     openings: &[Position],
     config: CandidateArenaConfig,
     stop: &AtomicBool,
@@ -65,8 +65,8 @@ pub fn play_paired_with_stop(
 
 /// 各开局配对独立调度，红黑两局全部完成后才加入统计。
 pub fn play_paired_parallel_with_stop(
-    candidate: &PikafishModel,
-    champion: &PikafishModel,
+    candidate: &PikafishCpuModel,
+    champion: &PikafishCpuModel,
     openings: &[Position],
     config: CandidateArenaConfig,
     workers: usize,
@@ -239,8 +239,8 @@ fn outcome_score(value: f32) -> f32 {
 
 fn play_game(
     opening: &Position,
-    red: &PikafishModel,
-    black: &PikafishModel,
+    red: &PikafishCpuModel,
+    black: &PikafishCpuModel,
     config: CandidateArenaConfig,
     stop: &AtomicBool,
 ) -> Result<f32, String> {
@@ -389,7 +389,10 @@ mod tests {
 
     #[test]
     fn parallel_real_games_have_the_same_score_as_serial() {
-        let model = PikafishModel::new(&candle_core::Device::Cpu).unwrap();
+        let model = crate::ab::pikafish_candle::PikafishModel::new(&candle_core::Device::Cpu)
+            .unwrap()
+            .cpu_snapshot()
+            .unwrap();
         let openings: Vec<_> = (0..9)
             .filter(|&file| file != 3)
             .map(|file| {

@@ -244,7 +244,7 @@ pub fn fill_threat_features(
 }
 
 /// 两个视角共享一次攻击关系遍历；输出顺序与分别调用上面的函数完全相同。
-pub(super) fn fill_threat_features_both(
+pub(crate) fn fill_threat_features_both(
     position: &Position,
     red: &mut Vec<usize>,
     black: &mut Vec<usize>,
@@ -255,11 +255,23 @@ pub(super) fn fill_threat_features_both(
     black.clear();
     red.reserve(64);
     black.reserve(64);
-    let occupied = (0..BOARD_SIZE)
-        .filter_map(|square| position.piece_at(square).map(|piece| (square, piece)))
-        .collect::<Vec<_>>();
-    for &(from, attacker) in &occupied {
-        for &(to, attacked) in &occupied {
+    let mut occupied = [(
+        0,
+        Piece {
+            kind: PieceKind::General,
+            color: Color::Red,
+        },
+    ); BOARD_SIZE];
+    let mut count = 0;
+    for square in 0..BOARD_SIZE {
+        if let Some(piece) = position.piece_at(square) {
+            occupied[count] = (square, piece);
+            count += 1;
+        }
+    }
+    let occupied = &occupied[..count];
+    for &(from, attacker) in occupied {
+        for &(to, attacked) in occupied {
             if attacks(
                 position,
                 attacker.kind,

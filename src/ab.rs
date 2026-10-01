@@ -21,6 +21,7 @@ mod dataloader;
 mod fused_feature_pool;
 mod optimizer;
 pub mod pikafish_candle;
+mod pikafish_sparse;
 mod play;
 mod replay;
 mod start;

@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    ab::{AbSearchLimits, pikafish_candle::PikafishModel, search_pikafish_model},
+    ab::{AbSearchLimits, pikafish_candle::PikafishCpuModel, search_pikafish_model},
     xiangqi::{Color, Position, RuleOutcome},
 };
 
@@ -76,7 +76,7 @@ impl SelfplayGame {
 
 /// 对局在内存中完成后才发送给训练器，不经 TSV 往返，也不发布半局标签。
 pub fn play_game(
-    model: &PikafishModel,
+    model: &PikafishCpuModel,
     start: Position,
     config: CandidateSelfplayConfig,
     stop: &AtomicBool,
@@ -177,7 +177,7 @@ fn q_to_training_cp(q: f32) -> i32 {
 /// 输出与 `pikafish-selfplay` 相同的评分列，供项目自己的浮点模型继续训练。
 /// `score_cp` 是 `tanh(cp/600)` 的逆映射，不是 Pikafish 引擎给出的真实厘兵分。
 pub fn generate(
-    model: &PikafishModel,
+    model: &PikafishCpuModel,
     output: &Path,
     config: CandidateSelfplayConfig,
 ) -> io::Result<CandidateSelfplayReport> {
@@ -186,7 +186,7 @@ pub fn generate(
 
 /// 单独导出 TSV 时复用内存对局接口；中断对局没有训练标签。
 pub fn generate_from_openings(
-    model: &PikafishModel,
+    model: &PikafishCpuModel,
     output: &Path,
     config: CandidateSelfplayConfig,
     openings: &[Position],

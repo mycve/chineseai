@@ -1,7 +1,7 @@
 //! 有界自博弈流水线和独立晋级服务；所有搜索共享不可变模型快照。
 use super::{EvolveConfig, PendingArena, distinct_openings, io_error};
 use crate::{
-    ab::pikafish_candle::PikafishModel,
+    ab::pikafish_candle::PikafishCpuModel,
     opening_book::OpeningBook,
     pikafish_candidate_arena::{
         CandidateArenaConfig, CandidateArenaResult, play_paired_parallel_with_stop,
@@ -33,7 +33,7 @@ pub struct PipelineStats {
 
 pub struct Champion {
     pub generation: usize,
-    pub model: Arc<PikafishModel>,
+    pub model: Arc<PikafishCpuModel>,
 }
 
 pub struct GeneratedGame {
@@ -194,8 +194,8 @@ impl SelfplayService {
 
 pub struct ArenaTask {
     pub pending: PendingArena,
-    pub candidate: Arc<PikafishModel>,
-    pub champion: Arc<PikafishModel>,
+    pub candidate: Arc<PikafishCpuModel>,
+    pub champion: Arc<PikafishCpuModel>,
     pub openings: Vec<Position>,
 }
 
@@ -203,7 +203,7 @@ pub struct ArenaOutcome {
     pub pending: PendingArena,
     pub result: Result<(Option<CandidateArenaResult>, Option<CandidateArenaResult>), String>,
     pub seconds: f64,
-    pub candidate: Arc<PikafishModel>,
+    pub candidate: Arc<PikafishCpuModel>,
 }
 
 pub struct ArenaService {
@@ -216,7 +216,7 @@ pub struct ArenaService {
 impl ArenaService {
     pub fn start(
         config: &EvolveConfig,
-        reference: Arc<PikafishModel>,
+        reference: Arc<PikafishCpuModel>,
         reference_openings: Vec<Position>,
         stop: Arc<AtomicBool>,
         stats: Arc<PipelineStats>,
@@ -245,27 +245,28 @@ impl ArenaService {
                         promotion_rate: config.promotion_rate,
                         confidence_z: config.confidence_z,
                     };
-                    let run = |opponent: &PikafishModel, openings: &[Position], offset: usize| {
-                        match play_paired_parallel_with_stop(
-                            &task.candidate,
-                            opponent,
-                            openings,
-                            arena_config,
-                            config.arena_workers,
-                            &cancel,
-                            |pair, _| {
-                                stats.arena_pairs.store(pair + offset, Ordering::Relaxed);
-                            },
-                        ) {
-                            Ok(result) => Ok(Some(result)),
-                            Err(message)
-                                if message == "arena game reached max_plies without result" =>
-                            {
-                                Ok(None)
+                    let run =
+                        |opponent: &PikafishCpuModel, openings: &[Position], offset: usize| {
+                            match play_paired_parallel_with_stop(
+                                &task.candidate,
+                                opponent,
+                                openings,
+                                arena_config,
+                                config.arena_workers,
+                                &cancel,
+                                |pair, _| {
+                                    stats.arena_pairs.store(pair + offset, Ordering::Relaxed);
+                                },
+                            ) {
+                                Ok(result) => Ok(Some(result)),
+                                Err(message)
+                                    if message == "arena game reached max_plies without result" =>
+                                {
+                                    Ok(None)
+                                }
+                                Err(message) => Err(message),
                             }
-                            Err(message) => Err(message),
-                        }
-                    };
+                        };
                     let result = (|| {
                         let current = run(&task.champion, &task.openings, 0)?;
                         if current.is_none() {
@@ -324,7 +325,12 @@ mod tests {
             "[FEN \"3k5/9/9/9/9/9/9/4R4/9/4K4 w - - 119 1\"]\n{{}}"
         )?;
         encoder.finish()?;
-        let model = Arc::new(PikafishModel::new(&candle_core::Device::Cpu).map_err(io_error)?);
+        let model = Arc::new(
+            crate::ab::pikafish_candle::PikafishModel::new(&candle_core::Device::Cpu)
+                .map_err(io_error)?
+                .cpu_snapshot()
+                .map_err(io_error)?,
+        );
         let mut config = EvolveConfig::default();
         config.selfplay_workers = 3;
         config.queue_games = 1;

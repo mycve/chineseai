@@ -1,0 +1,41 @@
+{
+  "baseline_commit": "4df25ae70de8598f9ca6af0e4f12d375a8e26b83",
+  "environment": {
+    "os": "Windows",
+    "cpu": "AMD Ryzen 9 9950X (16 cores / 32 threads)",
+    "profile": "fast, target-cpu=native",
+    "model_sha256": "ee6f70a0a256285c1b43c60aa5be5a000002092864b5c97efacae0a25869eec0"
+  },
+  "method": "同一保存权重与八个固定局面；评估预提取特征，搜索包含特征抽取；搜索始终串行，worker 参数只控制评估并发；每局面 128 节点、深度上限 8。不是 Linux 服务器或长期自博弈测量。",
+  "results": [
+    {
+      "workers": 1,
+      "before_eval_per_second": 3840.826914671421,
+      "after_eval_per_second": 404321.3869840859,
+      "eval_speedup": 105.2693589080088,
+      "before_search_seconds": 0.3497516,
+      "after_search_seconds": 0.0120572,
+      "search_speedup": 29.00769664598746,
+      "same_best_moves": true,
+      "max_q_error": 1.341104507446289e-07
+    },
+    {
+      "workers": 16,
+      "before_eval_per_second": 39995.11559650778,
+      "after_eval_per_second": 2776259.5108577777,
+      "eval_speedup": 69.41496403876353,
+      "before_search_seconds": 0.3529136,
+      "after_search_seconds": 0.011577,
+      "search_speedup": 30.484028677550313,
+      "same_best_moves": true,
+      "max_q_error": 1.341104507446289e-07
+    }
+  ],
+  "validation": [
+    "191 项测试通过，2 项原有测试忽略",
+    "64 样本 / 16 桶 CUDA 前向与 CPU 单局面一致，CPU/CUDA 梯度一致，SGD 降低损失",
+    "生产形状 GPU batch=64 单步训练完成，无 OOM",
+    "旧版本 2 进度从 update 11 续训至 13，保存停止",
+    "浮点权重 UCI 加载，go nodes 128 正常返回最佳着"
+  ]
+}

@@ -2,7 +2,7 @@
 use crate::{
     ab::{
         SplitMix64,
-        pikafish_candle::{PikafishExample, PikafishModel},
+        pikafish_candle::{PikafishCpuModel, PikafishExample, PikafishModel},
     },
     opening_book::OpeningBook,
     pikafish_candidate_arena::{CandidateArenaDecision, CandidateArenaResult},
@@ -631,22 +631,16 @@ fn submit_arena(
         pending
     };
     let candidate = if pending.cycle == state.cycle {
-        learner.snapshot(&Device::Cpu).map_err(io_error)?
+        learner.cpu_snapshot().map_err(io_error)?
     } else {
-        let model = PikafishModel::new(&Device::Cpu).map_err(io_error)?;
-        model
-            .load(&checkpoint(dir, pending.cycle))
-            .map_err(io_error)?;
-        model
+        PikafishCpuModel::load(&checkpoint(dir, pending.cycle)).map_err(io_error)?
     };
     let champion = {
         let current = shared.read().map_err(|_| io_error("冠军锁损坏"))?;
         if current.generation == pending.champion_generation {
             Arc::clone(&current.model)
         } else {
-            let model = PikafishModel::new(&Device::Cpu).map_err(io_error)?;
-            model
-                .load(&checkpoint(dir, pending.champion_cycle))
+            let model = PikafishCpuModel::load(&checkpoint(dir, pending.champion_cycle))
                 .map_err(io_error)?;
             Arc::new(model)
         }
@@ -716,16 +710,13 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
         learner
             .load(&checkpoint(dir, state.cycle))
             .map_err(io_error)?;
-        let reference = PikafishModel::new(&Device::Cpu).map_err(io_error)?;
-        reference.load(&checkpoint(dir, 0)).map_err(io_error)?;
+        let reference = PikafishCpuModel::load(&checkpoint(dir, 0)).map_err(io_error)?;
         let reference = Arc::new(reference);
         let champion = if state.champion_cycle == 0 {
             Arc::clone(&reference)
         } else {
-            let model = PikafishModel::new(&Device::Cpu).map_err(io_error)?;
-            model
-                .load(&checkpoint(dir, state.champion_cycle))
-                .map_err(io_error)?;
+            let model =
+                PikafishCpuModel::load(&checkpoint(dir, state.champion_cycle)).map_err(io_error)?;
             Arc::new(model)
         };
         let replay = load_replay(&dir.join(format!("replay-{:06}.tsv", state.cycle)))?;
@@ -743,7 +734,7 @@ pub fn run(config: EvolveConfig, target_update: Option<usize>) -> io::Result<()>
             learner.load(seed).map_err(io_error)?;
         }
         learner.save(&checkpoint(dir, 0)).map_err(io_error)?;
-        let reference = Arc::new(learner.snapshot(&Device::Cpu).map_err(io_error)?);
+        let reference = Arc::new(learner.cpu_snapshot().map_err(io_error)?);
         let reference_openings =
             distinct_openings(&mut opening_book, config.arena_pairs, &HashSet::new())?
                 .iter()

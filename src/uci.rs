@@ -1,4 +1,4 @@
-use crate::ab::pikafish_candle::{PikafishExample, PikafishModel};
+use crate::ab::pikafish_candle::{PikafishCpuCache, PikafishCpuModel};
 use crate::ab::{
     AbNnue, AbSearchControl, AbSearchLimits, AbUciSearchResult, cp_from_q, search_uci,
     search_uci_pikafish, search_uci_pikafish_float,
@@ -23,7 +23,7 @@ const DEFAULT_MOVE_OVERHEAD_MS: u64 = 10;
 enum UciModel {
     Native(Arc<AbNnue>),
     Pikafish(Arc<PikafishNet>),
-    PikafishFloat(Arc<PikafishModel>),
+    PikafishFloat(Arc<PikafishCpuModel>),
 }
 
 #[derive(Clone)]
@@ -164,10 +164,7 @@ fn load_float_or_native(path: &str) -> Result<UciModel, String> {
     let metadata: serde_json::Value =
         serde_json::from_slice(&header).map_err(|error| error.to_string())?;
     if metadata.get("transformer.psq").is_some() {
-        let model =
-            PikafishModel::new(&candle_core::Device::Cpu).map_err(|error| error.to_string())?;
-        model
-            .load(std::path::Path::new(path))
+        let model = PikafishCpuModel::load(std::path::Path::new(path))
             .map_err(|error| error.to_string())?;
         Ok(UciModel::PikafishFloat(Arc::new(model)))
     } else {
@@ -223,18 +220,13 @@ fn print_static_eval(state: &mut UciState) {
             println!("info string ChineseAI native static value: {cp:+} project cp");
         }
         UciModel::PikafishFloat(model) => {
-            let value = PikafishExample::from_position(&state.position)
-                .ok_or_else(|| "feature extraction failed".to_string())
-                .and_then(|example| {
-                    model
-                        .forward_inference(&[example])
-                        .and_then(|x| x.to_vec2::<f32>())
-                        .map_err(|error| error.to_string())
-                });
+            let value = model
+                .evaluate(&state.position, &mut PikafishCpuCache::default())
+                .map_err(|error| error.to_string());
             match value {
                 Ok(value) => println!(
                     "info string ChineseAI Pikafish float value: {:+} project cp",
-                    cp_from_q(value[0][0].clamp(-1.0, 1.0))
+                    cp_from_q(value)
                 ),
                 Err(error) => println!("info string eval failed: {error}"),
             }

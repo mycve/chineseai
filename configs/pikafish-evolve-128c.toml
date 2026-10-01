@@ -1,0 +1,38 @@
+# 128 物理核心 / 256 逻辑 CPU：正式长跑配置，不是烟雾测试。
+# 更改搜索和训练参数需要新目录；从当前冠军继承浮点权重。
+output_dir = "runs/pikafish-evolve-128c"
+seed_model = "runs/pikafish-evolve/best.safetensors"
+# 当前可用教师库只有约 5000 条；bootstrap_samples 不会凭空增加数据。
+bootstrap_sqlite = "eval/pikafish-selfplay-5000-d20.sqlite"
+bootstrap_samples = 5000
+bootstrap_epochs = 8
+opening_book = "book.pgn.gz"
+
+# 96 + 24 = 120 个搜索 worker，留 8 个物理核心给训练供给和系统。
+selfplay_workers = 96
+arena_workers = 24
+queue_games = 192
+max_champion_lag = 1
+
+# 每步节点预算；深度上限放宽，由节点预算实际控制搜索。
+selfplay_nodes = 8192
+arena_nodes = 32768
+max_depth = 64
+max_plies = 600
+opening_plies = 8
+
+# FIFO 保存局面样本数量，games_per_update 计完整终局数。
+games_per_update = 256
+replay_capacity = 2000000
+train_samples_per_update = 65536
+batch_size = 64
+learning_rate = 0.001
+
+# 每次测评 512 对开局，即每个对手 1024 局。
+# 候选同时面对当前冠军和固定基准；长时间测评在后台运行。
+arena_interval = 10
+arena_pairs = 512
+promotion_rate = 0.51
+confidence_z = 1.96
+seed = 20261001
+cuda = true

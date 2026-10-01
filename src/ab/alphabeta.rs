@@ -1,5 +1,5 @@
 //! Bounded iterative deepening negamax for NNUE self-play and promotion matches.
-use super::pikafish_candle::{PikafishExample, PikafishModel};
+use super::pikafish_candle::{PikafishCpuCache, PikafishCpuModel};
 use super::{AbEvalAccumulator, AbEvalScratch, AbNnue};
 use crate::nnue::pikafish_file::{PikafishEvalCache, PikafishNet};
 use std::sync::{
@@ -113,7 +113,76 @@ struct TtEntry {
     best_move: Option<Move>,
 }
 
+// 固定哈希槽保持原有碰撞语义；仅给访问过的槽分配条目，并在线程内复用。
+struct SparseTt {
+    slots: Box<[u16]>,
+    entries: Vec<Option<TtEntry>>,
+    used: usize,
+}
+impl SparseTt {
+    fn new() -> Self {
+        Self {
+            slots: vec![u16::MAX; TT_SIZE].into_boxed_slice(),
+            entries: Vec::new(),
+            used: 0,
+        }
+    }
+    fn reset(&mut self) {
+        for entry in self.entries[..self.used].iter().flatten() {
+            self.slots[entry.key as usize & (TT_SIZE - 1)] = u16::MAX;
+        }
+        self.used = 0;
+    }
+}
+thread_local! {static SEARCH_TT: std::cell::RefCell<Option<SparseTt>> = const {std::cell::RefCell::new(None)};}
+struct TtLease(Option<SparseTt>);
+impl TtLease {
+    fn new() -> Self {
+        let mut tt = SEARCH_TT
+            .with(|cached| cached.borrow_mut().take())
+            .unwrap_or_else(SparseTt::new);
+        tt.reset();
+        Self(Some(tt))
+    }
+}
+impl std::ops::Index<usize> for TtLease {
+    type Output = Option<TtEntry>;
+    fn index(&self, slot: usize) -> &Self::Output {
+        let tt = self.0.as_ref().unwrap();
+        let index = tt.slots[slot];
+        if index == u16::MAX {
+            &None
+        } else {
+            &tt.entries[index as usize]
+        }
+    }
+}
+impl std::ops::IndexMut<usize> for TtLease {
+    fn index_mut(&mut self, slot: usize) -> &mut Self::Output {
+        let tt = self.0.as_mut().unwrap();
+        let mut index = tt.slots[slot];
+        if index == u16::MAX {
+            index = tt.used as u16;
+            tt.used += 1;
+            tt.slots[slot] = index;
+            if tt.entries.len() < tt.used {
+                tt.entries.push(None);
+            }
+        }
+        &mut tt.entries[index as usize]
+    }
+}
+impl Drop for TtLease {
+    fn drop(&mut self) {
+        let tt = self.0.take();
+        let _ = SEARCH_TT.try_with(|cached| *cached.borrow_mut() = tt);
+    }
+}
+
 trait ValueModel {
+    fn pikafish_cpu(&self) -> Option<&PikafishCpuModel> {
+        None
+    }
     fn pikafish_net(&self) -> Option<&PikafishNet> {
         None
     }
@@ -191,7 +260,10 @@ impl ValueModel for AbNnue {
     }
 }
 
-impl ValueModel for PikafishModel {
+impl ValueModel for PikafishCpuModel {
+    fn pikafish_cpu(&self) -> Option<&PikafishCpuModel> {
+        Some(self)
+    }
     fn root_hidden(&self, _position: &Position) -> Vec<f32> {
         Vec::new()
     }
@@ -212,25 +284,15 @@ impl ValueModel for PikafishModel {
         _hidden: &[f32],
         _scratch: &mut Option<AbEvalScratch>,
     ) -> Result<f32, String> {
-        let example = PikafishExample::from_position(position)
-            .ok_or_else(|| "Pikafish feature extraction failed".to_owned())?;
-        let raw = self
-            .forward_inference(&[example])
-            .and_then(|output| output.to_vec2::<f32>())
-            .map_err(|error| error.to_string())?[0][0];
-        if !raw.is_finite() {
-            return Err("Pikafish evaluation is non-finite".to_owned());
-        }
-        // Training targets already use tanh(cp / 600); forward returns q.
-        Ok(raw.clamp(-1.0, 1.0))
+        self.evaluate(position, &mut PikafishCpuCache::default())
+            .map_err(|error| error.to_string())
     }
     fn root_wdl(
         &self,
         position: &Position,
         history: &[RuleHistoryEntry],
     ) -> Result<[f32; 3], String> {
-        let q = self
-            .evaluate(position, history, &[], &mut None)?
+        let q = ValueModel::evaluate(self, position, history, &[], &mut None)?
             .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
         Ok([(1.0 + q) * 0.5, 0.0, (1.0 - q) * 0.5])
     }
@@ -291,10 +353,11 @@ struct Search<'a, M: ValueModel + ?Sized> {
     selective_depth: usize,
     history_scores: [[i32; 90]; 90],
     killers: Vec<[Option<Move>; 2]>,
-    tt: Vec<Option<TtEntry>>,
+    tt: TtLease,
     hidden_pool: Vec<Vec<f32>>,
     scratch: Option<AbEvalScratch>,
     pikafish_cache: Option<PikafishEvalCache>,
+    pikafish_cpu_cache: Option<PikafishCpuCache>,
     error: Option<String>,
     control: Option<&'a AbSearchControl>,
 }
@@ -306,7 +369,11 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         history: &[RuleHistoryEntry],
         hidden: &[f32],
     ) -> f32 {
-        let result = if let (Some(net), Some(cache)) =
+        let result = if let (Some(model), Some(cache)) =
+            (self.model.pikafish_cpu(), self.pikafish_cpu_cache.as_mut())
+        {
+            model.evaluate(position, cache).map_err(|e| e.to_string())
+        } else if let (Some(net), Some(cache)) =
             (self.model.pikafish_net(), self.pikafish_cache.as_mut())
         {
             cache
@@ -748,14 +815,20 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         if self.tt[slot].as_ref().is_none_or(|entry| {
             entry.key != position.hash() || entry.history != *history || entry.depth <= depth
         }) {
-            self.tt[slot] = Some(TtEntry {
-                key: position.hash(),
-                history: history.clone(),
-                depth,
-                value: best,
+            let entry = self.tt[slot].get_or_insert_with(|| TtEntry {
+                key: 0,
+                history: Vec::new(),
+                depth: 0,
+                value: 0.0,
                 bound,
-                best_move,
+                best_move: None,
             });
+            entry.key = position.hash();
+            entry.history.clone_from(history);
+            entry.depth = depth;
+            entry.value = best;
+            entry.bound = bound;
+            entry.best_move = best_move;
         }
         best
     }
@@ -979,12 +1052,11 @@ fn search_with_control(
 }
 
 /// Search a trainable Pikafish-layout model with the same AB/PVS/TT path.
-/// Full-position Candle evaluation is intentionally used until an incremental
-/// transformer implementation is available.
+/// 搜索使用只读 CPU 权重和私有增量累加器；训练张量不进入叶评估。
 pub fn search_pikafish_model(
     position: &Position,
     history: &[RuleHistoryEntry],
-    model: &PikafishModel,
+    model: &PikafishCpuModel,
     limits: AbSearchLimits,
 ) -> Result<AbSearchResult, String> {
     let moves = position.legal_moves_with_rules(history);
@@ -1026,10 +1098,11 @@ fn search_with_model<M: ValueModel + ?Sized>(
         selective_depth: 0,
         history_scores: [[0; 90]; 90],
         killers: vec![[None; 2]; 128],
-        tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+        tt: TtLease::new(),
         hidden_pool: Vec::new(),
         scratch: model.scratch(),
         pikafish_cache: model.pikafish_net().map(|_| PikafishEvalCache::new()),
+        pikafish_cpu_cache: model.pikafish_cpu().map(|_| PikafishCpuCache::default()),
         error: None,
         control,
     };
@@ -1379,7 +1452,7 @@ pub(crate) fn search_uci_pikafish_float(
     position: &Position,
     history: Vec<RuleHistoryEntry>,
     root_moves: Vec<Move>,
-    model: &PikafishModel,
+    model: &PikafishCpuModel,
     limits: AbSearchLimits,
     control: &AbSearchControl,
     multipv: usize,
@@ -1425,11 +1498,67 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
+    fn transposition_slots_reset_reuse_and_collide() {
+        let mut tt = TtLease::new();
+        let entry = |key| {
+            Some(TtEntry {
+                key,
+                history: Vec::new(),
+                depth: 2,
+                value: 0.5,
+                bound: Bound::Exact,
+                best_move: None,
+            })
+        };
+        tt[17] = entry(17);
+        tt[17] = entry(17 + TT_SIZE as u64);
+        assert_eq!(tt.0.as_ref().unwrap().used, 1);
+        assert_eq!(tt[17].as_ref().unwrap().key, 17 + TT_SIZE as u64);
+        drop(tt);
+        let tt = TtLease::new();
+        assert!(tt[17].is_none());
+        assert_eq!(tt.0.as_ref().unwrap().entries.len(), 1);
+    }
+
+    #[test]
     fn pikafish_value_model_uses_shared_search() {
-        let model = PikafishModel::new(&candle_core::Device::Cpu).unwrap();
+        let trainer =
+            crate::ab::pikafish_candle::PikafishModel::new(&candle_core::Device::Cpu).unwrap();
+        let model = trainer.cpu_snapshot().unwrap();
         let position = Position::startpos();
-        let example = PikafishExample::from_position(&position).unwrap();
-        let raw = model.forward(&[example]).unwrap().to_vec2::<f32>().unwrap()[0][0];
+        let example =
+            crate::ab::pikafish_candle::PikafishExample::from_position(&position).unwrap();
+        let raw = trainer
+            .forward(&[example])
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()[0][0];
+        let mut cache = PikafishCpuCache::default();
+        let mut position = position.clone();
+        for i in 0..80 {
+            let example =
+                crate::ab::pikafish_candle::PikafishExample::from_position(&position).unwrap();
+            let expected = trainer
+                .forward_inference(&[example])
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()[0][0]
+                .clamp(-1., 1.);
+            let actual = model.evaluate(&position, &mut cache).unwrap();
+            assert!(
+                (actual - expected).abs() < 2e-5,
+                "ply {i}: {actual} vs {expected}"
+            );
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            position.make_move(moves[(i * 7 + 3) % moves.len()]);
+            if !position.has_general(Color::Red) || !position.has_general(Color::Black) {
+                break;
+            }
+        }
+        let position = Position::startpos();
         let evaluated = ValueModel::evaluate(&model, &position, &[], &[], &mut None).unwrap();
         assert!((evaluated - raw.clamp(-1.0, 1.0)).abs() < 1e-6);
         let result = search_pikafish_model(
@@ -1594,10 +1723,11 @@ mod tests {
             selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
-            tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+            tt: TtLease::new(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
             pikafish_cache: None,
+            pikafish_cpu_cache: None,
             error: None,
             control: None,
         };
@@ -1624,10 +1754,11 @@ mod tests {
             selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
-            tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+            tt: TtLease::new(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
             pikafish_cache: None,
+            pikafish_cpu_cache: None,
             error: None,
             control: None,
         };
@@ -1770,10 +1901,11 @@ mod tests {
             selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
-            tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+            tt: TtLease::new(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
             pikafish_cache: None,
+            pikafish_cpu_cache: None,
             error: None,
             control: None,
         };
@@ -1863,10 +1995,11 @@ mod tests {
             selective_depth: 0,
             history_scores: [[0; 90]; 90],
             killers: vec![[None; 2]; 128],
-            tt: std::iter::repeat_with(|| None).take(TT_SIZE).collect(),
+            tt: TtLease::new(),
             hidden_pool: Vec::new(),
             scratch: Some(AbEvalScratch::new(model.arch)),
             pikafish_cache: None,
+            pikafish_cpu_cache: None,
             error: None,
             control: None,
         };

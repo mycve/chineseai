@@ -2260,13 +2260,7 @@ fn main() {
             );
         }
         Some(CliCommand::PikafishCandidateSelfplay(cmd)) => {
-            let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
-            let model =
-                chineseai::ab::pikafish_candle::PikafishModel::new(&device).unwrap_or_else(|err| {
-                    panic!("pikafish-candidate-selfplay model init failed: {err}")
-                });
-            model
-                .load(&cmd.model)
+            let model = chineseai::ab::pikafish_candle::PikafishCpuModel::load(&cmd.model)
                 .unwrap_or_else(|err| panic!("pikafish-candidate-selfplay load failed: {err}"));
             let report = generate_candidate_selfplay(
                 &model,
@@ -2292,16 +2286,9 @@ fn main() {
             );
         }
         Some(CliCommand::PikafishCandidateArena(cmd)) => {
-            let device = candle_core::Device::Cpu;
-            let candidate = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
-                .unwrap_or_else(|err| panic!("candidate model init failed: {err}"));
-            candidate
-                .load(&cmd.candidate)
+            let candidate = chineseai::ab::pikafish_candle::PikafishCpuModel::load(&cmd.candidate)
                 .unwrap_or_else(|err| panic!("candidate model load failed: {err}"));
-            let champion = chineseai::ab::pikafish_candle::PikafishModel::new(&device)
-                .unwrap_or_else(|err| panic!("champion model init failed: {err}"));
-            champion
-                .load(&cmd.champion)
+            let champion = chineseai::ab::pikafish_candle::PikafishCpuModel::load(&cmd.champion)
                 .unwrap_or_else(|err| panic!("champion model load failed: {err}"));
             let mut book = OpeningBook::load(&cmd.opening_book, cmd.seed)
                 .unwrap_or_else(|err| panic!("arena opening book failed: {err}"));

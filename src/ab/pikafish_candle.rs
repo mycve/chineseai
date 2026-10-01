@@ -6,6 +6,8 @@ use std::path::Path;
 
 use crate::xiangqi::Position;
 use candle_core::{DType, Device, Result, Tensor, Var};
+mod cpu;
+pub use cpu::{PikafishCpuCache, PikafishCpuModel};
 
 pub const PSQ_FEATURES: usize = 16_536;
 pub const THREAT_FEATURES: usize = 45_547;
@@ -55,6 +57,11 @@ impl PikafishExample {
         let side = position.side_to_move();
         let mut psq = [Vec::new(), Vec::new()];
         let mut threats = [Vec::new(), Vec::new()];
+        crate::nnue::full_threats::fill_threat_features_both(
+            position,
+            &mut threats[0],
+            &mut Vec::new(),
+        )?;
         for (index, perspective) in [side, side.opposite()].into_iter().enumerate() {
             crate::nnue::pikafish::fill_psq_features(position, perspective, &mut psq[index])?;
             crate::nnue::pikafish::fill_threat_features(
@@ -143,57 +150,77 @@ impl PikafishModel {
         self.forward_mode(examples, false)
     }
 
+    pub fn cpu_snapshot(&self) -> Result<PikafishCpuModel> {
+        PikafishCpuModel::from_model(self)
+    }
+
     fn forward_mode(&self, examples: &[PikafishExample], training: bool) -> Result<Tensor> {
         if examples.is_empty() {
             candle_core::bail!("empty Pikafish batch");
         }
-        let mut outputs = Vec::with_capacity(examples.len());
-        for example in examples {
+        let psq: Vec<_> = examples
+            .iter()
+            .flat_map(|e| e.psq.iter().map(Vec::as_slice))
+            .collect();
+        let threats: Vec<_> = examples
+            .iter()
+            .flat_map(|e| e.threats.iter().map(Vec::as_slice))
+            .collect();
+        let psq_acc = super::pikafish_sparse::sums(&weight(&self.transformer_psq, training), &psq)?;
+        let threat_acc =
+            super::pikafish_sparse::sums(&weight(&self.transformer_threat, training), &threats)?;
+        let psqt = super::pikafish_sparse::sums(&weight(&self.psqt, training), &psq)?;
+        let threat_psqt =
+            super::pikafish_sparse::sums(&weight(&self.threat_psqt, training), &threats)?;
+        let acc = (psq_acc.broadcast_add(&weight(&self.transformer_bias, training))? + threat_acc)?;
+        let a = acc
+            .narrow(1, 0, TRANSFORMER_WIDTH / 2)?
+            .clamp(0f32, 255f32)?;
+        let b = acc
+            .narrow(1, TRANSFORMER_WIDTH / 2, TRANSFORMER_WIDTH / 2)?
+            .clamp(0f32, 255f32)?;
+        let transformed = (a * b)?
+            .affine(1.0 / (512.0 * 128.0), 0.0)?
+            .reshape((examples.len(), TRANSFORMER_WIDTH))?;
+        let psqt = (psqt + threat_psqt)?.reshape((examples.len(), 2, PSQT_BUCKETS))?;
+        let delta = (psqt.narrow(1, 0, 1)? - psqt.narrow(1, 1, 1)?)?
+            .affine(0.5, 0.0)?
+            .squeeze(1)?;
+        let mut groups: [Vec<usize>; LAYER_STACKS] = std::array::from_fn(|_| Vec::new());
+        for (i, example) in examples.iter().enumerate() {
             if example.psqt_bucket >= PSQT_BUCKETS || example.layer_stack >= LAYER_STACKS {
-                candle_core::bail!("Pikafish bucket out of range");
+                candle_core::bail!("Pikafish bucket out of range")
             }
-            let mut perspectives = Vec::with_capacity(2);
-            let mut psqt_values = Vec::with_capacity(2);
-            for side in 0..2 {
-                let psq_acc = sparse_sum(
-                    &weight(&self.transformer_psq, training),
-                    &example.psq[side],
-                    self.shape.psq_features,
-                )?;
-                let threat_acc = sparse_sum(
-                    &weight(&self.transformer_threat, training),
-                    &example.threats[side],
-                    self.shape.threat_features,
-                )?;
-                let acc = (weight(&self.transformer_bias, training) + psq_acc + threat_acc)?;
-                let a = acc
-                    .narrow(0, 0, TRANSFORMER_WIDTH / 2)?
-                    .clamp(0f32, 255f32)?;
-                let b = acc
-                    .narrow(0, TRANSFORMER_WIDTH / 2, TRANSFORMER_WIDTH / 2)?
-                    .clamp(0f32, 255f32)?;
-                perspectives.push((a * b)?.affine(1.0 / (512.0 * 128.0), 0.0)?);
-                let psqt = sparse_sum(
-                    &weight(&self.psqt, training),
-                    &example.psq[side],
-                    self.shape.psq_features,
-                )?;
-                let threat_psqt = sparse_sum(
-                    &weight(&self.threat_psqt, training),
-                    &example.threats[side],
-                    self.shape.threat_features,
-                )?;
-                let bucket_value = (psqt + threat_psqt)?.narrow(0, example.psqt_bucket, 1)?;
-                psqt_values.push(bucket_value);
-            }
-            let transformed = Tensor::cat(&[&perspectives[0], &perspectives[1]], 0)?
-                .reshape((1, TRANSFORMER_WIDTH))?;
-            let stack_out =
-                self.stacks[example.layer_stack].forward_mode(&transformed, training)?;
-            let psqt_delta = ((&psqt_values[0] - &psqt_values[1])? / 2.0)?.reshape((1, 1))?;
-            outputs.push((stack_out + psqt_delta)?);
+            groups[example.layer_stack].push(i);
         }
-        Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)
+        let mut outputs: Vec<Option<Tensor>> = vec![None; examples.len()];
+        for (bucket, indices) in groups
+            .iter()
+            .enumerate()
+            .filter(|(_, indices)| !indices.is_empty())
+        {
+            let inputs = indices
+                .iter()
+                .map(|&i| transformed.narrow(0, i, 1))
+                .collect::<Result<Vec<_>>>()?;
+            let values = indices
+                .iter()
+                .map(|&i| delta.get(i)?.narrow(0, examples[i].psqt_bucket, 1))
+                .collect::<Result<Vec<_>>>()?;
+            let input = Tensor::cat(&inputs, 0)?;
+            let value = Tensor::cat(&values, 0)?.reshape((indices.len(), 1))?;
+            let output = (self.stacks[bucket].forward_mode(&input, training)? + value)?;
+            for (row, &i) in indices.iter().enumerate() {
+                outputs[i] = Some(output.narrow(0, row, 1)?);
+            }
+        }
+        Tensor::cat(
+            &outputs
+                .iter()
+                .map(|output| output.as_ref().unwrap())
+                .collect::<Vec<_>>(),
+            0,
+        )
     }
 
     pub fn vars(&self) -> Vec<Var> {
@@ -305,19 +332,6 @@ fn weight(value: &Var, training: bool) -> Tensor {
     } else {
         value.as_tensor().detach()
     }
-}
-
-fn sparse_sum(table: &Tensor, indices: &[usize], rows: usize) -> Result<Tensor> {
-    if indices.iter().any(|&index| index >= rows) {
-        candle_core::bail!("Pikafish feature out of range");
-    }
-    if indices.is_empty() {
-        return Tensor::zeros(table.dim(1)?, DType::F32, table.device());
-    }
-    let ids: Vec<u32> = indices.iter().map(|&index| index as u32).collect();
-    table
-        .index_select(&Tensor::from_vec(ids, indices.len(), table.device())?, 0)?
-        .sum(0)
 }
 
 #[derive(Debug)]
@@ -482,6 +496,80 @@ mod tests {
         assert!(
             (model.forward_inference(&examples)?.to_vec2::<f32>()?[0][0] - trained).abs() > 0.6
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_batch_forward_gradients_and_sgd_match_cpu() -> Result<()> {
+        use candle_nn::{Optimizer, SGD};
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let cpu = PikafishModel::with_shape(
+            PikafishShape {
+                psq_features: 8,
+                threat_features: 8,
+            },
+            &Device::Cpu,
+        )?;
+        let gpu = cpu.snapshot(&device)?;
+        let examples: Vec<_> = (0..64)
+            .map(|i| PikafishExample {
+                psq: [
+                    vec![i % 8, (i + 1) % 8, i % 8],
+                    if i % 3 == 0 {
+                        vec![]
+                    } else {
+                        vec![(i + 3) % 8]
+                    },
+                ],
+                threats: [vec![(i + 2) % 8], vec![(i + 4) % 8]],
+                psqt_bucket: i % 16,
+                layer_stack: i % 16,
+            })
+            .collect();
+        let expected = cpu.forward(&examples)?;
+        let actual = gpu.forward(&examples)?;
+        for (example, batched) in examples.iter().zip(expected.to_vec2::<f32>()?) {
+            let single = cpu
+                .forward_inference(std::slice::from_ref(example))?
+                .to_vec2::<f32>()?[0][0];
+            assert!(
+                (single - batched[0]).abs() < 2e-5,
+                "batched vs single: {single} vs {}",
+                batched[0]
+            );
+        }
+        for (a, b) in actual
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .zip(expected.flatten_all()?.to_vec1::<f32>()?)
+        {
+            assert!((a - b).abs() < 2e-5, "forward: {a} vs {b}");
+        }
+        let cpu_loss = (&expected - 0.4)?.sqr()?.mean_all()?;
+        let gpu_loss = (&actual - 0.4)?.sqr()?.mean_all()?;
+        let cpu_grad = cpu_loss.backward()?;
+        let gpu_grad = gpu_loss.backward()?;
+        for (a, b) in cpu.vars().iter().zip(gpu.vars()) {
+            let expected = cpu_grad.get(a).unwrap().flatten_all()?.to_vec1::<f32>()?;
+            let actual = gpu_grad.get(&b).unwrap().flatten_all()?.to_vec1::<f32>()?;
+            for (x, y) in expected.into_iter().zip(actual) {
+                assert!(
+                    (x - y).abs() < 2e-5 + 1e-4 * x.abs(),
+                    "gradient: {x} vs {y}"
+                );
+            }
+        }
+        let before = gpu_loss.to_scalar::<f32>()?;
+        let mut optimizer = SGD::new(gpu.vars(), 0.001)?;
+        optimizer.backward_step(&gpu_loss)?;
+        let after = (gpu.forward(&examples)? - 0.4)?
+            .sqr()?
+            .mean_all()?
+            .to_scalar::<f32>()?;
+        assert!(after < before, "SGD loss {before} -> {after}");
         Ok(())
     }
 
