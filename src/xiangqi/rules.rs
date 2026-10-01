@@ -145,9 +145,9 @@ impl Position {
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
         crate::scope_profile!("xiangqi.legal_moves_with_rules");
-        self.legal_moves_with_rules_and_repetition(history)
+        self.legal_moves()
             .into_iter()
-            .map(|(mv, _)| mv)
+            .filter(|&mv| self.move_rule_status(history, mv).is_some())
             .collect()
     }
 
@@ -164,40 +164,70 @@ impl Position {
         history: &[RuleHistoryEntry],
     ) -> Vec<(Move, bool)> {
         crate::scope_profile!("xiangqi.legal_moves_with_rules_and_repetition");
-        let legal = self.legal_moves();
-        if legal.is_empty() {
-            return Vec::new();
-        }
-
-        let current_entry = (!history.last().is_some_and(|entry| {
-            entry.hash == self.hash && entry.side_to_move == self.side_to_move
-        }))
-        .then(|| self.rule_history_entry(None));
-
-        let mover = self.side_to_move;
-        legal
+        self.legal_moves()
             .into_iter()
             .filter_map(|mv| {
-                let repeats_history = self.move_repeats_history(history, mv);
-                if !repeats_history {
-                    return Some((mv, false));
-                }
-                let mut next = self.clone();
-                next.make_move(mv);
-                let mut next_history =
-                    Vec::with_capacity(history.len() + usize::from(current_entry.is_some()) + 1);
-                next_history.extend_from_slice(history);
-                if let Some(entry) = current_entry {
-                    next_history.push(entry);
-                }
-                next_history.push(self.rule_history_entry_after_move(mv));
-                (!rule_outcome_forbidden_for_mover(
-                    next.rule_outcome_with_history(&next_history),
-                    mover,
-                ))
-                .then_some((mv, true))
+                self.move_rule_status(history, mv)
+                    .map(|repeats| (mv, repeats))
             })
             .collect()
+    }
+
+    /// 只证明存在合法着，不构造整盘合法走法列表；规则过滤与完整生成共用。
+    pub(crate) fn has_legal_move_with_rules(&self, history: &[RuleHistoryEntry]) -> bool {
+        crate::scope_profile!("xiangqi.has_legal_move_with_rules");
+        let mut work = self.clone();
+        let mut moves = Vec::with_capacity(24);
+        for square in self.occupied_squares() {
+            let Some(piece) = self
+                .piece_at(square)
+                .filter(|piece| piece.color == self.side_to_move)
+            else {
+                continue;
+            };
+            moves.clear();
+            self.gen_piece_moves(square, piece, MoveGenMode::All, &mut moves);
+            for &mv in &moves {
+                let captured = work.make_move_board_only(mv);
+                let safe = !work.in_check(self.side_to_move);
+                work.unmake_move_board_only(mv, captured);
+                if safe && self.move_rule_status(history, mv).is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn search_move_allowed(
+        &self,
+        history: &[RuleHistoryEntry],
+        mv: Move,
+        safety_mask: u128,
+    ) -> bool {
+        self.is_safe_search_move(mv, safety_mask) && self.move_rule_status(history, mv).is_some()
+    }
+
+    fn move_rule_status(&self, history: &[RuleHistoryEntry], mv: Move) -> Option<bool> {
+        if !self.move_repeats_history(history, mv) {
+            return Some(false);
+        }
+        let mut next = self.clone();
+        next.make_move(mv);
+        let mut next_history = Vec::with_capacity(history.len() + 2);
+        next_history.extend_from_slice(history);
+        if !history
+            .last()
+            .is_some_and(|entry| entry.hash == self.hash && entry.side_to_move == self.side_to_move)
+        {
+            next_history.push(self.rule_history_entry(None));
+        }
+        next_history.push(self.rule_history_entry_after_move(mv));
+        (!rule_outcome_forbidden_for_mover(
+            next.rule_outcome_with_history(&next_history),
+            self.side_to_move,
+        ))
+        .then_some(true)
     }
 
     fn chased_masks_by(&self, color: Color) -> u128 {

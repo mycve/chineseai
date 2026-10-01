@@ -1,5 +1,7 @@
 # 单 worker profiling 与 Pikafish 源码对照
 
+后续真实服务器冠军权重测量及第二轮源码优化见 [训练权重报告](pikafish-trained-worker-20261001.md)。本页保留第一轮初始权重结果，不能与后续不同权重直接相除。
+
 尚未追平 Pikafish。固定八个教师局面、相同节点预算下，本项目从约 22.4 万提高到 39～41 万 NPS；Pikafish 为约 184～250 万 NPS。完整数据、模型与局面 SHA256、profiling 原始输出见 [JSON](pikafish-single-worker-20261001.json)。
 
 ## 基准条件和结果

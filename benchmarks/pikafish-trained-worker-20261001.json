@@ -1,0 +1,800 @@
+{
+  "reference_commit": "687170f0d8dbc43554b3f959ce07b5c14bec4f35",
+  "baseline_commit": "c6db0c0 (search unchanged in 8602e32)",
+  "cpu": "AMD Ryzen 9 9950X",
+  "os": "Windows",
+  "build": "fast, target-cpu=native, no profile",
+  "model_origin": "http://120.220.12.208:8765/best.safetensors",
+  "model_sha256": "4daa2ebc3f736c2333ef0dd543b5ce47975eef9ccd1711b0452bf535baa705b7",
+  "positions_sha256": "894da255caf489817640c3c0df8eeb93aaa472f841c5b076a2b3873a6d0f25d1",
+  "baseline": {
+    "eval_seconds": 0.0002492,
+    "evals": 1,
+    "evals_per_second": 4012.841091492777,
+    "node_budget": 262144,
+    "search_nodes": 6291456,
+    "search_nps": 426899.754001834,
+    "search_seconds": 14.7375489,
+    "searches": [
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.025452937930822372
+      ],
+      [
+        "e5e4",
+        0.060571275651454926
+      ],
+      [
+        "c0a2",
+        0.028041746467351913
+      ],
+      [
+        "e8e9",
+        -0.1709454506635666
+      ],
+      [
+        "g3f3",
+        -0.10059475153684616
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.24741961061954498
+      ],
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.025452937930822372
+      ],
+      [
+        "e5e4",
+        0.060571275651454926
+      ],
+      [
+        "c0a2",
+        0.028041746467351913
+      ],
+      [
+        "e8e9",
+        -0.1709454506635666
+      ],
+      [
+        "g3f3",
+        -0.10059475153684616
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.24741961061954498
+      ],
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.025452937930822372
+      ],
+      [
+        "e5e4",
+        0.060571275651454926
+      ],
+      [
+        "c0a2",
+        0.028041746467351913
+      ],
+      [
+        "e8e9",
+        -0.1709454506635666
+      ],
+      [
+        "g3f3",
+        -0.10059475153684616
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.24741961061954498
+      ]
+    ],
+    "workers": 1
+  },
+  "cold": {
+    "details": [
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 204686,
+        "seldepth": 12
+      },
+      {
+        "depth": 4,
+        "nodes": 262144,
+        "qnodes": 232027,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 223620,
+        "seldepth": 10
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 225912,
+        "seldepth": 13
+      },
+      {
+        "depth": 9,
+        "nodes": 262144,
+        "qnodes": 202327,
+        "seldepth": 16
+      },
+      {
+        "depth": 7,
+        "nodes": 262144,
+        "qnodes": 220686,
+        "seldepth": 11
+      },
+      {
+        "depth": 11,
+        "nodes": 262144,
+        "qnodes": 188862,
+        "seldepth": 14
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 228443,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 204686,
+        "seldepth": 12
+      },
+      {
+        "depth": 4,
+        "nodes": 262144,
+        "qnodes": 232027,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 223620,
+        "seldepth": 10
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 225912,
+        "seldepth": 13
+      },
+      {
+        "depth": 9,
+        "nodes": 262144,
+        "qnodes": 202327,
+        "seldepth": 16
+      },
+      {
+        "depth": 7,
+        "nodes": 262144,
+        "qnodes": 220686,
+        "seldepth": 11
+      },
+      {
+        "depth": 11,
+        "nodes": 262144,
+        "qnodes": 188862,
+        "seldepth": 14
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 228443,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 204686,
+        "seldepth": 12
+      },
+      {
+        "depth": 4,
+        "nodes": 262144,
+        "qnodes": 232027,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 223620,
+        "seldepth": 10
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 225912,
+        "seldepth": 13
+      },
+      {
+        "depth": 9,
+        "nodes": 262144,
+        "qnodes": 202327,
+        "seldepth": 16
+      },
+      {
+        "depth": 7,
+        "nodes": 262144,
+        "qnodes": 220686,
+        "seldepth": 11
+      },
+      {
+        "depth": 11,
+        "nodes": 262144,
+        "qnodes": 188862,
+        "seldepth": 14
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 228443,
+        "seldepth": 12
+      }
+    ],
+    "eval_seconds": 0.0001938,
+    "evals": 1,
+    "evals_per_second": 5159.958720330237,
+    "node_budget": 262144,
+    "score_cache_entries": 1048576,
+    "search_nodes": 6291456,
+    "search_nps": 596405.5929177594,
+    "search_seconds": 10.5489554,
+    "searches": [
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.02545289695262909
+      ],
+      [
+        "e5e4",
+        0.060571201145648956
+      ],
+      [
+        "c0a2",
+        0.028041770681738853
+      ],
+      [
+        "e8e9",
+        -0.17094558477401733
+      ],
+      [
+        "g3f3",
+        -0.10059484839439392
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.247419536113739
+      ],
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.02545289695262909
+      ],
+      [
+        "e5e4",
+        0.060571201145648956
+      ],
+      [
+        "c0a2",
+        0.028041770681738853
+      ],
+      [
+        "e8e9",
+        -0.17094558477401733
+      ],
+      [
+        "g3f3",
+        -0.10059484839439392
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.247419536113739
+      ],
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.02545289695262909
+      ],
+      [
+        "e5e4",
+        0.060571201145648956
+      ],
+      [
+        "c0a2",
+        0.028041770681738853
+      ],
+      [
+        "e8e9",
+        -0.17094558477401733
+      ],
+      [
+        "g3f3",
+        -0.10059484839439392
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.247419536113739
+      ]
+    ],
+    "validation_count": 902,
+    "validation_max_error": 7.152557373046875e-07,
+    "warm_cache": false,
+    "workers": 1
+  },
+  "warm": {
+    "details": [
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 204686,
+        "seldepth": 12
+      },
+      {
+        "depth": 4,
+        "nodes": 262144,
+        "qnodes": 232027,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 223620,
+        "seldepth": 10
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 225912,
+        "seldepth": 13
+      },
+      {
+        "depth": 9,
+        "nodes": 262144,
+        "qnodes": 202327,
+        "seldepth": 16
+      },
+      {
+        "depth": 7,
+        "nodes": 262144,
+        "qnodes": 220686,
+        "seldepth": 11
+      },
+      {
+        "depth": 11,
+        "nodes": 262144,
+        "qnodes": 188862,
+        "seldepth": 14
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 228443,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 204686,
+        "seldepth": 12
+      },
+      {
+        "depth": 4,
+        "nodes": 262144,
+        "qnodes": 232027,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 223620,
+        "seldepth": 10
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 225912,
+        "seldepth": 13
+      },
+      {
+        "depth": 9,
+        "nodes": 262144,
+        "qnodes": 202327,
+        "seldepth": 16
+      },
+      {
+        "depth": 7,
+        "nodes": 262144,
+        "qnodes": 220686,
+        "seldepth": 11
+      },
+      {
+        "depth": 11,
+        "nodes": 262144,
+        "qnodes": 188862,
+        "seldepth": 14
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 228443,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 204686,
+        "seldepth": 12
+      },
+      {
+        "depth": 4,
+        "nodes": 262144,
+        "qnodes": 232027,
+        "seldepth": 12
+      },
+      {
+        "depth": 6,
+        "nodes": 262144,
+        "qnodes": 223620,
+        "seldepth": 10
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 225912,
+        "seldepth": 13
+      },
+      {
+        "depth": 9,
+        "nodes": 262144,
+        "qnodes": 202327,
+        "seldepth": 16
+      },
+      {
+        "depth": 7,
+        "nodes": 262144,
+        "qnodes": 220686,
+        "seldepth": 11
+      },
+      {
+        "depth": 11,
+        "nodes": 262144,
+        "qnodes": 188862,
+        "seldepth": 14
+      },
+      {
+        "depth": 5,
+        "nodes": 262144,
+        "qnodes": 228443,
+        "seldepth": 12
+      }
+    ],
+    "eval_seconds": 0.0002779,
+    "evals": 1,
+    "evals_per_second": 3598.4166966534726,
+    "node_budget": 262144,
+    "score_cache_entries": 1048576,
+    "search_nodes": 6291456,
+    "search_nps": 742785.4795503346,
+    "search_seconds": 8.4700848,
+    "searches": [
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.02545289695262909
+      ],
+      [
+        "e5e4",
+        0.060571201145648956
+      ],
+      [
+        "c0a2",
+        0.028041770681738853
+      ],
+      [
+        "e8e9",
+        -0.17094558477401733
+      ],
+      [
+        "g3f3",
+        -0.10059484839439392
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.247419536113739
+      ],
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.02545299008488655
+      ],
+      [
+        "e5e4",
+        0.060571201145648956
+      ],
+      [
+        "c0a2",
+        0.028041770681738853
+      ],
+      [
+        "e8e9",
+        -0.17094548046588898
+      ],
+      [
+        "g3f3",
+        -0.10059471428394318
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.247419536113739
+      ],
+      [
+        "e9d9",
+        0.9950000047683716
+      ],
+      [
+        "a3c3",
+        -0.02545299008488655
+      ],
+      [
+        "e5e4",
+        0.060571201145648956
+      ],
+      [
+        "c0a2",
+        0.028041770681738853
+      ],
+      [
+        "e8e9",
+        -0.17094548046588898
+      ],
+      [
+        "g3f3",
+        -0.10059471428394318
+      ],
+      [
+        "e1f1",
+        -0.9919999837875366
+      ],
+      [
+        "a5a9",
+        0.247419536113739
+      ]
+    ],
+    "validation_count": 0,
+    "validation_max_error": null,
+    "warm_cache": true,
+    "workers": 1
+  },
+  "bestmove_mismatches_cold": 0,
+  "max_root_value_error_cold": 1.341104507446289e-07,
+  "bestmove_mismatches_warm": 0,
+  "max_root_value_error_warm": 1.341104507446289e-07,
+  "native_cold": {
+    "engine": "tools\\pikafish.exe",
+    "threads": 1,
+    "node_budget": 262144,
+    "warm_cache": false,
+    "search_nodes": 6295704,
+    "search_seconds": 2.5265659000142477,
+    "search_nps": 2491802.8063168656,
+    "searches": [
+      {
+        "fen": "2b1ka3/4a4/4br3/9/R1p3p1p/9/2P6/3A2n2/3K5/6c2 b",
+        "nodes": 262396,
+        "seconds": 0.04126990001532249,
+        "bestmove": "e9d9"
+      },
+      {
+        "fen": "2bak4/4a4/1r2c3b/6p1p/PC1n5/3n5/R3P1P1P/2p1B1N2/3NA4/3AK1B2 w",
+        "nodes": 262276,
+        "seconds": 0.15784930001245812,
+        "bestmove": "a3d3"
+      },
+      {
+        "fen": "4ka3/4a4/2n1b4/6n2/2b1p4/8P/9/4BA3/4A4/3C1KB2 b",
+        "nodes": 262320,
+        "seconds": 0.11135249998187646,
+        "bestmove": "e5e4"
+      },
+      {
+        "fen": "4kab2/4a4/1c2b4/R7p/6pn1/2r5P/P3P4/4C4/N8/2BAKAB2 w",
+        "nodes": 262391,
+        "seconds": 0.15120419999584556,
+        "bestmove": "a1b3"
+      },
+      {
+        "fen": "6b2/4k4/3a2N1b/2N1P4/9/9/P3p4/8B/4A4/3A1K3 b",
+        "nodes": 262298,
+        "seconds": 0.09564899999531917,
+        "bestmove": "e8e9"
+      },
+      {
+        "fen": "9/9/b3k3b/6p2/4C4/6B2/6p2/8B/3KA4/9 b",
+        "nodes": 262516,
+        "seconds": 0.08835189999081194,
+        "bestmove": "e7e8"
+      },
+      {
+        "fen": "N2a2b2/3k5/4ra3/9/9/9/9/9/4K4/9 w",
+        "nodes": 262178,
+        "seconds": 0.036304500012192875,
+        "bestmove": "e1f1"
+      },
+      {
+        "fen": "rn2kab2/2R1a2r1/b5c2/6p1p/C6C1/6P1P/R3P4/2N3N2/4A4/2BAK4 w",
+        "nodes": 262193,
+        "seconds": 0.16971990000456572,
+        "bestmove": "a5a9"
+      },
+      {
+        "fen": "2b1ka3/4a4/4br3/9/R1p3p1p/9/2P6/3A2n2/3K5/6c2 b",
+        "nodes": 262396,
+        "seconds": 0.04220070000155829,
+        "bestmove": "e9d9"
+      },
+      {
+        "fen": "2bak4/4a4/1r2c3b/6p1p/PC1n5/3n5/R3P1P1P/2p1B1N2/3NA4/3AK1B2 w",
+        "nodes": 262276,
+        "seconds": 0.1528767000127118,
+        "bestmove": "a3d3"
+      },
+      {
+        "fen": "4ka3/4a4/2n1b4/6n2/2b1p4/8P/9/4BA3/4A4/3C1KB2 b",
+        "nodes": 262320,
+        "seconds": 0.11834939999971539,
+        "bestmove": "e5e4"
+      },
+      {
+        "fen": "4kab2/4a4/1c2b4/R7p/6pn1/2r5P/P3P4/4C4/N8/2BAKAB2 w",
+        "nodes": 262391,
+        "seconds": 0.1432384999934584,
+        "bestmove": "a1b3"
+      },
+      {
+        "fen": "6b2/4k4/3a2N1b/2N1P4/9/9/P3p4/8B/4A4/3A1K3 b",
+        "nodes": 262298,
+        "seconds": 0.10039150001830421,
+        "bestmove": "e8e9"
+      },
+      {
+        "fen": "9/9/b3k3b/6p2/4C4/6B2/6p2/8B/3KA4/9 b",
+        "nodes": 262516,
+        "seconds": 0.08669949998147786,
+        "bestmove": "e7e8"
+      },
+      {
+        "fen": "N2a2b2/3k5/4ra3/9/9/9/9/9/4K4/9 w",
+        "nodes": 262178,
+        "seconds": 0.03677740000421181,
+        "bestmove": "e1f1"
+      },
+      {
+        "fen": "rn2kab2/2R1a2r1/b5c2/6p1p/C6C1/6P1P/R3P4/2N3N2/4A4/2BAK4 w",
+        "nodes": 262193,
+        "seconds": 0.15965639997739345,
+        "bestmove": "a5a9"
+      },
+      {
+        "fen": "2b1ka3/4a4/4br3/9/R1p3p1p/9/2P6/3A2n2/3K5/6c2 b",
+        "nodes": 262396,
+        "seconds": 0.04207759999553673,
+        "bestmove": "e9d9"
+      },
+      {
+        "fen": "2bak4/4a4/1r2c3b/6p1p/PC1n5/3n5/R3P1P1P/2p1B1N2/3NA4/3AK1B2 w",
+        "nodes": 262276,
+        "seconds": 0.15527789999032393,
+        "bestmove": "a3d3"
+      },
+      {
+        "fen": "4ka3/4a4/2n1b4/6n2/2b1p4/8P/9/4BA3/4A4/3C1KB2 b",
+        "nodes": 262320,
+        "seconds": 0.11710269999457523,
+        "bestmove": "e5e4"
+      },
+      {
+        "fen": "4kab2/4a4/1c2b4/R7p/6pn1/2r5P/P3P4/4C4/N8/2BAKAB2 w",
+        "nodes": 262391,
+        "seconds": 0.1404251999920234,
+        "bestmove": "a1b3"
+      },
+      {
+        "fen": "6b2/4k4/3a2N1b/2N1P4/9/9/P3p4/8B/4A4/3A1K3 b",
+        "nodes": 262298,
+        "seconds": 0.09919390000868589,
+        "bestmove": "e8e9"
+      },
+      {
+        "fen": "9/9/b3k3b/6p2/4C4/6B2/6p2/8B/3KA4/9 b",
+        "nodes": 262516,
+        "seconds": 0.0855026000062935,
+        "bestmove": "e7e8"
+      },
+      {
+        "fen": "N2a2b2/3k5/4ra3/9/9/9/9/9/4K4/9 w",
+        "nodes": 262178,
+        "seconds": 0.034160500013967976,
+        "bestmove": "e1f1"
+      },
+      {
+        "fen": "rn2kab2/2R1a2r1/b5c2/6p1p/C6C1/6P1P/R3P4/2N3N2/4A4/2BAK4 w",
+        "nodes": 262193,
+        "seconds": 0.16093420001561753,
+        "bestmove": "a5a9"
+      }
+    ]
+  },
+  "profile_trained_cold_8192": "profile:\nname                                        calls     total_ms       avg_us       max_us\npikafish.cpu.evaluate                      258200      582.923            2          108\npikafish.cpu.finish                        171969      415.226            2           86\npikafish.cpu.accumulator                   687876      196.280            0           44\npikafish.cpu.matvec                        343938      113.473            0           25\nxiangqi.rule_history_after_moved           325680      111.766            0           51\npikafish.features.threats                  171968       57.602            0         2169\nxiangqi.in_check                          1347451       48.699            0           50\nxiangqi.collect_legal_moves                101622       47.457            0           31\nxiangqi.rule_history.chased_origin         325680       47.306            0           21\nxiangqi.has_legal_move_with_rules          207535       35.047            0            8\nxiangqi.rule_history.gives_check           325680       31.498            0           50\nxiangqi.chased_mask_by                     325680       27.794            0           21\nxiangqi.legal_moves_with_rules              25610       26.481            1            7\nsearch.see                                  56590       24.828            0            4\nxiangqi.legal_moves                         25827       23.834            0           21\nxiangqi.pseudo_legal_moves                 101622       20.415            0            7\nxiangqi.legal_filter                       101622       13.191            0            5\nxiangqi.make_move                          438842       12.363            0            5\nxiangqi.rule_outcome_with_history          331530        9.498            0            4\npikafish.cpu.restore_parent                 32660        2.506            0            3\npikafish.cpu.cache_hit                      82080        1.843            0            1\nxiangqi.rule_history_after_move              1920        1.105            0            4\nxiangqi.rule_history.make_move               1920        0.164            0            0\npikafish.cpu.shared_cache_hit                4160        0.097            0            0\nxiangqi.rule_history.clone_position          1920        0.047            0            0\npikafish.features.psq                          16        0.021            1           16\nxiangqi.rule_history_entry                     60        0.010            0            1\n",
+  "profile_note": "线程局部分段计时，包含子调用及插桩开销；不与未插桩 NPS 比较。",
+  "tests": {
+    "passed": 206,
+    "ignored": 2,
+    "failed": 0
+  }
+}

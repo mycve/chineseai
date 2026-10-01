@@ -452,7 +452,6 @@ impl Position {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn gives_check_after_move(&mut self, mv: Move) -> bool {
         let captured = self.make_move_board_only(mv);
         let gives_check = self.in_check(self.side_to_move.opposite());
@@ -841,6 +840,33 @@ impl Position {
         moves
     }
 
+    pub(crate) fn search_move_candidates(&self, checked: bool) -> Vec<Move> {
+        if checked {
+            self.pseudo_legal_evasions()
+        } else {
+            self.pseudo_legal_moves()
+        }
+    }
+    pub(crate) fn search_safety_mask(&self, checked: bool) -> u128 {
+        if checked {
+            u128::MAX
+        } else {
+            self.safety_check_from_mask_when_not_in_check(self.side_to_move)
+        }
+    }
+    fn move_needs_safety_check(&self, mv: Move, mask: u128) -> bool {
+        self.board[mv.from as usize].is_some_and(|piece| piece.kind == PieceKind::General)
+            || mask & ((1u128 << mv.from) | (1u128 << mv.to)) != 0
+    }
+    fn is_safe_search_move(&self, mv: Move, mask: u128) -> bool {
+        if !self.move_needs_safety_check(mv, mask) {
+            return true;
+        }
+        let mut work = self.clone();
+        work.make_move_board_only(mv);
+        !work.in_check(self.side_to_move)
+    }
+
     fn collect_legal_moves(&self, captures_only: bool, in_check: bool) -> Vec<Move> {
         crate::scope_profile!("xiangqi.collect_legal_moves");
         let mut moves = if in_check {
@@ -864,18 +890,8 @@ impl Position {
             crate::scope_profile!("xiangqi.legal_filter");
             for read_index in 0..moves.len() {
                 let mv = moves[read_index];
-                let from = mv.from as usize;
-                let to = mv.to as usize;
-                let requires_safety_check = in_check
-                    || matches!(
-                        self.board[from],
-                        Some(Piece {
-                            kind: PieceKind::General,
-                            ..
-                        })
-                    )
-                    || ((safety_check_from_mask >> from) & 1) != 0
-                    || ((safety_check_from_mask >> to) & 1) != 0;
+                let requires_safety_check =
+                    self.move_needs_safety_check(mv, safety_check_from_mask);
                 if !requires_safety_check {
                     moves[legal_len] = mv;
                     legal_len += 1;

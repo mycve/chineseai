@@ -11,6 +11,7 @@ parser.add_argument("--model", type=Path, required=True)
 parser.add_argument("--positions", type=Path, default=Path("benchmarks/pikafish-search-positions.fen"))
 parser.add_argument("--nodes", type=int, default=262144)
 parser.add_argument("--repeats", type=int, default=3)
+parser.add_argument("--warm-cache", action="store_true", help="保留跨局面缓存，默认逐局 ucinewgame")
 args = parser.parse_args()
 process = subprocess.Popen([str(args.engine.resolve())], stdin=subprocess.PIPE,
                            stdout=subprocess.PIPE, text=True, encoding="utf-8")
@@ -46,7 +47,8 @@ try:
     until("bestmove")
     for _ in range(args.repeats):
         for fen in positions:
-            command("ucinewgame")
+            if not args.warm_cache:
+                command("ucinewgame")
             command("isready")
             until("readyok")
             command(f"position fen {fen}")
@@ -62,7 +64,7 @@ try:
     seconds = sum(row["seconds"] for row in results)
     nodes = sum(row["nodes"] for row in results)
     print(json.dumps({"engine": str(args.engine), "threads": 1, "node_budget": args.nodes,
-                      "search_nodes": nodes, "search_seconds": seconds,
+                      "warm_cache": args.warm_cache, "search_nodes": nodes, "search_seconds": seconds,
                       "search_nps": nodes / seconds, "searches": results}, ensure_ascii=False))
 finally:
     if process.poll() is None:

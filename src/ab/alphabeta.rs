@@ -422,31 +422,28 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             return terminal_value(outcome, position.side_to_move(), ply);
         }
         let checked = position.in_check(position.side_to_move());
-        let mut tactical = if checked {
-            position.legal_moves_with_rules(history)
-        } else {
-            // A capture changes the board material, so it cannot repeat a
-            // previous position. Avoid generating and rule-checking every
-            // quiet move at each quiescence node.
-            position.legal_capture_moves()
-        };
-        if tactical.is_empty() && (checked || position.legal_moves_with_rules(history).is_empty()) {
-            return mated_at(ply);
-        }
         let stand_pat = if checked {
             -2.0
         } else {
             self.evaluate(position, history, hidden, ply)
         };
-        // A checked position has no legal stand-pat score. Keep searching evasions
-        // even when the ordinary capture horizon has been reached.
-        if remaining == 0 && !checked {
-            return stand_pat;
+        if !checked && (remaining == 0 || stand_pat >= beta) {
+            return if position.has_legal_move_with_rules(history) {
+                stand_pat
+            } else {
+                mated_at(ply)
+            };
+        }
+        let mut tactical = if checked {
+            position.legal_moves_with_rules(history)
+        } else {
+            // 吃子改变子力，不能重复此前同一棋盘。
+            position.legal_capture_moves()
+        };
+        if tactical.is_empty() && (checked || !position.has_legal_move_with_rules(history)) {
+            return mated_at(ply);
         }
         if !checked {
-            if stand_pat >= beta {
-                return stand_pat;
-            }
             alpha = alpha.max(stand_pat);
         }
         tactical.sort_by_key(|mv| {
@@ -596,10 +593,6 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                 _ => {}
             }
         }
-        let mut moves = position.legal_moves_with_rules(history);
-        if moves.is_empty() {
-            return mated_at(ply);
-        }
         let original_alpha = alpha;
         let checked = position.in_check(position.side_to_move());
         // Search an isolated pass only at a non-PV cut node. The real position
@@ -620,6 +613,9 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                 return 0.0;
             }
             if static_eval >= beta + 0.10 {
+                if !position.has_legal_move_with_rules(history) {
+                    return mated_at(ply);
+                }
                 let undo = position.make_null_move();
                 let mut null_history = position.initial_rule_history();
                 let reduced_depth = depth.saturating_sub(3);
@@ -661,6 +657,8 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                 }
             }
         }
+        let mut moves = position.search_move_candidates(checked);
+        let safety_mask = position.search_safety_mask(checked);
         let major_material = depth <= 2 && has_major_material(position, position.side_to_move());
         moves.sort_by_key(|&mv| {
             std::cmp::Reverse(self.move_order_score(position, mv, tt_move, ply))
@@ -670,7 +668,30 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         let mut first = true;
         let mut searched_quiets = [None; 32];
         let mut quiet_count = 0;
-        for (index, mv) in moves.into_iter().enumerate() {
+        let mut legal_count = 0;
+        for mv in moves {
+            if !position.search_move_allowed(history, mv, safety_mask) {
+                continue;
+            }
+            let index = legal_count;
+            legal_count += 1;
+            let quiet = position.piece_at(mv.to as usize).is_none();
+            if beta - alpha <= 0.001
+                && major_material
+                && !checked
+                && quiet
+                && best > -0.9
+                && late_move_prunable(
+                    depth,
+                    index,
+                    self.history_scores[mv.from as usize][mv.to as usize],
+                    Some(mv) == tt_move
+                        || self.killers[ply.min(self.killers.len() - 1)].contains(&Some(mv)),
+                )
+                && !position.gives_check_after_move(mv)
+            {
+                continue;
+            }
             let before_buckets = self
                 .model
                 .pikafish_net()
@@ -695,32 +716,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                 );
             }
             history.push(position.rule_history_entry_after_moved(mover, mv, captured));
-            let gives_check = position.in_check(position.side_to_move());
-            let quiet = captured.is_none();
-            // Shallow late-move pruning applies only after at least one legal
-            // move has been searched. Checks and captures must still be tried:
-            // Xiangqi has many forcing cannon and rook continuations.
-            if beta - alpha <= 0.001
-                && major_material
-                && !checked
-                && !gives_check
-                && quiet
-                && best > -0.9
-                && late_move_prunable(
-                    depth,
-                    index,
-                    self.history_scores[mv.from as usize][mv.to as usize],
-                    Some(mv) == tt_move
-                        || self.killers[ply.min(self.killers.len() - 1)].contains(&Some(mv)),
-                )
-            {
-                history.pop();
-                position.unmake_move(mv, undo);
-                if before_buckets.is_some() {
-                    self.hidden_pool.push(child_hidden);
-                }
-                continue;
-            }
+            let gives_check = history.last().unwrap().gives_check;
             let reduction = quiet_reduction(
                 depth,
                 index,
@@ -812,6 +808,9 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
                 quiet_count += 1;
             }
             first = false;
+        }
+        if legal_count == 0 {
+            return mated_at(ply);
         }
         let bound = if best >= beta {
             Bound::Lower

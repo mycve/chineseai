@@ -1,8 +1,10 @@
 //! 搜索专用只读权重与线程私有增量累加器；热路径不创建 Candle 张量或获取存储锁。
 use super::*;
+use portable_atomic::{AtomicU128, Ordering};
 #[derive(Debug)]
 pub struct PikafishCpuModel {
     identity: usize,
+    scores: Option<SharedScores>,
     shape: PikafishShape,
     bias: Vec<f32>,
     psq: Vec<f32>,
@@ -11,6 +13,28 @@ pub struct PikafishCpuModel {
     threat_psqt: Vec<f32>,
     stacks: Vec<Stack>,
 }
+#[derive(Debug)]
+struct SharedScores(Box<[AtomicU128]>);
+impl SharedScores {
+    fn new(entries: usize) -> Self {
+        Self((0..entries).map(|_| AtomicU128::new(0)).collect())
+    }
+    fn get(&self, hash: u64) -> Option<f32> {
+        let word = self.0[hash as usize & (self.0.len() - 1)].load(Ordering::Relaxed);
+        (word & (1u128 << 32) != 0 && (word >> 64) as u64 == hash)
+            .then(|| f32::from_bits(word as u32))
+    }
+    fn put(&self, hash: u64, value: f32) {
+        let word = (u128::from(hash) << 64) | (1u128 << 32) | u128::from(value.to_bits());
+        self.0[hash as usize & (self.0.len() - 1)].store(word, Ordering::Relaxed);
+    }
+    fn clear(&self) {
+        for entry in self.0.iter() {
+            entry.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Stack {
     w0: Vec<f32>,
@@ -26,14 +50,17 @@ pub struct PikafishCpuCache {
     acc: [[f32; TRANSFORMER_WIDTH]; 2],
     psqt: [[f32; PSQT_BUCKETS]; 2],
     evaluations: usize,
+    accumulation_steps: usize,
     model: usize,
     side: Option<crate::xiangqi::Color>,
     scores: Box<[Option<(u64, f32)>]>,
     frames: Vec<AccumulatorFrame>,
+    changes: Vec<(usize, f32)>,
 }
 
 struct AccumulatorFrame {
     hash: Option<u64>,
+    accumulation_steps: usize,
     side: crate::xiangqi::Color,
     features: PikafishExample,
     acc: Box<[[f32; TRANSFORMER_WIDTH]; 2]>,
@@ -53,10 +80,12 @@ impl Default for PikafishCpuCache {
             acc: [[0.; TRANSFORMER_WIDTH]; 2],
             psqt: [[0.; PSQT_BUCKETS]; 2],
             evaluations: 0,
+            accumulation_steps: 32,
             model: 0,
             side: None,
             scores: vec![None; 8192].into_boxed_slice(),
             frames: Vec::new(),
+            changes: Vec::with_capacity(128),
         }
     }
 }
@@ -86,6 +115,7 @@ impl PikafishCpuModel {
         static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         Ok(Self {
             identity: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            scores: AtomicU128::is_lock_free().then(|| SharedScores::new(1 << 20)),
             shape: model.shape,
             bias: copy(&model.transformer_bias)?,
             psq: copy(&model.transformer_psq)?,
@@ -94,6 +124,15 @@ impl PikafishCpuModel {
             threat_psqt: copy(&model.threat_psqt)?,
             stacks,
         })
+    }
+    /// 仅用于冷缓存基准；运行中的清空也只影响缓存命中率。
+    pub fn clear_score_cache(&self) {
+        if let Some(scores) = &self.scores {
+            scores.clear();
+        }
+    }
+    pub fn score_cache_entries(&self) -> usize {
+        self.scores.as_ref().map_or(0, |scores| scores.0.len())
     }
     pub fn load(path: &Path) -> Result<Self> {
         let model = PikafishModel::new(&Device::Cpu)?;
@@ -130,6 +169,20 @@ impl PikafishCpuModel {
                     return Ok(value);
                 }
             }
+        }
+        if let Some(value) = self.scores.as_ref().and_then(|scores| scores.get(hash)) {
+            crate::scope_profile!("pikafish.cpu.shared_cache_hit");
+            if cache.model != self.identity {
+                cache.scores.fill(None);
+                cache.frames.clear();
+                cache.evaluations = 0;
+                cache.accumulation_steps = 32;
+                cache.model = self.identity;
+            }
+            cache.scores[slot] = Some((hash, value));
+            return Ok(value);
+        }
+        if cache.model == self.identity {
             if let Some((ply, Some(parent_hash))) = context {
                 if ply > 0 {
                     if let Some(frame) = cache
@@ -140,6 +193,7 @@ impl PikafishCpuModel {
                         crate::scope_profile!("pikafish.cpu.restore_parent");
                         cache.acc.copy_from_slice(frame.acc.as_slice());
                         cache.psqt = frame.psqt;
+                        cache.accumulation_steps = frame.accumulation_steps;
                         for i in 0..2 {
                             cache.previous.psq[i].clone_from(&frame.features.psq[i]);
                             cache.previous.threats[i].clone_from(&frame.features.threats[i]);
@@ -194,10 +248,14 @@ impl PikafishCpuModel {
         cache.next.psqt_bucket = cache.next.layer_stack;
         let value = self.finish(cache)?;
         cache.scores[slot] = Some((hash, value));
+        if let Some(scores) = &self.scores {
+            scores.put(hash, value);
+        }
         if let Some((ply, _)) = context {
             while cache.frames.len() <= ply {
                 cache.frames.push(AccumulatorFrame {
                     hash: None,
+                    accumulation_steps: cache.accumulation_steps,
                     side,
                     features: cache.previous.clone(),
                     acc: Box::new(cache.acc),
@@ -206,6 +264,7 @@ impl PikafishCpuModel {
             }
             let frame = &mut cache.frames[ply];
             frame.hash = Some(hash);
+            frame.accumulation_steps = cache.accumulation_steps;
             frame.side = side;
             frame.acc.copy_from_slice(&cache.acc);
             frame.psqt = cache.psqt;
@@ -237,6 +296,7 @@ impl PikafishCpuModel {
             cache.scores.fill(None);
             cache.frames.clear();
             cache.evaluations = 0;
+            cache.accumulation_steps = 32;
             cache.model = identity;
         }
         if cache.next.layer_stack >= LAYER_STACKS || cache.next.psqt_bucket >= PSQT_BUCKETS {
@@ -253,15 +313,17 @@ impl PikafishCpuModel {
                 candle_core::bail!("Pikafish feature out of range")
             }
         }
+        let refresh = cache.accumulation_steps >= 32;
+        let mut changed = false;
         for side in 0..2 {
             cache.next.psq[side].sort_unstable();
             cache.next.threats[side].sort_unstable();
-            let refresh = cache.evaluations % 32 == 0;
+
             if refresh {
                 cache.acc[side].copy_from_slice(&self.bias);
                 cache.psqt[side].fill(0.);
             }
-            update(
+            changed |= update(
                 &self.psq,
                 &self.psqt,
                 &cache.previous.psq[side],
@@ -269,8 +331,9 @@ impl PikafishCpuModel {
                 refresh,
                 &mut cache.acc[side],
                 &mut cache.psqt[side],
+                &mut cache.changes,
             );
-            update(
+            changed |= update(
                 &self.threats,
                 &self.threat_psqt,
                 &cache.previous.threats[side],
@@ -278,8 +341,14 @@ impl PikafishCpuModel {
                 refresh,
                 &mut cache.acc[side],
                 &mut cache.psqt[side],
+                &mut cache.changes,
             );
         }
+        cache.accumulation_steps = if refresh {
+            0
+        } else {
+            cache.accumulation_steps + usize::from(changed)
+        };
         let mut transformed = [0f32; TRANSFORMER_WIDTH];
         for side in 0..2 {
             for h in 0..TRANSFORMER_WIDTH / 2 {
@@ -324,42 +393,56 @@ fn update(
     refresh: bool,
     acc: &mut [f32],
     value: &mut [f32],
-) {
+    changes: &mut Vec<(usize, f32)>,
+) -> bool {
     crate::scope_profile!("pikafish.cpu.accumulator");
-    let add = |index: usize, sign: f32, acc: &mut [f32], value: &mut [f32]| {
-        for (a, &w) in acc
-            .iter_mut()
-            .zip(&table[index * TRANSFORMER_WIDTH..(index + 1) * TRANSFORMER_WIDTH])
-        {
-            *a += sign * w;
+    changes.clear();
+    if refresh {
+        changes.extend(new.iter().map(|&index| (index, 1.)));
+    } else {
+        let (mut a, mut b) = (0, 0);
+        while a < old.len() || b < new.len() {
+            if b == new.len() || a < old.len() && old[a] < new[b] {
+                changes.push((old[a], -1.));
+                a += 1;
+            } else if a == old.len() || new[b] < old[a] {
+                changes.push((new[b], 1.));
+                b += 1;
+            } else {
+                a += 1;
+                b += 1;
+            }
         }
+    }
+    if changes.is_empty() {
+        return false;
+    }
+    accumulate_rows(table, changes, acc);
+    for &(index, sign) in changes.iter() {
         for (a, &w) in value
             .iter_mut()
-            .zip(&psqt[index * PSQT_BUCKETS..(index + 1) * PSQT_BUCKETS])
+            .zip(&psqt[index * PSQT_BUCKETS..][..PSQT_BUCKETS])
         {
             *a += sign * w;
         }
-    };
-    if refresh {
-        for &index in new {
-            add(index, 1., acc, value);
-        }
-        return;
     }
-    let (mut a, mut b) = (0, 0);
-    while a < old.len() || b < new.len() {
-        if b == new.len() || a < old.len() && old[a] < new[b] {
-            add(old[a], -1., acc, value);
-            a += 1;
-        } else if a == old.len() || new[b] < old[a] {
-            add(new[b], 1., acc, value);
-            b += 1;
-        } else {
-            a += 1;
-            b += 1;
+    true
+}
+fn accumulate_rows(table: &[f32], changes: &[(usize, f32)], acc: &mut [f32]) {
+    for (tile_index, output) in acc.chunks_exact_mut(64).enumerate() {
+        let mut tile = [0f32; 64];
+        tile.copy_from_slice(output);
+        let offset = tile_index * 64;
+        for &(index, sign) in changes {
+            let row = &table[index * TRANSFORMER_WIDTH + offset..][..64];
+            for (a, &w) in tile.iter_mut().zip(row) {
+                *a += sign * w;
+            }
         }
+        output.copy_from_slice(&tile);
     }
 }
+
 fn matvec(input: &[f32], weights: &[f32], bias: &[f32], out: &mut [f32; FC_WIDTH]) {
     crate::scope_profile!("pikafish.cpu.matvec");
     out.fill(0.);
@@ -386,6 +469,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_score_cache_keeps_full_keys_and_atomic_values() {
+        let scores = SharedScores::new(8);
+        assert_eq!(scores.get(0), None);
+        scores.put(0, -0.25);
+        assert_eq!(scores.get(0), Some(-0.25));
+        scores.put(8, 0.75);
+        assert_eq!(scores.get(0), None);
+        assert_eq!(scores.get(8), Some(0.75));
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let scores = &scores;
+                scope.spawn(move || {
+                    for i in 0..10000u64 {
+                        let key = (i % 64 + thread * 64) * 8;
+                        let value = key as f32 / 4096.;
+                        scores.put(key, value);
+                        if let Some(actual) = scores.get(key) {
+                            assert_eq!(actual, value);
+                        }
+                    }
+                });
+            }
+        });
+        scores.clear();
+        assert!((0..4096u64).all(|key| scores.get(key).is_none()));
+    }
+
+    #[test]
+    fn tiled_feature_updates_preserve_scalar_addition_order() {
+        let table: Vec<_> = (0..8 * TRANSFORMER_WIDTH)
+            .map(|i| ((i * 17 % 71) as f32 - 35.) / 1000.)
+            .collect();
+        let psqt: Vec<_> = (0..8 * PSQT_BUCKETS)
+            .map(|i| (i as f32 - 64.) / 100.)
+            .collect();
+        let old = [1, 3, 3, 5];
+        let new = [0, 3, 4, 5, 5];
+        for refresh in [false, true] {
+            let mut acc = [128f32; TRANSFORMER_WIDTH];
+            let mut values = [0f32; PSQT_BUCKETS];
+            let mut expected = acc;
+            let mut expected_values = values;
+            let mut deltas = std::collections::BTreeMap::<usize, i32>::new();
+            if !refresh {
+                for &i in &old {
+                    *deltas.entry(i).or_default() -= 1;
+                }
+            }
+            for &i in &new {
+                *deltas.entry(i).or_default() += 1;
+            }
+            for (index, count) in deltas {
+                for _ in 0..count.unsigned_abs() {
+                    let sign = if count > 0 { 1. } else { -1. };
+                    for (a, w) in expected
+                        .iter_mut()
+                        .zip(&table[index * TRANSFORMER_WIDTH..][..TRANSFORMER_WIDTH])
+                    {
+                        *a += sign * w;
+                    }
+                    for (a, w) in expected_values
+                        .iter_mut()
+                        .zip(&psqt[index * PSQT_BUCKETS..][..PSQT_BUCKETS])
+                    {
+                        *a += sign * w;
+                    }
+                }
+            }
+            assert!(update(
+                &table,
+                &psqt,
+                &old,
+                &new,
+                refresh,
+                &mut acc,
+                &mut values,
+                &mut Vec::new()
+            ));
+            assert_eq!(acc.map(f32::to_bits), expected.map(f32::to_bits));
+            assert_eq!(values.map(f32::to_bits), expected_values.map(f32::to_bits));
+            assert!(!update(
+                &table,
+                &psqt,
+                &new,
+                &new,
+                false,
+                &mut acc,
+                &mut values,
+                &mut Vec::new()
+            ));
+        }
+    }
+
+    #[test]
     fn parent_accumulators_match_cold_evaluation_across_siblings() -> Result<()> {
         let trainer = PikafishModel::new(&Device::Cpu)?;
         let model = trainer.cpu_snapshot()?;
@@ -402,7 +579,10 @@ mod tests {
                 {
                     let actual =
                         model.evaluate_search(&position, &mut cache, ply + 1, Some(parent))?;
-                    let expected = model.evaluate(&position, &mut PikafishCpuCache::default())?;
+                    let expected = model.evaluate_example(
+                        &PikafishExample::from_position(&position).unwrap(),
+                        &mut PikafishCpuCache::default(),
+                    )?;
                     assert!((actual - expected).abs() < 2e-5, "{actual} != {expected}");
                 }
                 position.unmake_move(mv, undo);
@@ -432,7 +612,10 @@ mod tests {
         let mv = position.legal_moves()[0];
         let undo = position.make_move(mv);
         let child = original.evaluate(&position, &mut cache)?;
-        let expected = original.evaluate(&position, &mut PikafishCpuCache::default())?;
+        let expected = original.evaluate_example(
+            &PikafishExample::from_position(&position).unwrap(),
+            &mut PikafishCpuCache::default(),
+        )?;
         assert!((child - expected).abs() < 2e-5);
         position.unmake_move(mv, undo);
         assert_eq!(original.evaluate(&position, &mut cache)?, first);

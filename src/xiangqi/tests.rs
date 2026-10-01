@@ -1113,3 +1113,42 @@ fn checkmate_precedes_natural_move_limit() {
         Some(RuleOutcome::Win(Color::Red)),
     );
 }
+
+#[test]
+fn deferred_legality_and_existence_match_complete_rule_generator() {
+    for game in 0..8 {
+        let mut position = Position::startpos();
+        let mut history = position.initial_rule_history();
+        for ply in 0..120 {
+            let legal = position.legal_moves_with_rules(&history);
+            let checked = position.in_check(position.side_to_move());
+            let mask = position.search_safety_mask(checked);
+            let deferred: Vec<_> = position
+                .search_move_candidates(checked)
+                .into_iter()
+                .filter(|&mv| position.search_move_allowed(&history, mv, mask))
+                .collect();
+            assert_eq!(deferred, legal, "game={game} ply={ply}");
+            assert_eq!(
+                position.has_legal_move_with_rules(&history),
+                !legal.is_empty()
+            );
+            if legal.is_empty() {
+                break;
+            }
+            let mv = legal[(game * 31 + ply * 17 + 3) % legal.len()];
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+            if position.rule_outcome_with_history(&history).is_some() {
+                break;
+            }
+        }
+    }
+    for fen in [
+        "4k4/3R1R3/9/9/9/9/9/9/9/3K5 b - - 0 1",
+        "3RkR3/9/2N6/9/9/9/9/9/9/3K5 b - - 0 1",
+    ] {
+        let position = Position::from_fen(fen).unwrap();
+        assert!(!position.has_legal_move_with_rules(&position.initial_rule_history()));
+    }
+}
