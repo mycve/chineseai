@@ -368,11 +368,19 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         position: &Position,
         history: &[RuleHistoryEntry],
         hidden: &[f32],
+        ply: usize,
     ) -> f32 {
         let result = if let (Some(model), Some(cache)) =
             (self.model.pikafish_cpu(), self.pikafish_cpu_cache.as_mut())
         {
-            model.evaluate(position, cache).map_err(|e| e.to_string())
+            model
+                .evaluate_search(
+                    position,
+                    cache,
+                    ply,
+                    history.iter().rev().nth(1).map(|entry| entry.hash),
+                )
+                .map_err(|e| e.to_string())
         } else if let (Some(net), Some(cache)) =
             (self.model.pikafish_net(), self.pikafish_cache.as_mut())
         {
@@ -428,7 +436,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
         let stand_pat = if checked {
             -2.0
         } else {
-            self.evaluate(position, history, hidden)
+            self.evaluate(position, history, hidden, ply)
         };
         // A checked position has no legal stand-pat score. Keep searching evasions
         // even when the ordinary capture horizon has been reached.
@@ -607,7 +615,7 @@ impl<M: ValueModel + ?Sized> Search<'_, M> {
             previous_was_null,
             null_enabled,
         ) {
-            let static_eval = self.evaluate(position, history, hidden);
+            let static_eval = self.evaluate(position, history, hidden, ply);
             if self.exhausted {
                 return 0.0;
             }
@@ -956,6 +964,7 @@ fn piece_value(kind: PieceKind) -> i64 {
 /// attack geometry; it is slower than Pikafish's bitboard SEE but respects
 /// cannon screens, horse legs and king safety.
 fn static_exchange_gain(position: &mut Position, mv: Move) -> (i64, bool) {
+    crate::scope_profile!("search.see");
     let target = mv.to;
     let captured = position.piece_at(target as usize).unwrap();
     let undo = position.make_move(mv);
@@ -972,11 +981,7 @@ fn best_exchange_reply(position: &mut Position, target: u8, remaining: usize) ->
     let Some(victim) = position.piece_at(target as usize) else {
         return 0;
     };
-    let captures = position
-        .legal_moves()
-        .into_iter()
-        .filter(|mv| mv.to == target)
-        .collect::<Vec<_>>();
+    let captures = position.legal_capture_moves_to(target as usize);
     let mut best = 0;
     for mv in captures {
         let undo = position.make_move(mv);
@@ -1135,7 +1140,7 @@ fn search_with_model<M: ValueModel + ?Sized>(
                 if replies.is_empty() {
                     MATE
                 } else {
-                    -engine.evaluate(&next, &line, &root_child_hidden)
+                    -engine.evaluate(&next, &line, &root_child_hidden, 1)
                 }
             }
         })

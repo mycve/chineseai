@@ -1,4 +1,4 @@
-//! 固定权重和局面，测量真实叶评估及 128 节点搜索吞吐。
+//! 固定权重和局面，测量预提取特征评估及单 worker 搜索吞吐。
 use chineseai::{
     ab::{
         AbSearchLimits,
@@ -21,10 +21,19 @@ struct Args {
     iterations: usize,
     #[arg(long, default_value = "target/pikafish-perf.safetensors")]
     model: std::path::PathBuf,
+    #[arg(long, default_value_t = 8192)]
+    nodes: usize,
+    #[arg(long, default_value_t = 64)]
+    max_depth: usize,
+    #[arg(long, default_value_t = 5)]
+    search_repeats: usize,
+    /// 每行一个 FEN；用于同局面对照成熟引擎。
+    #[arg(long)]
+    positions: Option<std::path::PathBuf>,
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    assert!(args.workers > 0 && args.iterations > 0);
+    assert!(args.workers > 0 && args.iterations > 0 && args.nodes > 0 && args.search_repeats > 0);
     let model = PikafishModel::new(&candle_core::Device::Cpu)?;
     if args.model.exists() {
         model.load(&args.model)?;
@@ -38,6 +47,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let moves = position.legal_moves();
         position.make_move(moves[(i * 7 + 3) % moves.len()]);
         positions.push(position);
+    }
+    if let Some(path) = args.positions {
+        positions = std::fs::read_to_string(path)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(Position::from_fen)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(!positions.is_empty());
     }
     let examples: Vec<_> = positions
         .iter()
@@ -64,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap();
                 }
                 black_box(sum);
+                chineseai::profile::flush_thread();
             }));
         }
         let start = Instant::now();
@@ -77,22 +95,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut nodes = 0;
     let mut searches = Vec::new();
-    for position in &positions {
+    for position in positions
+        .iter()
+        .cycle()
+        .take(positions.len() * args.search_repeats)
+    {
         let result = search_pikafish_model(
             position,
             &position.initial_rule_history(),
             &model,
             AbSearchLimits {
-                nodes: 128,
-                max_depth: 8,
+                nodes: args.nodes,
+                max_depth: args.max_depth,
             },
         )?;
         nodes += result.nodes;
         searches.push((result.best_move.map(|m| m.to_uci()), result.value_q));
     }
+    let search_seconds = start.elapsed().as_secs_f64();
     println!(
         "{}",
-        serde_json::json!({"workers":args.workers,"evals":args.workers*args.iterations,"eval_seconds":eval_seconds,"evals_per_second":args.workers as f64*args.iterations as f64/eval_seconds,"search_seconds":start.elapsed().as_secs_f64(),"search_nodes":nodes,"searches":searches})
+        serde_json::json!({"workers":args.workers,"evals":args.workers*args.iterations,"eval_seconds":eval_seconds,"evals_per_second":args.workers as f64*args.iterations as f64/eval_seconds,"search_seconds":search_seconds,"search_nodes":nodes,"search_nps":nodes as f64/search_seconds,"node_budget":args.nodes,"searches":searches})
     );
+    chineseai::profile::print_report();
     Ok(())
 }

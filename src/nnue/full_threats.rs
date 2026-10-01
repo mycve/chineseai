@@ -171,6 +171,10 @@ fn attacks(position: &Position, kind: PieceKind, color: Color, from: usize, to: 
     if !pseudo_attack(kind, color, from, to) {
         return false;
     }
+    attacks_after_pseudo(position, kind, from, to)
+}
+
+fn attacks_after_pseudo(position: &Position, kind: PieceKind, from: usize, to: usize) -> bool {
     let (fr, ff, tr, tf) = (
         (from / 9) as i32,
         (from % 9) as i32,
@@ -251,6 +255,17 @@ pub(crate) fn fill_threat_features_both(
 ) -> Option<()> {
     let (_, red_mirror) = super::pikafish::feature_bucket(position, Color::Red)?;
     let (_, black_mirror) = super::pikafish::feature_bucket(position, Color::Black)?;
+    fill_threat_features_both_with_mirrors(position, red_mirror, black_mirror, red, black)
+}
+
+pub(crate) fn fill_threat_features_both_with_mirrors(
+    position: &Position,
+    red_mirror: bool,
+    black_mirror: bool,
+    red: &mut Vec<usize>,
+    black: &mut Vec<usize>,
+) -> Option<()> {
+    crate::scope_profile!("pikafish.features.threats");
     red.clear();
     black.clear();
     red.reserve(64);
@@ -263,22 +278,23 @@ pub(crate) fn fill_threat_features_both(
         },
     ); BOARD_SIZE];
     let mut count = 0;
-    for square in 0..BOARD_SIZE {
+    let mut occupied_mask = 0u128;
+    for square in position.occupied_squares() {
         if let Some(piece) = position.piece_at(square) {
             occupied[count] = (square, piece);
             count += 1;
+            occupied_mask |= 1u128 << square;
         }
     }
     let occupied = &occupied[..count];
+    let targets = pseudo_targets();
     for &(from, attacker) in occupied {
-        for &(to, attacked) in occupied {
-            if attacks(
-                position,
-                attacker.kind,
-                attacker.color,
-                native(from),
-                native(to),
-            ) {
+        let mut mask = targets[plane(attacker) * BOARD_SIZE + from] & occupied_mask;
+        while mask != 0 {
+            let to = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let attacked = position.piece_at(to).unwrap();
+            if attacks_after_pseudo(position, attacker.kind, native(from), native(to)) {
                 if let Some(index) =
                     threat_index(Color::Red, attacker, from, to, attacked, red_mirror)
                 {
@@ -293,6 +309,24 @@ pub(crate) fn fill_threat_features_both(
         }
     }
     Some(())
+}
+
+fn pseudo_targets() -> &'static [u128] {
+    static TARGETS: OnceLock<Vec<u128>> = OnceLock::new();
+    TARGETS.get_or_init(|| {
+        let mut targets = vec![0; PLANES * BOARD_SIZE];
+        for plane in 0..PLANES {
+            let color = if plane < 7 { Color::Red } else { Color::Black };
+            for from in 0..BOARD_SIZE {
+                for to in 0..BOARD_SIZE {
+                    if pseudo_attack(KINDS[plane % 7], color, native(from), native(to)) {
+                        targets[plane * BOARD_SIZE + from] |= 1u128 << to;
+                    }
+                }
+            }
+        }
+        targets
+    })
 }
 
 #[cfg(test)]

@@ -196,7 +196,7 @@ pub mod pikafish {
 
     fn mid_encoding(position: &Position, color: Color) -> u64 {
         let mut encoding = BALANCE_ENCODING;
-        for square in 0..BOARD_SIZE {
+        for square in position.occupied_squares() {
             let Some(piece) = position.piece_at(square) else {
                 continue;
             };
@@ -237,30 +237,20 @@ pub mod pikafish {
 
     /// 官方 KingBuckets 与中线对称决策；返回 0..23 的 HalfKAv2_hm 桶。
     pub fn feature_bucket(position: &Position, perspective: Color) -> Option<(usize, bool)> {
-        let mut king = None;
-        let mut opponent_king = None;
-        for square in 0..BOARD_SIZE {
-            let Some(piece) = position.piece_at(square) else {
-                continue;
-            };
-            if piece.kind == PieceKind::General {
-                if piece.color == perspective {
-                    king = Some(native_square(square));
-                } else {
-                    opponent_king = Some(native_square(square));
-                }
-            }
-        }
-        let (king, opponent_king) = (king?, opponent_king?);
+        let king = native_square(position.general_square(perspective)?);
+        let opponent_king = native_square(position.general_square(perspective.opposite())?);
         let (bucket, mirrored_king) = king_bucket(king);
         let (opponent_bucket, mirrored_opponent) = king_bucket(opponent_king);
-        let own_encoding = mid_encoding(position, perspective);
-        let opponent_encoding = mid_encoding(position, perspective.opposite());
-        let mid_mirror = (own_encoding & opponent_encoding & (1_u64 << 63)) != 0
-            && (own_encoding < BALANCE_ENCODING
-                || (own_encoding == BALANCE_ENCODING && opponent_encoding < BALANCE_ENCODING));
+        let mid_mirror = || {
+            let own_encoding = mid_encoding(position, perspective);
+            let opponent_encoding = mid_encoding(position, perspective.opposite());
+            (own_encoding & opponent_encoding & (1_u64 << 63)) != 0
+                && (own_encoding < BALANCE_ENCODING
+                    || (own_encoding == BALANCE_ENCODING && opponent_encoding < BALANCE_ENCODING))
+        };
         let mirror = mirrored_king
-            || (bucket & 1 != 0 && (mirrored_opponent || (opponent_bucket & 1 != 0 && mid_mirror)));
+            || (bucket & 1 != 0
+                && (mirrored_opponent || (opponent_bucket & 1 != 0 && mid_mirror())));
         Some((
             bucket * ATTACK_BUCKETS + attack_bucket(position, perspective),
             mirror,
@@ -273,10 +263,21 @@ pub mod pikafish {
         perspective: Color,
         output: &mut Vec<usize>,
     ) -> Option<()> {
+        crate::scope_profile!("pikafish.features.psq");
         let (bucket, mirror) = feature_bucket(position, perspective)?;
+        fill_psq_features_with_bucket(position, perspective, bucket, mirror, output)
+    }
+
+    pub(crate) fn fill_psq_features_with_bucket(
+        position: &Position,
+        perspective: Color,
+        bucket: usize,
+        mirror: bool,
+        output: &mut Vec<usize>,
+    ) -> Option<()> {
         output.clear();
         output.reserve(32);
-        for square in 0..BOARD_SIZE {
+        for square in position.occupied_squares() {
             let Some(mut piece) = position.piece_at(square) else {
                 continue;
             };
@@ -301,7 +302,7 @@ pub mod pikafish {
     pub fn attack_bucket(position: &Position, perspective: Color) -> usize {
         let mut rooks = 0;
         let mut horse_or_cannon = 0;
-        for square in 0..BOARD_SIZE {
+        for square in position.occupied_squares() {
             let Some(piece) = position.piece_at(square) else {
                 continue;
             };
@@ -322,7 +323,7 @@ pub mod pikafish {
         let side = position.side_to_move();
         let mut rooks = [0_usize; 2];
         let mut horse_cannons = [0_usize; 2];
-        for square in 0..BOARD_SIZE {
+        for square in position.occupied_squares() {
             let Some(piece) = position.piece_at(square) else {
                 continue;
             };

@@ -175,6 +175,19 @@ impl Position {
         self.general_squares[color_hash_index(color)]
     }
 
+    #[inline]
+    pub(crate) fn occupied_squares(&self) -> impl Iterator<Item = usize> {
+        let mut occupied = self.occupied;
+        std::iter::from_fn(move || {
+            if occupied == 0 {
+                return None;
+            }
+            let square = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            Some(square)
+        })
+    }
+
     #[cfg(test)]
     #[inline(always)]
     fn has_dynamic_material(&self, color: Color) -> bool {
@@ -262,8 +275,7 @@ impl Position {
         self.collect_legal_moves(true, self.in_check(self.side_to_move))
     }
 
-    #[cfg(test)]
-    fn legal_capture_moves_to(&self, target: usize) -> Vec<Move> {
+    pub(crate) fn legal_capture_moves_to(&self, target: usize) -> Vec<Move> {
         let Some(target_piece) = self.board.get(target).and_then(|piece| *piece) else {
             return Vec::new();
         };

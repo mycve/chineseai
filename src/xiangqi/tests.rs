@@ -297,6 +297,33 @@ fn legal_capture_moves_to_matches_filtered_capture_moves() {
 }
 
 #[test]
+fn targeted_captures_match_full_generator_across_legal_play() {
+    let mut position = Position::startpos();
+    for ply in 0..100 {
+        let legal = position.legal_moves();
+        for target in 0..BOARD_SIZE {
+            let expected: Vec<_> = legal
+                .iter()
+                .copied()
+                .filter(|mv| mv.to as usize == target && position.is_capture(*mv))
+                .collect();
+            let actual = position.legal_capture_moves_to(target);
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{} target={target}",
+                position.to_fen()
+            );
+            assert!(actual.iter().all(|mv| expected.contains(mv)));
+        }
+        if legal.is_empty() {
+            break;
+        }
+        position.make_move(legal[(ply * 37 + 11) % legal.len()]);
+    }
+}
+
+#[test]
 fn fast_attack_detection_matches_slow_scan() {
     let samples = [
         Position::startpos(),

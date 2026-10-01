@@ -28,6 +28,16 @@ pub struct PikafishCpuCache {
     evaluations: usize,
     model: usize,
     side: Option<crate::xiangqi::Color>,
+    scores: Box<[Option<(u64, f32)>]>,
+    frames: Vec<AccumulatorFrame>,
+}
+
+struct AccumulatorFrame {
+    hash: Option<u64>,
+    side: crate::xiangqi::Color,
+    features: PikafishExample,
+    acc: Box<[[f32; TRANSFORMER_WIDTH]; 2]>,
+    psqt: [[f32; PSQT_BUCKETS]; 2],
 }
 impl Default for PikafishCpuCache {
     fn default() -> Self {
@@ -45,6 +55,8 @@ impl Default for PikafishCpuCache {
             evaluations: 0,
             model: 0,
             side: None,
+            scores: vec![None; 8192].into_boxed_slice(),
+            frames: Vec::new(),
         }
     }
 }
@@ -89,6 +101,54 @@ impl PikafishCpuModel {
         model.cpu_snapshot()
     }
     pub fn evaluate(&self, position: &Position, cache: &mut PikafishCpuCache) -> Result<f32> {
+        self.evaluate_inner(position, cache, None)
+    }
+
+    pub(crate) fn evaluate_search(
+        &self,
+        position: &Position,
+        cache: &mut PikafishCpuCache,
+        ply: usize,
+        parent_hash: Option<u64>,
+    ) -> Result<f32> {
+        self.evaluate_inner(position, cache, Some((ply, parent_hash)))
+    }
+
+    fn evaluate_inner(
+        &self,
+        position: &Position,
+        cache: &mut PikafishCpuCache,
+        context: Option<(usize, Option<u64>)>,
+    ) -> Result<f32> {
+        crate::scope_profile!("pikafish.cpu.evaluate");
+        let hash = position.hash();
+        let slot = hash as usize & (cache.scores.len() - 1);
+        if cache.model == self.identity {
+            if let Some((key, value)) = cache.scores[slot] {
+                if key == hash {
+                    crate::scope_profile!("pikafish.cpu.cache_hit");
+                    return Ok(value);
+                }
+            }
+            if let Some((ply, Some(parent_hash))) = context {
+                if ply > 0 {
+                    if let Some(frame) = cache
+                        .frames
+                        .get(ply - 1)
+                        .filter(|frame| frame.hash == Some(parent_hash))
+                    {
+                        crate::scope_profile!("pikafish.cpu.restore_parent");
+                        cache.acc.copy_from_slice(frame.acc.as_slice());
+                        cache.psqt = frame.psqt;
+                        for i in 0..2 {
+                            cache.previous.psq[i].clone_from(&frame.features.psq[i]);
+                            cache.previous.threats[i].clone_from(&frame.features.threats[i]);
+                        }
+                        cache.side = Some(frame.side);
+                    }
+                }
+            }
+        }
         let side = position.side_to_move();
         if cache.side.is_some_and(|previous| previous != side) {
             cache.previous.psq.swap(0, 1);
@@ -97,19 +157,64 @@ impl PikafishCpuModel {
             cache.psqt.swap(0, 1);
         }
         cache.side = Some(side);
+        let red_bucket =
+            crate::nnue::pikafish::feature_bucket(position, crate::xiangqi::Color::Red)
+                .ok_or_else(|| candle_core::Error::Msg("invalid PSQ bucket".into()))?;
+        let black_bucket =
+            crate::nnue::pikafish::feature_bucket(position, crate::xiangqi::Color::Black)
+                .ok_or_else(|| candle_core::Error::Msg("invalid PSQ bucket".into()))?;
         for (i, perspective) in [side, side.opposite()].into_iter().enumerate() {
-            crate::nnue::pikafish::fill_psq_features(position, perspective, &mut cache.next.psq[i])
-                .ok_or_else(|| candle_core::Error::Msg("invalid PSQ features".into()))?;
+            let (bucket, mirror) = if perspective == crate::xiangqi::Color::Red {
+                red_bucket
+            } else {
+                black_bucket
+            };
+            crate::nnue::pikafish::fill_psq_features_with_bucket(
+                position,
+                perspective,
+                bucket,
+                mirror,
+                &mut cache.next.psq[i],
+            )
+            .ok_or_else(|| candle_core::Error::Msg("invalid PSQ features".into()))?;
         }
         let [red, black] = &mut cache.next.threats;
-        crate::nnue::full_threats::fill_threat_features_both(position, red, black)
-            .ok_or_else(|| candle_core::Error::Msg("invalid threat features".into()))?;
+        crate::nnue::full_threats::fill_threat_features_both_with_mirrors(
+            position,
+            red_bucket.1,
+            black_bucket.1,
+            red,
+            black,
+        )
+        .ok_or_else(|| candle_core::Error::Msg("invalid threat features".into()))?;
         if side == crate::xiangqi::Color::Black {
             cache.next.threats.swap(0, 1);
         }
         cache.next.layer_stack = crate::nnue::pikafish::layer_stack_bucket(position);
         cache.next.psqt_bucket = cache.next.layer_stack;
-        self.finish(cache)
+        let value = self.finish(cache)?;
+        cache.scores[slot] = Some((hash, value));
+        if let Some((ply, _)) = context {
+            while cache.frames.len() <= ply {
+                cache.frames.push(AccumulatorFrame {
+                    hash: None,
+                    side,
+                    features: cache.previous.clone(),
+                    acc: Box::new(cache.acc),
+                    psqt: cache.psqt,
+                });
+            }
+            let frame = &mut cache.frames[ply];
+            frame.hash = Some(hash);
+            frame.side = side;
+            frame.acc.copy_from_slice(&cache.acc);
+            frame.psqt = cache.psqt;
+            for i in 0..2 {
+                frame.features.psq[i].clone_from(&cache.previous.psq[i]);
+                frame.features.threats[i].clone_from(&cache.previous.threats[i]);
+            }
+        }
+        Ok(value)
     }
     pub fn evaluate_example(
         &self,
@@ -126,8 +231,11 @@ impl PikafishCpuModel {
         self.finish(cache)
     }
     fn finish(&self, cache: &mut PikafishCpuCache) -> Result<f32> {
+        crate::scope_profile!("pikafish.cpu.finish");
         let identity = self.identity;
         if cache.model != identity {
+            cache.scores.fill(None);
+            cache.frames.clear();
             cache.evaluations = 0;
             cache.model = identity;
         }
@@ -217,6 +325,7 @@ fn update(
     acc: &mut [f32],
     value: &mut [f32],
 ) {
+    crate::scope_profile!("pikafish.cpu.accumulator");
     let add = |index: usize, sign: f32, acc: &mut [f32], value: &mut [f32]| {
         for (a, &w) in acc
             .iter_mut()
@@ -251,7 +360,8 @@ fn update(
         }
     }
 }
-fn matvec(input: &[f32], weights: &[f32], bias: &[f32], out: &mut [f32]) {
+fn matvec(input: &[f32], weights: &[f32], bias: &[f32], out: &mut [f32; FC_WIDTH]) {
+    crate::scope_profile!("pikafish.cpu.matvec");
     out.fill(0.);
     for (&value, row) in input.iter().zip(weights.chunks_exact(out.len())) {
         for (o, &w) in out.iter_mut().zip(row) {
@@ -262,6 +372,7 @@ fn matvec(input: &[f32], weights: &[f32], bias: &[f32], out: &mut [f32]) {
         *o += b;
     }
 }
+
 fn activation(input: &[f32], out: &mut [f32]) {
     for (i, &x) in input.iter().enumerate() {
         let x = x.clamp(0., 1.);
@@ -273,6 +384,65 @@ fn activation(input: &[f32], out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_accumulators_match_cold_evaluation_across_siblings() -> Result<()> {
+        let trainer = PikafishModel::new(&Device::Cpu)?;
+        let model = trainer.cpu_snapshot()?;
+        let mut cache = PikafishCpuCache::default();
+        let mut position = Position::startpos();
+        for ply in 0..24 {
+            let parent = position.hash();
+            model.evaluate_search(&position, &mut cache, ply, None)?;
+            let moves = position.legal_moves();
+            for &mv in moves.iter().take(8) {
+                let undo = position.make_move(mv);
+                if position.has_general(crate::xiangqi::Color::Red)
+                    && position.has_general(crate::xiangqi::Color::Black)
+                {
+                    let actual =
+                        model.evaluate_search(&position, &mut cache, ply + 1, Some(parent))?;
+                    let expected = model.evaluate(&position, &mut PikafishCpuCache::default())?;
+                    assert!((actual - expected).abs() < 2e-5, "{actual} != {expected}");
+                }
+                position.unmake_move(mv, undo);
+            }
+            if moves.is_empty() {
+                break;
+            }
+            position.make_move(moves[(ply * 7 + 3) % moves.len()]);
+        }
+        assert!(!cache.frames.is_empty());
+        let newer = trainer.cpu_snapshot()?;
+        newer.evaluate(&position, &mut cache)?;
+        assert!(cache.frames.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn position_score_cache_is_scoped_to_model_and_handles_backtracking() -> Result<()> {
+        let trainer = PikafishModel::new(&Device::Cpu)?;
+        let original = trainer.cpu_snapshot()?;
+        let mut cache = PikafishCpuCache::default();
+        let mut position = Position::startpos();
+        let first = original.evaluate(&position, &mut cache)?;
+        let evaluated = cache.evaluations;
+        assert_eq!(original.evaluate(&position, &mut cache)?, first);
+        assert_eq!(cache.evaluations, evaluated);
+        let mv = position.legal_moves()[0];
+        let undo = position.make_move(mv);
+        let child = original.evaluate(&position, &mut cache)?;
+        let expected = original.evaluate(&position, &mut PikafishCpuCache::default())?;
+        assert!((child - expected).abs() < 2e-5);
+        position.unmake_move(mv, undo);
+        assert_eq!(original.evaluate(&position, &mut cache)?, first);
+        let mut newer = trainer.cpu_snapshot()?;
+        newer.stacks[11].b2 += 600.;
+        let changed = newer.evaluate(&position, &mut cache)?;
+        assert!((changed - first).abs() > 0.1);
+        assert!((original.evaluate(&position, &mut cache)? - first).abs() < 2e-5);
+        Ok(())
+    }
     #[test]
     fn incremental_all_buckets_duplicates_empty_and_snapshot_change() -> Result<()> {
         let model = PikafishModel::with_shape(
