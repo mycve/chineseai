@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
+use super::arch::CHECK_CONTEXT_SIZE;
+use super::inference::check_context_features;
 use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::{BOARD_SIZE, Color, Position};
 
@@ -206,6 +208,7 @@ pub(super) struct PackedBatch {
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
+    pub check_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
@@ -275,6 +278,7 @@ impl PackedBatch {
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
+            check_context: vec![0.0f32; batch_size * CHECK_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
             value_phase_masks: vec![0.0f32; batch_size * 3],
@@ -344,6 +348,24 @@ impl PackedBatch {
         let position = Position::from_canonical_piece_squares(&pieces);
         let opponent_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Black);
         let own_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Red);
+        let moves = sample
+            .move_indices
+            .iter()
+            .filter_map(|&index| {
+                dense_move_squares(index).map(|(from, to)| crate::xiangqi::Move::new(from, to))
+            })
+            .collect::<Vec<_>>();
+        let gives_check = moves
+            .iter()
+            .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
+            .collect::<Vec<_>>();
+        self.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE]
+            .copy_from_slice(&check_context_features(
+                &position,
+                &moves,
+                &gives_check,
+                [own_attacks, opponent_attacks],
+            ));
         let mut policy_offset = 0usize;
         for (sample_offset, (&move_index, &target)) in sample
             .move_indices
@@ -419,7 +441,7 @@ impl PackedBatch {
                         consequence_from % BOARD_SIZE,
                         consequence_to % BOARD_SIZE,
                     );
-                    let check = position.gives_check_after_move_fast(mv);
+                    let check = gives_check[policy_offset] != 0.0;
                     // 训练侧与推理侧共用同一个实现，避免两处内联公式漂移。
                     let (
                         source_attacked,

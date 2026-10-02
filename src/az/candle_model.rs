@@ -1,5 +1,6 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 
+use super::arch::CHECK_CONTEXT_SIZE;
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
@@ -24,6 +25,7 @@ pub(super) struct AzCandleModel {
     input_file_hidden: Var,
     input_king_piece_hidden: Var,
     rule_context_hidden: Var,
+    check_context_hidden: Var,
     hidden_bias: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
@@ -63,7 +65,8 @@ impl AzCandleModel {
             .broadcast_add(&self.hidden_bias)?;
         let accumulator_context = board_pre.matmul(&self.policy_accumulator_hidden.t()?)?;
         let rule_pre = batch.rule_context.matmul(&self.rule_context_hidden)?;
-        let sparse_pre = (board_pre + rule_pre)?;
+        let check_pre = batch.check_context.matmul(&self.check_context_hidden)?;
+        let sparse_pre = ((board_pre + rule_pre)? + check_pre)?;
         let sparse_hidden = sparse_pre.relu()?;
         let rms = sparse_hidden
             .sqr()?
@@ -188,6 +191,7 @@ pub(super) struct BatchTensors {
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) rule_context: Tensor,
+    pub(super) check_context: Tensor,
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
     pub(super) value_phase_masks: Tensor,
@@ -279,6 +283,11 @@ impl BatchTensors {
                 device,
             )?,
             policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
+            check_context: Tensor::from_vec(
+                packed.check_context,
+                (batch_size, CHECK_CONTEXT_SIZE),
+                device,
+            )?,
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
             value_source_phase_masks: Tensor::from_vec(
@@ -327,6 +336,11 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
+            check_context_hidden: var_from_slice(
+                &model.check_context_hidden,
+                (CHECK_CONTEXT_SIZE, hidden),
+                device,
+            )?,
             value_head_hidden: var_from_slice(
                 &model.value_head_hidden,
                 (VALUE_HEAD_SIZE, hidden),
@@ -412,6 +426,7 @@ impl AzCandleModel {
         vars.push(self.input_file_hidden.clone());
         vars.push(self.input_king_piece_hidden.clone());
         vars.push(self.rule_context_hidden.clone());
+        vars.push(self.check_context_hidden.clone());
         vars.push(self.hidden_bias.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
@@ -444,6 +459,7 @@ impl AzCandleModel {
             &mut model.input_king_piece_hidden,
         )?;
         copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
+        copy_var(&self.check_context_hidden, &mut model.check_context_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
@@ -491,6 +507,7 @@ impl AzCandleModel {
             &mut model.policy_repetition_bias,
         )?;
         model.rebuild_value_threat();
+        model.rebuild_check_context();
         model.rebuild_policy_tactical();
         model.rebuild_policy_cache();
         Ok(())
@@ -515,13 +532,13 @@ fn copy_var(var: &Var, dst: &mut [f32]) -> CandleResult<()> {
 mod tests {
     use super::*;
     use crate::{
+        az::nnue::extract_sparse_features_az,
         az::{
             AzEvalScratch, AzSampleMeta, AzTrainingSample, POLICY_SPARSE_TABLE_SIZE,
             RULE_CONTEXT_SIZE, canonical_buckets_for_perspective, dense_move_index,
             policy_consequence_features, policy_sparse_capture_index, policy_sparse_factor_indices,
             policy_sparse_main_index,
         },
-        az::nnue::extract_sparse_features_az,
         xiangqi::Position,
     };
 
@@ -621,6 +638,10 @@ mod tests {
         for (index, weight) in model.value_head_output.iter_mut().enumerate() {
             *weight = (index % 11) as f32 * 0.003 - 0.015;
         }
+        for (index, weight) in model.check_context_hidden.iter_mut().enumerate() {
+            *weight = (index % 17) as f32 * 0.01 - 0.08;
+        }
+        model.rebuild_check_context();
         model.value_head_bias.fill(1.0);
         for (index, weight) in model.policy_threat_context.iter_mut().enumerate() {
             *weight = (index % 13) as f32 * 0.0001 - 0.0005;
@@ -788,7 +809,9 @@ mod tests {
 
     #[test]
     fn gpu_and_cpu_weight_tensors_roundtrip() {
-        let model = AzNnue::random(16, 12345);
+        let mut model = AzNnue::random(16, 12345);
+        model.check_context_hidden.fill(0.125);
+        model.rebuild_check_context();
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
         let mut back = AzNnue::random_with_arch(model.arch, 54321);
         candle.copy_to_model(&mut back).unwrap();
@@ -811,6 +834,7 @@ mod tests {
             input_file_hidden,
             input_king_piece_hidden,
             rule_context_hidden,
+            check_context_hidden,
             hidden_bias,
             value_head_hidden,
             value_head_bias,
@@ -827,5 +851,142 @@ mod tests {
             policy_sparse_factor,
             policy_tactical,
         );
+        assert!(back.check_context_active);
+    }
+
+    fn check_context_training_matches_inference(device: &Device) {
+        use crate::az::{nnue::canonical_move, px0_sgd::Px0Sgd};
+
+        let positions = [
+            Position::startpos(),
+            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b")
+                .unwrap(),
+            Position::from_fen(
+                "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+            )
+            .unwrap(),
+            Position::from_fen("3k5/9/9/9/9/9/9/4r4/9/4K4 w").unwrap(),
+        ];
+        let positions = positions
+            .iter()
+            .flat_map(|p| [p.clone(), p.mirror_files()])
+            .collect::<Vec<_>>();
+        let samples = positions
+            .iter()
+            .map(|position| {
+                let moves = position.legal_moves();
+                AzTrainingSample {
+                    features: extract_sparse_features_az(position),
+                    move_indices: moves
+                        .iter()
+                        .map(|&mv| dense_move_index(canonical_move(position.side_to_move(), mv)))
+                        .collect(),
+                    policy: vec![1.0 / moves.len() as f32; moves.len()],
+                    repetition_flags: vec![0; moves.len()],
+                    rule_context: [0.0; RULE_CONTEXT_SIZE],
+                    value_wdl: [1.0, 0.0, 0.0],
+                    root_search_wdl: [1.0, 0.0, 0.0],
+                    value: 1.0,
+                    side_sign: 1.0,
+                    policy_weight: 1.0,
+                    value_weight: 1.0,
+                    search_simulations: 1,
+                    meta: AzSampleMeta::default(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..samples.len()).collect::<Vec<_>>();
+        let packed = PackedBatch::from_indices(&samples, &ids);
+        for (row, position) in positions.iter().enumerate() {
+            let moves = position.legal_moves();
+            let checks = moves
+                .iter()
+                .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
+                .collect::<Vec<_>>();
+            let context = crate::az::inference::check_context_features(
+                position,
+                &moves,
+                &checks,
+                position.attacked_squares_masks(),
+            );
+            assert_eq!(
+                &packed.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE],
+                &context
+            );
+        }
+        let batch = BatchTensors::from_packed(packed, device).unwrap();
+        let mut model = AzNnue::random(32, 20261002);
+        model.value_head_bias.fill(1.0);
+        // 新标量权重为零，已有价值头需能把梯度传回主干。
+        for (index, weight) in model.value_head_output.iter_mut().enumerate() {
+            *weight = (index % 11) as f32 * 0.003 - 0.015;
+        }
+        let candle = AzCandleModel::from_model(&model, device).unwrap();
+        let forward = candle.forward(&batch).unwrap();
+        let loss = candle_nn::ops::log_softmax(&forward.value_logits, 1)
+            .unwrap()
+            .mul(&batch.value_wdl)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .neg()
+            .unwrap();
+        let gradients = loss.backward().unwrap();
+        let gradient = gradients
+            .get(&candle.check_context_hidden)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(gradient.iter().all(|g| g.is_finite()));
+        assert!(gradient.iter().any(|g| g.abs() > 1e-8));
+        let mut optimizer = Px0Sgd::new(candle.all_vars(), 0.02).unwrap();
+        optimizer.step(&gradients).unwrap();
+        candle.copy_to_model(&mut model).unwrap();
+        assert!(model.check_context_hidden.iter().any(|&w| w != 0.0));
+        assert!(model.check_context_active);
+        let forward = candle.forward(&batch).unwrap();
+        let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let logits = forward.policy_logits.to_vec2::<f32>().unwrap();
+        for (row, sample) in samples.iter().enumerate() {
+            let position = &positions[row];
+            let moves = position.legal_moves();
+            let mut scratch = AzEvalScratch::new(model.arch);
+            let cpu = model.evaluate_with_scratch_output_with_repetition(
+                position,
+                &moves,
+                &sample.repetition_flags,
+                &sample.rule_context,
+                &mut scratch,
+            );
+            let (sample_wdl, sample_logits) =
+                crate::az::outputs_for_training_sample(&model, sample).unwrap();
+            for (a, b) in cpu.value_wdl.iter().zip(&wdl[row]) {
+                assert!((a - b).abs() < 1e-4, "row={row} value {a} != {b}");
+            }
+            for (a, b) in sample_wdl.iter().zip(&wdl[row]) {
+                assert!((a - b).abs() < 1e-4);
+            }
+            for (a, b) in sample_logits.iter().zip(&logits[row]) {
+                assert!((a - b).abs() < 2e-3, "row={row} policy {a} != {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn check_context_training_updates_zero_weights_and_matches_cpu() {
+        check_context_training_matches_inference(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn check_context_training_updates_zero_weights_and_matches_cuda() {
+        let device =
+            crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required");
+        check_context_training_matches_inference(device);
     }
 }
