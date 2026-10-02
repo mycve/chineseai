@@ -582,6 +582,9 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     );
     flush();
     let mut last_score_source = None;
+    // 已经打印过的节点数：用来判断"最后一次 info 是否已经报过"，避免重复行。
+    // 连杀证明/规则终局会在第一轮模拟之前就让循环 break，此时它仍是 None。
+    let mut last_reported_nodes = None;
     let mut report_progress = |progress: &AzUciSearchResult| {
         if let Some(proven) = high_score_source(progress) {
             if last_score_source != Some(proven) {
@@ -590,6 +593,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             }
         }
         print_search_info(progress, started);
+        last_reported_nodes = Some(progress.search.simulations);
         flush();
     };
     let report = search_uci(
@@ -626,6 +630,14 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
         if last_score_source != Some(proven) {
             print_high_score_source(&report, proven);
         }
+    }
+    // 搜索可能在第一轮模拟之前就已经被"证明"了（连杀证明、规则终局、唯一合法着法……），
+    // 那样 `search_uci` 的循环一进去就 break，而进度回调是每 64 次模拟才触发一次 ——
+    // 结果一条 `info` 都不打印，紧接着的无限分析等待会让引擎在 GUI 里彻底静默。
+    // 所以这里**兜底补一条**最终 info：无论搜索是怎么结束的，GUI 总能看到结果。
+    if last_reported_nodes != Some(result.simulations) {
+        print_search_info(&report, started);
+        flush();
     }
     // 无限分析在收到 stop 前不发 bestmove；证明终局后等待。
     while params.infinite && !stop.load(Ordering::Relaxed) {
