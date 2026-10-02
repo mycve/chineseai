@@ -23,6 +23,13 @@ const DEFAULT_FPU_VALUE: f32 = 0.23;
 const DEFAULT_FPU_VALUE_AT_ROOT: f32 = 1.0;
 const DEFAULT_POLICY_SOFTMAX_TEMP: f32 = 1.4;
 const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
+/// 对局/分析时默认开启的连杀证明深度：15 半回合 = 最多 mate in 8。
+///
+/// 与自博弈配置默认的 9 不同，因为 UCI 这边是"人看着的强度/分析"，而自博弈还要考虑
+/// 吞吐。代价实测：根局面没有将军着法时为 0；有将军但无杀时中局 7.31 → 12.52ms
+/// （800 sims）；真出杀时一次证明约 31ms（mate-in-8 / 58,178 节点）——那时它直接赢棋。
+/// 想省时间可以 `setoption name MateSearchPlies value 0`。
+const DEFAULT_MATE_SEARCH_PLIES: usize = 15;
 
 #[derive(Clone)]
 struct UciState {
@@ -49,6 +56,8 @@ struct UciState {
     rule60_max_ply: u16,
     seed: u64,
     multipv: usize,
+    /// 根节点连杀证明的最大半回合数（0 = 关闭）。改动会重置模型，下次 `go` 时按新值加载。
+    mate_search_plies: usize,
 }
 
 impl Default for UciState {
@@ -77,6 +86,7 @@ impl Default for UciState {
             rule60_max_ply: 120,
             seed: 20260409,
             multipv: 1,
+            mate_search_plies: DEFAULT_MATE_SEARCH_PLIES,
         }
     }
 }
@@ -176,6 +186,9 @@ fn print_uci_id() {
     println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
+    println!(
+        "option name MateSearchPlies type spin default {DEFAULT_MATE_SEARCH_PLIES} min 0 max 31"
+    );
     println!("uciok");
     flush();
 }
@@ -184,16 +197,18 @@ fn ensure_model(state: &mut UciState) {
     if state.model.is_some() {
         return;
     }
-    state.model = Some(Arc::new(AzNnue::load(&state.eval_file).unwrap_or_else(
-        |err| {
-            println!(
-                "info string failed to load {}, using random model: {}",
-                state.eval_file, err
-            );
-            flush();
-            AzNnue::random(128, state.seed)
-        },
-    )));
+    let mut model = AzNnue::load(&state.eval_file).unwrap_or_else(|err| {
+        println!(
+            "info string failed to load {}, using random model: {}",
+            state.eval_file, err
+        );
+        flush();
+        AzNnue::random(128, state.seed)
+    });
+    // 连杀预算挂模型上。在这里设一次，而不是每次 `go` 都克隆一份打了补丁的模型：
+    // 45MB 级的模型克隆在快棋里是要命的。
+    model.mate_search_plies = state.mate_search_plies;
+    state.model = Some(Arc::new(model));
 }
 
 fn handle_setoption(line: &str, state: &mut UciState) {
@@ -218,6 +233,15 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         }
         "evalfile" => {
             state.eval_file = value;
+            state.model = None;
+        }
+        // 连杀预算是模型上的搜索参数，所以这里跟 `evalfile` 一样重置模型（懒加载）：
+        // 下次 `go` 时按新值设好，搜索过程中就不需要为每一手克隆整份模型。
+        "matesearchplies" => {
+            state.mate_search_plies = value
+                .parse::<usize>()
+                .unwrap_or(state.mate_search_plies)
+                .min(31);
             state.model = None;
         }
         "simulations" => {
@@ -492,22 +516,27 @@ fn mate_search_plies_for(moves: usize) -> usize {
     }
 }
 
+/// 本次搜索实际使用的连杀深度：`go mate N` 优先，否则用 UCI 选项 `MateSearchPlies`。
+fn resolved_mate_plies(option: usize, params: &GoParams) -> usize {
+    params.mate.map_or(option.min(31), mate_search_plies_for)
+}
+
 fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
     let loaded = state.model.as_ref().expect("model was loaded");
-    // `go mate N`：把根节点连杀证明开到 2N-1 半回合（N=0 表示不限，取 31 半回合 = mate in 16）。
-    // 连杀预算是模型上的搜索参数（`AzNnue::mate_search_plies`），所以这里按需克隆一份打完补丁的
-    // 模型给本次搜索用；普通 `go` 走 `None` 分支、不付任何代价。
+    // 连杀深度：`go mate N` 临时覆盖 UCI 选项 `MateSearchPlies`。
+    // 选项的值在 `ensure_model` 里已经写进模型，所以普通 `go` 走"相等"分支、**不克隆**；
+    // 只有 `go mate N` 与模型当前值不同时才克隆一份给本次搜索用。
+    let mate_plies = resolved_mate_plies(state.mate_search_plies, &params);
     let patched;
-    let model: &AzNnue = match params.mate {
-        Some(moves) => {
-            patched = {
-                let mut patched = (**loaded).clone();
-                patched.mate_search_plies = mate_search_plies_for(moves);
-                patched
-            };
-            &patched
-        }
-        None => loaded,
+    let model: &AzNnue = if mate_plies == loaded.mate_search_plies {
+        loaded
+    } else {
+        patched = {
+            let mut patched = (**loaded).clone();
+            patched.mate_search_plies = mate_plies;
+            patched
+        };
+        &patched
     };
 
     let mut legal = uci_root_moves(&state.position, &state.rule_history);
@@ -824,6 +853,38 @@ mod tests {
         assert_eq!(mate_search_plies_for(5), 9);
         assert_eq!(mate_search_plies_for(8), 15);
         assert_eq!(mate_search_plies_for(0), 31);
+    }
+
+    /// 对局中必须**默认**就开连杀证明（UCI 选项 `MateSearchPlies`），否则普通 `go`
+    /// 会退化成纯 MCTS、在 mate-in-8 那类局面上找不到杀；`go mate N` 只做临时覆盖。
+    #[test]
+    fn mate_search_default_is_on_and_option_round_trips() {
+        let mut state = UciState::default();
+        assert_eq!(state.mate_search_plies, 15, "UCI 默认应是 mate in 8");
+        assert_eq!(
+            resolved_mate_plies(state.mate_search_plies, &parse_go("go movetime 1000")),
+            15,
+            "普通 go 用选项值"
+        );
+        assert_eq!(
+            resolved_mate_plies(state.mate_search_plies, &parse_go("go infinite")),
+            15
+        );
+        assert_eq!(
+            resolved_mate_plies(state.mate_search_plies, &parse_go("go mate 5")),
+            9,
+            "go mate N 临时覆盖"
+        );
+
+        handle_setoption("setoption name MateSearchPlies value 0", &mut state);
+        assert_eq!(state.mate_search_plies, 0, "可以关掉");
+        assert!(state.model.is_none(), "改动要重置模型以便下次按新值加载");
+        assert_eq!(
+            resolved_mate_plies(state.mate_search_plies, &parse_go("go movetime 1000")),
+            0
+        );
+        handle_setoption("setoption name MateSearchPlies value 99", &mut state);
+        assert_eq!(state.mate_search_plies, 31, "上限 clamp 到 31");
     }
 
     #[test]
