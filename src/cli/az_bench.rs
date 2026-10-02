@@ -13,6 +13,7 @@ pub(crate) fn run(cmd: AzBenchArgs) {
         panic!("failed to load `{model_path}`: {err}");
     });
     model.mate_search_plies = cmd.mate_search_plies;
+    model.mate_search_nodes = cmd.mate_search_nodes.max(1);
 
     let _ = alphazero_search(
         &position,
@@ -45,6 +46,7 @@ pub(crate) fn run(cmd: AzBenchArgs) {
     println!("cpuct        : {cpuct}");
 
     println!("mate_plies   : {}", model.mate_search_plies);
+    println!("mate_nodes   : {}", model.mate_search_nodes);
     println!("total_sims   : {total_sims}");
     println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
     println!(

@@ -315,6 +315,9 @@ pub(crate) struct AzBenchArgs {
     /// 打开根节点 check-only 连杀证明搜索，值为最大半回合数（0 = 关闭，15 = 最多 mate in 8 手）。
     #[arg(long, default_value_t = 0)]
     pub(crate) mate_search_plies: usize,
+    /// 连杀证明的节点预算（用延迟换可证深度）：默认 20 万只够 mate-in-8。
+    #[arg(long, default_value_t = 200_000)]
+    pub(crate) mate_search_nodes: usize,
     /// FEN string, or startpos if omitted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(crate) fen: Vec<String>,

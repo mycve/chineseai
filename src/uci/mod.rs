@@ -30,6 +30,10 @@ const DEFAULT_OPENING_TEMPERATURE: f32 = 0.0;
 /// （800 sims）；真出杀时一次证明约 31ms（mate-in-8 / 58,178 节点）——那时它直接赢棋。
 /// 想省时间可以 `setoption name MateSearchPlies value 0`。
 const DEFAULT_MATE_SEARCH_PLIES: usize = 15;
+/// 连杀证明的节点预算默认值，与 `AzNnue::mate_search_nodes` 的出厂值保持一致。
+///
+/// 20 万覆盖实测的 mate-in-8（58,178 节点），同时是"最坏情况花多少时间"的硬兜底。
+const DEFAULT_MATE_SEARCH_NODES: usize = 200_000;
 
 #[derive(Clone)]
 struct UciState {
@@ -58,6 +62,11 @@ struct UciState {
     multipv: usize,
     /// 根节点连杀证明的最大半回合数（0 = 关闭）。改动会重置模型，下次 `go` 时按新值加载。
     mate_search_plies: usize,
+    /// 根节点连杀证明的节点预算。改动同样会重置模型。
+    ///
+    /// 这是"用延迟换可证深度"的唯一旋钮：默认 20 万只够证出 mate-in-8（实测 58,178 节点），
+    /// 更长的连杀需要更大的预算，代价线性体现在每手耗时上。
+    mate_search_nodes: usize,
 }
 
 impl Default for UciState {
@@ -87,6 +96,7 @@ impl Default for UciState {
             seed: 20260409,
             multipv: 1,
             mate_search_plies: DEFAULT_MATE_SEARCH_PLIES,
+            mate_search_nodes: DEFAULT_MATE_SEARCH_NODES,
         }
     }
 }
@@ -189,6 +199,9 @@ fn print_uci_id() {
     println!(
         "option name MateSearchPlies type spin default {DEFAULT_MATE_SEARCH_PLIES} min 0 max 31"
     );
+    println!(
+        "option name MateSearchNodes type spin default {DEFAULT_MATE_SEARCH_NODES} min 1 max 100000000"
+    );
     println!("uciok");
     flush();
 }
@@ -208,6 +221,7 @@ fn ensure_model(state: &mut UciState) {
     // 连杀预算挂模型上。在这里设一次，而不是每次 `go` 都克隆一份打了补丁的模型：
     // 45MB 级的模型克隆在快棋里是要命的。
     model.mate_search_plies = state.mate_search_plies;
+    model.mate_search_nodes = state.mate_search_nodes;
     state.model = Some(Arc::new(model));
 }
 
@@ -242,6 +256,15 @@ fn handle_setoption(line: &str, state: &mut UciState) {
                 .parse::<usize>()
                 .unwrap_or(state.mate_search_plies)
                 .min(31);
+            state.model = None;
+        }
+        // 连杀证明的节点预算：唯一的"用延迟换深度"旋钮。
+        // 默认 20 万只够 mate-in-8；想证更长的杀就调大（代价线性体现在每手耗时上）。
+        "matesearchnodes" => {
+            state.mate_search_nodes = value
+                .parse::<usize>()
+                .unwrap_or(state.mate_search_nodes)
+                .max(1);
             state.model = None;
         }
         "simulations" => {
@@ -631,6 +654,7 @@ fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
             print_high_score_source(&report, proven);
         }
     }
+    print_mate_diagnostic(&report);
     // 搜索可能在第一轮模拟之前就已经被"证明"了（连杀证明、规则终局、唯一合法着法……），
     // 那样 `search_uci` 的循环一进去就 break，而进度回调是每 64 次模拟才触发一次 ——
     // 结果一条 `info` 都不打印，紧接着的无限分析等待会让引擎在 GUI 里彻底静默。
@@ -716,6 +740,20 @@ fn print_high_score_source(report: &AzUciSearchResult, proven: bool) {
             "value-estimate"
         }
     );
+}
+
+/// 根节点连杀证明的诊断。
+///
+/// 三种结果都打印，且只在最终结果时打印一次：
+/// - `source=search-proof`：证出连杀（含手数、半回合数、耗时节点数）；
+/// - `source=no-mate`：在给定深度内确实没有连杀；
+/// - `source=node-budget`：预算撞墙，**没找到不代表没有**——调大 `MateSearchNodes` 再看。
+///
+/// 此前这三种情况在 GUI 里完全无法区分（都只是"什么都没发生"）。
+fn print_mate_diagnostic(report: &AzUciSearchResult) {
+    if let Some(mate) = report.search.mate_search {
+        println!("info string {}", mate.uci_diagnostic());
+    }
 }
 
 fn print_search_info(report: &AzUciSearchResult, started: Instant) {
@@ -897,6 +935,25 @@ mod tests {
         );
         handle_setoption("setoption name MateSearchPlies value 99", &mut state);
         assert_eq!(state.mate_search_plies, 31, "上限 clamp 到 31");
+    }
+
+    /// `MateSearchNodes` 是"用延迟换可证深度"的旋钮：必须能设置、必须有下限、改了要重置模型。
+    #[test]
+    fn mate_search_nodes_option_round_trips() {
+        let mut state = UciState::default();
+        assert_eq!(state.mate_search_nodes, 200_000, "默认覆盖实测的 mate-in-8");
+
+        handle_setoption("setoption name MateSearchNodes value 2000000", &mut state);
+        assert_eq!(state.mate_search_nodes, 2_000_000);
+        assert!(state.model.is_none(), "改动要重置模型以便下次按新值加载");
+
+        handle_setoption("setoption name MateSearchNodes value 0", &mut state);
+        assert_eq!(state.mate_search_nodes, 1, "0 属于无效值，clamp 到 1");
+
+        // 解析失败必须保留**当前**值，而不是回落到出厂默认。
+        handle_setoption("setoption name MateSearchNodes value 500000", &mut state);
+        handle_setoption("setoption name MateSearchNodes value garbage", &mut state);
+        assert_eq!(state.mate_search_nodes, 500_000, "解析失败保留原值");
     }
 
     #[test]

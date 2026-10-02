@@ -657,10 +657,16 @@ pub struct AzNnue {
     ///
     /// 建议：**自博弈/数据生成用 9**（把可证射程从 mate-in-4 推到 mate-in-5，成本被深度上限兜住）；
     /// **分析、UCI `go mate N`、高预算评测用 15~17**（那个 mate-in-8 需要 15）。
-    /// 要再压成本就给 `mate.rs` 加置换表——当前没有置换表、也没有着法排序。
+    ///
+    /// 想证更长的杀只能加预算（[`Self::mate_search_nodes`]）：置换表和着法排序都实测过，
+    /// 在 check-only 树上没有收益，原因记在 `mate.rs` 的模块注释里。
     pub mate_search_plies: usize,
     /// 连杀证明搜索的全局节点预算上限。默认 20 万覆盖实测的 mate-in-8（58,178 节点），
     /// 同时是"最坏情况花多少时间"的硬兜底。
+    ///
+    /// UCI 侧对应 `MateSearchNodes`。实测抽帧库最坏的中局局面在 depth=31 下要 **656,431**
+    /// 节点才能判"无杀"（约 380ms）；把预算开到 2,000,000 就能让它走到结论，代价是这一手
+    /// 慢 10 倍。预算撞墙时会打印 `info string mate ... source=node-budget`。
     pub mate_search_nodes: usize,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     pub(super) gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,

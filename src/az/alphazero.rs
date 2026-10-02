@@ -115,6 +115,8 @@ pub struct AzSearchResult {
     pub search_depth_max: usize,
     pub search_depth_limit: usize,
     pub search_depth_cutoffs: usize,
+    /// 根节点连杀证明的诊断报告；`None` = 本次搜索没有跑证明（`mate_search_plies == 0`）。
+    pub mate_search: Option<mate::MateSearchReport>,
     pub candidates: Vec<AzCandidate>,
 }
 
@@ -298,6 +300,7 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             search_depth_max: 0,
             search_depth_limit: tree.max_depth,
             search_depth_cutoffs: 0,
+            mate_search: None,
             candidates: Vec::new(),
         };
     }
@@ -481,6 +484,8 @@ struct AzTree<'a> {
     search_depth_cutoffs: usize,
     eval_scratch: AzEvalScratch,
     rule_history_scratch: Vec<RuleHistoryEntry>,
+    /// 最近一次根节点连杀证明的报告（只在 `prove_root_mate` 里写）。
+    last_mate_search: Option<mate::MateSearchReport>,
 }
 
 #[derive(Clone)]
@@ -605,6 +610,7 @@ impl<'a> AzTree<'a> {
             search_depth_max: self.search_depth_max,
             search_depth_limit: self.max_depth,
             search_depth_cutoffs: self.search_depth_cutoffs,
+            mate_search: self.last_mate_search,
             candidates,
         }
     }
@@ -807,6 +813,7 @@ impl<'a> AzTree<'a> {
             search_depth_cutoffs: 0,
             eval_scratch,
             rule_history_scratch,
+            last_mate_search: None,
         }
     }
 
@@ -1515,14 +1522,23 @@ impl<'a> AzTree<'a> {
             return;
         }
         crate::scope_profile!("az.search.root_mate");
-        let Some(solution) = mate::search_root_mate(
+        let outcome = mate::search_root_mate_profiled(
             position,
             &self.rule_history_scratch,
             mate::MateSearchLimits {
                 max_plies: model.mate_search_plies,
                 max_nodes: model.mate_search_nodes,
             },
-        ) else {
+        );
+        // 报告写进搜索树，UCI 层再取出来打印：这样"证出来了 / 没杀 / 预算撞墙"
+        // 三种情况在 GUI 里可区分，而不是都表现为"什么都没发生"。
+        self.last_mate_search = Some(mate::MateSearchReport {
+            max_plies: model.mate_search_plies,
+            nodes: outcome.nodes,
+            budget_exhausted: outcome.budget_exhausted,
+            solution: outcome.solution,
+        });
+        let Some(solution) = outcome.solution else {
             return;
         };
         let Some(index) = self
