@@ -75,6 +75,13 @@ pub(crate) const WDL_HEAD_SIZE: usize = 3;
 /// high-dimensional history planes: rules stay in the environment, while the
 /// network only gets enough context to recognize an approaching repetition.
 pub const RULE_CONTEXT_SIZE: usize = 7;
+/// 引擎**已经算过、却一直没喂给模型**的那几个信号的维度。
+///
+/// 都是每节点一次就能拿到的量：`is_in_check`（搜索本来就在算，算完就扔）、将军着法数
+/// （`policy_gives_check` 本来就无条件算）、双方将的安全逃格数 / 九宫被攻击格数
+/// （都只是对已经算好的 `attacked_squares_masks` 做几次位测 + popcount）、机动性。
+/// 归一化后作为标量块加到主干上，用来给"杀势"这类整体态势一个直接入口。
+pub const CHECK_CONTEXT_SIZE: usize = 8;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(crate) const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(crate) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;

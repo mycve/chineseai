@@ -52,6 +52,21 @@ pub(crate) fn load_candle_f32_tensor(
         .map_err(candle_io_error)
 }
 
+/// 读一个**可选**张量：旧 checkpoint 里没有它时按 `expected` 个零补齐。
+///
+/// 这是"加新输入块又不作废已有 checkpoint"的关键：缺张量 ⇒ 全零 ⇒ 该块在评估路径里
+/// 被整体跳过 ⇒ 老模型逐位不变。新模型训练后张量非零，就自动启用。
+pub(crate) fn load_candle_f32_tensor_or_zeros(
+    tensors: &candle_core::safetensors::MmapedSafetensors,
+    name: &str,
+    expected: usize,
+) -> io::Result<Vec<f32>> {
+    if tensors.get(name).is_err() {
+        return Ok(vec![0.0; expected]);
+    }
+    load_candle_f32_tensor(tensors, name)
+}
+
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h]);
@@ -60,6 +75,7 @@ macro_rules! az_weight_tensors {
         $visit!(input_file_hidden, [STRUCTURAL_FILE_SIZE, $h]);
         $visit!(input_king_piece_hidden, [STRUCTURAL_KING_PIECE_SIZE, $h]);
         $visit!(rule_context_hidden, [RULE_CONTEXT_SIZE, $h]);
+        $visit!(check_context_hidden, [CHECK_CONTEXT_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
@@ -592,6 +608,13 @@ pub struct AzNnue {
     pub input_file_hidden: Vec<f32>,
     pub input_king_piece_hidden: Vec<f32>,
     pub rule_context_hidden: Vec<f32>,
+    /// "引擎已经算过、却没喂给模型"的标量块（见 `CHECK_CONTEXT_SIZE`）。
+    ///
+    /// **向后兼容**：这个张量在旧 checkpoint 里不存在，`load` 会按全零补齐并把
+    /// `check_context_active` 置 false，此时评估路径完全跳过它 —— 老模型逐位不变。
+    /// 全零初始化同样让新模型一开始是中性的，梯度会像 `rule_context_hidden` 那样
+    /// 把它学出来；一旦非零就自动启用，不需要额外的配置开关。
+    pub check_context_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
@@ -618,6 +641,8 @@ pub struct AzNnue {
     pub(crate) policy_tactical_folded: Vec<f32>,
     pub(crate) value_threat_active: bool,
     pub(crate) policy_tactical_active: bool,
+    /// `check_context_hidden` 是否非零（全零 = 老 checkpoint 或尚未训练出来 ⇒ 整块跳过）。
+    pub(crate) check_context_active: bool,
     /// 打开后策略头的 `destination_attacked/defended` 取**走完这步之后**的精确值
     /// （`Position::is_square_attacked_after_move` 的虚拟占位查询），而不是走前攻击
     /// 位板上的对应位。走前位板在两种情况下与真值不同：`from` 腾空让炮失去炮架或
@@ -669,6 +694,7 @@ impl Clone for AzNnue {
             input_file_hidden: self.input_file_hidden.clone(),
             input_king_piece_hidden: self.input_king_piece_hidden.clone(),
             rule_context_hidden: self.rule_context_hidden.clone(),
+            check_context_hidden: self.check_context_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
@@ -695,6 +721,7 @@ impl Clone for AzNnue {
             policy_tactical_folded: self.policy_tactical_folded.clone(),
             value_threat_active: self.value_threat_active,
             policy_tactical_active: self.policy_tactical_active,
+            check_context_active: self.check_context_active,
             policy_tactical_exact_after_move: self.policy_tactical_exact_after_move,
             mate_search_plies: self.mate_search_plies,
             mate_search_nodes: self.mate_search_nodes,
@@ -707,6 +734,110 @@ impl Clone for AzNnue {
 pub(crate) struct AzEvalOutput {
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
+}
+
+    /// 九宫的 9 个格子（按颜色）。
+fn palace_mask(color: Color) -> u128 {
+    let ranks: [usize; 3] = match color {
+        Color::Red => [7, 8, 9],
+        Color::Black => [0, 1, 2],
+    };
+    let mut mask = 0u128;
+    for rank in ranks {
+        for file in 3..=5 {
+            mask |= 1u128 << (rank * BOARD_FILES + file);
+        }
+    }
+    mask
+}
+
+/// 同线且中间全空（用于飞将判断）。
+fn file_clear_between(position: &Position, a: usize, b: usize) -> bool {
+    let file = a % BOARD_FILES;
+    if b % BOARD_FILES != file {
+        return false;
+    }
+    let (ra, rb) = (a / BOARD_FILES, b / BOARD_FILES);
+    let (start, end) = if ra < rb { (ra + 1, rb) } else { (rb + 1, ra) };
+    (start..end).all(|rank| position.piece_at(rank * BOARD_FILES + file).is_none())
+}
+
+/// `color` 的将还有几个**安全逃格**：宫内相邻、不被己方子挡住、不被 `attacker_mask` 覆盖、
+/// 且走进去不会与对方将照面。
+///
+/// 0 就是"杀网已经成形"。这里用对方攻击位板做判定，正好复用策略头已经算好的那张位板。
+fn king_safe_escapes(position: &Position, color: Color, attacker_mask: u128) -> usize {
+    let Some(king) = position.general_square(color) else {
+        return 0;
+    };
+    let enemy_king = position.general_square(color.opposite());
+    let file = king % BOARD_FILES;
+    let rank = king / BOARD_FILES;
+    let mut safe = 0usize;
+    for (df, dr) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+        let nf = file as i32 + df;
+        let nr = rank as i32 + dr;
+        if !(3..=5).contains(&nf) {
+            continue;
+        }
+        let rank_ok = match color {
+            Color::Red => (7..=9).contains(&nr),
+            Color::Black => (0..=2).contains(&nr),
+        };
+        if !rank_ok {
+            continue;
+        }
+        let square = nr as usize * BOARD_FILES + nf as usize;
+        if position
+            .piece_at(square)
+            .is_some_and(|piece| piece.color == color)
+        {
+            continue;
+        }
+        if attacker_mask & (1u128 << square) != 0 {
+            continue;
+        }
+        if enemy_king.is_some_and(|enemy| {
+            enemy % BOARD_FILES == square % BOARD_FILES
+                && file_clear_between(position, enemy, square)
+        }) {
+            continue;
+        }
+        safe += 1;
+    }
+    safe
+}
+
+/// 引擎**已经算过、却一直没喂给模型**的 8 个标量。全部来自调用方已经算好的量：
+/// `gives_check`（`fill_policy_gives_checks` 本来就无条件算）、`masks`（策略头本来就要的
+/// 全盘攻击位板）、`moves.len()`（调用方手里就有）。
+
+pub(crate) fn check_context_features(
+    position: &Position,
+    moves: &[Move],
+    gives_check: &[f32],
+    masks: [u128; 2],
+) -> [f32; CHECK_CONTEXT_SIZE] {
+    let side = position.side_to_move();
+    let enemy = side.opposite();
+    let own_attacks = masks[color_index(side)];
+    let enemy_attacks = masks[color_index(enemy)];
+    let checks = gives_check.iter().filter(|&&flag| flag != 0.0).count();
+    // 缺少将位（理论上不该出现）时不问 in_check，避免它的 expect 崩掉。
+    let in_check = position.general_square(side).is_some_and(|_| position.in_check(side));
+    let enemy_escapes = king_safe_escapes(position, enemy, own_attacks);
+    let our_escapes = king_safe_escapes(position, side, enemy_attacks);
+    [
+        f32::from(in_check),
+        (checks as f32 / 4.0).min(1.0),
+        (enemy_escapes as f32 / 4.0).min(1.0),
+        (our_escapes as f32 / 4.0).min(1.0),
+        ((own_attacks & palace_mask(enemy)).count_ones() as f32 / 9.0).min(1.0),
+        ((enemy_attacks & palace_mask(side)).count_ones() as f32 / 9.0).min(1.0),
+        (moves.len() as f32 / 64.0).min(1.0),
+        // 线性层拼不出这个交互："我有将军着法、而对方的将几乎没有安全逃格"。
+        f32::from(checks > 0 && enemy_escapes <= 1),
+    ]
 }
 
 impl AzNnue {
@@ -727,6 +858,8 @@ impl AzNnue {
         let input_king_piece_hidden = vec![0.0; STRUCTURAL_KING_PIECE_SIZE * hidden_size];
         // Start history-neutral; rule context is learned from self-play.
         let rule_context_hidden = vec![0.0; RULE_CONTEXT_SIZE * hidden_size];
+        // 同样从零开始：新模型一开始不依赖它，梯度再把它学出来。
+        let check_context_hidden = vec![0.0; CHECK_CONTEXT_SIZE * hidden_size];
         let hidden_bias = vec![0.0; hidden_size];
         // Start value-neutral. A random value head can evaluate startpos as a
         // large red/black advantage before any training, and MCTS amplifies
@@ -772,6 +905,7 @@ impl AzNnue {
             input_file_hidden,
             input_king_piece_hidden,
             rule_context_hidden,
+            check_context_hidden,
             hidden_bias,
             value_head_hidden,
             value_head_bias,
@@ -798,6 +932,7 @@ impl AzNnue {
             policy_tactical_folded: Vec::new(),
             value_threat_active: false,
             policy_tactical_active: false,
+            check_context_active: false,
             policy_tactical_exact_after_move: false,
             mate_search_plies: 0,
             mate_search_nodes: 200_000,
@@ -805,6 +940,7 @@ impl AzNnue {
         };
         model.rebuild_policy_cache();
         model.rebuild_value_threat();
+        model.rebuild_check_context();
         model
     }
 
@@ -943,6 +1079,12 @@ impl AzNnue {
             input_file_hidden: load_candle_f32_tensor(&tensors, "input_file_hidden")?,
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             rule_context_hidden: load_candle_f32_tensor(&tensors, "rule_context_hidden")?,
+            // 可选：旧 checkpoint 没有这个张量 ⇒ 全零 ⇒ 该块被跳过，老模型逐位不变。
+            check_context_hidden: load_candle_f32_tensor_or_zeros(
+                &tensors,
+                "check_context_hidden",
+                CHECK_CONTEXT_SIZE * hidden_size,
+            )?,
             hidden_bias,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
@@ -972,6 +1114,7 @@ impl AzNnue {
             policy_tactical_folded: Vec::new(),
             value_threat_active: false,
             policy_tactical_active: false,
+            check_context_active: false,
             policy_tactical_exact_after_move: false,
             mate_search_plies: 0,
             mate_search_nodes: 200_000,
@@ -979,6 +1122,7 @@ impl AzNnue {
         };
         model.rebuild_policy_cache();
         model.rebuild_value_threat();
+        model.rebuild_check_context();
         model.rebuild_policy_tactical();
         model.validate()?;
         Ok(model)
@@ -1066,6 +1210,20 @@ impl AzNnue {
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
             self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
         }
+        // "引擎已经算过、却没喂给模型"的标量块。全零时（旧 checkpoint 或还没训练出来）
+        // 整段跳过，评估路径与加这块之前逐位一致。
+        scratch.policy_inputs_ready = false;
+        if self.check_context_active {
+            crate::scope_profile!("az.eval.check_context");
+            self.fill_policy_inputs(position, moves, scratch, true);
+            let context = check_context_features(
+                position,
+                moves,
+                &scratch.policy_gives_check,
+                scratch.attack_masks,
+            );
+            self.add_check_context_to_hidden(&context, &mut scratch.hidden);
+        }
         scratch.policy_accumulator_context =
             self.policy_accumulator(position, position.side_to_move());
         {
@@ -1116,6 +1274,19 @@ impl AzNnue {
         };
         scratch.hidden.copy_from_slice(hidden);
         self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
+        // 与全量评估同一条标量块路径（见上面 `evaluate_with_scratch_output_with_repetition`）。
+        scratch.policy_inputs_ready = false;
+        if self.check_context_active {
+            crate::scope_profile!("az.eval.check_context");
+            self.fill_policy_inputs(position, moves, scratch, true);
+            let context = check_context_features(
+                position,
+                moves,
+                &scratch.policy_gives_check,
+                scratch.attack_masks,
+            );
+            self.add_check_context_to_hidden(&context, &mut scratch.hidden);
+        }
         scratch
             .policy_accumulator_context
             .copy_from_slice(policy_accumulator);
@@ -1174,11 +1345,16 @@ impl AzNnue {
         let move_map = move_map();
         let side = position.side_to_move();
         let king_buckets = canonical_buckets_for_perspective(position, side);
-        self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
-        let attack_masks = self
-            .policy_tactical_active
-            .then(|| position.attacked_squares_masks())
-            .unwrap_or_default();
+        // 主干之前如果已经算过（标量块需要），这里直接复用，避免同一个局面算两遍：
+        // 提前算的总工作量不变，只是把它挪到主干之前。
+        if !scratch.policy_inputs_ready {
+            self.fill_policy_inputs(position, moves, scratch, self.policy_tactical_active);
+        }
+        let attack_masks = if self.policy_tactical_active {
+            scratch.attack_masks
+        } else {
+            [0u128; 2]
+        };
         let opponent_attacks = attack_masks[color_index(side.opposite())];
         let own_attacks = attack_masks[color_index(side)];
         let repetition_logit = dot_product(&scratch.hidden, &self.policy_repetition_hidden)
@@ -1296,6 +1472,7 @@ impl AzNnue {
     }
 
     #[inline]
+
     pub(crate) fn add_rule_context_to_hidden(
         &self,
         rule_context: &[f32; RULE_CONTEXT_SIZE],
@@ -1311,6 +1488,42 @@ impl AzNnue {
                 *target += value * weight;
             }
         }
+    }
+
+    /// 把"引擎已经算过、却没喂给模型"的标量块加到主干上。
+    pub(crate) fn add_check_context_to_hidden(
+        &self,
+        check_context: &[f32; CHECK_CONTEXT_SIZE],
+        hidden: &mut [f32],
+    ) {
+        for (feature, &value) in check_context.iter().enumerate() {
+            if value == 0.0 {
+                continue;
+            }
+            let row = &self.check_context_hidden
+                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
+            for (target, &weight) in hidden.iter_mut().zip(row) {
+                *target += value * weight;
+            }
+        }
+    }
+
+    /// 在主干之前把"每走法将军 flag + 双方攻击位板"算好一次，供标量块与策略头共用。
+    ///
+    /// 这两样东西策略头本来就要算（位板受 `policy_tactical_active` 门控、flag 无条件），
+    /// 而标量块需要在主干之前用它们，所以只能提前算：总工作量不变，只是把顺序挪前。
+    pub(crate) fn fill_policy_inputs(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        scratch: &mut AzEvalScratch,
+        with_masks: bool,
+    ) {
+        self.fill_policy_gives_checks(position, moves, &mut scratch.policy_gives_check);
+        if with_masks {
+            scratch.attack_masks = position.attacked_squares_masks();
+        }
+        scratch.policy_inputs_ready = true;
     }
 
     pub(crate) fn add_factorized_structure_into(&self, features: &[usize], hidden: &mut [f32]) {
@@ -1580,6 +1793,11 @@ impl AzNnue {
                 .policy_threat_context
                 .iter()
                 .any(|&weight| weight != 0.0);
+    }
+
+    /// 全零（旧 checkpoint / 还没训练出来）时整块跳过，评估路径与加这个块之前完全一致。
+    pub(crate) fn rebuild_check_context(&mut self) {
+        self.check_context_active = self.check_context_hidden.iter().any(|&weight| weight != 0.0);
     }
 
     pub(crate) fn rebuild_policy_tactical(&mut self) {

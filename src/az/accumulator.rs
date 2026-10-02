@@ -17,6 +17,12 @@ pub(crate) struct AzEvalScratch {
     pub(crate) value_threat_accumulator: Vec<f32>,
     pub(crate) value_threat_activation: Vec<f32>,
     pub(crate) policy_gives_check: Vec<f32>,
+    /// 本节点的双方攻击位板。主干之前的标量块与策略头的战术块共用同一份，
+    /// 避免为同一个局面算两遍。
+    pub(crate) attack_masks: [u128; 2],
+    /// `policy_gives_check` / `attack_masks` 是否已经是**当前局面**的值。
+    /// 与 `scratch` 跨节点复用的做法配合：每次评估开头清零。
+    pub(crate) policy_inputs_ready: bool,
     pub(crate) logits: Vec<f32>,
     pub(crate) priors: Vec<f32>,
 }
@@ -35,6 +41,8 @@ impl AzEvalScratch {
             value_threat_accumulator: vec![0.0; VALUE_THREAT_RANK],
             value_threat_activation: vec![0.0; VALUE_THREAT_RANK * 2],
             policy_gives_check: Vec::with_capacity(192),
+            attack_masks: [0u128; 2],
+            policy_inputs_ready: false,
             logits: Vec::with_capacity(192),
             priors: Vec::with_capacity(192),
         }
@@ -52,6 +60,8 @@ impl AzEvalScratch {
             value_threat_accumulator: Vec::new(),
             value_threat_activation: Vec::new(),
             policy_gives_check: Vec::new(),
+            attack_masks: [0u128; 2],
+            policy_inputs_ready: false,
             logits: Vec::new(),
             priors: Vec::new(),
         }

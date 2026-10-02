@@ -3,13 +3,13 @@ use crate::xiangqi::{BOARD_SIZE, Color, Move, Position, color_index};
 
 use super::{
     AzArenaReport, AzEvalAccumulator, AzEvalScratch, AzExperiencePool, AzNnue, AzNnueArch,
-    AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
-    MateSearchLimits,
+    AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, CHECK_CONTEXT_SIZE,
+    DENSE_MOVE_SPACE, MateSearchLimits,
     POLICY_ACCUMULATOR_RANK, POLICY_CACHE_PIECE_SIZE, POLICY_CAPTURE_RELATION_OFFSET,
     POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_SIZE,
     RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64, VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB,
     VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE, alphazero_search_with_rules,
-    dense_move_index, dense_move_squares, evaluate_policy_groups, move_map,
+    check_context_features, dense_move_index, dense_move_squares, evaluate_policy_groups, move_map,
     policy_cache_capture_index, policy_cache_main_index, policy_consequence_features,
     policy_move_tactical_flags, policy_sparse_capture_index,
     policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
@@ -1249,6 +1249,125 @@ fn root_mate_proof_drives_search_result() {
     );
     assert!(plain.candidates.iter().all(|c| c.solved.is_none()));
     assert_ne!(plain.value_wdl, [1.0, 0.0, 0.0]);
+}
+
+/// 标量块的内容：startpos 上必须全是"中性"值，mate-in-1 局面必须直接暴露杀势。
+#[test]
+fn check_context_features_describe_check_and_mate_net() {
+    let flags = |position: &Position| {
+        position
+            .legal_moves()
+            .iter()
+            .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
+            .collect::<Vec<_>>()
+    };
+
+    // startpos：不被将军、没有将军着法、双方将都还有 4 个安全逃格、九宫没被攻击。
+    let startpos = Position::startpos();
+    let moves = startpos.legal_moves();
+    let context = check_context_features(
+        &startpos,
+        &moves,
+        &flags(&startpos),
+        startpos.attacked_squares_masks(),
+    );
+    assert_eq!(context[0], 0.0, "startpos 不应被将军");
+    assert_eq!(context[1], 0.0, "startpos 没有将军着法");
+    // 双方将的 d/f 逃格都被自己的士占着，只剩 e 线那一格；而 e3 有红兵挡线，
+    // 所以两边都**不**构成飞将 ⇒ 各恰好 1 个安全逃格。
+    assert_eq!(context[2], 0.25, "黑将只剩 1 个安全逃格");
+    assert_eq!(context[3], 0.25, "红将只剩 1 个安全逃格");
+    assert_eq!(context[4], 0.0, "没打到对方九宫");
+    assert_eq!(context[5], 0.0, "自己九宫也没被打");
+    assert_eq!(context[7], 0.0, "没有将军着法就没有杀势");
+    assert!((context[6] - 44.0 / 64.0).abs() < 1e-6, "startpos 44 个合法着法");
+
+    // mate-in-1（黑车 a9d9 杀）：黑方有 1 个将军着法，红将只剩 1 个安全逃格（d1；
+    // e2 被飞将封住、c2 出九宫、d3 出九宫），于是"杀势"标志直接立起来。
+    let mate = Position::from_fen("r3k4/9/9/9/9/9/9/3K5/9/9 b - - 0 1").unwrap();
+    let mate_moves = mate.legal_moves();
+    let mate_context = check_context_features(
+        &mate,
+        &mate_moves,
+        &flags(&mate),
+        mate.attacked_squares_masks(),
+    );
+    assert_eq!(mate_context[0], 0.0, "走子方自己没被将军");
+    // 黑方有 2 个将军着法：车 a9d9 沿 d 线，以及将 e9d9 走成飞将。
+    assert_eq!(mate_context[1], 0.5, "2 个将军着法 / 4");
+    // 红将 d2 只有 d1 一个安全逃格：c2/d3 出九宫、e2 会被黑将飞将封住。
+    assert_eq!(mate_context[2], 0.25, "红将只剩 1 个安全逃格 / 4");
+    assert_eq!(mate_context[7], 1.0, "有将军着法 + 对方将几乎无处可逃 = 杀势");
+
+    // 被将军的一侧：把黑车摆到 d9（d 线全空），红将 d2 就被将军。
+    let in_check = Position::from_fen("3rk4/9/9/9/9/9/9/3K5/9/9 w - - 0 1").unwrap();
+    let checked_moves = in_check.legal_moves();
+    let checked_context = check_context_features(
+        &in_check,
+        &checked_moves,
+        &flags(&in_check),
+        in_check.attacked_squares_masks(),
+    );
+    assert_eq!(checked_context[0], 1.0, "红方被黑车 d9 沿 d 线将军");
+}
+
+/// 标量块必须真的进到主干：只差 `check_context_hidden` 的两个模型，价值头的输出必须不同。
+#[test]
+fn check_context_block_reaches_the_trunk_when_active() {
+    let position = Position::startpos();
+    let history = position.initial_rule_history();
+    let moves = position.legal_moves();
+
+    let mut base = AzNnue::random(16, 71);
+    // 随机初始化时 `value_head_output` 恒为 0（价值刻意中性），softmax 恒为均匀分布，
+    // 任何主干变化都观察不到；先把它打开。
+    for (index, weight) in base.value_head_output.iter_mut().enumerate() {
+        *weight = ((index % 11) as f32 + 1.0) * 1.0e-2;
+    }
+    // 全零 ⇒ 未激活 ⇒ 评估路径整段跳过它（这正是旧 checkpoint 的行为）。
+    assert!(!base.check_context_active);
+    let without_block = base.evaluate_wdl_with_rules(&position, &history, &moves);
+
+    let mut active = base.clone();
+    for (index, weight) in active.check_context_hidden.iter_mut().enumerate() {
+        *weight = ((index % 17) as f32 + 1.0) * 1.0e-3;
+    }
+    active.rebuild_check_context();
+    assert!(active.check_context_active);
+    let with_block = active.evaluate_wdl_with_rules(&position, &history, &moves);
+
+    assert!(
+        with_block
+            .iter()
+            .zip(without_block.iter())
+            .any(|(left, right)| (left - right).abs() > 1e-6),
+        "check context 没有进到主干：{with_block:?} vs {without_block:?}"
+    );
+}
+
+/// 旧 checkpoint 里没有 `check_context_hidden` 这个张量：加载时必须按全零补齐，
+/// 而不是报错。这里直接对工作区的真实 checkpoint 验证（它不进版本库，缺失就跳过）。
+#[test]
+fn missing_check_context_tensor_loads_as_zeros() {
+    let path = std::path::Path::new("best.safetensors");
+    if !path.exists() {
+        return;
+    }
+    let tensors = unsafe {
+        candle_core::safetensors::MmapedSafetensors::new(path).expect("mmap best.safetensors")
+    };
+    assert!(
+        tensors.get("check_context_hidden").is_err(),
+        "这个 checkpoint 早于标量块，不该含该张量"
+    );
+    let zeros = super::load_candle_f32_tensor_or_zeros(
+        &tensors,
+        "check_context_hidden",
+        CHECK_CONTEXT_SIZE * 128,
+    )
+    .expect("缺失张量必须按零补齐而不是报错");
+    assert_eq!(zeros.len(), CHECK_CONTEXT_SIZE * 128);
+    assert!(zeros.iter().all(|&weight| weight == 0.0));
 }
 
 /// 精确走后战术位：默认必须与旧的"走前位板"逐位一致，打开后必须改用走后真值。
