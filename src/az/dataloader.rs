@@ -420,21 +420,13 @@ impl PackedBatch {
                         consequence_to % BOARD_SIZE,
                     );
                     let check = position.gives_check_after_move_fast(mv);
-                    // 训练侧固定用走前语义（`exact_destination = false`），与
-                    // `AzNnue::policy_tactical_exact_after_move` 的默认值一致：两边必须
-                    // 共用同一个实现，否则打开推理侧开关而不重训会让特征空间错配。
+                    // 训练侧与推理侧共用同一个实现，避免两处内联公式漂移。
                     let (
                         source_attacked,
                         destination_attacked,
                         source_defended,
                         destination_defended,
-                    ) = policy_move_tactical_flags(
-                        &position,
-                        mv,
-                        opponent_attacks,
-                        own_attacks,
-                        false,
-                    );
+                    ) = policy_move_tactical_flags(mv, opponent_attacks, own_attacks);
                     let tactical_base = item_index * POLICY_TACTICAL_TERMS;
                     for (offset, tactical) in policy_tactical_indices(
                         move_index,

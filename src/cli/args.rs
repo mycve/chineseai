@@ -311,10 +311,7 @@ pub(crate) struct AzBenchArgs {
     /// PUCT constant for AlphaZero search.
     #[arg(default_value_t = 1.0)]
     pub(crate) cpuct: f32,
-    /// 策略头的 destination_attacked/defended 改用走完之后的精确值（虚拟占位查询）。
-    /// 会改变已训练模型的输入语义，仅用于 A/B 对比与重训前的评估。
-    #[arg(long)]
-    pub(crate) exact_after_move_tactical: bool,
+
     /// 打开根节点 check-only 连杀证明搜索，值为最大半回合数（0 = 关闭，15 = 最多 mate in 8 手）。
     #[arg(long, default_value_t = 0)]
     pub(crate) mate_search_plies: usize,

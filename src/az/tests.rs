@@ -1116,17 +1116,6 @@ fn evaluate_wdl_with_rules_returns_normalized_distribution() {
     );
 }
 
-/// 默认必须是"走前语义"：这个开关改变了 checkpoint 的输入特征语义，全仓唯一的设置点
-/// 是 `az-bench --exact-after-move-tactical`。这里顺带钉住 `Clone` 会保留它。
-#[test]
-fn tactical_flags_default_to_pre_move_semantics() {
-    let model = AzNnue::random(8, 5);
-    assert!(!model.policy_tactical_exact_after_move);
-    let mut enabled = model.clone();
-    enabled.policy_tactical_exact_after_move = true;
-    assert!(enabled.clone().policy_tactical_exact_after_move);
-}
-
 /// 连杀证明搜索：mate-in-1 必须能证，且必须**不能**在 7 手内证明一个 mate-in-8 的局面
 /// （与 Pikafish `go mate 7` → 仍报 mate 8 的 oracle 一致）。
 #[test]
@@ -1370,13 +1359,15 @@ fn missing_check_context_tensor_loads_as_zeros() {
     assert!(zeros.iter().all(|&weight| weight == 0.0));
 }
 
-/// 精确走后战术位：默认必须与旧的"走前位板"逐位一致，打开后必须改用走后真值。
+/// 策略头的 `destination_attacked/defended` 用的是**走前**攻击位板，而不是走完之后的
+/// 真值——这是刻意保留的近似：精确值要按每个候选走法各查两次，实测 −25%~−39% NPS。
 ///
-/// 局面是"红车 a7、黑炮 a9、落点 a5"：走前黑炮正好隔着红车打 a5（1 个炮架），
-/// 红车走开之后炮架消失、而红车自己站到 a5 上（不攻击自己）。所以落点的
-/// `destination_attacked` 与 `destination_defended` 两位在两种模式下都翻转。
+/// 这条测试做两件事：(1) 用一个炮架局面钉住近似到底差在哪、差多少；
+/// (2) 在随机对局里统计"近似与真值不一致"的比例，给这个取舍一个可复查的数字。
+/// `Position::is_square_attacked_after_move` 就是这里的对照口径——它是环境层唯一
+/// 需要保留精确查询的地方（审计/测试/将来的"落子悬不悬"检测），生产路径不调用它。
 #[test]
-fn exact_after_move_tactical_flips_destination_flags() {
+fn tactical_flags_are_pre_move_and_the_gap_is_audited() {
     const RED_GENERAL: usize = 0;
     const RED_ROOK: usize = 4;
     const BLACK_GENERAL: usize = 7;
@@ -1389,43 +1380,67 @@ fn exact_after_move_tactical_flips_destination_flags() {
         (BLACK_GENERAL, square("e9")),
     ]);
     let mv = Move::new(square("a7"), square("a5"));
-    assert!(dense_move_index(mv) < DENSE_MOVE_SPACE);
-
     let side = position.side_to_move();
     let masks = position.attacked_squares_masks();
-    let approximate = policy_move_tactical_flags(
-        &position,
-        mv,
-        masks[color_index(side.opposite())],
-        masks[color_index(side)],
-        false,
-    );
-    let exact = policy_move_tactical_flags(
-        &position,
-        mv,
-        masks[color_index(side.opposite())],
-        masks[color_index(side)],
-        true,
-    );
     // (source_attacked, destination_attacked, source_defended, destination_defended)
+    let approximate = policy_move_tactical_flags(
+        mv,
+        masks[color_index(side.opposite())],
+        masks[color_index(side)],
+    );
+    // 走前：黑炮隔着红车打 a5（1 个炮架）⇒ attacked=true；红车自己盯着 a5 ⇒ defended=true。
     assert_eq!(approximate, (false, true, false, true));
-    assert_eq!(exact, (false, false, false, false));
+    // 走后真值：炮架没了、红车自己站在 a5（不攻击自己）⇒ 两位都变 false。
+    assert!(!position.is_square_attacked_after_move(square("a5"), side.opposite(), mv));
+    assert!(!position.is_square_attacked_after_move(square("a5"), side, mv));
 
-    // 开关必须真的落到评估路径上：tactical 表非零时，两种模式的 logits 必须不同。
-    let mut model = AzNnue::random(16, 41);
-    for (index, weight) in model.policy_tactical.iter_mut().enumerate() {
-        // 让每个 signature 桶的权重互不相同，签名一变就一定反映到 logits 上。
-        *weight = ((index % 13) as f32 + 1.0) * 1.0e-6;
+    // 随机对局里统计落点这一位的近似误差率。
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let (mut differing, mut total) = (0usize, 0usize);
+    for _ in 0..6 {
+        let mut position = Position::startpos();
+        for _ in 0..120 {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            let side = position.side_to_move();
+            let masks = position.attacked_squares_masks();
+            for _ in 0..moves.len().min(4) {
+                let mv = moves[(next() as usize) % moves.len()];
+                let to = mv.to as usize;
+                let (pre_attacked, pre_defended) = {
+                    let (_, attacked, _, defended) = policy_move_tactical_flags(
+                        mv,
+                        masks[color_index(side.opposite())],
+                        masks[color_index(side)],
+                    );
+                    (attacked, defended)
+                };
+                let post_attacked =
+                    position.is_square_attacked_after_move(to, side.opposite(), mv);
+                let post_defended = position.is_square_attacked_after_move(to, side, mv);
+                differing +=
+                    usize::from(pre_attacked != post_attacked) + usize::from(pre_defended != post_defended);
+                total += 2;
+            }
+            let mv = moves[(next() as usize) % moves.len()];
+            position.make_move(mv);
+        }
     }
-    model.rebuild_policy_tactical();
-    assert!(model.policy_tactical_active);
-
-    let moves = [mv];
-    let mut off = AzEvalScratch::new(model.arch);
-    let mut on = AzEvalScratch::new(model.arch);
-    model.policy_tactical_exact_after_move = false;
-    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut off);
-    model.policy_tactical_exact_after_move = true;
-    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut on);
-    assert_ne!(off.logits[0], on.logits[0]);
+    // 存在的意义：这个比例必须**非零**（否则近似就是精确的，精确查询可以整个删掉），
+    // 也不能大到失真。实测约 **21%**——远高于"罕见炮架边角"，因为沿直线走子时走子方
+    // 自己就攻击着落点，走前 `defended` 必然为真、走后未必。
+    assert!(differing > 0, "近似与真值完全一致？那精确查询就该删掉");
+    let rate = differing as f64 / total as f64;
+    assert!(
+        (0.10..0.35).contains(&rate),
+        "近似误差率与预期不符：{rate:.4}（{differing}/{total}）"
+    );
 }

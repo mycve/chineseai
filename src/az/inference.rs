@@ -542,34 +542,32 @@ pub(crate) fn policy_tactical_indices(
 /// 策略头战术签名用到的 4 个布尔量，返回顺序与 `policy_tactical_indices` 的入参一致：
 /// `(source_attacked, destination_attacked, source_defended, destination_defended)`。
 ///
-/// `source_*` 恒为**走前**语义（"我此刻站着的那格是否被攻击/被保护"）；
-/// `destination_attacked/defended` 在 `exact_destination` 为真时改用**走完之后**的精确
-/// 值（虚拟占位查询），否则沿用走前攻击位板上的对应位——后者是历史行为，保持已训练
-/// checkpoint 的输入语义不变。
+/// 四个位都用**走前**攻击位板，语义要按"现在"读，不要按"走后"读：
+/// - `source_attacked/defended` = 我此刻站着的这格是否被攻击/被保护；
+/// - `destination_attacked/defended` = **此刻**落点这一格是否被攻击/被保护。
+///
+/// 注意第二组**不是**"落子之后那枚子是否被攻击/被保护"：两者实测约 **21%** 不一致，
+/// 而且差异是系统性的、不是罕见边角——沿直线走子时走子方自己就攻击着落点（车/炮/兵
+/// 沿线移动），于是走前 `defended` 必然为真，走后却只取决于有没有**别的**子保护它；
+/// 此外 `from` 腾空还会让炮失去炮架、让车线打开、松开马腿/象眼。
+///
+/// 明知有约 21% 的语义差仍用近似，是因为精确值要按每个候选走法各查两次，实测
+/// **−25%~−39% NPS**（startpos 201k → 123k、中局 111k → 83k sims/s）。训练侧与推理侧
+/// 共用这一个实现，所以模型学到的就是"我们控制这一格"这个自洽信号。精确查询留在
+/// `Position::is_square_attacked_after_move`，只作审计/测试口径
+/// （见 `tactical_flags_are_pre_move_and_the_gap_is_audited`），生产路径不调用它。
 #[inline]
 pub(crate) fn policy_move_tactical_flags(
-    position: &Position,
     mv: Move,
     opponent_attacks: u128,
     own_attacks: u128,
-    exact_destination: bool,
 ) -> (bool, bool, bool, bool) {
     let from = mv.from as usize;
     let to = mv.to as usize;
-    let side = position.side_to_move();
     let source_attacked = opponent_attacks & (1u128 << from) != 0;
     let source_defended = own_attacks & (1u128 << from) != 0;
-    let (destination_attacked, destination_defended) = if exact_destination {
-        (
-            position.is_square_attacked_after_move(to, side.opposite(), mv),
-            position.is_square_attacked_after_move(to, side, mv),
-        )
-    } else {
-        (
-            opponent_attacks & (1u128 << to) != 0,
-            own_attacks & (1u128 << to) != 0,
-        )
-    };
+    let destination_attacked = opponent_attacks & (1u128 << to) != 0;
+    let destination_defended = own_attacks & (1u128 << to) != 0;
     (
         source_attacked,
         destination_attacked,
@@ -643,21 +641,6 @@ pub struct AzNnue {
     pub(crate) policy_tactical_active: bool,
     /// `check_context_hidden` 是否非零（全零 = 老 checkpoint 或尚未训练出来 ⇒ 整块跳过）。
     pub(crate) check_context_active: bool,
-    /// 打开后策略头的 `destination_attacked/defended` 取**走完这步之后**的精确值
-    /// （`Position::is_square_attacked_after_move` 的虚拟占位查询），而不是走前攻击
-    /// 位板上的对应位。走前位板在两种情况下与真值不同：`from` 腾空让炮失去炮架或
-    /// 让车线打开、`from` 腾空松开马腿/象眼。
-    ///
-    /// 默认关闭：已训练 checkpoint 的 tactical 表是按近似值学出来的，打开会改变输入
-    /// 语义（必须重训），也会让"沿用同一个模型"的评测结果不可比。
-    ///
-    /// 实测代价（`az-bench best.safetensors 800 60 1.4`，每次 800 sims × 60 次取均值）：
-    /// startpos 201k → 123k sims/s（**−39%**），中局 111k → 83k sims/s（**−25%**）。
-    /// 原因是它把"每节点算一次全盘攻击位板"变成"每节点每个候选走法各查两次"：
-    /// 每节点约 38 个走法 × 2 种颜色 × 单次虚拟查询 ≈ 40ns，约 +3µs/节点。
-    /// 因此**不建议在搜索热路径上打开**；要把这份信息给模型，应放到子节点的评估里
-    /// （子节点本来就会为自己的策略头算一次全盘位板，问 `to` 只需读那一位，边际成本为 0）。
-    pub policy_tactical_exact_after_move: bool,
     /// 根节点 check-only 连杀证明搜索的最大半回合数（0 = 关闭）。
     ///
     /// 挂在模型上而不是 `AzSearchLimits` 上，是因为后者的结构体字面量全仓有 41 处，
@@ -722,7 +705,6 @@ impl Clone for AzNnue {
             value_threat_active: self.value_threat_active,
             policy_tactical_active: self.policy_tactical_active,
             check_context_active: self.check_context_active,
-            policy_tactical_exact_after_move: self.policy_tactical_exact_after_move,
             mate_search_plies: self.mate_search_plies,
             mate_search_nodes: self.mate_search_nodes,
             gpu_trainer: None,
@@ -933,7 +915,6 @@ impl AzNnue {
             value_threat_active: false,
             policy_tactical_active: false,
             check_context_active: false,
-            policy_tactical_exact_after_move: false,
             mate_search_plies: 0,
             mate_search_nodes: 200_000,
             gpu_trainer: None,
@@ -1115,7 +1096,6 @@ impl AzNnue {
             value_threat_active: false,
             policy_tactical_active: false,
             check_context_active: false,
-            policy_tactical_exact_after_move: false,
             mate_search_plies: 0,
             mate_search_nodes: 200_000,
             gpu_trainer: None,
@@ -1423,13 +1403,7 @@ impl AzNnue {
                                 destination_attacked,
                                 source_defended,
                                 destination_defended,
-                            ) = policy_move_tactical_flags(
-                                position,
-                                *mv,
-                                opponent_attacks,
-                                own_attacks,
-                                self.policy_tactical_exact_after_move,
-                            );
+                            ) = policy_move_tactical_flags(*mv, opponent_attacks, own_attacks);
                             let tactical = policy_tactical_indices(
                                 move_index,
                                 moved_piece,
