@@ -60,6 +60,11 @@ pub struct AzLoopFileConfig {
     pub selfplay_dive_book: String,
     /// 自博弈开局来自跳水库的比例（0 关闭，1 只用跳水库）。
     pub selfplay_dive_fraction: f32,
+    /// 根节点连杀证明搜索的最大半回合数（0 = 关闭，9 = 最多 mate in 5，15 = mate in 8）。
+    ///
+    /// 带 `#[serde(default)]`：老配置文件里没有这一项时按 0（关闭）解析，不必改格式版本。
+    #[serde(default)]
+    pub mate_search_plies: usize,
     pub replay_capacity: usize,
     pub shuffle_size: usize,
     pub replay_recent_games: u32,
@@ -129,6 +134,9 @@ impl Default for AzLoopFileConfig {
             selfplay_opening_book: "book.pgn.gz".into(),
             selfplay_dive_book: "dive.sqlite".into(),
             selfplay_dive_fraction: 0.5,
+            // 9 半回合 = mate in 5：实测把可证射程从 mate-in-4 推到 mate-in-5，
+            // 而"有将军但无杀"的局面只 +4%，根局面没有将军着法时为 0。
+            mate_search_plies: 9,
             replay_capacity: 2400000,
             shuffle_size: 524_288,
             replay_recent_games: 7500,
@@ -191,6 +199,7 @@ impl AzLoopFileConfig {
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
         line!("selfplay_dive_book", q(&self.selfplay_dive_book));
         line!("selfplay_dive_fraction", f(self.selfplay_dive_fraction));
+        line!("mate_search_plies", self.mate_search_plies);
         line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
@@ -332,6 +341,8 @@ impl AzLoopFileConfig {
         self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
         self.selfplay_dive_fraction = self.selfplay_dive_fraction.clamp(0.0, 1.0);
+        // 上限 31 半回合（mate in 16）与 `go mate 0` 的取值一致：再深只会烧时间。
+        self.mate_search_plies = self.mate_search_plies.min(31);
 
         self.replay_recent_games = self.replay_recent_games.max(1);
         self.shuffle_size = self.shuffle_size.max(1);
@@ -374,6 +385,41 @@ mod tests {
         assert_eq!(config.root_dirichlet_alpha, 0.12);
         assert_eq!(config.temperature_cutoff_plies, 78);
         assert!(config.fpu_absolute_at_root);
+    }
+
+    /// 连杀预算要能往返、能 clamp；默认值就是推荐的 9；**老配置文件缺这一项时必须按 0
+    /// 解析而不是报错**（`#[serde(default)]`）。
+    #[test]
+    fn mate_search_config_roundtrips_and_clamps() {
+        assert_eq!(AzLoopFileConfig::default().mate_search_plies, 9);
+
+        let config = AzLoopFileConfig {
+            mate_search_plies: 15,
+            ..AzLoopFileConfig::default()
+        };
+        let text = config.to_file_text();
+        assert!(text.contains("mate_search_plies = 15\n"));
+        assert_eq!(AzLoopFileConfig::parse(&text).mate_search_plies, 15);
+
+        let legacy = text
+            .lines()
+            .filter(|line| !line.starts_with("mate_search_plies"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            AzLoopFileConfig::parse(&legacy).mate_search_plies,
+            0,
+            "老配置缺这一项时应按关闭解析"
+        );
+
+        let clamped = AzLoopFileConfig::parse(
+            &AzLoopFileConfig {
+                mate_search_plies: 99,
+                ..AzLoopFileConfig::default()
+            }
+            .to_file_text(),
+        );
+        assert_eq!(clamped.mate_search_plies, 31);
     }
 
     /// 跳水库配置要能原样往返，并且比例被 clamp 到 [0,1]。

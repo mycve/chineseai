@@ -37,6 +37,12 @@ pub struct AzLoopConfig {
     pub opening_positions: Arc<[AzStartSnapshot]>,
     pub mirror_probability: f32,
     pub record_fens: bool,
+    /// 根节点连杀证明搜索的最大半回合数（0 = 关闭）。详见 `AzNnue::mate_search_plies`。
+    ///
+    /// 推荐 9：实测把模型的可证射程从 mate-in-4 推到 mate-in-5，代价是"根局面有将军但
+    /// 无杀"时 +4%、根局面没有将军着法时 0。证明出来的连杀会经由搜索既有的 solved 传播
+    /// 把该手的策略目标压成杀着、价值目标设成必胜，这是让模型从自博弈里学到连杀的关键。
+    pub mate_search_plies: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -318,6 +324,12 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
 /// Compress exact rule history into bounded continuous inputs. Values are
 /// perspective-relative to the side to move, so canonical board mirroring
 /// remains valid.
+///
+/// 第 [0] 个分量是 `rule60_count_with_history / rule60_max_ply`，因此它的**尺度依赖
+/// `Position::rule60_max_ply`**。训练数据的两个来源都固定在这个值上：Px0 数据集重建
+/// 时被 `from_fen` 强制成 120（`px0_data.rs`），自博弈侧则由 `AzLoopConfig.rule60_max_ply`
+/// 决定。把自博弈的限着改成 120 以外的值（或 `None`）会让 [0] 与历史数据集不同尺度，
+/// 而没有重训就无法恢复——改这个配置项等于改特征语义。
 pub fn rule_context_features(
     position: &Position,
     history: &[crate::xiangqi::RuleHistoryEntry],
@@ -338,10 +350,15 @@ pub fn rule_context_features(
         (matches, last_match.map_or(history.len(), |index| index + 1))
     });
     let cycle = &history[cycle_start.min(history.len())..];
+    // [2] 用输入切片的长度，而不是回滚重算结果的长度：重算必须"一进一出、长度守恒"
+    // 才等价，把长度钉在输入上就不必依赖那个隐式契约。
+    let cycle_len = cycle.len();
     // 逐着记录不再保存捉子掩码（只扫描被移动棋子会漏掉被发现的攻击），
     // 这里按完整局面回滚重算，语义与旧版一致。
-    let exact_cycle = position.recompute_cycle_chases(cycle);
-    let cycle = exact_cycle.as_slice();
+    // `cycle` 为空 ⟺ 历史里没有重复局面（这是绝大多数节点的常态），此时重算只会
+    // 白克隆一次完整局面并返回空切片，所以直接沿用原切片。
+    let exact_cycle = (!cycle.is_empty()).then(|| position.recompute_cycle_chases(cycle));
+    let cycle = exact_cycle.as_deref().unwrap_or(cycle);
     let side = position.side_to_move();
     let cycle_count = |color: Color, predicate: fn(&crate::xiangqi::RuleHistoryEntry) -> bool| {
         cycle
@@ -356,7 +373,7 @@ pub fn rule_context_features(
             position.rule60_count_with_history(history) as f32 / max_ply as f32
         }),
         (prior_matches as f32 / 3.0).min(1.0),
-        (cycle.len() as f32 / 32.0).min(1.0),
+        (cycle_len as f32 / 32.0).min(1.0),
         (cycle_count(side, is_check) as f32 / 4.0).min(1.0),
         (cycle_count(side.opposite(), is_check) as f32 / 4.0).min(1.0),
         (cycle_count(side, is_chase) as f32 / 4.0).min(1.0),

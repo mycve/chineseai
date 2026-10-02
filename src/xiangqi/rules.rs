@@ -404,6 +404,12 @@ impl Position {
     /// "被发现的攻击"（例如拆炮架后另一子开始捉子），所以只有从当前局面回滚到
     /// 区间起点、再逐着重放求差才准确。历史里为对齐插入的锚点
     /// （`mv` 与 `mover` 同时为 `None`）不产生走子，直接跳过。
+    ///
+    /// 回滚依赖每个 entry 的 `mv` / `mover` / `captured` 与实际对局逐字一致：`captured`
+    /// 是唯一无法从局面上反推的字段（被吃子已经不在棋盘上了）。因此历史只能由
+    /// [`Position::rule_history_entry_after_move`] / [`Position::rule_history_entry_after_moved`]
+    /// 构造；手工拼装或反序列化出来的 entry 必须自己保证 `captured` 正确，否则
+    /// debug 构建会命中下面的断言，release 构建会静默回滚出错局面。
     pub fn recompute_cycle_chases(&self, entries: &[RuleHistoryEntry]) -> Vec<RuleHistoryEntry> {
         let mut position = self.clone();
         for entry in entries.iter().rev() {
@@ -422,7 +428,11 @@ impl Position {
             };
             let before = position.chased_masks_by(mover);
             let captured = position.make_move_board_only(mv);
-            debug_assert_eq!(captured, entry.captured);
+            debug_assert_eq!(
+                captured, entry.captured,
+                "history entry's captured disagrees with the board: entries must come from \
+                 rule_history_entry_after_move / rule_history_entry_after_moved"
+            );
             position.side_to_move = mover.opposite();
             let after = position.chased_masks_by(mover);
             exact.push(RuleHistoryEntry {
@@ -564,6 +574,13 @@ mod tests {
         // 按完整局面回滚重算才能发现"拆炮架后被发现的攻击"。
         let exact = position.recompute_cycle_chases(&[recorded]);
         assert_ne!(exact[0].chased_mask & (1u128 << horse), 0);
+    }
+
+    #[test]
+    fn recompute_cycle_chases_of_empty_cycle_is_empty() {
+        // `rule_context_features` 在 cycle 为空时直接跳过这次重算（省一次整盘 clone），
+        // 这条钉住那个前提：空输入必须返回空结果且不改变任何分量。
+        assert!(Position::startpos().recompute_cycle_chases(&[]).is_empty());
     }
 
     #[test]

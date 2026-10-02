@@ -19,6 +19,17 @@ pub struct IllegalMove {
     pub text: String,
 }
 
+/// 规则完整的走子环境：`Position` + 精确的 `rule_history` + 可撤销的走子栈。
+///
+/// **注意：真正的热路径不使用它。** 自博弈（`az::play`）、搜索（`az::alphazero`）、UCI
+/// （`uci`）、抽帧库（`pikafish`）都各自内联维护 `Position` 加一个 `Vec<RuleHistoryEntry>`，
+/// 因为 `step` 每次要做两次完整合法着生成（一次判合法、一次判结局），还要给每条规则历史
+/// 克隆整盘局面，代价远高于直接 `make_move` + `rule_history_entry_after_moved`。这里的
+/// 价值是"一份可读的、规则完整的参考实现"和它的测试。
+///
+/// 因此**改动规则语义时两处都要改**，并且要留意它们并不完全等价：本环境的
+/// [`XiangqiEnv::legal_moves`] 在局面已有判定时返回空表，而 UCI 的根着法生成在规则过滤
+/// 之后为空时会回退到 `legal_moves()`。不要把两者当成同一个东西互相替换。
 #[derive(Clone, Debug)]
 pub struct XiangqiEnv {
     position: Position,

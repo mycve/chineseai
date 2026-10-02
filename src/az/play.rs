@@ -283,6 +283,14 @@ impl AzSelfplayData {
 
 pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.generate");
+    // 连杀预算挂在模型上（`AzNnue::mate_search_plies`）。这里统一打一次补丁，让单线程与
+    // 多线程两条路径共用同一份设置；两边本来就一样时不克隆（关闭态零代价）。
+    let patched = (model.mate_search_plies != config.mate_search_plies).then(|| {
+        let mut patched = model.clone();
+        patched.mate_search_plies = config.mate_search_plies;
+        patched
+    });
+    let model = patched.as_ref().unwrap_or(model);
     let workers = config.workers.max(1).min(config.games.max(1));
     if workers == 1 || config.games <= 1 {
         return generate_selfplay_chunk(model, config);
@@ -1353,7 +1361,94 @@ mod tests {
             opening_positions: Default::default(),
             mirror_probability: 0.0,
             record_fens: false,
+            mate_search_plies: 0,
         }
+    }
+
+    /// `record_fens` 原来全仓没有读取方，属于"会静默腐烂"的公开诊断开关（默认 false）。
+    /// 这里钉住它的契约：每个样本恰好一条 FEN，写的是该样本局面的**有效** 60 回合计数
+    /// （`to_fen_with_history`，而不是 `to_fen` 的原始 halfmove clock），且能被回读。
+    #[test]
+    fn record_fens_writes_one_effective_clock_fen_per_sample() {
+        let mut config = selfplay_test_config(1);
+        config.record_fens = true;
+        config.max_plies = 8;
+        let model = AzNnue::random_with_arch(crate::az::AzNnueArch::default(), 11);
+        let data = generate_selfplay_data(&model, &config);
+
+        assert!(!data.samples.is_empty());
+        assert_eq!(data.position_fens.len(), data.samples.len());
+        for fen in &data.position_fens {
+            let tokens = fen.split(' ').collect::<Vec<_>>();
+            assert_eq!(tokens.len(), 6, "unexpected FEN shape: {fen}");
+            assert!(
+                tokens[4].parse::<u16>().is_ok(),
+                "clock token must be numeric: {fen}"
+            );
+            Position::from_fen(fen)
+                .unwrap_or_else(|err| panic!("recorded FEN does not round-trip `{fen}`: {err}"));
+        }
+    }
+
+    /// 配置里的连杀预算必须真的作用到自博弈用的那个模型上。
+    ///
+    /// 用一个 **mate-in-8** 局面开局（不能用 mate-in-1：那只靠旧的 `immediate_mate_child`
+    /// 就能证，证明不了新接线）。预算生效时根搜索会证明杀棋，于是该样本的策略目标被压成
+    /// 杀着上的一热分布、价值目标变成必胜；关掉之后同一局面必须回到普通 MCTS。
+    /// 这是"让模型从自博弈里学到连杀"整条链路的端到端证据
+    /// （配置 → 模型补丁 → 搜索证明 → 训练样本）。
+    #[test]
+    fn selfplay_applies_configured_mate_search() {
+        let mate_position =
+            Position::from_fen("2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1")
+                .unwrap();
+        let mate_move = mate_position.parse_uci_move("h2h0").unwrap();
+        let mate_index =
+            dense_move_index(canonical_move(mate_position.side_to_move(), mate_move));
+        assert!(mate_index < crate::az::DENSE_MOVE_SPACE, "杀着必须在策略走法空间里");
+
+        let mut config = selfplay_test_config(1);
+        config.max_plies = 2;
+        config.mate_search_plies = 15;
+        config.opening_positions = Arc::from(vec![AzStartSnapshot {
+            rule_history: mate_position.initial_rule_history(),
+            position: mate_position,
+            phase_ply: 0,
+            generation: 0,
+        }]);
+        let model = AzNnue::random_with_arch(crate::az::AzNnueArch::default(), 13);
+        let data = generate_selfplay_data(&model, &config);
+
+        let first = data.samples.first().expect("至少要有一个样本");
+        let index = first
+            .move_indices
+            .iter()
+            .position(|&candidate| candidate == mate_index)
+            .expect("杀着必须在候选里");
+        assert!(
+            (first.policy[index] - 1.0).abs() < 1e-6,
+            "策略目标应压在杀着上：{:?}",
+            first.policy
+        );
+        assert_eq!(first.value, 1.0);
+        assert_eq!(first.value_wdl, [1.0, 0.0, 0.0]);
+
+        // 关掉连杀预算之后同一局面必须回到普通 MCTS：64 simulations 撞不出 mate-in-8，
+        // 所以既不会出现一热策略目标、也不会被判成必胜。
+        config.mate_search_plies = 0;
+        let plain = generate_selfplay_data(&model, &config);
+        let plain_first = plain.samples.first().expect("至少要有一个样本");
+        let plain_index = plain_first
+            .move_indices
+            .iter()
+            .position(|&candidate| candidate == mate_index)
+            .expect("杀着必须在候选里");
+        assert!(
+            plain_first.policy[plain_index] < 1.0 - 1e-6,
+            "关闭时不应出现一热策略目标：{:?}",
+            plain_first.policy
+        );
+        assert!(plain_first.value < 1.0, "关闭时不应判成必胜");
     }
 
     #[test]

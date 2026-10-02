@@ -11,7 +11,7 @@ pub(crate) use uci_search::{AzUciSearchResult, search_uci};
 
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, POLICY_ACCUMULATOR_RANK, SplitMix64,
-    color_index, rule_context_features,
+    color_index, mate, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.0;
@@ -178,6 +178,7 @@ pub fn alphazero_search_trace_with_rules(
     );
     let root = tree.root;
     tree.expand(root);
+    tree.prove_root_mate(position, model);
     let mut stopper = KldGainStopper::default();
     let mut used = 0;
     for _ in 0..limits.simulations {
@@ -302,6 +303,7 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
     }
 
     let mut used = 0usize;
+    tree.prove_root_mate(position, model);
     let mut kld_stopper = KldGainStopper::default();
     let mut last_progress = Instant::now();
     {
@@ -384,6 +386,7 @@ pub(super) fn alphazero_search_with_rules_reusing(
         crate::scope_profile!("az.search.root_expand");
         tree.expand(root);
     }
+    tree.prove_root_mate(position, model);
     let used = if tree.nodes[root].children_len == 0 {
         0
     } else {
@@ -1497,6 +1500,45 @@ impl<'a> AzTree<'a> {
             || child.q(draw_score),
             |value| wdl_utility(scalar_terminal_wdl(value as f32), draw_score),
         )
+    }
+
+    /// 根节点 check-only 连杀证明：证明出来就把"杀着之后的那个子局面"标成对方必败。
+    ///
+    /// 复用搜索既有的 `solved` 传播，所以不需要任何新的判定路径：`child_solved` 会对子节点
+    /// 的 solved 取反（这里写 -1 = 对方必败），于是 `root_policy` 把策略目标压到杀着上、
+    /// `proven_root_value` 把价值目标设成必胜。
+    ///
+    /// 只在 `AzNnue::mate_search_plies > 0` 时运行。两个搜索入口（复用 / 不复用 workspace）
+    /// 共用这一个实现，避免两处漂移。
+    fn prove_root_mate(&mut self, position: &Position, model: &AzNnue) {
+        if model.mate_search_plies == 0 || self.node_children(self.root).is_empty() {
+            return;
+        }
+        crate::scope_profile!("az.search.root_mate");
+        let Some(solution) = mate::search_root_mate(
+            position,
+            &self.rule_history_scratch,
+            mate::MateSearchLimits {
+                max_plies: model.mate_search_plies,
+                max_nodes: model.mate_search_nodes,
+            },
+        ) else {
+            return;
+        };
+        let Some(index) = self
+            .node_children(self.root)
+            .iter()
+            .position(|child| child.mv == solution.mv)
+        else {
+            return;
+        };
+        // 建立杀着对应的子节点（含一次网络评估）。
+        self.simulate_child(self.root, index, 1);
+        let Some(child_node) = self.node_children(self.root)[index].child_node() else {
+            return;
+        };
+        self.set_proven(child_node, -1);
+        self.update_solved(self.root);
     }
 
     fn update_solved(&mut self, node_index: usize) {

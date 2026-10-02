@@ -18,6 +18,45 @@ fn full_fen_preserves_rule60_clock() {
 }
 
 #[test]
+fn to_fen_with_history_counts_check_exemptions() {
+    let position = Position::from_fen(
+        "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 30 1",
+    )
+    .unwrap();
+    assert_eq!(position.halfmove_clock(), 30);
+    let mut history = position.initial_rule_history();
+    // 红方连续将军 11 次：前 10 次照常计数，第 11 次起进入豁免、不再计入 60 回合。
+    for _ in 0..11 {
+        history.push(RuleHistoryEntry {
+            hash: 0,
+            side_to_move: Color::Black,
+            mover: Some(Color::Red),
+            gives_check: true,
+            chased_mask: 0,
+            mv: None,
+            captured: None,
+            rule60_clock: 0,
+        });
+    }
+    assert_eq!(position.rule60_count_with_history(&history), 40);
+    // 两个导出函数写的是不同的数：`to_fen` 是原始 halfmove clock，`to_fen_with_history`
+    // 才是计入将军豁免之后的有效计数。谁把后者"简化"成前者，这条就会红。
+    assert_eq!(position.to_fen().split(' ').nth(4), Some("30"));
+    assert_eq!(
+        position.to_fen_with_history(&history).split(' ').nth(4),
+        Some("40")
+    );
+    // 注意：40 回读进 halfmove_clock 只是近似值，豁免状态本身无法用 FEN 表达。
+    assert_eq!(
+        position
+            .to_fen_with_history(&history)
+            .split(' ')
+            .next(),
+        position.to_fen().split(' ').next()
+    );
+}
+
+#[test]
 fn soldier_move_does_not_reset_rule60_clock() {
     let mut position = Position::from_fen(
         "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 57 1",
@@ -1083,6 +1122,235 @@ fn gives_check_fast_matches_bruteforce() {
             position.rule_history_entry_after_move(mv);
             position.make_move(mv);
         }
+    }
+}
+
+/// `is_square_attacked_after_move` 必须和"真的走一步再看 `is_square_attacked`"一致。
+///
+/// 每个抽样走法都**扫全部 90 格 × 两种颜色**（而不是只问落点），这样才会真的走到那些
+/// 只在特定目标几何下才成立的分支：飞将、象眼、过河兵侧移、九宫内的士/将。
+#[test]
+fn attacked_after_move_matches_make_move_on_random_games() {
+    let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut compared = 0usize;
+    for game in 0..8u64 {
+        let mut position = Position::startpos();
+        for ply in 0..160usize {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            for sample in 0..moves.len().min(3) {
+                let mv = moves[(next() as usize).wrapping_add(sample) % moves.len()];
+                let mut after = position.clone();
+                after.make_move(mv);
+                for color in [Color::Red, Color::Black] {
+                    for target in 0..BOARD_SIZE {
+                        assert_eq!(
+                            position.is_square_attacked_after_move(target, color, mv),
+                            after.is_square_attacked(target, color),
+                            "target={target} by={color:?} mv={mv} game={game} ply={ply}\n{}",
+                            position.to_fen()
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+            let mv = moves[(next() as usize) % moves.len()];
+            position.make_move(mv);
+        }
+    }
+    assert!(compared > 500_000, "coverage too small: {compared}");
+}
+
+/// 逐条覆盖"只有 `from` 腾空与 `to` 被占两处占位变化"会改变攻击关系的情形。
+///
+/// 每条都同时断言(1)走前值、(2)真 make_move 之后的真值、(3)虚拟占位查询的值，
+/// 并要求走前走后必须翻转——否则这条用例没有真的测到东西。
+/// `from_canonical_piece_squares` 不做合法性校验，因此能覆盖飞将这类合法走法
+/// 到不了的边界。
+#[test]
+fn attacked_after_move_covers_from_and_to_occupancy_cases() {
+    // 棋子类别索引：0..7 为红方（将/士/象/马/车/炮/兵），7..14 为黑方。
+    const RED_GENERAL: usize = 0;
+    const RED_ROOK: usize = 4;
+    const RED_CANNON: usize = 5;
+    const RED_SOLDIER: usize = 6;
+    const BLACK_GENERAL: usize = 7;
+    const BLACK_ELEPHANT: usize = 9;
+    const BLACK_HORSE: usize = 10;
+    const BLACK_ROOK: usize = 11;
+    const BLACK_CANNON: usize = 12;
+
+    let check = |pieces: &[(usize, usize)],
+                 target: usize,
+                 by: Color,
+                 mv: Move,
+                 before: bool,
+                 after_expected: bool| {
+        assert_ne!(before, after_expected, "case must flip: mv={mv}");
+        let position = Position::from_canonical_piece_squares(pieces);
+        assert_eq!(
+            position.is_square_attacked(target, by),
+            before,
+            "pre-move mismatch: target={target} by={by:?} mv={mv}"
+        );
+        let mut after = position.clone();
+        after.make_move(mv);
+        assert_eq!(
+            after.is_square_attacked(target, by),
+            after_expected,
+            "oracle mismatch: target={target} by={by:?} mv={mv}"
+        );
+        assert_eq!(
+            position.is_square_attacked_after_move(target, by, mv),
+            after_expected,
+            "virtual mismatch: target={target} by={by:?} mv={mv}"
+        );
+    };
+
+    // 1. `from` 原本是炮架：走后炮失去对落点的攻击。
+    check(
+        &[
+            (BLACK_CANNON, index(0, 0)),
+            (RED_ROOK, index(0, 2)),
+            (RED_GENERAL, index(3, 9)),
+            (BLACK_GENERAL, index(4, 0)),
+        ],
+        index(0, 4),
+        Color::Black,
+        Move::new(index(0, 2), index(0, 4)),
+        true,
+        false,
+    );
+
+    // 2. `from` 原本挡住车线：走后车获得对落点的攻击。
+    check(
+        &[
+            (BLACK_ROOK, index(0, 0)),
+            (RED_ROOK, index(0, 2)),
+            (RED_GENERAL, index(3, 9)),
+            (BLACK_GENERAL, index(4, 0)),
+        ],
+        index(0, 4),
+        Color::Black,
+        Move::new(index(0, 2), index(0, 4)),
+        false,
+        true,
+    );
+
+    // 3. `to` 被占之后给敌方炮造出炮架（目标格不是落点）。
+    check(
+        &[
+            (BLACK_CANNON, index(0, 0)),
+            (RED_SOLDIER, index(0, 6)),
+            (RED_GENERAL, index(3, 9)),
+            (BLACK_GENERAL, index(4, 0)),
+        ],
+        index(0, 4),
+        Color::Black,
+        Move::new(index(0, 6), index(0, 2)),
+        false,
+        true,
+    );
+
+    // 4. 马腿恰好是 `from`：走后马松开（目标格不是落点，且与 from 不共线）。
+    check(
+        &[
+            (BLACK_HORSE, index(1, 1)),
+            (RED_SOLDIER, index(1, 2)),
+            (RED_GENERAL, index(3, 9)),
+            (BLACK_GENERAL, index(4, 0)),
+        ],
+        index(0, 3),
+        Color::Black,
+        Move::new(index(1, 2), index(1, 3)),
+        false,
+        true,
+    );
+
+    // 5. 象眼恰好是 `from`：走后象松开。
+    check(
+        &[
+            (BLACK_ELEPHANT, index(0, 0)),
+            (RED_SOLDIER, index(1, 1)),
+            (RED_GENERAL, index(3, 9)),
+            (BLACK_GENERAL, index(4, 0)),
+        ],
+        index(2, 2),
+        Color::Black,
+        Move::new(index(1, 1), index(1, 0)),
+        false,
+        true,
+    );
+
+    // 6. 飞将：`from` 腾空后同线打通（目标格不是落点）。
+    check(
+        &[
+            (BLACK_GENERAL, index(4, 0)),
+            (RED_GENERAL, index(4, 7)),
+            (RED_SOLDIER, index(4, 3)),
+        ],
+        index(4, 7),
+        Color::Black,
+        Move::new(index(4, 3), index(3, 3)),
+        false,
+        true,
+    );
+
+    // 7. 飞将落在己方将的新格子上（目标格就是落点）。
+    check(
+        &[(BLACK_GENERAL, index(4, 0)), (RED_GENERAL, index(4, 8))],
+        index(4, 7),
+        Color::Black,
+        Move::new(index(4, 8), index(4, 7)),
+        false,
+        true,
+    );
+
+    // 8. 己方炮失去炮架：己方对目标格的"保护"消失（`by` 是走子方）。
+    check(
+        &[
+            (RED_CANNON, index(0, 9)),
+            (RED_SOLDIER, index(0, 7)),
+            (RED_GENERAL, index(3, 9)),
+            (BLACK_GENERAL, index(4, 0)),
+        ],
+        index(0, 5),
+        Color::Red,
+        Move::new(index(0, 7), index(1, 7)),
+        true,
+        false,
+    );
+
+    // 9. 炮失去炮架、但**另一条射线上还有攻击者**：真值保持不变。
+    //
+    // 这条与第 1 条在"走前 mask 位 / to→from 射线状态 / 跃子查表"三样输入上完全相同，
+    // 真值却相反（第 1 条由真变假，这里仍为真）。因此"只看一条 to→from 射线加跃子"
+    // 的修正函数不可能精确，必须有完整的走后攻击查询。它是防止将来退回近似实现的关键
+    // 回归用例。
+    {
+        let pieces = [
+            (BLACK_CANNON, index(0, 0)),
+            (BLACK_GENERAL, index(3, 0)),
+            (RED_ROOK, index(0, 2)),
+            (BLACK_ROOK, index(4, 4)),
+            (RED_GENERAL, index(3, 9)),
+        ];
+        let position = Position::from_canonical_piece_squares(&pieces);
+        let mv = Move::new(index(0, 2), index(0, 4));
+        let target = index(0, 4);
+        assert!(position.is_square_attacked(target, Color::Black));
+        let mut after = position.clone();
+        after.make_move(mv);
+        assert!(after.is_square_attacked(target, Color::Black));
+        assert!(position.is_square_attacked_after_move(target, Color::Black, mv));
     }
 }
 

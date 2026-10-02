@@ -142,5 +142,6 @@ pub(crate) fn build_az_loop_config(
         opening_positions: Arc::clone(opening_positions),
         mirror_probability: config.mirror_probability,
         record_fens: false,
+        mate_search_plies: config.mate_search_plies,
     }
 }

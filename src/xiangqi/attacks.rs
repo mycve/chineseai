@@ -1,7 +1,7 @@
 use super::{
-    BOARD_FILES, Color, DIAGONAL_STEPS, ELEPHANT_STEPS, HORSE_STEPS, ORTHOGONAL_STEPS, Piece,
-    PieceKind, Position, color_hash_index, elephant_stays_home, file_of, fixed_attack_masks, index,
-    inside_board, inside_palace, nearest_on_ray, orthogonal_ray_masks, rank_of, ray_through,
+    BOARD_FILES, Color, DIAGONAL_STEPS, ELEPHANT_STEPS, HORSE_STEPS, Move, ORTHOGONAL_STEPS,
+    Piece, PieceKind, Position, color_hash_index, elephant_stays_home, file_of, fixed_attack_masks,
+    index, inside_board, inside_palace, nearest_on_ray, orthogonal_ray_masks, rank_of, ray_through,
     soldier_crossed_river,
 };
 
@@ -139,6 +139,227 @@ impl Position {
     pub(crate) fn is_square_attacked(&self, target: usize, by: Color) -> bool {
         self.is_square_attacked_by_leapers(target, by)
             || self.is_square_attacked_by_sliders(target, by)
+    }
+
+    /// `mv` 走完之后的局面里，`target` 是否被 `by` 方攻击。
+    ///
+    /// 与 `is_square_attacked` 语义完全一致，只是棋盘按"`from` 已空、`to` 由走子方
+    /// 占据"的虚拟占位读取：不 make/unmake、不分配内存，因此可以安全地用于
+    /// "每个候选走法问一次"的场合。等价于
+    /// `let mut next = self.clone(); next.make_move(mv); next.is_square_attacked(target, by)`。
+    ///
+    /// 对"目标格就是落点"的常见用法，占位变化有三条路径都会影响结果，缺一不可：
+    /// 1. `from` 腾空——松开马腿/象眼，或让直线子的炮架/挡子消失（含炮**失去**对
+    ///    落点的攻击这一"损失"方向，这是只看"会不会获得攻击"的推理容易漏掉的）；
+    /// 2. `from` 腾空让同线打通、或让敌方炮变成第一挡子；
+    /// 3. `to` 被占——若走的是将，落点成为我方将，飞将规则会**新造**出对该格的攻击。
+    ///    第 3 条在合法走法里不会出现（将走到被攻击/照面的格子即自杀），但本函数是
+    ///    通用 API，对伪合法走法同样精确。
+    ///
+    /// 前提：`mv.from` 上有子（合法走法必然满足）。
+    pub fn is_square_attacked_after_move(&self, target: usize, by: Color, mv: Move) -> bool {
+        debug_assert!(
+            self.board[mv.from as usize].is_some(),
+            "is_square_attacked_after_move requires an occupied from square"
+        );
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        let moved = self.board[from];
+        let occupied = |square: usize| -> Option<Piece> {
+            if square == from {
+                None
+            } else if square == to {
+                moved
+            } else {
+                self.board[square]
+            }
+        };
+        self.virtual_leaper_attacks(target, by, &occupied)
+            || self.virtual_slider_attacks(target, by, &occupied)
+    }
+
+    /// `is_square_attacked` 的跃子部分，占位由 `occupied` 提供以支持虚拟占位。
+    fn virtual_leaper_attacks<F>(&self, target: usize, by: Color, occupied: &F) -> bool
+    where
+        F: Fn(usize) -> Option<Piece>,
+    {
+        let file = file_of(target) as i32;
+        let rank = rank_of(target) as i32;
+
+        for (df, dr) in ORTHOGONAL_STEPS {
+            let from_file = file - df;
+            let from_rank = rank - dr;
+            if !inside_board(from_file, from_rank) {
+                continue;
+            }
+            let from = index(from_file as usize, from_rank as usize);
+            if matches!(
+                occupied(from),
+                Some(Piece {
+                    color,
+                    kind: PieceKind::General
+                }) if color == by
+                    && inside_palace(by, file as usize, rank as usize)
+                    && inside_palace(by, from_file as usize, from_rank as usize)
+            ) {
+                return true;
+            }
+        }
+
+        for (df, dr) in DIAGONAL_STEPS {
+            let from_file = file - df;
+            let from_rank = rank - dr;
+            if !inside_board(from_file, from_rank) {
+                continue;
+            }
+            let from = index(from_file as usize, from_rank as usize);
+            if matches!(
+                occupied(from),
+                Some(Piece {
+                    color,
+                    kind: PieceKind::Advisor
+                }) if color == by
+                    && inside_palace(by, file as usize, rank as usize)
+                    && inside_palace(by, from_file as usize, from_rank as usize)
+            ) {
+                return true;
+            }
+        }
+
+        for ((leg_df, leg_dr), (move_df, move_dr)) in HORSE_STEPS {
+            let from_file = file - move_df;
+            let from_rank = rank - move_dr;
+            if !inside_board(from_file, from_rank) {
+                continue;
+            }
+            let leg_file = from_file + leg_df;
+            let leg_rank = from_rank + leg_dr;
+            if !inside_board(leg_file, leg_rank) {
+                continue;
+            }
+            let from = index(from_file as usize, from_rank as usize);
+            let leg = index(leg_file as usize, leg_rank as usize);
+            if occupied(leg).is_none()
+                && matches!(
+                    occupied(from),
+                    Some(Piece {
+                        color,
+                        kind: PieceKind::Horse
+                    }) if color == by
+                )
+            {
+                return true;
+            }
+        }
+
+        for ((eye_df, eye_dr), (move_df, move_dr)) in ELEPHANT_STEPS {
+            let from_file = file - move_df;
+            let from_rank = rank - move_dr;
+            if !inside_board(from_file, from_rank) {
+                continue;
+            }
+            let eye_file = from_file + eye_df;
+            let eye_rank = from_rank + eye_dr;
+            if !inside_board(eye_file, eye_rank) {
+                continue;
+            }
+            let from = index(from_file as usize, from_rank as usize);
+            let eye = index(eye_file as usize, eye_rank as usize);
+            if occupied(eye).is_none()
+                && matches!(
+                    occupied(from),
+                    Some(Piece {
+                        color,
+                        kind: PieceKind::Elephant
+                    }) if color == by && elephant_stays_home(by, rank as usize)
+                )
+            {
+                return true;
+            }
+        }
+
+        let soldier_forward_from_rank = rank - by.forward_step();
+        if inside_board(file, soldier_forward_from_rank) {
+            let from = index(file as usize, soldier_forward_from_rank as usize);
+            if matches!(
+                occupied(from),
+                Some(Piece {
+                    color,
+                    kind: PieceKind::Soldier
+                }) if color == by
+            ) {
+                return true;
+            }
+        }
+
+        for side_df in [-1, 1] {
+            let from_file = file - side_df;
+            if !inside_board(from_file, rank) {
+                continue;
+            }
+            let from = index(from_file as usize, rank as usize);
+            if matches!(
+                occupied(from),
+                Some(Piece {
+                    color,
+                    kind: PieceKind::Soldier
+                }) if color == by && soldier_crossed_river(by, rank as usize)
+            ) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// `is_square_attacked` 的直线部分，占位由 `occupied` 提供以支持虚拟占位。
+    fn virtual_slider_attacks<F>(&self, target: usize, by: Color, occupied: &F) -> bool
+    where
+        F: Fn(usize) -> Option<Piece>,
+    {
+        let file = file_of(target) as i32;
+        let rank = rank_of(target) as i32;
+
+        for (df, dr) in ORTHOGONAL_STEPS {
+            let mut seen_screen = false;
+            let mut nf = file + df;
+            let mut nr = rank + dr;
+
+            while inside_board(nf, nr) {
+                let sq = index(nf as usize, nr as usize);
+                if let Some(piece) = occupied(sq) {
+                    if !seen_screen {
+                        if piece.color == by {
+                            if piece.kind == PieceKind::Rook {
+                                return true;
+                            }
+                            if piece.kind == PieceKind::General
+                                && df == 0
+                                && matches!(
+                                    occupied(target),
+                                    Some(Piece {
+                                        color,
+                                        kind: PieceKind::General
+                                    }) if color == by.opposite()
+                                )
+                            {
+                                return true;
+                            }
+                        }
+                        seen_screen = true;
+                    } else if piece.color == by && piece.kind == PieceKind::Cannon {
+                        return true;
+                    } else {
+                        break;
+                    }
+                }
+
+                nf += df;
+                nr += dr;
+            }
+        }
+
+        false
     }
 
     pub(super) fn visit_attacker_origins_to<F>(

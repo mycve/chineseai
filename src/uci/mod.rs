@@ -386,6 +386,9 @@ struct GoParams {
     move_time_ms: Option<u64>,
     nodes: Option<usize>,
     depth: Option<usize>,
+    /// `go mate N`：证明 N 手以内的连杀。此前这个 token 只出现在 `is_go_keyword` 里，
+    /// 命令会被静默忽略并退化成普通 MCTS。
+    mate: Option<usize>,
     infinite: bool,
 }
 
@@ -412,6 +415,7 @@ fn parse_go(line: &str) -> GoParams {
             "movetime" => params.move_time_ms = parse_next(&tokens, index),
             "nodes" => params.nodes = parse_next(&tokens, index),
             "depth" => params.depth = parse_next(&tokens, index),
+            "mate" => params.mate = parse_next(&tokens, index),
             "infinite" => {
                 params.infinite = true;
                 index += 1;
@@ -478,8 +482,33 @@ fn start_go(line: &str, state: &mut UciState) -> ActiveSearch {
     ActiveSearch { stop, handle }
 }
 
+/// `go mate N` → 连杀证明的最大半回合数。N 手杀 = 2N-1 半回合；N=0（UCI 里表示"不限"）
+/// 取 31 半回合 = mate in 16。
+fn mate_search_plies_for(moves: usize) -> usize {
+    if moves == 0 {
+        31
+    } else {
+        moves.saturating_mul(2).saturating_sub(1)
+    }
+}
+
 fn run_go_search(state: UciState, params: GoParams, stop: Arc<AtomicBool>) {
-    let model = state.model.as_ref().expect("model was loaded");
+    let loaded = state.model.as_ref().expect("model was loaded");
+    // `go mate N`：把根节点连杀证明开到 2N-1 半回合（N=0 表示不限，取 31 半回合 = mate in 16）。
+    // 连杀预算是模型上的搜索参数（`AzNnue::mate_search_plies`），所以这里按需克隆一份打完补丁的
+    // 模型给本次搜索用；普通 `go` 走 `None` 分支、不付任何代价。
+    let patched;
+    let model: &AzNnue = match params.mate {
+        Some(moves) => {
+            patched = {
+                let mut patched = (**loaded).clone();
+                patched.mate_search_plies = mate_search_plies_for(moves);
+                patched
+            };
+            &patched
+        }
+        None => loaded,
+    };
 
     let mut legal = uci_root_moves(&state.position, &state.rule_history);
     let root_has_legal_moves = !legal.is_empty();
@@ -777,6 +806,24 @@ mod tests {
         assert_eq!(params.moves_to_go, Some(20));
         assert_eq!(params.nodes, Some(1_234));
         assert_eq!(params.depth, Some(12));
+    }
+
+    /// `go mate N` 以前只出现在 `is_go_keyword` 里，命令会被静默忽略并退化成普通 MCTS。
+    #[test]
+    fn go_mate_is_parsed_and_mapped_to_a_ply_budget() {
+        assert_eq!(parse_go("go mate 8").mate, Some(8));
+        assert_eq!(parse_go("go depth 12").mate, None);
+        assert_eq!(parse_go("go infinite").mate, None);
+        // 与 searchmoves 这类多 token 指令混用时也要能解析出来。
+        assert_eq!(
+            parse_go("go searchmoves a0a1 b0c2 mate 3").mate,
+            Some(3),
+            "mate 必须能被 is_go_keyword 正确截断"
+        );
+        assert_eq!(mate_search_plies_for(1), 1);
+        assert_eq!(mate_search_plies_for(5), 9);
+        assert_eq!(mate_search_plies_for(8), 15);
+        assert_eq!(mate_search_plies_for(0), 31);
     }
 
     #[test]

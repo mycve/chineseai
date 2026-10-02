@@ -70,6 +70,11 @@ pub fn open_dive_db(path: &Path) -> io::Result<Connection> {
 ///
 /// Px0 book 的 FEN 本身就只有两段，不带 60 回合自然限着计数；旧加载路径用
 /// `Position::from_fen` 把计数当 0，所以规范化到两段后行为完全一致。
+///
+/// **这是有意的信息丢弃，抽帧库的键也只到这一步**：规范化后的 FEN 既不保留
+/// `halfmove_clock`（60 回合计数），也不保留任何重复/长将/长捉历史。因此从抽帧库
+/// 取出的局面一律是"历史未知"的锚点局面——`rule_context` 里与循环有关的 6 个分量
+/// 在这类起点上不可信，只应被当作"全新对局"来用。要真正恢复历史，只能保留着法。
 pub fn normalize_fen(fen: &str) -> io::Result<String> {
     let mut parts = fen.split_whitespace();
     let board = parts.next().ok_or_else(|| invalid("empty FEN"))?;

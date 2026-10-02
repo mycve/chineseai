@@ -18,6 +18,7 @@ mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
 mod inference;
+mod mate;
 pub mod nnue;
 mod play;
 pub mod px0_data;
@@ -76,6 +77,7 @@ pub use arch::{
     POLICY_TACTICAL_FACTOR_SIZE, RULE_CONTEXT_SIZE, dense_move_index,
 };
 pub use inference::{AzNnue, outputs_for_training_sample, position_for_training_sample};
+pub use mate::{MateSearchLimits, MateSolution, search_root_mate};
 pub use sample::{
     AzHoldoutReport, AzLoopConfig, AzLoopReport, AzPhaseValueReport, AzPolicyGroupStats,
     AzSampleMeta, AzStartSource, AzTrainLossWeights, AzTrainStats, AzTrainingSample,

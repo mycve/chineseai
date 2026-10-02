@@ -9,9 +9,11 @@ pub(crate) fn run(cmd: AzBenchArgs) {
     let cpuct = cmd.cpuct.max(0.0);
     let fen = cmd.fen.join(" ");
     let position = parse_position(&fen);
-    let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+    let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
         panic!("failed to load `{model_path}`: {err}");
     });
+    model.policy_tactical_exact_after_move = cmd.exact_after_move_tactical;
+    model.mate_search_plies = cmd.mate_search_plies;
 
     let _ = alphazero_search(
         &position,
@@ -42,6 +44,11 @@ pub(crate) fn run(cmd: AzBenchArgs) {
     println!("search       : alphazero");
     println!("simd         : {}", chineseai::az::inference_simd_backend());
     println!("cpuct        : {cpuct}");
+    println!(
+        "exact_tactical: {}",
+        model.policy_tactical_exact_after_move
+    );
+    println!("mate_plies   : {}", model.mate_search_plies);
     println!("total_sims   : {total_sims}");
     println!("elapsed_ms   : {:.3}", elapsed.as_secs_f64() * 1000.0);
     println!(

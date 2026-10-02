@@ -15,9 +15,9 @@ use super::{
     dense_move_squares,
     fused_feature_pool::{PADDING_ITEM, pack_feature},
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
-    normalize_wdl_target, policy_sparse_capture_index, policy_sparse_factor_indices,
-    policy_sparse_main_index, policy_tactical_indices, visit_value_king_piece_features,
-    visit_value_threat_features,
+    normalize_wdl_target, policy_move_tactical_flags, policy_sparse_capture_index,
+    policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
+    visit_value_king_piece_features, visit_value_threat_features,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -420,10 +420,21 @@ impl PackedBatch {
                         consequence_to % BOARD_SIZE,
                     );
                     let check = position.gives_check_after_move_fast(mv);
-                    let source_attacked = opponent_attacks & (1u128 << mv.from as usize) != 0;
-                    let destination_attacked = opponent_attacks & (1u128 << mv.to as usize) != 0;
-                    let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
-                    let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
+                    // 训练侧固定用走前语义（`exact_destination = false`），与
+                    // `AzNnue::policy_tactical_exact_after_move` 的默认值一致：两边必须
+                    // 共用同一个实现，否则打开推理侧开关而不重训会让特征空间错配。
+                    let (
+                        source_attacked,
+                        destination_attacked,
+                        source_defended,
+                        destination_defended,
+                    ) = policy_move_tactical_flags(
+                        &position,
+                        mv,
+                        opponent_attacks,
+                        own_attacks,
+                        false,
+                    );
                     let tactical_base = item_index * POLICY_TACTICAL_TERMS;
                     for (offset, tactical) in policy_tactical_indices(
                         move_index,

@@ -1519,6 +1519,7 @@ mod supply_tests {
             opening_positions: snapshots.clone().into(),
             mirror_probability: 0.0,
             record_fens: false,
+            mate_search_plies: 0,
         };
         let data = chineseai::az::generate_selfplay_data(&model, &loop_config);
         assert!(!data.samples.is_empty(), "从跳水起点应该能生成样本");

@@ -523,6 +523,45 @@ pub(crate) fn policy_tactical_indices(
     [exact, piece_factor, relation]
 }
 
+/// 策略头战术签名用到的 4 个布尔量，返回顺序与 `policy_tactical_indices` 的入参一致：
+/// `(source_attacked, destination_attacked, source_defended, destination_defended)`。
+///
+/// `source_*` 恒为**走前**语义（"我此刻站着的那格是否被攻击/被保护"）；
+/// `destination_attacked/defended` 在 `exact_destination` 为真时改用**走完之后**的精确
+/// 值（虚拟占位查询），否则沿用走前攻击位板上的对应位——后者是历史行为，保持已训练
+/// checkpoint 的输入语义不变。
+#[inline]
+pub(crate) fn policy_move_tactical_flags(
+    position: &Position,
+    mv: Move,
+    opponent_attacks: u128,
+    own_attacks: u128,
+    exact_destination: bool,
+) -> (bool, bool, bool, bool) {
+    let from = mv.from as usize;
+    let to = mv.to as usize;
+    let side = position.side_to_move();
+    let source_attacked = opponent_attacks & (1u128 << from) != 0;
+    let source_defended = own_attacks & (1u128 << from) != 0;
+    let (destination_attacked, destination_defended) = if exact_destination {
+        (
+            position.is_square_attacked_after_move(to, side.opposite(), mv),
+            position.is_square_attacked_after_move(to, side, mv),
+        )
+    } else {
+        (
+            opponent_attacks & (1u128 << to) != 0,
+            own_attacks & (1u128 << to) != 0,
+        )
+    };
+    (
+        source_attacked,
+        destination_attacked,
+        source_defended,
+        destination_defended,
+    )
+}
+
 pub(crate) fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
     let sparse = move_map().dense_to_sparse[move_index] as usize;
     let from = sparse / BOARD_SIZE;
@@ -579,6 +618,42 @@ pub struct AzNnue {
     pub(crate) policy_tactical_folded: Vec<f32>,
     pub(crate) value_threat_active: bool,
     pub(crate) policy_tactical_active: bool,
+    /// 打开后策略头的 `destination_attacked/defended` 取**走完这步之后**的精确值
+    /// （`Position::is_square_attacked_after_move` 的虚拟占位查询），而不是走前攻击
+    /// 位板上的对应位。走前位板在两种情况下与真值不同：`from` 腾空让炮失去炮架或
+    /// 让车线打开、`from` 腾空松开马腿/象眼。
+    ///
+    /// 默认关闭：已训练 checkpoint 的 tactical 表是按近似值学出来的，打开会改变输入
+    /// 语义（必须重训），也会让"沿用同一个模型"的评测结果不可比。
+    ///
+    /// 实测代价（`az-bench best.safetensors 800 60 1.4`，每次 800 sims × 60 次取均值）：
+    /// startpos 201k → 123k sims/s（**−39%**），中局 111k → 83k sims/s（**−25%**）。
+    /// 原因是它把"每节点算一次全盘攻击位板"变成"每节点每个候选走法各查两次"：
+    /// 每节点约 38 个走法 × 2 种颜色 × 单次虚拟查询 ≈ 40ns，约 +3µs/节点。
+    /// 因此**不建议在搜索热路径上打开**；要把这份信息给模型，应放到子节点的评估里
+    /// （子节点本来就会为自己的策略头算一次全盘位板，问 `to` 只需读那一位，边际成本为 0）。
+    pub policy_tactical_exact_after_move: bool,
+    /// 根节点 check-only 连杀证明搜索的最大半回合数（0 = 关闭）。
+    ///
+    /// 挂在模型上而不是 `AzSearchLimits` 上，是因为后者的结构体字面量全仓有 41 处，
+    /// 而它只在根节点用一次、与网络质量无关，属于"这一次搜索肯花多少额外预算"。
+    /// 打开后：证明出连杀就直接把该子局面标成对方必败，`root_policy` 会把策略目标
+    /// 压到杀着上、`proven_root_value` 会把价值目标设为必胜。
+    ///
+    /// 代价：每次根搜索多一次受限搜索。**实测**（`az-bench best.safetensors 800 5 1.4`，
+    /// ms/search 取 5 次均值）：
+    /// - 根局面**没有**将军着法（startpos）：4.08 → 3.99ms，无可测代价（只多一遍 check 过滤）；
+    /// - 有将军但**没杀**（中局）：7.31 → 7.59ms（plies=9，**+4%**）、12.52ms（plies=15，**+71%**）；
+    /// - **真出杀**（mate-in-8 的局面）：5.4 → 36.5ms，一次证明约 **31ms / 58,178 节点**；
+    ///   证完根节点已 solved，`simulate` 立即返回，所以每次搜索只付一次。
+    ///
+    /// 建议：**自博弈/数据生成用 9**（把可证射程从 mate-in-4 推到 mate-in-5，成本被深度上限兜住）；
+    /// **分析、UCI `go mate N`、高预算评测用 15~17**（那个 mate-in-8 需要 15）。
+    /// 要再压成本就给 `mate.rs` 加置换表——当前没有置换表、也没有着法排序。
+    pub mate_search_plies: usize,
+    /// 连杀证明搜索的全局节点预算上限。默认 20 万覆盖实测的 mate-in-8（58,178 节点），
+    /// 同时是"最坏情况花多少时间"的硬兜底。
+    pub mate_search_nodes: usize,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     pub(super) gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -620,6 +695,9 @@ impl Clone for AzNnue {
             policy_tactical_folded: self.policy_tactical_folded.clone(),
             value_threat_active: self.value_threat_active,
             policy_tactical_active: self.policy_tactical_active,
+            policy_tactical_exact_after_move: self.policy_tactical_exact_after_move,
+            mate_search_plies: self.mate_search_plies,
+            mate_search_nodes: self.mate_search_nodes,
             gpu_trainer: None,
         }
     }
@@ -720,6 +798,9 @@ impl AzNnue {
             policy_tactical_folded: Vec::new(),
             value_threat_active: false,
             policy_tactical_active: false,
+            policy_tactical_exact_after_move: false,
+            mate_search_plies: 0,
+            mate_search_nodes: 200_000,
             gpu_trainer: None,
         };
         model.rebuild_policy_cache();
@@ -891,6 +972,9 @@ impl AzNnue {
             policy_tactical_folded: Vec::new(),
             value_threat_active: false,
             policy_tactical_active: false,
+            policy_tactical_exact_after_move: false,
+            mate_search_plies: 0,
+            mate_search_nodes: 200_000,
             gpu_trainer: None,
         };
         model.rebuild_policy_cache();
@@ -1158,12 +1242,18 @@ impl AzNnue {
                         consequence.map_or(0.0, |(from, _, captured)| {
                             let moved_piece = from / BOARD_SIZE;
                             let check = scratch.policy_gives_check[index];
-                            let source_attacked =
-                                opponent_attacks & (1u128 << mv.from as usize) != 0;
-                            let destination_attacked =
-                                opponent_attacks & (1u128 << mv.to as usize) != 0;
-                            let source_defended = own_attacks & (1u128 << mv.from as usize) != 0;
-                            let destination_defended = own_attacks & (1u128 << mv.to as usize) != 0;
+                            let (
+                                source_attacked,
+                                destination_attacked,
+                                source_defended,
+                                destination_defended,
+                            ) = policy_move_tactical_flags(
+                                position,
+                                *mv,
+                                opponent_attacks,
+                                own_attacks,
+                                self.policy_tactical_exact_after_move,
+                            );
                             let tactical = policy_tactical_indices(
                                 move_index,
                                 moved_piece,

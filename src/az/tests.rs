@@ -3,15 +3,17 @@ use crate::xiangqi::{BOARD_SIZE, Color, Move, Position, color_index};
 
 use super::{
     AzArenaReport, AzEvalAccumulator, AzEvalScratch, AzExperiencePool, AzNnue, AzNnueArch,
-    AzSampleMeta, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
+    AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
+    MateSearchLimits,
     POLICY_ACCUMULATOR_RANK, POLICY_CACHE_PIECE_SIZE, POLICY_CAPTURE_RELATION_OFFSET,
     POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_SIZE,
     RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64, VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB,
-    VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE, dense_move_index,
-    dense_move_squares, evaluate_policy_groups, move_map, policy_cache_capture_index,
-    policy_cache_main_index, policy_consequence_features, policy_sparse_capture_index,
+    VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE, alphazero_search_with_rules,
+    dense_move_index, dense_move_squares, evaluate_policy_groups, move_map,
+    policy_cache_capture_index, policy_cache_main_index, policy_consequence_features,
+    policy_move_tactical_flags, policy_sparse_capture_index,
     policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
-    rule_context_features, scalar_value_to_wdl_target,
+    rule_context_features, scalar_value_to_wdl_target, search_root_mate,
     visit_value_king_piece_features, visit_value_threat_features,
 };
 
@@ -1026,6 +1028,285 @@ fn rule_context_exposes_repetition_without_history_planes() {
     let context = rule_context_features(&position, &[entry, entry, entry]);
 
     assert!((context[1] - 2.0 / 3.0).abs() < 1e-6);
-    assert!(context[2] > 0.0);
+    // cycle 从"最后一次命中之后"开始，因此这里只有 1 个 entry；这份 cycle 里没有任何
+    // 真实着法（全是锚点），但它仍必须计入 [2] —— 空 cycle 优化不能把它一起跳过。
+    assert_eq!(context[2], 1.0 / 32.0);
     assert_eq!(context[3..], [0.0; 4]);
+}
+
+/// 没有重复局面时 `rule_context_features` 的 cycle 分支必须完全不贡献任何分量。
+///
+/// 这条正对着 `cycle.is_empty()` 的短路：跳过的只是一次白克隆，7 个分量一个都不许变。
+#[test]
+fn rule_context_is_cycle_free_without_repetition() {
+    let mut position = Position::startpos();
+    let mut history = position.initial_rule_history();
+    for notation in ["b0c2", "b9c7", "a0b0", "a9b9"] {
+        let mv = position.parse_uci_move(notation).unwrap();
+        let mover = position.side_to_move();
+        let captured = position.piece_at(mv.to as usize);
+        position.make_move(mv);
+        history.push(position.rule_history_entry_after_moved(mover, mv, captured));
+    }
+    // 前提：历史里确实没有任何重复局面，否则这条测试测不到空 cycle 分支。
+    for (index, entry) in history.iter().enumerate() {
+        for old in &history[..index] {
+            assert!(
+                entry.hash != old.hash || entry.side_to_move != old.side_to_move,
+                "unexpected repetition at history index {index}"
+            );
+        }
+    }
+
+    let context = rule_context_features(&position, &history);
+    assert_eq!(context[1], 0.0, "no prior match => [1] must be zero");
+    assert_eq!(context[2], 0.0, "empty cycle => [2] must be zero");
+    assert_eq!(context[3..], [0.0; 4], "empty cycle => no check/chase counts");
+    assert_eq!(
+        context[0],
+        position.rule60_count_with_history(&history) as f32 / 120.0,
+        "[0] must come from the whole history, not from the cycle"
+    );
+}
+
+/// `evaluate_wdl_with_rules` 是公开 API，但此前全仓没有任何调用者、也没有测试。
+/// 它必须（1）返回归一化的 WDL 分布，（2）真的把 rule_context 喂进主干。
+#[test]
+fn evaluate_wdl_with_rules_returns_normalized_distribution() {
+    let model = AzNnue::random(16, 97);
+    // 必须用 60 回合计数非零的局面：startpos 的 7 个分量全是 0，而
+    // `add_rule_context_to_hidden` 会跳过零，那样根本测不出 context 有没有进主干。
+    let position = Position::from_fen(
+        "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 30 1",
+    )
+    .unwrap();
+    let history = position.initial_rule_history();
+    let moves = position.legal_moves();
+    assert!(!moves.is_empty());
+    assert!(
+        rule_context_features(&position, &history)
+            .iter()
+            .any(|value| *value != 0.0)
+    );
+
+    let wdl = model.evaluate_wdl_with_rules(&position, &history, &moves);
+    assert!(wdl.iter().all(|value| value.is_finite() && *value >= 0.0));
+    assert!((wdl.iter().sum::<f32>() - 1.0).abs() < 1e-4, "{wdl:?}");
+
+    // 随机初始化的 `value_head_output` 恒为 0（刻意保持价值中性），此时 softmax 恒为均匀
+    // 分布、任何输入变化都观察不到。先把它打开，再比较"只差 rule_context_hidden"的两个
+    // 模型：唯一变量就是 context 有没有进主干。
+    let mut base = model.clone();
+    for (index, weight) in base.value_head_output.iter_mut().enumerate() {
+        *weight = ((index % 11) as f32 + 1.0) * 1.0e-2;
+    }
+    let without_context = base.evaluate_wdl_with_rules(&position, &history, &moves);
+
+    let mut with_context = base.clone();
+    for (index, weight) in with_context.rule_context_hidden.iter_mut().enumerate() {
+        *weight = ((index % 17) as f32 + 1.0) * 1.0e-3;
+    }
+    let shifted = with_context.evaluate_wdl_with_rules(&position, &history, &moves);
+    assert!(
+        shifted
+            .iter()
+            .zip(without_context.iter())
+            .any(|(left, right)| (left - right).abs() > 1e-6),
+        "rule_context did not reach the value head: {shifted:?} vs {without_context:?}"
+    );
+}
+
+/// 默认必须是"走前语义"：这个开关改变了 checkpoint 的输入特征语义，全仓唯一的设置点
+/// 是 `az-bench --exact-after-move-tactical`。这里顺带钉住 `Clone` 会保留它。
+#[test]
+fn tactical_flags_default_to_pre_move_semantics() {
+    let model = AzNnue::random(8, 5);
+    assert!(!model.policy_tactical_exact_after_move);
+    let mut enabled = model.clone();
+    enabled.policy_tactical_exact_after_move = true;
+    assert!(enabled.clone().policy_tactical_exact_after_move);
+}
+
+/// 连杀证明搜索：mate-in-1 必须能证，且必须**不能**在 7 手内证明一个 mate-in-8 的局面
+/// （与 Pikafish `go mate 7` → 仍报 mate 8 的 oracle 一致）。
+#[test]
+fn mate_search_proves_mate_in_one_and_respects_ply_limit() {
+    // 黑车 a9→d9 之后：红将 d2 的 d3 在九宫外、c2 在九宫外，只剩 d1（仍在 d 线上）与 e2
+    // （被 e9 黑将的飞将封住），且红方没有别的子可以垫将或吃车 ⇒ 将死。
+    let position = Position::from_fen("r3k4/9/9/9/9/9/9/3K5/9/9 b - - 0 1").unwrap();
+    let history = position.initial_rule_history();
+    let solution = search_root_mate(
+        &position,
+        &history,
+        MateSearchLimits {
+            max_plies: 1,
+            max_nodes: 10_000,
+        },
+    )
+    .expect("mate in 1 must be proven");
+    assert_eq!(solution.mv.to_uci(), "a9d9");
+    assert_eq!(solution.plies, 1);
+    // 0 半回合（关闭）必须什么都不做。
+    assert!(
+        search_root_mate(&position, &history, MateSearchLimits::OFF).is_none(),
+        "MateSearchLimits::OFF must disable the search"
+    );
+}
+
+/// oracle 局面：Pikafish `go mate 8` → 黑方强制连杀、首着 h2h0、共 15 半回合，
+/// 且 `go mate 7` 21 秒仍只报 mate 8（7 手内无杀）。证明树只有 24 条终端线。
+///
+/// MCTS 靠访问分配撞不出这条杀（实测 64–4096 sims 全走 h5f4，h2h0 从未超过 4 次访问；
+/// 把全部 8192 次压到 h2h0 上才浮现 +0.97），而这套受限证明搜索应该直接证出来。
+#[test]
+fn mate_search_proves_mate_in_eight() {
+    let position =
+        Position::from_fen("2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1")
+            .unwrap();
+    let history = position.initial_rule_history();
+    // 实测：这一条杀要 58,178 个节点才证出来（无置换表、无着法排序），所以预算给 20 万。
+    let limits = MateSearchLimits {
+        max_plies: 15,
+        max_nodes: 200_000,
+    };
+    let solution = search_root_mate(&position, &history, limits).expect("mate in 8 must be proven");
+    assert_eq!(solution.plies, 15, "oracle 说最快 8 手（15 半回合）");
+    assert_eq!(solution.mv.to_uci(), "h2h0", "oracle 首着");
+    assert!(solution.nodes <= limits.max_nodes);
+    // 节点预算必须是真的兜底，而不是摆设：有限预算下宁可证不出来。
+    assert!(
+        search_root_mate(
+            &position,
+            &history,
+            MateSearchLimits {
+                max_plies: 15,
+                max_nodes: 1,
+            }
+        )
+        .is_none(),
+        "tiny node budget must not prove anything"
+    );
+    // 7 手（13 半回合）内无杀。
+    assert!(
+        search_root_mate(
+            &position,
+            &history,
+            MateSearchLimits {
+                max_plies: 13,
+                max_nodes: 50_000,
+            }
+        )
+        .is_none(),
+        "oracle: 7 手内无杀"
+    );
+}
+
+/// 证明结果必须经由**既有**机制喂进搜索结果：杀着拿到 `solved = +1`、策略目标变成它上面
+/// 的一热分布、价值目标变成必胜。全程不需要 checkpoint（连杀搜索不走网络）。
+#[test]
+fn root_mate_proof_drives_search_result() {
+    let position =
+        Position::from_fen("2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1")
+            .unwrap();
+    let mut model = AzNnue::random(16, 3);
+    model.mate_search_plies = 15;
+
+    let provable = alphazero_search_with_rules(
+        &position,
+        None,
+        None,
+        &model,
+        AzSearchLimits {
+            simulations: 64,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        provable.best_move.map(|mv| mv.to_uci()),
+        Some("h2h0".to_owned())
+    );
+    assert_eq!(provable.value_wdl, [1.0, 0.0, 0.0]);
+    let mate = provable
+        .candidates
+        .iter()
+        .find(|candidate| candidate.mv.to_uci() == "h2h0")
+        .expect("mate move must be among the candidates");
+    assert_eq!(mate.solved, Some(1));
+    assert!((mate.policy - 1.0).abs() < 1e-6, "policy={}", mate.policy);
+
+    // 关掉之后同一局面（同一随机权重）必须回到普通 MCTS：证明不出来，就没有任何子节点
+    // 带 solved，价值也不再是必胜。
+    model.mate_search_plies = 0;
+    let plain = alphazero_search_with_rules(
+        &position,
+        None,
+        None,
+        &model,
+        AzSearchLimits {
+            simulations: 64,
+            ..Default::default()
+        },
+    );
+    assert!(plain.candidates.iter().all(|c| c.solved.is_none()));
+    assert_ne!(plain.value_wdl, [1.0, 0.0, 0.0]);
+}
+
+/// 精确走后战术位：默认必须与旧的"走前位板"逐位一致，打开后必须改用走后真值。
+///
+/// 局面是"红车 a7、黑炮 a9、落点 a5"：走前黑炮正好隔着红车打 a5（1 个炮架），
+/// 红车走开之后炮架消失、而红车自己站到 a5 上（不攻击自己）。所以落点的
+/// `destination_attacked` 与 `destination_defended` 两位在两种模式下都翻转。
+#[test]
+fn exact_after_move_tactical_flips_destination_flags() {
+    const RED_GENERAL: usize = 0;
+    const RED_ROOK: usize = 4;
+    const BLACK_GENERAL: usize = 7;
+    const BLACK_CANNON: usize = 12;
+    let square = |name: &str| crate::xiangqi::parse_square(name).unwrap();
+    let position = Position::from_canonical_piece_squares(&[
+        (BLACK_CANNON, square("a9")),
+        (RED_ROOK, square("a7")),
+        (RED_GENERAL, square("d0")),
+        (BLACK_GENERAL, square("e9")),
+    ]);
+    let mv = Move::new(square("a7"), square("a5"));
+    assert!(dense_move_index(mv) < DENSE_MOVE_SPACE);
+
+    let side = position.side_to_move();
+    let masks = position.attacked_squares_masks();
+    let approximate = policy_move_tactical_flags(
+        &position,
+        mv,
+        masks[color_index(side.opposite())],
+        masks[color_index(side)],
+        false,
+    );
+    let exact = policy_move_tactical_flags(
+        &position,
+        mv,
+        masks[color_index(side.opposite())],
+        masks[color_index(side)],
+        true,
+    );
+    // (source_attacked, destination_attacked, source_defended, destination_defended)
+    assert_eq!(approximate, (false, true, false, true));
+    assert_eq!(exact, (false, false, false, false));
+
+    // 开关必须真的落到评估路径上：tactical 表非零时，两种模式的 logits 必须不同。
+    let mut model = AzNnue::random(16, 41);
+    for (index, weight) in model.policy_tactical.iter_mut().enumerate() {
+        // 让每个 signature 桶的权重互不相同，签名一变就一定反映到 logits 上。
+        *weight = ((index % 13) as f32 + 1.0) * 1.0e-6;
+    }
+    model.rebuild_policy_tactical();
+    assert!(model.policy_tactical_active);
+
+    let moves = [mv];
+    let mut off = AzEvalScratch::new(model.arch);
+    let mut on = AzEvalScratch::new(model.arch);
+    model.policy_tactical_exact_after_move = false;
+    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut off);
+    model.policy_tactical_exact_after_move = true;
+    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut on);
+    assert_ne!(off.logits[0], on.logits[0]);
 }

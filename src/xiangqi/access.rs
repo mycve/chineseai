@@ -61,8 +61,14 @@ impl Position {
         self.rule60_max_ply
     }
 
+    /// `sq` 是否被 `color` 方攻击。
+    ///
+    /// 名字里的"保护"只是习惯叫法：语义就是"该格被该方攻击"，不检查 `sq` 上站的是谁
+    /// （是对方子、己方子还是空格，结果一样）。因为"没有棋子攻击自己所在的格子"对
+    /// 跃子和滑子都成立，所以它和 `is_square_attacked(sq, color)` 完全等价。
+    #[inline(always)]
     pub fn is_piece_protected(&self, sq: usize, color: Color) -> bool {
-        self.visit_attacker_origins_to(sq, color, |from| from != sq)
+        self.is_square_attacked(sq, color)
     }
 
     pub(super) fn find_general(&self, color: Color) -> Option<usize> {

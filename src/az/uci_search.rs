@@ -139,6 +139,7 @@ pub(crate) fn search_uci(
     let mut tree = AzTree::new(position.clone(), history, Some(root_moves), model, limits);
     tree.adjudicate_root_rules = false;
     tree.expand(0);
+    tree.prove_root_mate(position, model);
     let mut used = 0;
     let mut last_progress = Instant::now();
     if tree.nodes[0].children_len > 0 {
@@ -207,6 +208,39 @@ mod tests {
                 history.push(entry);
             }
         }
+    }
+
+    /// UCI 搜索走的是自己的建树循环（`tree.expand(0)`），所以连杀证明也必须在这里生效，
+    /// 否则 `go mate N` 会静默退化成普通 MCTS。
+    #[test]
+    fn uci_search_applies_root_mate_proof() {
+        let position =
+            Position::from_fen("2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1")
+                .unwrap();
+        let history = position.initial_rule_history();
+        let limits = AzSearchLimits {
+            simulations: 64,
+            ..Default::default()
+        };
+
+        let plain_model = AzNnue::random(16, 20260929);
+        let plain = run(&position, history.clone(), &plain_model, limits);
+        assert_ne!(
+            plain.search.best_move.map(|mv| mv.to_uci()),
+            Some("h2h0".to_owned()),
+            "普通 MCTS 在这个局面证明不出 mate-in-8（具体走哪手由随机权重决定，不作断言）"
+        );
+        assert!(plain.variations[0].proven.is_none());
+
+        let mut mate_model = plain_model;
+        mate_model.mate_search_plies = 15;
+        let proven = run(&position, history, &mate_model, limits);
+        assert_eq!(
+            proven.search.best_move.map(|mv| mv.to_uci()),
+            Some("h2h0".to_owned())
+        );
+        assert_eq!(proven.variations[0].moves[0].to_uci(), "h2h0");
+        assert_eq!(proven.variations[0].proven, Some(1));
     }
 
     #[test]
