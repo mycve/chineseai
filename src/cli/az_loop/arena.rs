@@ -195,11 +195,11 @@ pub(crate) fn build_arena_start_positions(
         ^ 0xD1B5_4A32_D192_ED03
         ^ (gate_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut book = Px0OpeningBook::load(&config.arena_opening_book, seed)
-        .unwrap_or_else(|err| panic!("failed to load Px0 arena book: {err}"));
+        .unwrap_or_else(|err| panic!("failed to load Px0 arena opening book: {err}"));
     let count = book.len();
     let positions = book
         .next_batch(1000, 0)
-        .unwrap_or_else(|err| panic!("invalid Px0 arena FEN: {err}"))
+        .unwrap_or_else(|err| panic!("invalid arena opening FEN: {err}"))
         .into_iter()
         .map(|snapshot| snapshot.position)
         .collect();

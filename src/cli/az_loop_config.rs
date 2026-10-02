@@ -52,6 +52,14 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub selfplay_opening_book: String,
+    /// 跳水热身库（`dive-games` 产出的 SQLite）。空表示不用。
+    ///
+    /// 与 `selfplay_opening_book` 并行采样：`selfplay_dive_fraction` 的开局从跳水库里
+    /// 取，其余仍从开局库里取。跳水库只放我们与 Pikafish 意见冲突且真的掉水的局面，
+    /// 所以它针对的是弱点，而不是广度。
+    pub selfplay_dive_book: String,
+    /// 自博弈开局来自跳水库的比例（0 关闭，1 只用跳水库）。
+    pub selfplay_dive_fraction: f32,
     pub replay_capacity: usize,
     pub shuffle_size: usize,
     pub replay_recent_games: u32,
@@ -119,6 +127,8 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
             selfplay_opening_book: "book.pgn.gz".into(),
+            selfplay_dive_book: "dive.sqlite".into(),
+            selfplay_dive_fraction: 0.5,
             replay_capacity: 2400000,
             shuffle_size: 524_288,
             replay_recent_games: 7500,
@@ -179,6 +189,8 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
+        line!("selfplay_dive_book", q(&self.selfplay_dive_book));
+        line!("selfplay_dive_fraction", f(self.selfplay_dive_fraction));
         line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
@@ -319,6 +331,7 @@ impl AzLoopFileConfig {
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
+        self.selfplay_dive_fraction = self.selfplay_dive_fraction.clamp(0.0, 1.0);
 
         self.replay_recent_games = self.replay_recent_games.max(1);
         self.shuffle_size = self.shuffle_size.max(1);
@@ -353,12 +366,41 @@ mod tests {
         let config = AzLoopFileConfig::parse(&AzLoopFileConfig::default().to_file_text());
         let expected = AzLoopFileConfig::default();
         assert_eq!(config.selfplay_opening_book, "book.pgn.gz");
+        assert_eq!(config.selfplay_dive_book, "dive.sqlite");
+        assert_eq!(config.selfplay_dive_fraction, 0.5);
         assert_eq!(config.arena_opening_book, "book.pgn.gz");
         assert_eq!(config.simulations, 10_000);
         assert_eq!(config.cpuct, expected.cpuct);
         assert_eq!(config.root_dirichlet_alpha, 0.12);
         assert_eq!(config.temperature_cutoff_plies, 78);
         assert!(config.fpu_absolute_at_root);
+    }
+
+    /// 跳水库配置要能原样往返，并且比例被 clamp 到 [0,1]。
+    #[test]
+    fn dive_book_config_roundtrips_and_clamps() {
+        let config = AzLoopFileConfig {
+            selfplay_dive_book: "runs/dive-0620.sqlite".into(),
+            selfplay_dive_fraction: 0.25,
+            ..AzLoopFileConfig::default()
+        };
+        let text = config.to_file_text();
+        assert!(text.contains("selfplay_dive_book = \"runs/dive-0620.sqlite\"\n"));
+        assert!(text.contains("selfplay_dive_fraction = 0.25\n"));
+        let restored = AzLoopFileConfig::parse(&text);
+        assert_eq!(restored.selfplay_dive_book, "runs/dive-0620.sqlite");
+        assert_eq!(restored.selfplay_dive_fraction, 0.25);
+
+        for (input, expected) in [(2.0_f32, 1.0_f32), (-1.0, 0.0)] {
+            let clamped = AzLoopFileConfig::parse(
+                &AzLoopFileConfig {
+                    selfplay_dive_fraction: input,
+                    ..AzLoopFileConfig::default()
+                }
+                .to_file_text(),
+            );
+            assert_eq!(clamped.selfplay_dive_fraction, expected);
+        }
     }
 
     #[test]

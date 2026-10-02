@@ -28,6 +28,95 @@ use std::{
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
 
+/// 自博弈起点有两个来源：开局库给广度，跳水库给弱点。
+///
+/// 两个都在同一个 `Mutex` 后面，worker 线程按 batch 轮流取，避免多个线程同时驱动
+/// 两个读取游标。
+pub(crate) struct SelfplaySupply {
+    openings: chineseai::pikafish::opening_book::Px0OpeningBook,
+    dives: Option<chineseai::pikafish::dive_store::DiveBook>,
+    dive_fraction: f32,
+    batches: u64,
+}
+
+impl SelfplaySupply {
+    /// 取一批起点。按**批**（而不是按局面）决定整批来自哪个源：一个 batch 内来源干净，
+    /// 上报的 `start_source` 也读得出来。
+    pub(crate) fn next_batch(
+        &mut self,
+        count: usize,
+        generation: u32,
+        seed: u64,
+    ) -> std::io::Result<Vec<chineseai::az::AzStartSnapshot>> {
+        self.batches = self.batches.wrapping_add(1);
+        let use_dive = self
+            .dives
+            .as_ref()
+            .is_some_and(|_| dive_batch_selected(self.dive_fraction, seed, self.batches));
+        match (use_dive, self.dives.as_mut()) {
+            (true, Some(dives)) => dives.next_batch(count, generation),
+            _ => self.openings.next_batch(count, generation),
+        }
+    }
+}
+
+/// 按比例决定这一批是否用跳水库。SplitMix64 混种子，保证可复现。
+pub(crate) fn dive_batch_selected(fraction: f32, seed: u64, batches: u64) -> bool {
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    let mut rng = chineseai::az::SplitMix64::new(
+        seed ^ batches.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03,
+    );
+    rng.unit_f32() < fraction
+}
+
+/// 装载自博弈起点供应。跳水库是可选的补充：路径为空、比例为 0、文件缺失或读不出来，
+/// 都只打印一行然后退回"只用开局库"，不打断整轮训练。
+pub(crate) fn build_selfplay_supply(config: &crate::cli::az_loop_config::AzLoopFileConfig) -> SelfplaySupply {
+    let path = config.selfplay_dive_book.trim();
+    let dives = if path.is_empty() || config.selfplay_dive_fraction <= 0.0 {
+        None
+    } else if !std::path::Path::new(path).exists() {
+        println!("dive     : skipped missing book={path}");
+        None
+    } else {
+        match chineseai::pikafish::dive_store::DiveBook::open(path, config.seed) {
+            Ok(book) => {
+                println!(
+                    "dive     : book={} positions={} selfplay_fraction={}",
+                    path,
+                    book.len(),
+                    config.selfplay_dive_fraction
+                );
+                Some(book)
+            }
+            Err(err) => {
+                println!("dive     : skipped book={path} reason={err}");
+                None
+            }
+        }
+    };
+    SelfplaySupply {
+        openings: chineseai::pikafish::opening_book::Px0OpeningBook::load(
+            &config.selfplay_opening_book,
+            config.seed,
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to load Px0 opening book `{}`: {err}",
+                config.selfplay_opening_book
+            )
+        }),
+        dives,
+        dive_fraction: config.selfplay_dive_fraction,
+        batches: 0,
+    }
+}
+
 pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let config_path = cmd.config;
     let Some(config) = load_or_create_az_loop_config(&config_path) else {
@@ -203,25 +292,14 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         learner_update: start_update.saturating_sub(1).min(u32::MAX as usize) as u32,
         model: Arc::new(initial_selfplay_model),
     }));
-    let book_openings = Arc::new(std::sync::Mutex::new(
-        chineseai::pikafish::opening_book::Px0OpeningBook::load(
-            &config.selfplay_opening_book,
-            config.seed,
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to load Px0 opening book `{}`: {err}",
-                config.selfplay_opening_book
-            )
-        }),
-    ));
+    let supply = Arc::new(std::sync::Mutex::new(build_selfplay_supply(&config)));
     let mut selfplay_handles = Vec::with_capacity(selfplay_worker_count);
     for worker_id in 0..selfplay_worker_count {
         let selfplay_stop = stop_requested.clone();
         let selfplay_config = config.clone();
         let selfplay_tx = selfplay_tx.clone();
         let shared_model = Arc::clone(&shared_model);
-        let book_openings = Arc::clone(&book_openings);
+        let supply = Arc::clone(&supply);
         selfplay_handles.push(thread::spawn(move || {
             let mut batch_index = 0usize;
             let mut local_version = u64::MAX;
@@ -252,11 +330,11 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     &Arc::default(),
                 );
                 loop_config.games = 4;
-                loop_config.opening_positions = book_openings
+                loop_config.opening_positions = supply
                     .lock()
-                    .unwrap_or_else(|_| panic!("Px0 opening book poisoned"))
-                    .next_batch(loop_config.games, local_learner_update)
-                    .unwrap_or_else(|err| panic!("invalid Px0 opening: {err}"))
+                    .unwrap_or_else(|_| panic!("selfplay supply poisoned"))
+                    .next_batch(loop_config.games, local_learner_update, batch_seed)
+                    .unwrap_or_else(|err| panic!("invalid selfplay opening: {err}"))
                     .into();
                 let data = generate_selfplay_data(
                     local_model
@@ -1244,4 +1322,246 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod supply_tests {
+    use super::*;
+    use chineseai::pikafish::dive_store;
+    use rusqlite::params;
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("supply-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 开局库现在只有 `book.pgn.gz` 一种形态。
+    fn write_opening_book(path: &Path, fens: &[(&str, u32)]) {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut text = String::new();
+        for (fen, _) in fens {
+            text.push_str(&format!("[FEN \"{fen}\"]\n{{}}\n"));
+        }
+        let mut encoder = GzEncoder::new(std::fs::File::create(path).unwrap(), Compression::fast());
+        encoder.write_all(text.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    fn write_dive_book(path: &Path, fens: &[&str]) {
+        let conn = dive_store::open_dive_db(path).unwrap();
+        for fen in fens {
+            conn.execute(
+                "INSERT INTO dives (fen, plies, our_q, pika_q, delta_q) VALUES (?1, 20, 0.6, -0.9, 1.5)",
+                params![fen],
+            )
+            .unwrap();
+        }
+    }
+
+    fn config_for(opening: &Path, dive: &Path, fraction: f32) -> crate::cli::az_loop_config::AzLoopFileConfig {
+        let mut config = crate::cli::az_loop_config::AzLoopFileConfig::default();
+        config.selfplay_opening_book = opening.to_string_lossy().into_owned();
+        config.selfplay_dive_book = dive.to_string_lossy().into_owned();
+        config.selfplay_dive_fraction = fraction;
+        config.seed = 20260411;
+        config
+    }
+
+    #[test]
+    fn fraction_bounds_are_exact() {
+        for seed in [0u64, 7, 20260411] {
+            assert!(!dive_batch_selected(0.0, seed, 1));
+            assert!(dive_batch_selected(1.0, seed, 1));
+            // 越界值由 AzLoopFileConfig::normalize 先 clamp 到 [0,1]；
+            // 这里的原语对越界值也保持单调语义。
+            assert!(!dive_batch_selected(-0.5, seed, 1));
+            assert!(dive_batch_selected(2.0, seed, 1));
+        }
+    }
+
+    #[test]
+    fn fraction_is_reproducible_and_statistically_on_target() {
+        let seed = 0x5EED_1234;
+        for batches in 1..64u64 {
+            assert_eq!(
+                dive_batch_selected(0.5, seed, batches),
+                dive_batch_selected(0.5, seed, batches)
+            );
+        }
+        let hits = (1..=10_000u64)
+            .filter(|&batches| dive_batch_selected(0.25, seed, batches))
+            .count();
+        // 10k 次抽样，期望 2500；给足二项分布余量。
+        assert!((2300..2700).contains(&hits), "hits={hits}");
+    }
+
+    /// 比例 1.0 时全部来自跳水库（跳水库里的局面不在开局库里，可据此区分）。
+    #[test]
+    fn fraction_one_serves_only_dive_positions() {
+        let dir = temp_dir("frac1");
+        let opening = dir.join("book.pgn.gz");
+        let dive = dir.join("dive.sqlite");
+        write_opening_book(&opening, &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0)]);
+        write_dive_book(&dive, &["3k5/9/9/9/9/9/9/9/4P4/4K4 w"]);
+        let config = config_for(&opening, &dive, 1.0);
+        let mut supply = build_selfplay_supply(&config);
+        let dive_hash = Position::from_fen("3k5/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        for batch in 0..4u64 {
+            let snapshots = supply.next_batch(3, 5, batch).unwrap();
+            assert_eq!(snapshots.len(), 3);
+            assert!(snapshots.iter().all(|s| s.position.hash() == dive_hash));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 比例 0.0 时全部来自开局库；跳水库即使存在也不参与。
+    #[test]
+    fn fraction_zero_serves_only_opening_positions() {
+        let dir = temp_dir("frac0");
+        let opening = dir.join("book.pgn.gz");
+        let dive = dir.join("dive.sqlite");
+        write_opening_book(&opening, &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0)]);
+        write_dive_book(&dive, &["3k5/9/9/9/9/9/9/9/4P4/4K4 w"]);
+        let config = config_for(&opening, &dive, 0.0);
+        let mut supply = build_selfplay_supply(&config);
+        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        for batch in 0..4u64 {
+            let snapshots = supply.next_batch(2, 5, batch).unwrap();
+            assert!(snapshots.iter().all(|s| s.position.hash() == opening_hash));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跳水库文件缺失只降级，不 panic。
+    #[test]
+    fn missing_dive_book_falls_back_to_openings() {
+        let dir = temp_dir("missing");
+        let opening = dir.join("book.pgn.gz");
+        write_opening_book(&opening, &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0)]);
+        let config = config_for(&opening, &dir.join("nope.sqlite"), 0.5);
+        let mut supply = build_selfplay_supply(&config);
+        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        for batch in 0..4u64 {
+            let snapshots = supply.next_batch(2, 5, batch).unwrap();
+            assert!(snapshots.iter().all(|s| s.position.hash() == opening_hash));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 集成：`dive-games` 产出的库真的能驱动自博弈起点，并且从这些局面
+    /// 能生成带 start_source=OpeningBook 的合法样本。
+    #[test]
+    fn dive_positions_drive_selfplay_start_selection() {
+        let dir = temp_dir("e2e");
+        let opening = dir.join("book.pgn.gz");
+        let dive = dir.join("dive.sqlite");
+        // 开局库给常规起点；跳水库给"已经掉水"的起点。
+        write_opening_book(
+            &opening,
+            &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0), ("3k5/9/9/9/9/9/9/9/4P4/4K4 w", 0)],
+        );
+        write_dive_book(
+            &dive,
+            &[
+                "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w",
+                "rnb1kabnr/4a4/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/4C2C1/9/RNBAKABNR w",
+            ],
+        );
+
+        let config = config_for(&opening, &dive, 1.0);
+        let mut supply = build_selfplay_supply(&config);
+        let snapshots = supply.next_batch(4, 11, 1).unwrap();
+        assert_eq!(snapshots.len(), 4);
+
+        // 起点必须是全合法局面，并且带上 generation。
+        for snapshot in &snapshots {
+            assert!(!snapshot.position.legal_moves().is_empty());
+            assert_eq!(snapshot.phase_ply, 0);
+            assert_eq!(snapshot.generation, 11);
+            assert_eq!(snapshot.rule_history.len(), 1);
+        }
+
+        // 真的拿这些起点跑自博弈，样本要能打上 OpeningBook 来源。
+        let model = chineseai::az::AzNnue::random_with_arch(Default::default(), 7);
+        let loop_config = chineseai::az::AzLoopConfig {
+            games: snapshots.len(),
+            max_plies: 6,
+            rule60_max_ply: None,
+            simulations: 8,
+            seed: 20260411,
+            workers: 1,
+            generation_update: 3,
+            temperature_start: 0.0,
+            temperature_cutoff_plies: 0,
+            temperature_visit_offset: 0.0,
+            temperature_endgame: 0.0,
+            temperature_decay_delay_plies: 0,
+            temperature_decay_plies: 0,
+            cpuct: 1.0,
+            cpuct_at_root: 1.9,
+            cpuct_base: 38739.0,
+            cpuct_factor: 3.894,
+            cpuct_base_at_root: 38739.0,
+            cpuct_factor_at_root: 3.894,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            fpu_value: 0.23,
+            fpu_value_at_root: 1.0,
+            fpu_absolute_at_root: true,
+            minimum_kldgain_per_node: 0.0,
+            draw_score: 0.0,
+            policy_softmax_temp: 1.4,
+            opening_positions: snapshots.clone().into(),
+            mirror_probability: 0.0,
+            record_fens: false,
+        };
+        let data = chineseai::az::generate_selfplay_data(&model, &loop_config);
+        assert!(!data.samples.is_empty(), "从跳水起点应该能生成样本");
+        assert!(
+            data.samples
+                .iter()
+                .all(|sample| sample.meta.start_source == chineseai::az::AzStartSource::OpeningBook),
+            "跳水起点在自博弈里的来源应记作 OpeningBook"
+        );
+        assert_eq!(data.start_games[chineseai::az::AzStartSource::OpeningBook.index()], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 比例 0.5 时两批起点应该都能取到，且每个 batch 内部来源干净。
+    #[test]
+    fn mixed_fraction_alternates_cleanly_per_batch() {
+        let dir = temp_dir("mixed");
+        let opening = dir.join("book.pgn.gz");
+        let dive = dir.join("dive.sqlite");
+        write_opening_book(&opening, &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0)]);
+        write_dive_book(&dive, &["3k5/9/9/9/9/9/9/9/4P4/4K4 w"]);
+        let config = config_for(&opening, &dive, 0.5);
+        let mut supply = build_selfplay_supply(&config);
+        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        let dive_hash = Position::from_fen("3k5/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        let mut opening_batches = 0;
+        let mut dive_batches = 0;
+        for batch in 1..=64u64 {
+            let snapshots = supply.next_batch(4, 9, batch).unwrap();
+            let hashes: std::collections::HashSet<_> =
+                snapshots.iter().map(|s| s.position.hash()).collect();
+            assert_eq!(hashes.len(), 1, "一个 batch 内来源必须干净");
+            if hashes.contains(&dive_hash) {
+                dive_batches += 1;
+            } else {
+                assert!(hashes.contains(&opening_hash));
+                opening_batches += 1;
+            }
+            assert_eq!(snapshots[0].generation, 9);
+            assert_eq!(snapshots[0].phase_ply, 0);
+        }
+        assert!(opening_batches > 0 && dive_batches > 0);
+        assert_eq!(opening_batches + dive_batches, 64);
+    }
 }

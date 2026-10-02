@@ -1,7 +1,7 @@
 use clap::{CommandFactory, Parser};
 
 use crate::cli::args::{Cli, CliCommand};
-use crate::cli::{az_bench, az_init, az_loop, az_policy_scale, az_search, vs_pikafish};
+use crate::cli::{az_bench, az_init, az_loop, az_policy_scale, az_search, dive_games, vs_pikafish};
 
 pub(crate) fn run() {
     let cli = Cli::parse();
@@ -21,6 +21,7 @@ pub(crate) fn run() {
                 return;
             }
         }
+        Some(CliCommand::DiveGames(cmd)) => dive_games::run(cmd),
         Some(CliCommand::VsPikafish(cmd)) => vs_pikafish::run(cmd),
     }
     chineseai::infra::profile::print_report();

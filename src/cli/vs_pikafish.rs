@@ -1,9 +1,9 @@
 use crate::cli::args::*;
-use chineseai::{
-    pikafish::{VsPikafishConfig, run_vs_pikafish},
-    pikafish::opening_book::Px0OpeningBook,
+use chineseai::pikafish::{
+    PikafishEngineConfig, VsPikafishConfig, opening_book::Px0OpeningBook, run_vs_pikafish,
 };
 use std::path::Path;
+use std::path::PathBuf;
 
 pub(crate) fn run(cmd: VsPikafishArgs) {
     let pikafish_exe = cmd.pikafish_exe;
@@ -29,13 +29,13 @@ pub(crate) fn run(cmd: VsPikafishArgs) {
             .unwrap_or_else(|err| panic!("failed to load Px0 opening book: {err}"));
         let positions = book
             .next_batch(cmd.opening_positions.max(1), 0)
-            .unwrap_or_else(|err| panic!("invalid Px0 FEN: {err}"))
+            .unwrap_or_else(|err| panic!("invalid opening FEN: {err}"))
             .into_iter()
             .map(|s| s.position)
             .collect();
         (
             positions,
-            format!("px0(shuffled,book={})", cmd.opening_book),
+            format!("px0-shuffled(book={})", cmd.opening_book),
         )
     };
     let summary = run_vs_pikafish(
@@ -59,7 +59,18 @@ pub(crate) fn run(cmd: VsPikafishArgs) {
             fpu_value_at_root,
             policy_softmax_temp,
             report_games: cmd.report_games,
+            engine: PikafishEngineConfig {
+                nnue: (!cmd.pikafish_nnue.trim().is_empty())
+                    .then(|| PathBuf::from(&cmd.pikafish_nnue)),
+                threads: cmd.pikafish_threads.max(1),
+                hash_mb: cmd.pikafish_hash_mb,
+                use_book: Some(cmd.pikafish_use_book),
+            },
+            dive: None,
+            skip_games: cmd.skip_games,
+            stop_after: cmd.stop_after,
         },
+        None,
     )
     .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
     for item in &summary.abnormal_ends {

@@ -29,8 +29,147 @@ pub(crate) enum CliCommand {
     AzBench(AzBenchArgs),
     /// Run self-play training from a TOML config.
     AzLoop(AzLoopArgs),
+    /// Find "dive" positions by playing from the opening book against Pikafish.
+    DiveGames(DiveGamesArgs),
     /// Run ChineseAI against a Pikafish UCI engine.
     VsPikafish(VsPikafishArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(after_long_help = "\
+A frame is kept only when it is a \"blind spot\": the truth says we are already
+lost while we have not noticed, and the two are far enough apart.
+
+  pika_q <= --lost-below      (Pikafish: we are lost)
+  our_q  >= --lost-below      (we have not noticed)
+  |our_q - pika_q| >= --delta-q
+
+Win rate is the metric because Pikafish `wdl` and our WDL head are the same
+quantity. Only the FEN (plus the decision inputs) is stored: these positions are
+fed back to reinforcement learning to explore, not labelled for supervision.
+Endgames are excluded by --min-pieces / --max-dive-ply, and a game stops once
+--max-frames-per-game frames have been collected.
+
+Examples:
+  chineseai dive-games ./tools/pikafish best.safetensors --games 500 --parallel-games 16
+  chineseai dive-games ./tools/pikafish best.safetensors --games 200 \\
+      --opening-book book.pgn.gz --opening-positions 2000 --pikafish-depth 12")]
+pub(crate) struct DiveGamesArgs {
+    /// Pikafish UCI executable path.
+    pub(crate) pikafish_exe: String,
+    /// ChineseAI AZ-NNUE model path.
+    pub(crate) model: String,
+    /// Output SQLite dive library.
+    #[arg(long, default_value = "dive.sqlite")]
+    pub(crate) output: String,
+    /// Px0 opening book (book.pgn.gz) used to generate start positions.
+    #[arg(long, default_value = "book.pgn.gz")]
+    pub(crate) opening_book: String,
+    /// Number of shuffled start positions taken from the opening book.
+    #[arg(long, default_value_t = 500)]
+    pub(crate) opening_positions: usize,
+    /// Total games (ChineseAI plays Red in even games, Black in odd games).
+    #[arg(long, default_value_t = 40)]
+    pub(crate) games: usize,
+    /// Simultaneous games / long-lived Pikafish processes.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) parallel_games: usize,
+    /// ChineseAI MCTS simulations per move.
+    #[arg(short = 's', long, default_value_t = 800)]
+    pub(crate) simulations: usize,
+    /// Pikafish search depth during play (also the evaluation depth when --analyze-depth is 0).
+    #[arg(long, default_value_t = 12)]
+    pub(crate) pikafish_depth: u32,
+    /// Pikafish depth used to re-evaluate dive candidates; 0 reuses --pikafish-depth.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) analyze_depth: u32,
+    /// Draw after this many plies.
+    #[arg(long, default_value_t = 200)]
+    pub(crate) max_plies: usize,
+    /// Disagreement threshold on the win-rate scale: |our_q - pika_q| >= delta_q.
+    /// Win rate is the primary metric because Pikafish wdl and our WDL head are
+    /// the same quantity; cp is only recorded.
+    #[arg(long, default_value_t = 0.35)]
+    pub(crate) delta_q: f32,
+    /// We count a position only when the truth says we are already lost
+    /// (`pika_q <= lost_below`) while we have not noticed (`our_q >= lost_below`),
+    /// with the two at least --delta-q apart.
+    #[arg(long, default_value_t = -0.80, allow_negative_numbers = true)]
+    pub(crate) lost_below: f32,
+    /// Optional extra drop gate on the win-rate scale; 0 disables.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) drop_q: f32,
+    /// Optional extra disagreement gate in centipawns; 0 disables.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) delta_cp: i32,
+    /// Optional extra drop gate in centipawns; 0 disables.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) drop_cp: i32,
+    /// Stop a game once this many dive frames have been collected. 0 disables.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) max_frames_per_game: usize,
+    /// Endgame exclusion: minimum total pieces on the board.
+    #[arg(long, default_value_t = 20)]
+    pub(crate) min_pieces: usize,
+    /// Endgame exclusion: no dive is taken beyond this ply.
+    #[arg(long, default_value_t = 80)]
+    pub(crate) max_dive_ply: usize,
+    /// Empty the dives table before collecting.
+    #[arg(long)]
+    pub(crate) clear: bool,
+    /// Print the final FEN and move list of every game.
+    #[arg(long)]
+    pub(crate) report_games: bool,
+    /// Pikafish Threads option.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) pikafish_threads: u32,
+    /// Pikafish Hash option in MB.
+    #[arg(long, default_value_t = 64)]
+    pub(crate) pikafish_hash_mb: u32,
+    /// Pikafish NNUE file; empty lets the engine find pikafish.nnue next to the executable.
+    #[arg(long, default_value = "")]
+    pub(crate) pikafish_nnue: String,
+    /// Allow the engine's own opening book during play (off by default so evals stay honest).
+    #[arg(long)]
+    pub(crate) pikafish_use_book: bool,
+    /// Skip the first N games (resume a previous run: same --seed remaps the same
+    /// opening position to the same game index, so skipping is exact).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) skip_games: usize,
+    /// Stop after N games this run; 0 runs all --games. Ctrl+C also stops cleanly
+    /// after the current game finishes.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) stop_after: usize,
+    /// ChineseAI PUCT constant.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) cpuct: f32,
+    /// ChineseAI root PUCT constant.
+    #[arg(long, default_value_t = 1.9)]
+    pub(crate) cpuct_at_root: f32,
+    /// ChineseAI dynamic PUCT base.
+    #[arg(long, default_value_t = 38739.0)]
+    pub(crate) cpuct_base: f32,
+    /// ChineseAI dynamic PUCT growth factor.
+    #[arg(long, default_value_t = 3.894)]
+    pub(crate) cpuct_factor: f32,
+    /// ChineseAI root dynamic PUCT base.
+    #[arg(long, default_value_t = 38739.0)]
+    pub(crate) cpuct_base_at_root: f32,
+    /// ChineseAI root dynamic PUCT growth factor.
+    #[arg(long, default_value_t = 3.894)]
+    pub(crate) cpuct_factor_at_root: f32,
+    /// ChineseAI non-root first-play urgency reduction.
+    #[arg(long, default_value_t = 0.23)]
+    pub(crate) fpu_value: f32,
+    /// ChineseAI root first-play urgency reduction.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) fpu_value_at_root: f32,
+    /// Divisor applied to ChineseAI policy logits before search.
+    #[arg(long, default_value_t = 1.4)]
+    pub(crate) policy_softmax_temp: f32,
+    /// Random seed.
+    #[arg(long, default_value_t = 20260411)]
+    pub(crate) seed: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -235,6 +374,12 @@ pub(crate) struct VsPikafishArgs {
     /// Random seed.
     #[arg(long, default_value_t = 20260411)]
     pub(crate) seed: u64,
+    /// Skip the first N games (resume a previous run with the same --seed).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) skip_games: usize,
+    /// Stop after N games this run; 0 means run all --games.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) stop_after: usize,
     /// Pikafish search depth.
     #[arg(long, default_value_t = DEFAULT_VS_PIKAFISH_DEPTH)]
     pub(crate) pikafish_depth: u32,
@@ -247,10 +392,22 @@ pub(crate) struct VsPikafishArgs {
     /// Print the final FEN and complete move list for every game.
     #[arg(long)]
     pub(crate) report_games: bool,
-    /// Px0 book.pgn.gz used to generate random start positions. Empty uses startpos.
+    /// Px0 book.pgn.gz used for random start positions. Empty uses startpos.
     #[arg(long, default_value = "book.pgn.gz")]
     pub(crate) opening_book: String,
-    /// Number of shuffled FEN positions to take from the Px0 book.
+    /// Number of shuffled FEN positions to take from the opening book.
     #[arg(long, default_value_t = 1000)]
     pub(crate) opening_positions: usize,
+    /// Pikafish Threads option.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) pikafish_threads: u32,
+    /// Pikafish Hash option in MB.
+    #[arg(long, default_value_t = 64)]
+    pub(crate) pikafish_hash_mb: u32,
+    /// Pikafish NNUE file; empty lets the engine find pikafish.nnue next to the executable.
+    #[arg(long, default_value = "")]
+    pub(crate) pikafish_nnue: String,
+    /// Allow the engine's own opening book during play.
+    #[arg(long)]
+    pub(crate) pikafish_use_book: bool,
 }

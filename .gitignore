@@ -20,6 +20,10 @@ tools/*
 eval/*.csv
 eval/*.fens
 eval/*.bin
+# 抽帧库是可再生的中间产物（重跑 dive-games 就有），不进版本库。
+/dive.sqlite
+/dive.sqlite-shm
+/dive.sqlite-wal
 eval/*.sqlite
 eval/torch-policy-*/
 eval/*/
