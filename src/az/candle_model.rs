@@ -449,6 +449,54 @@ impl AzCandleModel {
         vars
     }
 
+    /// 与 [`Self::all_vars`] **同序**：该张量是否施加 weight decay。
+    ///
+    /// 排除两类，只对稠密 matmul 权重施加 decay：
+    /// * **行 gather 型查表** —— 逐样本只激活极少数行（威胁表每位置上限 192/107750 行，
+    ///   即 0.18%），对整表施加 decay 等于持续收缩从未激活的行。这里包括 5 个 feature_pool
+    ///   表、`value_king_piece_hidden`、`value_threat_embedding`、`policy_sparse_*`、
+    ///   `policy_tactical`，以及 `fused_policy` 按走法下标取用的那几张表
+    ///   （`policy_move_bias`/`policy_consequence_output`/`policy_move_context`/
+    ///   `policy_accumulator_move`，见 `fused_policy.rs` 里的固定偏移取址）。
+    /// * **所有 bias**（`hidden_bias`/`value_head_bias`/`policy_repetition_bias`）。
+    ///
+    /// 量级提醒：`lr=4e-4` 时每步衰减因子是 `1 - lr*wd = 1 - 4e-8`，十万步累计只收缩 0.4%，
+    /// 所以这个分组在 Adam 的学习率尺度下几乎不动结果。
+    pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
+        /// 与 `all_vars` 的 push 顺序一一对应。
+        const DECAY: [bool; 26] = [
+            false, // input_hidden
+            false, // input_piece_hidden
+            false, // input_rank_hidden
+            false, // input_file_hidden
+            false, // input_king_piece_hidden
+            true,  // rule_context_hidden
+            true,  // check_context_hidden
+            false, // hidden_bias
+            true,  // value_head_hidden
+            false, // value_head_bias
+            false, // value_king_piece_hidden
+            true,  // value_head_output
+            false, // value_threat_embedding
+            true,  // value_threat_output
+            true,  // policy_threat_context
+            false, // policy_move_bias
+            false, // policy_consequence_output
+            true,  // policy_context_hidden
+            false, // policy_move_context
+            true,  // policy_accumulator_hidden
+            false, // policy_accumulator_move
+            false, // policy_sparse_table
+            false, // policy_sparse_factor
+            false, // policy_tactical
+            true,  // policy_repetition_hidden
+            false, // policy_repetition_bias
+        ];
+        let vars = self.all_vars();
+        debug_assert_eq!(vars.len(), DECAY.len());
+        (vars, DECAY.to_vec())
+    }
+
     pub(super) fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
         copy_var(&self.input_hidden, &mut model.input_hidden)?;
         copy_var(&self.input_piece_hidden, &mut model.input_piece_hidden)?;

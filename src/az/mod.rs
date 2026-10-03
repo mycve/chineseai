@@ -1,4 +1,5 @@
 mod accumulator;
+mod adamw;
 mod alphazero;
 pub(crate) use alphazero::{AzUciSearchResult, search_uci};
 mod arch;
@@ -56,8 +57,8 @@ pub use play::{
 pub use replay::{AzExperiencePool, AzReplaySampleBatch, AzReplayWindowStats, Px0ReplaySampler};
 pub use start::AzStartSnapshot;
 pub use train::{
-    train_samples, train_samples_weighted, train_samples_weighted_owned,
-    train_samples_weighted_shared,
+    AzTrainOptimizer, train_samples, train_samples_weighted, train_samples_weighted_owned,
+    train_samples_weighted_owned_with_optimizer, train_samples_weighted_shared,
 };
 
 // 门面重导出：把拆分到子模块的项保持在 `crate::az::*` 的原路径上。

@@ -25,9 +25,19 @@ pub(super) fn train_samples_gpu(
     batch_size: usize,
     rng: &mut super::SplitMix64,
     loss_weights: super::AzTrainLossWeights,
+    optimizer: super::AzTrainOptimizer,
 ) -> Result<super::AzTrainStats, String> {
-    candle::train_samples_gpu(model, samples, epochs, lr, batch_size, rng, loss_weights)
-        .map_err(|err| err.to_string())
+    candle::train_samples_gpu(
+        model,
+        samples,
+        epochs,
+        lr,
+        batch_size,
+        rng,
+        loss_weights,
+        optimizer,
+    )
+    .map_err(|err| err.to_string())
 }
 
 #[cfg(not(any(
@@ -82,6 +92,7 @@ pub(super) fn train_samples_gpu(
     _batch_size: usize,
     _rng: &mut super::SplitMix64,
     _loss_weights: super::AzTrainLossWeights,
+    _optimizer: super::AzTrainOptimizer,
 ) -> Result<super::AzTrainStats, String> {
     Err("GPU training is disabled by `--no-default-features`".to_string())
 }

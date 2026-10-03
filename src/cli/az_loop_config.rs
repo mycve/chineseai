@@ -1,4 +1,4 @@
-use chineseai::az::AzNnueArch;
+use chineseai::az::{AzNnueArch, AzTrainOptimizer};
 use chineseai::infra::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
@@ -70,6 +70,13 @@ pub struct AzLoopFileConfig {
     pub replay_recent_games: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
+    /// 训练优化器内核：`"adamw"`（默认）或 `"px0-sgd"`。
+    ///
+    /// 带 `#[serde(default)]`：老配置文件里没有这一项时按默认值解析，不必改格式版本。
+    /// 注意 `lr` 的语义随内核变化 —— AdamW 用常数 lr（逐坐标自适应，步长 ≈ lr），
+    /// Px0Sgd 用 `lr` 作 base 并乘 warmup 与按累计步数分段的阶梯，两者尺度不可直接比较。
+    #[serde(default)]
+    pub train_optimizer: AzTrainOptimizer,
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
@@ -102,7 +109,10 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 10_000,
             selfplay_samples_per_update: 120000,
-            lr: 0.02,
+            // 默认内核是 AdamW（逐坐标自适应，步长 ≈ lr），所以 `lr` 用旧配方的 4e-4。
+            // 改用 `train_optimizer = "px0-sgd"` 时必须把 `lr` 提到 0.02 量级：带动量 SGD 的
+            // 步长 ∝ lr·g，两个尺度不可混用。
+            lr: 0.0004,
             batch_size: 2048,
             // Px0 SelfPlayGame采用450步上限，200步会过早丢失终局价值标签。
             max_plies: 450,
@@ -142,6 +152,7 @@ impl Default for AzLoopFileConfig {
             replay_recent_games: 7500,
             train_warmup_samples: 600000,
             train_samples_per_update: 120000,
+            train_optimizer: AzTrainOptimizer::default(),
             mirror_probability: 0.5,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
@@ -244,6 +255,7 @@ impl AzLoopFileConfig {
         line!("replay_recent_games", self.replay_recent_games);
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
+        line!("train_optimizer", q(self.train_optimizer.as_str()));
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
@@ -422,6 +434,37 @@ mod tests {
         assert_eq!(clamped.mate_search_plies, 31);
     }
 
+    /// 优化器选择要能原样往返；老配置缺这一项时按默认（AdamW）解析。
+    #[test]
+    fn train_optimizer_config_roundtrips_and_defaults() {
+        assert_eq!(
+            AzLoopFileConfig::default().train_optimizer,
+            AzTrainOptimizer::AdamW
+        );
+
+        let config = AzLoopFileConfig {
+            train_optimizer: AzTrainOptimizer::Px0Sgd,
+            ..AzLoopFileConfig::default()
+        };
+        let text = config.to_file_text();
+        assert!(text.contains("train_optimizer = \"px0-sgd\"\n"));
+        assert_eq!(
+            AzLoopFileConfig::parse(&text).train_optimizer,
+            AzTrainOptimizer::Px0Sgd
+        );
+
+        let legacy = text
+            .lines()
+            .filter(|line| !line.starts_with("train_optimizer"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            AzLoopFileConfig::parse(&legacy).train_optimizer,
+            AzTrainOptimizer::AdamW,
+            "老配置缺这一项时应按默认的 adamw 解析"
+        );
+    }
+
     /// 跳水库配置要能原样往返，并且比例被 clamp 到 [0,1]。
     #[test]
     fn dive_book_config_roundtrips_and_clamps() {
@@ -465,7 +508,7 @@ mod tests {
         let text = config.to_file_text();
 
         assert!(text.starts_with("format_version = 30\n"));
-        assert!(text.contains("lr = 0.02\n"));
+        assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
         assert!(text.contains("rule60_max_ply = 120\n"));
@@ -544,7 +587,7 @@ mod tests {
 
         let parsed = AzLoopFileConfig::parse(&text);
         assert_eq!(parsed.model_path, "model.safetensors");
-        assert!((parsed.lr - 0.02).abs() < 1e-9);
+        assert!((parsed.lr - 0.0004).abs() < 1e-9);
         assert_eq!(parsed.arena_interval, 20);
         assert_eq!(parsed.pikafish_label_eval_interval, 20);
     }

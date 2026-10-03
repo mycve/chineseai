@@ -11,7 +11,7 @@ use crate::cli::training_console;
 use chineseai::az::{
     AzArenaReport, AzExperiencePool, AzLoopReport, AzNnue, AzSearchLimits, AzTrainLossWeights,
     Px0ReplaySampler, SplitMix64, generate_selfplay_data, policy_target_entropy,
-    train_samples_weighted_owned,
+    train_samples_weighted_owned_with_optimizer,
 };
 use chineseai::xiangqi::Position;
 use rusqlite::Connection;
@@ -186,14 +186,24 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let optimizer_state_path = restore_path.clone();
     if restore_path.exists() {
         model
-            .restore_training_state(restore_path, start_update, config.lr)
-            .unwrap_or_else(|err| panic!("refusing mismatched SGD resume state: {err}"));
+            .restore_training_state(
+                restore_path,
+                start_update,
+                config.lr,
+                config.train_optimizer,
+            )
+            .unwrap_or_else(|err| panic!("refusing mismatched optimizer resume state: {err}"));
         println!(
-            "optimizer: restored SGD momentum and global step from `{}`",
+            "optimizer: restored {} state and global step from `{}`",
+            config.train_optimizer.as_str(),
             restore_path.display()
         );
     } else {
-        println!("optimizer: fresh SGD momentum; global step=0, warmup=250");
+        println!(
+            "optimizer: fresh {} lr={} global step=0",
+            config.train_optimizer.as_str(),
+            config.lr
+        );
     }
     let selfplay_model = model.clone();
     let initial_arena_reference_model = {
@@ -257,11 +267,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     });
     let mut tb = SummaryWriter::new(&tb_dir);
     println!(
-        "train: config={} update={} sims={} batch={} optimizer=SGD+Nesterov lr={} max_plies={} book={} tensorboard={}",
+        "train: config={} update={} sims={} batch={} optimizer={} lr={} max_plies={} book={} tensorboard={}",
         config_path,
         start_update,
         config.simulations,
         config.batch_size,
+        config.train_optimizer.as_str(),
         config.lr,
         config.max_plies,
         config.selfplay_opening_book,
@@ -463,7 +474,11 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     trainer_config.seed ^ steps_before as u64 ^ 0xE703_7ED1_A0B4_28DB,
                 );
                 let test_data = test_sampler.sample(pool, count, 0, &mut test_rng).samples;
-                trainer_model.set_training_holdout(test_data, trainer_config.lr)?;
+                trainer_model.set_training_holdout(
+                    test_data,
+                    trainer_config.lr,
+                    trainer_config.train_optimizer,
+                )?;
             }
             let sampled_batch = replay_sampler.sample(
                 pool,
@@ -480,7 +495,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             let train_update = trainer_start_update.saturating_add(train_index);
             let current_lr = trainer_config.lr;
             let train_started = Instant::now();
-            let stats = train_samples_weighted_owned(
+            let stats = train_samples_weighted_owned_with_optimizer(
                 &mut trainer_model,
                 train_data,
                 1,
@@ -491,6 +506,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     value: trainer_config.train_value_weight,
                     policy: trainer_config.train_policy_weight,
                 },
+                trainer_config.train_optimizer,
             )
             .unwrap_or_else(|err| panic!("training update {} failed: {err}", train_update));
             let train_seconds = train_started.elapsed().as_secs_f32();

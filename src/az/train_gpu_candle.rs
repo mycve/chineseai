@@ -1,20 +1,95 @@
+use super::adamw::AzAdamW;
 use super::px0_sgd::Px0Sgd;
-use candle_core::{Device, Result as CandleResult, Tensor, backprop::GradStore};
+use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
 use candle_nn::ops::log_softmax;
 use std::{sync::Arc, thread, time::Instant};
 
 use super::{
-    AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainStats, AzTrainingSample, AzValueMomentStats,
-    WDL_HEAD_SIZE,
+    AzNnue, AzNnueArch, AzTrainLossWeights, AzTrainOptimizer, AzTrainStats, AzTrainingSample,
+    AzValueMomentStats, WDL_HEAD_SIZE,
     candle_model::{AzCandleModel, BatchTensors},
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
 
+/// 优化器内核的两种实现，对外暴露同一组接口（`set_base_lr`/`step`/`steps`/`last_lr`/
+/// `save`/`restore`），这样自博弈循环与检查点逻辑都不必关心选的是哪一个。
+#[derive(Debug)]
+enum TrainOptimizer {
+    Px0(Box<Px0Sgd>),
+    AdamW(Box<AzAdamW>),
+}
+
+impl TrainOptimizer {
+    fn new(
+        kind: AzTrainOptimizer,
+        vars: Vec<Var>,
+        decay: Vec<bool>,
+        lr: f64,
+    ) -> CandleResult<Self> {
+        Ok(match kind {
+            AzTrainOptimizer::Px0Sgd => Self::Px0(Box::new(Px0Sgd::new(vars, lr)?)),
+            AzTrainOptimizer::AdamW => Self::AdamW(Box::new(AzAdamW::new(vars, decay, lr)?)),
+        })
+    }
+
+    fn set_base_lr(&mut self, lr: f64) {
+        match self {
+            Self::Px0(opt) => opt.base_lr = lr,
+            Self::AdamW(opt) => opt.base_lr = lr,
+        }
+    }
+
+    fn step(&mut self, grads: &GradStore) -> CandleResult<()> {
+        match self {
+            Self::Px0(opt) => opt.step(grads),
+            Self::AdamW(opt) => opt.step(grads),
+        }
+    }
+
+    fn steps(&self) -> usize {
+        match self {
+            Self::Px0(opt) => opt.steps,
+            Self::AdamW(opt) => opt.steps,
+        }
+    }
+
+    fn last_lr(&self) -> f64 {
+        match self {
+            Self::Px0(opt) => opt.last_lr,
+            Self::AdamW(opt) => opt.last_lr,
+        }
+    }
+
+    /// 测试用：把累计步数拨到指定值，触发检查点/留出集相关的分支。
+    #[cfg(test)]
+    fn set_steps(&mut self, steps: usize) {
+        match self {
+            Self::Px0(opt) => opt.steps = steps,
+            Self::AdamW(opt) => opt.steps = steps,
+        }
+    }
+
+    fn save(&self, path: &std::path::Path, next_update: usize) -> CandleResult<()> {
+        match self {
+            Self::Px0(opt) => opt.save(path, next_update),
+            Self::AdamW(opt) => opt.save(path, next_update),
+        }
+    }
+
+    fn restore(&mut self, path: &std::path::Path, next_update: usize) -> CandleResult<()> {
+        match self {
+            Self::Px0(opt) => opt.restore(path, next_update),
+            Self::AdamW(opt) => opt.restore(path, next_update),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
     arch: AzNnueArch,
+    optimizer_kind: AzTrainOptimizer,
     replica: GpuReplica,
-    optimizer: Px0Sgd,
+    optimizer: TrainOptimizer,
     holdout: Option<Arc<Vec<AzTrainingSample>>>,
     checks: Vec<super::AzHoldoutReport>,
 }
@@ -33,6 +108,7 @@ pub(super) fn train_samples_gpu(
     batch_size: usize,
     rng: &mut super::SplitMix64,
     loss_weights: AzTrainLossWeights,
+    optimizer_kind: AzTrainOptimizer,
 ) -> CandleResult<AzTrainStats> {
     if samples.is_empty() || epochs == 0 || lr <= 0.0 {
         return Ok(AzTrainStats::default());
@@ -41,9 +117,9 @@ pub(super) fn train_samples_gpu(
     if model
         .gpu_trainer
         .as_ref()
-        .is_none_or(|trainer| !trainer.matches(model))
+        .is_none_or(|trainer| !trainer.matches(model, optimizer_kind))
     {
-        model.gpu_trainer = Some(Box::new(GpuTrainer::new(model, lr)?));
+        model.gpu_trainer = Some(Box::new(GpuTrainer::new(model, lr, optimizer_kind)?));
     }
     let mut stats = AzTrainStats::default();
     let profile_enabled = train_profile_enabled();
@@ -114,7 +190,11 @@ pub(super) fn train_samples_gpu(
 }
 
 impl GpuTrainer {
-    pub(super) fn new(model: &AzNnue, lr: f32) -> CandleResult<Self> {
+    pub(super) fn new(
+        model: &AzNnue,
+        lr: f32,
+        optimizer_kind: AzTrainOptimizer,
+    ) -> CandleResult<Self> {
         let replica = match GpuReplica::new(model, 0) {
             Ok(replica) => replica,
             Err(_) => {
@@ -122,10 +202,12 @@ impl GpuTrainer {
                 GpuReplica::new_cpu(model)?
             }
         };
-        let optimizer = Px0Sgd::new(replica.model.all_vars(), lr as f64)?;
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let optimizer = TrainOptimizer::new(optimizer_kind, vars, decay, lr as f64)?;
 
         Ok(Self {
             arch: model.arch,
+            optimizer_kind,
             replica,
             optimizer,
             holdout: None,
@@ -133,12 +215,12 @@ impl GpuTrainer {
         })
     }
 
-    fn matches(&self, model: &AzNnue) -> bool {
-        self.arch == model.arch
+    fn matches(&self, model: &AzNnue, optimizer_kind: AzTrainOptimizer) -> bool {
+        self.arch == model.arch && self.optimizer_kind == optimizer_kind
     }
 
     fn set_learning_rate(&mut self, lr: f32) {
-        self.optimizer.base_lr = lr as f64;
+        self.optimizer.set_base_lr(lr as f64);
     }
 
     pub(super) fn save_state(
@@ -158,7 +240,7 @@ impl GpuTrainer {
     }
 
     pub(super) fn steps(&self) -> usize {
-        self.optimizer.steps
+        self.optimizer.steps()
     }
 
     pub(super) fn set_holdout(&mut self, samples: Vec<AzTrainingSample>) {
@@ -210,7 +292,7 @@ impl GpuTrainer {
     }
 
     pub(super) fn last_learning_rate(&self) -> f32 {
-        self.optimizer.last_lr as f32
+        self.optimizer.last_lr() as f32
     }
 
     fn train_batch(
@@ -536,50 +618,58 @@ mod monitoring_tests {
             value: 1.0,
             policy: 1.0,
         };
-        let mut model = AzNnue::random(16, 20260927);
-        let mut uninterrupted = GpuTrainer::new(&model, 0.02).unwrap();
-        eprintln!(
-            "SGD batch resume device: {:?}",
-            uninterrupted.replica.device
-        );
-        let (stats, _) = uninterrupted.train_batch_single(batch(), weights).unwrap();
-        assert!(stats.loss.is_finite());
-        uninterrupted.copy_to_model(&mut model).unwrap();
-        let dir = std::env::current_dir().unwrap().join("tmp");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!(
-            "sgd-batch-resume-test-{}.safetensors",
-            std::process::id()
-        ));
-        uninterrupted.save_state(&path, 42).unwrap();
-        let mut restored = GpuTrainer::new(&model, 0.02).unwrap();
-        restored.restore_state(&path, 42).unwrap();
-        std::fs::remove_file(path).unwrap();
-        uninterrupted.train_batch_single(batch(), weights).unwrap();
-        restored.train_batch_single(batch(), weights).unwrap();
-        assert_eq!(restored.optimizer.steps, uninterrupted.optimizer.steps);
-        assert_eq!(
-            restored.last_learning_rate(),
-            uninterrupted.last_learning_rate()
-        );
-        for (a, b) in uninterrupted
-            .replica
-            .model
-            .all_vars()
-            .iter()
-            .zip(restored.replica.model.all_vars())
-        {
-            let delta = (a.as_tensor() - b.as_tensor())
-                .unwrap()
-                .abs()
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .max(0)
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
-            assert!(delta < 1e-6, "resumed model tensor delta={delta}");
+        // 两个优化器内核都要在真实（含融合 CUDA 算子）路径上验证"恢复 == 不中断"。
+        // 学习率按各自尺度给：Px0Sgd 用 0.02，AdamW 用 4e-4。
+        for (kind, lr) in [
+            (AzTrainOptimizer::Px0Sgd, 0.02f32),
+            (AzTrainOptimizer::AdamW, 4e-4f32),
+        ] {
+            let mut model = AzNnue::random(16, 20260927);
+            let mut uninterrupted = GpuTrainer::new(&model, lr, kind).unwrap();
+            eprintln!(
+                "batch resume device for {kind:?}: {:?}",
+                uninterrupted.replica.device
+            );
+            let (stats, _) = uninterrupted.train_batch_single(batch(), weights).unwrap();
+            assert!(stats.loss.is_finite());
+            uninterrupted.copy_to_model(&mut model).unwrap();
+            let dir = std::env::current_dir().unwrap().join("tmp");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!(
+                "batch-resume-test-{}-{}.safetensors",
+                kind.as_str(),
+                std::process::id()
+            ));
+            uninterrupted.save_state(&path, 42).unwrap();
+            let mut restored = GpuTrainer::new(&model, lr, kind).unwrap();
+            restored.restore_state(&path, 42).unwrap();
+            std::fs::remove_file(path).unwrap();
+            uninterrupted.train_batch_single(batch(), weights).unwrap();
+            restored.train_batch_single(batch(), weights).unwrap();
+            assert_eq!(restored.optimizer.steps(), uninterrupted.optimizer.steps());
+            assert_eq!(
+                restored.last_learning_rate(),
+                uninterrupted.last_learning_rate()
+            );
+            for (a, b) in uninterrupted
+                .replica
+                .model
+                .all_vars()
+                .iter()
+                .zip(restored.replica.model.all_vars())
+            {
+                let delta = (a.as_tensor() - b.as_tensor())
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(delta < 1e-6, "{kind:?} resumed model tensor delta={delta}");
+            }
         }
     }
 
@@ -664,9 +754,16 @@ mod monitoring_tests {
             .iter()
             .map(|v| v.as_tensor().clone())
             .collect::<Vec<_>>();
-        let optimizer = Px0Sgd::new(replica.model.all_vars(), 0.02).unwrap();
+        let optimizer = TrainOptimizer::new(
+            AzTrainOptimizer::Px0Sgd,
+            replica.model.all_vars(),
+            vec![true; replica.model.all_vars().len()],
+            0.02,
+        )
+        .unwrap();
         let mut trainer = GpuTrainer {
             arch: AzNnueArch { hidden_size: 16 },
+            optimizer_kind: AzTrainOptimizer::Px0Sgd,
             replica,
             optimizer,
             holdout: None,
@@ -696,7 +793,7 @@ mod monitoring_tests {
                 0.0
             );
         }
-        trainer.optimizer.steps = super::super::PX0_TEST_STEPS - 1;
+        trainer.optimizer.set_steps(super::super::PX0_TEST_STEPS - 1);
         let mut model = AzNnue::random(16, 20260907);
         model.gpu_trainer = Some(Box::new(trainer));
         train_samples_gpu(
@@ -707,6 +804,7 @@ mod monitoring_tests {
             1,
             &mut super::super::SplitMix64::new(8),
             AzTrainLossWeights::default(),
+            AzTrainOptimizer::Px0Sgd,
         )
         .unwrap();
         let checks = model.take_training_checks();

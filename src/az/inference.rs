@@ -972,8 +972,10 @@ impl AzNnue {
         path: impl AsRef<Path>,
         next_update: usize,
         lr: f32,
+        optimizer: AzTrainOptimizer,
     ) -> io::Result<()> {
-        let mut trainer = train_gpu::GpuTrainer::new(self, lr).map_err(candle_io_error)?;
+        let mut trainer =
+            train_gpu::GpuTrainer::new(self, lr, optimizer).map_err(candle_io_error)?;
         trainer
             .restore_state(path.as_ref(), next_update)
             .map_err(candle_io_error)?;
@@ -991,10 +993,11 @@ impl AzNnue {
         &mut self,
         samples: Vec<AzTrainingSample>,
         lr: f32,
+        optimizer: AzTrainOptimizer,
     ) -> io::Result<()> {
         if self.gpu_trainer.is_none() {
             self.gpu_trainer = Some(Box::new(
-                train_gpu::GpuTrainer::new(self, lr).map_err(candle_io_error)?,
+                train_gpu::GpuTrainer::new(self, lr, optimizer).map_err(candle_io_error)?,
             ));
         }
         self.gpu_trainer.as_mut().unwrap().set_holdout(samples);
