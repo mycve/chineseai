@@ -48,10 +48,7 @@ fn to_fen_with_history_counts_check_exemptions() {
     );
     // 注意：40 回读进 halfmove_clock 只是近似值，豁免状态本身无法用 FEN 表达。
     assert_eq!(
-        position
-            .to_fen_with_history(&history)
-            .split(' ')
-            .next(),
+        position.to_fen_with_history(&history).split(' ').next(),
         position.to_fen().split(' ').next()
     );
 }
@@ -647,12 +644,34 @@ fn five_long_chase_cycles_lose() {
 }
 
 #[test]
-fn mixed_check_and_chase_cycle_is_not_perpetual_chase() {
+fn mixed_check_and_chase_cycle_requires_the_forcing_side_to_change() {
     let mut history = vec![
         test_rule_entry(1, Color::Red, None, false, 0),
-        test_rule_entry(2, Color::Black, Some(Color::Red), true, 1 << 20),
+        test_rule_entry(2, Color::Black, Some(Color::Red), true, 0),
         test_rule_entry(3, Color::Red, Some(Color::Black), false, 0),
         test_rule_entry(4, Color::Black, Some(Color::Red), false, 1 << 20),
+        test_rule_entry(1, Color::Red, Some(Color::Black), false, 0),
+    ];
+    let cycle = history[1..].to_vec();
+    assert_eq!(Position::rule_outcome(&history), None);
+    for _ in 0..2 {
+        history.extend_from_slice(&cycle);
+        assert_eq!(Position::rule_outcome(&history), None);
+    }
+    history.extend_from_slice(&cycle);
+    assert_eq!(
+        Position::rule_outcome(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
+fn mixed_check_and_idle_cycle_remains_a_draw() {
+    let mut history = vec![
+        test_rule_entry(1, Color::Red, None, false, 0),
+        test_rule_entry(2, Color::Black, Some(Color::Red), true, 0),
+        test_rule_entry(3, Color::Red, Some(Color::Black), false, 0),
+        test_rule_entry(4, Color::Black, Some(Color::Red), false, 0),
         test_rule_entry(1, Color::Red, Some(Color::Black), false, 0),
     ];
     history.extend_from_within(1..);
@@ -660,6 +679,30 @@ fn mixed_check_and_chase_cycle_is_not_perpetual_chase() {
         Position::rule_outcome(&history),
         Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
     );
+}
+
+#[test]
+fn tiantian_check_and_chase_loop_filters_the_black_rook_repeat() {
+    let mut position =
+        Position::from_fen("3k2b2/9/3a5/p7p/9/2P6/P2n4P/2C1R4/1r1KN4/3A1A3 w - - 3 36").unwrap();
+    let mut history = position.initial_rule_history();
+    let cycle = "d1d2 b1b0 d2d1 b0b1";
+    for (index, text) in cycle.split_whitespace().cycle().take(21).enumerate() {
+        let mv = position.parse_uci_move(text).unwrap();
+        let allowed = position.legal_moves_with_rules(&history).contains(&mv);
+        // 允许三个完整循环，第四个循环（原棋谱第 86 步）黑方必须变招。
+        assert_eq!(allowed, index < 15 || position.side_to_move() == Color::Red);
+        history.push(position.rule_history_entry_after_move(mv));
+        position.make_move(mv);
+        assert_eq!(
+            position.rule_outcome_with_history(&history),
+            (index >= 15).then_some(RuleOutcome::Win(Color::Red))
+        );
+    }
+    let repeat = position.parse_uci_move("b1b0").unwrap();
+    let moves = position.legal_moves_with_rules(&history);
+    assert!(!moves.contains(&repeat));
+    assert!(!moves.is_empty(), "黑方应有可用的变招");
 }
 
 #[test]

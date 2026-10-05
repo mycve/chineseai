@@ -1047,6 +1047,27 @@ mod tests {
     }
 
     #[test]
+    fn uci_root_limits_check_chase_cycles_even_after_external_repeats() {
+        let mut position =
+            Position::from_fen("3k2b2/9/3a5/p7p/9/2P6/P2n4P/2C1R4/1r1KN4/3A1A3 w - - 3 36")
+                .unwrap();
+        let mut history = position.initial_rule_history();
+        let cycle = ["d1d2", "b1b0", "d2d1", "b0b1"];
+        apply_uci_moves(&mut position, &mut history, &cycle.repeat(3)).unwrap();
+        assert_eq!(position.rule_outcome_with_history(&history), None);
+        apply_uci_moves(&mut position, &mut history, &cycle[..3]).unwrap();
+        let repeat = position.parse_uci_move("b0b1").unwrap();
+        assert!(position.legal_moves().contains(&repeat));
+        let root_moves = uci_root_moves(&position, &history);
+        assert!(!root_moves.contains(&repeat));
+        assert!(!root_moves.is_empty());
+        // 导入平台已经走出的第四轮循环，也必须继续要求黑方变招。
+        apply_uci_moves(&mut position, &mut history, &["b0b1", "d1d2"]).unwrap();
+        let repeat = position.parse_uci_move("b1b0").unwrap();
+        assert!(!uci_root_moves(&position, &history).contains(&repeat));
+    }
+
+    #[test]
     fn opening_temperature_tracks_game_ply() {
         let mut state = UciState::default();
         handle_setoption("setoption name OpeningTempPlies value 20", &mut state);

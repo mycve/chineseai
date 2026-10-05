@@ -7,7 +7,11 @@ use super::{
 enum RuleViolation {
     LongCheck,
     LongChase,
+    CheckChase,
 }
+
+/// 持续将捉最多允许三个完整循环，第四个循环必须变招。
+const CHECK_CHASE_ALLOWED_CYCLES: usize = 3;
 
 impl Position {
     pub fn initial_rule_history(&self) -> Vec<RuleHistoryEntry> {
@@ -79,7 +83,7 @@ impl Position {
         let outcome = if let Some(entries) = repetition_cycle(history) {
             // 逐着记录不带捉子掩码，重复判定必须按完整局面回滚重算。
             let exact_entries = self.recompute_cycle_chases(entries);
-            Some(adjudicate_repetition(&exact_entries))
+            adjudicate_repetition(&exact_entries)
         } else if self
             .rule60_max_ply
             .is_some_and(|max_ply| self.rule60_count_with_history(history) >= max_ply)
@@ -137,7 +141,7 @@ impl Position {
 
     pub fn rule_outcome(history: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
         crate::scope_profile!("xiangqi.rule_outcome");
-        repetition_cycle(history).map(adjudicate_repetition)
+        repetition_cycle(history).and_then(adjudicate_repetition)
     }
 
     pub fn legal_moves_with_rules(&self, history: &[RuleHistoryEntry]) -> Vec<Move> {
@@ -459,26 +463,43 @@ fn repetition_cycle(history: &[RuleHistoryEntry]) -> Option<&[RuleHistoryEntry]>
     Some(&history[cycle_start..=current_index])
 }
 
-fn adjudicate_repetition(entries: &[RuleHistoryEntry]) -> RuleOutcome {
+fn adjudicate_repetition(entries: &[RuleHistoryEntry]) -> Option<RuleOutcome> {
     let red_violation = repeated_rule_violation(entries, Color::Red);
     let black_violation = repeated_rule_violation(entries, Color::Black);
+    // 切片不含第一次出现的锚点，同一末局面的出现次数即完整循环数。
+    let current = entries.last()?;
+    let cycles = entries
+        .iter()
+        .filter(|entry| entry.hash == current.hash && entry.side_to_move == current.side_to_move)
+        .count();
+    let pending_check_chase = cycles <= CHECK_CHASE_ALLOWED_CYCLES
+        && [red_violation, black_violation].contains(&Some(RuleViolation::CheckChase));
+    let active_violation = |violation| match violation {
+        Some(RuleViolation::CheckChase) if pending_check_chase => None,
+        Some(RuleViolation::CheckChase) => Some(RuleViolation::LongChase),
+        other => other,
+    };
+    let red_violation = active_violation(red_violation);
+    let black_violation = active_violation(black_violation);
 
-    // 长将 > 长捉同一子 > 其他循环。
+    // 长将 > 长捉同一子 / 持续将捉 > 其他循环。
     match (red_violation, black_violation) {
         (Some(RuleViolation::LongCheck), Some(RuleViolation::LongCheck)) => {
-            return RuleOutcome::Draw(RuleDrawReason::MutualLongCheck);
+            return Some(RuleOutcome::Draw(RuleDrawReason::MutualLongCheck));
         }
-        (Some(RuleViolation::LongCheck), _) => return RuleOutcome::Win(Color::Black),
-        (_, Some(RuleViolation::LongCheck)) => return RuleOutcome::Win(Color::Red),
+        (Some(RuleViolation::LongCheck), _) => return Some(RuleOutcome::Win(Color::Black)),
+        (_, Some(RuleViolation::LongCheck)) => return Some(RuleOutcome::Win(Color::Red)),
         _ => {}
     }
     match (red_violation, black_violation) {
         (Some(RuleViolation::LongChase), Some(RuleViolation::LongChase)) => {
-            RuleOutcome::Draw(RuleDrawReason::MutualLongChase)
+            Some(RuleOutcome::Draw(RuleDrawReason::MutualLongChase))
         }
-        (Some(RuleViolation::LongChase), _) => RuleOutcome::Win(Color::Black),
-        (_, Some(RuleViolation::LongChase)) => RuleOutcome::Win(Color::Red),
-        _ => RuleOutcome::Draw(RuleDrawReason::Repetition),
+        (Some(RuleViolation::LongChase), _) => Some(RuleOutcome::Win(Color::Black)),
+        (_, Some(RuleViolation::LongChase)) => Some(RuleOutcome::Win(Color::Red)),
+        // 尚在额度内的将捉循环继续对局，不能提前被普通三次重复判和截断。
+        _ if pending_check_chase => None,
+        _ => Some(RuleOutcome::Draw(RuleDrawReason::Repetition)),
     }
 }
 
@@ -502,9 +523,13 @@ fn repeated_rule_violation(entries: &[RuleHistoryEntry], color: Color) -> Option
         return Some(RuleViolation::LongCheck);
     }
 
-    // 本方一将一捉不能算逐着长捉；对方的将军不消除本方的捉子记录。
+    // 自定义变招规则：本方持续将、捉交替且没有闲着，超过额度后与长捉同级。
+    // 将军步无需捉同一子；非将军步必须有实际捉子，不能把一将一闲误判违规。
     if mover_entries.iter().any(|entry| entry.gives_check) {
-        return None;
+        return mover_entries
+            .iter()
+            .all(|entry| entry.gives_check || entry.chased_mask != 0)
+            .then_some(RuleViolation::CheckChase);
     }
 
     let mut identity_at_square = std::array::from_fn::<_, { super::BOARD_SIZE }, _>(|sq| sq as u8);
