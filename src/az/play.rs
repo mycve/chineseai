@@ -285,11 +285,18 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     crate::scope_profile!("az.selfplay.generate");
     // 连杀预算挂在模型上（`AzNnue::mate_search_plies`）。这里统一打一次补丁，让单线程与
     // 多线程两条路径共用同一份设置；两边本来就一样时不克隆（关闭态零代价）。
-    let patched = (model.mate_search_plies != config.mate_search_plies).then(|| {
-        let mut patched = model.clone();
-        patched.mate_search_plies = config.mate_search_plies;
-        patched
-    });
+    let patched = (model.mate_search_plies != config.mate_search_plies
+        || model.tactical_search_nodes != config.tactical_search_nodes
+        || model.tactical_search_plies != config.tactical_search_plies
+        || model.tactical_quiet_plies != config.tactical_quiet_plies)
+        .then(|| {
+            let mut patched = model.clone();
+            patched.mate_search_plies = config.mate_search_plies;
+            patched.tactical_search_nodes = config.tactical_search_nodes;
+            patched.tactical_search_plies = config.tactical_search_plies;
+            patched.tactical_quiet_plies = config.tactical_quiet_plies;
+            patched
+        });
     let model = patched.as_ref().unwrap_or(model);
     let workers = config.workers.max(1).min(config.games.max(1));
     if workers == 1 || config.games <= 1 {
@@ -1362,6 +1369,9 @@ mod tests {
             mirror_probability: 0.0,
             record_fens: false,
             mate_search_plies: 0,
+            tactical_search_nodes: 0,
+            tactical_search_plies: 8,
+            tactical_quiet_plies: 2,
         }
     }
 
@@ -1399,13 +1409,16 @@ mod tests {
     /// （配置 → 模型补丁 → 搜索证明 → 训练样本）。
     #[test]
     fn selfplay_applies_configured_mate_search() {
-        let mate_position =
-            Position::from_fen("2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1")
-                .unwrap();
+        let mate_position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
         let mate_move = mate_position.parse_uci_move("h2h0").unwrap();
-        let mate_index =
-            dense_move_index(canonical_move(mate_position.side_to_move(), mate_move));
-        assert!(mate_index < crate::az::DENSE_MOVE_SPACE, "杀着必须在策略走法空间里");
+        let mate_index = dense_move_index(canonical_move(mate_position.side_to_move(), mate_move));
+        assert!(
+            mate_index < crate::az::DENSE_MOVE_SPACE,
+            "杀着必须在策略走法空间里"
+        );
 
         let mut config = selfplay_test_config(1);
         config.max_plies = 2;

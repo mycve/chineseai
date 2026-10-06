@@ -227,6 +227,15 @@ Examples:
   chineseai az-search model.safetensors 50000 1.5 --top 12 startpos
   chineseai az-search model.safetensors 10000 --trace-move b0c2 --verify-top 3 startpos")]
 pub(crate) struct AzSearchArgs {
+    /// 每个叶子的内部战术节点预算，0 关闭。
+    #[arg(long, default_value_t = 0)]
+    pub(crate) tactical_search_nodes: usize,
+    /// 战术延伸层数，最多 16。
+    #[arg(long, default_value_t = 8)]
+    pub(crate) tactical_search_plies: usize,
+    /// 根候选后全宽搜索层数，最多 2。
+    #[arg(long, default_value_t = 2)]
+    pub(crate) tactical_quiet_plies: usize,
     /// AZ-NNUE model path.
     pub(crate) model: String,
     /// Number of MCTS simulations.

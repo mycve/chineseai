@@ -1,8 +1,6 @@
 use crate::cli::args::*;
 use chineseai::{
-    az::{
-        AzNnue, AzSearchLimits, alphazero_search_trace_with_rules, alphazero_search_with_rules,
-    },
+    az::{AzNnue, AzSearchLimits, alphazero_search_trace_with_rules, alphazero_search_with_rules},
     xiangqi::{Move, Position},
 };
 use std::time::Instant;
@@ -131,15 +129,18 @@ pub(crate) fn run(cmd: AzSearchArgs) {
     let mut position = parse_position(&fen);
     let mut rule_history = position.initial_rule_history();
     for text in &cmd.moves {
-        let mv = position.parse_uci_move(text).unwrap_or_else(|| {
-            panic!("invalid or illegal --move `{text}` for this position")
-        });
+        let mv = position
+            .parse_uci_move(text)
+            .unwrap_or_else(|| panic!("invalid or illegal --move `{text}` for this position"));
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
-    let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+    let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
         panic!("failed to load `{model_path}`: {err}");
     });
+    model.tactical_search_nodes = cmd.tactical_search_nodes;
+    model.tactical_search_plies = cmd.tactical_search_plies.min(16);
+    model.tactical_quiet_plies = cmd.tactical_quiet_plies.min(2);
     let search_limits = AzSearchLimits {
         simulations,
         seed: 0,
@@ -221,6 +222,17 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         .unwrap_or_else(|| "(none)".into());
     println!("AZ SEARCH");
     println!("=========");
+    if model.tactical_search_nodes > 0 {
+        println!(
+            "  Tactical     nodes/leaf={} plies={} quiet={} visited={} completed={} aborted={}",
+            model.tactical_search_nodes,
+            model.tactical_search_plies,
+            model.tactical_quiet_plies,
+            result.tactical_nodes,
+            result.tactical_completed,
+            result.tactical_aborted
+        );
+    }
     println!("\nPOSITION");
     println!("  FEN          {}", position.to_fen());
     println!("  Side         {:?}", position.side_to_move());
@@ -313,16 +325,11 @@ pub(crate) fn run(cmd: AzSearchArgs) {
     }
     if !verify_moves.is_empty() {
         println!("\nCHILD VERIFICATION — {verify_sims} simulations each");
-        println!(
-            "  MOVE     VISITS   ROOT Q     NN Q   DEEP Q       ΔQ      CP  OPPONENT REPLY"
-        );
-        println!(
-            "  -------  -------  -------  -------  -------  -------  ------  --------------"
-        );
+        println!("  MOVE     VISITS   ROOT Q     NN Q   DEEP Q       ΔQ      CP  OPPONENT REPLY");
+        println!("  -------  -------  -------  -------  -------  -------  ------  --------------");
     }
     for mv in verify_moves {
-        let Some(root_candidate) = result.candidates.iter().find(|item| item.mv == mv)
-        else {
+        let Some(root_candidate) = result.candidates.iter().find(|item| item.mv == mv) else {
             println!("  {mv:<7}  unavailable at root");
             continue;
         };
@@ -331,8 +338,7 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         let mut child = position.clone();
         child.make_move(mv);
         let child_legal = child.legal_moves_with_rules(&child_rule_history);
-        let child_nn_q =
-            model.evaluate_value_with_rules(&child, &child_rule_history, &child_legal);
+        let child_nn_q = model.evaluate_value_with_rules(&child, &child_rule_history, &child_legal);
         let mut verify_limits = search_limits;
         verify_limits.simulations = verify_sims.max(1);
         verify_limits.seed = 0;

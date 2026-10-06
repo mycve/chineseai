@@ -143,5 +143,8 @@ pub(crate) fn build_az_loop_config(
         mirror_probability: config.mirror_probability,
         record_fens: false,
         mate_search_plies: config.mate_search_plies,
+        tactical_search_nodes: config.tactical_search_nodes,
+        tactical_search_plies: config.tactical_search_plies,
+        tactical_quiet_plies: config.tactical_quiet_plies,
     }
 }

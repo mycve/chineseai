@@ -138,6 +138,7 @@ pub(crate) fn search_uci(
 ) -> AzUciSearchResult {
     let mut tree = AzTree::new(position.clone(), history, Some(root_moves), model, limits);
     tree.adjudicate_root_rules = false;
+    tree.search_control = Some(control.clone());
     tree.expand(0);
     tree.prove_root_mate(position, model);
     let mut used = 0;
@@ -214,9 +215,10 @@ mod tests {
     /// 否则 `go mate N` 会静默退化成普通 MCTS。
     #[test]
     fn uci_search_applies_root_mate_proof() {
-        let position =
-            Position::from_fen("2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1")
-                .unwrap();
+        let position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
         let history = position.initial_rule_history();
         let limits = AzSearchLimits {
             simulations: 64,

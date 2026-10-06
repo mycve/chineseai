@@ -392,8 +392,10 @@ impl MateSearch {
             return None;
         }
         self.nodes += 1;
-        if self.rule_verdict(position) == Some(true) {
-            return Some(0);
+        match self.rule_verdict(position) {
+            Some(true) => return Some(0),
+            Some(false) => return None,
+            None => {}
         }
         let moves = self.attacker_moves(position);
         if moves.is_empty() {
@@ -425,8 +427,10 @@ impl MateSearch {
         if replies.is_empty() {
             return Some(0);
         }
-        if self.rule_verdict(position) == Some(true) {
-            return Some(0);
+        match self.rule_verdict(position) {
+            Some(true) => return Some(0),
+            Some(false) => return None,
+            None => {}
         }
         if plies_left == 0 {
             return None;
@@ -462,7 +466,26 @@ impl MateSearch {
 mod tests {
     use super::*;
 
-    const MATE_IN_EIGHT: &str = "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1";
+    #[test]
+    fn rule_draw_cannot_be_extended_into_a_mate_proof() {
+        for side in ["w", "b"] {
+            let p =
+                Position::from_fen(&format!("4k4/9/4R4/9/9/9/9/9/9/4K4 {side} - - 120 1")).unwrap();
+            let mut search = MateSearch {
+                attacker: Color::Red,
+                nodes: 0,
+                max_nodes: 1000,
+                history: p.initial_rule_history(),
+                line: LineTable::new(),
+            };
+            assert_eq!(search.rule_verdict(&p), Some(false));
+            assert!(search.attacker_to_move(&p, 7).is_none());
+            assert!(search.defender_to_move(&p, 7).is_none());
+        }
+    }
+
+    const MATE_IN_EIGHT: &str =
+        "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1";
     /// 深度受限 DFS 下 mate-in-8 的节点数（改动前的实测值，注释里记的是同一个数）。
     const MATE_IN_EIGHT_NODES: usize = 58_178;
 

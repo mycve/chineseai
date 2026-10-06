@@ -65,6 +65,10 @@ pub struct AzLoopFileConfig {
     /// 带 `#[serde(default)]`：老配置文件里没有这一项时按 0（关闭）解析，不必改格式版本。
     #[serde(default)]
     pub mate_search_plies: usize,
+    /// 每叶战术搜索预算，0 关闭；先测试吞吐量后再启用。
+    pub tactical_search_nodes: usize,
+    pub tactical_search_plies: usize,
+    pub tactical_quiet_plies: usize,
     pub replay_capacity: usize,
     pub shuffle_size: usize,
     pub replay_recent_games: u32,
@@ -147,6 +151,9 @@ impl Default for AzLoopFileConfig {
             // 9 半回合 = mate in 5：实测把可证射程从 mate-in-4 推到 mate-in-5，
             // 而"有将军但无杀"的局面只 +4%，根局面没有将军着法时为 0。
             mate_search_plies: 9,
+            tactical_search_nodes: 0,
+            tactical_search_plies: 8,
+            tactical_quiet_plies: 2,
             replay_capacity: 2400000,
             shuffle_size: 524_288,
             replay_recent_games: 7500,
@@ -211,6 +218,9 @@ impl AzLoopFileConfig {
         line!("selfplay_dive_book", q(&self.selfplay_dive_book));
         line!("selfplay_dive_fraction", f(self.selfplay_dive_fraction));
         line!("mate_search_plies", self.mate_search_plies);
+        line!("tactical_search_nodes", self.tactical_search_nodes);
+        line!("tactical_search_plies", self.tactical_search_plies);
+        line!("tactical_quiet_plies", self.tactical_quiet_plies);
         line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
@@ -355,6 +365,8 @@ impl AzLoopFileConfig {
         self.selfplay_dive_fraction = self.selfplay_dive_fraction.clamp(0.0, 1.0);
         // 上限 31 半回合（mate in 16）与 `go mate 0` 的取值一致：再深只会烧时间。
         self.mate_search_plies = self.mate_search_plies.min(31);
+        self.tactical_search_plies = self.tactical_search_plies.min(16);
+        self.tactical_quiet_plies = self.tactical_quiet_plies.min(2);
 
         self.replay_recent_games = self.replay_recent_games.max(1);
         self.shuffle_size = self.shuffle_size.max(1);

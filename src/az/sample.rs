@@ -43,6 +43,9 @@ pub struct AzLoopConfig {
     /// 无杀"时 +4%、根局面没有将军着法时 0。证明出来的连杀会经由搜索既有的 solved 传播
     /// 把该手的策略目标压成杀着、价值目标设成必胜，这是让模型从自博弈里学到连杀的关键。
     pub mate_search_plies: usize,
+    pub tactical_search_nodes: usize,
+    pub tactical_search_plies: usize,
+    pub tactical_quiet_plies: usize,
 }
 
 #[derive(Clone, Debug, Default)]
