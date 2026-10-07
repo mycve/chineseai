@@ -63,6 +63,8 @@ pub(crate) const POLICY_ACCUMULATOR_BIAS_ROW: usize =
     POLICY_ACCUMULATOR_KING_PIECE_OFFSET + STRUCTURAL_KING_PIECE_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
 pub(crate) const VALUE_HEAD_SIZE: usize = 96;
+/// 王棋子价值表先在16维累加，再投影到价值隐藏层。
+pub(crate) const VALUE_KING_PIECE_RANK: usize = 16;
 pub(crate) const VALUE_KING_PIECE_VOCAB: usize = 2 * V2_KING_BUCKETS * 14 * BOARD_SIZE;
 pub(crate) const VALUE_KING_PIECE_MAX_ACTIVE: usize = 64;
 pub(crate) const VALUE_THREAT_RANK: usize = 64;

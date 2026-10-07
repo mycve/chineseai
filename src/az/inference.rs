@@ -68,7 +68,11 @@ macro_rules! az_weight_tensors {
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(
             value_king_piece_hidden,
-            [VALUE_KING_PIECE_VOCAB, VALUE_HEAD_SIZE]
+            [VALUE_KING_PIECE_VOCAB, VALUE_KING_PIECE_RANK]
+        );
+        $visit!(
+            value_king_piece_projection,
+            [VALUE_KING_PIECE_RANK, VALUE_HEAD_SIZE]
         );
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
         $visit!(value_history_output, [WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE]);
@@ -609,6 +613,7 @@ pub struct AzNnue {
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_king_piece_hidden: Vec<f32>,
+    pub value_king_piece_projection: Vec<f32>,
     pub value_head_output: Vec<f32>,
     /// 当前48维空间摘要与最近两步48维变化的 WDL 旁路，布局为 [3, 96]。
     pub value_history_output: Vec<f32>,
@@ -695,6 +700,7 @@ impl Clone for AzNnue {
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_king_piece_hidden: self.value_king_piece_hidden.clone(),
+            value_king_piece_projection: self.value_king_piece_projection.clone(),
             value_head_output: self.value_head_output.clone(),
             value_history_output: self.value_history_output.clone(),
             value_history_cache: self.value_history_cache.clone(),
@@ -875,7 +881,12 @@ impl AzNnue {
             .map(|_| rng.weight((2.0 / hidden_size.max(1) as f32).sqrt() * 0.5))
             .collect();
         let value_head_bias = vec![0.0; VALUE_HEAD_SIZE];
-        let value_king_piece_hidden = vec![0.0; VALUE_KING_PIECE_VOCAB * VALUE_HEAD_SIZE];
+        let value_king_piece_hidden = vec![0.0; VALUE_KING_PIECE_VOCAB * VALUE_KING_PIECE_RANK];
+        // 零表保持初始旁路输出为零；非零投影使价值输出头开始学习后，表即可收到梯度。
+        let mut value_king_piece_projection = vec![0.0; VALUE_KING_PIECE_RANK * VALUE_HEAD_SIZE];
+        for channel in 0..VALUE_KING_PIECE_RANK {
+            value_king_piece_projection[channel * VALUE_HEAD_SIZE + channel] = 1.0;
+        }
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
         let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
@@ -922,6 +933,7 @@ impl AzNnue {
             value_head_hidden,
             value_head_bias,
             value_king_piece_hidden,
+            value_king_piece_projection,
             value_head_output,
             value_history_output: vec![0.0; WDL_HEAD_SIZE * HISTORY_CONTEXT_SIZE],
             value_history_cache: super::history::ValueHistoryCache::default(),
@@ -1133,6 +1145,10 @@ impl AzNnue {
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_king_piece_hidden: load_candle_f32_tensor(&tensors, "value_king_piece_hidden")?,
+            value_king_piece_projection: load_candle_f32_tensor(
+                &tensors,
+                "value_king_piece_projection",
+            )?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
             value_history_output: load_candle_f32_tensor(&tensors, "value_history_output")?,
             value_history_cache: super::history::ValueHistoryCache::default(),
@@ -1930,20 +1946,26 @@ impl AzNnue {
         accumulator: &mut Vec<f32>,
     ) {
         crate::scope_profile!("az.eval.value_king_piece");
-        accumulator.resize(VALUE_HEAD_SIZE, 0.0);
-        accumulator.fill(0.0);
+        let mut pooled = [0.0; VALUE_KING_PIECE_RANK];
         let mut active = 0;
         visit_value_king_piece_features(position, position.side_to_move(), |feature| {
             active += 1;
             let row = &self.value_king_piece_hidden
-                [feature * VALUE_HEAD_SIZE..(feature + 1) * VALUE_HEAD_SIZE];
-            for (sum, &weight) in accumulator.iter_mut().zip(row) {
+                [feature * VALUE_KING_PIECE_RANK..(feature + 1) * VALUE_KING_PIECE_RANK];
+            for (sum, &weight) in pooled.iter_mut().zip(row) {
                 *sum += weight;
             }
         });
         let scale = 1.0 / (active.max(1) as f32).sqrt();
-        for sum in accumulator {
-            *sum *= scale;
+        accumulator.resize(VALUE_HEAD_SIZE, 0.0);
+        accumulator.fill(0.0);
+        for (channel, value) in pooled.into_iter().enumerate() {
+            let value = value * scale;
+            let row = &self.value_king_piece_projection
+                [channel * VALUE_HEAD_SIZE..(channel + 1) * VALUE_HEAD_SIZE];
+            for (sum, &weight) in accumulator.iter_mut().zip(row) {
+                *sum += value * weight;
+            }
         }
     }
 
@@ -2294,6 +2316,17 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(validate_tensor, hidden);
+        if self
+            .value_king_piece_hidden
+            .iter()
+            .chain(&self.value_king_piece_projection)
+            .any(|weight| !weight.is_finite())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "az king-piece factors have invalid parameters",
+            ));
+        }
         if self.value_history_output.iter().any(|x| !x.is_finite())
             || !self.value_history_cache.valid()
         {

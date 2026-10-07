@@ -6,7 +6,8 @@ use super::{
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
     POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE,
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    VALUE_HEAD_SIZE, VALUE_KING_PIECE_VOCAB, VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    VALUE_HEAD_SIZE, VALUE_KING_PIECE_RANK, VALUE_KING_PIECE_VOCAB, VALUE_THREAT_RANK,
+    VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
@@ -32,6 +33,7 @@ pub(super) struct AzCandleModel {
     value_head_hidden: Var,
     value_head_bias: Var,
     value_king_piece_hidden: Var,
+    value_king_piece_projection: Var,
     value_head_output: Var,
     value_history_output: Var,
     moves_left_output: Var,
@@ -87,6 +89,7 @@ impl AzCandleModel {
             self.value_king_piece_hidden.as_tensor(),
             &batch.value_king_piece_indices,
         )?
+        .matmul(self.value_king_piece_projection.as_tensor())?
         .broadcast_mul(&batch.value_king_piece_scales)?;
         let value_head = hidden
             .matmul(&self.value_head_hidden.t()?)?
@@ -382,7 +385,12 @@ impl AzCandleModel {
             value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
             value_king_piece_hidden: var_from_slice(
                 &model.value_king_piece_hidden,
-                (VALUE_KING_PIECE_VOCAB, VALUE_HEAD_SIZE),
+                (VALUE_KING_PIECE_VOCAB, VALUE_KING_PIECE_RANK),
+                device,
+            )?,
+            value_king_piece_projection: var_from_slice(
+                &model.value_king_piece_projection,
+                (VALUE_KING_PIECE_RANK, VALUE_HEAD_SIZE),
                 device,
             )?,
             value_head_output: var_from_slice(
@@ -473,6 +481,7 @@ impl AzCandleModel {
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_king_piece_hidden.clone());
+        vars.push(self.value_king_piece_projection.clone());
         vars.push(self.value_head_output.clone());
         vars.push(self.value_threat_embedding.clone());
         vars.push(self.value_threat_output.clone());
@@ -509,7 +518,7 @@ impl AzCandleModel {
     /// 所以这个分组在 Adam 的学习率尺度下几乎不动结果。
     pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
         /// 与 `all_vars` 的 push 顺序一一对应。
-        const DECAY: [bool; 31] = [
+        const DECAY: [bool; 32] = [
             false, // input_hidden
             false, // input_piece_hidden
             false, // input_rank_hidden
@@ -523,6 +532,7 @@ impl AzCandleModel {
             true,  // value_head_hidden
             false, // value_head_bias
             false, // value_king_piece_hidden
+            true,  // value_king_piece_projection
             true,  // value_head_output
             false, // value_threat_embedding
             true,  // value_threat_output
@@ -566,6 +576,10 @@ impl AzCandleModel {
         copy_var(
             &self.value_king_piece_hidden,
             &mut model.value_king_piece_hidden,
+        )?;
+        copy_var(
+            &self.value_king_piece_projection,
+            &mut model.value_king_piece_projection,
         )?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
         copy_var(&self.value_history_output, &mut model.value_history_output)?;
@@ -646,6 +660,131 @@ mod tests {
         },
         xiangqi::Position,
     };
+
+    #[test]
+    fn king_piece_factorization_initialization_trains_both_factors() {
+        king_piece_factorization_training_matches_cpu(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn king_piece_factorization_cuda_training_matches_cpu() {
+        let device = crate::az::cuda_test_device::shared_cuda_device()
+            .expect("CUDA is required for this test");
+        king_piece_factorization_training_matches_cpu(device);
+    }
+
+    fn king_piece_factorization_training_matches_cpu(device: &Device) {
+        let position = Position::startpos();
+        let moves = position.legal_moves();
+        let sample = AzTrainingSample {
+            features: extract_sparse_features_az(&position),
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            history_features: crate::az::history_features(&position, &[]),
+            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
+            repetition_flags: vec![0; moves.len()],
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            value: 0.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        };
+        let mut model = AzNnue::random(96, 20261008);
+        assert_eq!(
+            model.value_king_piece_hidden.len(),
+            VALUE_KING_PIECE_VOCAB * VALUE_KING_PIECE_RANK
+        );
+        assert!(model.value_king_piece_hidden.iter().all(|&x| x == 0.0));
+        for channel in 0..VALUE_KING_PIECE_RANK {
+            let row = &model.value_king_piece_projection
+                [channel * VALUE_HEAD_SIZE..(channel + 1) * VALUE_HEAD_SIZE];
+            assert_eq!(row[channel], 1.0);
+            assert_eq!(row.iter().filter(|&&x| x != 0.0).count(), 1);
+        }
+        // 保持每个价值方向的ReLU开放，专门核验两个因子的梯度启动。
+        model.value_head_hidden.fill(0.0);
+        model.value_head_bias.fill(1.0);
+        let initial_projection = model.value_king_piece_projection.clone();
+        let candle = AzCandleModel::from_model(&model, device).unwrap();
+        let (all_vars, decay) = candle.all_vars_with_decay();
+        assert_eq!(all_vars.len(), 32);
+        let index = all_vars
+            .iter()
+            .position(|v| v.id() == candle.value_king_piece_projection.id())
+            .unwrap();
+        assert!(decay[index]);
+        let batch = BatchTensors::from_packed(
+            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
+            device,
+        )
+        .unwrap();
+        let mut optimizer = crate::az::adamw::AzAdamW::new(all_vars, decay, 0.001).unwrap();
+        let mut live_channels = [false; VALUE_KING_PIECE_RANK];
+        let mut projection_live = false;
+        for step in 0..6 {
+            let forward = candle.forward(&batch).unwrap();
+            let loss = candle_nn::ops::log_softmax(&forward.value_logits, 1)
+                .unwrap()
+                .mul(&batch.value_wdl)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .neg()
+                .unwrap();
+            let gradients = loss.backward().unwrap();
+            let table_gradient = gradients
+                .get(&candle.value_king_piece_hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(table_gradient.iter().all(|x| x.is_finite()));
+            for (channel, live) in live_channels.iter_mut().enumerate() {
+                *live |= table_gradient
+                    .iter()
+                    .skip(channel)
+                    .step_by(VALUE_KING_PIECE_RANK)
+                    .any(|x| x.abs() > 1e-8);
+            }
+            let projection_gradient = gradients
+                .get(&candle.value_king_piece_projection)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(projection_gradient.iter().all(|x| x.is_finite()));
+            if step == 0 {
+                assert!(projection_gradient.iter().all(|&x| x == 0.0));
+            }
+            projection_live |= projection_gradient.iter().any(|x| x.abs() > 1e-8);
+            optimizer.step(&gradients).unwrap();
+        }
+        assert!(live_channels.into_iter().all(|live| live));
+        assert!(projection_live);
+        candle.copy_to_model(&mut model).unwrap();
+        assert!(model.value_king_piece_hidden.iter().any(|x| x.abs() > 1e-6));
+        assert!(
+            model
+                .value_king_piece_projection
+                .iter()
+                .zip(initial_projection)
+                .any(|(&x, y)| (x - y).abs() > 1e-6)
+        );
+        let wdl = candle_nn::ops::softmax(&candle.forward(&batch).unwrap().value_logits, 1)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let (cpu, _) = crate::az::outputs_for_training_sample(&model, &sample).unwrap();
+        assert!(cpu.iter().zip(&wdl[0]).all(|(&x, &y)| (x - y).abs() < 2e-5));
+    }
 
     #[test]
     fn history_head_trains_and_matches_cpu_after_two_moves() {
@@ -751,8 +890,10 @@ mod tests {
         let path = std::env::var("CHINESEAI_AUDIT_MODEL")
             .unwrap_or_else(|_| "tmp/px0-reservoir-131072.epoch-3.safetensors".into());
         let model = AzNnue::load(path).unwrap();
+        let data_path =
+            std::env::var("CHINESEAI_AUDIT_DATA").unwrap_or_else(|_| "data/data.bin".into());
         let dataset =
-            crate::az::px0_data::load(std::path::Path::new("data/data.bin"), 1024, 1024).unwrap();
+            crate::az::px0_data::load(std::path::Path::new(&data_path), 1024, 1024).unwrap();
         let stride = (dataset.train.len() / 128).max(1);
         let samples: Vec<_> = dataset
             .train
@@ -788,11 +929,12 @@ mod tests {
                 })
                 .collect();
             let mut scratch = AzEvalScratch::new(model.arch);
-            let cpu = model.evaluate_with_scratch_output_with_repetition(
+            let cpu = model.evaluate_with_scratch_output_with_repetition_and_history_features(
                 &position,
                 &moves,
                 &sample.repetition_flags,
                 &sample.rule_context,
+                &sample.history_features,
                 &mut scratch,
             );
             max_value = max_value.max((cpu.value - (wdl[row][0] - wdl[row][2])).abs());
@@ -1049,6 +1191,7 @@ mod tests {
             value_head_hidden,
             value_head_bias,
             value_king_piece_hidden,
+            value_king_piece_projection,
             value_head_output,
             value_history_output,
             policy_threat_context,

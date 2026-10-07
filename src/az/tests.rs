@@ -877,6 +877,14 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
     assert_eq!(model.value_head_bias, loaded.value_head_bias);
     assert_eq!(model.value_head_output, loaded.value_head_output);
+    assert_eq!(
+        model.value_king_piece_hidden,
+        loaded.value_king_piece_hidden
+    );
+    assert_eq!(
+        model.value_king_piece_projection,
+        loaded.value_king_piece_projection
+    );
     assert_eq!(model.moves_left_output, loaded.moves_left_output);
     assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
     assert!(loaded.moves_left_active);
