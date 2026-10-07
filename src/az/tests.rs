@@ -81,8 +81,8 @@ fn packed_policy_cache_matches_original_formulas() {
         for piece in 0..POLICY_CACHE_PIECE_SIZE {
             for us in 0..V2_KING_BUCKETS {
                 for them in 0..V2_KING_BUCKETS {
-                    let mut expected = model.policy_sparse_table
-                        [policy_sparse_main_index(mv, piece, us, them)];
+                    let mut expected =
+                        model.policy_sparse_table[policy_sparse_main_index(mv, piece, us, them)];
                     for factor in policy_sparse_factor_indices(mv, piece, us, them) {
                         expected += model.policy_sparse_factor[factor];
                     }
@@ -114,8 +114,7 @@ fn packed_policy_cache_matches_original_formulas() {
                 delta.to_bits()
             );
             assert_eq!(
-                model.policy_accumulator_capture[mv * POLICY_CACHE_PIECE_SIZE + piece]
-                    .to_bits(),
+                model.policy_accumulator_capture[mv * POLICY_CACHE_PIECE_SIZE + piece].to_bits(),
                 capture.to_bits()
             );
         }
@@ -232,8 +231,7 @@ fn value_king_piece_features_change_with_king_bucket() {
 #[test]
 fn capture_relation_changes_only_capture_policy_not_value() {
     let position =
-        Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
-            .unwrap();
+        Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w").unwrap();
     let moves = position.legal_moves();
     let mut model = AzNnue::random(32, 20260928);
     model.policy_tactical[..POLICY_CAPTURE_RELATION_OFFSET].fill(0.125);
@@ -301,8 +299,7 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
                     state & 16 != 0,
                 );
                 assert!(
-                    (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE)
-                        .contains(&indices[2])
+                    (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE).contains(&indices[2])
                 );
                 assert!(seen.insert(indices[2]));
             }
@@ -518,8 +515,7 @@ fn policy_accumulator_matches_full_refresh() {
                 &mut accumulators[color_index(perspective)],
             );
             let refreshed = model.policy_accumulator(&position, perspective);
-            for (incremental, full) in
-                accumulators[color_index(perspective)].iter().zip(refreshed)
+            for (incremental, full) in accumulators[color_index(perspective)].iter().zip(refreshed)
             {
                 assert!((incremental - full).abs() < 2.0e-5);
             }
@@ -723,8 +719,7 @@ fn batched_training_is_deterministic() {
 
     let mut rng_single = SplitMix64::new(99);
     let mut rng_repeated = SplitMix64::new(99);
-    let single_stats =
-        train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single).unwrap();
+    let single_stats = train_samples(&mut single, &samples, 5, 0.003, 4, &mut rng_single).unwrap();
     let repeated_stats =
         train_samples(&mut repeated, &samples, 5, 0.003, 4, &mut rng_repeated).unwrap();
 
@@ -846,6 +841,7 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     let mut model = AzNnue::random(16, 42);
     model.moves_left_output.fill(0.03);
     model.moves_left_bias[0] = 0.2;
+    model.shared_bias.fill(0.1);
     model.rebuild_moves_left();
     let path = std::env::temp_dir().join("chineseai_test_aznnue_roundtrip.safetensors");
     let _ = fs::remove_file(&path);
@@ -862,6 +858,8 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
         loaded.input_king_piece_hidden
     );
     assert_eq!(model.hidden_bias, loaded.hidden_bias);
+    assert_eq!(model.shared_hidden, loaded.shared_hidden);
+    assert_eq!(model.shared_bias, loaded.shared_bias);
     assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
     assert_eq!(model.value_head_bias, loaded.value_head_bias);
     assert_eq!(model.value_head_output, loaded.value_head_output);
@@ -1078,7 +1076,11 @@ fn rule_context_is_cycle_free_without_repetition() {
     let context = rule_context_features(&position, &history);
     assert_eq!(context[1], 0.0, "no prior match => [1] must be zero");
     assert_eq!(context[2], 0.0, "empty cycle => [2] must be zero");
-    assert_eq!(context[3..], [0.0; 4], "empty cycle => no check/chase counts");
+    assert_eq!(
+        context[3..],
+        [0.0; 4],
+        "empty cycle => no check/chase counts"
+    );
     assert_eq!(
         context[0],
         position.rule60_count_with_history(&history) as f32 / 120.0,
@@ -1286,7 +1288,10 @@ fn check_context_features_describe_check_and_mate_net() {
     assert_eq!(context[4], 0.0, "没打到对方九宫");
     assert_eq!(context[5], 0.0, "自己九宫也没被打");
     assert_eq!(context[7], 0.0, "没有将军着法就没有杀势");
-    assert!((context[6] - 44.0 / 64.0).abs() < 1e-6, "startpos 44 个合法着法");
+    assert!(
+        (context[6] - 44.0 / 64.0).abs() < 1e-6,
+        "startpos 44 个合法着法"
+    );
 
     // mate-in-1（黑车 a9d9 杀）：黑方有 1 个将军着法，红将只剩 1 个安全逃格（d1；
     // e2 被飞将封住、c2 出九宫、d3 出九宫），于是"杀势"标志直接立起来。
@@ -1303,7 +1308,10 @@ fn check_context_features_describe_check_and_mate_net() {
     assert_eq!(mate_context[1], 0.5, "2 个将军着法 / 4");
     // 红将 d2 只有 d1 一个安全逃格：c2/d3 出九宫、e2 会被黑将飞将封住。
     assert_eq!(mate_context[2], 0.25, "红将只剩 1 个安全逃格 / 4");
-    assert_eq!(mate_context[7], 1.0, "有将军着法 + 对方将几乎无处可逃 = 杀势");
+    assert_eq!(
+        mate_context[7], 1.0,
+        "有将军着法 + 对方将几乎无处可逃 = 杀势"
+    );
 
     // 被将军的一侧：把黑车摆到 d9（d 线全空），红将 d2 就被将军。
     let in_check = Position::from_fen("3rk4/9/9/9/9/9/9/3K5/9/9 w - - 0 1").unwrap();
@@ -1330,7 +1338,7 @@ fn check_context_block_reaches_the_trunk_when_active() {
     for (index, weight) in base.value_head_output.iter_mut().enumerate() {
         *weight = ((index % 11) as f32 + 1.0) * 1.0e-2;
     }
-    // 全零 ⇒ 未激活 ⇒ 评估路径整段跳过它（这正是旧 checkpoint 的行为）。
+    // 全零 ⇒ 未激活 ⇒ 评估路径整段跳过它（新模型初始也应保持中性）。
     assert!(!base.check_context_active);
     let without_block = base.evaluate_wdl_with_rules(&position, &history, &moves);
 
@@ -1351,40 +1359,33 @@ fn check_context_block_reaches_the_trunk_when_active() {
     );
 }
 
-/// 缺少可选头的旧 checkpoint 必须零初始化，并保持原评估结果。
+/// 模型仅接受当前格式及完整的张量集合。
 #[test]
-fn missing_optional_heads_load_as_zeros() {
+fn model_rejects_old_format_and_missing_tensors() {
     let model = AzNnue::random(16, 73);
-    let path = std::env::temp_dir().join("chineseai_test_missing_heads.safetensors");
+    let path = std::env::temp_dir().join("chineseai_test_strict_model.safetensors");
     model.save(&path).unwrap();
-    let mut tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu).unwrap();
+    let tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu).unwrap();
     for name in [
         "check_context_hidden",
         "moves_left_output",
         "moves_left_bias",
+        "shared_hidden",
+        "shared_bias",
     ] {
-        tensors.remove(name);
+        let mut missing = tensors.clone();
+        missing.remove(name);
+        candle_core::safetensors::save(&missing, &path).unwrap();
+        assert!(AzNnue::load(&path).is_err(), "missing {name}");
     }
-    candle_core::safetensors::save(&tensors, &path).unwrap();
-    let loaded = AzNnue::load(&path).unwrap();
+    let mut old = tensors;
+    old.insert(
+        "az_model_format_version".into(),
+        candle_core::Tensor::new(&[36.0f32], &candle_core::Device::Cpu).unwrap(),
+    );
+    candle_core::safetensors::save(&old, &path).unwrap();
+    assert!(AzNnue::load(&path).is_err());
     fs::remove_file(&path).unwrap();
-    assert!(
-        loaded
-            .check_context_hidden
-            .iter()
-            .all(|&weight| weight == 0.0)
-    );
-    assert!(loaded.moves_left_output.iter().all(|&weight| weight == 0.0));
-    assert_eq!(loaded.moves_left_bias, vec![0.0]);
-    assert!(!loaded.check_context_active);
-    assert!(!loaded.moves_left_active);
-    let position = Position::startpos();
-    let history = position.initial_rule_history();
-    let moves = position.legal_moves();
-    assert_eq!(
-        model.evaluate_wdl_with_rules(&position, &history, &moves),
-        loaded.evaluate_wdl_with_rules(&position, &history, &moves)
-    );
 }
 
 /// 策略头的 `destination_attacked/defended` 用的是**走前**攻击位板，而不是走完之后的
@@ -1451,11 +1452,10 @@ fn tactical_flags_are_pre_move_and_the_gap_is_audited() {
                     );
                     (attacked, defended)
                 };
-                let post_attacked =
-                    position.is_square_attacked_after_move(to, side.opposite(), mv);
+                let post_attacked = position.is_square_attacked_after_move(to, side.opposite(), mv);
                 let post_defended = position.is_square_attacked_after_move(to, side, mv);
-                differing +=
-                    usize::from(pre_attacked != post_attacked) + usize::from(pre_defended != post_defended);
+                differing += usize::from(pre_attacked != post_attacked)
+                    + usize::from(pre_defended != post_defended);
                 total += 2;
             }
             let mv = moves[(next() as usize) % moves.len()];

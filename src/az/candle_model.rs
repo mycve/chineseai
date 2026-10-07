@@ -27,6 +27,8 @@ pub(super) struct AzCandleModel {
     rule_context_hidden: Var,
     check_context_hidden: Var,
     hidden_bias: Var,
+    shared_hidden: Var,
+    shared_bias: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_king_piece_hidden: Var,
@@ -75,7 +77,11 @@ impl AzCandleModel {
             .mean_keepdim(1)?
             .affine(1.0, RMS_NORM_EPS)?
             .sqrt()?;
-        let hidden = sparse_hidden.broadcast_div(&rms)?;
+        let hidden = sparse_hidden
+            .broadcast_div(&rms)?
+            .matmul(&self.shared_hidden.t()?)?
+            .broadcast_add(&self.shared_bias)?
+            .relu()?;
         let value_king_piece = sparse_pool(
             self.value_king_piece_hidden.as_tensor(),
             &batch.value_king_piece_indices,
@@ -350,6 +356,8 @@ impl AzCandleModel {
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
+            shared_hidden: var_from_slice(&model.shared_hidden, (hidden, hidden), device)?,
+            shared_bias: var_from_slice(&model.shared_bias, hidden, device)?,
             check_context_hidden: var_from_slice(
                 &model.check_context_hidden,
                 (CHECK_CONTEXT_SIZE, hidden),
@@ -444,6 +452,8 @@ impl AzCandleModel {
         vars.push(self.rule_context_hidden.clone());
         vars.push(self.check_context_hidden.clone());
         vars.push(self.hidden_bias.clone());
+        vars.push(self.shared_hidden.clone());
+        vars.push(self.shared_bias.clone());
         vars.push(self.value_head_hidden.clone());
         vars.push(self.value_head_bias.clone());
         vars.push(self.value_king_piece_hidden.clone());
@@ -482,7 +492,7 @@ impl AzCandleModel {
     /// 所以这个分组在 Adam 的学习率尺度下几乎不动结果。
     pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
         /// 与 `all_vars` 的 push 顺序一一对应。
-        const DECAY: [bool; 28] = [
+        const DECAY: [bool; 30] = [
             false, // input_hidden
             false, // input_piece_hidden
             false, // input_rank_hidden
@@ -491,6 +501,8 @@ impl AzCandleModel {
             true,  // rule_context_hidden
             true,  // check_context_hidden
             false, // hidden_bias
+            true,  // shared_hidden
+            false, // shared_bias
             true,  // value_head_hidden
             false, // value_head_bias
             false, // value_king_piece_hidden
@@ -529,6 +541,8 @@ impl AzCandleModel {
         copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
         copy_var(&self.check_context_hidden, &mut model.check_context_hidden)?;
         copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
+        copy_var(&self.shared_hidden, &mut model.shared_hidden)?;
+        copy_var(&self.shared_bias, &mut model.shared_bias)?;
         copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
         copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
         copy_var(
@@ -612,6 +626,23 @@ mod tests {
         },
         xiangqi::Position,
     };
+
+    fn assert_shared_gradients(
+        model: &AzCandleModel,
+        gradients: &candle_core::backprop::GradStore,
+    ) {
+        for var in [&model.shared_hidden, &model.shared_bias] {
+            let values = gradients
+                .get(var)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(values.iter().all(|g| g.is_finite()));
+            assert!(values.iter().any(|g| g.abs() > 1e-8));
+        }
+    }
 
     #[test]
     #[ignore = "需要本地已训练检查点、Px0数据及CUDA；只核对前向"]
@@ -821,6 +852,7 @@ mod tests {
             .unwrap()
             .backward()
             .unwrap();
+        assert_shared_gradients(&gradient_candle, &gradients);
         let tactical_gradient = gradients
             .get(&gradient_candle.policy_tactical)
             .unwrap()
@@ -910,6 +942,8 @@ mod tests {
             rule_context_hidden,
             check_context_hidden,
             hidden_bias,
+            shared_hidden,
+            shared_bias,
             value_head_hidden,
             value_head_bias,
             value_king_piece_hidden,
@@ -1002,6 +1036,10 @@ mod tests {
         model.rebuild_moves_left();
         let candle = AzCandleModel::from_model(&model, device).unwrap();
         let forward = candle.forward(&batch).unwrap();
+        assert_shared_gradients(
+            &candle,
+            &forward.moves_left.sum_all().unwrap().backward().unwrap(),
+        );
         let loss = candle_nn::ops::log_softmax(&forward.value_logits, 1)
             .unwrap()
             .mul(&batch.value_wdl)
@@ -1011,6 +1049,7 @@ mod tests {
             .neg()
             .unwrap();
         let gradients = loss.backward().unwrap();
+        assert_shared_gradients(&candle, &gradients);
         let gradient = gradients
             .get(&candle.check_context_hidden)
             .unwrap()

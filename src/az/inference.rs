@@ -52,21 +52,6 @@ pub(crate) fn load_candle_f32_tensor(
         .map_err(candle_io_error)
 }
 
-/// 读一个**可选**张量：旧 checkpoint 里没有它时按 `expected` 个零补齐。
-///
-/// 这是"加新输入块又不作废已有 checkpoint"的关键：缺张量 ⇒ 全零 ⇒ 该块在评估路径里
-/// 被整体跳过 ⇒ 老模型逐位不变。新模型训练后张量非零，就自动启用。
-pub(crate) fn load_candle_f32_tensor_or_zeros(
-    tensors: &candle_core::safetensors::MmapedSafetensors,
-    name: &str,
-    expected: usize,
-) -> io::Result<Vec<f32>> {
-    if tensors.get(name).is_err() {
-        return Ok(vec![0.0; expected]);
-    }
-    load_candle_f32_tensor(tensors, name)
-}
-
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h]);
@@ -77,6 +62,8 @@ macro_rules! az_weight_tensors {
         $visit!(rule_context_hidden, [RULE_CONTEXT_SIZE, $h]);
         $visit!(check_context_hidden, [CHECK_CONTEXT_SIZE, $h]);
         $visit!(hidden_bias, [$h]);
+        $visit!(shared_hidden, [$h, $h]);
+        $visit!(shared_bias, [$h]);
         $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h]);
         $visit!(value_head_bias, [VALUE_HEAD_SIZE]);
         $visit!(
@@ -613,12 +600,11 @@ pub struct AzNnue {
     pub rule_context_hidden: Vec<f32>,
     /// "引擎已经算过、却没喂给模型"的标量块（见 `CHECK_CONTEXT_SIZE`）。
     ///
-    /// **向后兼容**：这个张量在旧 checkpoint 里不存在，`load` 会按全零补齐并把
-    /// `check_context_active` 置 false，此时评估路径完全跳过它 —— 老模型逐位不变。
-    /// 全零初始化同样让新模型一开始是中性的，梯度会像 `rule_context_hidden` 那样
-    /// 把它学出来；一旦非零就自动启用，不需要额外的配置开关。
+    /// 全零初始化；训练后非零时启用。
     pub check_context_hidden: Vec<f32>,
     pub hidden_bias: Vec<f32>,
+    pub shared_hidden: Vec<f32>,
+    pub shared_bias: Vec<f32>,
     pub value_head_hidden: Vec<f32>,
     pub value_head_bias: Vec<f32>,
     pub value_king_piece_hidden: Vec<f32>,
@@ -648,7 +634,7 @@ pub struct AzNnue {
     pub(crate) policy_tactical_folded: Vec<f32>,
     pub(crate) value_threat_active: bool,
     pub(crate) policy_tactical_active: bool,
-    /// `check_context_hidden` 是否非零（全零 = 老 checkpoint 或尚未训练出来 ⇒ 整块跳过）。
+    /// `check_context_hidden` 是否非零（全零时跳过）。
     pub(crate) check_context_active: bool,
     /// 根节点 check-only 连杀证明搜索的最大半回合数（0 = 关闭）。
     ///
@@ -700,6 +686,8 @@ impl Clone for AzNnue {
             rule_context_hidden: self.rule_context_hidden.clone(),
             check_context_hidden: self.check_context_hidden.clone(),
             hidden_bias: self.hidden_bias.clone(),
+            shared_hidden: self.shared_hidden.clone(),
+            shared_bias: self.shared_bias.clone(),
             value_head_hidden: self.value_head_hidden.clone(),
             value_head_bias: self.value_head_bias.clone(),
             value_king_piece_hidden: self.value_king_piece_hidden.clone(),
@@ -909,6 +897,9 @@ impl AzNnue {
         let policy_tactical = vec![0.0; POLICY_TACTICAL_SIZE];
         let policy_repetition_hidden = vec![0.0; hidden_size];
         let policy_repetition_bias = vec![0.0; 1];
+        let shared_hidden = (0..hidden_size * hidden_size)
+            .map(|_| rng.weight((6.0 / hidden_size as f32).sqrt()))
+            .collect();
         let mut model = Self {
             hidden_size,
             arch,
@@ -920,6 +911,8 @@ impl AzNnue {
             rule_context_hidden,
             check_context_hidden,
             hidden_bias,
+            shared_hidden,
+            shared_bias: vec![0.0; hidden_size],
             value_head_hidden,
             value_head_bias,
             value_king_piece_hidden,
@@ -1124,23 +1117,16 @@ impl AzNnue {
             input_file_hidden: load_candle_f32_tensor(&tensors, "input_file_hidden")?,
             input_king_piece_hidden: load_candle_f32_tensor(&tensors, "input_king_piece_hidden")?,
             rule_context_hidden: load_candle_f32_tensor(&tensors, "rule_context_hidden")?,
-            // 可选：旧 checkpoint 没有这个张量 ⇒ 全零 ⇒ 该块被跳过，老模型逐位不变。
-            check_context_hidden: load_candle_f32_tensor_or_zeros(
-                &tensors,
-                "check_context_hidden",
-                CHECK_CONTEXT_SIZE * hidden_size,
-            )?,
+            check_context_hidden: load_candle_f32_tensor(&tensors, "check_context_hidden")?,
             hidden_bias,
+            shared_hidden: load_candle_f32_tensor(&tensors, "shared_hidden")?,
+            shared_bias: load_candle_f32_tensor(&tensors, "shared_bias")?,
             value_head_hidden: load_candle_f32_tensor(&tensors, "value_head_hidden")?,
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_king_piece_hidden: load_candle_f32_tensor(&tensors, "value_king_piece_hidden")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
-            moves_left_output: load_candle_f32_tensor_or_zeros(
-                &tensors,
-                "moves_left_output",
-                hidden_size,
-            )?,
-            moves_left_bias: load_candle_f32_tensor_or_zeros(&tensors, "moves_left_bias", 1)?,
+            moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
+            moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
             moves_left_active: false,
             moves_left_params: AzMovesLeftParams::default(),
             value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
@@ -1281,8 +1267,7 @@ impl AzNnue {
             self.input_embedding_linear_into(&features, &mut scratch.hidden);
             self.add_rule_context_to_hidden(rule_context, &mut scratch.hidden);
         }
-        // "引擎已经算过、却没喂给模型"的标量块。全零时（旧 checkpoint 或还没训练出来）
-        // 整段跳过，评估路径与加这块之前逐位一致。
+        // 全零的将军上下文权重不影响隐藏层，跳过其特征计算。
         scratch.policy_inputs_ready = false;
         if self.check_context_active {
             crate::scope_profile!("az.eval.check_context");
@@ -1299,6 +1284,8 @@ impl AzNnue {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
+            self.shared_hidden_into(&scratch.hidden, &mut scratch.shared_hidden);
+            std::mem::swap(&mut scratch.hidden, &mut scratch.shared_hidden);
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
@@ -1366,6 +1353,8 @@ impl AzNnue {
             crate::scope_profile!("az.eval.activation_norm");
             relu_in_place(&mut scratch.hidden);
             rms_norm_in_place(&mut scratch.hidden);
+            self.shared_hidden_into(&scratch.hidden, &mut scratch.shared_hidden);
+            std::mem::swap(&mut scratch.hidden, &mut scratch.shared_hidden);
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
@@ -1874,11 +1863,18 @@ impl AzNnue {
                 .any(|&weight| weight != 0.0);
     }
 
-    /// 全零（旧 checkpoint / 还没训练出来）时整块跳过，评估路径与加这个块之前完全一致。
-    pub(crate) fn moves_left_from_hidden(&self, hidden: &[f32]) -> f32 {
-        if !self.moves_left_active {
-            return MOVES_LEFT_SCALE;
+    pub(crate) fn shared_hidden_into(&self, hidden: &[f32], output: &mut Vec<f32>) {
+        output.resize(self.hidden_size, 0.0);
+        for (row, value) in output.iter_mut().enumerate() {
+            let start = row * self.hidden_size;
+            *value = (dot_product(hidden, &self.shared_hidden[start..start + self.hidden_size])
+                + self.shared_bias[row])
+                .max(0.0);
         }
+    }
+
+    /// 从共享隐藏层计算剩余步数预测。
+    pub(crate) fn moves_left_from_hidden(&self, hidden: &[f32]) -> f32 {
         ((dot_product(hidden, &self.moves_left_output) + self.moves_left_bias[0] + 1.0).max(0.0)
             * MOVES_LEFT_SCALE)
             .min(4096.0)

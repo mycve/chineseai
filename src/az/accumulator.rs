@@ -9,6 +9,7 @@ pub(crate) struct AzEvalScratch {
     // NNUE 热路径复用特征存储，避免每个 MCTS 叶节点分配并排序 Vec。
     pub(crate) features: Vec<usize>,
     pub(crate) hidden: Vec<f32>,
+    pub(crate) shared_hidden: Vec<f32>,
     pub(crate) policy_context: Vec<f32>,
     pub(crate) policy_accumulator_context: [f32; POLICY_ACCUMULATOR_RANK],
     pub(crate) policy_piece_square_scores: Vec<f32>,
@@ -33,6 +34,7 @@ impl AzEvalScratch {
         Self {
             features: Vec::with_capacity(48),
             hidden: vec![0.0; hidden_size],
+            shared_hidden: vec![0.0; hidden_size],
             policy_context: vec![0.0; POLICY_MOVE_CONTEXT_SIZE],
             policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
@@ -52,6 +54,7 @@ impl AzEvalScratch {
         Self {
             features: Vec::new(),
             hidden: Vec::new(),
+            shared_hidden: Vec::new(),
             policy_context: Vec::new(),
             policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
             policy_piece_square_scores: Vec::new(),
@@ -196,7 +199,10 @@ impl AzEvalAccumulator {
     }
 }
 
-pub(crate) fn canonical_buckets_for_perspective(position: &Position, perspective: Color) -> (usize, usize) {
+pub(crate) fn canonical_buckets_for_perspective(
+    position: &Position,
+    perspective: Color,
+) -> (usize, usize) {
     let us = position
         .general_square(perspective)
         .map(|sq| canonical_general_bucket(0, canonical_square_for(perspective, sq)))

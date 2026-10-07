@@ -117,10 +117,6 @@ impl Px0Sgd {
         };
         let state = get("state")?.to_vec1::<i64>()?;
         let rates = get("base_lr")?.to_vec1::<f64>()?;
-        let restored_vars = super::adamw::optimizer_restore_var_count(
-            &self.vars,
-            tensors.len().saturating_sub(2) / 2,
-        )?;
         if state.len() != 4
             || state[0] != 1
             || state[1] != crate::infra::version::MODEL_FORMAT_VERSION as i64
@@ -128,7 +124,7 @@ impl Px0Sgd {
             || state[3] != next_update as i64
             || rates.len() != 2
             || rates[0] != self.base_lr
-            || tensors.len() != 2 + restored_vars * 2
+            || tensors.len() != 2 + self.vars.len() * 2
         {
             candle_core::bail!(
                 "SGD state does not match resume metadata: format={:?}/{} next_update={:?}/{next_update} base_lr={:?}/{} tensors={}/{}",
@@ -138,11 +134,11 @@ impl Px0Sgd {
                 rates.first(),
                 self.base_lr,
                 tensors.len(),
-                2 + restored_vars * 2
+                2 + self.vars.len() * 2
             );
         }
         // 先完整验证；不允许旧 checkpoint 的动量误配到不同权重。
-        for (i, var) in self.vars[..restored_vars].iter().enumerate() {
+        for (i, var) in self.vars.iter().enumerate() {
             let saved = get(&format!("weight_{i}"))?;
             let velocity = get(&format!("velocity_{i}"))?;
             if saved.shape() != var.shape()
@@ -163,19 +159,11 @@ impl Px0Sgd {
                 candle_core::bail!("SGD state weight mismatch at tensor {i}");
             }
         }
-        for (i, velocity) in self.velocity[..restored_vars].iter().enumerate() {
+        for (i, velocity) in self.velocity.iter().enumerate() {
             velocity.set(&get(&format!("velocity_{i}"))?.to_device(velocity.device())?)?;
-        }
-        for i in restored_vars..self.vars.len() {
-            self.velocity[i].set(&self.vars[i].zeros_like()?)?;
         }
         self.steps = state[2] as usize;
         self.last_lr = rates[1];
-        if restored_vars != self.vars.len() {
-            eprintln!(
-                "[chineseai] SGD: restored 26 existing tensors and training steps; initialized moves-left momentum to zero"
-            );
-        }
         Ok(())
     }
 }

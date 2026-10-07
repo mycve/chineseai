@@ -185,10 +185,7 @@ fn encode_replay_entry(out: &mut Vec<u8>, entry: &ReplayEntry) -> io::Result<()>
     encode_az_training_sample(out, &entry.sample)
 }
 
-fn decode_az_training_sample<R: Read>(
-    reader: &mut R,
-    version: u32,
-) -> io::Result<AzTrainingSample> {
+fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSample> {
     let nf = replay_read_u32(reader)?;
     if nf > REPLAY_MAX_FEATURES_PER_SAMPLE {
         return Err(io::Error::new(
@@ -241,11 +238,8 @@ fn decode_az_training_sample<R: Read>(
     let side_sign = replay_read_f32(reader)?;
     let policy_weight = replay_read_f32(reader)?;
     let value_weight = replay_read_f32(reader)?;
-    let (moves_left, moves_left_weight) = if version == 41 {
-        (0.0, 0.0)
-    } else {
-        (replay_read_f32(reader)?, replay_read_f32(reader)?)
-    };
+    let moves_left = replay_read_f32(reader)?;
+    let moves_left_weight = replay_read_f32(reader)?;
     if !moves_left.is_finite()
         || moves_left < 0.0
         || !moves_left_weight.is_finite()
@@ -294,8 +288,8 @@ fn decode_az_training_sample<R: Read>(
     })
 }
 
-fn decode_replay_entry<R: Read>(reader: &mut R, version: u32) -> io::Result<ReplayEntry> {
-    let sample = decode_az_training_sample(reader, version)?;
+fn decode_replay_entry<R: Read>(reader: &mut R) -> io::Result<ReplayEntry> {
+    let sample = decode_az_training_sample(reader)?;
     Ok(ReplayEntry { sample })
 }
 
@@ -645,7 +639,7 @@ impl AzExperiencePool {
         Ok(out)
     }
 
-    fn decode_replay_payload(data: &[u8], capacity: usize, version: u32) -> io::Result<Self> {
+    fn decode_replay_payload(data: &[u8], capacity: usize) -> io::Result<Self> {
         let mut reader = Cursor::new(data);
         let _stored_capacity = replay_read_u64(&mut reader)? as usize;
         let n_chunks = replay_read_u64(&mut reader)? as usize;
@@ -668,7 +662,7 @@ impl AzExperiencePool {
             }
             let mut entries = Vec::with_capacity(n_entries.min(capacity));
             for _ in 0..n_entries {
-                let entry = decode_replay_entry(&mut reader, version)?;
+                let entry = decode_replay_entry(&mut reader)?;
                 if capacity > 0 {
                     entries.push(entry);
                 }
@@ -729,7 +723,7 @@ impl AzExperiencePool {
             ));
         }
         let ver = LittleEndian::read_u32(&file_blob[4..8]);
-        if ver != REPLAY_FILE_VERSION && ver != 41 {
+        if ver != REPLAY_FILE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("replay unsupported version {ver} (expected v{REPLAY_FILE_VERSION})"),
@@ -742,13 +736,7 @@ impl AzExperiencePool {
             ));
         }
         let inner = Self::decompress_chunked_snapshot(&file_blob[12..])?;
-        let pool = Self::decode_replay_payload(&inner, capacity, ver)?;
-        if ver == 41 {
-            eprintln!(
-                "[chineseai] replay: restored v41 samples; unknown moves-left labels are masked; next save uses v42"
-            );
-        }
-        Ok(pool)
+        Self::decode_replay_payload(&inner, capacity)
     }
 
     fn decompress_chunked_snapshot(data: &[u8]) -> io::Result<Vec<u8>> {
@@ -883,66 +871,21 @@ mod tests {
     }
 
     #[test]
-    fn replay_v41_upgrade_preserves_samples_and_masks_unknown_distance() {
-        let originals = [
-            sample(AzStartSource::OpeningBook, 7, 11),
-            sample(AzStartSource::Midgame, 7, 12),
-        ];
-        let mut inner = Vec::new();
-        replay_push_u64(&mut inner, 10);
-        replay_push_u64(&mut inner, 1);
-        replay_push_u32(&mut inner, 7);
-        replay_push_u64(&mut inner, originals.len() as u64);
-        for original in &originals {
-            let mut encoded = Vec::new();
-            encode_az_training_sample(&mut encoded, original).unwrap();
-            // v41 的尾部从 search_simulations 到 start_source 共 49 字节；没有两个 MLH 浮点数。
-            let offset = encoded.len() - 49 - 8;
-            encoded.drain(offset..offset + 8);
-            inner.extend_from_slice(&encoded);
+    fn replay_rejects_old_format() {
+        let mut pool = AzExperiencePool::new(10);
+        pool.add_games(vec![vec![sample(AzStartSource::OpeningBook, 7, 11)]]);
+        let path = std::env::temp_dir().join(format!(
+            "chineseai-strict-replay-{}.lz4",
+            std::process::id()
+        ));
+        pool.save_snapshot_lz4(&path).unwrap();
+        let current = fs::read(&path).unwrap();
+        for version in [40u32, 41] {
+            let mut old = current.clone();
+            old[4..8].copy_from_slice(&version.to_le_bytes());
+            fs::write(&path, &old).unwrap();
+            assert!(AzExperiencePool::load_snapshot_lz4(&path, 10).is_err());
         }
-        let mut blob = REPLAY_MAGIC.to_vec();
-        replay_push_u32(&mut blob, 41);
-        blob.extend_from_slice(REPLAY_CHUNKED_MARKER);
-        replay_push_u64(&mut blob, inner.len() as u64);
-        replay_push_u64(
-            &mut blob,
-            inner.len().div_ceil(REPLAY_COMPRESS_CHUNK_BYTES) as u64,
-        );
-        for chunk in inner.chunks(REPLAY_COMPRESS_CHUNK_BYTES) {
-            let compressed = compress_prepend_size(chunk);
-            replay_push_u32(&mut blob, chunk.len() as u32);
-            replay_push_u64(&mut blob, compressed.len() as u64);
-            blob.extend_from_slice(&compressed);
-        }
-        let path =
-            std::env::temp_dir().join(format!("chineseai-replay-v41-{}.lz4", std::process::id()));
-        fs::write(&path, &blob).unwrap();
-        let loaded = AzExperiencePool::load_snapshot_lz4(&path, 10).unwrap();
-        assert_eq!(loaded.sample_count(), originals.len());
-        for (restored, original) in loaded.iter_samples().zip(&originals) {
-            assert_eq!(restored.moves_left, 0.0);
-            assert_eq!(restored.moves_left_weight, 0.0);
-            let mut expected = Vec::new();
-            let mut actual = Vec::new();
-            encode_az_training_sample(&mut expected, original).unwrap();
-            encode_az_training_sample(&mut actual, restored).unwrap();
-            assert_eq!(expected, actual);
-        }
-        loaded.save_snapshot_lz4(&path).unwrap();
-        assert_eq!(
-            LittleEndian::read_u32(&fs::read(&path).unwrap()[4..8]),
-            REPLAY_FILE_VERSION
-        );
-        assert_eq!(
-            AzExperiencePool::load_snapshot_lz4(&path, 10)
-                .unwrap()
-                .sample_count(),
-            originals.len()
-        );
-        blob[4..8].copy_from_slice(&40u32.to_le_bytes());
-        fs::write(&path, &blob).unwrap();
-        assert!(AzExperiencePool::load_snapshot_lz4(&path, 10).is_err());
         fs::remove_file(path).unwrap();
     }
 
@@ -955,8 +898,7 @@ mod tests {
         original.moves_left_weight = 1.0;
         original.repetition_flags[0] = 1;
         encode_az_training_sample(&mut encoded, &original).unwrap();
-        let decoded =
-            decode_az_training_sample(&mut Cursor::new(encoded), REPLAY_FILE_VERSION).unwrap();
+        let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
         assert_eq!(decoded.meta.start_source, AzStartSource::OpeningBook);
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
@@ -998,8 +940,7 @@ mod tests {
         for chunk in &pool.chunks {
             let mut encoded = Vec::new();
             encode_replay_entry(&mut encoded, &chunk.entries[0]).unwrap();
-            let decoded =
-                decode_replay_entry(&mut Cursor::new(encoded), REPLAY_FILE_VERSION).unwrap();
+            let decoded = decode_replay_entry(&mut Cursor::new(encoded)).unwrap();
             let restored = ReplayChunk::new(vec![decoded.sample]);
             assert_eq!(chunk_is_test(chunk, 77), chunk_is_test(&restored, 77));
         }
