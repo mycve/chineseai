@@ -698,6 +698,113 @@ mod monitoring_tests {
     }
 
     #[test]
+    fn moves_left_upgrade_preserves_both_optimizer_states_and_steps() {
+        for (kind, lr) in [
+            (AzTrainOptimizer::AdamW, 4e-4),
+            (AzTrainOptimizer::Px0Sgd, 0.02),
+        ] {
+            let mut model = AzNnue::random(8, 87);
+            let legacy_candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+            let (mut vars, mut decay) = legacy_candle.all_vars_with_decay();
+            vars.truncate(26);
+            decay.truncate(26);
+            let mut legacy = TrainOptimizer::new(kind, vars.clone(), decay, lr).unwrap();
+            legacy.set_steps(70000);
+            legacy
+                .step(&vars[0].sum_all().unwrap().backward().unwrap())
+                .unwrap();
+            legacy_candle.copy_to_model(&mut model).unwrap();
+            let migrated = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+            let (new_vars, new_decay) = migrated.all_vars_with_decay();
+            let mut resumed =
+                TrainOptimizer::new(kind, new_vars.clone(), new_decay.clone(), lr).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "chineseai-mlh-upgrade-{}-{}.safetensors",
+                kind.as_str(),
+                std::process::id()
+            ));
+            let migrated_path = path.with_extension("migrated.safetensors");
+            legacy.save(&path, 42).unwrap();
+            assert!(resumed.restore(&path, 43).is_err());
+            let mut wrong_lr =
+                TrainOptimizer::new(kind, new_vars.clone(), new_decay.clone(), lr * 2.0).unwrap();
+            assert!(wrong_lr.restore(&path, 42).is_err());
+            new_vars[27]
+                .set(&Tensor::new(&[0.5f32], &Device::Cpu).unwrap())
+                .unwrap();
+            assert!(resumed.restore(&path, 42).is_err());
+            new_vars[27]
+                .set(&new_vars[27].zeros_like().unwrap())
+                .unwrap();
+            resumed.restore(&path, 42).unwrap();
+            assert_eq!(resumed.steps(), legacy.steps());
+            resumed.save(&migrated_path, 42).unwrap();
+            let old_state = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+            let new_state = candle_core::safetensors::load(&migrated_path, &Device::Cpu).unwrap();
+            for (name, old) in old_state {
+                let new = &new_state[&name];
+                if name == "decay_mask" {
+                    assert_eq!(
+                        old.to_vec1::<i64>().unwrap(),
+                        new.to_vec1::<i64>().unwrap()[..26]
+                    );
+                } else {
+                    assert_eq!(
+                        old.flatten_all()
+                            .unwrap()
+                            .to_dtype(candle_core::DType::F64)
+                            .unwrap()
+                            .to_vec1::<f64>()
+                            .unwrap(),
+                        new.flatten_all()
+                            .unwrap()
+                            .to_dtype(candle_core::DType::F64)
+                            .unwrap()
+                            .to_vec1::<f64>()
+                            .unwrap(),
+                        "{kind:?}: {name}"
+                    );
+                }
+            }
+            for index in 26..28 {
+                for prefix in if kind == AzTrainOptimizer::AdamW {
+                    vec!["first_moment", "second_moment"]
+                } else {
+                    vec!["velocity"]
+                } {
+                    assert!(
+                        new_state[&format!("{prefix}_{index}")]
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap()
+                            .iter()
+                            .all(|&v| v == 0.0)
+                    );
+                }
+            }
+            // 继续训练原参数，恢复后与未中断优化器完全一致。
+            legacy
+                .step(&vars[0].sum_all().unwrap().backward().unwrap())
+                .unwrap();
+            resumed
+                .step(&new_vars[0].sum_all().unwrap().backward().unwrap())
+                .unwrap();
+            assert_eq!(
+                vars[0].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                new_vars[0].flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            // 新头在相同全局步数下也能接收梯度。
+            resumed
+                .step(&new_vars[27].sum_all().unwrap().backward().unwrap())
+                .unwrap();
+            assert_ne!(new_vars[27].to_vec1::<f32>().unwrap()[0], 0.0);
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(migrated_path).unwrap();
+        }
+    }
+
+    #[test]
     fn moves_left_loss_trains_head_and_masks_unknown_distance() {
         let position = crate::xiangqi::Position::startpos();
         let moves = position.legal_moves();
@@ -880,7 +987,9 @@ mod monitoring_tests {
                 0.0
             );
         }
-        trainer.optimizer.set_steps(super::super::PX0_TEST_STEPS - 1);
+        trainer
+            .optimizer
+            .set_steps(super::super::PX0_TEST_STEPS - 1);
         let mut model = AzNnue::random(16, 20260907);
         model.gpu_trainer = Some(Box::new(trainer));
         train_samples_gpu(

@@ -162,7 +162,11 @@ impl AzAdamW {
         let state = get("state")?.to_vec1::<i64>()?;
         let hyper = get("hyper")?.to_vec1::<f64>()?;
         let mask = get("decay_mask")?.to_vec1::<i64>()?;
-        let expected_mask: Vec<i64> = self.decay.iter().map(|&flag| i64::from(flag)).collect();
+        let restored_vars = optimizer_restore_var_count(&self.vars, mask.len())?;
+        let expected_mask: Vec<i64> = self.decay[..restored_vars]
+            .iter()
+            .map(|&flag| i64::from(flag))
+            .collect();
         if state.len() != STATE_LEN
             || state[0] != STATE_TAG
             || state[1] != crate::infra::version::MODEL_FORMAT_VERSION as i64
@@ -175,14 +179,22 @@ impl AzAdamW {
             || hyper[4] != EPS
             || hyper[5] != DENSE_WEIGHT_DECAY
             || mask != expected_mask
-            || tensors.len() != 3 + self.vars.len() * 3
+            || tensors.len() != 3 + restored_vars * 3
         {
             candle_core::bail!(
-                "AdamW state does not match model format, learning rate, decay mask or next update"
+                "AdamW state does not match resume metadata: format={:?}/{} next_update={:?}/{next_update} base_lr={:?}/{} decay_mask_match={} tensors={}/{}",
+                state.get(1),
+                crate::infra::version::MODEL_FORMAT_VERSION,
+                state.get(3),
+                hyper.first(),
+                self.base_lr,
+                mask == expected_mask,
+                tensors.len(),
+                3 + restored_vars * 3
             );
         }
         // 先完整验证；不允许旧 checkpoint 的动量误配到不同权重。
-        for (i, var) in self.vars.iter().enumerate() {
+        for (i, var) in self.vars[..restored_vars].iter().enumerate() {
             for name in [
                 format!("weight_{i}"),
                 format!("first_moment_{i}"),
@@ -207,16 +219,51 @@ impl AzAdamW {
                 }
             }
         }
-        for i in 0..self.vars.len() {
+        for i in 0..restored_vars {
             self.first_moment[i]
                 .set(&get(&format!("first_moment_{i}"))?.to_device(self.vars[i].device())?)?;
             self.second_moment[i]
                 .set(&get(&format!("second_moment_{i}"))?.to_device(self.vars[i].device())?)?;
         }
+        for i in restored_vars..self.vars.len() {
+            let zeros = self.vars[i].zeros_like()?;
+            self.first_moment[i].set(&zeros)?;
+            self.second_moment[i].set(&zeros)?;
+        }
         self.steps = state[2] as usize;
         self.last_lr = hyper[1];
+        if restored_vars != self.vars.len() {
+            eprintln!(
+                "[chineseai] AdamW: restored 26 existing tensors and training steps; initialized moves-left moments to zero"
+            );
+        }
         Ok(())
     }
+}
+
+/// 仅迁移本次 MLH 增加的两个尾部张量；旧权重、超参数仍由恢复入口逐项验证。
+pub(super) fn optimizer_restore_var_count(vars: &[Var], stored: usize) -> Result<usize> {
+    if stored == vars.len() {
+        return Ok(stored);
+    }
+    if stored == 26
+        && vars.len() == 28
+        && vars[26].dims() == [1, vars[7].elem_count()]
+        && vars[27].dims() == [1]
+        && vars[26..]
+            .iter()
+            .map(|var| var.flatten_all()?.to_vec1::<f32>())
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .flatten()
+            .all(|&weight| weight == 0.0)
+    {
+        return Ok(stored);
+    }
+    candle_core::bail!(
+        "optimizer tensor count mismatch: saved={stored}, model={}; only zero-initialized moves-left heads can be added",
+        vars.len()
+    );
 }
 
 fn zeros_like(vars: &[Var]) -> Result<Vec<Var>> {
@@ -361,14 +408,14 @@ mod tests {
             std::process::id()
         ));
         opt.save(&path, 42).unwrap();
-        let restored_var = Var::new(var.to_vec1::<f32>().unwrap().as_slice(), &Device::Cpu).unwrap();
+        let restored_var =
+            Var::new(var.to_vec1::<f32>().unwrap().as_slice(), &Device::Cpu).unwrap();
         let mut restored = AzAdamW::new(vec![restored_var.clone()], vec![true], 4e-4).unwrap();
         for attempts in [43usize, 41] {
             assert!(restored.restore(&path, attempts).is_err());
         }
         // 换一个 decay 分组的优化器不能载入这份状态。
-        let mut wrong_group =
-            AzAdamW::new(vec![restored_var.clone()], vec![false], 4e-4).unwrap();
+        let mut wrong_group = AzAdamW::new(vec![restored_var.clone()], vec![false], 4e-4).unwrap();
         assert!(wrong_group.restore(&path, 42).is_err());
         restored.restore(&path, 42).unwrap();
         assert_eq!(restored.steps, opt.steps);
