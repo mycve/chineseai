@@ -3,17 +3,16 @@ use crate::xiangqi::{BOARD_SIZE, Color, Move, Position, color_index};
 
 use super::{
     AzArenaReport, AzEvalAccumulator, AzEvalScratch, AzExperiencePool, AzNnue, AzNnueArch,
-    AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, CHECK_CONTEXT_SIZE,
-    DENSE_MOVE_SPACE, MateSearchLimits,
-    POLICY_ACCUMULATOR_RANK, POLICY_CACHE_PIECE_SIZE, POLICY_CAPTURE_RELATION_OFFSET,
-    POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_SIZE,
-    RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64, VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB,
-    VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE, alphazero_search_with_rules,
-    check_context_features, dense_move_index, dense_move_squares, evaluate_policy_groups, move_map,
-    policy_cache_capture_index, policy_cache_main_index, policy_consequence_features,
-    policy_move_tactical_flags, policy_sparse_capture_index,
-    policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
-    rule_context_features, scalar_value_to_wdl_target, search_root_mate,
+    AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
+    MateSearchLimits, POLICY_ACCUMULATOR_RANK, POLICY_CACHE_PIECE_SIZE,
+    POLICY_CAPTURE_RELATION_OFFSET, POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_EXACT_SIZE,
+    POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64,
+    VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB, VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB,
+    WDL_HEAD_SIZE, alphazero_search_with_rules, check_context_features, dense_move_index,
+    dense_move_squares, evaluate_policy_groups, move_map, policy_cache_capture_index,
+    policy_cache_main_index, policy_consequence_features, policy_move_tactical_flags,
+    policy_sparse_capture_index, policy_sparse_factor_indices, policy_sparse_main_index,
+    policy_tactical_indices, rule_context_features, scalar_value_to_wdl_target, search_root_mate,
     visit_value_king_piece_features, visit_value_threat_features,
 };
 
@@ -36,6 +35,8 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: update,
@@ -151,6 +152,8 @@ fn repetition_policy_metrics_separate_opportunities_and_model_mass() {
         side_sign: 1.0,
         policy_weight: 1.0,
         value_weight: 1.0,
+        moves_left: 0.0,
+        moves_left_weight: 0.0,
         search_simulations: 1,
         meta: AzSampleMeta::default(),
     };
@@ -199,9 +202,7 @@ fn value_king_piece_features_change_with_king_bucket() {
     let mut first_features = Vec::new();
     let mut second_features = Vec::new();
     visit_value_king_piece_features(&first, Color::Red, |feature| first_features.push(feature));
-    visit_value_king_piece_features(&second, Color::Red, |feature| {
-        second_features.push(feature)
-    });
+    visit_value_king_piece_features(&second, Color::Red, |feature| second_features.push(feature));
     assert_eq!(first_features.len(), 6);
     assert_eq!(second_features.len(), 6);
     let rook_first = first_features
@@ -407,22 +408,12 @@ fn zero_initialized_consequence_branch_preserves_policy_logits() {
     );
 
     let mut baseline = AzEvalScratch::new(model.arch);
-    model.evaluate_with_scratch_output(
-        &position,
-        &moves,
-        &[0.0; RULE_CONTEXT_SIZE],
-        &mut baseline,
-    );
+    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut baseline);
 
     let mut active = model.clone();
     active.policy_consequence_output.fill(0.1);
     let mut changed = AzEvalScratch::new(model.arch);
-    active.evaluate_with_scratch_output(
-        &position,
-        &moves,
-        &[0.0; RULE_CONTEXT_SIZE],
-        &mut changed,
-    );
+    active.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut changed);
     assert!(
         baseline
             .logits
@@ -445,23 +436,13 @@ fn zero_initialized_policy_accumulator_is_neutral_and_trainable() {
     );
 
     let mut baseline = AzEvalScratch::new(model.arch);
-    model.evaluate_with_scratch_output(
-        &position,
-        &moves,
-        &[0.0; RULE_CONTEXT_SIZE],
-        &mut baseline,
-    );
+    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut baseline);
 
     let mut active = model.clone();
     active.policy_accumulator_move.fill(0.01);
     active.rebuild_policy_cache();
     let mut changed = AzEvalScratch::new(model.arch);
-    active.evaluate_with_scratch_output(
-        &position,
-        &moves,
-        &[0.0; RULE_CONTEXT_SIZE],
-        &mut changed,
-    );
+    active.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut changed);
     assert!(
         baseline
             .logits
@@ -591,6 +572,8 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -606,6 +589,8 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -621,6 +606,8 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -636,6 +623,8 @@ fn value_head_can_overfit_tiny_fixed_dataset() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -670,6 +659,8 @@ fn batched_training_is_deterministic() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -685,6 +676,8 @@ fn batched_training_is_deterministic() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -700,6 +693,8 @@ fn batched_training_is_deterministic() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -715,6 +710,8 @@ fn batched_training_is_deterministic() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -761,6 +758,8 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -776,6 +775,8 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -791,6 +792,8 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -806,6 +809,8 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         },
@@ -838,7 +843,10 @@ fn value_only_training_updates_trunk_when_trunk_training_enabled() {
 
 #[test]
 fn aznnue_safetensors_roundtrip_matches_weights() {
-    let model = AzNnue::random(16, 42);
+    let mut model = AzNnue::random(16, 42);
+    model.moves_left_output.fill(0.03);
+    model.moves_left_bias[0] = 0.2;
+    model.rebuild_moves_left();
     let path = std::env::temp_dir().join("chineseai_test_aznnue_roundtrip.safetensors");
     let _ = fs::remove_file(&path);
     model.save(&path).unwrap();
@@ -857,6 +865,9 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     assert_eq!(model.value_head_hidden, loaded.value_head_hidden);
     assert_eq!(model.value_head_bias, loaded.value_head_bias);
     assert_eq!(model.value_head_output, loaded.value_head_output);
+    assert_eq!(model.moves_left_output, loaded.moves_left_output);
+    assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
+    assert!(loaded.moves_left_active);
     assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
     assert_eq!(
         model.policy_consequence_output,
@@ -914,6 +925,8 @@ fn replay_pool_prunes_whole_game_chunks() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: update,
@@ -956,6 +969,8 @@ fn replay_pool_mixed_recent_sampling_uses_requested_recent_fraction() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: update,
@@ -998,6 +1013,8 @@ fn replay_recent_games_counts_complete_games_not_generation_batches() {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta {
                 generation_update: 7,
@@ -1334,29 +1351,40 @@ fn check_context_block_reaches_the_trunk_when_active() {
     );
 }
 
-/// 旧 checkpoint 里没有 `check_context_hidden` 这个张量：加载时必须按全零补齐，
-/// 而不是报错。这里直接对工作区的真实 checkpoint 验证（它不进版本库，缺失就跳过）。
+/// 缺少可选头的旧 checkpoint 必须零初始化，并保持原评估结果。
 #[test]
-fn missing_check_context_tensor_loads_as_zeros() {
-    let path = std::path::Path::new("best.safetensors");
-    if !path.exists() {
-        return;
-    }
-    let tensors = unsafe {
-        candle_core::safetensors::MmapedSafetensors::new(path).expect("mmap best.safetensors")
-    };
-    assert!(
-        tensors.get("check_context_hidden").is_err(),
-        "这个 checkpoint 早于标量块，不该含该张量"
-    );
-    let zeros = super::load_candle_f32_tensor_or_zeros(
-        &tensors,
+fn missing_optional_heads_load_as_zeros() {
+    let model = AzNnue::random(16, 73);
+    let path = std::env::temp_dir().join("chineseai_test_missing_heads.safetensors");
+    model.save(&path).unwrap();
+    let mut tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu).unwrap();
+    for name in [
         "check_context_hidden",
-        CHECK_CONTEXT_SIZE * 128,
-    )
-    .expect("缺失张量必须按零补齐而不是报错");
-    assert_eq!(zeros.len(), CHECK_CONTEXT_SIZE * 128);
-    assert!(zeros.iter().all(|&weight| weight == 0.0));
+        "moves_left_output",
+        "moves_left_bias",
+    ] {
+        tensors.remove(name);
+    }
+    candle_core::safetensors::save(&tensors, &path).unwrap();
+    let loaded = AzNnue::load(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(
+        loaded
+            .check_context_hidden
+            .iter()
+            .all(|&weight| weight == 0.0)
+    );
+    assert!(loaded.moves_left_output.iter().all(|&weight| weight == 0.0));
+    assert_eq!(loaded.moves_left_bias, vec![0.0]);
+    assert!(!loaded.check_context_active);
+    assert!(!loaded.moves_left_active);
+    let position = Position::startpos();
+    let history = position.initial_rule_history();
+    let moves = position.legal_moves();
+    assert_eq!(
+        model.evaluate_wdl_with_rules(&position, &history, &moves),
+        loaded.evaluate_wdl_with_rules(&position, &history, &moves)
+    );
 }
 
 /// 策略头的 `destination_attacked/defended` 用的是**走前**攻击位板，而不是走完之后的

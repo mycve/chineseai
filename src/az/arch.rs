@@ -54,7 +54,8 @@ pub(crate) const POLICY_SPARSE_FACTOR_SIZE: usize = POLICY_SPARSE_MOVE_PIECE_SIZ
 pub(crate) const POLICY_ACCUMULATOR_PIECE_OFFSET: usize = AZ_NNUE_INPUT_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_RANK_OFFSET: usize =
     POLICY_ACCUMULATOR_PIECE_OFFSET + STRUCTURAL_PIECE_SIZE;
-pub(crate) const POLICY_ACCUMULATOR_FILE_OFFSET: usize = POLICY_ACCUMULATOR_RANK_OFFSET + STRUCTURAL_RANK_SIZE;
+pub(crate) const POLICY_ACCUMULATOR_FILE_OFFSET: usize =
+    POLICY_ACCUMULATOR_RANK_OFFSET + STRUCTURAL_RANK_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_KING_PIECE_OFFSET: usize =
     POLICY_ACCUMULATOR_FILE_OFFSET + STRUCTURAL_FILE_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_BIAS_ROW: usize =
@@ -224,4 +225,54 @@ pub fn dense_move_index(mv: Move) -> usize {
         mv.to
     );
     dense as usize
+}
+
+/// MLH 使用半回合；归一化用于稳定回归梯度。
+pub(crate) const MOVES_LEFT_SCALE: f32 = 100.0;
+pub(crate) const MOVES_LEFT_LOSS_WEIGHT: f32 = 0.05;
+/// 剩余步数对搜索的影响；默认参数来自 PX0/LC0 classic 搜索。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AzMovesLeftParams {
+    pub enabled: bool,
+    pub threshold: f32,
+    pub max_effect: f32,
+    pub slope: f32,
+    pub constant_factor: f32,
+    pub scaled_factor: f32,
+    pub quadratic_factor: f32,
+}
+
+impl Default for AzMovesLeftParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: 0.8,
+            max_effect: 0.0345,
+            slope: 0.0027,
+            constant_factor: 0.0,
+            scaled_factor: 1.6521,
+            quadratic_factor: -0.6521,
+        }
+    }
+}
+
+impl AzMovesLeftParams {
+    pub fn normalize(mut self) -> Self {
+        fn bounded(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+            if value.is_finite() {
+                value.clamp(min, max)
+            } else {
+                fallback
+            }
+        }
+        let defaults = Self::default();
+        self.threshold = bounded(self.threshold, 0.0, 1.0, defaults.threshold);
+        self.max_effect = bounded(self.max_effect, 0.0, 1.0, defaults.max_effect);
+        self.slope = bounded(self.slope, 0.0, 1.0, defaults.slope);
+        self.constant_factor = bounded(self.constant_factor, -1.0, 1.0, defaults.constant_factor);
+        self.scaled_factor = bounded(self.scaled_factor, -2.0, 2.0, defaults.scaled_factor);
+        self.quadratic_factor =
+            bounded(self.quadratic_factor, -1.0, 1.0, defaults.quadratic_factor);
+        self
+    }
 }

@@ -182,6 +182,7 @@ impl<'a> TacticalProbe<'a> {
         self.nodes += 1;
         if let Some(value) = terminal_value(p, h) {
             return Ok(AzEvalOutput {
+                moves_left: 0.0,
                 value,
                 value_wdl: scalar_terminal_wdl(value),
             });
@@ -189,6 +190,7 @@ impl<'a> TacticalProbe<'a> {
         let mut moves = p.legal_moves_with_rules(h);
         if moves.is_empty() {
             return Ok(AzEvalOutput {
+                moves_left: 0.0,
                 value: -1.0,
                 value_wdl: [0.0, 0.0, 1.0],
             });
@@ -211,6 +213,7 @@ impl<'a> TacticalProbe<'a> {
             value
         } else {
             AzEvalOutput {
+                moves_left: 0.0,
                 value: 0.0,
                 value_wdl: [0.0, 1.0, 0.0],
             }
@@ -259,6 +262,7 @@ impl<'a> TacticalProbe<'a> {
             h.pop();
             let child = child?;
             let eval = AzEvalOutput {
+                moves_left: child.moves_left + 1.0,
                 value: -child.value,
                 value_wdl: flip_wdl(child.value_wdl),
             };

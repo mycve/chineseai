@@ -176,6 +176,7 @@ pub(super) fn train_samples_gpu(
             .max(1) as f32;
         stats.value_loss /= valid;
         stats.policy_ce /= denom;
+        stats.moves_left_loss /= stats.moves_left_samples.max(1) as f32;
     }
     let trainer = model
         .gpu_trainer
@@ -282,6 +283,10 @@ impl GpuTrainer {
             value_samples: valid,
             loss: stats.loss / stats.samples.max(1) as f32,
             value_loss: stats.value_loss / valid.max(1) as f32,
+            moves_left_rmse: (stats.moves_left_loss / stats.moves_left_samples.max(1) as f32)
+                .sqrt()
+                * super::MOVES_LEFT_SCALE,
+            moves_left_samples: stats.moves_left_samples,
             policy_kl: stats.policy_ce / stats.samples.max(1) as f32
                 - super::policy_target_entropy(samples),
             value_rmse: (stats.value_error_sq_sum / valid.max(1) as f32)
@@ -420,7 +425,17 @@ impl GpuReplica {
             .broadcast_mul(&batch_tensors.policy_weights)?
             .sum_all()?
             .affine(policy_weight.max(0.0) as f64, 0.0)?;
-        let loss_sum = (weighted_value_loss + weighted_policy_ce)?;
+        let moves_left_error =
+            (forward.moves_left.squeeze(1)? - &batch_tensors.moves_left_targets)?.sqr()?;
+        let moves_left_loss = (&moves_left_error * &batch_tensors.moves_left_weights)?.sum_all()?;
+        let valid_moves_left = batch_tensors
+            .moves_left_weights
+            .gt(0.0)?
+            .to_dtype(candle_core::DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()? as usize;
+        let loss_sum = ((weighted_value_loss + weighted_policy_ce)?
+            + moves_left_loss.affine(super::MOVES_LEFT_LOSS_WEIGHT as f64, 0.0)?)?;
         let loss_tensor = (&loss_sum / batch_len as f64)?;
         let moments = masked_value_moments(
             &value,
@@ -436,7 +451,12 @@ impl GpuReplica {
         let source_phase_value =
             std::array::from_fn(|i| moment_stats(&moments[(i + 4) * 7..(i + 5) * 7]));
         let metrics = Tensor::stack(
-            &[loss_sum.detach(), value_ce.detach(), policy_ce.detach()],
+            &[
+                loss_sum.detach(),
+                value_ce.detach(),
+                policy_ce.detach(),
+                moves_left_loss.detach(),
+            ],
             0,
         )?
         .to_vec1::<f32>()?;
@@ -444,6 +464,8 @@ impl GpuReplica {
             loss: metrics[0],
             value_loss: metrics[1],
             policy_ce: metrics[2],
+            moves_left_loss: metrics[3],
+            moves_left_samples: valid_moves_left,
             value_pred_sum: global.pred_sum,
             value_pred_sq_sum: global.pred_sq_sum,
             value_target_sum: global.target_sum,
@@ -610,6 +632,8 @@ mod monitoring_tests {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };
@@ -674,6 +698,67 @@ mod monitoring_tests {
     }
 
     #[test]
+    fn moves_left_loss_trains_head_and_masks_unknown_distance() {
+        let position = crate::xiangqi::Position::startpos();
+        let moves = position.legal_moves();
+        let sample = AzTrainingSample {
+            features: crate::az::nnue::extract_sparse_features_az(&position),
+            rule_context: Default::default(),
+            move_indices: moves
+                .iter()
+                .map(|&mv| crate::az::dense_move_index(mv))
+                .collect(),
+            repetition_flags: Vec::new(),
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [0.0, 1.0, 0.0],
+            root_search_wdl: [0.0, 1.0, 0.0],
+            value: 0.0,
+            side_sign: 1.0,
+            policy_weight: 0.0,
+            value_weight: 0.0,
+            moves_left: 40.0,
+            moves_left_weight: 1.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        };
+        let mut model = AzNnue::random(8, 81);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
+        let batch = BatchTensors::from_packed(
+            PackedBatch::from_indices(&[sample.clone()], &[0]),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let initial = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
+        assert_eq!(initial.stats.moves_left_samples, 1);
+        let initial_loss = initial.stats.moves_left_loss;
+        let (vars, decay) = replica.model.all_vars_with_decay();
+        let mut optimizer =
+            TrainOptimizer::new(AzTrainOptimizer::Px0Sgd, vars, decay, 0.02).unwrap();
+        for _ in 0..5 {
+            let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
+            optimizer
+                .step(&loss.loss_tensor.backward().unwrap())
+                .unwrap();
+        }
+        let final_loss = replica
+            .compute_batch_loss(&batch, 1, 0.0, 0.0)
+            .unwrap()
+            .stats
+            .moves_left_loss;
+        assert!(final_loss < initial_loss, "{final_loss} >= {initial_loss}");
+        replica.model.copy_to_model(&mut model).unwrap();
+        assert!(model.moves_left_active);
+        let mut masked = sample;
+        masked.moves_left_weight = 0.0;
+        let batch =
+            BatchTensors::from_packed(PackedBatch::from_indices(&[masked], &[0]), &Device::Cpu)
+                .unwrap();
+        let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
+        assert_eq!(loss.stats.moves_left_samples, 0);
+        assert_eq!(loss.loss_tensor.to_scalar::<f32>().unwrap(), 0.0);
+    }
+
+    #[test]
     fn masked_samples_do_not_pollute_value_monitoring() {
         let position = crate::xiangqi::Position::startpos();
         let moves = position.legal_moves();
@@ -692,6 +777,8 @@ mod monitoring_tests {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: Default::default(),
         };

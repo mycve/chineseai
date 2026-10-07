@@ -3,9 +3,9 @@ pub(crate) mod checkpoints;
 pub(crate) mod config;
 pub(crate) mod selfplay;
 
-use crate::cli::az_loop_config::load_or_create_az_loop_config;
 use crate::cli::args::*;
 use crate::cli::az_loop::{arena::*, checkpoints::*, config::*, selfplay::*};
+use crate::cli::az_loop_config::load_or_create_az_loop_config;
 use crate::cli::reporting::*;
 use crate::cli::training_console;
 use chineseai::az::{
@@ -76,7 +76,9 @@ pub(crate) fn dive_batch_selected(fraction: f32, seed: u64, batches: u64) -> boo
 
 /// 装载自博弈起点供应。跳水库是可选的补充：路径为空、比例为 0、文件缺失或读不出来，
 /// 都只打印一行然后退回"只用开局库"，不打断整轮训练。
-pub(crate) fn build_selfplay_supply(config: &crate::cli::az_loop_config::AzLoopFileConfig) -> SelfplaySupply {
+pub(crate) fn build_selfplay_supply(
+    config: &crate::cli::az_loop_config::AzLoopFileConfig,
+) -> SelfplaySupply {
     let path = config.selfplay_dive_book.trim();
     let dives = if path.is_empty() || config.selfplay_dive_fraction <= 0.0 {
         None
@@ -176,6 +178,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         println!("model    : init {}", config.model_path);
         (AzNnue::random_with_arch(config_arch, config.seed), false)
     };
+    model.moves_left_params = config.moves_left_params();
     let optimizer_state_path = PathBuf::from(format!("{config_path}.sgd.safetensors"));
     let model_optimizer_path = optimizer_checkpoint_path(model_path);
     let restore_path = if model_optimizer_path.exists() {
@@ -210,7 +213,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         if !best_path.exists() {
             save_model(&selfplay_model, &best_path);
         }
-        let reference = AzNnue::load(&best_path).unwrap_or_else(|err| {
+        let mut reference = AzNnue::load(&best_path).unwrap_or_else(|err| {
             panic!("failed to load best model `{}`: {err}", best_path.display());
         });
         if reference.arch != selfplay_model.arch {
@@ -221,6 +224,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 selfplay_model.arch
             );
         }
+        reference.moves_left_params = config.moves_left_params();
         reference
     };
     let initial_selfplay_model = selfplay_model;
@@ -228,10 +232,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let mut replay_pool =
         (config.replay_capacity > 0).then(|| AzExperiencePool::new(config.replay_capacity));
     if config.replay_capacity > 0 && replay_snapshot_path.exists() {
-        match AzExperiencePool::load_snapshot_lz4(
-            &replay_snapshot_path,
-            config.replay_capacity,
-        ) {
+        match AzExperiencePool::load_snapshot_lz4(&replay_snapshot_path, config.replay_capacity) {
             Ok(pool) => {
                 println!(
                     "replay   : restored {}/{} samples from `{}`",
@@ -281,14 +282,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     let selfplay_worker_count = config.workers.max(1);
     // 覆盖一次GPU更新期间完成的批次，同时限制旧模型样本和内存积压。
     let selfplay_queue_capacity = selfplay_worker_count.saturating_mul(2).max(32);
-    let (selfplay_tx, selfplay_rx) =
-        mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
+    let (selfplay_tx, selfplay_rx) = mpsc::sync_channel::<SelfplayBatch>(selfplay_queue_capacity);
     // 评估在主线程同步汇总时，训练结果仍可排队，避免反压训练和自对弈流水线。
     let (trainer_tx, trainer_rx) = mpsc::channel::<TrainerEvent>();
     let mut arena_reference_model = initial_arena_reference_model;
-    let mut champion_paths =
-        champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
-            .unwrap_or_else(|err| panic!("failed to load champion history: {err}"));
+    let mut champion_paths = champion_checkpoint_paths(&config.model_path, &config.checkpoint_dir)
+        .unwrap_or_else(|err| panic!("failed to load champion history: {err}"));
     if champion_paths.is_empty() {
         let initial_champion = save_best_checkpoint_model(
             &arena_reference_model,
@@ -418,19 +417,15 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         let mut trainer_model = model;
         let mut trainer_pool = replay_pool;
         let mut train_index = 0usize;
-        let mut replay_sampler = Px0ReplaySampler::partitioned(
-            trainer_config.shuffle_size,
-            trainer_config.seed,
-            false,
-        );
+        let mut replay_sampler =
+            Px0ReplaySampler::partitioned(trainer_config.shuffle_size, trainer_config.seed, false);
         let mut test_sampler = Px0ReplaySampler::partitioned(
             (trainer_config.shuffle_size / 10).max(1),
             trainer_config.seed,
             true,
         );
-        let mut cycle_end =
-            (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS + 1)
-                * chineseai::az::PX0_CYCLE_STEPS;
+        let mut cycle_end = (trainer_model.training_steps() / chineseai::az::PX0_CYCLE_STEPS + 1)
+            * chineseai::az::PX0_CYCLE_STEPS;
         let min_train_samples = trainer_config.batch_size.max(1);
         'training: while let Ok(mut pending) = ready_rx.recv() {
             let pending_games = pending.selfplay.games.len();
@@ -438,9 +433,8 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 pool.add_games(std::mem::take(&mut pending.selfplay.games));
             }
             if trainer_stop.load(Ordering::SeqCst)
-                || target_update.is_some_and(|target| {
-                    trainer_start_update.saturating_add(train_index) > target
-                })
+                || target_update
+                    .is_some_and(|target| trainer_start_update.saturating_add(train_index) > target)
             {
                 continue;
             }
@@ -451,8 +445,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 continue;
             }
             let mut rng = chineseai::az::SplitMix64::new(
-                trainer_config.seed
-                    ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
+                trainer_config.seed ^ (train_index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03),
             );
             let steps_before = trainer_model.training_steps();
             let train_steps = trainer_config
@@ -527,9 +520,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                         optimizer_checkpoint_path(&path),
                         train_update.saturating_add(1),
                     )
-                    .unwrap_or_else(|err| {
-                        panic!("failed to save checkpoint SGD state: {err}")
-                    });
+                    .unwrap_or_else(|err| panic!("failed to save checkpoint SGD state: {err}"));
             }
             let mut report = build_async_training_report(
                 pending,
@@ -550,10 +541,8 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             report.cycle_complete = report.training_steps == cycle_end;
             if report.cycle_complete {
                 save_model(&trainer_model, Path::new(&trainer_config.model_path));
-                trainer_model.save_training_state(
-                    &optimizer_state_path,
-                    train_update.saturating_add(1),
-                )?;
+                trainer_model
+                    .save_training_state(&optimizer_state_path, train_update.saturating_add(1))?;
                 pool.save_snapshot_lz4(&trainer_snapshot_path)?;
                 cycle_end += chineseai::az::PX0_CYCLE_STEPS;
             }
@@ -752,8 +741,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             break;
         }
         generated_games_total = generated_games_total.saturating_add(report.games as u64);
-        generated_samples_total =
-            generated_samples_total.saturating_add(report.samples as u64);
+        generated_samples_total = generated_samples_total.saturating_add(report.samples as u64);
         let deployed_model = candidate_model.clone();
         interrupt_save_model = Some(candidate_model.clone());
         interrupt_save_next_update = update.saturating_add(1);
@@ -800,11 +788,25 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             if check.value_samples > 0 {
                 log_scalar(&mut tb, "test/wdl_ce", check.step, check.value_loss);
                 log_scalar(&mut tb, "test/value_rmse", check.step, check.value_rmse);
+                log_scalar(
+                    &mut tb,
+                    "test/moves_left_rmse_plies",
+                    check.step,
+                    check.moves_left_rmse,
+                );
+                log_scalar(
+                    &mut tb,
+                    "test/moves_left_samples",
+                    check.step,
+                    check.moves_left_samples as f32,
+                );
             }
         }
         for (tag, value) in [
             ("train/optimized_loss", report.loss),
             ("train/wdl_ce", report.value_loss),
+            ("train/moves_left_mse", report.moves_left_loss),
+            ("train/moves_left_samples", report.moves_left_samples as f32),
             ("train/policy_kl", report.policy_kl),
             ("train/value_rmse", value_rmse),
             ("train/value_corr", report.value_corr),
@@ -916,8 +918,8 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                     previous_index.is_some(),
                     anchor_index.is_some(),
                 );
-                let anchor_positions = arena_start_positions
-                    .split_off(current_count.saturating_add(previous_count));
+                let anchor_positions =
+                    arena_start_positions.split_off(current_count.saturating_add(previous_count));
                 let previous_positions = arena_start_positions.split_off(current_count);
                 let current_positions = arena_start_positions;
                 let candidate = Arc::new(deployed_model.clone());
@@ -929,9 +931,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                             eval_starts: ArenaStarts::Positions(Arc::new(positions)),
                             simulations: config.arena_simulations,
                             max_plies: config.max_plies,
-                            rule60_max_ply: config
-                                .sixty_move_rule
-                                .then_some(config.rule60_max_ply),
+                            rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
                             cpuct: config.arena_cpuct,
                             cpuct_at_root: config.arena_cpuct_at_root,
                             cpuct_base: config.cpuct_base,
@@ -955,7 +955,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 );
                 let load_champion = |index: usize| {
                     let path = &champion_paths[index];
-                    let model = AzNnue::load(path).unwrap_or_else(|err| {
+                    let mut model = AzNnue::load(path).unwrap_or_else(|err| {
                         panic!("failed to load champion `{}`: {err}", path.display())
                     });
                     assert_eq!(
@@ -964,6 +964,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                         "champion `{}` architecture mismatch",
                         path.display()
                     );
+                    model.moves_left_params = config.moves_left_params();
                     Arc::new(model)
                 };
                 let previous_arena = previous_index.map(|index| {
@@ -992,9 +993,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 );
                 let promoted = gate_decision == ArenaGateDecision::Promote;
                 if let (Some(index), Some(report)) = (anchor_index, anchor_arena.as_ref()) {
-                    if report.score_rate_upper_bound(config.arena_promotion_confidence_z)
-                        < 0.50
-                    {
+                    if report.score_rate_upper_bound(config.arena_promotion_confidence_z) < 0.50 {
                         arena_nemesis_update = checkpoint_number(&champion_paths[index]);
                     } else if promoted && nemesis_index == Some(index) {
                         arena_nemesis_update = None;
@@ -1123,8 +1122,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                         rows,
                         AzSearchLimits {
                             simulations: config.pikafish_label_eval_simulations,
-                            seed: config.seed
-                                ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
+                            seed: config.seed ^ (update as u64).wrapping_mul(0xD6E8_FD50_19B7_8421),
                             cpuct: config.pikafish_label_eval_cpuct,
                             cpuct_at_root: config.pikafish_label_eval_cpuct_at_root,
                             cpuct_base: config.cpuct_base,
@@ -1138,8 +1136,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                             fpu_value_at_root: 1.0,
                             fpu_absolute_at_root: true,
                             minimum_kldgain_per_node: 0.0,
-                            policy_softmax_temp: config
-                                .pikafish_label_eval_policy_softmax_temp,
+                            policy_softmax_temp: config.pikafish_label_eval_policy_softmax_temp,
                             draw_score: config.draw_score,
                             value_scale: 1.0,
                         },
@@ -1285,8 +1282,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     // 等待线程前持续排空结果队列，避免满队列让训练及产数线程相互等待。
     for event in trainer_rx {
         if exited_after_ctrl_c {
-            generated_games_total =
-                generated_games_total.saturating_add(event.report.games as u64);
+            generated_games_total = generated_games_total.saturating_add(event.report.games as u64);
             generated_samples_total =
                 generated_samples_total.saturating_add(event.report.samples as u64);
             interrupt_save_model = Some(event.candidate_model);
@@ -1379,7 +1375,11 @@ mod supply_tests {
         }
     }
 
-    fn config_for(opening: &Path, dive: &Path, fraction: f32) -> crate::cli::az_loop_config::AzLoopFileConfig {
+    fn config_for(
+        opening: &Path,
+        dive: &Path,
+        fraction: f32,
+    ) -> crate::cli::az_loop_config::AzLoopFileConfig {
         let mut config = crate::cli::az_loop_config::AzLoopFileConfig::default();
         config.selfplay_opening_book = opening.to_string_lossy().into_owned();
         config.selfplay_dive_book = dive.to_string_lossy().into_owned();
@@ -1426,7 +1426,9 @@ mod supply_tests {
         write_dive_book(&dive, &["3k5/9/9/9/9/9/9/9/4P4/4K4 w"]);
         let config = config_for(&opening, &dive, 1.0);
         let mut supply = build_selfplay_supply(&config);
-        let dive_hash = Position::from_fen("3k5/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        let dive_hash = Position::from_fen("3k5/9/9/9/9/9/9/9/4P4/4K4 w")
+            .unwrap()
+            .hash();
         for batch in 0..4u64 {
             let snapshots = supply.next_batch(3, 5, batch).unwrap();
             assert_eq!(snapshots.len(), 3);
@@ -1445,7 +1447,9 @@ mod supply_tests {
         write_dive_book(&dive, &["3k5/9/9/9/9/9/9/9/4P4/4K4 w"]);
         let config = config_for(&opening, &dive, 0.0);
         let mut supply = build_selfplay_supply(&config);
-        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w")
+            .unwrap()
+            .hash();
         for batch in 0..4u64 {
             let snapshots = supply.next_batch(2, 5, batch).unwrap();
             assert!(snapshots.iter().all(|s| s.position.hash() == opening_hash));
@@ -1461,7 +1465,9 @@ mod supply_tests {
         write_opening_book(&opening, &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0)]);
         let config = config_for(&opening, &dir.join("nope.sqlite"), 0.5);
         let mut supply = build_selfplay_supply(&config);
-        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w")
+            .unwrap()
+            .hash();
         for batch in 0..4u64 {
             let snapshots = supply.next_batch(2, 5, batch).unwrap();
             assert!(snapshots.iter().all(|s| s.position.hash() == opening_hash));
@@ -1479,7 +1485,10 @@ mod supply_tests {
         // 开局库给常规起点；跳水库给"已经掉水"的起点。
         write_opening_book(
             &opening,
-            &[("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0), ("3k5/9/9/9/9/9/9/9/4P4/4K4 w", 0)],
+            &[
+                ("4k4/9/9/9/9/9/9/9/4P4/4K4 w", 0),
+                ("3k5/9/9/9/9/9/9/9/4P4/4K4 w", 0),
+            ],
         );
         write_dive_book(
             &dive,
@@ -1535,6 +1544,7 @@ mod supply_tests {
             opening_positions: snapshots.clone().into(),
             mirror_probability: 0.0,
             record_fens: false,
+            moves_left_params: chineseai::az::AzMovesLeftParams::default(),
             mate_search_plies: 0,
             tactical_search_nodes: 0,
             tactical_search_plies: 8,
@@ -1548,7 +1558,10 @@ mod supply_tests {
                 .all(|sample| sample.meta.start_source == chineseai::az::AzStartSource::OpeningBook),
             "跳水起点在自博弈里的来源应记作 OpeningBook"
         );
-        assert_eq!(data.start_games[chineseai::az::AzStartSource::OpeningBook.index()], 4);
+        assert_eq!(
+            data.start_games[chineseai::az::AzStartSource::OpeningBook.index()],
+            4
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1563,8 +1576,12 @@ mod supply_tests {
         write_dive_book(&dive, &["3k5/9/9/9/9/9/9/9/4P4/4K4 w"]);
         let config = config_for(&opening, &dive, 0.5);
         let mut supply = build_selfplay_supply(&config);
-        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
-        let dive_hash = Position::from_fen("3k5/9/9/9/9/9/9/9/4P4/4K4 w").unwrap().hash();
+        let opening_hash = Position::from_fen("4k4/9/9/9/9/9/9/9/4P4/4K4 w")
+            .unwrap()
+            .hash();
+        let dive_hash = Position::from_fen("3k5/9/9/9/9/9/9/9/4P4/4K4 w")
+            .unwrap()
+            .hash();
         let mut opening_batches = 0;
         let mut dive_batches = 0;
         for batch in 1..=64u64 {

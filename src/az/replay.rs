@@ -73,6 +73,16 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
             "replay encode: move_indices/policy mismatch or too long",
         ));
     }
+    if !sample.moves_left.is_finite()
+        || sample.moves_left < 0.0
+        || !sample.moves_left_weight.is_finite()
+        || sample.moves_left_weight < 0.0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid moves-left target",
+        ));
+    }
     replay_push_u32(out, sample.features.len() as u32);
     for &f in &sample.features {
         replay_push_u32(out, f as u32);
@@ -102,6 +112,8 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
     replay_push_f32(out, sample.side_sign);
     replay_push_f32(out, sample.policy_weight);
     replay_push_f32(out, sample.value_weight);
+    replay_push_f32(out, sample.moves_left);
+    replay_push_f32(out, sample.moves_left_weight);
     replay_push_u32(out, sample.search_simulations);
     replay_push_u32(out, sample.meta.generation_update);
     replay_push_u64(out, sample.meta.game_id);
@@ -226,6 +238,18 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     let side_sign = replay_read_f32(reader)?;
     let policy_weight = replay_read_f32(reader)?;
     let value_weight = replay_read_f32(reader)?;
+    let moves_left = replay_read_f32(reader)?;
+    let moves_left_weight = replay_read_f32(reader)?;
+    if !moves_left.is_finite()
+        || moves_left < 0.0
+        || !moves_left_weight.is_finite()
+        || moves_left_weight < 0.0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid moves-left target",
+        ));
+    }
     let search_simulations = replay_read_u32(reader)?;
     let meta = AzSampleMeta {
         generation_update: replay_read_u32(reader)?,
@@ -257,6 +281,8 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
         side_sign,
         policy_weight,
         value_weight,
+        moves_left,
+        moves_left_weight,
         search_simulations,
         meta,
     })
@@ -794,6 +820,8 @@ mod tests {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 400,
             meta: AzSampleMeta {
                 generation_update: generation,
@@ -847,6 +875,8 @@ mod tests {
         let mut encoded = Vec::new();
         let mut original = sample(AzStartSource::OpeningBook, 7, 11);
         original.root_search_wdl = [0.6, 0.3, 0.1];
+        original.moves_left = 37.0;
+        original.moves_left_weight = 1.0;
         original.repetition_flags[0] = 1;
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
@@ -854,6 +884,8 @@ mod tests {
         assert_eq!(decoded.meta.generation_update, 7);
         assert_eq!(decoded.meta.game_id, 11);
         assert_eq!(decoded.root_search_wdl, original.root_search_wdl);
+        assert_eq!(decoded.moves_left, 37.0);
+        assert_eq!(decoded.moves_left_weight, 1.0);
         assert_eq!(decoded.repetition_flags, original.repetition_flags);
     }
 

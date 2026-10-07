@@ -86,6 +86,7 @@ pub struct AzCandidate {
     pub policy: f32,
     /// 已证明的结果，按根走棋方视角：胜 1、和 0、负 -1。
     pub solved: Option<i8>,
+    pub moves_left: Option<f32>,
 }
 
 impl AzCandidate {
@@ -112,6 +113,8 @@ pub struct AzSearchResult {
     /// Raw network WDL at the root before search. Used only for TD bootstrapping.
     pub network_value_wdl: [f32; 3],
     pub best_value_wdl: [f32; 3],
+    /// 严格证明的终局距离（半回合），不依赖网络预测。
+    pub proven_moves_left: Option<usize>,
     pub simulations: usize,
     pub search_depth_avg: f32,
     pub search_depth_max: usize,
@@ -301,6 +304,7 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             value_wdl: tree.nodes[root].value_wdl,
             network_value_wdl: tree.nodes[root].value_wdl,
             best_value_wdl: tree.nodes[root].value_wdl,
+            proven_moves_left: tree.nodes[root].proven_moves_left,
             simulations: 0,
             search_depth_avg: 0.0,
             search_depth_max: 0,
@@ -516,8 +520,11 @@ struct AzNode {
     children_len: u16,
     visits: u32,
     value_wdl_sum: [f32; 3],
+    moves_left_sum: f32,
     value: f32,
     value_wdl: [f32; 3],
+    moves_left: f32,
+    proven_moves_left: Option<usize>,
     expanded: bool,
     // 只由规则终局与完整子树证明产生，始终是当前走棋方视角。
     solved: Option<i8>,
@@ -531,6 +538,7 @@ struct AzChild {
     prior: f32,
     visits: u32,
     value_wdl_sum: [f32; 3],
+    moves_left_sum: f32,
     child: u32,
 }
 
@@ -589,6 +597,11 @@ impl<'a> AzTree<'a> {
                 prior: child.prior,
                 policy,
                 solved: self.child_solved(child),
+                moves_left: self
+                    .model
+                    .moves_left_active
+                    .then(|| self.child_moves_left(child))
+                    .filter(|v| v.is_finite()),
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -621,6 +634,7 @@ impl<'a> AzTree<'a> {
                         child.value_wdl_sum.map(|v| v / child.visits as f32)
                     }
                 }),
+            proven_moves_left: root_node.proven_moves_left,
             simulations,
             search_depth_avg: self.search_depth_avg(),
             search_depth_max: self.search_depth_max,
@@ -774,10 +788,13 @@ impl<'a> AzTree<'a> {
             children_len: 0,
             visits: 0,
             value_wdl_sum: [0.0; 3],
+            moves_left_sum: 0.0,
             value: 0.0,
             value_wdl: [0.0, 1.0, 0.0],
+            moves_left: 0.0,
             expanded: false,
             solved: None,
+            proven_moves_left: None,
             bounds: (-1, 1),
         });
         Self {
@@ -900,7 +917,12 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].expanded = true;
             self.nodes[node_index].solved = Some(value as i8);
-            return AzEvalOutput { value_wdl, value };
+            self.nodes[node_index].proven_moves_left = Some(0);
+            return AzEvalOutput {
+                value_wdl,
+                value,
+                moves_left: 0.0,
+            };
         }
 
         let (moves, repetition_flags): (Vec<_>, Vec<_>) = {
@@ -940,7 +962,9 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
             self.nodes[node_index].expanded = true;
             self.nodes[node_index].solved = Some(-1);
+            self.nodes[node_index].proven_moves_left = Some(0);
             return AzEvalOutput {
+                moves_left: 0.0,
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
             };
@@ -1009,6 +1033,7 @@ impl<'a> AzTree<'a> {
                             prior,
                             visits: 0,
                             value_wdl_sum: [0.0; 3],
+                            moves_left_sum: 0.0,
                             child: NO_CHILD,
                         }),
                 );
@@ -1020,6 +1045,7 @@ impl<'a> AzTree<'a> {
         }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
+        self.nodes[node_index].moves_left = eval.moves_left;
         self.nodes[node_index].expanded = true;
         if let Some(index) = self.immediate_mate_child(node_index) {
             let mut depth = 1;
@@ -1031,9 +1057,11 @@ impl<'a> AzTree<'a> {
             // 建立终局子节点并传播证明；父节点的本次访问由 simulate 统一计数。
             let visits = self.nodes[node_index].visits;
             let sum = self.nodes[node_index].value_wdl_sum;
+            let distance_sum = self.nodes[node_index].moves_left_sum;
             let proven = self.simulate_child(node_index, index, depth);
             self.nodes[node_index].visits = visits;
             self.nodes[node_index].value_wdl_sum = sum;
+            self.nodes[node_index].moves_left_sum = distance_sum;
             return proven;
         }
         eval
@@ -1116,6 +1144,7 @@ impl<'a> AzTree<'a> {
             if let Some(eval) = self.tactical_value(node_index, &moves) {
                 self.nodes[node_index].value = eval.value;
                 self.nodes[node_index].value_wdl = eval.value_wdl;
+                self.nodes[node_index].moves_left = eval.moves_left;
                 self.add_node_visit(node_index, eval);
                 self.record_leaf_depth(depth, false);
                 return eval;
@@ -1239,10 +1268,13 @@ impl<'a> AzTree<'a> {
                     children_len: 0,
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
+                    moves_left_sum: 0.0,
                     value: 0.0,
                     value_wdl: [0.0, 1.0, 0.0],
+                    moves_left: 0.0,
                     expanded: false,
                     solved: None,
+                    proven_moves_left: None,
                     bounds: (-1, 1),
                 });
                 self.node_children_mut(node_index)[child_index].set_child_node(child_node);
@@ -1255,12 +1287,14 @@ impl<'a> AzTree<'a> {
         let child_eval = self.simulate(child_node, child_depth);
         self.rule_history_scratch.truncate(history_len);
         let eval = AzEvalOutput {
+            moves_left: child_eval.moves_left + 1.0,
             value_wdl: flip_wdl(child_eval.value_wdl),
             value: -child_eval.value,
         };
         let child = &mut self.node_children_mut(node_index)[child_index];
         child.visits += 1;
         add_wdl(&mut child.value_wdl_sum, eval.value_wdl);
+        child.moves_left_sum += eval.moves_left;
         self.update_solved(node_index);
         let eval = if self.nodes[node_index].solved.is_some() {
             self.node_eval(node_index)
@@ -1285,7 +1319,12 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = value;
             self.nodes[node_index].value_wdl = value_wdl;
             self.nodes[node_index].solved = Some(value as i8);
-            return AzEvalOutput { value_wdl, value };
+            self.nodes[node_index].proven_moves_left = Some(0);
+            return AzEvalOutput {
+                value_wdl,
+                value,
+                moves_left: 0.0,
+            };
         }
         let (moves, repetition_flags): (Vec<_>, Vec<_>) = {
             crate::scope_profile!("az.search.expand_legal_moves");
@@ -1300,7 +1339,9 @@ impl<'a> AzTree<'a> {
             self.nodes[node_index].value = -1.0;
             self.nodes[node_index].value_wdl = [0.0, 0.0, 1.0];
             self.nodes[node_index].solved = Some(-1);
+            self.nodes[node_index].proven_moves_left = Some(0);
             return AzEvalOutput {
+                moves_left: 0.0,
                 value_wdl: [0.0, 0.0, 1.0],
                 value: -1.0,
             };
@@ -1329,6 +1370,7 @@ impl<'a> AzTree<'a> {
         }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
+        self.nodes[node_index].moves_left = eval.moves_left;
         eval
     }
 
@@ -1467,11 +1509,13 @@ impl<'a> AzTree<'a> {
     fn node_eval(&self, node_index: usize) -> AzEvalOutput {
         if let Some(value) = self.nodes[node_index].solved {
             return AzEvalOutput {
+                moves_left: self.nodes[node_index].moves_left,
                 value_wdl: scalar_terminal_wdl(value as f32),
                 value: value as f32,
             };
         }
         AzEvalOutput {
+            moves_left: self.nodes[node_index].moves_left,
             value_wdl: self.nodes[node_index].value_wdl,
             value: self.nodes[node_index].value,
         }
@@ -1480,6 +1524,7 @@ impl<'a> AzTree<'a> {
     fn add_node_visit(&mut self, node_index: usize, eval: AzEvalOutput) {
         self.nodes[node_index].visits += 1;
         add_wdl(&mut self.nodes[node_index].value_wdl_sum, eval.value_wdl);
+        self.nodes[node_index].moves_left_sum += eval.moves_left;
     }
 
     fn node_draw_score(&self, node_index: usize) -> f32 {
@@ -1546,7 +1591,7 @@ impl<'a> AzTree<'a> {
             if priority == 2 {
                 return index;
             }
-            let score = self.child_score_with_solved(
+            let mut score = self.child_score_with_solved(
                 child,
                 solved,
                 draw_score,
@@ -1554,6 +1599,7 @@ impl<'a> AzTree<'a> {
                 parent_visits_sqrt,
                 cpuct,
             );
+            score += self.moves_left_utility(node_index, child, self.child_q(child, draw_score));
             let replace = best.is_none_or(|(_, best_priority, best_prior, best_score)| {
                 priority > best_priority
                     || (priority == best_priority
@@ -1681,6 +1727,59 @@ impl<'a> AzTree<'a> {
             .collect()
     }
 
+    /// 参考 PX0/LC0 classic MEvaluator：保留 Q，添加有上限、随胜负把握平滑增强的 M。
+    fn moves_left_utility(&self, node_index: usize, child: &AzChild, q: f32) -> f32 {
+        let params = self.model.moves_left_params;
+        if !params.enabled
+            || !self.model.moves_left_active
+            || child.visits == 0
+            || self.child_solved(child).is_some()
+        {
+            return 0.0;
+        }
+        let node = &self.nodes[node_index];
+        let parent_q = if node.visits > 0 {
+            (node.value_wdl_sum[0] - node.value_wdl_sum[2]) / node.visits as f32
+        } else {
+            node.value_wdl[0] - node.value_wdl[2]
+        };
+        if parent_q.abs() <= params.threshold {
+            return 0.0;
+        }
+        let parent_m = if node.visits > 0 {
+            node.moves_left_sum / node.visits as f32
+        } else {
+            node.moves_left
+        };
+        // 边上回传的距离含当前这一手；PX0 使用子节点自身的距离。
+        let child_m = self.child_moves_left(child) - 1.0;
+        if !parent_m.is_finite() || !child_m.is_finite() {
+            return 0.0;
+        }
+        let x = if params.threshold > 0.0 && params.threshold < 1.0 {
+            ((q.abs() - params.threshold) / (1.0 - params.threshold)).clamp(0.0, 1.0)
+        } else {
+            q.abs()
+        };
+        let m = (params.slope * (child_m - parent_m)).clamp(-params.max_effect, params.max_effect);
+        -q.signum()
+            * m
+            * (params.constant_factor + params.scaled_factor * x + params.quadratic_factor * x * x)
+    }
+
+    fn child_moves_left(&self, child: &AzChild) -> f32 {
+        if let Some(index) = child.child_node() {
+            if self.nodes[index].solved.is_some() {
+                return self.nodes[index].moves_left + 1.0;
+            }
+        }
+        if child.visits > 0 {
+            child.moves_left_sum / child.visits as f32
+        } else {
+            f32::INFINITY
+        }
+    }
+
     fn child_solved(&self, child: &AzChild) -> Option<i8> {
         child
             .child_node()
@@ -1744,6 +1843,8 @@ impl<'a> AzTree<'a> {
             return;
         };
         self.set_proven(child_node, -1);
+        self.nodes[child_node].moves_left = solution.plies.saturating_sub(1) as f32;
+        self.nodes[child_node].proven_moves_left = Some(solution.plies.saturating_sub(1));
         self.update_solved(self.root);
     }
 
@@ -1776,7 +1877,29 @@ impl<'a> AzTree<'a> {
         if self.nodes[node_index].solved.is_some() {
             return;
         }
+        let distances: Option<Vec<usize>> = self
+            .node_children(node_index)
+            .iter()
+            .filter(|child| self.child_solved(child) == Some(value))
+            .map(|child| {
+                child
+                    .child_node()
+                    .and_then(|index| self.nodes[index].proven_moves_left)
+                    .map(|distance| distance + 1)
+            })
+            .collect();
+        let distance = distances.and_then(|distances| {
+            if value == -1 {
+                distances.into_iter().max()
+            } else {
+                distances.into_iter().min()
+            }
+        });
         let node = &mut self.nodes[node_index];
+        node.proven_moves_left = distance;
+        if let Some(distance) = distance {
+            node.moves_left = distance as f32;
+        }
         node.solved = Some(value);
         node.bounds = (value, value);
         let exact_sum = scalar_terminal_wdl(value as f32).map(|p| p * node.visits as f32);
@@ -2109,6 +2232,7 @@ mod tests {
         tree.expand(tree.root);
         let mut stopper = KldGainStopper::default();
         tree.node_children_mut(tree.root)[0].visits = 100;
+        tree.node_children_mut(tree.root)[0].moves_left_sum = 10100.0;
         tree.node_children_mut(tree.root)[1].visits = 100;
         tree.nodes[tree.root].visits = 200;
         assert!(!stopper.should_stop(&tree, 0.00005));
@@ -2434,6 +2558,7 @@ mod tests {
             prior: 1.0,
             visits: 0,
             value_wdl_sum: [0.0; 3],
+            moves_left_sum: 0.0,
             child: NO_CHILD,
         };
         assert_eq!(child.child_node(), None);
@@ -2468,6 +2593,7 @@ mod tests {
             prior: 1.0,
             visits: 4,
             value_wdl_sum: [1.0, 2.0, 1.0],
+            moves_left_sum: 0.0,
             child: NO_CHILD,
         };
 
@@ -2666,6 +2792,161 @@ mod tests {
     }
 
     #[test]
+    fn moves_left_800_smooth_bonus_preserves_value_and_visit_policy() {
+        let mut model = AzNnue::random(8, 79);
+        model.moves_left_bias[0] = 0.5;
+        model.rebuild_moves_left();
+        let position = Position::startpos();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.expand(tree.root);
+        tree.nodes[tree.root].visits = 100;
+        tree.nodes[tree.root].value_wdl_sum = [95.0, 0.0, 5.0];
+        tree.nodes[tree.root].moves_left_sum = 5000.0;
+        for child in tree.node_children_mut(tree.root) {
+            child.visits = 10;
+            child.value_wdl_sum = [9.7, 0.0, 0.3];
+            child.moves_left_sum = 510.0;
+            child.prior = 0.0;
+        }
+        tree.node_children_mut(tree.root)[0].moves_left_sum = 1010.0;
+        tree.node_children_mut(tree.root)[1].moves_left_sum = 110.0;
+        let children = tree.node_children(tree.root);
+        let short = tree.moves_left_utility(tree.root, &children[1], 0.94);
+        let long = tree.moves_left_utility(tree.root, &children[0], 0.94);
+        assert!(short > 0.0 && short <= 0.0345);
+        assert!(long < 0.0 && long >= -0.0345);
+        assert_eq!(tree.select_child(tree.root), 1);
+        assert_eq!(tree.moves_left_utility(tree.root, &children[1], 0.8), 0.0);
+        assert_eq!(tree.moves_left_utility(tree.root, &children[1], 0.0), 0.0);
+        assert!(short < tree.moves_left_utility(tree.root, &children[1], 1.0));
+        assert!(0.99 + long > 0.87 + tree.moves_left_utility(tree.root, &children[1], 0.87));
+        // 最终仍按访问量选步、生成策略，不把有噪声的距离预测做成单点标签。
+        tree.node_children_mut(tree.root)[0].visits = 100;
+        tree.node_children_mut(tree.root)[0].moves_left_sum = 10100.0;
+        assert_eq!(tree.best_root_child(tree.root), Some(0));
+        let policy = tree.root_policy(tree.root);
+        assert!(policy[0] < 1.0 && policy[1] > 0.0);
+        tree.nodes[tree.root].value_wdl_sum = [80.0, 20.0, 0.0];
+        assert_eq!(
+            tree.moves_left_utility(tree.root, &tree.node_children(tree.root)[1], 0.94),
+            0.0
+        );
+        tree.nodes[tree.root].value_wdl_sum = [5.0, 0.0, 95.0];
+        assert!(tree.moves_left_utility(tree.root, &tree.node_children(tree.root)[1], -0.94) < 0.0);
+        assert!(tree.moves_left_utility(tree.root, &tree.node_children(tree.root)[0], -0.94) > 0.0);
+    }
+
+    #[test]
+    fn moves_left_runtime_controls_disable_bonus() {
+        let mut model = AzNnue::random(8, 85);
+        model.moves_left_bias[0] = 0.5;
+        model.rebuild_moves_left();
+        for params in [
+            super::super::AzMovesLeftParams {
+                enabled: false,
+                ..Default::default()
+            },
+            super::super::AzMovesLeftParams {
+                threshold: 1.0,
+                ..Default::default()
+            },
+            super::super::AzMovesLeftParams {
+                max_effect: 0.0,
+                ..Default::default()
+            },
+            super::super::AzMovesLeftParams {
+                slope: 0.0,
+                ..Default::default()
+            },
+        ] {
+            model.moves_left_params = params;
+            let position = Position::startpos();
+            let mut tree = AzTree::new(
+                position.clone(),
+                position.initial_rule_history(),
+                None,
+                &model,
+                AzSearchLimits::default(),
+            );
+            tree.expand(tree.root);
+            tree.nodes[tree.root].visits = 10;
+            tree.nodes[tree.root].value_wdl_sum = [10.0, 0.0, 0.0];
+            tree.nodes[tree.root].moves_left_sum = 1000.0;
+            let child = &mut tree.node_children_mut(tree.root)[0];
+            child.visits = 10;
+            child.moves_left_sum = 110.0;
+            assert_eq!(
+                tree.moves_left_utility(tree.root, &tree.node_children(tree.root)[0], 1.0),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn moves_left_result_only_proof_has_no_distance_label() {
+        let model = AzNnue::random(8, 81);
+        let position = Position::startpos();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            None,
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.set_proven(tree.root, 1);
+        assert_eq!(tree.nodes[tree.root].proven_moves_left, None);
+    }
+
+    #[test]
+    fn moves_left_proven_mate_counts_terminal_distance_once() {
+        let model = AzNnue::random(8, 82);
+        let position =
+            Position::from_fen("C1rakab2/9/N5n2/4p3p/6p2/9/P3c3P/4KC3/9/2BA1A1c1 w - - 0 1")
+                .unwrap();
+        let mv = position.parse_uci_move("a7c8").unwrap();
+        let result = alphazero_search_with_rules_controlled(
+            &position,
+            None,
+            Some(vec![mv]),
+            &model,
+            AzSearchLimits {
+                simulations: 800,
+                ..AzSearchLimits::default()
+            },
+            None,
+        );
+        assert_eq!(result.proven_moves_left, Some(3));
+        assert_eq!(result.best_move, Some(mv));
+    }
+
+    #[test]
+    fn moves_left_backup_counts_each_half_move_without_sign_flip() {
+        let mut model = AzNnue::random(8, 80);
+        model.moves_left_bias[0] = -0.5;
+        model.rebuild_moves_left();
+        let position = Position::startpos();
+        let mv = position.parse_uci_move("b0c2").unwrap();
+        let mut tree = AzTree::new(
+            position.clone(),
+            position.initial_rule_history(),
+            Some(vec![mv]),
+            &model,
+            AzSearchLimits::default(),
+        );
+        tree.expand(tree.root);
+        let result = tree.simulate_child(tree.root, 0, 1);
+        assert_eq!(result.moves_left, 51.0);
+        assert_eq!(tree.node_children(tree.root)[0].moves_left_sum, 51.0);
+        assert_eq!(tree.nodes[tree.root].moves_left_sum, 51.0);
+    }
+
+    #[test]
     fn select_child_breaks_equal_scores_by_higher_prior() {
         let model = AzNnue::random(4, 7);
         let position = Position::startpos();
@@ -2701,6 +2982,7 @@ mod tests {
                     prior: 0.10,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
                     child: NO_CHILD,
                 },
                 AzChild {
@@ -2708,6 +2990,7 @@ mod tests {
                     prior: 0.90,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
                     child: NO_CHILD,
                 },
             ],
@@ -2786,6 +3069,7 @@ mod tests {
                     prior: 0.25,
                     visits: 1,
                     value_wdl_sum: [0.0, 1.0, 0.0],
+                    moves_left_sum: 0.0,
                     child: NO_CHILD,
                 },
                 AzChild {
@@ -2793,6 +3077,7 @@ mod tests {
                     prior: 0.75,
                     visits: 0,
                     value_wdl_sum: [0.0; 3],
+                    moves_left_sum: 0.0,
                     child: NO_CHILD,
                 },
             ],

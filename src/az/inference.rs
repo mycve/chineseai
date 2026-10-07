@@ -84,6 +84,8 @@ macro_rules! az_weight_tensors {
             [VALUE_KING_PIECE_VOCAB, VALUE_HEAD_SIZE]
         );
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(moves_left_output, [1, $h]);
+        $visit!(moves_left_bias, [1]);
         $visit!(
             value_threat_embedding,
             [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK]
@@ -576,7 +578,10 @@ pub(crate) fn policy_move_tactical_flags(
     )
 }
 
-pub(crate) fn policy_king_distance_buckets(move_index: usize, them_king_bucket: usize) -> (usize, usize) {
+pub(crate) fn policy_king_distance_buckets(
+    move_index: usize,
+    them_king_bucket: usize,
+) -> (usize, usize) {
     let sparse = move_map().dense_to_sparse[move_index] as usize;
     let from = sparse / BOARD_SIZE;
     let to = sparse % BOARD_SIZE;
@@ -618,6 +623,10 @@ pub struct AzNnue {
     pub value_head_bias: Vec<f32>,
     pub value_king_piece_hidden: Vec<f32>,
     pub value_head_output: Vec<f32>,
+    pub moves_left_output: Vec<f32>,
+    pub moves_left_bias: Vec<f32>,
+    pub(crate) moves_left_active: bool,
+    pub moves_left_params: AzMovesLeftParams,
     pub value_threat_embedding: Vec<f32>,
     pub value_threat_output: Vec<f32>,
     pub policy_threat_context: Vec<f32>,
@@ -695,6 +704,10 @@ impl Clone for AzNnue {
             value_head_bias: self.value_head_bias.clone(),
             value_king_piece_hidden: self.value_king_piece_hidden.clone(),
             value_head_output: self.value_head_output.clone(),
+            moves_left_output: self.moves_left_output.clone(),
+            moves_left_bias: self.moves_left_bias.clone(),
+            moves_left_active: self.moves_left_active,
+            moves_left_params: self.moves_left_params,
             value_threat_embedding: self.value_threat_embedding.clone(),
             value_threat_output: self.value_threat_output.clone(),
             policy_threat_context: self.policy_threat_context.clone(),
@@ -731,9 +744,10 @@ impl Clone for AzNnue {
 pub(crate) struct AzEvalOutput {
     pub value_wdl: [f32; WDL_HEAD_SIZE],
     pub value: f32,
+    pub moves_left: f32,
 }
 
-    /// 九宫的 9 个格子（按颜色）。
+/// 九宫的 9 个格子（按颜色）。
 fn palace_mask(color: Color) -> u128 {
     let ranks: [usize; 3] = match color {
         Color::Red => [7, 8, 9],
@@ -821,7 +835,9 @@ pub(crate) fn check_context_features(
     let enemy_attacks = masks[color_index(enemy)];
     let checks = gives_check.iter().filter(|&&flag| flag != 0.0).count();
     // 缺少将位（理论上不该出现）时不问 in_check，避免它的 expect 崩掉。
-    let in_check = position.general_square(side).is_some_and(|_| position.in_check(side));
+    let in_check = position
+        .general_square(side)
+        .is_some_and(|_| position.in_check(side));
     let enemy_escapes = king_safe_escapes(position, enemy, own_attacks);
     let our_escapes = king_safe_escapes(position, side, enemy_attacks);
     [
@@ -908,6 +924,10 @@ impl AzNnue {
             value_head_bias,
             value_king_piece_hidden,
             value_head_output,
+            moves_left_output: vec![0.0; hidden_size],
+            moves_left_bias: vec![0.0],
+            moves_left_active: false,
+            moves_left_params: AzMovesLeftParams::default(),
             value_threat_embedding,
             value_threat_output,
             policy_threat_context,
@@ -940,6 +960,7 @@ impl AzNnue {
         model.rebuild_policy_cache();
         model.rebuild_value_threat();
         model.rebuild_check_context();
+        model.rebuild_moves_left();
         model
     }
 
@@ -1092,6 +1113,14 @@ impl AzNnue {
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_king_piece_hidden: load_candle_f32_tensor(&tensors, "value_king_piece_hidden")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
+            moves_left_output: load_candle_f32_tensor_or_zeros(
+                &tensors,
+                "moves_left_output",
+                hidden_size,
+            )?,
+            moves_left_bias: load_candle_f32_tensor_or_zeros(&tensors, "moves_left_bias", 1)?,
+            moves_left_active: false,
+            moves_left_params: AzMovesLeftParams::default(),
             value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
             value_threat_output: load_candle_f32_tensor(&tensors, "value_threat_output")?,
             policy_threat_context: load_candle_f32_tensor(&tensors, "policy_threat_context")?,
@@ -1127,6 +1156,7 @@ impl AzNnue {
         model.rebuild_policy_cache();
         model.rebuild_value_threat();
         model.rebuild_check_context();
+        model.rebuild_moves_left();
         model.rebuild_policy_tactical();
         model.validate()?;
         Ok(model)
@@ -1203,8 +1233,10 @@ impl AzNnue {
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
-        let value = self.evaluate_value_only_with_scratch_output(position, moves, rule_context, scratch);
-        scratch.policy_accumulator_context = self.policy_accumulator(position, position.side_to_move());
+        let value =
+            self.evaluate_value_only_with_scratch_output(position, moves, rule_context, scratch);
+        scratch.policy_accumulator_context =
+            self.policy_accumulator(position, position.side_to_move());
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         value
     }
@@ -1262,7 +1294,11 @@ impl AzNnue {
             )
         };
         scratch.features = features;
-        AzEvalOutput { value_wdl, value }
+        AzEvalOutput {
+            value_wdl,
+            value,
+            moves_left: self.moves_left_from_hidden(&scratch.hidden),
+        }
     }
 
     pub(crate) fn evaluate_incremental_with_scratch_output(
@@ -1325,7 +1361,11 @@ impl AzNnue {
             )
         };
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
-        AzEvalOutput { value_wdl, value }
+        AzEvalOutput {
+            value_wdl,
+            value,
+            moves_left: self.moves_left_from_hidden(&scratch.hidden),
+        }
     }
 
     pub(crate) fn evaluate_policy_with_scratch(
@@ -1471,7 +1511,12 @@ impl AzNnue {
         }
     }
 
-    pub(crate) fn fill_policy_gives_checks(&self, position: &Position, moves: &[Move], output: &mut Vec<f32>) {
+    pub(crate) fn fill_policy_gives_checks(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        output: &mut Vec<f32>,
+    ) {
         crate::scope_profile!("az.eval.policy.gives_check");
         output.resize(moves.len(), 0.0);
         for (flag, &mv) in output.iter_mut().zip(moves) {
@@ -1739,7 +1784,11 @@ impl AzNnue {
         logits
     }
 
-    pub(crate) fn value_king_piece_accumulate(&self, position: &Position, accumulator: &mut Vec<f32>) {
+    pub(crate) fn value_king_piece_accumulate(
+        &self,
+        position: &Position,
+        accumulator: &mut Vec<f32>,
+    ) {
         crate::scope_profile!("az.eval.value_king_piece");
         accumulator.resize(VALUE_HEAD_SIZE, 0.0);
         accumulator.fill(0.0);
@@ -1804,8 +1853,22 @@ impl AzNnue {
     }
 
     /// 全零（旧 checkpoint / 还没训练出来）时整块跳过，评估路径与加这个块之前完全一致。
+    pub(crate) fn moves_left_from_hidden(&self, hidden: &[f32]) -> f32 {
+        ((dot_product(hidden, &self.moves_left_output) + self.moves_left_bias[0] + 1.0).max(0.0)
+            * MOVES_LEFT_SCALE)
+            .min(4096.0)
+    }
+
+    pub(crate) fn rebuild_moves_left(&mut self) {
+        self.moves_left_active =
+            self.moves_left_output.iter().any(|&v| v != 0.0) || self.moves_left_bias[0] != 0.0;
+    }
+
     pub(crate) fn rebuild_check_context(&mut self) {
-        self.check_context_active = self.check_context_hidden.iter().any(|&weight| weight != 0.0);
+        self.check_context_active = self
+            .check_context_hidden
+            .iter()
+            .any(|&weight| weight != 0.0);
     }
 
     pub(crate) fn rebuild_policy_tactical(&mut self) {

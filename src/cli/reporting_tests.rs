@@ -69,6 +69,8 @@ fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         side_sign: 1.0,
         policy_weight: 1.0,
         value_weight: 1.0,
+        moves_left: 0.0,
+        moves_left_weight: 0.0,
         search_simulations: 2_000,
         meta: AzSampleMeta {
             generation_update: generation,

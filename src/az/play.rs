@@ -285,12 +285,14 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     crate::scope_profile!("az.selfplay.generate");
     // 连杀预算挂在模型上（`AzNnue::mate_search_plies`）。这里统一打一次补丁，让单线程与
     // 多线程两条路径共用同一份设置；两边本来就一样时不克隆（关闭态零代价）。
-    let patched = (model.mate_search_plies != config.mate_search_plies
+    let patched = (model.moves_left_params != config.moves_left_params
+        || model.mate_search_plies != config.mate_search_plies
         || model.tactical_search_nodes != config.tactical_search_nodes
         || model.tactical_search_plies != config.tactical_search_plies
         || model.tactical_quiet_plies != config.tactical_quiet_plies)
         .then(|| {
             let mut patched = model.clone();
+            patched.moves_left_params = config.moves_left_params.normalize();
             patched.mate_search_plies = config.mate_search_plies;
             patched.tactical_search_nodes = config.tactical_search_nodes;
             patched.tactical_search_plies = config.tactical_search_plies;
@@ -466,6 +468,9 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut game_proofs = Vec::new();
         let mut result = None;
         let mut search_failed = false;
+        let mut proven_termination = false;
+        let mut proven_terminal_ply = None;
+        let mut played_plies = 0usize;
         let mut plies = 0usize;
 
         for local_ply in 0..config.max_plies.saturating_sub(start_phase_ply) {
@@ -613,12 +618,15 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             }
             if let Some(outcome) = proven_result {
                 terminal.search_proven[outcome_index(outcome)] += 1;
+                proven_termination = true;
+                proven_terminal_ply = search.proven_moves_left.map(|distance| ply + distance);
                 result = Some(outcome);
                 break;
             }
             let mover = position.side_to_move();
             let captured = position.piece_at(mv.to as usize);
             position.make_move(mv);
+            played_plies += 1;
             rule_history.push(position.rule_history_entry_after_moved(mover, mv, captured));
 
             if !position.has_general(Color::Red) {
@@ -692,6 +700,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         {
             crate::scope_profile!("az.selfplay.finalize_game");
             finalize_value_targets(&mut game_samples, &game_proofs, terminal_result);
+            finalize_moves_left_targets(
+                &mut game_samples,
+                proven_terminal_ply.or_else(|| {
+                    (terminal_result.is_some() && !proven_termination)
+                        .then_some(start_phase_ply + played_plies)
+                }),
+            );
         }
         samples.extend(game_samples.clone());
         games.push(game_samples);
@@ -850,6 +865,8 @@ fn make_training_sample(
         side_sign,
         policy_weight: policy_weight.max(0.0),
         value_weight: 1.0,
+        moves_left: 0.0,
+        moves_left_weight: 0.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
     }
@@ -921,6 +938,19 @@ fn proven_root_value(candidates: &[AzCandidate]) -> Option<i8> {
             .max()
     } else {
         None
+    }
+}
+
+fn finalize_moves_left_targets(samples: &mut [AzTrainingSample], terminal_ply: Option<usize>) {
+    for sample in samples {
+        sample.moves_left = 0.0;
+        sample.moves_left_weight = 0.0;
+        if let Some(end) = terminal_ply {
+            if end > sample.meta.ply as usize {
+                sample.moves_left = (end - sample.meta.ply as usize) as f32;
+                sample.moves_left_weight = 1.0;
+            }
+        }
     }
 }
 
@@ -1368,6 +1398,7 @@ mod tests {
             opening_positions: Default::default(),
             mirror_probability: 0.0,
             record_fens: false,
+            moves_left_params: crate::az::AzMovesLeftParams::default(),
             mate_search_plies: 0,
             tactical_search_nodes: 0,
             tactical_search_plies: 8,
@@ -1445,6 +1476,8 @@ mod tests {
         );
         assert_eq!(first.value, 1.0);
         assert_eq!(first.value_wdl, [1.0, 0.0, 0.0]);
+        assert_eq!(first.moves_left, 15.0);
+        assert_eq!(first.moves_left_weight, 1.0);
 
         // 关掉连杀预算之后同一局面必须回到普通 MCTS：64 simulations 撞不出 mate-in-8，
         // 所以既不会出现一热策略目标、也不会被判成必胜。
@@ -1748,6 +1781,7 @@ mod tests {
             prior: policy,
             policy,
             solved: None,
+            moves_left: None,
         }
     }
 
@@ -1760,6 +1794,7 @@ mod tests {
             prior: 0.0,
             policy: 0.0,
             solved: None,
+            moves_left: None,
         }
     }
 
@@ -1776,9 +1811,24 @@ mod tests {
             side_sign,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         }
+    }
+
+    #[test]
+    fn moves_left_targets_use_terminal_ply_and_mask_unknown_endings() {
+        let mut samples = [sample(0.0, 1.0), sample(0.0, -1.0)];
+        samples[0].meta.ply = 40;
+        samples[1].meta.ply = 43;
+        finalize_moves_left_targets(&mut samples, Some(45));
+        assert_eq!(samples[0].moves_left, 5.0);
+        assert_eq!(samples[1].moves_left, 2.0);
+        assert!(samples.iter().all(|s| s.moves_left_weight == 1.0));
+        finalize_moves_left_targets(&mut samples, None);
+        assert!(samples.iter().all(|s| s.moves_left_weight == 0.0));
     }
 
     #[test]

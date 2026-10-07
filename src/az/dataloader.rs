@@ -211,6 +211,8 @@ pub(super) struct PackedBatch {
     pub check_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
+    pub moves_left_targets: Vec<f32>,
+    pub moves_left_weights: Vec<f32>,
     pub value_phase_masks: Vec<f32>,
     pub value_source_phase_masks: Vec<f32>,
 }
@@ -281,6 +283,8 @@ impl PackedBatch {
             check_context: vec![0.0f32; batch_size * CHECK_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
+            moves_left_targets: vec![0.0; batch_size],
+            moves_left_weights: vec![0.0; batch_size],
             value_phase_masks: vec![0.0f32; batch_size * 3],
             value_source_phase_masks: vec![0.0f32; batch_size * 9],
         };
@@ -305,6 +309,13 @@ impl PackedBatch {
                 .copy_from_slice(&sample.rule_context);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
+            if sample.moves_left.is_finite()
+                && sample.moves_left >= 0.0
+                && sample.moves_left_weight.is_finite()
+            {
+                packed.moves_left_targets[row] = sample.moves_left / super::MOVES_LEFT_SCALE;
+                packed.moves_left_weights[row] = sample.moves_left_weight.max(0.0);
+            }
             let phase = if sample.meta.ply < 40 {
                 0
             } else if sample.meta.ply < 120 {
@@ -658,6 +669,8 @@ mod tests {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 0,
             meta: AzSampleMeta::default(),
         }

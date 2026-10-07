@@ -42,6 +42,7 @@ pub struct AzLoopConfig {
     /// 推荐 9：实测把模型的可证射程从 mate-in-4 推到 mate-in-5，代价是"根局面有将军但
     /// 无杀"时 +4%、根局面没有将军着法时 0。证明出来的连杀会经由搜索既有的 solved 传播
     /// 把该手的策略目标压成杀着、价值目标设成必胜，这是让模型从自博弈里学到连杀的关键。
+    pub moves_left_params: AzMovesLeftParams,
     pub mate_search_plies: usize,
     pub tactical_search_nodes: usize,
     pub tactical_search_plies: usize,
@@ -70,6 +71,8 @@ pub struct AzLoopReport {
     pub loss: f32,
     pub learning_rate: f32,
     pub value_loss: f32,
+    pub moves_left_loss: f32,
+    pub moves_left_samples: usize,
     pub value_mse: f32,
     pub value_pred_mean: f32,
     pub value_target_mean: f32,
@@ -158,6 +161,9 @@ pub struct AzTrainingSample {
     pub side_sign: f32,
     pub policy_weight: f32,
     pub value_weight: f32,
+    /// 距离实际终局的半回合数；未知距离时权重为零。
+    pub moves_left: f32,
+    pub moves_left_weight: f32,
     pub search_simulations: u32,
     pub meta: AzSampleMeta,
 }
@@ -431,6 +437,8 @@ pub struct AzTrainStats {
     pub loss: f32,
     pub value_loss: f32,
     pub policy_ce: f32,
+    pub moves_left_loss: f32,
+    pub moves_left_samples: usize,
     pub value_pred_sum: f32,
     pub value_pred_sq_sum: f32,
     pub value_target_sum: f32,
@@ -452,6 +460,8 @@ pub struct AzHoldoutReport {
     pub value_samples: usize,
     pub loss: f32,
     pub value_loss: f32,
+    pub moves_left_rmse: f32,
+    pub moves_left_samples: usize,
     pub policy_kl: f32,
     pub value_rmse: f32,
 }
@@ -488,6 +498,8 @@ impl AzTrainStats {
         self.loss += other.loss;
         self.value_loss += other.value_loss;
         self.policy_ce += other.policy_ce;
+        self.moves_left_loss += other.moves_left_loss;
+        self.moves_left_samples += other.moves_left_samples;
         self.value_pred_sum += other.value_pred_sum;
         self.value_pred_sq_sum += other.value_pred_sq_sum;
         self.value_target_sum += other.value_target_sum;

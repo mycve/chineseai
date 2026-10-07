@@ -31,6 +31,8 @@ pub(super) struct AzCandleModel {
     value_head_bias: Var,
     value_king_piece_hidden: Var,
     value_head_output: Var,
+    moves_left_output: Var,
+    moves_left_bias: Var,
     value_threat_embedding: Var,
     value_threat_output: Var,
     policy_threat_context: Var,
@@ -163,7 +165,13 @@ impl AzCandleModel {
         let policy_logits =
             ((policy_logits + sparse_logits + tactical_logits)? + repetition_logits)?;
 
+        let moves_left = hidden
+            .matmul(&self.moves_left_output.t()?)?
+            .broadcast_add(&self.moves_left_bias)?
+            .affine(1.0, 1.0)?
+            .relu()?;
         Ok(ForwardOutput {
+            moves_left,
             value_logits,
             policy_logits,
         })
@@ -171,6 +179,8 @@ impl AzCandleModel {
 }
 
 pub(super) struct ForwardOutput {
+    /// 已除以 MOVES_LEFT_SCALE 的半回合数。
+    pub(super) moves_left: Tensor,
     pub(super) value_logits: Tensor,
     pub(super) policy_logits: Tensor,
 }
@@ -194,6 +204,8 @@ pub(super) struct BatchTensors {
     pub(super) check_context: Tensor,
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
+    pub(super) moves_left_targets: Tensor,
+    pub(super) moves_left_weights: Tensor,
     pub(super) value_phase_masks: Tensor,
     pub(super) value_source_phase_masks: Tensor,
 }
@@ -289,6 +301,8 @@ impl BatchTensors {
                 device,
             )?,
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
+            moves_left_targets: Tensor::from_vec(packed.moves_left_targets, batch_size, device)?,
+            moves_left_weights: Tensor::from_vec(packed.moves_left_weights, batch_size, device)?,
             value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
             value_source_phase_masks: Tensor::from_vec(
                 packed.value_source_phase_masks,
@@ -357,6 +371,8 @@ impl AzCandleModel {
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
+            moves_left_output: var_from_slice(&model.moves_left_output, (1, hidden), device)?,
+            moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
             value_threat_embedding: var_from_slice(
                 &model.value_threat_embedding,
                 (VALUE_THREAT_VOCAB, VALUE_THREAT_RANK),
@@ -446,6 +462,8 @@ impl AzCandleModel {
         vars.push(self.policy_tactical.clone());
         vars.push(self.policy_repetition_hidden.clone());
         vars.push(self.policy_repetition_bias.clone());
+        vars.push(self.moves_left_output.clone());
+        vars.push(self.moves_left_bias.clone());
         vars
     }
 
@@ -464,7 +482,7 @@ impl AzCandleModel {
     /// 所以这个分组在 Adam 的学习率尺度下几乎不动结果。
     pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
         /// 与 `all_vars` 的 push 顺序一一对应。
-        const DECAY: [bool; 26] = [
+        const DECAY: [bool; 28] = [
             false, // input_hidden
             false, // input_piece_hidden
             false, // input_rank_hidden
@@ -491,6 +509,8 @@ impl AzCandleModel {
             false, // policy_tactical
             true,  // policy_repetition_hidden
             false, // policy_repetition_bias
+            true,  // moves_left_output
+            false, // moves_left_bias
         ];
         let vars = self.all_vars();
         debug_assert_eq!(vars.len(), DECAY.len());
@@ -554,6 +574,9 @@ impl AzCandleModel {
             &self.policy_repetition_bias,
             &mut model.policy_repetition_bias,
         )?;
+        copy_var(&self.moves_left_output, &mut model.moves_left_output)?;
+        copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
+        model.rebuild_moves_left();
         model.rebuild_value_threat();
         model.rebuild_check_context();
         model.rebuild_policy_tactical();
@@ -721,6 +744,7 @@ mod tests {
         }
         model.rebuild_policy_cache();
         model.rebuild_policy_tactical();
+        model.rebuild_moves_left();
         model.rebuild_value_threat();
 
         let mut cpu = AzEvalScratch::new(model.arch);
@@ -746,6 +770,8 @@ mod tests {
             side_sign: 1.0,
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
             search_simulations: 1,
             meta: AzSampleMeta::default(),
         };
@@ -938,6 +964,8 @@ mod tests {
                     side_sign: 1.0,
                     policy_weight: 1.0,
                     value_weight: 1.0,
+                    moves_left: 0.0,
+                    moves_left_weight: 0.0,
                     search_simulations: 1,
                     meta: AzSampleMeta::default(),
                 }
@@ -969,6 +997,9 @@ mod tests {
         for (index, weight) in model.value_head_output.iter_mut().enumerate() {
             *weight = (index % 11) as f32 * 0.003 - 0.015;
         }
+        model.moves_left_output.fill(0.02);
+        model.moves_left_bias[0] = 0.1;
+        model.rebuild_moves_left();
         let candle = AzCandleModel::from_model(&model, device).unwrap();
         let forward = candle.forward(&batch).unwrap();
         let loss = candle_nn::ops::log_softmax(&forward.value_logits, 1)
@@ -1000,6 +1031,7 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap();
         let logits = forward.policy_logits.to_vec2::<f32>().unwrap();
+        let moves_left = forward.moves_left.to_vec2::<f32>().unwrap();
         for (row, sample) in samples.iter().enumerate() {
             let position = &positions[row];
             let moves = position.legal_moves();
@@ -1013,6 +1045,9 @@ mod tests {
             );
             let (sample_wdl, sample_logits) =
                 crate::az::outputs_for_training_sample(&model, sample).unwrap();
+            assert!(
+                (cpu.moves_left - moves_left[row][0] * crate::az::MOVES_LEFT_SCALE).abs() < 1e-3
+            );
             for (a, b) in cpu.value_wdl.iter().zip(&wdl[row]) {
                 assert!((a - b).abs() < 1e-4, "row={row} value {a} != {b}");
             }

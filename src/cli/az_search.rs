@@ -53,8 +53,12 @@ pub(crate) fn print_az_search_candidates(result: &chineseai::az::AzSearchResult,
         "\nCANDIDATES — visits descending ({shown}/{})",
         candidates.len()
     );
-    println!("    #  B  MOVE      VISITS  VISIT P       Q      CP       NET P      TREE P");
-    println!("  ---- --  -------  --------  -------  ------  ------  ----------  ----------");
+    println!(
+        "    #  B  MOVE      VISITS  VISIT P       Q      CP       NET P      TREE P   MLH(ply)"
+    );
+    println!(
+        "  ---- --  -------  --------  -------  ------  ------  ----------  ----------  ---------"
+    );
     for (rank, candidate) in candidates.into_iter().take(shown).enumerate() {
         let best = if Some(candidate.mv) == result.best_move {
             "*"
@@ -62,7 +66,7 @@ pub(crate) fn print_az_search_candidates(result: &chineseai::az::AzSearchResult,
             " "
         };
         println!(
-            "  {:>4}  {}  {:<7}  {:>8}  {:>6.2}%  {:>+6.3}  {:>+6}  {:>9.5}  {:>9.5}",
+            "  {:>4}  {}  {:<7}  {:>8}  {:>6.2}%  {:>+6.3}  {:>+6}  {:>9.5}  {:>9.5}  {:>9}",
             rank + 1,
             best,
             candidate.mv,
@@ -72,6 +76,10 @@ pub(crate) fn print_az_search_candidates(result: &chineseai::az::AzSearchResult,
             chineseai::az::cp_from_q(candidate.q),
             candidate.raw_prior,
             candidate.prior,
+            candidate
+                .moves_left
+                .map(|m| format!("{m:.1}"))
+                .unwrap_or_else(|| "-".into()),
         );
     }
 }
@@ -301,6 +309,20 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         search_elapsed.as_secs_f64() * 1000.0,
         result.simulations as f64 / elapsed_seconds
     );
+    if let Some(distance) = result
+        .candidates
+        .iter()
+        .find(|c| Some(c.mv) == result.best_move)
+        .and_then(|c| c.moves_left)
+    {
+        println!(
+            "  Moves left   {:.1} plies; MLH enabled={} threshold |Q|>{:.3} / |CP|>{:.0}",
+            distance,
+            model.moves_left_params.enabled,
+            model.moves_left_params.threshold,
+            model.moves_left_params.threshold * 1000.0
+        );
+    }
     print_az_search_candidates(&result, cmd.top);
     if let Some(trace_move) = trace_move {
         print_az_search_trace(trace_move, &trace);

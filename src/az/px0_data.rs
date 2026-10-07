@@ -19,6 +19,15 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn float(record: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
 }
+fn moves_left_target(record: &[u8]) -> (f32, f32) {
+    let plies = float(record, VALUES + 24);
+    if plies.is_finite() && plies > 0.0 && record[10178] & 48 == 0 {
+        (plies, 1.0)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 fn index(record: &[u8], offset: usize) -> usize {
     u16::from_le_bytes(record[offset..offset + 2].try_into().unwrap()) as usize
 }
@@ -455,6 +464,7 @@ fn decode_game(
         let best_index = locate(best)?;
         let root = wdl(float(record, VALUES), float(record, VALUES + 8))?;
         let target = wdl(float(record, VALUES + 4), float(record, VALUES + 12))?;
+        let (plies_left, moves_left_weight) = moves_left_target(record);
         let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
             rule_context: rule_context_features(&position, &history),
@@ -473,6 +483,8 @@ fn decode_game(
             side_sign: if side == Color::Red { 1.0 } else { -1.0 },
             policy_weight: 1.0,
             value_weight: 1.0,
+            moves_left: plies_left,
+            moves_left_weight,
             search_simulations: visits,
             meta: AzSampleMeta {
                 game_id,
@@ -631,6 +643,20 @@ mod tests {
         assert_eq!(canonical.to_uci(), "i0i1");
         assert_ne!(dense_move_index(canonical), 0);
         assert_eq!(px0_move(0, Color::Red).unwrap().to_uci(), "a0a1");
+    }
+
+    #[test]
+    fn moves_left_v6_target_uses_actual_plies_and_masks_adjudication() {
+        let mut record = vec![0u8; RECORD_SIZE];
+        record[VALUES + 24..VALUES + 28].copy_from_slice(&37.0f32.to_le_bytes());
+        assert_eq!(moves_left_target(&record), (37.0, 1.0));
+        for flag in [16, 32] {
+            record[10178] = flag;
+            assert_eq!(moves_left_target(&record), (0.0, 0.0));
+        }
+        record[10178] = 0;
+        record[VALUES + 24..VALUES + 28].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(moves_left_target(&record), (0.0, 0.0));
     }
 
     #[test]

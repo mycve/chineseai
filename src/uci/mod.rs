@@ -1,6 +1,6 @@
 use crate::az::{
-    AzCandidate, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchResult, SplitMix64, cp_from_q,
-    search_uci,
+    AzCandidate, AzMovesLeftParams, AzNnue, AzSearchControl, AzSearchLimits, AzUciSearchResult,
+    SplitMix64, cp_from_q, search_uci,
 };
 use crate::xiangqi::{Color, Move, Position, RuleHistoryEntry};
 use std::io::{self, BufRead, Write};
@@ -67,6 +67,7 @@ struct UciState {
     /// 这是"用延迟换可证深度"的唯一旋钮：默认 20 万只够证出 mate-in-8（实测 58,178 节点），
     /// 更长的连杀需要更大的预算，代价线性体现在每手耗时上。
     mate_search_nodes: usize,
+    moves_left_params: AzMovesLeftParams,
 }
 
 impl Default for UciState {
@@ -97,6 +98,7 @@ impl Default for UciState {
             multipv: 1,
             mate_search_plies: DEFAULT_MATE_SEARCH_PLIES,
             mate_search_nodes: DEFAULT_MATE_SEARCH_NODES,
+            moves_left_params: AzMovesLeftParams::default(),
         }
     }
 }
@@ -202,6 +204,35 @@ fn print_uci_id() {
     println!(
         "option name MateSearchNodes type spin default {DEFAULT_MATE_SEARCH_NODES} min 1 max 100000000"
     );
+    let moves_left = AzMovesLeftParams::default();
+    println!(
+        "option name MovesLeftEnabled type check default {}",
+        moves_left.enabled
+    );
+    println!(
+        "option name MovesLeftThreshold type string default {}",
+        moves_left.threshold
+    );
+    println!(
+        "option name MovesLeftMaxEffect type string default {}",
+        moves_left.max_effect
+    );
+    println!(
+        "option name MovesLeftSlope type string default {}",
+        moves_left.slope
+    );
+    println!(
+        "option name MovesLeftConstantFactor type string default {}",
+        moves_left.constant_factor
+    );
+    println!(
+        "option name MovesLeftScaledFactor type string default {}",
+        moves_left.scaled_factor
+    );
+    println!(
+        "option name MovesLeftQuadraticFactor type string default {}",
+        moves_left.quadratic_factor
+    );
     println!("uciok");
     flush();
 }
@@ -220,6 +251,7 @@ fn ensure_model(state: &mut UciState) {
     });
     // 连杀预算挂模型上。在这里设一次，而不是每次 `go` 都克隆一份打了补丁的模型：
     // 45MB 级的模型克隆在快棋里是要命的。
+    model.moves_left_params = state.moves_left_params;
     model.mate_search_plies = state.mate_search_plies;
     model.mate_search_nodes = state.mate_search_nodes;
     state.model = Some(Arc::new(model));
@@ -240,6 +272,35 @@ fn handle_setoption(line: &str, state: &mut UciState) {
         .unwrap_or_default();
 
     match name.as_str() {
+        "movesleftenabled" => {
+            if let Ok(enabled) = value.to_ascii_lowercase().parse::<bool>() {
+                state.moves_left_params.enabled = enabled;
+                state.model = None;
+            }
+        }
+        "movesleftthreshold"
+        | "movesleftmaxeffect"
+        | "movesleftslope"
+        | "movesleftconstantfactor"
+        | "movesleftscaledfactor"
+        | "movesleftquadraticfactor" => {
+            if let Ok(number) = value.parse::<f32>()
+                && number.is_finite()
+            {
+                let field = match name.as_str() {
+                    "movesleftthreshold" => &mut state.moves_left_params.threshold,
+                    "movesleftmaxeffect" => &mut state.moves_left_params.max_effect,
+                    "movesleftslope" => &mut state.moves_left_params.slope,
+                    "movesleftconstantfactor" => &mut state.moves_left_params.constant_factor,
+                    "movesleftscaledfactor" => &mut state.moves_left_params.scaled_factor,
+                    _ => &mut state.moves_left_params.quadratic_factor,
+                };
+                *field = number;
+                state.moves_left_params = state.moves_left_params.normalize();
+                state.model = None;
+            }
+        }
+
         "multipv" => {
             if let Ok(value) = value.parse::<usize>() {
                 state.multipv = value.clamp(1, 64);
@@ -939,6 +1000,52 @@ mod tests {
 
     /// `MateSearchNodes` 是"用延迟换可证深度"的旋钮：必须能设置、必须有下限、改了要重置模型。
     #[test]
+    fn moves_left_options_apply_and_reject_non_finite_values() {
+        let mut state = UciState::default();
+        assert_eq!(state.moves_left_params, AzMovesLeftParams::default());
+        for (name, value) in [
+            ("MovesLeftThreshold", "0.9"),
+            ("MovesLeftMaxEffect", "0.02"),
+            ("MovesLeftSlope", "0.001"),
+            ("MovesLeftConstantFactor", "0.1"),
+            ("MovesLeftScaledFactor", "1.2"),
+            ("MovesLeftQuadraticFactor", "-0.4"),
+        ] {
+            state.model = Some(Arc::new(AzNnue::random(8, 83)));
+            handle_setoption(&format!("setoption name {name} value {value}"), &mut state);
+            assert!(
+                state.model.is_none(),
+                "{name} must update the next loaded model"
+            );
+        }
+        assert_eq!(
+            state.moves_left_params,
+            AzMovesLeftParams {
+                enabled: true,
+                threshold: 0.9,
+                max_effect: 0.02,
+                slope: 0.001,
+                constant_factor: 0.1,
+                scaled_factor: 1.2,
+                quadratic_factor: -0.4,
+            }
+        );
+        for invalid in ["NaN", "inf", "bad"] {
+            handle_setoption(
+                &format!("setoption name MovesLeftThreshold value {invalid}"),
+                &mut state,
+            );
+            assert_eq!(state.moves_left_params.threshold, 0.9);
+        }
+        handle_setoption("setoption name MovesLeftEnabled value false", &mut state);
+        assert!(!state.moves_left_params.enabled);
+        handle_setoption("setoption name MovesLeftThreshold value 5", &mut state);
+        assert_eq!(state.moves_left_params.threshold, 1.0);
+        handle_setoption("setoption name MovesLeftMaxEffect value -1", &mut state);
+        assert_eq!(state.moves_left_params.max_effect, 0.0);
+    }
+
+    #[test]
     fn mate_search_nodes_option_round_trips() {
         let mut state = UciState::default();
         assert_eq!(state.mate_search_nodes, 200_000, "默认覆盖实测的 mate-in-8");
@@ -1102,6 +1209,7 @@ mod tests {
                 prior: 0.0,
                 policy: 0.8,
                 solved: None,
+                moves_left: None,
             },
             AzCandidate {
                 mv: alternate,
@@ -1111,6 +1219,7 @@ mod tests {
                 prior: 0.0,
                 policy: 0.2,
                 solved: None,
+                moves_left: None,
             },
             AzCandidate {
                 mv: Move::new(0, 3),
@@ -1120,6 +1229,7 @@ mod tests {
                 prior: 0.0,
                 policy: 0.0,
                 solved: None,
+                moves_left: None,
             },
         ];
         assert_eq!(choose_opening_move(&candidates, best, 0.0, 1), best);

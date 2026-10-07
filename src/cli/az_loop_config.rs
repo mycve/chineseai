@@ -1,4 +1,4 @@
-use chineseai::az::{AzNnueArch, AzTrainOptimizer};
+use chineseai::az::{AzMovesLeftParams, AzNnueArch, AzTrainOptimizer};
 use chineseai::infra::version::AZ_LOOP_CONFIG_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write, fs, path::Path};
@@ -65,6 +65,14 @@ pub struct AzLoopFileConfig {
     /// 带 `#[serde(default)]`：老配置文件里没有这一项时按 0（关闭）解析，不必改格式版本。
     #[serde(default)]
     pub mate_search_plies: usize,
+    pub moves_left_enabled: bool,
+    pub moves_left_threshold: f32,
+    pub moves_left_max_effect: f32,
+    pub moves_left_slope: f32,
+    pub moves_left_constant_factor: f32,
+    pub moves_left_scaled_factor: f32,
+    pub moves_left_quadratic_factor: f32,
+
     /// 每叶战术搜索预算，0 关闭；先测试吞吐量后再启用。
     pub tactical_search_nodes: usize,
     pub tactical_search_plies: usize,
@@ -108,6 +116,7 @@ pub struct AzLoopFileConfig {
 
 impl Default for AzLoopFileConfig {
     fn default() -> Self {
+        let moves_left = AzMovesLeftParams::default();
         Self {
             format_version: AZ_LOOP_CONFIG_FORMAT_VERSION,
             model_path: "model.safetensors".into(),
@@ -151,6 +160,14 @@ impl Default for AzLoopFileConfig {
             // 9 半回合 = mate in 5：实测把可证射程从 mate-in-4 推到 mate-in-5，
             // 而"有将军但无杀"的局面只 +4%，根局面没有将军着法时为 0。
             mate_search_plies: 9,
+            moves_left_enabled: moves_left.enabled,
+            moves_left_threshold: moves_left.threshold,
+            moves_left_max_effect: moves_left.max_effect,
+            moves_left_slope: moves_left.slope,
+            moves_left_constant_factor: moves_left.constant_factor,
+            moves_left_scaled_factor: moves_left.scaled_factor,
+            moves_left_quadratic_factor: moves_left.quadratic_factor,
+
             tactical_search_nodes: 0,
             tactical_search_plies: 8,
             tactical_quiet_plies: 2,
@@ -218,6 +235,20 @@ impl AzLoopFileConfig {
         line!("selfplay_dive_book", q(&self.selfplay_dive_book));
         line!("selfplay_dive_fraction", f(self.selfplay_dive_fraction));
         line!("mate_search_plies", self.mate_search_plies);
+        line!("moves_left_enabled", self.moves_left_enabled);
+        line!("moves_left_threshold", f(self.moves_left_threshold));
+        line!("moves_left_max_effect", f(self.moves_left_max_effect));
+        line!("moves_left_slope", f(self.moves_left_slope));
+        line!(
+            "moves_left_constant_factor",
+            f(self.moves_left_constant_factor)
+        );
+        line!("moves_left_scaled_factor", f(self.moves_left_scaled_factor));
+        line!(
+            "moves_left_quadratic_factor",
+            f(self.moves_left_quadratic_factor)
+        );
+
         line!("tactical_search_nodes", self.tactical_search_nodes);
         line!("tactical_search_plies", self.tactical_search_plies);
         line!("tactical_quiet_plies", self.tactical_quiet_plies);
@@ -328,6 +359,19 @@ impl AzLoopFileConfig {
         config.normalize()
     }
 
+    pub fn moves_left_params(&self) -> AzMovesLeftParams {
+        AzMovesLeftParams {
+            enabled: self.moves_left_enabled,
+            threshold: self.moves_left_threshold,
+            max_effect: self.moves_left_max_effect,
+            slope: self.moves_left_slope,
+            constant_factor: self.moves_left_constant_factor,
+            scaled_factor: self.moves_left_scaled_factor,
+            quadratic_factor: self.moves_left_quadratic_factor,
+        }
+        .normalize()
+    }
+
     pub fn arch(&self) -> AzNnueArch {
         AzNnueArch {
             hidden_size: self.hidden_size,
@@ -335,6 +379,15 @@ impl AzLoopFileConfig {
     }
 
     fn normalize(mut self) -> Self {
+        let moves_left = self.moves_left_params();
+        self.moves_left_enabled = moves_left.enabled;
+        self.moves_left_threshold = moves_left.threshold;
+        self.moves_left_max_effect = moves_left.max_effect;
+        self.moves_left_slope = moves_left.slope;
+        self.moves_left_constant_factor = moves_left.constant_factor;
+        self.moves_left_scaled_factor = moves_left.scaled_factor;
+        self.moves_left_quadratic_factor = moves_left.quadratic_factor;
+
         self.simulations = self.simulations.max(1);
         self.selfplay_samples_per_update = self.selfplay_samples_per_update.max(1);
         self.lr = self.lr.max(0.0);
@@ -413,6 +466,44 @@ mod tests {
 
     /// 连杀预算要能往返、能 clamp；默认值就是推荐的 9；**老配置文件缺这一项时必须按 0
     /// 解析而不是报错**（`#[serde(default)]`）。
+    #[test]
+    fn moves_left_config_roundtrips_defaults_and_clamps() {
+        let config = AzLoopFileConfig {
+            moves_left_enabled: false,
+            moves_left_threshold: 0.9,
+            moves_left_max_effect: 0.02,
+            moves_left_slope: 0.001,
+            moves_left_constant_factor: 0.1,
+            moves_left_scaled_factor: 1.2,
+            moves_left_quadratic_factor: -0.4,
+            ..AzLoopFileConfig::default()
+        };
+        let text = config.to_file_text();
+        assert_eq!(
+            AzLoopFileConfig::parse(&text).moves_left_params(),
+            config.moves_left_params()
+        );
+        let legacy = text
+            .lines()
+            .filter(|line| !line.starts_with("moves_left_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            AzLoopFileConfig::parse(&legacy).moves_left_params(),
+            AzMovesLeftParams::default()
+        );
+        let clamped = AzLoopFileConfig {
+            moves_left_threshold: 5.0,
+            moves_left_max_effect: -1.0,
+            moves_left_slope: f32::NAN,
+            ..AzLoopFileConfig::default()
+        }
+        .normalize();
+        assert_eq!(clamped.moves_left_threshold, 1.0);
+        assert_eq!(clamped.moves_left_max_effect, 0.0);
+        assert_eq!(clamped.moves_left_slope, AzMovesLeftParams::default().slope);
+    }
+
     #[test]
     fn mate_search_config_roundtrips_and_clamps() {
         assert_eq!(AzLoopFileConfig::default().mate_search_plies, 9);

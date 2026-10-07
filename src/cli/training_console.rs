@@ -78,8 +78,13 @@ impl TrainingConsole {
             if checkpoint { " checkpoint=saved" } else { "" }
         );
         let loss = format!(
-            "train: samples={} loss={:.4} WDL={:.4} policy_KL={:.4}",
-            report.train_samples, report.loss, report.value_loss, report.policy_kl
+            "train: samples={} loss={:.4} WDL={:.4} policy_KL={:.4} MLH={:.4}/{}",
+            report.train_samples,
+            report.loss,
+            report.value_loss,
+            report.policy_kl,
+            report.moves_left_loss,
+            report.moves_left_samples
         );
         let value = format!(
             "value: RMSE={:.4} corr={:.3} lr={:.6} sims={:.1} train={:.1}s",
