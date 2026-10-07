@@ -61,19 +61,16 @@ impl AzLoopProgressState {
 
 pub(crate) fn load_az_loop_progress(config_path: &str) -> AzLoopProgressState {
     let path = az_loop_progress_path(config_path);
-    let Ok(text) = fs::read_to_string(&path) else {
-        return AzLoopProgressState::default();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return AzLoopProgressState::default();
+        }
+        Err(err) => panic!("failed to read `{}`: {err}", path.display()),
     };
-    let state = toml::from_str::<AzLoopProgressState>(&text)
+    toml::from_str::<AzLoopProgressState>(&text)
         .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", path.display()))
-        .normalize();
-    fs::remove_file(&path).unwrap_or_else(|err| {
-        panic!(
-            "loaded progress but failed to remove consumed `{}`: {err}",
-            path.display()
-        )
-    });
-    state
+        .normalize()
 }
 
 pub(crate) fn save_az_loop_progress(config_path: &str, state: &AzLoopProgressState) {
@@ -147,5 +144,31 @@ pub(crate) fn build_az_loop_config(
         tactical_search_nodes: config.tactical_search_nodes,
         tactical_search_plies: config.tactical_search_plies,
         tactical_quiet_plies: config.tactical_quiet_plies,
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn loading_progress_keeps_it_for_restarts_after_failed_restore() {
+        let path = std::env::temp_dir().join(format!(
+            "chineseai-progress-retry-{}.toml",
+            std::process::id()
+        ));
+        let config_path = path.to_str().unwrap();
+        let progress_path = az_loop_progress_path(config_path);
+        assert_eq!(load_az_loop_progress(config_path).next_update, 1);
+        save_az_loop_progress_pair(config_path, 44109, Some(43000), 123, 456);
+        for _ in 0..2 {
+            let loaded = load_az_loop_progress(config_path);
+            assert_eq!(loaded.next_update, 44109);
+            assert_eq!(loaded.nemesis_update, Some(43000));
+            assert_eq!(loaded.generated_games, 123);
+            assert_eq!(loaded.generated_samples, 456);
+            assert!(progress_path.exists());
+        }
+        std::fs::remove_file(progress_path).unwrap();
     }
 }

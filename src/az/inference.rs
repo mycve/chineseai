@@ -1000,6 +1000,28 @@ impl AzNnue {
         Ok(true)
     }
 
+    /// 优化器检查点同时记录更新序号；缺失独立进度文件时用它恢复。
+    pub fn training_state_next_update(path: impl AsRef<Path>) -> io::Result<usize> {
+        let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }
+            .map_err(candle_io_error)?;
+        let state = tensors
+            .load("state", &Device::Cpu)
+            .and_then(|state| state.to_vec1::<i64>())
+            .map_err(candle_io_error)?;
+        if state.len() != 4
+            || !matches!(state[0], 1 | 2)
+            || state[1] != MODEL_FORMAT_VERSION as i64
+            || state[2] < 0
+            || state[3] < 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid optimizer resume metadata",
+            ));
+        }
+        usize::try_from(state[3]).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
     pub fn restore_training_state(
         &mut self,
         path: impl AsRef<Path>,

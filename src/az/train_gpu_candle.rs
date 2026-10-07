@@ -724,21 +724,22 @@ mod monitoring_tests {
                 std::process::id()
             ));
             let migrated_path = path.with_extension("migrated.safetensors");
-            legacy.save(&path, 42).unwrap();
-            assert!(resumed.restore(&path, 43).is_err());
+            legacy.save(&path, 44109).unwrap();
+            assert_eq!(AzNnue::training_state_next_update(&path).unwrap(), 44109);
+            assert!(resumed.restore(&path, 44110).is_err());
             let mut wrong_lr =
                 TrainOptimizer::new(kind, new_vars.clone(), new_decay.clone(), lr * 2.0).unwrap();
-            assert!(wrong_lr.restore(&path, 42).is_err());
+            assert!(wrong_lr.restore(&path, 44109).is_err());
             new_vars[27]
                 .set(&Tensor::new(&[0.5f32], &Device::Cpu).unwrap())
                 .unwrap();
-            assert!(resumed.restore(&path, 42).is_err());
+            assert!(resumed.restore(&path, 44109).is_err());
             new_vars[27]
                 .set(&new_vars[27].zeros_like().unwrap())
                 .unwrap();
-            resumed.restore(&path, 42).unwrap();
+            resumed.restore(&path, 44109).unwrap();
             assert_eq!(resumed.steps(), legacy.steps());
-            resumed.save(&migrated_path, 42).unwrap();
+            resumed.save(&migrated_path, 44109).unwrap();
             let old_state = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
             let new_state = candle_core::safetensors::load(&migrated_path, &Device::Cpu).unwrap();
             for (name, old) in old_state {

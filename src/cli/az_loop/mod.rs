@@ -126,19 +126,10 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     };
     let target_update = cmd.target_update.map(|update| update.max(1));
     let progress_boot = load_az_loop_progress(&config_path);
-    let start_update = progress_boot.next_update.max(1);
+    let mut start_update = progress_boot.next_update.max(1);
     let mut arena_nemesis_update = progress_boot.nemesis_update;
     let mut generated_games_total = progress_boot.generated_games;
     let mut generated_samples_total = progress_boot.generated_samples;
-    if let Some(target_update) = target_update
-        && start_update > target_update
-    {
-        println!(
-            "target   : already complete, start_update={} target_update={}",
-            start_update, target_update
-        );
-        return false;
-    }
     let best_path = best_model_path(&config.model_path);
 
     let config_arch = config.arch();
@@ -188,6 +179,19 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
     };
     let optimizer_state_path = restore_path.clone();
     if restore_path.exists() {
+        let checkpoint_update =
+            AzNnue::training_state_next_update(restore_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to read optimizer progress `{}`: {err}",
+                    restore_path.display()
+                )
+            });
+        if checkpoint_update != start_update {
+            println!(
+                "progress : align next_update={start_update} to optimizer checkpoint next_update={checkpoint_update}"
+            );
+        }
+        start_update = checkpoint_update;
         model
             .restore_training_state(
                 restore_path,
@@ -207,6 +211,25 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             config.train_optimizer.as_str(),
             config.lr
         );
+    }
+    // 只有模型权重及优化器完整验证成功后，才修复缺失或滞后的进度。
+    if start_update != progress_boot.next_update {
+        save_az_loop_progress_pair(
+            &config_path,
+            start_update,
+            arena_nemesis_update,
+            generated_games_total,
+            generated_samples_total,
+        );
+    }
+    if let Some(target_update) = target_update
+        && start_update > target_update
+    {
+        println!(
+            "target   : already complete, start_update={} target_update={}",
+            start_update, target_update
+        );
+        return false;
     }
     let selfplay_model = model.clone();
     let initial_arena_reference_model = {
