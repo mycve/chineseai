@@ -42,8 +42,7 @@ fn progress_roundtrip_preserves_generated_totals() {
 
 #[test]
 fn az_search_defaults_match_px0_match_settings() {
-    let cli =
-        Cli::try_parse_from(["chineseai", "az-search", "model.safetensors", "3200"]).unwrap();
+    let cli = Cli::try_parse_from(["chineseai", "az-search", "model.safetensors", "3200"]).unwrap();
     let Some(CliCommand::AzSearch(args)) = cli.command else {
         panic!("expected az-search command");
     };
@@ -61,6 +60,7 @@ fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         repetition_flags: Vec::new(),
         features: vec![0],
         rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
+        history_features: [0.0; chineseai::az::HISTORY_CONTEXT_SIZE],
         move_indices: (0..policy.len()).collect(),
         policy,
         value_wdl: [0.0, 1.0, 0.0],

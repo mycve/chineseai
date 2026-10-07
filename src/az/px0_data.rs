@@ -90,6 +90,27 @@ fn position(record: &[u8]) -> io::Result<Position> {
     Position::from_fen(&fen).map_err(invalid)
 }
 
+fn record_history_features(
+    record: &[u8],
+    ply: usize,
+) -> io::Result<[f32; super::HISTORY_CONTEXT_SIZE]> {
+    let available = ply.min(2);
+    let mut planes = [[0u128; 14]; 3];
+    for (history, board) in planes.iter_mut().enumerate().take(available + 1) {
+        for (piece, mask) in board.iter_mut().enumerate() {
+            // Px0 每个历史时刻 15 平面：14 棋子平面和一个重复标记。
+            let offset = PLANES + (history * 15 + piece) * 16;
+            *mask = u128::from_le_bytes(record[offset..offset + 16].try_into().unwrap());
+            if *mask >> 90 != 0 {
+                return Err(invalid("history piece plane exceeds board"));
+            }
+        }
+    }
+    Ok(super::history::history_features_from_planes(
+        &planes, available,
+    ))
+}
+
 fn px0_move(move_index: usize, side: Color) -> io::Result<Move> {
     let (from, to) =
         dense_move_squares(move_index).ok_or_else(|| invalid("policy index out of range"))?;
@@ -495,6 +516,7 @@ fn decode_game(
         let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
             rule_context: rule_context_features(&position, &history),
+            history_features: record_history_features(record, ply)?,
             move_indices: moves
                 .iter()
                 .map(|&mv| dense_move_index(canonical_move(side, mv)))
@@ -574,11 +596,12 @@ pub fn evaluate(model: &AzNnue, samples: &[AzTrainingSample]) -> Metrics {
                 Move::new(from, to)
             })
             .collect::<Vec<_>>();
-        let output = model.evaluate_with_scratch_output_with_repetition(
+        let output = model.evaluate_with_scratch_output_with_repetition_and_history_features(
             &position,
             &moves,
             &sample.repetition_flags,
             &sample.rule_context,
+            &sample.history_features,
             &mut scratch,
         );
         let max = scratch
@@ -628,6 +651,60 @@ pub fn evaluate(model: &AzNnue, samples: &[AzTrainingSample]) -> Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn px0_history_planes_match_real_moves_with_fifteen_plane_stride() {
+        use crate::xiangqi::{Color, PieceKind};
+        let mut current = Position::startpos();
+        let mut history = current.initial_rule_history();
+        let mut positions = vec![current.clone()];
+        for _ in 0..3 {
+            let mv = current.legal_moves()[0];
+            history.push(current.rule_history_entry_after_move(mv));
+            current.make_move(mv);
+            positions.push(current.clone());
+        }
+        let mut record = vec![0u8; RECORD_SIZE];
+        let side = current.side_to_move();
+        for h in 0..3 {
+            let previous = &positions[positions.len() - 1 - h];
+            for square in 0..90 {
+                let Some(piece) = previous.piece_at(square) else {
+                    continue;
+                };
+                let kind = match piece.kind {
+                    PieceKind::Rook => 0,
+                    PieceKind::Advisor => 1,
+                    PieceKind::Cannon => 2,
+                    PieceKind::Soldier => 3,
+                    PieceKind::Horse => 4,
+                    PieceKind::Elephant => 5,
+                    PieceKind::General => 6,
+                };
+                let plane = kind + if piece.color == side { 0 } else { 7 };
+                let rank = if side == Color::Black {
+                    square / 9
+                } else {
+                    9 - square / 9
+                };
+                let bit = rank * 9 + square % 9;
+                record[PLANES + (h * 15 + plane) * 16 + bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        for available in 0..3 {
+            let actual = record_history_features(&record, available).unwrap();
+            let expected = super::super::history::history_features(
+                &current,
+                &history[history.len() - available..],
+            );
+            for (&a, &b) in actual.iter().zip(&expected) {
+                assert!((a - b).abs() < 1e-6, "available={available}: {a} != {b}");
+            }
+        }
+        // 第一个历史棋盘中 bit90 超界，不能把它当棋子或重复标记。
+        record[PLANES + 15 * 16 + 11] |= 4;
+        assert!(record_history_features(&record, 2).is_err());
+    }
 
     #[test]
     fn reservoir_is_reproducible_and_samples_the_entire_stream() {

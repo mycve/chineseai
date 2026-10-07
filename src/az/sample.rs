@@ -152,6 +152,8 @@ pub struct AzPhaseValueReport {
 pub struct AzTrainingSample {
     pub features: Vec<usize>,
     pub rule_context: [f32; RULE_CONTEXT_SIZE],
+    /// 当前棋盘摘要与可恢复前两步的空间变化，统一到 Px0 行棋方视角。
+    pub history_features: [f32; super::HISTORY_CONTEXT_SIZE],
     pub move_indices: Vec<usize>,
     pub repetition_flags: Vec<u8>,
     pub policy: Vec<f32>,

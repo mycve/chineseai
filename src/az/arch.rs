@@ -6,6 +6,7 @@ use super::px0_policy_map;
 pub(crate) const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = 2062;
 pub(crate) const POLICY_CONSEQUENCE_SIZE: usize = 32;
+pub const HISTORY_CONTEXT_SIZE: usize = 96;
 pub(crate) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(crate) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
 pub(crate) const POLICY_ACCUMULATOR_RANK: usize = 64;

@@ -83,11 +83,24 @@ fn encode_az_training_sample(out: &mut Vec<u8>, sample: &AzTrainingSample) -> io
             "invalid moves-left target",
         ));
     }
+    if sample
+        .history_features
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid history features",
+        ));
+    }
     replay_push_u32(out, sample.features.len() as u32);
     for &f in &sample.features {
         replay_push_u32(out, f as u32);
     }
     for &value in &sample.rule_context {
+        replay_push_f32(out, value);
+    }
+    for &value in &sample.history_features {
         replay_push_f32(out, value);
     }
     replay_push_u32(out, sample.move_indices.len() as u32);
@@ -201,6 +214,16 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     for value in &mut rule_context {
         *value = replay_read_f32(reader)?;
     }
+    let mut history_features = [0.0; super::HISTORY_CONTEXT_SIZE];
+    for value in &mut history_features {
+        *value = replay_read_f32(reader)?;
+        if !value.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid history features",
+            ));
+        }
+    }
     let nm = replay_read_u32(reader)?;
     if nm > REPLAY_MAX_MOVES_PER_SAMPLE {
         return Err(io::Error::new(
@@ -272,6 +295,7 @@ fn decode_az_training_sample<R: Read>(reader: &mut R) -> io::Result<AzTrainingSa
     Ok(AzTrainingSample {
         features,
         rule_context,
+        history_features,
         move_indices,
         repetition_flags,
         policy,
@@ -812,6 +836,7 @@ mod tests {
             repetition_flags: vec![0],
             features: vec![0],
             rule_context: [0.0; super::super::RULE_CONTEXT_SIZE],
+            history_features: [0.0; crate::az::HISTORY_CONTEXT_SIZE],
             move_indices: vec![0],
             policy: vec![1.0],
             value_wdl: [0.0, 1.0, 0.0],
@@ -897,6 +922,7 @@ mod tests {
         original.moves_left = 37.0;
         original.moves_left_weight = 1.0;
         original.repetition_flags[0] = 1;
+        original.history_features = std::array::from_fn(|i| i as f32 / 128.0);
         encode_az_training_sample(&mut encoded, &original).unwrap();
         let decoded = decode_az_training_sample(&mut Cursor::new(encoded)).unwrap();
         assert_eq!(decoded.meta.start_source, AzStartSource::OpeningBook);
@@ -906,6 +932,7 @@ mod tests {
         assert_eq!(decoded.moves_left, 37.0);
         assert_eq!(decoded.moves_left_weight, 1.0);
         assert_eq!(decoded.repetition_flags, original.repetition_flags);
+        assert_eq!(decoded.history_features, original.history_features);
     }
 
     #[test]

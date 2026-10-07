@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
-use super::arch::CHECK_CONTEXT_SIZE;
+use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
 use super::inference::check_context_features;
 use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::{BOARD_SIZE, Color, Position};
@@ -208,6 +208,7 @@ pub(super) struct PackedBatch {
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
+    pub history_features: Vec<f32>,
     pub check_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
@@ -280,6 +281,7 @@ impl PackedBatch {
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
+            history_features: vec![0.0f32; batch_size * HISTORY_CONTEXT_SIZE],
             check_context: vec![0.0f32; batch_size * CHECK_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
@@ -307,6 +309,8 @@ impl PackedBatch {
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
             packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
                 .copy_from_slice(&sample.rule_context);
+            packed.history_features[row * HISTORY_CONTEXT_SIZE..(row + 1) * HISTORY_CONTEXT_SIZE]
+                .copy_from_slice(&sample.history_features);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
             if sample.moves_left.is_finite()
@@ -661,6 +665,7 @@ mod tests {
             repetition_flags: Vec::new(),
             features: vec![index % AZ_NNUE_INPUT_SIZE],
             rule_context: [0.0; RULE_CONTEXT_SIZE],
+            history_features: [0.0; HISTORY_CONTEXT_SIZE],
             move_indices: vec![0, 1],
             policy: vec![1.0 + index as f32, 1.0],
             value_wdl: [1.0, 0.0, 0.0],

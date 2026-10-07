@@ -4,8 +4,8 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piec
 
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
-/// 当前网络仅使用面向行棋方的 canonical 棋子位置，不输入历史步。
-/// 重复、长将、长捉等依赖历史的规则由环境精确处理。
+/// 主干使用面向行棋方的 canonical 棋子位置；价值头另接最近两步历史特征。
+/// 重复、长将、长捉等规则由环境精确处理。
 pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
 
 pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {

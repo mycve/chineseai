@@ -1,6 +1,6 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 
-use super::arch::CHECK_CONTEXT_SIZE;
+use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
@@ -33,6 +33,7 @@ pub(super) struct AzCandleModel {
     value_head_bias: Var,
     value_king_piece_hidden: Var,
     value_head_output: Var,
+    value_history_output: Var,
     moves_left_output: Var,
     moves_left_bias: Var,
     value_threat_embedding: Var,
@@ -100,7 +101,11 @@ impl AzCandleModel {
         .broadcast_mul(&batch.value_threat_scales)?;
         let threat_activation = threat_accumulator;
         let threat_pair = Tensor::cat(&[&threat_activation, &threat_activation.sqr()?], 1)?;
-        let value_logits = (value_logits + threat_pair.matmul(&self.value_threat_output.t()?)?)?;
+        let value_logits = ((value_logits
+            + threat_pair.matmul(&self.value_threat_output.t()?)?)?
+            + batch
+                .history_features
+                .matmul(&self.value_history_output.t()?)?)?;
         let piece_square_policy = self
             .input_hidden
             .narrow(1, 0, policy_consequence_size)?
@@ -207,6 +212,7 @@ pub(super) struct BatchTensors {
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) rule_context: Tensor,
+    pub(super) history_features: Tensor,
     pub(super) check_context: Tensor,
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
@@ -300,6 +306,11 @@ impl BatchTensors {
                 (batch_size, RULE_CONTEXT_SIZE),
                 device,
             )?,
+            history_features: Tensor::from_vec(
+                packed.history_features,
+                (batch_size, HISTORY_CONTEXT_SIZE),
+                device,
+            )?,
             policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
             check_context: Tensor::from_vec(
                 packed.check_context,
@@ -377,6 +388,11 @@ impl AzCandleModel {
             value_head_output: var_from_slice(
                 &model.value_head_output,
                 (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            value_history_output: var_from_slice(
+                &model.value_history_output,
+                (WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE),
                 device,
             )?,
             moves_left_output: var_from_slice(&model.moves_left_output, (1, hidden), device)?,
@@ -474,6 +490,7 @@ impl AzCandleModel {
         vars.push(self.policy_repetition_bias.clone());
         vars.push(self.moves_left_output.clone());
         vars.push(self.moves_left_bias.clone());
+        vars.push(self.value_history_output.clone());
         vars
     }
 
@@ -492,7 +509,7 @@ impl AzCandleModel {
     /// 所以这个分组在 Adam 的学习率尺度下几乎不动结果。
     pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
         /// 与 `all_vars` 的 push 顺序一一对应。
-        const DECAY: [bool; 30] = [
+        const DECAY: [bool; 31] = [
             false, // input_hidden
             false, // input_piece_hidden
             false, // input_rank_hidden
@@ -523,6 +540,7 @@ impl AzCandleModel {
             false, // policy_repetition_bias
             true,  // moves_left_output
             false, // moves_left_bias
+            true,  // value_history_output
         ];
         let vars = self.all_vars();
         debug_assert_eq!(vars.len(), DECAY.len());
@@ -550,6 +568,7 @@ impl AzCandleModel {
             &mut model.value_king_piece_hidden,
         )?;
         copy_var(&self.value_head_output, &mut model.value_head_output)?;
+        copy_var(&self.value_history_output, &mut model.value_history_output)?;
         copy_var(
             &self.value_threat_embedding,
             &mut model.value_threat_embedding,
@@ -592,6 +611,7 @@ impl AzCandleModel {
         copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
         model.rebuild_moves_left();
         model.rebuild_value_threat();
+        model.rebuild_value_history();
         model.rebuild_check_context();
         model.rebuild_policy_tactical();
         model.rebuild_policy_cache();
@@ -626,6 +646,87 @@ mod tests {
         },
         xiangqi::Position,
     };
+
+    #[test]
+    fn history_head_trains_and_matches_cpu_after_two_moves() {
+        let mut position = Position::startpos();
+        let mut history = Vec::new();
+        for _ in 0..2 {
+            let mv = position.legal_moves()[0];
+            let mover = position.side_to_move();
+            let captured = position.piece_at(mv.to as usize);
+            position.make_move(mv);
+            history.push(position.rule_history_entry_after_moved(mover, mv, captured));
+        }
+        let moves = position.legal_moves();
+        let sample = AzTrainingSample {
+            features: extract_sparse_features_az(&position),
+            rule_context: [0.0; RULE_CONTEXT_SIZE],
+            history_features: crate::az::history_features(&position, &history),
+            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
+            repetition_flags: vec![0; moves.len()],
+            policy: vec![1.0 / moves.len() as f32; moves.len()],
+            value_wdl: [1.0, 0.0, 0.0],
+            root_search_wdl: [1.0, 0.0, 0.0],
+            value: 1.0,
+            side_sign: 1.0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            moves_left: 0.0,
+            moves_left_weight: 0.0,
+            search_simulations: 0,
+            meta: Default::default(),
+        };
+        assert!(sample.history_features[48..].iter().any(|x| *x != 0.0));
+        let mut model = AzNnue::random(16, 7);
+        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let (vars, decay) = candle.all_vars_with_decay();
+        assert_eq!(vars.last().unwrap().id(), candle.value_history_output.id());
+        assert!(*decay.last().unwrap());
+        let batch = BatchTensors::from_packed(
+            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let output = candle.forward(&batch).unwrap();
+        let loss = candle_nn::ops::log_softmax(&output.value_logits, 1)
+            .unwrap()
+            .mul(&batch.value_wdl)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .neg()
+            .unwrap();
+        let gradients = loss.backward().unwrap();
+        let gradient = gradients
+            .get(&candle.value_history_output)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(gradient.iter().all(|x| x.is_finite()));
+        assert!(gradient.iter().any(|x| x.abs() > 1e-8));
+        let mut optimizer = crate::az::adamw::AzAdamW::new(
+            vec![candle.value_history_output.clone()],
+            vec![true],
+            0.001,
+        )
+        .unwrap();
+        optimizer.step(&gradients).unwrap();
+        candle.copy_to_model(&mut model).unwrap();
+        let candle_wdl = candle_nn::ops::softmax(&candle.forward(&batch).unwrap().value_logits, 1)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let (cpu_wdl, _) = crate::az::outputs_for_training_sample(&model, &sample).unwrap();
+        assert!(
+            cpu_wdl
+                .iter()
+                .zip(&candle_wdl[0])
+                .all(|(a, b)| (a - b).abs() < 1e-5)
+        );
+    }
 
     fn assert_shared_gradients(
         model: &AzCandleModel,
@@ -793,6 +894,7 @@ mod tests {
             repetition_flags,
             features: extract_sparse_features_az(&position),
             rule_context: [0.0; RULE_CONTEXT_SIZE],
+            history_features: crate::az::history_features(&position, &[]),
             move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
             policy: vec![1.0; moves.len()],
             value_wdl: [0.0, 1.0, 0.0],
@@ -948,6 +1050,7 @@ mod tests {
             value_head_bias,
             value_king_piece_hidden,
             value_head_output,
+            value_history_output,
             policy_threat_context,
             policy_move_bias,
             policy_consequence_output,
@@ -992,6 +1095,7 @@ mod tests {
                     policy: vec![1.0 / moves.len() as f32; moves.len()],
                     repetition_flags: vec![0; moves.len()],
                     rule_context: [0.0; RULE_CONTEXT_SIZE],
+                    history_features: crate::az::history_features(position, &[]),
                     value_wdl: [1.0, 0.0, 0.0],
                     root_search_wdl: [1.0, 0.0, 0.0],
                     value: 1.0,

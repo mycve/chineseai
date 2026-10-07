@@ -18,6 +18,7 @@ mod dataloader;
 mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
+mod history;
 mod inference;
 mod mate;
 pub mod nnue;
@@ -72,12 +73,14 @@ pub(crate) use crate::xiangqi::PieceKind;
 
 pub(crate) use accumulator::*;
 pub(crate) use arch::*;
+pub use history::{history_features, history_features_from_planes};
 pub(crate) use inference::*;
 pub(crate) use simd::*;
 
 pub use arch::{
-    AzMovesLeftParams, AzNnueArch, CHECK_CONTEXT_SIZE, DENSE_MOVE_SPACE, POLICY_SPARSE_MAIN_SIZE,
-    POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_FACTOR_SIZE, RULE_CONTEXT_SIZE, dense_move_index,
+    AzMovesLeftParams, AzNnueArch, CHECK_CONTEXT_SIZE, DENSE_MOVE_SPACE, HISTORY_CONTEXT_SIZE,
+    POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_FACTOR_SIZE,
+    RULE_CONTEXT_SIZE, dense_move_index,
 };
 pub use inference::{AzNnue, outputs_for_training_sample, position_for_training_sample};
 pub use mate::{

@@ -71,6 +71,7 @@ macro_rules! az_weight_tensors {
             [VALUE_KING_PIECE_VOCAB, VALUE_HEAD_SIZE]
         );
         $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(value_history_output, [WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE]);
         $visit!(moves_left_output, [1, $h]);
         $visit!(moves_left_bias, [1]);
         $visit!(
@@ -609,6 +610,9 @@ pub struct AzNnue {
     pub value_head_bias: Vec<f32>,
     pub value_king_piece_hidden: Vec<f32>,
     pub value_head_output: Vec<f32>,
+    /// 当前48维空间摘要与最近两步48维变化的 WDL 旁路，布局为 [3, 96]。
+    pub value_history_output: Vec<f32>,
+    pub(crate) value_history_cache: super::history::ValueHistoryCache,
     pub moves_left_output: Vec<f32>,
     pub moves_left_bias: Vec<f32>,
     pub(crate) moves_left_active: bool,
@@ -692,6 +696,8 @@ impl Clone for AzNnue {
             value_head_bias: self.value_head_bias.clone(),
             value_king_piece_hidden: self.value_king_piece_hidden.clone(),
             value_head_output: self.value_head_output.clone(),
+            value_history_output: self.value_history_output.clone(),
+            value_history_cache: self.value_history_cache.clone(),
             moves_left_output: self.moves_left_output.clone(),
             moves_left_bias: self.moves_left_bias.clone(),
             moves_left_active: self.moves_left_active,
@@ -917,6 +923,8 @@ impl AzNnue {
             value_head_bias,
             value_king_piece_hidden,
             value_head_output,
+            value_history_output: vec![0.0; WDL_HEAD_SIZE * HISTORY_CONTEXT_SIZE],
+            value_history_cache: super::history::ValueHistoryCache::default(),
             moves_left_output: vec![0.0; hidden_size],
             moves_left_bias: vec![0.0],
             moves_left_active: false,
@@ -954,6 +962,7 @@ impl AzNnue {
         model.rebuild_value_threat();
         model.rebuild_check_context();
         model.rebuild_moves_left();
+        model.rebuild_value_history();
         model
     }
 
@@ -1125,6 +1134,8 @@ impl AzNnue {
             value_head_bias: load_candle_f32_tensor(&tensors, "value_head_bias")?,
             value_king_piece_hidden: load_candle_f32_tensor(&tensors, "value_king_piece_hidden")?,
             value_head_output: load_candle_f32_tensor(&tensors, "value_head_output")?,
+            value_history_output: load_candle_f32_tensor(&tensors, "value_history_output")?,
+            value_history_cache: super::history::ValueHistoryCache::default(),
             moves_left_output: load_candle_f32_tensor(&tensors, "moves_left_output")?,
             moves_left_bias: load_candle_f32_tensor(&tensors, "moves_left_bias")?,
             moves_left_active: false,
@@ -1166,6 +1177,7 @@ impl AzNnue {
         model.rebuild_check_context();
         model.rebuild_moves_left();
         model.rebuild_policy_tactical();
+        model.rebuild_value_history();
         model.validate()?;
         Ok(model)
     }
@@ -1182,10 +1194,12 @@ impl AzNnue {
         moves: &[Move],
     ) -> f32 {
         let mut scratch = AzEvalScratch::new(self.arch);
-        self.evaluate_with_scratch_output(
+        self.evaluate_with_scratch_output_with_repetition_and_history(
             position,
             moves,
+            &[],
             &rule_context_features(position, history),
+            history,
             &mut scratch,
         )
         .value
@@ -1198,10 +1212,12 @@ impl AzNnue {
         moves: &[Move],
     ) -> [f32; WDL_HEAD_SIZE] {
         let mut scratch = AzEvalScratch::new(self.arch);
-        self.evaluate_with_scratch_output(
+        self.evaluate_with_scratch_output_with_repetition_and_history(
             position,
             moves,
+            &[],
             &rule_context_features(position, history),
+            history,
             &mut scratch,
         )
         .value_wdl
@@ -1241,8 +1257,72 @@ impl AzNnue {
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
-        let value =
-            self.evaluate_value_only_with_scratch_output(position, moves, rule_context, scratch);
+        self.evaluate_with_scratch_output_with_repetition_and_history(
+            position,
+            moves,
+            repetition_flags,
+            rule_context,
+            &[],
+            scratch,
+        )
+    }
+
+    pub(crate) fn evaluate_with_scratch_output_with_repetition_and_history(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        repetition_flags: &[u8],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        let history_logits = self.value_history_cache.logits(position, history);
+        self.evaluate_with_scratch_output_with_history_logits(
+            position,
+            moves,
+            repetition_flags,
+            rule_context,
+            history_logits,
+            scratch,
+        )
+    }
+
+    pub(crate) fn evaluate_with_scratch_output_with_repetition_and_history_features(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        repetition_flags: &[u8],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        history_features: &[f32; HISTORY_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        let history_logits = self.value_history_logits_from_features(history_features);
+        self.evaluate_with_scratch_output_with_history_logits(
+            position,
+            moves,
+            repetition_flags,
+            rule_context,
+            history_logits,
+            scratch,
+        )
+    }
+
+    fn evaluate_with_scratch_output_with_history_logits(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        repetition_flags: &[u8],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        history_logits: [f32; WDL_HEAD_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        let value = self.evaluate_value_only_with_history_logits(
+            position,
+            moves,
+            rule_context,
+            history_logits,
+            scratch,
+        );
         scratch.policy_accumulator_context =
             self.policy_accumulator(position, position.side_to_move());
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
@@ -1254,6 +1334,24 @@ impl AzNnue {
         position: &Position,
         moves: &[Move],
         rule_context: &[f32; RULE_CONTEXT_SIZE],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        let history_logits = self.value_history_cache.logits(position, &[]);
+        self.evaluate_value_only_with_history_logits(
+            position,
+            moves,
+            rule_context,
+            history_logits,
+            scratch,
+        )
+    }
+
+    fn evaluate_value_only_with_history_logits(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        history_logits: [f32; WDL_HEAD_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         crate::scope_profile!("az.evaluate_with_scratch");
@@ -1290,11 +1388,14 @@ impl AzNnue {
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
             self.value_king_piece_accumulate(position, &mut scratch.value_king_piece_accumulator);
-            let threat_logits = self.value_threat_logits(
+            let mut threat_logits = self.value_threat_logits(
                 position,
                 &mut scratch.value_threat_accumulator,
                 &mut scratch.value_threat_activation,
             );
+            for j in 0..WDL_HEAD_SIZE {
+                threat_logits[j] += history_logits[j];
+            }
             self.value_wdl_from_hidden_into(
                 &scratch.hidden,
                 &scratch.value_king_piece_accumulator,
@@ -1310,6 +1411,7 @@ impl AzNnue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn evaluate_incremental_with_scratch_output(
         &self,
         position: &Position,
@@ -1320,6 +1422,30 @@ impl AzNnue {
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
+        self.evaluate_incremental_with_scratch_output_with_history(
+            position,
+            accumulator_hidden,
+            policy_accumulator,
+            moves,
+            repetition_flags,
+            rule_context,
+            &[],
+            scratch,
+        )
+    }
+
+    pub(crate) fn evaluate_incremental_with_scratch_output_with_history(
+        &self,
+        position: &Position,
+        accumulator_hidden: &[f32],
+        policy_accumulator: &[f32; POLICY_ACCUMULATOR_RANK],
+        moves: &[Move],
+        repetition_flags: &[u8],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        let history_logits = self.value_history_cache.logits(position, history);
         crate::scope_profile!("az.evaluate_incremental_with_scratch");
         scratch.hidden.resize(self.hidden_size, 0.0);
         let hidden = if accumulator_hidden.len() == self.hidden_size {
@@ -1359,11 +1485,14 @@ impl AzNnue {
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
             self.value_king_piece_accumulate(position, &mut scratch.value_king_piece_accumulator);
-            let threat_logits = self.value_threat_logits(
+            let mut threat_logits = self.value_threat_logits(
                 position,
                 &mut scratch.value_threat_accumulator,
                 &mut scratch.value_threat_activation,
             );
+            for j in 0..WDL_HEAD_SIZE {
+                threat_logits[j] += history_logits[j];
+            }
             self.value_wdl_from_hidden_into(
                 &scratch.hidden,
                 &scratch.value_king_piece_accumulator,
@@ -1910,6 +2039,32 @@ impl AzNnue {
         }
     }
 
+    pub(crate) fn rebuild_value_history(&mut self) {
+        self.value_history_cache =
+            super::history::ValueHistoryCache::new(&self.value_history_output);
+    }
+
+    pub fn value_history_logits_from_features(
+        &self,
+        features: &[f32; HISTORY_CONTEXT_SIZE],
+    ) -> [f32; WDL_HEAD_SIZE] {
+        std::array::from_fn(|output| {
+            dot_product(
+                features,
+                &self.value_history_output
+                    [output * HISTORY_CONTEXT_SIZE..(output + 1) * HISTORY_CONTEXT_SIZE],
+            )
+        })
+    }
+
+    pub fn value_history_logits(
+        &self,
+        position: &Position,
+        history: &[crate::xiangqi::RuleHistoryEntry],
+    ) -> [f32; WDL_HEAD_SIZE] {
+        self.value_history_cache.logits(position, history)
+    }
+
     pub(crate) fn rebuild_policy_cache(&mut self) {
         let mut projected = Vec::with_capacity(POLICY_ACCUMULATOR_ROWS * POLICY_ACCUMULATOR_RANK);
         let projection = &self.policy_accumulator_hidden;
@@ -2139,6 +2294,14 @@ impl AzNnue {
             };
         }
         az_weight_tensors!(validate_tensor, hidden);
+        if self.value_history_output.iter().any(|x| !x.is_finite())
+            || !self.value_history_cache.valid()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "az history head has invalid parameters or derived cache",
+            ));
+        }
         if self.policy_accumulator_features.len()
             != POLICY_ACCUMULATOR_ROWS * POLICY_ACCUMULATOR_RANK
             || self.policy_accumulator_move.len() != DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK
@@ -2186,11 +2349,12 @@ pub fn outputs_for_training_sample(
         return None;
     }
     let mut scratch = AzEvalScratch::new(model.arch);
-    let evaluated = model.evaluate_with_scratch_output_with_repetition(
+    let evaluated = model.evaluate_with_scratch_output_with_repetition_and_history_features(
         &position,
         &moves,
         &sample.repetition_flags,
         &sample.rule_context,
+        &sample.history_features,
         &mut scratch,
     );
     Some((evaluated.value_wdl, scratch.logits))

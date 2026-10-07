@@ -28,6 +28,7 @@ mod tests {
         AzTrainingSample {
             features: nnue::extract_sparse_features_az(&position),
             rule_context: [0.0; RULE_CONTEXT_SIZE],
+            history_features: [0.0; super::HISTORY_CONTEXT_SIZE],
             move_indices: moves.iter().map(|mv| dense_move_index(*mv)).collect(),
             repetition_flags: Vec::new(),
             policy,

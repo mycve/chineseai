@@ -621,6 +621,7 @@ mod monitoring_tests {
             repetition_flags: Vec::new(),
             features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
+            history_features: crate::az::history_features(&position, &[]),
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))
@@ -728,6 +729,7 @@ mod monitoring_tests {
         let sample = AzTrainingSample {
             features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
+            history_features: crate::az::history_features(&position, &[]),
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))
@@ -791,6 +793,7 @@ mod monitoring_tests {
             repetition_flags: Vec::new(),
             features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
+            history_features: crate::az::history_features(&position, &[]),
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))

@@ -975,18 +975,20 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
             let accumulator_end = accumulator_start + self.model.hidden_size;
-            self.model.evaluate_incremental_with_scratch_output(
-                &self.nodes[node_index].position,
-                &self.accumulator_arena[accumulator_start..accumulator_end],
-                &self.nodes[node_index].policy_accumulator,
-                &moves,
-                &repetition_flags,
-                &rule_context_features(
+            self.model
+                .evaluate_incremental_with_scratch_output_with_history(
                     &self.nodes[node_index].position,
+                    &self.accumulator_arena[accumulator_start..accumulator_end],
+                    &self.nodes[node_index].policy_accumulator,
+                    &moves,
+                    &repetition_flags,
+                    &rule_context_features(
+                        &self.nodes[node_index].position,
+                        &self.rule_history_scratch,
+                    ),
                     &self.rule_history_scratch,
-                ),
-                &mut self.eval_scratch,
-            )
+                    &mut self.eval_scratch,
+                )
         };
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
         eval.value *= self.value_scale;
@@ -1351,18 +1353,20 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
             let accumulator_end = accumulator_start + self.model.hidden_size;
-            self.model.evaluate_incremental_with_scratch_output(
-                &self.nodes[node_index].position,
-                &self.accumulator_arena[accumulator_start..accumulator_end],
-                &self.nodes[node_index].policy_accumulator,
-                &moves,
-                &repetition_flags,
-                &rule_context_features(
+            self.model
+                .evaluate_incremental_with_scratch_output_with_history(
                     &self.nodes[node_index].position,
+                    &self.accumulator_arena[accumulator_start..accumulator_end],
+                    &self.nodes[node_index].policy_accumulator,
+                    &moves,
+                    &repetition_flags,
+                    &rule_context_features(
+                        &self.nodes[node_index].position,
+                        &self.rule_history_scratch,
+                    ),
                     &self.rule_history_scratch,
-                ),
-                &mut self.eval_scratch,
-            )
+                    &mut self.eval_scratch,
+                )
         };
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
         eval.value *= self.value_scale;
