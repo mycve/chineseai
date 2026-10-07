@@ -1876,6 +1876,9 @@ impl AzNnue {
 
     /// 全零（旧 checkpoint / 还没训练出来）时整块跳过，评估路径与加这个块之前完全一致。
     pub(crate) fn moves_left_from_hidden(&self, hidden: &[f32]) -> f32 {
+        if !self.moves_left_active {
+            return MOVES_LEFT_SCALE;
+        }
         ((dot_product(hidden, &self.moves_left_output) + self.moves_left_bias[0] + 1.0).max(0.0)
             * MOVES_LEFT_SCALE)
             .min(4096.0)

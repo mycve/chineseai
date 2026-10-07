@@ -12,8 +12,9 @@ mod uci_search;
 pub(crate) use uci_search::{AzUciSearchResult, search_uci};
 
 use super::{
-    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzNnue, POLICY_ACCUMULATOR_RANK, SplitMix64,
-    check_context_features, color_index, mate, rule_context_features,
+    AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzMovesLeftParams, AzNnue,
+    POLICY_ACCUMULATOR_RANK, SplitMix64, check_context_features, color_index, mate,
+    rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.0;
@@ -1571,6 +1572,7 @@ impl<'a> AzTree<'a> {
             alphazero_fpu_value_reduction(node, children, fpu_reduction, draw_score)
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
+        let moves_left = self.moves_left_context(node_index);
         // 已完成战术搜索的反击至少实际访问两次，避免低策略先验把它埋掉。
         if let Some(reply) = node.tactical_reply {
             if let Some((index, _)) = children.iter().enumerate().find(|(_, child)| {
@@ -1591,15 +1593,15 @@ impl<'a> AzTree<'a> {
             if priority == 2 {
                 return index;
             }
-            let mut score = self.child_score_with_solved(
+            let score = self.child_score_with_solved(
                 child,
                 solved,
                 draw_score,
                 fpu_value,
                 parent_visits_sqrt,
                 cpuct,
+                moves_left.as_ref(),
             );
-            score += self.moves_left_utility(node_index, child, self.child_q(child, draw_score));
             let replace = best.is_none_or(|(_, best_priority, best_prior, best_score)| {
                 priority > best_priority
                     || (priority == best_priority
@@ -1665,6 +1667,7 @@ impl<'a> AzTree<'a> {
         fpu_value: f32,
         parent_visits_sqrt: f32,
         cpuct: f32,
+        moves_left: Option<&(f32, AzMovesLeftParams)>,
     ) -> f32 {
         let q = if child.visits > 0 {
             solved.map_or_else(
@@ -1675,7 +1678,14 @@ impl<'a> AzTree<'a> {
             fpu_value
         };
         let u = cpuct * child.prior * parent_visits_sqrt / (1.0 + child.visits as f32);
-        q + u
+        let score = q + u;
+        if let Some(context) = moves_left
+            && child.visits > 0
+            && solved.is_none()
+        {
+            return score + self.moves_left_bonus(context, child, q);
+        }
+        score
     }
 
     fn root_policy(&self, node_index: usize) -> Vec<f32> {
@@ -1727,15 +1737,15 @@ impl<'a> AzTree<'a> {
             .collect()
     }
 
-    /// 参考 PX0/LC0 classic MEvaluator：保留 Q，添加有上限、随胜负把握平滑增强的 M。
-    fn moves_left_utility(&self, node_index: usize, child: &AzChild, q: f32) -> f32 {
+    /// 父节点的 MLH 门槛与平均距离只算一次，低胜负把握时走普通 PUCT。
+    fn moves_left_context(&self, node_index: usize) -> Option<(f32, AzMovesLeftParams)> {
         let params = self.model.moves_left_params;
         if !params.enabled
             || !self.model.moves_left_active
-            || child.visits == 0
-            || self.child_solved(child).is_some()
+            || params.max_effect == 0.0
+            || params.slope == 0.0
         {
-            return 0.0;
+            return None;
         }
         let node = &self.nodes[node_index];
         let parent_q = if node.visits > 0 {
@@ -1744,16 +1754,26 @@ impl<'a> AzTree<'a> {
             node.value_wdl[0] - node.value_wdl[2]
         };
         if parent_q.abs() <= params.threshold {
-            return 0.0;
+            return None;
         }
         let parent_m = if node.visits > 0 {
             node.moves_left_sum / node.visits as f32
         } else {
             node.moves_left
         };
-        // 边上回传的距离含当前这一手；PX0 使用子节点自身的距离。
-        let child_m = self.child_moves_left(child) - 1.0;
-        if !parent_m.is_finite() || !child_m.is_finite() {
+        parent_m.is_finite().then_some((parent_m, params))
+    }
+
+    /// 参考 PX0/LC0 MEvaluator；调用方已检查已访问且未证明，直接复用 PUCT 的 Q。
+    fn moves_left_bonus(
+        &self,
+        (parent_m, params): &(f32, AzMovesLeftParams),
+        child: &AzChild,
+        q: f32,
+    ) -> f32 {
+        // 边上回传含当前这一手；PX0 使用子节点自身的距离。
+        let child_m = child.moves_left_sum / child.visits as f32 - 1.0;
+        if !child_m.is_finite() {
             return 0.0;
         }
         let x = if params.threshold > 0.0 && params.threshold < 1.0 {
@@ -1765,6 +1785,15 @@ impl<'a> AzTree<'a> {
         -q.signum()
             * m
             * (params.constant_factor + params.scaled_factor * x + params.quadratic_factor * x * x)
+    }
+
+    #[cfg(test)]
+    fn moves_left_utility(&self, node_index: usize, child: &AzChild, q: f32) -> f32 {
+        if child.visits == 0 || self.child_solved(child).is_some() {
+            return 0.0;
+        }
+        self.moves_left_context(node_index)
+            .map_or(0.0, |context| self.moves_left_bonus(&context, child, q))
     }
 
     fn child_moves_left(&self, child: &AzChild) -> f32 {
