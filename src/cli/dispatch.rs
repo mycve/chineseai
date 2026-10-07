@@ -1,7 +1,10 @@
 use clap::{CommandFactory, Parser};
 
 use crate::cli::args::{Cli, CliCommand};
-use crate::cli::{az_bench, az_init, az_loop, az_policy_scale, az_search, dive_games, vs_pikafish};
+use crate::cli::{
+    az_bench, az_calibrate_policy, az_init, az_loop, az_policy_scale, az_search, dive_games,
+    vs_pikafish,
+};
 
 pub(crate) fn run() {
     let cli = Cli::parse();
@@ -12,6 +15,7 @@ pub(crate) fn run() {
         }
         Some(CliCommand::AzInit(cmd)) => az_init::run(cmd),
         Some(CliCommand::AzPolicyScale(cmd)) => az_policy_scale::run(cmd),
+        Some(CliCommand::AzCalibratePolicy(cmd)) => az_calibrate_policy::run(cmd),
         Some(CliCommand::AzSearch(cmd)) => az_search::run(cmd),
         Some(CliCommand::AzBench(cmd)) => az_bench::run(cmd),
         // `az_loop::run` returns false exactly where the old match arm did `return;`,

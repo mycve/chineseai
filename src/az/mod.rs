@@ -22,6 +22,8 @@ mod inference;
 mod mate;
 pub mod nnue;
 mod play;
+mod policy_calibration;
+pub use policy_calibration::{PolicyCalibrationReport, calibrate_policy};
 pub mod px0_data;
 mod px0_policy_map;
 #[path = "px0_sgd.rs"]

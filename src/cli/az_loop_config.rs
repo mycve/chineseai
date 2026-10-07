@@ -131,7 +131,7 @@ impl Default for AzLoopFileConfig {
             max_plies: 450,
             sixty_move_rule: true,
             rule60_max_ply: 120,
-            hidden_size: 128,
+            hidden_size: AzNnueArch::default().hidden_size,
             seed: 20260420,
             workers: 0,
             temperature_start: 0.9,
@@ -643,7 +643,7 @@ mod tests {
         assert!(text.contains("workers = 0\n"));
         assert!(text.contains("batch_size = 2048\n"));
         assert!(text.contains("max_plies = 450\n"));
-        assert!(text.contains("hidden_size = 128\n"));
+        assert!(text.contains("hidden_size = 96\n"));
         assert!(text.contains("replay_capacity = 2400000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));
         assert!(text.contains("train_warmup_samples = 600000\n"));

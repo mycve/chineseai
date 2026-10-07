@@ -23,6 +23,8 @@ pub(crate) enum CliCommand {
     AzInit(AzInitArgs),
     /// Scale one policy component for structural ablation.
     AzPolicyScale(AzPolicyScaleArgs),
+    /// 冻结网络，校准已有策略因子并保存新模型。
+    AzCalibratePolicy(AzCalibratePolicyArgs),
     /// Search one position and print policy/debug details.
     AzSearch(AzSearchArgs),
     /// Benchmark fixed-position search speed.
@@ -175,7 +177,7 @@ pub(crate) struct DiveGamesArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct AzInitArgs {
     /// Hidden size of the model.
-    #[arg(default_value_t = 128)]
+    #[arg(default_value_t = chineseai::az::AzNnueArch::default().hidden_size)]
     pub(crate) hidden: usize,
     /// Output model path.
     #[arg(default_value = "model.safetensors")]
@@ -189,6 +191,27 @@ impl AzInitArgs {
     pub(crate) fn arch(&self) -> chineseai::az::AzNnueArch {
         chineseai::az::AzNnueArch::with_hidden_size(self.hidden.max(1))
     }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AzCalibratePolicyArgs {
+    /// 输入模型路径。
+    #[arg(long)]
+    pub(crate) model: String,
+    /// Px0 训练 TAR；固定留出组自动排除。
+    #[arg(long)]
+    pub(crate) train: String,
+    /// 新模型路径，拒绝覆盖已有文件。
+    #[arg(long)]
+    pub(crate) output: String,
+    /// 最多加载的完整训练对局数。
+    #[arg(long, default_value_t = 512)]
+    pub(crate) games: usize,
+    /// 策略因子更新次数。
+    #[arg(long, default_value_t = 1000)]
+    pub(crate) steps: usize,
+    #[arg(long, default_value_t = 17)]
+    pub(crate) seed: u64,
 }
 
 #[derive(Args, Debug, Clone)]

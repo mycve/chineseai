@@ -1,5 +1,6 @@
 mod args;
 mod az_bench;
+mod az_calibrate_policy;
 mod az_init;
 mod az_loop;
 mod az_loop_config;

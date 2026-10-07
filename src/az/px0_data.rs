@@ -145,6 +145,33 @@ pub fn load(path: &Path, max_games: usize, validation_games: usize) -> io::Resul
     finish_dataset(dataset)
 }
 
+/// 仅加载名称散列不属于固定留出组的训练对局，适用于独立校准工具。
+pub fn load_training(path: &Path, max_games: usize) -> io::Result<Vec<AzTrainingSample>> {
+    if max_games == 0 {
+        return Err(invalid("training game count must be positive"));
+    }
+    let mut archive = tar::Archive::new(File::open(path)?);
+    let mut dataset = empty_dataset();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let name = entry.path()?.to_string_lossy().into_owned();
+        if game_id(&name) % 10 == 0 {
+            continue;
+        }
+        decode_game(&mut dataset, &name, entry, false)?;
+        if dataset.games >= max_games {
+            break;
+        }
+    }
+    if dataset.train.is_empty() {
+        return Err(invalid("empty training samples"));
+    }
+    Ok(dataset.train)
+}
+
 fn empty_dataset() -> Dataset {
     Dataset {
         train: vec![],
