@@ -1352,7 +1352,24 @@ impl AzNnue {
         rule_context: &[f32; RULE_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
-        let history_logits = self.value_history_cache.logits(position, &[]);
+        self.evaluate_value_only_with_scratch_output_with_history(
+            position,
+            moves,
+            rule_context,
+            &[],
+            scratch,
+        )
+    }
+
+    pub(crate) fn evaluate_value_only_with_scratch_output_with_history(
+        &self,
+        position: &Position,
+        moves: &[Move],
+        rule_context: &[f32; RULE_CONTEXT_SIZE],
+        history: &[crate::xiangqi::RuleHistoryEntry],
+        scratch: &mut AzEvalScratch,
+    ) -> AzEvalOutput {
+        let history_logits = self.value_history_cache.logits(position, history);
         self.evaluate_value_only_with_history_logits(
             position,
             moves,

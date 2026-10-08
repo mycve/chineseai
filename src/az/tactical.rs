@@ -19,6 +19,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stand_pat_uses_recent_move_history() {
+        let mut p = Position::startpos();
+        let mut history = p.initial_rule_history();
+        for text in ["b0c2", "b9c7"] {
+            let mv = p.parse_uci_move(text).unwrap();
+            history.push(p.rule_history_entry_after_move(mv));
+            p.make_move(mv);
+        }
+        let features = crate::az::history_features(&p, &history);
+        assert!(features[48..].iter().any(|&x| x != 0.0));
+        let mut model = AzNnue::random(8, 31);
+        model.value_history_output.fill(0.0);
+        for i in 48..96 {
+            model.value_history_output[i] = features[i] * 100.0;
+        }
+        model.rebuild_value_history();
+        let moves = p.legal_moves_with_rules(&history);
+        let expected = model.evaluate_wdl_with_rules(&p, &history, &moves);
+        let no_history = model.evaluate_wdl_with_rules(&p, &[], &moves);
+        assert!((expected[0] - no_history[0]).abs() > 1e-4);
+        let original_history = history.clone();
+        let mut probe = TacticalProbe::new(&model, 1, 1.0);
+        let actual = probe
+            .search(&p, &mut history, 0, 0, 0, -2.0, 2.0, 0.0)
+            .unwrap();
+        assert_eq!(actual.value_wdl, expected);
+        assert_eq!(history, original_history);
+    }
+
+    #[test]
     fn full_width_compares_every_quiet_reply_and_preserves_wdl() {
         let model = AzNnue::random(8, 31);
         let p = Position::startpos();
@@ -202,12 +232,15 @@ impl<'a> TacticalProbe<'a> {
         }
         let stand_pat = quiet == 0 && !checked;
         let mut best = if stand_pat {
-            let mut value = self.model.evaluate_value_only_with_scratch_output(
-                p,
-                &moves,
-                &rule_context_features(p, h),
-                &mut self.scratch,
-            );
+            let mut value = self
+                .model
+                .evaluate_value_only_with_scratch_output_with_history(
+                    p,
+                    &moves,
+                    &rule_context_features(p, h),
+                    h,
+                    &mut self.scratch,
+                );
             value.value_wdl = scale_wdl_value(value.value_wdl, self.value_scale);
             value.value *= self.value_scale;
             value
