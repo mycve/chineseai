@@ -59,6 +59,7 @@ pub struct AzLoopReport {
     pub games: usize,
     pub samples: usize,
     pub avg_search_simulations: f32,
+    pub search_nn_cache_hit_rate: f32,
     pub red_wins: usize,
     pub black_wins: usize,
     pub draws: usize,

@@ -123,6 +123,10 @@ pub(crate) fn build_async_training_report(
         samples: selfplay_samples,
         avg_search_simulations: pending.selfplay.search_simulations.simulations_sum as f32
             / search_count,
+        search_nn_cache_hit_rate: pending.selfplay.search_simulations.nn_cache_hits as f32
+            / (pending.selfplay.search_simulations.nn_evaluations
+                + pending.selfplay.search_simulations.nn_cache_hits)
+                .max(1) as f32,
         red_wins: pending.selfplay.red_wins,
         black_wins: pending.selfplay.black_wins,
         draws: pending.selfplay.draws,

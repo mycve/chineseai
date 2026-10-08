@@ -51,12 +51,16 @@ pub struct AzTerminalStats {
 pub struct AzSearchSimulationStats {
     pub searches: usize,
     pub simulations_sum: usize,
+    pub nn_evaluations: usize,
+    pub nn_cache_hits: usize,
 }
 
 impl AzSearchSimulationStats {
     pub fn add_assign(&mut self, other: &Self) {
         self.searches += other.searches;
         self.simulations_sum += other.simulations_sum;
+        self.nn_evaluations += other.nn_evaluations;
+        self.nn_cache_hits += other.nn_cache_hits;
     }
 }
 
@@ -507,12 +511,13 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                     &position,
                     &rule_history,
                     legal,
-                    model,
                     limits,
                     &mut search_workspace,
                 )
             };
             search_simulations.simulations_sum += search.simulations;
+            search_simulations.nn_evaluations += search_workspace.last_nn_evaluations;
+            search_simulations.nn_cache_hits += search_workspace.last_cache_hits;
             crate::scope_profile!("az.selfplay.post_search");
             let proven_result = proven_root_value(&search.candidates).map(|value| {
                 value as f32

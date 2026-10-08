@@ -5,6 +5,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+mod eval_cache;
+
 #[path = "tactical.rs"]
 mod tactical;
 #[path = "uci_search.rs"]
@@ -359,7 +361,11 @@ pub fn alphazero_search(
     alphazero_search_with_rules(position, None, None, model, limits)
 }
 
-pub(super) struct AzSearchWorkspace {
+pub(super) struct AzSearchWorkspace<'a> {
+    model: &'a AzNnue,
+    previous_limits: Option<AzSearchLimits>,
+    pub(super) last_nn_evaluations: usize,
+    pub(super) last_cache_hits: usize,
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
@@ -368,9 +374,13 @@ pub(super) struct AzSearchWorkspace {
     rule_history_scratch: Vec<RuleHistoryEntry>,
 }
 
-impl AzSearchWorkspace {
-    pub(super) fn new(model: &AzNnue) -> Self {
+impl<'a> AzSearchWorkspace<'a> {
+    pub(super) fn new(model: &'a AzNnue) -> Self {
         Self {
+            model,
+            previous_limits: None,
+            last_nn_evaluations: 0,
+            last_cache_hits: 0,
             nodes: Vec::new(),
             children: Vec::new(),
             accumulator_arena: Vec::new(),
@@ -385,16 +395,14 @@ pub(super) fn alphazero_search_with_rules_reusing(
     position: &Position,
     rule_history: &[RuleHistoryEntry],
     root_moves: Vec<Move>,
-    model: &AzNnue,
     limits: AzSearchLimits,
-    workspace: &mut AzSearchWorkspace,
+    workspace: &mut AzSearchWorkspace<'_>,
 ) -> AzSearchResult {
     crate::scope_profile!("az.alphazero_search");
     let mut tree = AzTree::new_reusing(
         position.clone(),
         rule_history,
         Some(root_moves),
-        model,
         limits,
         workspace,
     );
@@ -403,7 +411,7 @@ pub(super) fn alphazero_search_with_rules_reusing(
         crate::scope_profile!("az.search.root_expand");
         tree.expand(root);
     }
-    tree.prove_root_mate(position, model);
+    tree.prove_root_mate(position, workspace.model);
     let used = if tree.nodes[root].children_len == 0 {
         0
     } else {
@@ -422,6 +430,8 @@ pub(super) fn alphazero_search_with_rules_reusing(
         used
     };
     let result = tree.search_result(used);
+    workspace.last_nn_evaluations = tree.nn_evaluations;
+    workspace.last_cache_hits = tree.cache_hits;
     tree.recycle_into(workspace);
     result
 }
@@ -505,10 +515,14 @@ struct AzTree<'a> {
     tactical_completed: usize,
     tactical_aborted: usize,
     search_control: Option<AzSearchControl>,
+    eval_cache: Option<eval_cache::CachedTree>,
+    cache_hits: usize,
+    nn_evaluations: usize,
 }
 
 #[derive(Clone)]
 struct AzNode {
+    cache_node: u32,
     position: Position,
     accumulator_offset: u32,
     policy_accumulator: [f32; POLICY_ACCUMULATOR_RANK],
@@ -536,6 +550,7 @@ struct AzNode {
 #[derive(Clone)]
 struct AzChild {
     mv: Move,
+    gives_check: bool,
     prior: f32,
     visits: u32,
     value_wdl_sum: [f32; 3],
@@ -722,15 +737,15 @@ impl<'a> AzTree<'a> {
         position: Position,
         rule_history: &[RuleHistoryEntry],
         root_moves: Option<Vec<Move>>,
-        model: &'a AzNnue,
         limits: AzSearchLimits,
-        workspace: &mut AzSearchWorkspace,
+        workspace: &mut AzSearchWorkspace<'a>,
     ) -> Self {
-        Self::new_with_buffers(
+        let cached = eval_cache::take_cached(&position, rule_history, limits, workspace);
+        let mut tree = Self::new_with_buffers(
             position,
             rule_history,
             root_moves,
-            model,
+            workspace.model,
             limits,
             std::mem::take(&mut workspace.nodes),
             std::mem::take(&mut workspace.children),
@@ -739,9 +754,14 @@ impl<'a> AzTree<'a> {
             workspace
                 .eval_scratch
                 .take()
-                .unwrap_or_else(|| AzEvalScratch::new(model.arch)),
+                .unwrap_or_else(|| AzEvalScratch::new(workspace.model.arch)),
             std::mem::take(&mut workspace.rule_history_scratch),
-        )
+        );
+        if let Some(cached) = cached {
+            tree.nodes[0].cache_node = cached.root as u32;
+            tree.eval_cache = Some(cached);
+        }
+        tree
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -777,6 +797,7 @@ impl<'a> AzTree<'a> {
         let root_policy_accumulator =
             root_policy_accumulators[color_index(position.side_to_move())];
         nodes.push(AzNode {
+            cache_node: NO_CHILD,
             position,
             accumulator_offset: root_accumulator_offset as u32,
             policy_accumulator: root_policy_accumulator,
@@ -857,10 +878,13 @@ impl<'a> AzTree<'a> {
             tactical_completed: 0,
             tactical_aborted: 0,
             search_control: None,
+            eval_cache: None,
+            cache_hits: 0,
+            nn_evaluations: 0,
         }
     }
 
-    fn recycle_into(mut self, workspace: &mut AzSearchWorkspace) {
+    fn recycle_into(mut self, workspace: &mut AzSearchWorkspace<'_>) {
         workspace.nodes = std::mem::take(&mut self.nodes);
         workspace.children = std::mem::take(&mut self.children);
         workspace.accumulator_arena = std::mem::take(&mut self.accumulator_arena);
@@ -971,45 +995,72 @@ impl<'a> AzTree<'a> {
             };
         }
 
-        let mut eval = {
-            crate::scope_profile!("az.search.nn_eval");
-            let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
-            let accumulator_end = accumulator_start + self.model.hidden_size;
-            self.model
-                .evaluate_incremental_with_scratch_output_with_history(
+        let cached = if node_index == self.root {
+            None
+        } else {
+            self.eval_cache.as_ref().and_then(|cache| {
+                cache.network(
+                    self.nodes[node_index].cache_node,
                     &self.nodes[node_index].position,
-                    &self.accumulator_arena[accumulator_start..accumulator_end],
-                    &self.nodes[node_index].policy_accumulator,
                     &moves,
-                    &repetition_flags,
-                    &rule_context_features(
-                        &self.nodes[node_index].position,
-                        &self.rule_history_scratch,
-                    ),
-                    &self.rule_history_scratch,
-                    &mut self.eval_scratch,
                 )
+            })
         };
-        eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
-        eval.value *= self.value_scale;
-        if let Some(tactical_eval) = self.tactical_value(node_index, &moves) {
-            eval = tactical_eval;
-        }
-        if node_index == self.root {
-            softmax_into(
-                &self.eval_scratch.logits[..moves.len()],
-                1.0,
-                &mut self.root_raw_priors,
-            );
-        }
-        let priors = {
-            crate::scope_profile!("az.search.softmax");
-            softmax_into(
-                &self.eval_scratch.logits[..moves.len()],
-                self.policy_softmax_temp,
-                &mut self.eval_scratch.priors,
-            )
+        let eval = if let Some((eval, priors)) = cached {
+            self.cache_hits += 1;
+            self.eval_scratch.priors.clear();
+            self.eval_scratch
+                .priors
+                .extend(priors.iter().map(|edge| edge.prior));
+            self.eval_scratch.policy_gives_check.clear();
+            self.eval_scratch
+                .policy_gives_check
+                .extend(priors.iter().map(|edge| u8::from(edge.gives_check) as f32));
+            eval
+        } else {
+            let mut eval = {
+                self.nn_evaluations += 1;
+                crate::scope_profile!("az.search.nn_eval");
+                let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
+                let accumulator_end = accumulator_start + self.model.hidden_size;
+                self.model
+                    .evaluate_incremental_with_scratch_output_with_history(
+                        &self.nodes[node_index].position,
+                        &self.accumulator_arena[accumulator_start..accumulator_end],
+                        &self.nodes[node_index].policy_accumulator,
+                        &moves,
+                        &repetition_flags,
+                        &rule_context_features(
+                            &self.nodes[node_index].position,
+                            &self.rule_history_scratch,
+                        ),
+                        &self.rule_history_scratch,
+                        &mut self.eval_scratch,
+                    )
+            };
+            eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
+            eval.value *= self.value_scale;
+            if let Some(tactical_eval) = self.tactical_value(node_index, &moves) {
+                eval = tactical_eval;
+            }
+            if node_index == self.root {
+                softmax_into(
+                    &self.eval_scratch.logits[..moves.len()],
+                    1.0,
+                    &mut self.root_raw_priors,
+                );
+            }
+            {
+                crate::scope_profile!("az.search.softmax");
+                softmax_into(
+                    &self.eval_scratch.logits[..moves.len()],
+                    self.policy_softmax_temp,
+                    &mut self.eval_scratch.priors,
+                );
+            }
+            eval
         };
+        let priors = &mut self.eval_scratch.priors;
         if node_index == self.root
             && self.root_dirichlet_alpha > 0.0
             && self.root_exploration_fraction > 0.0
@@ -1026,20 +1077,21 @@ impl<'a> AzTree<'a> {
             crate::scope_profile!("az.search.children_build");
             let priors = &mut self.eval_scratch.priors;
             let offset = self.children.len();
-            self.children
-                .extend(
-                    moves
-                        .into_iter()
-                        .zip(priors.drain(..))
-                        .map(|(mv, prior)| AzChild {
-                            mv,
-                            prior,
-                            visits: 0,
-                            value_wdl_sum: [0.0; 3],
-                            moves_left_sum: 0.0,
-                            child: NO_CHILD,
-                        }),
-                );
+            self.children.extend(
+                moves
+                    .into_iter()
+                    .zip(priors.drain(..))
+                    .zip(&self.eval_scratch.policy_gives_check)
+                    .map(|((mv, prior), &gives_check)| AzChild {
+                        mv,
+                        gives_check: gives_check != 0.0,
+                        prior,
+                        visits: 0,
+                        value_wdl_sum: [0.0; 3],
+                        moves_left_sum: 0.0,
+                        child: NO_CHILD,
+                    }),
+            );
             let len = self.children.len() - offset;
             self.nodes[node_index].children_offset =
                 u32::try_from(offset).expect("MCTS child arena exceeds compact offset range");
@@ -1073,8 +1125,8 @@ impl<'a> AzTree<'a> {
     fn immediate_mate_child(&self, node_index: usize) -> Option<usize> {
         let position = &self.nodes[node_index].position;
         for (index, child) in self.node_children(node_index).iter().enumerate() {
-            // expand 刚评估过同序走法，复用 policy 已计算的将军标记。
-            if self.eval_scratch.policy_gives_check[index] == 0.0 {
+            // 将军标记来自同序网络评估或等价缓存。
+            if !child.gives_check {
                 continue;
             }
             let mut reply = position.clone();
@@ -1256,7 +1308,17 @@ impl<'a> AzTree<'a> {
                 let child_rule_entry =
                     child_position.rule_history_entry_after_moved(mover, mv, captured);
                 let child_node = self.nodes.len();
+                let cache_node = self.eval_cache.as_ref().map_or(NO_CHILD, |cache| {
+                    cache.matching_child(
+                        self.nodes[node_index].cache_node,
+                        child_index,
+                        mv,
+                        &child_position,
+                        child_rule_entry,
+                    )
+                });
                 self.nodes.push(AzNode {
+                    cache_node,
                     position: child_position,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
@@ -1350,6 +1412,7 @@ impl<'a> AzTree<'a> {
             };
         }
         let mut eval = {
+            self.nn_evaluations += 1;
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
             let accumulator_end = accumulator_start + self.model.hidden_size;
@@ -2304,7 +2367,6 @@ mod tests {
             &position,
             &history,
             vec![mv],
-            &model,
             limits,
             &mut workspace,
         );
@@ -2587,8 +2649,9 @@ mod tests {
 
     #[test]
     fn child_node_index_uses_compact_sentinel_representation() {
-        assert!(std::mem::size_of::<AzChild>() <= 40);
+        assert_eq!(std::mem::size_of::<AzChild>(), 32);
         let mut child = AzChild {
+            gives_check: false,
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
             visits: 0,
@@ -2624,6 +2687,7 @@ mod tests {
     #[test]
     fn wdl_q_applies_draw_score_instead_of_discarding_draw_probability() {
         let child = AzChild {
+            gives_check: false,
             mv: Position::startpos().legal_moves()[0],
             prior: 1.0,
             visits: 4,
@@ -2720,14 +2784,8 @@ mod tests {
             limits,
         );
         let mut workspace = AzSearchWorkspace::new(&model);
-        let actual = alphazero_search_with_rules_reusing(
-            &position,
-            &history,
-            legal,
-            &model,
-            limits,
-            &mut workspace,
-        );
+        let actual =
+            alphazero_search_with_rules_reusing(&position, &history, legal, limits, &mut workspace);
 
         assert_eq!(actual.best_move, expected.best_move);
         assert_eq!(actual.simulations, expected.simulations);
@@ -3013,6 +3071,7 @@ mod tests {
             tree.root,
             vec![
                 AzChild {
+                    gives_check: false,
                     mv: legal[0],
                     prior: 0.10,
                     visits: 1,
@@ -3021,6 +3080,7 @@ mod tests {
                     child: NO_CHILD,
                 },
                 AzChild {
+                    gives_check: false,
                     mv: legal[1],
                     prior: 0.90,
                     visits: 1,
@@ -3100,6 +3160,7 @@ mod tests {
             tree.root,
             [
                 AzChild {
+                    gives_check: false,
                     mv: legal[0],
                     prior: 0.25,
                     visits: 1,
@@ -3108,6 +3169,7 @@ mod tests {
                     child: NO_CHILD,
                 },
                 AzChild {
+                    gives_check: false,
                     mv: legal[1],
                     prior: 0.75,
                     visits: 0,
@@ -3786,7 +3848,6 @@ mod tests {
             &position,
             &history,
             vec![mate],
-            &model,
             limits,
             &mut workspace,
         );

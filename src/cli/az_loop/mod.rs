@@ -852,6 +852,10 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 "selfplay/avg_search_simulations",
                 report.avg_search_simulations,
             ),
+            (
+                "selfplay/search_nn_cache_hit_rate",
+                report.search_nn_cache_hit_rate,
+            ),
             ("selfplay/avg_plies", report.avg_plies),
             ("selfplay/completed_games", completed as f32),
             ("selfplay/visit_policy_entropy", report.root_visit_entropy),
