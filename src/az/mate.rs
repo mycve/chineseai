@@ -112,6 +112,8 @@ pub struct MateSearchOutcome {
     pub nodes: usize,
     /// 节点预算是否中途被耗尽（为真时"没找到"不代表"没有杀"）。
     pub budget_exhausted: bool,
+    /// 停止信号或截止时间中断了证明；未找到不能解释为没有连杀。
+    pub interrupted: bool,
 }
 
 impl MateSearchOutcome {
@@ -120,6 +122,7 @@ impl MateSearchOutcome {
         solution: None,
         nodes: 0,
         budget_exhausted: false,
+        interrupted: false,
     };
 
     /// 没证出连杀时的原因：`None` 表示真的没有，也可以据此打印诊断。
@@ -127,7 +130,9 @@ impl MateSearchOutcome {
         if self.solution.is_some() {
             return None;
         }
-        if self.budget_exhausted {
+        if self.interrupted {
+            Some("interrupted")
+        } else if self.budget_exhausted {
             Some("node-budget")
         } else {
             Some("no-mate")
@@ -140,6 +145,7 @@ impl MateSearchOutcome {
             max_plies,
             nodes: self.nodes,
             budget_exhausted: self.budget_exhausted,
+            interrupted: self.interrupted,
             solution: self.solution,
         }
     }
@@ -154,6 +160,8 @@ pub struct MateSearchReport {
     pub nodes: usize,
     /// 节点预算是否中途被耗尽。
     pub budget_exhausted: bool,
+    /// 停止信号或截止时间中断了证明。
+    pub interrupted: bool,
     /// 证明出来的连杀。
     pub solution: Option<MateSolution>,
 }
@@ -171,6 +179,10 @@ impl MateSearchReport {
                 solution.plies.div_ceil(2),
                 solution.nodes,
                 self.max_plies,
+            ),
+            None if self.interrupted => format!(
+                "mate plies=- moves=- nodes={} budget={} source=interrupted",
+                self.nodes, self.max_plies,
             ),
             None if self.budget_exhausted => format!(
                 "mate plies=- moves=- nodes={} budget={} source=node-budget",
@@ -202,6 +214,15 @@ pub fn search_root_mate_profiled(
     history: &[RuleHistoryEntry],
     limits: MateSearchLimits,
 ) -> MateSearchOutcome {
+    search_root_mate_profiled_controlled(position, history, limits, None)
+}
+
+pub(super) fn search_root_mate_profiled_controlled(
+    position: &Position,
+    history: &[RuleHistoryEntry],
+    limits: MateSearchLimits,
+    control: Option<&super::AzSearchControl>,
+) -> MateSearchOutcome {
     if limits.max_plies == 0 || limits.max_nodes == 0 {
         return MateSearchOutcome::DISABLED;
     }
@@ -212,12 +233,15 @@ pub fn search_root_mate_profiled(
         max_nodes: limits.max_nodes,
         history: history.to_vec(),
         line: LineTable::new(),
+        control,
+        interrupted: false,
     };
     if !search.push_line(position) {
         return MateSearchOutcome {
             solution: None,
             nodes: 0,
             budget_exhausted: false,
+            interrupted: false,
         };
     }
     let mut max_plies = 1usize;
@@ -252,7 +276,8 @@ pub fn search_root_mate_profiled(
     MateSearchOutcome {
         solution,
         nodes: search.nodes,
-        budget_exhausted: search.exhausted(),
+        budget_exhausted: search.nodes >= search.max_nodes,
+        interrupted: search.interrupted,
     }
 }
 
@@ -308,19 +333,27 @@ impl LineTable {
     }
 }
 
-struct MateSearch {
+struct MateSearch<'a> {
     /// 攻方（根局面的走子方），用于区分"己方判胜"与"对方判胜/判和"。
     attacker: Color,
     nodes: usize,
     max_nodes: usize,
     history: Vec<RuleHistoryEntry>,
     line: LineTable,
+    control: Option<&'a super::AzSearchControl>,
+    interrupted: bool,
 }
 
-impl MateSearch {
+impl MateSearch<'_> {
     #[inline]
-    fn exhausted(&self) -> bool {
-        self.nodes >= self.max_nodes
+    fn exhausted(&mut self) -> bool {
+        if self
+            .control
+            .is_some_and(super::AzSearchControl::should_stop)
+        {
+            self.interrupted = true;
+        }
+        self.interrupted || self.nodes >= self.max_nodes
     }
 
     /// 把当前局面记进"这一条线"。返回 false 表示该局面已经在本线里出现过：
@@ -477,6 +510,8 @@ mod tests {
                 max_nodes: 1000,
                 history: p.initial_rule_history(),
                 line: LineTable::new(),
+                control: None,
+                interrupted: false,
             };
             assert_eq!(search.rule_verdict(&p), Some(false));
             assert!(search.attacker_to_move(&p, 7).is_none());

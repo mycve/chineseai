@@ -154,7 +154,7 @@ impl AzSearchControl {
         Self { stop, deadline }
     }
 
-    fn should_stop(&self) -> bool {
+    pub(super) fn should_stop(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
             || self
                 .deadline
@@ -1844,13 +1844,14 @@ impl<'a> AzTree<'a> {
             return;
         }
         crate::scope_profile!("az.search.root_mate");
-        let outcome = mate::search_root_mate_profiled(
+        let outcome = mate::search_root_mate_profiled_controlled(
             position,
             &self.rule_history_scratch,
             mate::MateSearchLimits {
                 max_plies: model.mate_search_plies,
                 max_nodes: model.mate_search_nodes,
             },
+            self.search_control.as_ref(),
         );
         // 报告写进搜索树，UCI 层再取出来打印：这样"证出来了 / 没杀 / 预算撞墙"
         // 三种情况在 GUI 里可区分，而不是都表现为"什么都没发生"。
@@ -1858,6 +1859,7 @@ impl<'a> AzTree<'a> {
             max_plies: model.mate_search_plies,
             nodes: outcome.nodes,
             budget_exhausted: outcome.budget_exhausted,
+            interrupted: outcome.interrupted,
             solution: outcome.solution,
         });
         let Some(solution) = outcome.solution else {
@@ -3612,6 +3614,39 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn root_mate_proof_honors_stop_and_expired_deadline() {
+        let position = Position::from_fen(
+            "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
+        )
+        .unwrap();
+        let mut model = AzNnue::random(4, 7);
+        model.mate_search_plies = 15;
+        model.mate_search_nodes = 200_000;
+        for control in [
+            AzSearchControl::new(Arc::new(AtomicBool::new(true)), None),
+            AzSearchControl::new(Arc::new(AtomicBool::new(false)), Some(Instant::now())),
+        ] {
+            let mut tree = AzTree::new(
+                position.clone(),
+                position.initial_rule_history(),
+                None,
+                &model,
+                AzSearchLimits::default(),
+            );
+            tree.search_control = Some(control);
+            tree.expand(tree.root);
+            tree.prove_root_mate(&position, &model);
+            let report = tree.last_mate_search.unwrap();
+            assert!(report.interrupted);
+            assert!(!report.budget_exhausted);
+            assert_eq!(report.nodes, 0);
+            assert!(report.solution.is_none());
+            assert!(report.uci_diagnostic().contains("source=interrupted"));
+            assert!(tree.nodes[tree.root].solved.is_none());
         }
     }
 
