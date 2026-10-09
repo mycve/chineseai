@@ -243,11 +243,11 @@ fn ensure_model(state: &mut UciState) {
     }
     let mut model = AzNnue::load(&state.eval_file).unwrap_or_else(|err| {
         println!(
-            "info string failed to load {}, using random model: {}",
+            "info string failed to load {}, search disabled: {}",
             state.eval_file, err
         );
         flush();
-        AzNnue::random(128, state.seed)
+        std::process::exit(1)
     });
     // 连杀预算挂模型上。在这里设一次，而不是每次 `go` 都克隆一份打了补丁的模型：
     // 45MB 级的模型克隆在快棋里是要命的。
