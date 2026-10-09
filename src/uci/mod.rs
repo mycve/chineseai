@@ -57,6 +57,7 @@ struct UciState {
     game_ply: Option<usize>,
     draw_score: f32,
     sixty_move_rule: bool,
+    repetition_draw: bool,
     rule60_max_ply: u16,
     seed: u64,
     multipv: usize,
@@ -93,6 +94,7 @@ impl Default for UciState {
             game_ply: Some(0),
             draw_score: 0.0,
             sixty_move_rule: true,
+            repetition_draw: true,
             rule60_max_ply: 120,
             seed: 20260409,
             multipv: 1,
@@ -197,6 +199,7 @@ fn print_uci_id() {
     println!("option name OpeningTemperature type string default {DEFAULT_OPENING_TEMPERATURE}");
     println!("option name DrawScore type string default 0.0");
     println!("option name Sixty Move Rule type check default true");
+    println!("option name RepetitionDraw type check default true");
     println!("option name Rule60MaxPly type spin default 120 min 1 max 150");
     println!(
         "option name MateSearchPlies type spin default {DEFAULT_MATE_SEARCH_PLIES} min 0 max 31"
@@ -397,6 +400,10 @@ fn handle_setoption(line: &str, state: &mut UciState) {
             state.sixty_move_rule = value.eq_ignore_ascii_case("true");
             apply_rule_options(state);
         }
+        "repetitiondraw" => {
+            state.repetition_draw = value.eq_ignore_ascii_case("true");
+            apply_rule_options(state);
+        }
         "rule60maxply" => {
             state.rule60_max_ply = value
                 .parse::<u16>()
@@ -409,6 +416,7 @@ fn handle_setoption(line: &str, state: &mut UciState) {
 }
 
 fn apply_rule_options(state: &mut UciState) {
+    state.position.set_repetition_draw_enabled(state.repetition_draw);
     state
         .position
         .set_rule60_max_ply(state.sixty_move_rule.then_some(state.rule60_max_ply));
@@ -431,6 +439,7 @@ fn handle_position(line: &str, state: &mut UciState) {
         _ => return,
     };
     position.set_rule60_max_ply(state.sixty_move_rule.then_some(state.rule60_max_ply));
+    position.set_repetition_draw_enabled(state.repetition_draw);
     let mut history = position.initial_rule_history();
     if let Some(index) = moves_index {
         if let Err(error) = apply_uci_moves(&mut position, &mut history, &tokens[index + 1..]) {
@@ -1110,6 +1119,21 @@ mod tests {
         assert_eq!(state.position.rule60_max_ply(), None);
         handle_position("position startpos", &mut state);
         assert_eq!(state.position.rule60_max_ply(), None);
+    }
+
+    #[test]
+    fn repetition_draw_option_survives_position_import() {
+        let mut state = UciState::default();
+        assert!(state.position.repetition_draw_enabled());
+        handle_setoption("setoption name RepetitionDraw value false", &mut state);
+        assert!(!state.position.repetition_draw_enabled());
+        handle_position("position startpos moves b0c2 b9c7", &mut state);
+        assert!(!state.position.repetition_draw_enabled());
+        let command = format!("position fen {}", state.position.to_fen());
+        handle_position(&command, &mut state);
+        assert!(!state.position.repetition_draw_enabled());
+        handle_setoption("setoption name RepetitionDraw value true", &mut state);
+        assert!(state.position.repetition_draw_enabled());
     }
 
     #[test]

@@ -1,6 +1,63 @@
 use super::*;
 
 #[test]
+fn repetition_draw_toggle_keeps_other_draw_rules_and_position_settings() {
+    let mut position = Position::startpos();
+    let mut history = position.initial_rule_history();
+    for _ in 0..2 {
+        for text in ["b0c2", "b9c7", "c2b0", "c7b9"] {
+            let mv = position.parse_uci_move(text).unwrap();
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+    }
+    assert!(position.repetition_draw_enabled());
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+    );
+    let hash = position.hash();
+    position.set_repetition_draw_enabled(false);
+    assert_eq!(position.rule_outcome_with_history(&history), None);
+    assert_eq!(position.hash(), hash);
+    assert!(!position.clone().repetition_draw_enabled());
+    assert!(!position.mirror_files().repetition_draw_enabled());
+    position.set_rule60_max_ply(Some(8));
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit))
+    );
+    position.set_repetition_draw_enabled(true);
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+    );
+}
+
+#[test]
+fn repetition_draw_toggle_preserves_long_check_loss() {
+    let mut position = Position::from_fen("3k5/9/9/9/9/9/9/9/4R4/5K3 w").unwrap();
+    let mut history = position.initial_rule_history();
+    for _ in 0..2 {
+        for text in ["e1d1", "d9e9", "d1e1", "e9d9"] {
+            let mv = position.parse_uci_move(text).unwrap();
+            assert!(position.legal_moves().contains(&mv));
+            history.push(position.rule_history_entry_after_move(mv));
+            position.make_move(mv);
+        }
+    }
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+    position.set_repetition_draw_enabled(false);
+    assert_eq!(
+        position.rule_outcome_with_history(&history),
+        Some(RuleOutcome::Win(Color::Black))
+    );
+}
+
+#[test]
 fn startpos_roundtrip_fen() {
     let position = Position::startpos();
     assert_eq!(position.to_fen(), format!("{STARTPOS_FEN} - - 0 1"));

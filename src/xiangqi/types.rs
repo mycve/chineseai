@@ -182,6 +182,7 @@ pub struct Position {
     pub(super) general_squares: [Option<usize>; 2],
     pub(super) halfmove_clock: u16,
     pub(super) rule60_max_ply: Option<u16>,
+    pub(super) repetition_draw_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

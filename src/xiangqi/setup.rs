@@ -45,6 +45,7 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock: 0,
             rule60_max_ply: Some(120),
+            repetition_draw_enabled: true,
         };
         let state = position.compute_state();
         Self {
@@ -119,6 +120,7 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock,
             rule60_max_ply: Some(120),
+            repetition_draw_enabled: true,
         };
         let state = position.compute_state();
         let position = Self {
@@ -199,6 +201,7 @@ impl Position {
             general_squares: [None; 2],
             halfmove_clock: self.halfmove_clock,
             rule60_max_ply: self.rule60_max_ply,
+            repetition_draw_enabled: self.repetition_draw_enabled,
         };
         let state = position.compute_state();
         Self {

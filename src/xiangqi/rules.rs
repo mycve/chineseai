@@ -80,17 +80,29 @@ impl Position {
         if !self.has_general(Color::Black) {
             return Some(RuleOutcome::Win(Color::Red));
         }
+        let other_draws = || {
+            if self
+                .rule60_max_ply
+                .is_some_and(|max_ply| self.rule60_count_with_history(history) >= max_ply)
+            {
+                Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit))
+            } else {
+                self.insufficient_material_outcome()
+            }
+        };
         let outcome = if let Some(entries) = repetition_cycle(history) {
             // 逐着记录不带捉子掩码，重复判定必须按完整局面回滚重算。
             let exact_entries = self.recompute_cycle_chases(entries);
-            adjudicate_repetition(&exact_entries)
-        } else if self
-            .rule60_max_ply
-            .is_some_and(|max_ply| self.rule60_count_with_history(history) >= max_ply)
-        {
-            Some(RuleOutcome::Draw(RuleDrawReason::NaturalMoveLimit))
+            let repeated = adjudicate_repetition(&exact_entries);
+            if !self.repetition_draw_enabled
+                && repeated == Some(RuleOutcome::Draw(RuleDrawReason::Repetition))
+            {
+                other_draws()
+            } else {
+                repeated
+            }
         } else {
-            self.insufficient_material_outcome()
+            other_draws()
         };
         // 将死、困毙优先于重复和无吃子和棋；仅在已有判定时追加检查。
         if outcome.is_some() && self.legal_moves().is_empty() {

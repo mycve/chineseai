@@ -61,6 +61,15 @@ impl Position {
         self.rule60_max_ply
     }
 
+    pub fn repetition_draw_enabled(&self) -> bool {
+        self.repetition_draw_enabled
+    }
+
+    /// 仅控制普通重复局面判和，不关闭长将、长捉判负或其他终局规则。
+    pub fn set_repetition_draw_enabled(&mut self, enabled: bool) {
+        self.repetition_draw_enabled = enabled;
+    }
+
     /// `sq` 是否被 `color` 方攻击。
     ///
     /// 名字里的"保护"只是习惯叫法：语义就是"该格被该方攻击"，不检查 `sq` 上站的是谁
