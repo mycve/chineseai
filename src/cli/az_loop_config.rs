@@ -52,14 +52,6 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub selfplay_opening_book: String,
-    /// 跳水热身库（`dive-games` 产出的 SQLite）。空表示不用。
-    ///
-    /// 与 `selfplay_opening_book` 并行采样：`selfplay_dive_fraction` 的开局从跳水库里
-    /// 取，其余仍从开局库里取。跳水库只放我们与 Pikafish 意见冲突且真的掉水的局面，
-    /// 所以它针对的是弱点，而不是广度。
-    pub selfplay_dive_book: String,
-    /// 自博弈开局来自跳水库的比例（0 关闭，1 只用跳水库）。
-    pub selfplay_dive_fraction: f32,
     /// 根节点连杀证明搜索的最大半回合数（0 = 关闭，9 = 最多 mate in 5，15 = mate in 8）。
     ///
     /// 带 `#[serde(default)]`：老配置文件里没有这一项时按 0（关闭）解析，不必改格式版本。
@@ -151,8 +143,6 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
             selfplay_opening_book: "book.pgn.gz".into(),
-            selfplay_dive_book: "dive.sqlite".into(),
-            selfplay_dive_fraction: 0.5,
             // 9 半回合 = mate in 5：实测把可证射程从 mate-in-4 推到 mate-in-5，
             // 而"有将军但无杀"的局面只 +4%，根局面没有将军着法时为 0。
             mate_search_plies: 9,
@@ -225,8 +215,6 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
-        line!("selfplay_dive_book", q(&self.selfplay_dive_book));
-        line!("selfplay_dive_fraction", f(self.selfplay_dive_fraction));
         line!("mate_search_plies", self.mate_search_plies);
         line!("moves_left_enabled", self.moves_left_enabled);
         line!("moves_left_threshold", f(self.moves_left_threshold));
@@ -405,7 +393,6 @@ impl AzLoopFileConfig {
         self.draw_score = self.draw_score.clamp(-1.0, 1.0);
         self.minimum_kldgain_per_node = self.minimum_kldgain_per_node.max(0.0);
         self.policy_softmax_temp = self.policy_softmax_temp.max(1e-3);
-        self.selfplay_dive_fraction = self.selfplay_dive_fraction.clamp(0.0, 1.0);
         // 上限 31 半回合（mate in 16）与 `go mate 0` 的取值一致：再深只会烧时间。
         self.mate_search_plies = self.mate_search_plies.min(31);
 
@@ -442,8 +429,6 @@ mod tests {
         let config = AzLoopFileConfig::parse(&AzLoopFileConfig::default().to_file_text());
         let expected = AzLoopFileConfig::default();
         assert_eq!(config.selfplay_opening_book, "book.pgn.gz");
-        assert_eq!(config.selfplay_dive_book, "dive.sqlite");
-        assert_eq!(config.selfplay_dive_fraction, 0.5);
         assert_eq!(config.arena_opening_book, "book.pgn.gz");
         assert_eq!(config.simulations, 10_000);
         assert_eq!(config.cpuct, expected.cpuct);
@@ -556,33 +541,6 @@ mod tests {
         );
     }
 
-    /// 跳水库配置要能原样往返，并且比例被 clamp 到 [0,1]。
-    #[test]
-    fn dive_book_config_roundtrips_and_clamps() {
-        let config = AzLoopFileConfig {
-            selfplay_dive_book: "runs/dive-0620.sqlite".into(),
-            selfplay_dive_fraction: 0.25,
-            ..AzLoopFileConfig::default()
-        };
-        let text = config.to_file_text();
-        assert!(text.contains("selfplay_dive_book = \"runs/dive-0620.sqlite\"\n"));
-        assert!(text.contains("selfplay_dive_fraction = 0.25\n"));
-        let restored = AzLoopFileConfig::parse(&text);
-        assert_eq!(restored.selfplay_dive_book, "runs/dive-0620.sqlite");
-        assert_eq!(restored.selfplay_dive_fraction, 0.25);
-
-        for (input, expected) in [(2.0_f32, 1.0_f32), (-1.0, 0.0)] {
-            let clamped = AzLoopFileConfig::parse(
-                &AzLoopFileConfig {
-                    selfplay_dive_fraction: input,
-                    ..AzLoopFileConfig::default()
-                }
-                .to_file_text(),
-            );
-            assert_eq!(clamped.selfplay_dive_fraction, expected);
-        }
-    }
-
     #[test]
     fn fixed_dirichlet_config_roundtrips() {
         let config = AzLoopFileConfig {
@@ -598,7 +556,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 31\n"));
+        assert!(text.starts_with("format_version = 32\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
@@ -687,7 +645,7 @@ mod tests {
     fn old_config_versions_are_rejected() {
         let text = AzLoopFileConfig::default()
             .to_file_text()
-            .replace("format_version = 31", "format_version = 27");
+            .replace("format_version = 32", "format_version = 27");
         let error = std::panic::catch_unwind(|| AzLoopFileConfig::parse(&text));
         assert!(error.is_err());
     }
