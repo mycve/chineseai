@@ -7,15 +7,13 @@ use std::time::{Duration, Instant};
 
 mod eval_cache;
 
-#[path = "tactical.rs"]
-mod tactical;
 #[path = "uci_search.rs"]
 mod uci_search;
 pub(crate) use uci_search::{AzUciSearchResult, search_uci};
 
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzMovesLeftParams, AzNnue,
-    POLICY_ACCUMULATOR_RANK, SplitMix64, check_context_features, color_index, mate,
+    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, mate,
     rule_context_features,
 };
 
@@ -123,9 +121,6 @@ pub struct AzSearchResult {
     pub search_depth_max: usize,
     pub search_depth_limit: usize,
     pub search_depth_cutoffs: usize,
-    pub tactical_nodes: usize,
-    pub tactical_completed: usize,
-    pub tactical_aborted: usize,
     /// 根节点连杀证明的诊断报告；`None` = 本次搜索没有跑证明（`mate_search_plies == 0`）。
     pub mate_search: Option<mate::MateSearchReport>,
     pub candidates: Vec<AzCandidate>,
@@ -313,9 +308,6 @@ fn alphazero_search_with_rules_controlled_with_progress_root_mode(
             search_depth_max: 0,
             search_depth_limit: tree.max_depth,
             search_depth_cutoffs: 0,
-            tactical_nodes: 0,
-            tactical_completed: 0,
-            tactical_aborted: 0,
             mate_search: None,
             candidates: Vec::new(),
         };
@@ -511,9 +503,6 @@ struct AzTree<'a> {
     rule_history_scratch: Vec<RuleHistoryEntry>,
     /// 最近一次根节点连杀证明的报告（只在 `prove_root_mate` 里写）。
     last_mate_search: Option<mate::MateSearchReport>,
-    tactical_nodes: usize,
-    tactical_completed: usize,
-    tactical_aborted: usize,
     search_control: Option<AzSearchControl>,
     eval_cache: Option<eval_cache::CachedTree>,
     cache_hits: usize,
@@ -528,8 +517,6 @@ struct AzNode {
     policy_accumulator: [f32; POLICY_ACCUMULATOR_RANK],
     parent: u32,
     incoming_move: Option<Move>,
-    tactical_reply: Option<Move>,
-    tactical_pending: bool,
     rule_entry: Option<RuleHistoryEntry>,
     children_offset: u32,
     children_len: u16,
@@ -656,9 +643,6 @@ impl<'a> AzTree<'a> {
             search_depth_max: self.search_depth_max,
             search_depth_limit: self.max_depth,
             search_depth_cutoffs: self.search_depth_cutoffs,
-            tactical_nodes: self.tactical_nodes,
-            tactical_completed: self.tactical_completed,
-            tactical_aborted: self.tactical_aborted,
             mate_search: self.last_mate_search,
             candidates,
         }
@@ -803,8 +787,6 @@ impl<'a> AzTree<'a> {
             policy_accumulator: root_policy_accumulator,
             parent: NO_CHILD,
             incoming_move: None,
-            tactical_reply: None,
-            tactical_pending: false,
             rule_entry: None,
             children_offset: 0,
             children_len: 0,
@@ -874,9 +856,6 @@ impl<'a> AzTree<'a> {
             eval_scratch,
             rule_history_scratch,
             last_mate_search: None,
-            tactical_nodes: 0,
-            tactical_completed: 0,
-            tactical_aborted: 0,
             search_control: None,
             eval_cache: None,
             cache_hits: 0,
@@ -1040,9 +1019,6 @@ impl<'a> AzTree<'a> {
             };
             eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
             eval.value *= self.value_scale;
-            if let Some(tactical_eval) = self.tactical_value(node_index, &moves) {
-                eval = tactical_eval;
-            }
             if node_index == self.root {
                 softmax_into(
                     &self.eval_scratch.logits[..moves.len()],
@@ -1162,7 +1138,6 @@ impl<'a> AzTree<'a> {
             return eval;
         }
         if !self.nodes[node_index].expanded {
-            let tactical_completed_before = self.tactical_completed;
             let was_in_check = self.nodes[node_index]
                 .position
                 .in_check(self.nodes[node_index].position.side_to_move());
@@ -1173,8 +1148,7 @@ impl<'a> AzTree<'a> {
             // 需要策略分配预算的选择。
             if self.nodes[node_index].children_len > 0
                 && self.nodes[node_index].solved.is_none()
-                && ((was_in_check && self.tactical_completed == tactical_completed_before)
-                    || self.nodes[node_index].children_len == 1)
+                && (was_in_check || self.nodes[node_index].children_len == 1)
             {
                 let child_index = self.select_child(node_index);
                 return self.simulate_child(node_index, child_index, depth + 1);
@@ -1188,22 +1162,6 @@ impl<'a> AzTree<'a> {
             self.add_node_visit(node_index, eval);
             self.record_leaf_depth(depth, false);
             return eval;
-        }
-        if self.nodes[node_index].tactical_pending && self.nodes[node_index].visits >= 8 {
-            self.nodes[node_index].tactical_pending = false;
-            let moves: Vec<_> = self
-                .node_children(node_index)
-                .iter()
-                .map(|child| child.mv)
-                .collect();
-            if let Some(eval) = self.tactical_value(node_index, &moves) {
-                self.nodes[node_index].value = eval.value;
-                self.nodes[node_index].value_wdl = eval.value_wdl;
-                self.nodes[node_index].moves_left = eval.moves_left;
-                self.add_node_visit(node_index, eval);
-                self.record_leaf_depth(depth, false);
-                return eval;
-            }
         }
         let child_index = {
             crate::scope_profile!("az.search.select_child");
@@ -1332,8 +1290,6 @@ impl<'a> AzTree<'a> {
                     parent: u32::try_from(node_index)
                         .expect("MCTS node index exceeds compact parent range"),
                     incoming_move: Some(mv),
-                    tactical_reply: None,
-                    tactical_pending: false,
                     rule_entry: Some(child_rule_entry),
                     children_offset: 0,
                     children_len: 0,
@@ -1439,145 +1395,10 @@ impl<'a> AzTree<'a> {
         };
         eval.value_wdl = scale_wdl_value(eval.value_wdl, self.value_scale);
         eval.value *= self.value_scale;
-        if let Some(tactical_eval) = self.tactical_value(node_index, &moves) {
-            eval = tactical_eval;
-        }
         self.nodes[node_index].value = eval.value;
         self.nodes[node_index].value_wdl = eval.value_wdl;
         self.nodes[node_index].moves_left = eval.moves_left;
         eval
-    }
-
-    fn tactical_value(&mut self, node_index: usize, moves: &[Move]) -> Option<AzEvalOutput> {
-        if node_index == self.root
-            || self.model.tactical_search_nodes == 0
-            || self.model.tactical_search_plies == 0
-        {
-            return None;
-        }
-        let checked = self.nodes[node_index]
-            .position
-            .in_check(self.nodes[node_index].position.side_to_move());
-        let root_threat = self.nodes[node_index].parent as usize == self.root
-            && self.model.tactical_quiet_plies > 0
-            && moves.iter().any(|&mv| {
-                self.nodes[node_index]
-                    .position
-                    .gives_check_after_move_fast(mv)
-            })
-            && {
-                let p = &self.nodes[node_index].position;
-                let flags: Vec<_> = moves
-                    .iter()
-                    .map(|&mv| f32::from(p.gives_check_after_move_fast(mv)))
-                    .collect();
-                check_context_features(p, moves, &flags, p.attacked_squares_masks())[7] > 0.0
-            };
-        let mut quiet = if root_threat {
-            self.model.tactical_quiet_plies.min(2)
-        } else {
-            0
-        };
-        if quiet > 0 && self.nodes[node_index].visits < 8 {
-            let children = self.node_children(self.root);
-            let index = children
-                .iter()
-                .position(|child| child.child_node() == Some(node_index))
-                .unwrap();
-            let prior = self.root_raw_priors[index];
-            let rank = self
-                .root_raw_priors
-                .iter()
-                .enumerate()
-                .filter(|&(other, p)| *p > prior || (*p == prior && other < index))
-                .count();
-            if rank >= 4 {
-                self.nodes[node_index].tactical_pending = true;
-                quiet = 0;
-            }
-        }
-        let p = &self.nodes[node_index].position;
-        if quiet == 0
-            && !checked
-            && self.nodes[node_index]
-                .rule_entry
-                .is_none_or(|entry| entry.captured.is_none())
-        {
-            return None;
-        }
-        if quiet == 0
-            && !p.in_check(p.side_to_move())
-            && !moves
-                .iter()
-                .any(|&mv| p.is_capture(mv) || p.gives_check_after_move_fast(mv))
-        {
-            return None;
-        }
-        let mut probe = tactical::TacticalProbe::new(
-            self.model,
-            if quiet > 0 {
-                self.model.tactical_search_nodes
-            } else {
-                self.model.tactical_search_nodes.min(128)
-            },
-            self.value_scale,
-        );
-        let draw_score = if p.side_to_move() == self.nodes[self.root].position.side_to_move() {
-            self.draw_score
-        } else {
-            -self.draw_score
-        };
-        probe.control = self.search_control.as_ref();
-        let plies = self.model.tactical_search_plies.min(16);
-        let mut result = None;
-        let mut reply = None;
-        // 吃子/应将先完成，再补安静反击。后续撞预算只丢弃未完成的那次校验。
-        for quiet_depth in 0..=quiet {
-            match probe.search(
-                p,
-                &mut self.rule_history_scratch,
-                quiet_depth,
-                plies,
-                0,
-                -2.0,
-                2.0,
-                draw_score,
-            ) {
-                Ok(eval) => {
-                    result = Some(eval);
-                    reply = probe.best_reply;
-                }
-                Err(()) => {
-                    self.tactical_aborted += 1;
-                    break;
-                }
-            }
-        }
-        // 完整主结果已有后才尝试主动将军，避免将军链耗尽预算丢掉吃子搜索结果。
-        if result.is_some() && probe.nodes < probe.max_nodes {
-            match probe.search(
-                p,
-                &mut self.rule_history_scratch,
-                quiet,
-                plies,
-                2,
-                -2.0,
-                2.0,
-                draw_score,
-            ) {
-                Ok(eval) => {
-                    result = Some(eval);
-                    reply = probe.best_reply;
-                }
-                Err(()) => self.tactical_aborted += 1,
-            }
-        }
-        self.tactical_nodes += probe.nodes;
-        if result.is_some() {
-            self.tactical_completed += 1;
-            self.nodes[node_index].tactical_reply = reply;
-        }
-        result
     }
 
     fn node_eval(&self, node_index: usize) -> AzEvalOutput {
@@ -1646,14 +1467,6 @@ impl<'a> AzTree<'a> {
         };
         let cpuct = self.compute_cpuct(node.visits, is_root);
         let moves_left = self.moves_left_context(node_index);
-        // 已完成战术搜索的反击至少实际访问两次，避免低策略先验把它埋掉。
-        if let Some(reply) = node.tactical_reply {
-            if let Some((index, _)) = children.iter().enumerate().find(|(_, child)| {
-                child.mv == reply && child.visits < 2 && self.child_solved(child).is_none()
-            }) {
-                return index;
-            }
-        }
         // 一趟同时取"证明优先级 → PUCT 分数 → 先验"的字典序最大值。
         // 原实现先扫一遍找已证明胜的子节点、再扫一遍求最高优先级、最后在最高
         // 优先级里比分数，每个子节点要查三次 `child_solved`（每次都随机访问
@@ -2521,136 +2334,6 @@ mod tests {
 
         assert_eq!(result.search_depth_max, 2);
         assert_eq!(result.search_depth_cutoffs, 0);
-    }
-
-    #[test]
-    fn tactical_estimates_feed_mcts_without_claiming_a_proof() {
-        let p = Position::from_fen(
-            "Cn1akab2/5R3/2n1b4/p2Rp1P1p/2p3r2/5N3/P1c1P4/4B4/9/1r1AKAB2 b - - 0 1",
-        )
-        .unwrap();
-        let mv = p.parse_uci_move("f9e8").unwrap();
-        let mut model = AzNnue::random(4, 19);
-        model.tactical_search_nodes = 128;
-        model.tactical_search_plies = 2;
-        model.tactical_quiet_plies = 1;
-        let result = alphazero_search_with_rules(
-            &p,
-            None,
-            Some(vec![mv]),
-            &model,
-            AzSearchLimits {
-                simulations: 2,
-                ..AzSearchLimits::default()
-            },
-        );
-        assert!(result.tactical_nodes > 0);
-        assert!(result.tactical_nodes <= 128 * 2);
-        assert!(result.candidates.iter().all(|c| c.solved.is_none()));
-        let wdl = model.evaluate_wdl_with_rules(&p, &p.initial_rule_history(), &[mv]);
-        assert_eq!(result.network_value_wdl, wdl);
-    }
-
-    #[test]
-    fn tactical_reply_receives_real_visits_despite_zero_prior() {
-        let p = Position::startpos();
-        let model = AzNnue::random(4, 19);
-        let mut tree = AzTree::new(
-            p.clone(),
-            p.initial_rule_history(),
-            None,
-            &model,
-            AzSearchLimits::default(),
-        );
-        tree.expand(0);
-        let reply = tree.node_children(0)[0].mv;
-        tree.nodes[0].tactical_reply = Some(reply);
-        tree.node_children_mut(0)[0].prior = 0.0;
-        assert_eq!(tree.select_child(0), 0);
-        tree.simulate(0, 0);
-        assert_eq!(tree.node_children(0)[0].visits, 1);
-        assert_eq!(tree.select_child(0), 0);
-        tree.simulate(0, 0);
-        assert_eq!(tree.node_children(0)[0].visits, 2);
-        assert_ne!(tree.select_child(0), 0);
-    }
-
-    #[test]
-    fn quiet_opening_does_not_run_a_full_width_tactical_probe() {
-        let p = Position::startpos();
-        let mut model = AzNnue::random(4, 19);
-        model.tactical_search_nodes = 4096;
-        let mv = p.parse_uci_move("h2e2").unwrap();
-        let result = alphazero_search_with_rules(
-            &p,
-            None,
-            Some(vec![mv]),
-            &model,
-            AzSearchLimits {
-                simulations: 1,
-                ..AzSearchLimits::default()
-            },
-        );
-        assert_eq!(result.tactical_nodes, 0);
-    }
-
-    #[test]
-    fn low_prior_root_threat_is_deferred_then_audited() {
-        let p = Position::from_fen(
-            "Cn1akab2/5R3/2n1b4/p2Rp1P1p/2p3r2/5N3/P1c1P4/4B4/9/1r1AKAB2 b - - 0 1",
-        )
-        .unwrap();
-        let mut model = AzNnue::random(4, 19);
-        model.tactical_search_nodes = 64;
-        let mut tree = AzTree::new(
-            p.clone(),
-            p.initial_rule_history(),
-            None,
-            &model,
-            AzSearchLimits::default(),
-        );
-        tree.expand(0);
-        let mv = p.parse_uci_move("b0b1").unwrap();
-        let index = tree
-            .node_children(0)
-            .iter()
-            .position(|child| child.mv == mv)
-            .unwrap();
-        tree.root_raw_priors.fill(1.0);
-        tree.root_raw_priors[index] = 0.0;
-        tree.simulate_child(0, index, 1);
-        let child = tree.node_children(0)[index].child_node().unwrap();
-        assert!(tree.nodes[child].tactical_pending);
-        assert_eq!(tree.tactical_nodes, 0);
-        tree.nodes[child].visits = 8;
-        let entry = tree.nodes[child].rule_entry.unwrap();
-        tree.rule_history_scratch.push(entry);
-        tree.simulate(child, 1);
-        tree.rule_history_scratch.pop();
-        assert!(!tree.nodes[child].tactical_pending);
-        assert!(tree.tactical_nodes > 0);
-    }
-
-    #[test]
-    fn tactical_budget_fallback_matches_the_original_leaf() {
-        let p = Position::from_fen(
-            "Cn1akab2/5R3/2n1b4/p2Rp1P1p/2p3r2/5N3/P1c1P4/4B4/9/1r1AKAB2 b - - 0 1",
-        )
-        .unwrap();
-        let mv = p.parse_uci_move("f9e8").unwrap();
-        let mut model = AzNnue::random(4, 19);
-        let limits = AzSearchLimits {
-            simulations: 1,
-            ..AzSearchLimits::default()
-        };
-        let baseline = alphazero_search_with_rules(&p, None, Some(vec![mv]), &model, limits);
-        model.tactical_search_nodes = 1;
-        let result = alphazero_search_with_rules(&p, None, Some(vec![mv]), &model, limits);
-        assert!(result.tactical_aborted > 0);
-        assert_eq!(result.tactical_nodes, 1);
-        assert_eq!(result.value_wdl, baseline.value_wdl);
-        assert_eq!(result.network_value_wdl, baseline.network_value_wdl);
-        assert!(result.candidates[0].solved.is_none());
     }
 
     #[test]

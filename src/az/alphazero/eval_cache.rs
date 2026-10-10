@@ -25,10 +25,7 @@ pub(super) fn take_cached(
     workspace: &mut AzSearchWorkspace<'_>,
 ) -> Option<CachedTree> {
     let previous = workspace.previous_limits.replace(signature(limits));
-    if previous != Some(signature(limits))
-        || workspace.model.tactical_search_nodes != 0
-        || limits.draw_score != 0.0
-        || workspace.nodes.is_empty()
+    if previous != Some(signature(limits)) || limits.draw_score != 0.0 || workspace.nodes.is_empty()
     {
         return None;
     }

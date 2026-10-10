@@ -75,9 +75,6 @@ pub struct AzLoopConfig {
     /// 把该手的策略目标压成杀着、价值目标设成必胜，这是让模型从自博弈里学到连杀的关键。
     pub moves_left_params: AzMovesLeftParams,
     pub mate_search_plies: usize,
-    pub tactical_search_nodes: usize,
-    pub tactical_search_plies: usize,
-    pub tactical_quiet_plies: usize,
 }
 
 #[derive(Clone, Debug, Default)]

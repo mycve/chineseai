@@ -141,9 +141,6 @@ pub(crate) fn build_az_loop_config(
         record_fens: false,
         moves_left_params: config.moves_left_params(),
         mate_search_plies: config.mate_search_plies,
-        tactical_search_nodes: config.tactical_search_nodes,
-        tactical_search_plies: config.tactical_search_plies,
-        tactical_quiet_plies: config.tactical_quiet_plies,
     }
 }
 

@@ -73,10 +73,6 @@ pub struct AzLoopFileConfig {
     pub moves_left_scaled_factor: f32,
     pub moves_left_quadratic_factor: f32,
 
-    /// 每叶战术搜索预算，0 关闭；先测试吞吐量后再启用。
-    pub tactical_search_nodes: usize,
-    pub tactical_search_plies: usize,
-    pub tactical_quiet_plies: usize,
     pub replay_capacity: usize,
     pub shuffle_size: usize,
     pub replay_recent_games: u32,
@@ -168,9 +164,6 @@ impl Default for AzLoopFileConfig {
             moves_left_scaled_factor: moves_left.scaled_factor,
             moves_left_quadratic_factor: moves_left.quadratic_factor,
 
-            tactical_search_nodes: 0,
-            tactical_search_plies: 8,
-            tactical_quiet_plies: 2,
             replay_capacity: 2400000,
             shuffle_size: 524_288,
             replay_recent_games: 7500,
@@ -249,9 +242,6 @@ impl AzLoopFileConfig {
             f(self.moves_left_quadratic_factor)
         );
 
-        line!("tactical_search_nodes", self.tactical_search_nodes);
-        line!("tactical_search_plies", self.tactical_search_plies);
-        line!("tactical_quiet_plies", self.tactical_quiet_plies);
         line!("minimum_kldgain_per_node", f(self.minimum_kldgain_per_node));
         line!("fpu_absolute_at_root", self.fpu_absolute_at_root);
         line!("temperature_visit_offset", f(self.temperature_visit_offset));
@@ -418,8 +408,6 @@ impl AzLoopFileConfig {
         self.selfplay_dive_fraction = self.selfplay_dive_fraction.clamp(0.0, 1.0);
         // 上限 31 半回合（mate in 16）与 `go mate 0` 的取值一致：再深只会烧时间。
         self.mate_search_plies = self.mate_search_plies.min(31);
-        self.tactical_search_plies = self.tactical_search_plies.min(16);
-        self.tactical_quiet_plies = self.tactical_quiet_plies.min(2);
 
         self.replay_recent_games = self.replay_recent_games.max(1);
         self.shuffle_size = self.shuffle_size.max(1);
@@ -610,7 +598,7 @@ mod tests {
         let config = AzLoopFileConfig::default();
         let text = config.to_file_text();
 
-        assert!(text.starts_with("format_version = 30\n"));
+        assert!(text.starts_with("format_version = 31\n"));
         assert!(text.contains("lr = 0.0004\n"));
         assert!(text.contains("temperature_start = 0.9\n"));
         assert!(text.contains("sixty_move_rule = true\n"));
@@ -699,7 +687,7 @@ mod tests {
     fn old_config_versions_are_rejected() {
         let text = AzLoopFileConfig::default()
             .to_file_text()
-            .replace("format_version = 30", "format_version = 27");
+            .replace("format_version = 31", "format_version = 27");
         let error = std::panic::catch_unwind(|| AzLoopFileConfig::parse(&text));
         assert!(error.is_err());
     }

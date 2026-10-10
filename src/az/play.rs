@@ -290,17 +290,11 @@ pub fn generate_selfplay_data(model: &AzNnue, config: &AzLoopConfig) -> AzSelfpl
     // 连杀预算挂在模型上（`AzNnue::mate_search_plies`）。这里统一打一次补丁，让单线程与
     // 多线程两条路径共用同一份设置；两边本来就一样时不克隆（关闭态零代价）。
     let patched = (model.moves_left_params != config.moves_left_params
-        || model.mate_search_plies != config.mate_search_plies
-        || model.tactical_search_nodes != config.tactical_search_nodes
-        || model.tactical_search_plies != config.tactical_search_plies
-        || model.tactical_quiet_plies != config.tactical_quiet_plies)
+        || model.mate_search_plies != config.mate_search_plies)
         .then(|| {
             let mut patched = model.clone();
             patched.moves_left_params = config.moves_left_params.normalize();
             patched.mate_search_plies = config.mate_search_plies;
-            patched.tactical_search_nodes = config.tactical_search_nodes;
-            patched.tactical_search_plies = config.tactical_search_plies;
-            patched.tactical_quiet_plies = config.tactical_quiet_plies;
             patched
         });
     let model = patched.as_ref().unwrap_or(model);
@@ -1421,9 +1415,6 @@ mod tests {
             record_fens: false,
             moves_left_params: crate::az::AzMovesLeftParams::default(),
             mate_search_plies: 0,
-            tactical_search_nodes: 0,
-            tactical_search_plies: 8,
-            tactical_quiet_plies: 2,
         }
     }
 

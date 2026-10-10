@@ -672,12 +672,6 @@ pub struct AzNnue {
     /// 节点才能判"无杀"（约 380ms）；把预算开到 2,000,000 就能让它走到结论，代价是这一手
     /// 慢 10 倍。预算撞墙时会打印 `info string mate ... source=node-budget`。
     pub mate_search_nodes: usize,
-    /// 每个 MCTS 叶子的战术节点预算；0 关闭，实验功能。
-    pub tactical_search_nodes: usize,
-    /// 战术延伸半回合上限（应将、吃子和有限主动将军）。
-    pub tactical_search_plies: usize,
-    /// 根候选之后额外全宽半回合数，最多 2，覆盖安静反击。
-    pub tactical_quiet_plies: usize,
     #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
     pub(super) gpu_trainer: Option<Box<train_gpu::GpuTrainer>>,
 }
@@ -732,9 +726,6 @@ impl Clone for AzNnue {
             check_context_active: self.check_context_active,
             mate_search_plies: self.mate_search_plies,
             mate_search_nodes: self.mate_search_nodes,
-            tactical_search_nodes: self.tactical_search_nodes,
-            tactical_search_plies: self.tactical_search_plies,
-            tactical_quiet_plies: self.tactical_quiet_plies,
             gpu_trainer: None,
         }
     }
@@ -965,9 +956,6 @@ impl AzNnue {
             check_context_active: false,
             mate_search_plies: 0,
             mate_search_nodes: 200_000,
-            tactical_search_nodes: 0,
-            tactical_search_plies: 8,
-            tactical_quiet_plies: 2,
             gpu_trainer: None,
         };
         model.rebuild_policy_cache();
@@ -1183,9 +1171,6 @@ impl AzNnue {
             check_context_active: false,
             mate_search_plies: 0,
             mate_search_nodes: 200_000,
-            tactical_search_nodes: 0,
-            tactical_search_plies: 8,
-            tactical_quiet_plies: 2,
             gpu_trainer: None,
         };
         model.rebuild_policy_cache();
@@ -1439,54 +1424,6 @@ impl AzNnue {
             self.policy_accumulator(position, position.side_to_move());
         self.evaluate_policy_with_scratch(position, moves, repetition_flags, scratch);
         value
-    }
-
-    pub(crate) fn evaluate_value_only_with_scratch_output(
-        &self,
-        position: &Position,
-        moves: &[Move],
-        rule_context: &[f32; RULE_CONTEXT_SIZE],
-        scratch: &mut AzEvalScratch,
-    ) -> AzEvalOutput {
-        self.evaluate_value_only_with_scratch_output_with_history(
-            position,
-            moves,
-            rule_context,
-            &[],
-            scratch,
-        )
-    }
-
-    pub(crate) fn evaluate_value_only_with_scratch_output_with_history(
-        &self,
-        position: &Position,
-        moves: &[Move],
-        rule_context: &[f32; RULE_CONTEXT_SIZE],
-        history: &[crate::xiangqi::RuleHistoryEntry],
-        scratch: &mut AzEvalScratch,
-    ) -> AzEvalOutput {
-        let reflected =
-            self.history_orientation(position, history, moves, &[]) == std::cmp::Ordering::Greater;
-        let mirrored;
-        let mut mapped = std::mem::take(&mut scratch.reflected_moves);
-        let (position, moves) = if reflected {
-            mirrored = position.mirror_files();
-            mapped.clear();
-            mapped.extend(moves.iter().copied().map(crate::az::nnue::mirror_file_move));
-            (&mirrored, mapped.as_slice())
-        } else {
-            (position, moves)
-        };
-        let logits = self.oriented_history_logits(position, history, None, reflected);
-        let output = self.evaluate_value_only_with_history_logits(
-            position,
-            moves,
-            rule_context,
-            logits,
-            scratch,
-        );
-        scratch.reflected_moves = mapped;
-        output
     }
 
     fn evaluate_value_only_with_history_logits(

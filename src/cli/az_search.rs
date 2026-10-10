@@ -143,12 +143,9 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         rule_history.push(position.rule_history_entry_after_move(mv));
         position.make_move(mv);
     }
-    let mut model = AzNnue::load(&model_path).unwrap_or_else(|err| {
+    let model = AzNnue::load(&model_path).unwrap_or_else(|err| {
         panic!("failed to load `{model_path}`: {err}");
     });
-    model.tactical_search_nodes = cmd.tactical_search_nodes;
-    model.tactical_search_plies = cmd.tactical_search_plies.min(16);
-    model.tactical_quiet_plies = cmd.tactical_quiet_plies.min(2);
     let search_limits = AzSearchLimits {
         simulations,
         seed: 0,
@@ -230,17 +227,6 @@ pub(crate) fn run(cmd: AzSearchArgs) {
         .unwrap_or_else(|| "(none)".into());
     println!("AZ SEARCH");
     println!("=========");
-    if model.tactical_search_nodes > 0 {
-        println!(
-            "  Tactical     nodes/leaf={} plies={} quiet={} visited={} completed={} aborted={}",
-            model.tactical_search_nodes,
-            model.tactical_search_plies,
-            model.tactical_quiet_plies,
-            result.tactical_nodes,
-            result.tactical_completed,
-            result.tactical_aborted
-        );
-    }
     println!("\nPOSITION");
     println!("  FEN          {}", position.to_fen());
     println!("  Side         {:?}", position.side_to_move());
