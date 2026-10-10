@@ -62,7 +62,7 @@ pub(super) fn fixed_attack_masks() -> &'static [[[u128; BOARD_SIZE]; 3]; 2] {
 }
 
 #[inline(always)]
-pub(super) fn nearest_on_ray(blockers: u128, increasing: bool) -> usize {
+pub(crate) fn nearest_on_ray(blockers: u128, increasing: bool) -> usize {
     if increasing {
         blockers.trailing_zeros() as usize
     } else {

@@ -11,7 +11,18 @@ impl Position {
     /// second as its capture target.  This gives the network the missing
     /// cannon-screen relation without another board scan.  Slider rays use the
     /// position occupancy bitboard, so they jump directly between blockers.
-    pub(crate) fn visit_occupied_relations(
+    pub(crate) fn visit_occupied_relations(&self, visitor: impl FnMut(usize, Piece, usize, Piece)) {
+        self.visit_piece_relations::<true>(visitor);
+    }
+
+    pub(crate) fn visit_occupied_leaper_relations(
+        &self,
+        visitor: impl FnMut(usize, Piece, usize, Piece),
+    ) {
+        self.visit_piece_relations::<false>(visitor);
+    }
+
+    fn visit_piece_relations<const SLIDERS: bool>(
         &self,
         mut visitor: impl FnMut(usize, Piece, usize, Piece),
     ) {
@@ -20,6 +31,9 @@ impl Position {
             let source = pieces.trailing_zeros() as usize;
             pieces &= pieces - 1;
             let piece = self.board[source].expect("occupancy and board must agree");
+            if !SLIDERS && matches!(piece.kind, PieceKind::Rook | PieceKind::Cannon) {
+                continue;
+            }
             let file = file_of(source) as i32;
             let rank = rank_of(source) as i32;
             let mut visit_step = |df: i32, dr: i32| {

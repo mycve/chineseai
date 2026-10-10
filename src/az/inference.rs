@@ -11,7 +11,7 @@ use crate::az::nnue::{
 use crate::infra::version::MODEL_FORMAT_VERSION;
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, color_index,
-    piece_kind_index,
+    nearest_on_ray, piece_kind_index,
 };
 
 use super::*;
@@ -300,10 +300,7 @@ pub(crate) fn visit_value_threat_features(
     perspective: Color,
     mut visitor: impl FnMut(usize),
 ) {
-    position.visit_occupied_relations(|source, attacker, target, attacked| {
-        if matches!(attacker.kind, PieceKind::Rook | PieceKind::Cannon) {
-            return;
-        }
+    position.visit_occupied_leaper_relations(|source, attacker, target, attacked| {
         let feature = value_threat_index(perspective, source, attacker, target, attacked);
         if feature != VALUE_THREAT_PAIR_VOCAB {
             visitor(feature);
@@ -317,27 +314,28 @@ pub(crate) fn visit_value_threat_features(
         if !matches!(attacker.kind, PieceKind::Rook | PieceKind::Cannon) {
             continue;
         }
-        let source_file = (source % BOARD_FILES) as i32;
-        let source_rank = (source / BOARD_FILES) as i32;
         for (df, dr) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
-            let mut first = None;
-            let mut second = None;
-            let mut blocker_count = 0usize;
-            let (mut file, mut rank) = (source_file + df, source_rank + dr);
-            while (0..BOARD_FILES as i32).contains(&file) && (0..BOARD_RANKS as i32).contains(&rank)
-            {
-                let square = rank as usize * BOARD_FILES + file as usize;
-                if let Some(piece) = position.piece_at(square) {
-                    blocker_count += 1;
-                    if first.is_none() {
-                        first = Some((square, piece));
-                    } else if second.is_none() {
-                        second = Some((square, piece));
-                    }
-                }
-                file += df;
-                rank += dr;
-            }
+            let direction_native = if df == 0 {
+                2 + usize::from(dr < 0)
+            } else {
+                usize::from(df < 0)
+            };
+            let blockers = position.orthogonal_blockers(source, direction_native);
+            let blocker_count = blockers.count_ones() as usize;
+            let increasing = dr * BOARD_FILES as i32 + df > 0;
+            let first = if blockers == 0 {
+                None
+            } else {
+                let sq = nearest_on_ray(blockers, increasing);
+                Some((sq, position.piece_at(sq).unwrap()))
+            };
+            let rest = first.map_or(0, |(sq, _)| blockers & !(1u128 << sq));
+            let second = if rest == 0 {
+                None
+            } else {
+                let sq = nearest_on_ray(rest, increasing);
+                Some((sq, position.piece_at(sq).unwrap()))
+            };
             let owner = usize::from(attacker.color != perspective);
             let slider = usize::from(attacker.kind == PieceKind::Cannon);
             let attacker_class = owner * 2 + slider;

@@ -4,6 +4,11 @@ use super::{
 };
 
 impl Position {
+    #[inline]
+    pub(crate) fn orthogonal_blockers(&self, source: usize, direction: usize) -> u128 {
+        self.occupied & super::orthogonal_ray_masks()[source][direction]
+    }
+
     #[inline(always)]
     pub fn side_to_move(&self) -> Color {
         self.side_to_move
