@@ -4,6 +4,37 @@ use crate::xiangqi::{BOARD_FILES, Color, Move, Position};
 
 use super::*;
 
+/// 所有空间输入与策略标签进入同一个左右代表，完整 H96 无需拆分。
+pub(crate) fn canonicalize_training_sample(sample: &mut AzTrainingSample) {
+    let Some(position) = position_for_training_sample(sample) else {
+        return;
+    };
+    let moves = sample
+        .move_indices
+        .iter()
+        .map(|&index| {
+            let (from, to) = dense_move_squares(index).expect("invalid training move");
+            Move::new(from, to)
+        })
+        .collect::<Vec<_>>();
+    if super::reflection::input_orientation(
+        &position,
+        &sample.history_features,
+        &moves,
+        &sample.repetition_flags,
+    )
+    .is_gt()
+    {
+        nnue::mirror_sparse_features_az_canonical_file(&mut sample.features);
+        sample.history_features =
+            super::reflection::mirror_history_features(&sample.history_features);
+        for (index, mv) in sample.move_indices.iter_mut().zip(&moves) {
+            *index = dense_move_index(nnue::mirror_file_move(*mv));
+        }
+    }
+    sample.features.sort_unstable();
+}
+
 #[derive(Clone, Debug)]
 pub struct AzLoopConfig {
     pub games: usize,

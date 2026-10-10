@@ -1266,43 +1266,49 @@ impl<'a> AzTree<'a> {
                     let parent_captured = self.nodes[grandparent]
                         .position
                         .piece_at(parent_move.to as usize);
-                    AzEvalAccumulator::apply_transition_for_perspective(
-                        self.model,
+                    let context = super::accumulator::CanonicalTransition::new(
                         &self.nodes[grandparent].position,
+                        &self.nodes[node_index].position,
+                        perspective,
+                    );
+                    AzEvalAccumulator::apply_canonical_transition(
+                        self.model,
                         &self.nodes[node_index].position,
                         parent_move,
                         parent_moved,
                         parent_captured,
-                        perspective,
+                        &context,
                         accumulator,
                     );
-                    self.model.apply_policy_transition(
-                        &self.nodes[grandparent].position,
+                    self.model.apply_policy_canonical_transition(
                         &self.nodes[node_index].position,
                         parent_move,
                         parent_moved,
                         parent_captured,
-                        perspective,
+                        &context,
                         &mut child_policy_accumulator,
                     );
                 }
-                AzEvalAccumulator::apply_transition_for_perspective(
-                    self.model,
+                let context = super::accumulator::CanonicalTransition::new(
                     &self.nodes[node_index].position,
+                    &child_position,
+                    perspective,
+                );
+                AzEvalAccumulator::apply_canonical_transition(
+                    self.model,
                     &child_position,
                     mv,
                     moved,
                     captured,
-                    perspective,
+                    &context,
                     accumulator,
                 );
-                self.model.apply_policy_transition(
-                    &self.nodes[node_index].position,
+                self.model.apply_policy_canonical_transition(
                     &child_position,
                     mv,
                     moved,
                     captured,
-                    perspective,
+                    &context,
                     &mut child_policy_accumulator,
                 );
                 let child_rule_entry =

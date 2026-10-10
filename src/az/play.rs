@@ -871,7 +871,7 @@ fn make_training_sample(
         *value /= total_policy;
     }
 
-    AzTrainingSample {
+    let mut sample = AzTrainingSample {
         features,
         rule_context: rule_context_features(position, rule_history),
         history_features,
@@ -888,7 +888,9 @@ fn make_training_sample(
         moves_left_weight: 0.0,
         search_simulations: search_simulations.min(u32::MAX as usize) as u32,
         meta,
-    }
+    };
+    super::sample::canonicalize_training_sample(&mut sample);
+    sample
 }
 
 fn root_search_meta(
@@ -1925,17 +1927,28 @@ mod tests {
         );
 
         let mirrored_position = position.mirror_files();
-        let mirrored_moves = candidates
+        let mirrored_candidates = candidates
             .iter()
-            .map(|candidate| mirror_file_move(candidate.mv))
+            .map(|c| {
+                let mut c = c.clone();
+                c.mv = mirror_file_move(c.mv);
+                c
+            })
             .collect::<Vec<_>>();
-        let expected = mirrored_moves
-            .iter()
-            .copied()
-            .map(|mv| dense_move_index(canonical_move(mirrored_position.side_to_move(), mv)))
-            .collect::<Vec<_>>();
-
-        assert_eq!(sample.move_indices, expected);
+        let expected = make_training_sample(
+            &mirrored_position,
+            &mirrored_position.initial_rule_history(),
+            &mirrored_candidates,
+            0.0,
+            [0.6, 0.3, 0.1],
+            false,
+            AzSampleMeta::default(),
+            1,
+            1.0,
+        );
+        assert_eq!(sample.features, expected.features);
+        assert_eq!(sample.move_indices, expected.move_indices);
+        assert_eq!(sample.history_features, expected.history_features);
         let expected_policy = candidates
             .iter()
             .map(|candidate| candidate.policy)
@@ -1945,10 +1958,6 @@ mod tests {
             assert!((actual - expected / expected_total).abs() < 1e-6);
         }
         assert_eq!(sample.root_search_wdl, [0.6, 0.3, 0.1]);
-        assert_eq!(
-            sample.history_features,
-            super::super::history::history_features(&mirrored_position, &[])
-        );
     }
 
     #[test]
@@ -1982,10 +1991,28 @@ mod tests {
             1,
             1.0,
         );
-        assert_eq!(
-            sample.history_features,
-            super::super::history::history_features(&mirrored_position, &mirrored_history)
+        let mirrored_candidates = candidates
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                c.mv = mirror_file_move(c.mv);
+                c
+            })
+            .collect::<Vec<_>>();
+        let expected = make_training_sample(
+            &mirrored_position,
+            &mirrored_history,
+            &mirrored_candidates,
+            0.0,
+            [0.0, 1.0, 0.0],
+            false,
+            AzSampleMeta::default(),
+            1,
+            1.0,
         );
+        assert_eq!(sample.features, expected.features);
+        assert_eq!(sample.move_indices, expected.move_indices);
+        assert_eq!(sample.history_features, expected.history_features);
         assert!(
             sample.history_features[48..]
                 .iter()

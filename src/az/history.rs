@@ -1,4 +1,5 @@
 //! 当前空间摘要与最近两步的二阶空间变化，统一使用当前行棋方视角。
+//! 横坐标以棋盘中心为零；镜像只改变符号与左右区域顺序。
 use super::arch::HISTORY_CONTEXT_SIZE;
 use crate::xiangqi::{Color, Piece, PieceKind, Position, RuleHistoryEntry};
 
@@ -29,38 +30,60 @@ fn piece_square(piece: Piece, square: usize, side: Color) -> usize {
     plane * 90 + orient_square(square, side)
 }
 
-fn contribution(index: usize) -> ([(usize, f32); 4], [(usize, f32); 4]) {
+fn integer_contribution(index: usize) -> ([(usize, i32); 4], [(usize, i32); 4]) {
     let plane = index / 90;
     let square = index % 90;
-    let x = (square % 9) as f32 / 8.0;
-    let y = (square / 9) as f32 / 9.0;
+    let x = (square % 9) as i32 - 4;
+    let y = (square / 9) as i32;
     let region = usize::from(square / 9 >= 5) * 3 + square % 9 / 3;
-    let sign = if plane < 7 { 1.0 } else { -1.0 };
+    let sign = if plane < 7 { 1 } else { -1 };
     (
         [
-            (plane * 3, 0.2),
-            (plane * 3 + 1, x * 0.2),
-            (plane * 3 + 2, y * 0.2),
-            (42 + region, sign / 16.0),
+            (plane * 3, 1),
+            (plane * 3 + 1, x),
+            (plane * 3 + 2, y),
+            (42 + region, sign),
         ],
         [
-            (plane * 3, x * x * 0.2),
-            (plane * 3 + 1, y * y * 0.2),
-            (plane * 3 + 2, x * y * 0.2),
-            (42 + region, sign * (x + y) / 32.0),
+            (plane * 3, x * x),
+            (plane * 3 + 1, y * y),
+            (plane * 3 + 2, x * y),
+            (42 + region, sign * y),
         ],
     )
 }
 
-fn descriptor(planes: &[u128; 14]) -> ([f32; BASIS], [f32; BASIS]) {
-    let mut first = [0.0; BASIS];
-    let mut second = [0.0; BASIS];
+fn feature_scale(index: usize, second: bool) -> f32 {
+    if index >= 42 {
+        return if second { 1.0 / 288.0 } else { 1.0 / 16.0 };
+    }
+    match (second, index % 3) {
+        (false, 0) => 0.2,
+        (false, 1) => 0.2 / 8.0,
+        (false, _) => 0.2 / 9.0,
+        (true, 0) => 0.2 / 64.0,
+        (true, 1) => 0.2 / 81.0,
+        (true, _) => 0.2 / 72.0,
+    }
+}
+
+fn contribution(index: usize) -> ([(usize, f32); 4], [(usize, f32); 4]) {
+    let (first, second) = integer_contribution(index);
+    (
+        first.map(|(i, v)| (i, v as f32 * feature_scale(i, false))),
+        second.map(|(i, v)| (i, v as f32 * feature_scale(i, true))),
+    )
+}
+
+fn descriptor(planes: &[u128; 14]) -> ([i32; BASIS], [i32; BASIS]) {
+    let mut first = [0; BASIS];
+    let mut second = [0; BASIS];
     for (plane, &mask) in planes.iter().enumerate() {
         for square in 0..90 {
             if mask & (1u128 << square) == 0 {
                 continue;
             }
-            let (a, b) = contribution(plane * 90 + square);
+            let (a, b) = integer_contribution(plane * 90 + square);
             for (i, value) in a {
                 first[i] += value;
             }
@@ -80,12 +103,20 @@ pub fn history_features_from_planes(
 ) -> [f32; HISTORY_CONTEXT_SIZE] {
     let (first, current) = descriptor(&planes[0]);
     let mut features = [0.0; HISTORY_CONTEXT_SIZE];
-    features[..BASIS].copy_from_slice(&first);
+    for i in 0..BASIS {
+        features[i] = first[i] as f32 * feature_scale(i, false);
+    }
+    // 先以二倍整数累加两步差分，再缩放。左右变换只有符号与置换，
+    // 不受棋子枚举顺序或浮点累加舍入影响。
+    let mut delta_twice = [0; BASIS];
     for h in 1..=available.min(2) {
         let (_, past) = descriptor(&planes[h]);
         for i in 0..BASIS {
-            features[BASIS + i] += (current[i] - past[i]) / h as f32;
+            delta_twice[i] += (current[i] - past[i]) * (2 / h as i32);
         }
+    }
+    for i in 0..BASIS {
+        features[BASIS + i] = delta_twice[i] as f32 * (feature_scale(i, true) * 0.5);
     }
     features
 }
@@ -240,6 +271,39 @@ mod tests {
             }
         }
         masks
+    }
+
+    #[test]
+    fn reflection_history_planes_match_signed_permutation_bit_for_bit() {
+        let mut original = [[0u128; 14]; 3];
+        for (h, boards) in original.iter_mut().enumerate() {
+            for (p, mask) in boards.iter_mut().enumerate() {
+                for square in 0..90 {
+                    if (square * 17 + p * 13 + h * 7) % 23 < 3 {
+                        *mask |= 1u128 << square;
+                    }
+                }
+            }
+        }
+        let mut mirrored = [[0u128; 14]; 3];
+        for h in 0..3 {
+            for p in 0..14 {
+                for square in 0..90 {
+                    if original[h][p] & (1u128 << square) != 0 {
+                        mirrored[h][p] |= 1u128 << super::super::nnue::mirror_file_square(square);
+                    }
+                }
+            }
+        }
+        for available in 0..=2 {
+            let expected = super::super::reflection::mirror_history_features(
+                &history_features_from_planes(&original, available),
+            );
+            let actual = history_features_from_planes(&mirrored, available);
+            for i in 0..HISTORY_CONTEXT_SIZE {
+                assert_eq!(actual[i].to_bits(), expected[i].to_bits(), "feature {i}");
+            }
+        }
     }
 
     #[test]
