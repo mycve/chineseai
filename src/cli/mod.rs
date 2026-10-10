@@ -7,7 +7,6 @@ mod az_loop_config;
 mod az_policy_scale;
 mod az_search;
 mod dispatch;
-mod dive_games;
 mod reporting;
 mod training_console;
 mod vs_pikafish;

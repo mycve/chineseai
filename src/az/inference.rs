@@ -668,7 +668,7 @@ pub struct AzNnue {
     /// 连杀证明搜索的全局节点预算上限。默认 20 万覆盖实测的 mate-in-8（58,178 节点），
     /// 同时是"最坏情况花多少时间"的硬兜底。
     ///
-    /// UCI 侧对应 `MateSearchNodes`。实测抽帧库最坏的中局局面在 depth=31 下要 **656,431**
+    /// UCI 侧对应 `MateSearchNodes`。历史压力测试中最坏的中局在 depth=31 下要 **656,431**
     /// 节点才能判"无杀"（约 380ms）；把预算开到 2,000,000 就能让它走到结论，代价是这一手
     /// 慢 10 倍。预算撞墙时会打印 `info string mate ... source=node-budget`。
     pub mate_search_nodes: usize,

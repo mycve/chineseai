@@ -66,11 +66,9 @@ pub(crate) fn run(cmd: VsPikafishArgs) {
                 hash_mb: cmd.pikafish_hash_mb,
                 use_book: Some(cmd.pikafish_use_book),
             },
-            dive: None,
             skip_games: cmd.skip_games,
             stop_after: cmd.stop_after,
         },
-        None,
     )
     .unwrap_or_else(|err| panic!("vs-pikafish failed: {err}"));
     for item in &summary.abnormal_ends {

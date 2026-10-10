@@ -23,7 +23,7 @@ eval/*.bin
 # 本地战术搜索实验日志和报告。
 /eval/blindspot-quiescence-*
 /eval/mcts-tactical-*
-# 抽帧库是可再生的中间产物（重跑 dive-games 就有），不进版本库。
+# 已移除工具留下的本地数据库，继续忽略以免误提交用户数据。
 /dive.sqlite
 /dive.sqlite-shm
 /dive.sqlite-wal

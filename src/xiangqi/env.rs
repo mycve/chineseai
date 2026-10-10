@@ -22,7 +22,7 @@ pub struct IllegalMove {
 /// 规则完整的走子环境：`Position` + 精确的 `rule_history` + 可撤销的走子栈。
 ///
 /// **注意：真正的热路径不使用它。** 自博弈（`az::play`）、搜索（`az::alphazero`）、UCI
-/// （`uci`）、抽帧库（`pikafish`）都各自内联维护 `Position` 加一个 `Vec<RuleHistoryEntry>`，
+/// （`uci`）、外部引擎对局（`pikafish`）都各自内联维护 `Position` 加一个 `Vec<RuleHistoryEntry>`，
 /// 因为 `step` 每次要做两次完整合法着生成（一次判合法、一次判结局），还要给每条规则历史
 /// 克隆整盘局面，代价远高于直接 `make_move` + `rule_history_entry_after_moved`。这里的
 /// 价值是"一份可读的、规则完整的参考实现"和它的测试。
