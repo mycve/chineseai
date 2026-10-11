@@ -513,7 +513,7 @@ fn decode_game(
         let root = wdl(float(record, VALUES), float(record, VALUES + 8))?;
         let target = wdl(float(record, VALUES + 4), float(record, VALUES + 12))?;
         let (plies_left, moves_left_weight) = moves_left_target(record);
-        let mut sample = AzTrainingSample {
+        let sample = AzTrainingSample {
             features: extract_sparse_features_az(&position),
             rule_context: rule_context_features(&position, &history),
             history_features: record_history_features(record, ply)?,
@@ -550,7 +550,6 @@ fn decode_game(
                 ..AzSampleMeta::default()
             },
         };
-        super::sample::canonicalize_training_sample(&mut sample);
         if record[10178] & 64 != 0 {
             dataset.deleted += 1;
         } else if game_id % 10 == 0 {

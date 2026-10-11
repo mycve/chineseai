@@ -205,8 +205,6 @@ pub(super) struct PackedBatch {
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
     pub policy_repetition: Vec<f32>,
-    pub policy_mirror_indices: Vec<u32>,
-    pub has_policy_pairs: bool,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
@@ -222,17 +220,6 @@ pub(super) struct PackedBatch {
 
 impl PackedBatch {
     pub(super) fn from_indices(samples: &[AzTrainingSample], batch: &[usize]) -> Self {
-        let normalized = batch
-            .iter()
-            .map(|&i| {
-                let mut sample = samples[i].clone();
-                super::sample::canonicalize_training_sample(&mut sample);
-                sample
-            })
-            .collect::<Vec<_>>();
-        let indices = (0..normalized.len()).collect::<Vec<_>>();
-        let samples = normalized.as_slice();
-        let batch = indices.as_slice();
         let batch_size = batch.len();
         let max_features = batch
             .iter()
@@ -291,10 +278,6 @@ impl PackedBatch {
             policy_targets: vec![0.0f32; batch_size * max_policy_moves],
             policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
             policy_repetition: vec![0.0; batch_size * max_policy_moves],
-            policy_mirror_indices: (0..batch_size)
-                .flat_map(|_| 0..max_policy_moves as u32)
-                .collect(),
-            has_policy_pairs: false,
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
             rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
@@ -387,24 +370,6 @@ impl PackedBatch {
                 dense_move_squares(index).map(|(from, to)| crate::xiangqi::Move::new(from, to))
             })
             .collect::<Vec<_>>();
-        if super::reflection::input_orientation(
-            &position,
-            &sample.history_features,
-            &moves,
-            &sample.repetition_flags,
-        )
-        .is_eq()
-        {
-            for (i, &mv) in moves.iter().enumerate() {
-                let mirrored = super::nnue::mirror_file_move(mv);
-                let j = moves
-                    .iter()
-                    .position(|&m| m == mirrored)
-                    .expect("symmetric training input requires paired moves");
-                self.policy_mirror_indices[policy_base + i] = j as u32;
-                self.has_policy_pairs |= i != j;
-            }
-        }
         let gives_check = moves
             .iter()
             .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))

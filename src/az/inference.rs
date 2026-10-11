@@ -1275,15 +1275,13 @@ impl AzNnue {
         history: &[crate::xiangqi::RuleHistoryEntry],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
-        let orientation = self.history_orientation(position, history, moves, repetition_flags);
-        self.evaluate_oriented(
+        let history_logits = self.value_history_cache.logits(position, history);
+        self.evaluate_with_scratch_output_with_history_logits(
             position,
             moves,
             repetition_flags,
             rule_context,
-            history,
-            None,
-            orientation,
+            history_logits,
             scratch,
         )
     }
@@ -1297,109 +1295,15 @@ impl AzNnue {
         history_features: &[f32; HISTORY_CONTEXT_SIZE],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
-        let orientation = super::reflection::input_orientation(
-            position,
-            history_features,
-            moves,
-            repetition_flags,
-        );
-        self.evaluate_oriented(
+        let history_logits = self.value_history_logits_from_features(history_features);
+        self.evaluate_with_scratch_output_with_history_logits(
             position,
             moves,
             repetition_flags,
-            rule_context,
-            &[],
-            Some(history_features),
-            orientation,
-            scratch,
-        )
-    }
-
-    fn history_orientation(
-        &self,
-        position: &Position,
-        history: &[crate::xiangqi::RuleHistoryEntry],
-        moves: &[Move],
-        flags: &[u8],
-    ) -> std::cmp::Ordering {
-        let board = super::reflection::board_orientation(position);
-        if board != std::cmp::Ordering::Equal {
-            return board;
-        }
-        super::reflection::input_orientation(
-            position,
-            &super::history::history_features(position, history),
-            moves,
-            flags,
-        )
-    }
-
-    fn oriented_history_logits(
-        &self,
-        position: &Position,
-        history: &[crate::xiangqi::RuleHistoryEntry],
-        explicit: Option<&[f32; HISTORY_CONTEXT_SIZE]>,
-        reflected: bool,
-    ) -> [f32; WDL_HEAD_SIZE] {
-        if let Some(features) = explicit {
-            return self.value_history_logits_from_features(&if reflected {
-                super::reflection::mirror_history_features(features)
-            } else {
-                *features
-            });
-        }
-        if !reflected {
-            return self.value_history_cache.logits(position, history);
-        }
-        // 历史头只读取最近两着；规则历史与真实棋盘始终由调用者保留。
-        let Some(last) = history.last() else {
-            return self.value_history_cache.logits(position, history);
-        };
-        let mut recent = [*last; 2];
-        let count = history.len().min(2);
-        for (dst, src) in recent.iter_mut().zip(&history[history.len() - count..]) {
-            *dst = *src;
-            dst.mv = dst.mv.map(crate::az::nnue::mirror_file_move);
-        }
-        self.value_history_cache.logits(position, &recent[..count])
-    }
-
-    fn evaluate_oriented(
-        &self,
-        position: &Position,
-        moves: &[Move],
-        flags: &[u8],
-        rule_context: &[f32; RULE_CONTEXT_SIZE],
-        history: &[crate::xiangqi::RuleHistoryEntry],
-        explicit: Option<&[f32; HISTORY_CONTEXT_SIZE]>,
-        orientation: std::cmp::Ordering,
-        scratch: &mut AzEvalScratch,
-    ) -> AzEvalOutput {
-        let reflected = orientation == std::cmp::Ordering::Greater;
-        let mirrored;
-        let mut mapped = std::mem::take(&mut scratch.reflected_moves);
-        let (position, evaluated_moves) = if reflected {
-            mirrored = position.mirror_files();
-            mapped.clear();
-            mapped.extend(moves.iter().copied().map(crate::az::nnue::mirror_file_move));
-            (&mirrored, mapped.as_slice())
-        } else {
-            (position, moves)
-        };
-        let history_logits = self.oriented_history_logits(position, history, explicit, reflected);
-        let output = self.evaluate_with_scratch_output_with_history_logits(
-            position,
-            evaluated_moves,
-            flags,
             rule_context,
             history_logits,
             scratch,
-        );
-        if orientation == std::cmp::Ordering::Equal {
-            super::reflection::symmetrize_policy_logits(moves, &mut scratch.logits);
-        }
-        scratch.reflected_moves = mapped;
-        output
+        )
     }
 
     fn evaluate_with_scratch_output_with_history_logits(
@@ -1523,48 +1427,7 @@ impl AzNnue {
         history: &[crate::xiangqi::RuleHistoryEntry],
         scratch: &mut AzEvalScratch,
     ) -> AzEvalOutput {
-        let orientation = self.history_orientation(position, history, moves, repetition_flags);
-        let reflected = orientation == std::cmp::Ordering::Greater;
-        let mirrored;
-        let mut mapped = std::mem::take(&mut scratch.reflected_moves);
-        let (canonical_position, evaluated_moves) = if reflected {
-            mirrored = position.mirror_files();
-            mapped.clear();
-            mapped.extend(moves.iter().copied().map(crate::az::nnue::mirror_file_move));
-            (&mirrored, mapped.as_slice())
-        } else {
-            (position, moves)
-        };
-        let history_logits =
-            self.oriented_history_logits(canonical_position, history, None, reflected);
-        let output = self.evaluate_incremental_oriented(
-            canonical_position,
-            accumulator_hidden,
-            policy_accumulator,
-            evaluated_moves,
-            repetition_flags,
-            rule_context,
-            history_logits,
-            scratch,
-        );
-        if orientation == std::cmp::Ordering::Equal {
-            super::reflection::symmetrize_policy_logits(moves, &mut scratch.logits);
-        }
-        scratch.reflected_moves = mapped;
-        output
-    }
-
-    fn evaluate_incremental_oriented(
-        &self,
-        position: &Position,
-        accumulator_hidden: &[f32],
-        policy_accumulator: &[f32; POLICY_ACCUMULATOR_RANK],
-        moves: &[Move],
-        repetition_flags: &[u8],
-        rule_context: &[f32; RULE_CONTEXT_SIZE],
-        history_logits: [f32; WDL_HEAD_SIZE],
-        scratch: &mut AzEvalScratch,
-    ) -> AzEvalOutput {
+        let history_logits = self.value_history_cache.logits(position, history);
         crate::scope_profile!("az.evaluate_incremental_with_scratch");
         scratch.hidden.resize(self.hidden_size, 0.0);
         let hidden = if accumulator_hidden.len() == self.hidden_size {
@@ -2291,36 +2154,17 @@ impl AzNnue {
         position: &Position,
         perspective: Color,
     ) -> [f32; POLICY_ACCUMULATOR_RANK] {
-        let reflected = super::reflection::board_orientation_for(position, perspective)
-            == std::cmp::Ordering::Greater;
-        let buckets =
-            super::accumulator::canonical_buckets_for_reflection(position, perspective, reflected);
-        self.policy_accumulator_oriented(position, perspective, reflected, buckets)
-    }
-
-    fn policy_accumulator_oriented(
-        &self,
-        position: &Position,
-        perspective: Color,
-        reflected: bool,
-        buckets: (usize, usize),
-    ) -> [f32; POLICY_ACCUMULATOR_RANK] {
         let mut accumulator = [0.0; POLICY_ACCUMULATOR_RANK];
         self.add_policy_row(&mut accumulator, POLICY_ACCUMULATOR_BIAS_ROW, 1);
+        let buckets = canonical_buckets_for_perspective(position, perspective);
         for square in 0..BOARD_SIZE {
-            let source = if reflected {
-                crate::az::nnue::mirror_file_square(square)
-            } else {
-                square
-            };
-            if let Some(piece) = position.piece_at(source) {
+            if let Some(piece) = position.piece_at(square) {
                 self.add_policy_piece(&mut accumulator, perspective, buckets, square, piece, 1);
             }
         }
         accumulator
     }
 
-    #[cfg(test)]
     pub(crate) fn apply_policy_transition(
         &self,
         before: &Position,
@@ -2331,36 +2175,12 @@ impl AzNnue {
         perspective: Color,
         accumulator: &mut [f32; POLICY_ACCUMULATOR_RANK],
     ) {
-        let context = super::accumulator::CanonicalTransition::new(before, after, perspective);
-        self.apply_policy_canonical_transition(after, mv, moved, captured, &context, accumulator);
-    }
-
-    pub(crate) fn apply_policy_canonical_transition(
-        &self,
-        after: &Position,
-        mv: Move,
-        moved: Piece,
-        captured: Option<Piece>,
-        context: &super::accumulator::CanonicalTransition,
-        accumulator: &mut [f32; POLICY_ACCUMULATOR_RANK],
-    ) {
-        let perspective = context.perspective;
-        let before_buckets = context.before_buckets;
-        let after_buckets = context.after_buckets;
-        if context.needs_refresh() {
-            *accumulator = self.policy_accumulator_oriented(
-                after,
-                perspective,
-                context.after_reflected,
-                after_buckets,
-            );
+        let before_buckets = canonical_buckets_for_perspective(before, perspective);
+        let after_buckets = canonical_buckets_for_perspective(after, perspective);
+        if before_buckets != after_buckets {
+            *accumulator = self.policy_accumulator(after, perspective);
             return;
         }
-        let mv = if context.reflected {
-            crate::az::nnue::mirror_file_move(mv)
-        } else {
-            mv
-        };
         self.add_policy_piece(
             accumulator,
             perspective,

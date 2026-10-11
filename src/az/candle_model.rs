@@ -178,11 +178,6 @@ impl AzCandleModel {
         let repetition_logits = batch.policy_repetition.broadcast_mul(&repetition_logit)?;
         let policy_logits =
             ((policy_logits + sparse_logits + tactical_logits)? + repetition_logits)?;
-        let policy_logits = if let Some(indices) = &batch.policy_mirror_indices {
-            (&policy_logits + policy_logits.gather(indices, 1)?)?.affine(0.5, 0.0)?
-        } else {
-            policy_logits
-        };
 
         let moves_left = hidden
             .matmul(&self.moves_left_output.t()?)?
@@ -217,7 +212,6 @@ pub(super) struct BatchTensors {
     pub(super) policy_targets: Tensor,
     pub(super) policy_mask: Tensor,
     pub(super) policy_repetition: Tensor,
-    pub(super) policy_mirror_indices: Option<Tensor>,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
     pub(super) rule_context: Tensor,
@@ -308,15 +302,6 @@ impl BatchTensors {
                 (batch_size, max_policy_moves),
                 device,
             )?,
-            policy_mirror_indices: if packed.has_policy_pairs {
-                Some(Tensor::from_vec(
-                    packed.policy_mirror_indices,
-                    (batch_size, max_policy_moves),
-                    device,
-                )?)
-            } else {
-                None
-            },
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
             rule_context: Tensor::from_vec(
@@ -679,76 +664,6 @@ mod tests {
     #[test]
     fn king_piece_factorization_initialization_trains_both_factors() {
         king_piece_factorization_training_matches_cpu(&Device::Cpu);
-    }
-
-    #[test]
-    fn reflection_policy_pairing_trains_and_matches_cpu() {
-        reflection_policy_pairing(&Device::Cpu);
-    }
-
-    #[cfg(feature = "slow-tests")]
-    #[test]
-    fn reflection_policy_pairing_trains_on_cuda() {
-        reflection_policy_pairing(crate::az::cuda_test_device::shared_cuda_device().unwrap());
-    }
-
-    fn reflection_policy_pairing(device: &Device) {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let chosen = crate::xiangqi::Move::from_uci("b0c2").unwrap();
-        let mirror = crate::az::nnue::mirror_file_move(chosen);
-        let sample = AzTrainingSample {
-            features: extract_sparse_features_az(&position),
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
-            history_features: crate::az::history_features(&position, &[]),
-            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
-            repetition_flags: vec![0; moves.len()],
-            policy: moves.iter().map(|&mv| f32::from(mv == chosen)).collect(),
-            value_wdl: [0.0, 1.0, 0.0],
-            root_search_wdl: [0.0, 1.0, 0.0],
-            value: 0.0,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            moves_left: 0.0,
-            moves_left_weight: 0.0,
-            search_simulations: 0,
-            meta: Default::default(),
-        };
-        let model = AzNnue::random(16, 20261010);
-        let candle = AzCandleModel::from_model(&model, device).unwrap();
-        let packed = PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]);
-        assert!(packed.has_policy_pairs);
-        let batch = BatchTensors::from_packed(packed, device).unwrap();
-        let forward = candle.forward(&batch).unwrap();
-        let logits = forward.policy_logits.to_vec2::<f32>().unwrap();
-        let (_, cpu_logits) = crate::az::outputs_for_training_sample(&model, &sample).unwrap();
-        for (i, &mv) in moves.iter().enumerate() {
-            let j = moves
-                .iter()
-                .position(|&other| other == crate::az::nnue::mirror_file_move(mv))
-                .unwrap();
-            assert_eq!(logits[0][i].to_bits(), logits[0][j].to_bits());
-            assert!((logits[0][i] - cpu_logits[i]).abs() < 1e-5);
-        }
-        let loss = candle_nn::ops::log_softmax(&forward.policy_logits, 1)
-            .unwrap()
-            .mul(&batch.policy_targets)
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .neg()
-            .unwrap();
-        let gradients = loss.backward().unwrap();
-        let bias = gradients
-            .get(&candle.policy_move_bias)
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let a = bias[dense_move_index(chosen)];
-        let b = bias[dense_move_index(mirror)];
-        assert!(a.is_finite() && a.abs() > 1e-6);
-        assert!((a - b).abs() < 1e-6);
     }
 
     #[cfg(feature = "slow-tests")]
