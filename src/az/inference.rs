@@ -823,10 +823,10 @@ pub(crate) fn check_context_features(
     let own_attacks = masks[color_index(side)];
     let enemy_attacks = masks[color_index(enemy)];
     let checks = gives_check.iter().filter(|&&flag| flag != 0.0).count();
-    // 缺少将位（理论上不该出现）时不问 in_check，避免它的 expect 崩掉。
+    // 复用当前局面的敌方攻击位棋盘；缺少将位时保持原来的 false。
     let in_check = position
         .general_square(side)
-        .is_some_and(|_| position.in_check(side));
+        .is_some_and(|square| enemy_attacks & (1u128 << square) != 0);
     let enemy_escapes = king_safe_escapes(position, enemy, own_attacks);
     let our_escapes = king_safe_escapes(position, side, enemy_attacks);
     [
@@ -1943,12 +1943,9 @@ impl AzNnue {
         threat_logits: [f32; WDL_HEAD_SIZE],
     ) -> ([f32; WDL_HEAD_SIZE], f32) {
         value_head.resize(VALUE_HEAD_SIZE, 0.0);
-        value_head.copy_from_slice(&self.value_head_bias);
-        for (feature, value) in value_head.iter_mut().enumerate().take(VALUE_HEAD_SIZE) {
-            let hidden_row = &self.value_head_hidden
-                [feature * self.hidden_size..(feature + 1) * self.hidden_size];
-            *value += king_piece[feature] + dot_product(hidden, hidden_row);
-            *value = (*value).max(0.0);
+        matrix_dot_into(hidden, &self.value_head_hidden, value_head);
+        for (feature, value) in value_head.iter_mut().enumerate() {
+            *value = (self.value_head_bias[feature] + (king_piece[feature] + *value)).max(0.0);
         }
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
@@ -1982,11 +1979,9 @@ impl AzNnue {
 
     pub(crate) fn shared_hidden_into(&self, hidden: &[f32], output: &mut Vec<f32>) {
         output.resize(self.hidden_size, 0.0);
-        for (row, value) in output.iter_mut().enumerate() {
-            let start = row * self.hidden_size;
-            *value = (dot_product(hidden, &self.shared_hidden[start..start + self.hidden_size])
-                + self.shared_bias[row])
-                .max(0.0);
+        matrix_dot_into(hidden, &self.shared_hidden, output);
+        for (value, &bias) in output.iter_mut().zip(&self.shared_bias) {
+            *value = (*value + bias).max(0.0);
         }
     }
 

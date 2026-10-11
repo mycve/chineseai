@@ -440,3 +440,90 @@ pub(crate) unsafe fn scale_in_place_neon(values: &mut [f32], scale: f32) {
         *value *= vgetq_lane_f32::<0>(scale);
     }
 }
+
+pub(crate) fn matrix_dot_into(input: &[f32], weights: &[f32], output: &mut [f32]) {
+    assert_eq!(weights.len(), input.len() * output.len());
+    #[cfg(target_arch = "x86_64")]
+    if input.len() >= 64
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: feature detection and matching matrix dimensions above.
+        unsafe {
+            matrix_dot_avx2_fma(input, weights, output);
+        }
+        return;
+    }
+    for (row, value) in output.iter_mut().enumerate() {
+        *value = dot_product(input, &weights[row * input.len()..(row + 1) * input.len()]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matrix_dot_avx2_fma(input: &[f32], weights: &[f32], output: &mut [f32]) {
+    use std::arch::x86_64::*;
+    // 两行共用输入，保留原点积的四路累加、归约和尾部计算顺序。
+    let width = input.len();
+    let pairs = output.len() / 2;
+    for pair in 0..pairs {
+        let row = pair * 2;
+        let mut accumulators = [[_mm256_setzero_ps(); 4]; 2];
+        for chunk in 0..width / 32 {
+            for block in 0..4 {
+                let index = chunk * 32 + block * 8;
+                unsafe {
+                    let values = _mm256_loadu_ps(input.as_ptr().add(index));
+                    for offset in 0..2 {
+                        let coefficients =
+                            _mm256_loadu_ps(weights.as_ptr().add((row + offset) * width + index));
+                        accumulators[offset][block] =
+                            _mm256_fmadd_ps(values, coefficients, accumulators[offset][block]);
+                    }
+                }
+            }
+        }
+        for offset in 0..2 {
+            let a = accumulators[offset];
+            let sum = _mm256_add_ps(_mm256_add_ps(a[0], a[1]), _mm256_add_ps(a[2], a[3]));
+            let mut lanes = [0.0; 8];
+            unsafe {
+                _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+            }
+            let mut result = lanes.iter().sum::<f32>();
+            for index in width / 32 * 32..width {
+                result += input[index] * weights[(row + offset) * width + index];
+            }
+            output[row + offset] = result;
+        }
+    }
+    if output.len() % 2 != 0 {
+        let row = output.len() - 1;
+        output[row] =
+            unsafe { dot_product_avx2_fma(input, &weights[row * width..(row + 1) * width]) };
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn matrix_dot_matches_existing_dot_bitwise() {
+    for width in [16, 64, 80, 96, 128, 192] {
+        for rows in [1, 2, 3, 16, 96] {
+            let input: Vec<f32> = (0..width)
+                .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.013)
+                .collect();
+            let weights: Vec<f32> = (0..width * rows)
+                .map(|i| ((i * 53 % 199) as f32 - 99.0) * 0.017)
+                .collect();
+            let mut output = vec![0.0; rows];
+            matrix_dot_into(&input, &weights, &mut output);
+            for row in 0..rows {
+                assert_eq!(
+                    output[row].to_bits(),
+                    dot_product(&input, &weights[row * width..(row + 1) * width]).to_bits(),
+                    "width {width} row {row}"
+                );
+            }
+        }
+    }
+}

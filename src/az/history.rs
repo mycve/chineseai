@@ -177,12 +177,13 @@ impl ValueHistoryCache {
         }
         let side = position.side_to_move();
         let mut result = [0.0; 3];
-        for square in 0..90 {
-            if let Some(piece) = position.piece_at(square) {
-                let value = self.current[piece_square(piece, square, side)];
-                for j in 0..3 {
-                    result[j] += value[j];
-                }
+        for square in position.occupied_squares() {
+            let piece = position
+                .piece_at(square)
+                .expect("occupancy and board must agree");
+            let value = self.current[piece_square(piece, square, side)];
+            for j in 0..3 {
+                result[j] += value[j];
             }
         }
         let Some(last) = history
