@@ -113,10 +113,10 @@ pub(crate) fn visit_value_king_piece_features(
     mut visitor: impl FnMut(usize),
 ) {
     let buckets = canonical_buckets_for_perspective(position, perspective);
-    for square in 0..BOARD_SIZE {
-        let Some(piece) = position.piece_at(square) else {
-            continue;
-        };
+    for square in position.occupied_squares() {
+        let piece = position
+            .piece_at(square)
+            .expect("occupancy and board must agree");
         let piece_index = piece_absolute_feature_index(perspective, piece);
         let canonical = canonical_square_for(perspective, square);
         for (king_side, bucket) in [(0, buckets.0), (1, buckets.1)] {
@@ -307,10 +307,10 @@ pub(crate) fn visit_value_threat_features(
         }
     });
 
-    for source in 0..BOARD_SIZE {
-        let Some(attacker) = position.piece_at(source) else {
-            continue;
-        };
+    for source in position.occupied_squares() {
+        let attacker = position
+            .piece_at(source)
+            .expect("occupancy and board must agree");
         if !matches!(attacker.kind, PieceKind::Rook | PieceKind::Cannon) {
             continue;
         }

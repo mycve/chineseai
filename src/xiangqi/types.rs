@@ -185,6 +185,21 @@ pub struct Position {
     pub(super) repetition_draw_enabled: bool,
 }
 
+impl Position {
+    /// 按格号升序遍历，保持特征提取和浮点累加顺序。
+    pub(crate) fn occupied_squares(&self) -> impl Iterator<Item = usize> {
+        let mut occupied = self.occupied;
+        std::iter::from_fn(move || {
+            if occupied == 0 {
+                return None;
+            }
+            let square = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            Some(square)
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PositionState {
     pub(super) hash: u64,
