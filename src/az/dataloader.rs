@@ -239,14 +239,26 @@ impl PackedBatch {
             .max()
             .unwrap_or(0)
             .max(1);
-        let value_threats = batch
+        let positions = batch
             .iter()
-            .map(|&sample_index| value_threat_features(&samples[sample_index]))
+            .map(|&sample_index| {
+                let pieces = samples[sample_index]
+                    .features
+                    .iter()
+                    .filter_map(|&feature| decode_current_piece_square_feature(feature))
+                    .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
+                    .collect::<Vec<_>>();
+                Position::from_canonical_piece_squares(&pieces)
+            })
+            .collect::<Vec<_>>();
+        let value_threats = positions
+            .iter()
+            .map(value_threat_features)
             .collect::<Vec<_>>();
         let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let value_king_pieces = batch
+        let value_king_pieces = positions
             .iter()
-            .map(|&sample_index| value_king_piece_features(&samples[sample_index]))
+            .map(value_king_piece_features)
             .collect::<Vec<_>>();
         let max_value_king_pieces = value_king_pieces
             .iter()
@@ -293,7 +305,8 @@ impl PackedBatch {
 
         for (row, (&sample_index, threats)) in batch.iter().zip(&value_threats).enumerate() {
             let sample = &samples[sample_index];
-            packed.pack_features(row, sample);
+            let king_buckets = canonical_general_buckets_from_features(&sample.features);
+            packed.pack_features(row, sample, king_buckets);
             let threat_base = row * max_value_threats;
             packed.value_threat_indices[threat_base..threat_base + threats.len()]
                 .copy_from_slice(threats);
@@ -303,7 +316,7 @@ impl PackedBatch {
             packed.value_king_piece_indices[king_base..king_base + king_pieces.len()]
                 .copy_from_slice(king_pieces);
             packed.value_king_piece_scales[row] = 1.0 / (king_pieces.len().max(1) as f32).sqrt();
-            packed.pack_policy(row, sample);
+            packed.pack_policy(row, sample, &positions[row], king_buckets);
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
@@ -334,9 +347,13 @@ impl PackedBatch {
         packed
     }
 
-    fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
-        let (us_king_bucket, them_king_bucket) =
-            canonical_general_buckets_from_features(&sample.features);
+    fn pack_features(
+        &mut self,
+        row: usize,
+        sample: &AzTrainingSample,
+        king_buckets: (usize, usize),
+    ) {
+        let (us_king_bucket, them_king_bucket) = king_buckets;
         let feature_base = row * self.max_features;
         for (feature_offset, &feature) in sample.features.iter().enumerate() {
             if feature >= AZ_NNUE_INPUT_SIZE {
@@ -348,21 +365,22 @@ impl PackedBatch {
         }
     }
 
-    fn pack_policy(&mut self, row: usize, sample: &AzTrainingSample) {
+    fn pack_policy(
+        &mut self,
+        row: usize,
+        sample: &AzTrainingSample,
+        position: &Position,
+        king_buckets: (usize, usize),
+    ) {
         let policy_base = row * self.max_policy_moves;
-        let king_buckets = canonical_general_buckets_from_features(&sample.features);
         let mut board_features = [usize::MAX; BOARD_SIZE];
-        let mut pieces = Vec::with_capacity(sample.features.len());
         for &feature in &sample.features {
             if let Some(structural) = decode_current_piece_square_feature(feature) {
                 let square = structural.rank * 9 + structural.file;
                 board_features[square] = feature;
-                pieces.push((structural.piece_index, square));
             }
         }
-        let position = Position::from_canonical_piece_squares(&pieces);
-        let opponent_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Black);
-        let own_attacks = position.attacked_squares_mask(crate::xiangqi::Color::Red);
+        let [own_attacks, opponent_attacks] = position.attacked_squares_masks();
         let moves = sample
             .move_indices
             .iter()
@@ -376,7 +394,7 @@ impl PackedBatch {
             .collect::<Vec<_>>();
         self.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE]
             .copy_from_slice(&check_context_features(
-                &position,
+                position,
                 &moves,
                 &gives_check,
                 [own_attacks, opponent_attacks],
@@ -491,16 +509,9 @@ impl PackedBatch {
     }
 }
 
-fn value_threat_features(sample: &AzTrainingSample) -> Vec<u32> {
-    let pieces = sample
-        .features
-        .iter()
-        .filter_map(|&feature| decode_current_piece_square_feature(feature))
-        .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
-        .collect::<Vec<_>>();
-    let position = Position::from_canonical_piece_squares(&pieces);
+fn value_threat_features(position: &Position) -> Vec<u32> {
     let mut features = Vec::with_capacity(32);
-    visit_value_threat_features(&position, Color::Red, |feature| {
+    visit_value_threat_features(position, Color::Red, |feature| {
         features.push(feature as u32);
     });
     assert!(
@@ -510,16 +521,9 @@ fn value_threat_features(sample: &AzTrainingSample) -> Vec<u32> {
     features
 }
 
-fn value_king_piece_features(sample: &AzTrainingSample) -> Vec<u32> {
-    let pieces = sample
-        .features
-        .iter()
-        .filter_map(|&feature| decode_current_piece_square_feature(feature))
-        .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
-        .collect::<Vec<_>>();
-    let position = Position::from_canonical_piece_squares(&pieces);
+fn value_king_piece_features(position: &Position) -> Vec<u32> {
     let mut features = Vec::with_capacity(VALUE_KING_PIECE_MAX_ACTIVE);
-    visit_value_king_piece_features(&position, Color::Red, |feature| {
+    visit_value_king_piece_features(position, Color::Red, |feature| {
         features.push(feature as u32)
     });
     assert!(features.len() <= VALUE_KING_PIECE_MAX_ACTIVE);
