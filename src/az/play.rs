@@ -27,9 +27,6 @@ fn outcome_index(result_red: f32) -> usize {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AzTerminalStats {
-    pub pikafish_checks: usize,
-    /// 裁判提前判胜，按红胜、黑胜排列。
-    pub pikafish_wins: [usize; 2],
     /// 已由搜索证明的提前终局，按红胜、和棋、黑胜排列。
     pub search_proven: [usize; 3],
     pub no_legal_moves: usize,
@@ -81,10 +78,6 @@ impl AzTerminalStats {
 
     pub fn add_assign(&mut self, other: &Self) {
         for (count, other_count) in self.search_proven.iter_mut().zip(other.search_proven) {
-            *count += other_count;
-        }
-        self.pikafish_checks += other.pikafish_checks;
-        for (count, other_count) in self.pikafish_wins.iter_mut().zip(other.pikafish_wins) {
             *count += other_count;
         }
         self.no_legal_moves += other.no_legal_moves;
@@ -412,9 +405,6 @@ fn choose_selfplay_start(
 fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayData {
     crate::scope_profile!("az.selfplay.chunk");
     let mut rng = SplitMix64::new(config.seed);
-    // 裁判抽签不消耗搜索/采样 RNG，未判胜的对局仍保持原有 MCTS 分布。
-    let mut judge_rng = SplitMix64::new(config.seed ^ 0x7069_6b61_6669_7368);
-    let mut judge = None;
     let mut samples = Vec::new();
     let mut position_fens = Vec::new();
     let mut red_wins = 0usize;
@@ -464,12 +454,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
         let mut position = start.position;
         let mut rule_history = start.rule_history;
         let start_phase_ply = start.phase_ply;
-        let check_ply = config.selfplay_pikafish_exe.as_ref().and_then(|_| {
-            (judge_rng.unit_f32() < 0.2).then(|| 40 + (judge_rng.next_u64() % 81) as usize)
-        });
-        let initial_fen = check_ply.map(|_| position.to_fen_with_history(&rule_history));
-        let initial_history_len = rule_history.len();
-        let mut judge_termination = false;
         let start_source = start.source;
         let start_source_index = start_source.index();
         let start_age = config.generation_update.saturating_sub(start.generation);
@@ -506,39 +490,6 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
                 });
                 terminal.record_no_legal_moves(&position);
                 break;
-            }
-
-            if check_ply == Some(ply) && position.rule_outcome_with_history(&rule_history).is_none()
-            {
-                if judge.is_none() {
-                    judge = Some(
-                        crate::pikafish::PikafishJudge::spawn(
-                            config.selfplay_pikafish_exe.as_ref().unwrap(),
-                        )
-                        .expect("无法启动自博弈 Pikafish 裁判，请检查引擎和 NNUE 路径"),
-                    );
-                }
-                let moves: Vec<_> = rule_history[initial_history_len..]
-                    .iter()
-                    .filter_map(|entry| entry.mv.map(|mv| mv.to_uci()))
-                    .collect();
-                terminal.pikafish_checks += 1;
-                if let Some(outcome) = judge
-                    .as_mut()
-                    .unwrap()
-                    .adjudicate(
-                        initial_fen.as_ref().unwrap(),
-                        &moves,
-                        position.side_to_move(),
-                    )
-                    .expect("自博弈 Pikafish 裁判通信失败")
-                {
-                    terminal.pikafish_wins[usize::from(outcome < 0.0)] += 1;
-                    judge_termination = true;
-                    result = Some(outcome);
-                    plies = played_plies;
-                    break;
-                }
             }
 
             search_simulations.searches += 1;
@@ -751,7 +702,7 @@ fn generate_selfplay_chunk(model: &AzNnue, config: &AzLoopConfig) -> AzSelfplayD
             finalize_moves_left_targets(
                 &mut game_samples,
                 proven_terminal_ply.or_else(|| {
-                    (terminal_result.is_some() && !proven_termination && !judge_termination)
+                    (terminal_result.is_some() && !proven_termination)
                         .then_some(start_phase_ply + played_plies)
                 }),
             );
@@ -1431,7 +1382,6 @@ mod tests {
     fn selfplay_test_config(games: usize) -> AzLoopConfig {
         AzLoopConfig {
             games,
-            selfplay_pikafish_exe: None,
             max_plies: 12,
             rule60_max_ply: Some(120),
             simulations: 64,
@@ -1940,46 +1890,6 @@ mod tests {
         assert!(samples.iter().all(|sample| sample.value_weight == 1.0));
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
-    }
-
-    #[test]
-    #[ignore = "需要本地 Pikafish 引擎及 NNUE"]
-    fn pikafish_judge_selfplay_preserves_policy() {
-        let mut config = selfplay_test_config(1);
-        // 选定抽签会在第 40 ply 检查的种子，前一手仍由原 MCTS 生成。
-        config.seed = (0..10_000)
-            .find(|seed| {
-                let mut rng = SplitMix64::new(seed ^ 0x7069_6b61_6669_7368);
-                rng.unit_f32() < 0.2 && 40 + rng.next_u64() % 81 == 40
-            })
-            .unwrap();
-        config.simulations = 1;
-        config.max_plies = 41;
-        config.opening_positions = vec![AzStartSnapshot {
-            position: Position::from_fen("4k4/9/9/9/4p4/9/9/9/R8/4K4 w - - 0 1").unwrap(),
-            rule_history: Vec::new(),
-            phase_ply: 39,
-            generation: 0,
-        }]
-        .into();
-        let model = AzNnue::random(4, 7);
-        let baseline = generate_selfplay_chunk(&model, &config);
-        config.selfplay_pikafish_exe = Some(if cfg!(windows) {
-            "tools/pikafish.exe".into()
-        } else {
-            "tools/pikafish".into()
-        });
-        let judged = generate_selfplay_chunk(&model, &config);
-        assert_eq!(judged.terminal.pikafish_checks, 1);
-        assert_eq!(judged.terminal.pikafish_wins, [1, 0]);
-        assert_eq!(judged.samples.len(), 1);
-        assert_eq!(judged.samples[0].policy, baseline.samples[0].policy);
-        assert_eq!(
-            judged.samples[0].move_indices,
-            baseline.samples[0].move_indices
-        );
-        assert_eq!(judged.samples[0].value, 1.0);
-        assert_eq!(judged.samples[0].moves_left_weight, 0.0);
     }
 
     #[test]

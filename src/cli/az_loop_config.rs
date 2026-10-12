@@ -52,8 +52,6 @@ pub struct AzLoopFileConfig {
     pub draw_score: f32,
     pub policy_softmax_temp: f32,
     pub selfplay_opening_book: String,
-    /// 自博弈裁判引擎路径；空字符串关闭。20% 对局在 40–120 ply 检查一次。
-    pub selfplay_pikafish_exe: String,
     /// 根节点连杀证明搜索的最大半回合数（0 = 关闭，9 = 最多 mate in 5，15 = mate in 8）。
     ///
     /// 带 `#[serde(default)]`：老配置文件里没有这一项时按 0（关闭）解析，不必改格式版本。
@@ -145,11 +143,6 @@ impl Default for AzLoopFileConfig {
             draw_score: 0.0,
             policy_softmax_temp: 1.45,
             selfplay_opening_book: "book.pgn.gz".into(),
-            selfplay_pikafish_exe: if cfg!(windows) {
-                "tools/pikafish.exe".into()
-            } else {
-                "tools/pikafish".into()
-            },
             // 9 半回合 = mate in 5：实测把可证射程从 mate-in-4 推到 mate-in-5，
             // 而"有将军但无杀"的局面只 +4%，根局面没有将军着法时为 0。
             mate_search_plies: 9,
@@ -222,7 +215,6 @@ impl AzLoopFileConfig {
         line!("format_version", AZ_LOOP_CONFIG_FORMAT_VERSION);
         line!("model_path", q(&self.model_path));
         line!("selfplay_opening_book", q(&self.selfplay_opening_book));
-        line!("selfplay_pikafish_exe", q(&self.selfplay_pikafish_exe));
         line!("mate_search_plies", self.mate_search_plies);
         line!("moves_left_enabled", self.moves_left_enabled);
         line!("moves_left_threshold", f(self.moves_left_threshold));
@@ -483,18 +475,6 @@ mod tests {
         assert_eq!(clamped.moves_left_threshold, 1.0);
         assert_eq!(clamped.moves_left_max_effect, 0.0);
         assert_eq!(clamped.moves_left_slope, AzMovesLeftParams::default().slope);
-    }
-
-    #[test]
-    fn pikafish_judge_config_roundtrips() {
-        let config = AzLoopFileConfig::default();
-        let parsed = AzLoopFileConfig::parse(&config.to_file_text());
-        assert_eq!(parsed.selfplay_pikafish_exe, config.selfplay_pikafish_exe);
-        let disabled = AzLoopFileConfig {
-            selfplay_pikafish_exe: String::new(),
-            ..config
-        };
-        assert!(AzLoopFileConfig::parse(&disabled.to_file_text()).selfplay_pikafish_exe.is_empty());
     }
 
     #[test]

@@ -110,8 +110,6 @@ pub(crate) fn build_az_loop_config(
 ) -> AzLoopConfig {
     AzLoopConfig {
         games: 1,
-        selfplay_pikafish_exe: (!config.selfplay_pikafish_exe.is_empty())
-            .then(|| config.selfplay_pikafish_exe.clone().into()),
         max_plies: config.max_plies,
         rule60_max_ply: config.sixty_move_rule.then_some(config.rule60_max_ply),
         simulations: config.simulations,
