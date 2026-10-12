@@ -842,6 +842,12 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 report.terminal_rule_draw_mutual_long_chase as f32,
             ),
             ("terminal/rule_win_red", report.terminal_rule_win_red as f32),
+            ("selfplay/pikafish_checks", report.pikafish_checks as f32),
+            ("terminal/pikafish_red_win", report.pikafish_wins[0] as f32),
+            (
+                "terminal/pikafish_black_win",
+                report.pikafish_wins[1] as f32,
+            ),
             (
                 "terminal/rule_win_black",
                 report.terminal_rule_win_black as f32,

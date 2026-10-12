@@ -5,12 +5,13 @@ use super::{
 };
 
 impl Position {
-    /// Visit occupied piece relations used by the network's relation head.
+    /// 测试用的完整关系遍历，用于核对攻击及炮架关系。
     ///
     /// For a cannon the first occupied square is emitted as its screen and the
     /// second as its capture target.  This gives the network the missing
     /// cannon-screen relation without another board scan.  Slider rays use the
     /// position occupancy bitboard, so they jump directly between blockers.
+    #[cfg(test)]
     pub(crate) fn visit_occupied_relations(&self, visitor: impl FnMut(usize, Piece, usize, Piece)) {
         self.visit_piece_relations::<true>(visitor);
     }

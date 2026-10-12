@@ -7,6 +7,7 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct AzLoopConfig {
     pub games: usize,
+    pub selfplay_pikafish_exe: Option<std::path::PathBuf>,
     pub max_plies: usize,
     pub rule60_max_ply: Option<u16>,
     pub simulations: usize,
@@ -136,6 +137,8 @@ pub struct AzLoopReport {
     pub terminal_rule_win_black: usize,
     pub terminal_max_plies: usize,
     pub terminal_search_proven: [usize; 3],
+    pub pikafish_checks: usize,
+    pub pikafish_wins: [usize; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -6,10 +6,6 @@ use super::{
 };
 
 impl Position {
-    pub(crate) fn attacked_squares_mask(&self, by: Color) -> u128 {
-        self.attacked_squares_masks()[color_hash_index(by)]
-    }
-
     pub(crate) fn attacked_squares_masks(&self) -> [u128; 2] {
         let mut masks = [0u128; 2];
         let occupancy = self.occupied;

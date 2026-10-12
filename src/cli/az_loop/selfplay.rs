@@ -220,5 +220,7 @@ pub(crate) fn build_async_training_report(
         terminal_rule_win_black: pending.selfplay.terminal.rule_win_black,
         terminal_max_plies: pending.selfplay.terminal.max_plies,
         terminal_search_proven: pending.selfplay.terminal.search_proven,
+        pikafish_checks: pending.selfplay.terminal.pikafish_checks,
+        pikafish_wins: pending.selfplay.terminal.pikafish_wins,
     }
 }

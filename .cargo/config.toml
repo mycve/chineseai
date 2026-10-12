@@ -1,3 +1,8 @@
+[env]
+# Windows 的 nvcc/MSVC 使用项目构建目录写临时文件。
+TEMP = { value = "target", relative = true, force = true }
+TMP = { value = "target", relative = true, force = true }
+
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]
 
