@@ -1239,7 +1239,7 @@ mod tests {
     }
 
     fn check_context_training_matches_inference(device: &Device) {
-        use crate::az::{nnue::canonical_move, px0_sgd::Px0Sgd};
+        use crate::az::{adamw::AzAdamW, nnue::canonical_move};
 
         let positions = [
             Position::startpos(),
@@ -1336,7 +1336,8 @@ mod tests {
             .unwrap();
         assert!(gradient.iter().all(|g| g.is_finite()));
         assert!(gradient.iter().any(|g| g.abs() > 1e-8));
-        let mut optimizer = Px0Sgd::new(candle.all_vars(), 0.02).unwrap();
+        let (vars, decay) = candle.all_vars_with_decay();
+        let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
         optimizer.step(&gradients).unwrap();
         candle.copy_to_model(&mut model).unwrap();
         assert!(model.check_context_hidden.iter().any(|&w| w != 0.0));

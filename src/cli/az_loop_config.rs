@@ -70,12 +70,7 @@ pub struct AzLoopFileConfig {
     pub replay_recent_games: u32,
     pub train_warmup_samples: usize,
     pub train_samples_per_update: usize,
-    /// 训练优化器内核：`"adamw"`（默认）或 `"px0-sgd"`。
-    ///
-    /// 带 `#[serde(default)]`：老配置文件里没有这一项时按默认值解析，不必改格式版本。
-    /// 注意 `lr` 的语义随内核变化 —— AdamW 用常数 lr（逐坐标自适应，步长 ≈ lr），
-    /// Px0Sgd 用 `lr` 作 base 并乘 warmup 与按累计步数分段的阶梯，两者尺度不可直接比较。
-    #[serde(default)]
+    /// 统一使用 AdamW，lr 是预热结束时的峰值学习率。
     pub train_optimizer: AzTrainOptimizer,
     pub mirror_probability: f32,
     pub train_value_weight: f32,
@@ -110,9 +105,6 @@ impl Default for AzLoopFileConfig {
             model_path: "model.safetensors".into(),
             simulations: 10_000,
             selfplay_samples_per_update: 120000,
-            // 默认内核是 AdamW（逐坐标自适应，步长 ≈ lr），所以 `lr` 用旧配方的 4e-4。
-            // 改用 `train_optimizer = "px0-sgd"` 时必须把 `lr` 提到 0.02 量级：带动量 SGD 的
-            // 步长 ∝ lr·g，两个尺度不可混用。
             lr: 0.0004,
             batch_size: 2048,
             // Px0 SelfPlayGame采用450步上限，200步会过早丢失终局价值标签。
@@ -519,14 +511,21 @@ mod tests {
         );
 
         let config = AzLoopFileConfig {
-            train_optimizer: AzTrainOptimizer::Px0Sgd,
+            train_optimizer: AzTrainOptimizer::AdamW,
             ..AzLoopFileConfig::default()
         };
         let text = config.to_file_text();
-        assert!(text.contains("train_optimizer = \"px0-sgd\"\n"));
+        assert!(text.contains("train_optimizer = \"adamw\"\n"));
+        assert!(
+            toml::from_str::<AzLoopFileConfig>(&text.replace(
+                "train_optimizer = \"adamw\"",
+                "train_optimizer = \"px0-sgd\""
+            ))
+            .is_err()
+        );
         assert_eq!(
             AzLoopFileConfig::parse(&text).train_optimizer,
-            AzTrainOptimizer::Px0Sgd
+            AzTrainOptimizer::AdamW
         );
 
         let legacy = text

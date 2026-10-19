@@ -1090,7 +1090,7 @@ impl AzNnue {
             .and_then(|state| state.to_vec1::<i64>())
             .map_err(candle_io_error)?;
         if state.len() != 4
-            || !matches!(state[0], 1 | 2)
+            || state[0] != super::adamw::STATE_TAG
             || state[1] != MODEL_FORMAT_VERSION as i64
             || state[2] < 0
             || state[3] < 1

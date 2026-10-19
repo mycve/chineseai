@@ -40,7 +40,7 @@ pub(crate) fn tensorboard_encoded_subdir(config: &AzLoopFileConfig) -> String {
     let encoded = format!(
         concat!(
             "sim{}_sspu{}_bs{}_lr{}_h{}_mxp{}_sr{}_r60{}_wk{}_",
-            "shuf{}_rrw{}_sgd09nesterov_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_rc{}_",
+            "shuf{}_rrw{}_adamw_w250_isqrt10000_min01_cp{}_cpr{}_fv{}_fvr{}_pst{}_tb{}_teg{}_tdd{}_tde{}_rc{}_",
             "tspu{}_mp{}_cpi{}_ai{}_as{}_acp{}_acpr{}_apst{}_rda{}_ref{}_sd{}"
         ),
         config.simulations,
@@ -109,10 +109,14 @@ pub(crate) fn checkpoint_path(model_path: &str, checkpoint_dir: &str, update: us
 }
 
 pub(crate) fn optimizer_checkpoint_path(model_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.sgd.safetensors", model_path.display()))
+    PathBuf::from(format!("{}.adamw.safetensors", model_path.display()))
 }
 
-pub(crate) fn best_checkpoint_path(model_path: &str, checkpoint_dir: &str, update: usize) -> PathBuf {
+pub(crate) fn best_checkpoint_path(
+    model_path: &str,
+    checkpoint_dir: &str,
+    update: usize,
+) -> PathBuf {
     let base = Path::new(model_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -148,7 +152,10 @@ pub(crate) fn save_best_checkpoint_model(
     path
 }
 
-pub(crate) fn champion_checkpoint_paths(model_path: &str, checkpoint_dir: &str) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn champion_checkpoint_paths(
+    model_path: &str,
+    checkpoint_dir: &str,
+) -> io::Result<Vec<PathBuf>> {
     let directory = Path::new(checkpoint_dir);
     if !directory.exists() {
         return Ok(Vec::new());

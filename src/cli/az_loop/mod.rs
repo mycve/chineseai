@@ -111,7 +111,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         (AzNnue::random_with_arch(config_arch, config.seed), false)
     };
     model.moves_left_params = config.moves_left_params();
-    let optimizer_state_path = PathBuf::from(format!("{config_path}.sgd.safetensors"));
+    let optimizer_state_path = PathBuf::from(format!("{config_path}.adamw.safetensors"));
     let model_optimizer_path = optimizer_checkpoint_path(model_path);
     let restore_path = if model_optimizer_path.exists() {
         &model_optimizer_path
@@ -148,7 +148,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         );
     } else {
         println!(
-            "optimizer: fresh {} lr={} global step=0",
+            "optimizer: fresh {} peak_lr={} schedule=warmup250-inverse_sqrt10000-min0.1 global step=0",
             config.train_optimizer.as_str(),
             config.lr
         );
@@ -484,7 +484,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                         optimizer_checkpoint_path(&path),
                         train_update.saturating_add(1),
                     )
-                    .unwrap_or_else(|err| panic!("failed to save checkpoint SGD state: {err}"));
+                    .unwrap_or_else(|err| panic!("failed to save checkpoint AdamW state: {err}"));
             }
             let mut report = build_async_training_report(
                 pending,

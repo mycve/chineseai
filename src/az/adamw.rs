@@ -7,25 +7,40 @@ use std::{collections::HashMap, path::Path};
 //   2. 它的 `step_t` 是私有字段且没有 getter，resume 后偏差校正会从头算 —— 恢复后的头
 //      几十步 `scale_m/sqrt(scale_v)` 偏小（t=1 时约 0.32×，之后渐近到 1×），即欠更新；
 //   3. 它不支持按张量分组决定 weight decay。
-// 本实现照 `px0_sgd.rs` 的模板：自持步数计数器、m/v 用同一套 safetensors 布局序列化、
-// decay 按张量分组。
+// 自持累计步数，持久化 m/v、调度参数及 decay 分组。
 const BETA1: f64 = 0.9;
 const BETA2: f64 = 0.999;
 const EPS: f64 = 1e-8;
-/// 与 Px0Sgd 用同一个全局梯度范数上限，保证两臂的裁剪口径一致。
-/// 实测这个阈值几乎不会触发（正常范数是 O(1)），所以它实际是个 no-op。
+/// 全局梯度范数上限。
 const MAX_GRAD_NORM: f64 = 10_000.0;
 /// 施加 decay 的稠密权重用的系数。
 ///
 /// 注意量级：`lr=4e-4` 时每步衰减因子是 `1 - lr*wd = 1 - 4e-8`，十万步累计只收缩
 /// **0.4%**。所以这个旋钮在 Adam 的学习率尺度下几乎不动结果 —— 分组与否不会混淆消融。
 pub(super) const DENSE_WEIGHT_DECAY: f64 = 1e-4;
-/// 优化器状态文件的格式标签。与 Px0Sgd 的 `1` 区分开，禁止两种优化器的状态互载。
-const STATE_TAG: i64 = 2;
+/// 调度参数成为恢复契约的一部分；拒绝旧的固定学习率状态。
+pub(super) const STATE_TAG: i64 = 3;
 /// `state` 张量的元素个数：tag / 模型格式版本 / 步数 / 下次更新的序号。
 const STATE_LEN: usize = 4;
-/// `hyper` 张量：base_lr / last_lr / beta1 / beta2 / eps / dense_weight_decay。
-const HYPER_LEN: usize = 6;
+/// `hyper` 张量还保存预热步数、衰减时间尺度和最低倍率。
+const HYPER_LEN: usize = 9;
+const WARMUP_STEPS: usize = 250;
+const DECAY_STEPS: usize = 10_000;
+const MIN_LR_RATIO: f64 = 0.1;
+
+/// steps 为已经完成的更新次数。持续自博弈无需设定总训练步数。
+fn learning_rate(base_lr: f64, steps: usize) -> f64 {
+    let update = steps.saturating_add(1);
+    let ratio = if update <= WARMUP_STEPS {
+        update as f64 / WARMUP_STEPS as f64
+    } else {
+        (1.0 + (update - WARMUP_STEPS) as f64 / DECAY_STEPS as f64)
+            .sqrt()
+            .recip()
+            .max(MIN_LR_RATIO)
+    };
+    base_lr * ratio
+}
 
 #[derive(Debug)]
 pub(super) struct AzAdamW {
@@ -41,6 +56,9 @@ pub(super) struct AzAdamW {
 
 impl AzAdamW {
     pub fn new(vars: Vec<Var>, decay: Vec<bool>, base_lr: f64) -> Result<Self> {
+        if !base_lr.is_finite() || base_lr <= 0.0 {
+            candle_core::bail!("AdamW peak learning rate must be finite and positive");
+        }
         if vars.len() != decay.len() {
             candle_core::bail!(
                 "AdamW decay mask length {} does not match {} vars",
@@ -63,8 +81,7 @@ impl AzAdamW {
 
     pub fn step(&mut self, grads: &GradStore) -> Result<()> {
         let scale = gradient_scale(&self.vars, grads)?;
-        // 常数学习率：没有 warmup，也没有按步数分段的阶梯。
-        let lr = self.base_lr;
+        let lr = learning_rate(self.base_lr, self.steps);
         self.steps += 1;
         let step = self.steps as i32;
         let scale_m = 1.0 / (1.0 - BETA1.powi(step));
@@ -129,6 +146,9 @@ impl AzAdamW {
                     BETA2,
                     EPS,
                     DENSE_WEIGHT_DECAY,
+                    WARMUP_STEPS as f64,
+                    DECAY_STEPS as f64,
+                    MIN_LR_RATIO,
                 ],
                 &cpu,
             )?,
@@ -174,6 +194,10 @@ impl AzAdamW {
             || hyper[3] != BETA2
             || hyper[4] != EPS
             || hyper[5] != DENSE_WEIGHT_DECAY
+            || hyper[6] != WARMUP_STEPS as f64
+            || hyper[7] != DECAY_STEPS as f64
+            || hyper[8] != MIN_LR_RATIO
+            || !hyper[1].is_finite()
             || mask != expected_mask
             || tensors.len() != 3 + self.vars.len() * 3
         {
@@ -274,6 +298,76 @@ mod tests {
         opt.step(&grads).unwrap();
     }
 
+    #[test]
+    fn schedule_warms_up_decays_smoothly_and_keeps_a_floor() {
+        let peak = 4e-4;
+        assert_eq!(learning_rate(peak, 0), peak / 250.0);
+        assert_eq!(learning_rate(peak, 249), peak);
+        assert!(learning_rate(peak, 250) < peak);
+        assert!((learning_rate(peak, 10_249) - peak / 2f64.sqrt()).abs() < 1e-15);
+        assert_eq!(learning_rate(peak, 990_249), peak * MIN_LR_RATIO);
+        assert_eq!(learning_rate(peak, usize::MAX), peak * MIN_LR_RATIO);
+        for steps in 1..250 {
+            assert!(learning_rate(peak, steps) > learning_rate(peak, steps - 1));
+        }
+        for steps in 250..20_000 {
+            assert!(learning_rate(peak, steps) <= learning_rate(peak, steps - 1));
+        }
+    }
+
+    #[test]
+    fn resume_preserves_schedule_at_warmup_decay_and_floor_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "chineseai-adamw-schedule-{}.safetensors",
+            std::process::id()
+        ));
+        for steps in [249, 10_249, 990_249] {
+            let var = Var::new(&[1f32], &Device::Cpu).unwrap();
+            let mut opt = AzAdamW::new(vec![var.clone()], vec![true], 4e-4).unwrap();
+            step(&mut opt, &[0.5]);
+            opt.steps = steps;
+            opt.last_lr = learning_rate(opt.base_lr, steps - 1);
+            opt.save(&path, 42).unwrap();
+            let saved_var =
+                Var::new(var.to_vec1::<f32>().unwrap().as_slice(), &Device::Cpu).unwrap();
+            let mut restored = AzAdamW::new(vec![saved_var.clone()], vec![true], 4e-4).unwrap();
+            restored.restore(&path, 42).unwrap();
+            for _ in 0..3 {
+                step(&mut opt, &[0.25]);
+                step(&mut restored, &[0.25]);
+                assert_eq!(restored.steps, opt.steps);
+                assert_eq!(restored.last_lr, learning_rate(opt.base_lr, opt.steps - 1));
+                assert_eq!(
+                    var.to_vec1::<f32>().unwrap(),
+                    saved_var.to_vec1::<f32>().unwrap()
+                );
+            }
+        }
+        // 调度不同或旧格式的状态必须拒绝，不能悄悄改变恢复后的训练轨迹。
+        let tensors = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        for legacy in [false, true] {
+            let mut altered = tensors.clone();
+            if legacy {
+                let mut state = altered["state"].to_vec1::<i64>().unwrap();
+                state[0] = 2;
+                altered.insert("state".into(), Tensor::new(state, &Device::Cpu).unwrap());
+            } else {
+                let mut hyper = altered["hyper"].to_vec1::<f64>().unwrap();
+                hyper[6] += 1.0;
+                altered.insert("hyper".into(), Tensor::new(hyper, &Device::Cpu).unwrap());
+            }
+            candle_core::safetensors::save(&altered, &path).unwrap();
+            let var = Var::new(
+                tensors["weight_0"].to_vec1::<f32>().unwrap().as_slice(),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let mut opt = AzAdamW::new(vec![var], vec![true], 4e-4).unwrap();
+            assert!(opt.restore(&path, 42).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// 逐步对照一个纯 f64 的参考实现，覆盖 bias correction 与 decay 分组。
     #[test]
     fn adamw_matches_reference_including_decay_group() {
@@ -309,10 +403,11 @@ mod tests {
                 let g = grad[i % 2] as f64;
                 m[i] = BETA1 * m[i] + (1.0 - BETA1) * g;
                 v[i] = BETA2 * v[i] + (1.0 - BETA2) * g * g;
-                let update = (m[i] * scale_m) / ((v[i] * scale_v).sqrt() + EPS) * lr;
+                let step_lr = learning_rate(lr, opt.steps - 1);
+                let update = (m[i] * scale_m) / ((v[i] * scale_v).sqrt() + EPS) * step_lr;
                 // 前两个下标走 decay 组，后两个不走。
                 reference[i] = if i < 2 {
-                    reference[i] * (1.0 - lr * DENSE_WEIGHT_DECAY) - update
+                    reference[i] * (1.0 - step_lr * DENSE_WEIGHT_DECAY) - update
                 } else {
                     reference[i] - update
                 };
@@ -334,8 +429,7 @@ mod tests {
                 );
             }
         }
-        // 常数学习率：last_lr 必须始终等于 base_lr。
-        assert!((opt.last_lr - lr).abs() < 1e-12);
+        assert_eq!(opt.last_lr, learning_rate(lr, opt.steps - 1));
     }
 
     #[test]

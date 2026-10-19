@@ -1,6 +1,5 @@
 use super::adamw::AzAdamW;
-use super::px0_sgd::Px0Sgd;
-use candle_core::{Device, Result as CandleResult, Tensor, Var, backprop::GradStore};
+use candle_core::{Device, Result as CandleResult, Tensor, backprop::GradStore};
 use candle_nn::ops::log_softmax;
 use std::{sync::Arc, thread, time::Instant};
 
@@ -11,85 +10,12 @@ use super::{
     dataloader::{BatchPlan, DataLoaderConfig, PackedBatch, PackedStepBatch, PrefetchDataLoader},
 };
 
-/// 优化器内核的两种实现，对外暴露同一组接口（`set_base_lr`/`step`/`steps`/`last_lr`/
-/// `save`/`restore`），这样自博弈循环与检查点逻辑都不必关心选的是哪一个。
-#[derive(Debug)]
-enum TrainOptimizer {
-    Px0(Box<Px0Sgd>),
-    AdamW(Box<AzAdamW>),
-}
-
-impl TrainOptimizer {
-    fn new(
-        kind: AzTrainOptimizer,
-        vars: Vec<Var>,
-        decay: Vec<bool>,
-        lr: f64,
-    ) -> CandleResult<Self> {
-        Ok(match kind {
-            AzTrainOptimizer::Px0Sgd => Self::Px0(Box::new(Px0Sgd::new(vars, lr)?)),
-            AzTrainOptimizer::AdamW => Self::AdamW(Box::new(AzAdamW::new(vars, decay, lr)?)),
-        })
-    }
-
-    fn set_base_lr(&mut self, lr: f64) {
-        match self {
-            Self::Px0(opt) => opt.base_lr = lr,
-            Self::AdamW(opt) => opt.base_lr = lr,
-        }
-    }
-
-    fn step(&mut self, grads: &GradStore) -> CandleResult<()> {
-        match self {
-            Self::Px0(opt) => opt.step(grads),
-            Self::AdamW(opt) => opt.step(grads),
-        }
-    }
-
-    fn steps(&self) -> usize {
-        match self {
-            Self::Px0(opt) => opt.steps,
-            Self::AdamW(opt) => opt.steps,
-        }
-    }
-
-    fn last_lr(&self) -> f64 {
-        match self {
-            Self::Px0(opt) => opt.last_lr,
-            Self::AdamW(opt) => opt.last_lr,
-        }
-    }
-
-    /// 测试用：把累计步数拨到指定值，触发检查点/留出集相关的分支。
-    #[cfg(test)]
-    fn set_steps(&mut self, steps: usize) {
-        match self {
-            Self::Px0(opt) => opt.steps = steps,
-            Self::AdamW(opt) => opt.steps = steps,
-        }
-    }
-
-    fn save(&self, path: &std::path::Path, next_update: usize) -> CandleResult<()> {
-        match self {
-            Self::Px0(opt) => opt.save(path, next_update),
-            Self::AdamW(opt) => opt.save(path, next_update),
-        }
-    }
-
-    fn restore(&mut self, path: &std::path::Path, next_update: usize) -> CandleResult<()> {
-        match self {
-            Self::Px0(opt) => opt.restore(path, next_update),
-            Self::AdamW(opt) => opt.restore(path, next_update),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct GpuTrainer {
     arch: AzNnueArch,
     optimizer_kind: AzTrainOptimizer,
     replica: GpuReplica,
-    optimizer: TrainOptimizer,
+    optimizer: AzAdamW,
     holdout: Option<Arc<Vec<AzTrainingSample>>>,
     checks: Vec<super::AzHoldoutReport>,
 }
@@ -204,7 +130,7 @@ impl GpuTrainer {
             }
         };
         let (vars, decay) = replica.model.all_vars_with_decay();
-        let optimizer = TrainOptimizer::new(optimizer_kind, vars, decay, lr as f64)?;
+        let optimizer = AzAdamW::new(vars, decay, lr as f64)?;
 
         Ok(Self {
             arch: model.arch,
@@ -221,7 +147,7 @@ impl GpuTrainer {
     }
 
     fn set_learning_rate(&mut self, lr: f32) {
-        self.optimizer.set_base_lr(lr as f64);
+        self.optimizer.base_lr = lr as f64;
     }
 
     pub(super) fn save_state(
@@ -241,7 +167,7 @@ impl GpuTrainer {
     }
 
     pub(super) fn steps(&self) -> usize {
-        self.optimizer.steps()
+        self.optimizer.steps
     }
 
     pub(super) fn set_holdout(&mut self, samples: Vec<AzTrainingSample>) {
@@ -297,7 +223,7 @@ impl GpuTrainer {
     }
 
     pub(super) fn last_learning_rate(&self) -> f32 {
-        self.optimizer.last_lr() as f32
+        self.optimizer.last_lr as f32
     }
 
     fn train_batch(
@@ -614,7 +540,7 @@ mod monitoring_tests {
 
     #[cfg(feature = "slow-tests")]
     #[test]
-    fn complete_sgd_batch_resume_keeps_all_model_tensors_and_momentum() {
+    fn complete_adamw_batch_resume_keeps_all_model_tensors_and_moments() {
         let position = crate::xiangqi::Position::startpos();
         let moves = position.legal_moves();
         let sample = AzTrainingSample {
@@ -643,12 +569,7 @@ mod monitoring_tests {
             value: 1.0,
             policy: 1.0,
         };
-        // 两个优化器内核都要在真实（含融合 CUDA 算子）路径上验证"恢复 == 不中断"。
-        // 学习率按各自尺度给：Px0Sgd 用 0.02，AdamW 用 4e-4。
-        for (kind, lr) in [
-            (AzTrainOptimizer::Px0Sgd, 0.02f32),
-            (AzTrainOptimizer::AdamW, 4e-4f32),
-        ] {
+        for (kind, lr) in [(AzTrainOptimizer::AdamW, 4e-4f32)] {
             let mut model = AzNnue::random(16, 20260927);
             let mut uninterrupted = GpuTrainer::new(&model, lr, kind).unwrap();
             eprintln!(
@@ -671,7 +592,7 @@ mod monitoring_tests {
             std::fs::remove_file(path).unwrap();
             uninterrupted.train_batch_single(batch(), weights).unwrap();
             restored.train_batch_single(batch(), weights).unwrap();
-            assert_eq!(restored.optimizer.steps(), uninterrupted.optimizer.steps());
+            assert_eq!(restored.optimizer.steps, uninterrupted.optimizer.steps);
             assert_eq!(
                 restored.last_learning_rate(),
                 uninterrupted.last_learning_rate()
@@ -700,15 +621,11 @@ mod monitoring_tests {
 
     #[test]
     fn optimizer_rejects_partial_tensor_state() {
-        for (kind, lr) in [
-            (AzTrainOptimizer::AdamW, 4e-4),
-            (AzTrainOptimizer::Px0Sgd, 0.02),
-        ] {
+        for (kind, lr) in [(AzTrainOptimizer::AdamW, 4e-4)] {
             let model = AzNnue::random(8, 87);
             let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
             let (vars, decay) = candle.all_vars_with_decay();
-            let partial =
-                TrainOptimizer::new(kind, vars[..28].to_vec(), decay[..28].to_vec(), lr).unwrap();
+            let partial = AzAdamW::new(vars[..28].to_vec(), decay[..28].to_vec(), lr).unwrap();
             let path = std::env::temp_dir().join(format!(
                 "chineseai-partial-{}-{}.safetensors",
                 kind.as_str(),
@@ -716,7 +633,7 @@ mod monitoring_tests {
             ));
             partial.save(&path, 44109).unwrap();
             assert_eq!(AzNnue::training_state_next_update(&path).unwrap(), 44109);
-            let mut restored = TrainOptimizer::new(kind, vars, decay, lr).unwrap();
+            let mut restored = AzAdamW::new(vars, decay, lr).unwrap();
             assert!(restored.restore(&path, 44109).is_err());
             std::fs::remove_file(path).unwrap();
         }
@@ -758,8 +675,7 @@ mod monitoring_tests {
         assert_eq!(initial.stats.moves_left_samples, 1);
         let initial_loss = initial.stats.moves_left_loss;
         let (vars, decay) = replica.model.all_vars_with_decay();
-        let mut optimizer =
-            TrainOptimizer::new(AzTrainOptimizer::Px0Sgd, vars, decay, 0.02).unwrap();
+        let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
         for _ in 0..5 {
             let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
             optimizer
@@ -869,16 +785,15 @@ mod monitoring_tests {
             .iter()
             .map(|v| v.as_tensor().clone())
             .collect::<Vec<_>>();
-        let optimizer = TrainOptimizer::new(
-            AzTrainOptimizer::Px0Sgd,
+        let optimizer = AzAdamW::new(
             replica.model.all_vars(),
             vec![true; replica.model.all_vars().len()],
-            0.02,
+            4e-4,
         )
         .unwrap();
         let mut trainer = GpuTrainer {
             arch: AzNnueArch { hidden_size: 16 },
-            optimizer_kind: AzTrainOptimizer::Px0Sgd,
+            optimizer_kind: AzTrainOptimizer::AdamW,
             replica,
             optimizer,
             holdout: None,
@@ -908,20 +823,18 @@ mod monitoring_tests {
                 0.0
             );
         }
-        trainer
-            .optimizer
-            .set_steps(super::super::PX0_TEST_STEPS - 1);
+        trainer.optimizer.steps = super::super::PX0_TEST_STEPS - 1;
         let mut model = AzNnue::random(16, 20260907);
         model.gpu_trainer = Some(Box::new(trainer));
         train_samples_gpu(
             &mut model,
             Arc::new(holdout_samples),
             1,
-            0.02,
+            4e-4,
             1,
             &mut super::super::SplitMix64::new(8),
             AzTrainLossWeights::default(),
-            AzTrainOptimizer::Px0Sgd,
+            AzTrainOptimizer::AdamW,
         )
         .unwrap();
         let checks = model.take_training_checks();
