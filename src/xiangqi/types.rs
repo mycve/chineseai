@@ -188,7 +188,11 @@ pub struct Position {
 impl Position {
     /// 按格号升序遍历，保持特征提取和浮点累加顺序。
     pub(crate) fn occupied_squares(&self) -> impl Iterator<Item = usize> {
-        let mut occupied = self.occupied;
+        self.occupied_squares_from(u128::MAX)
+    }
+
+    pub(crate) fn occupied_squares_from(&self, sources: u128) -> impl Iterator<Item = usize> {
+        let mut occupied = self.occupied & sources;
         std::iter::from_fn(move || {
             if occupied == 0 {
                 return None;

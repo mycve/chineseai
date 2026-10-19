@@ -190,6 +190,7 @@ pub(super) struct PackedStepBatch {
 #[derive(Clone, Debug)]
 pub(super) struct PackedBatch {
     pub batch_size: usize,
+    pub value_buckets: Vec<u32>,
     pub max_features: usize,
     pub max_policy_moves: usize,
     pub max_value_threats: usize,
@@ -269,6 +270,10 @@ impl PackedBatch {
 
         let mut packed = Self {
             batch_size,
+            value_buckets: positions
+                .iter()
+                .map(|p| super::value_material_bucket(p, Color::Red) as u32)
+                .collect(),
             max_features,
             max_policy_moves,
             max_value_threats,

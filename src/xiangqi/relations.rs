@@ -16,18 +16,28 @@ impl Position {
         self.visit_piece_relations::<true>(visitor);
     }
 
-    pub(crate) fn visit_occupied_leaper_relations(
+    pub(crate) fn visit_occupied_leaper_relations_from(
+        &self,
+        sources: u128,
+        visitor: impl FnMut(usize, Piece, usize, Piece),
+    ) {
+        self.visit_piece_relations_from::<false>(sources, visitor);
+    }
+
+    #[cfg(test)]
+    fn visit_piece_relations<const SLIDERS: bool>(
         &self,
         visitor: impl FnMut(usize, Piece, usize, Piece),
     ) {
-        self.visit_piece_relations::<false>(visitor);
+        self.visit_piece_relations_from::<SLIDERS>(u128::MAX, visitor);
     }
 
-    fn visit_piece_relations<const SLIDERS: bool>(
+    fn visit_piece_relations_from<const SLIDERS: bool>(
         &self,
+        sources: u128,
         mut visitor: impl FnMut(usize, Piece, usize, Piece),
     ) {
-        let mut pieces = self.occupied;
+        let mut pieces = self.occupied & sources;
         while pieces != 0 {
             let source = pieces.trailing_zeros() as usize;
             pieces &= pieces - 1;

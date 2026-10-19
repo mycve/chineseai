@@ -74,7 +74,10 @@ macro_rules! az_weight_tensors {
             value_king_piece_projection,
             [VALUE_KING_PIECE_RANK, VALUE_HEAD_SIZE]
         );
-        $visit!(value_head_output, [WDL_HEAD_SIZE, VALUE_HEAD_SIZE]);
+        $visit!(
+            value_head_output,
+            [VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE]
+        );
         $visit!(value_history_output, [WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE]);
         $visit!(moves_left_output, [1, $h]);
         $visit!(moves_left_bias, [1]);
@@ -107,16 +110,56 @@ macro_rules! az_weight_tensors {
     };
 }
 
+/// 按双方车与马炮数量选择价值输出专家；走棋方始终为第一视角。
+pub(crate) fn value_material_bucket(position: &Position, perspective: Color) -> usize {
+    let mut rooks = [0usize; 2];
+    let mut minors = [0usize; 2];
+    for square in position.occupied_squares() {
+        let piece = position.piece_at(square).unwrap();
+        let side = usize::from(piece.color != perspective);
+        match piece.kind {
+            PieceKind::Rook => rooks[side] += 1,
+            PieceKind::Horse | PieceKind::Cannon => minors[side] += 1,
+            _ => {}
+        }
+    }
+    value_material_bucket_counts(rooks, minors)
+}
+
+pub(crate) fn value_material_bucket_counts(rooks: [usize; 2], minors: [usize; 2]) -> usize {
+    let [us, them] = rooks.map(|n| n.min(2));
+    let total = minors[0] + minors[1];
+    if us == them {
+        us * 8 + usize::from(minors[0] == minors[1]) * 4 + (total / 2).min(3)
+    } else if us == 2 && them == 1 {
+        24 + usize::from(total >= 4)
+    } else if us == 1 && them == 2 {
+        26 + usize::from(total >= 4)
+    } else if us > 0 && them == 0 {
+        28 + usize::from(total >= 4)
+    } else {
+        30 + usize::from(total >= 4)
+    }
+}
+
 pub(crate) fn visit_value_king_piece_features(
     position: &Position,
     perspective: Color,
     mut visitor: impl FnMut(usize),
-) {
+) -> usize {
+    let mut rooks = [0usize; 2];
+    let mut minors = [0usize; 2];
     let buckets = canonical_buckets_for_perspective(position, perspective);
     for square in position.occupied_squares() {
         let piece = position
             .piece_at(square)
             .expect("occupancy and board must agree");
+        let side = usize::from(piece.color != perspective);
+        match piece.kind {
+            PieceKind::Rook => rooks[side] += 1,
+            PieceKind::Horse | PieceKind::Cannon => minors[side] += 1,
+            _ => {}
+        }
         let piece_index = piece_absolute_feature_index(perspective, piece);
         let canonical = canonical_square_for(perspective, square);
         for (king_side, bucket) in [(0, buckets.0), (1, buckets.1)] {
@@ -126,17 +169,22 @@ pub(crate) fn visit_value_king_piece_features(
             );
         }
     }
+    value_material_bucket_counts(rooks, minors)
 }
 
-pub(crate) fn threat_relation_map() -> &'static [u32] {
+pub(crate) fn threat_relation_map() -> &'static [u16] {
     use std::sync::OnceLock;
-    static MAP: OnceLock<Vec<u32>> = OnceLock::new();
+    static MAP: OnceLock<Vec<u16>> = OnceLock::new();
     MAP.get_or_init(|| {
-        let mut map = vec![u32::MAX; STRUCTURAL_PIECE_SIZE * BOARD_SIZE * BOARD_SIZE];
-        let mut next = 0u32;
+        let mut map = vec![u16::MAX; STRUCTURAL_PIECE_SIZE * BOARD_SIZE * BOARD_SIZE];
+        let mut next = 0u16;
         for attacker in 0..STRUCTURAL_PIECE_SIZE {
             let ours = attacker < 7;
             let kind = attacker % 7;
+            // 车炮已由射线与炮架特征编码，不再分配从未激活的配对行。
+            if kind == 4 || kind == 5 {
+                continue;
+            }
             for source in 0..BOARD_SIZE {
                 if !threat_reachable_square(attacker, source) {
                     continue;
@@ -144,68 +192,61 @@ pub(crate) fn threat_relation_map() -> &'static [u32] {
                 let rank = source / BOARD_FILES;
                 let file = source % BOARD_FILES;
                 let mut targets = Vec::with_capacity(18);
-                if kind == 4 || kind == 5 {
-                    targets.extend((0..BOARD_SIZE).filter(|&target| {
-                        target != source
-                            && (target / BOARD_FILES == rank || target % BOARD_FILES == file)
-                    }));
-                } else {
-                    let steps: &[(isize, isize)] = match kind {
-                        0 => &[(0, -1), (0, 1), (-1, 0), (1, 0)],
-                        1 => &[(-1, -1), (1, -1), (-1, 1), (1, 1)],
-                        2 => &[(-2, -2), (2, -2), (-2, 2), (2, 2)],
-                        3 => &[
-                            (-1, -2),
-                            (1, -2),
-                            (-1, 2),
-                            (1, 2),
-                            (-2, -1),
-                            (-2, 1),
-                            (2, -1),
-                            (2, 1),
-                        ],
-                        6 if ours && rank <= 4 => &[(0, -1), (-1, 0), (1, 0)],
-                        6 if !ours && rank >= 5 => &[(0, 1), (-1, 0), (1, 0)],
-                        6 if ours => &[(0, -1)],
-                        6 => &[(0, 1)],
-                        _ => unreachable!(),
-                    };
-                    for &(df, dr) in steps {
-                        let target_file = file as isize + df;
-                        let target_rank = rank as isize + dr;
-                        if !(0..BOARD_FILES as isize).contains(&target_file)
-                            || !(0..BOARD_RANKS as isize).contains(&target_rank)
-                        {
-                            continue;
-                        }
-                        if (kind == 0 || kind == 1)
-                            && (!(3..=5).contains(&(target_file as usize))
-                                || if ours {
-                                    target_rank < 7
-                                } else {
-                                    target_rank > 2
-                                })
-                        {
-                            continue;
-                        }
-                        if kind == 2
-                            && if ours {
-                                target_rank < 5
-                            } else {
-                                target_rank > 4
-                            }
-                        {
-                            continue;
-                        }
-                        targets.push(target_rank as usize * BOARD_FILES + target_file as usize);
+                let steps: &[(isize, isize)] = match kind {
+                    0 => &[(0, -1), (0, 1), (-1, 0), (1, 0)],
+                    1 => &[(-1, -1), (1, -1), (-1, 1), (1, 1)],
+                    2 => &[(-2, -2), (2, -2), (-2, 2), (2, 2)],
+                    3 => &[
+                        (-1, -2),
+                        (1, -2),
+                        (-1, 2),
+                        (1, 2),
+                        (-2, -1),
+                        (-2, 1),
+                        (2, -1),
+                        (2, 1),
+                    ],
+                    6 if ours && rank <= 4 => &[(0, -1), (-1, 0), (1, 0)],
+                    6 if !ours && rank >= 5 => &[(0, 1), (-1, 0), (1, 0)],
+                    6 if ours => &[(0, -1)],
+                    6 => &[(0, 1)],
+                    _ => unreachable!(),
+                };
+                for &(df, dr) in steps {
+                    let target_file = file as isize + df;
+                    let target_rank = rank as isize + dr;
+                    if !(0..BOARD_FILES as isize).contains(&target_file)
+                        || !(0..BOARD_RANKS as isize).contains(&target_rank)
+                    {
+                        continue;
                     }
+                    if (kind == 0 || kind == 1)
+                        && (!(3..=5).contains(&(target_file as usize))
+                            || if ours {
+                                target_rank < 7
+                            } else {
+                                target_rank > 2
+                            })
+                    {
+                        continue;
+                    }
+                    if kind == 2
+                        && if ours {
+                            target_rank < 5
+                        } else {
+                            target_rank > 4
+                        }
+                    {
+                        continue;
+                    }
+                    targets.push(target_rank as usize * BOARD_FILES + target_file as usize);
                 }
                 for target in targets {
                     let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
                     map[relation] = next;
                     next += (0..STRUCTURAL_PIECE_SIZE)
                         .filter(|&piece| threat_reachable_square(piece, target))
-                        .count() as u32;
+                        .count() as u16;
                 }
             }
         }
@@ -285,7 +326,7 @@ pub(crate) fn value_threat_index(
     let target = canonical_square_for(perspective, target);
     let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
     let base = threat_relation_map()[relation];
-    if base == u32::MAX {
+    if base == u16::MAX {
         return VALUE_THREAT_PAIR_VOCAB;
     }
     let offset = threat_attacked_offsets()[target * STRUCTURAL_PIECE_SIZE + attacked];
@@ -298,16 +339,36 @@ pub(crate) fn value_threat_index(
 pub(crate) fn visit_value_threat_features(
     position: &Position,
     perspective: Color,
+    visitor: impl FnMut(usize),
+) {
+    visit_value_threat_features_from(position, perspective, u128::MAX, visitor);
+}
+
+pub(crate) fn visit_value_threat_features_from(
+    position: &Position,
+    perspective: Color,
+    sources: u128,
     mut visitor: impl FnMut(usize),
 ) {
-    position.visit_occupied_leaper_relations(|source, attacker, target, attacked| {
+    visit_value_threat_entries_from(position, perspective, sources, |entry| {
+        visitor((entry & 0xffff) as usize)
+    });
+}
+
+pub(crate) fn visit_value_threat_entries_from(
+    position: &Position,
+    perspective: Color,
+    sources: u128,
+    mut visitor: impl FnMut(u32),
+) {
+    position.visit_occupied_leaper_relations_from(sources, |source, attacker, target, attacked| {
         let feature = value_threat_index(perspective, source, attacker, target, attacked);
         if feature != VALUE_THREAT_PAIR_VOCAB {
-            visitor(feature);
+            visitor(((source as u32) << 16) | feature as u32);
         }
     });
 
-    for source in position.occupied_squares() {
+    for source in position.occupied_squares_from(sources) {
         let attacker = position
             .piece_at(source)
             .expect("occupancy and board must agree");
@@ -351,7 +412,9 @@ pub(crate) fn visit_value_threat_features(
                     2 + usize::from(canonical_df > 0)
                 };
                 let ray = ((((attacker_class * 2) * 4 + direction) * 9) * 15 + 14) * 4;
-                visitor(VALUE_THREAT_PAIR_VOCAB + ray);
+                visitor(
+                    (1 << 23) | ((source as u32) << 16) | (VALUE_THREAT_PAIR_VOCAB + ray) as u32,
+                );
                 continue;
             }
             let ray_state = blocker_count.min(3);
@@ -375,7 +438,9 @@ pub(crate) fn visit_value_threat_features(
                     + blocked_class)
                     * 4)
                     + ray_state;
-                visitor(VALUE_THREAT_PAIR_VOCAB + ray);
+                visitor(
+                    (1 << 23) | ((source as u32) << 16) | (VALUE_THREAT_PAIR_VOCAB + ray) as u32,
+                );
 
                 if attacker.kind == PieceKind::Cannon && ordinal == 1 {
                     let (screen_source, screen) = first.expect("second blocker requires first");
@@ -404,7 +469,11 @@ pub(crate) fn visit_value_threat_features(
                         triple ^= triple >> 29;
                     }
                     let triple = triple as usize & (VALUE_CANNON_TRIPLE_VOCAB - 1);
-                    visitor(VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + triple);
+                    visitor(
+                        (1 << 23)
+                            | ((source as u32) << 16)
+                            | (VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + triple) as u32,
+                    );
                 }
             }
         }
@@ -434,6 +503,11 @@ pub(crate) fn policy_consequence_features(
 pub(crate) fn policy_cache_main_index(mv: usize, piece: usize, us: usize, them: usize) -> usize {
     debug_assert!(piece < POLICY_CACHE_PIECE_SIZE);
     ((mv * POLICY_CACHE_PIECE_SIZE + piece) * V2_KING_BUCKETS + us) * V2_KING_BUCKETS + them
+}
+
+#[inline]
+pub(crate) fn policy_tactical_cache_index(mv: usize, piece: usize, signature: usize) -> usize {
+    (mv * POLICY_CACHE_PIECE_SIZE + piece) * POLICY_TACTICAL_SIGNATURE_BUCKETS + signature
 }
 
 #[inline]
@@ -663,6 +737,9 @@ pub struct AzNnue {
     /// 想证更长的杀只能加预算（[`Self::mate_search_nodes`]）：置换表和着法排序都实测过，
     /// 在 check-only 树上没有收益，原因记在 `mate.rs` 的模块注释里。
     pub mate_search_plies: usize,
+    /// 实验性威胁增量缓存；当前 MCTS 默认使用更快的全量遍历。
+    pub threat_incremental: bool,
+    pub node_incremental: bool,
     /// 连杀证明搜索的全局节点预算上限。默认 20 万覆盖实测的 mate-in-8（58,178 节点），
     /// 同时是"最坏情况花多少时间"的硬兜底。
     ///
@@ -723,6 +800,8 @@ impl Clone for AzNnue {
             policy_tactical_active: self.policy_tactical_active,
             check_context_active: self.check_context_active,
             mate_search_plies: self.mate_search_plies,
+            threat_incremental: self.threat_incremental,
+            node_incremental: self.node_incremental,
             mate_search_nodes: self.mate_search_nodes,
             gpu_trainer: None,
         }
@@ -878,7 +957,7 @@ impl AzNnue {
         }
         // Keep the value head output-neutral at initialization. This preserves
         // stable first self-play while giving value its own nonlinear capacity.
-        let value_head_output = vec![0.0; WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
+        let value_head_output = vec![0.0; VALUE_BUCKETS * WDL_HEAD_SIZE * VALUE_HEAD_SIZE];
         let value_threat_embedding = (0..VALUE_THREAT_VOCAB * VALUE_THREAT_RANK)
             .map(|_| rng.weight(0.02))
             .collect();
@@ -953,6 +1032,8 @@ impl AzNnue {
             policy_tactical_active: false,
             check_context_active: false,
             mate_search_plies: 0,
+            threat_incremental: false,
+            node_incremental: true,
             mate_search_nodes: 200_000,
             gpu_trainer: None,
         };
@@ -1168,6 +1249,8 @@ impl AzNnue {
             policy_tactical_active: false,
             check_context_active: false,
             mate_search_plies: 0,
+            threat_incremental: false,
+            node_incremental: true,
             mate_search_nodes: 200_000,
             gpu_trainer: None,
         };
@@ -1369,16 +1452,22 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_king_piece_accumulate(position, &mut scratch.value_king_piece_accumulator);
+            let bucket = self.value_king_piece_accumulate(
+                position,
+                &mut scratch.value_king_piece_accumulator,
+                scratch.value_king_piece_precomputed.take(),
+            );
             let mut threat_logits = self.value_threat_logits(
                 position,
                 &mut scratch.value_threat_accumulator,
                 &mut scratch.value_threat_activation,
+                scratch.value_threat_precomputed.take(),
             );
             for j in 0..WDL_HEAD_SIZE {
                 threat_logits[j] += history_logits[j];
             }
             self.value_wdl_from_hidden_into(
+                bucket,
                 &scratch.hidden,
                 &scratch.value_king_piece_accumulator,
                 &mut scratch.value_head,
@@ -1466,16 +1555,22 @@ impl AzNnue {
         }
         let (value_wdl, value) = {
             crate::scope_profile!("az.eval.value_head");
-            self.value_king_piece_accumulate(position, &mut scratch.value_king_piece_accumulator);
+            let bucket = self.value_king_piece_accumulate(
+                position,
+                &mut scratch.value_king_piece_accumulator,
+                scratch.value_king_piece_precomputed.take(),
+            );
             let mut threat_logits = self.value_threat_logits(
                 position,
                 &mut scratch.value_threat_accumulator,
                 &mut scratch.value_threat_activation,
+                scratch.value_threat_precomputed.take(),
             );
             for j in 0..WDL_HEAD_SIZE {
                 threat_logits[j] += history_logits[j];
             }
             self.value_wdl_from_hidden_into(
+                bucket,
                 &scratch.hidden,
                 &scratch.value_king_piece_accumulator,
                 &mut scratch.value_head,
@@ -1610,7 +1705,11 @@ impl AzNnue {
                                 captured.map(|feature| feature / BOARD_SIZE),
                                 check != 0.0,
                             );
-                            let base = self.policy_tactical_folded[tactical[0]];
+                            let base = self.policy_tactical_folded[policy_tactical_cache_index(
+                                move_index,
+                                moved_piece,
+                                tactical[0] % POLICY_TACTICAL_SIGNATURE_BUCKETS,
+                            )];
                             captured.map_or(base, |_| base + self.policy_tactical[tactical[2]])
                         })
                     } else {
@@ -1864,6 +1963,7 @@ impl AzNnue {
         position: &Position,
         accumulator: &mut Vec<f32>,
         activation: &mut Vec<f32>,
+        precomputed: Option<([f32; VALUE_THREAT_RANK], usize)>,
     ) -> [f32; WDL_HEAD_SIZE] {
         if !self.value_threat_active {
             return [0.0; WDL_HEAD_SIZE];
@@ -1875,14 +1975,19 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.value_threat.accumulate");
             let mut active = 0usize;
-            visit_value_threat_features(position, perspective, |feature| {
-                active += 1;
-                let row = &self.value_threat_embedding
-                    [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
-                for (sum, weight) in accumulator.iter_mut().zip(row) {
-                    *sum += weight;
-                }
-            });
+            if let Some((sum, count)) = precomputed {
+                accumulator.copy_from_slice(&sum);
+                active = count;
+            } else {
+                visit_value_threat_features(position, perspective, |feature| {
+                    active += 1;
+                    let row = &self.value_threat_embedding
+                        [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
+                    for (sum, weight) in accumulator.iter_mut().zip(row) {
+                        *sum += weight;
+                    }
+                });
+            }
             let scale = 1.0 / (active.max(1) as f32).sqrt();
             for value in accumulator.iter_mut() {
                 *value *= scale;
@@ -1910,18 +2015,25 @@ impl AzNnue {
         &self,
         position: &Position,
         accumulator: &mut Vec<f32>,
-    ) {
+        precomputed: Option<ValueKingState>,
+    ) -> usize {
         crate::scope_profile!("az.eval.value_king_piece");
-        let mut pooled = [0.0; VALUE_KING_PIECE_RANK];
-        let mut active = 0;
-        visit_value_king_piece_features(position, position.side_to_move(), |feature| {
-            active += 1;
-            let row = &self.value_king_piece_hidden
-                [feature * VALUE_KING_PIECE_RANK..(feature + 1) * VALUE_KING_PIECE_RANK];
-            for (sum, &weight) in pooled.iter_mut().zip(row) {
-                *sum += weight;
-            }
-        });
+        let (pooled, active, bucket) = if let Some(state) = precomputed {
+            (state.pool, state.active(), state.bucket())
+        } else {
+            let mut pooled = [0.0; VALUE_KING_PIECE_RANK];
+            let mut active = 0;
+            let bucket =
+                visit_value_king_piece_features(position, position.side_to_move(), |feature| {
+                    active += 1;
+                    let row = &self.value_king_piece_hidden
+                        [feature * VALUE_KING_PIECE_RANK..(feature + 1) * VALUE_KING_PIECE_RANK];
+                    for (sum, &weight) in pooled.iter_mut().zip(row) {
+                        *sum += weight;
+                    }
+                });
+            (pooled, active, bucket)
+        };
         let scale = 1.0 / (active.max(1) as f32).sqrt();
         accumulator.resize(VALUE_HEAD_SIZE, 0.0);
         accumulator.fill(0.0);
@@ -1933,10 +2045,12 @@ impl AzNnue {
                 *sum += value * weight;
             }
         }
+        bucket
     }
 
     pub(crate) fn value_wdl_from_hidden_into(
         &self,
+        bucket: usize,
         hidden: &[f32],
         king_piece: &[f32],
         value_head: &mut Vec<f32>,
@@ -1949,7 +2063,8 @@ impl AzNnue {
         }
         let mut logits = [0.0f32; WDL_HEAD_SIZE];
         for (out, logit) in logits.iter_mut().enumerate() {
-            let row = &self.value_head_output[out * VALUE_HEAD_SIZE..(out + 1) * VALUE_HEAD_SIZE];
+            let start = (bucket * WDL_HEAD_SIZE + out) * VALUE_HEAD_SIZE;
+            let row = &self.value_head_output[start..start + VALUE_HEAD_SIZE];
             *logit = dot_product(value_head, row) + threat_logits[out];
         }
         let wdl = softmax_fixed3(logits);
@@ -2006,7 +2121,7 @@ impl AzNnue {
 
     pub(crate) fn rebuild_policy_tactical(&mut self) {
         self.policy_tactical_active = self.policy_tactical.iter().any(|&weight| weight != 0.0);
-        self.policy_tactical_folded = self.policy_tactical[..POLICY_TACTICAL_EXACT_SIZE].to_vec();
+        self.policy_tactical_folded = vec![0.0; POLICY_TACTICAL_EXACT_SIZE];
         for move_index in 0..DENSE_MOVE_SPACE {
             for moved_piece in 0..STRUCTURAL_PIECE_SIZE / 2 {
                 for signature in 0..POLICY_TACTICAL_SIGNATURE_BUCKETS {
@@ -2016,7 +2131,9 @@ impl AzNnue {
                     let piece_factor = POLICY_TACTICAL_EXACT_SIZE
                         + moved_piece * POLICY_TACTICAL_SIGNATURE_BUCKETS
                         + signature;
-                    self.policy_tactical_folded[exact] += self.policy_tactical[piece_factor];
+                    self.policy_tactical_folded
+                        [policy_tactical_cache_index(move_index, moved_piece, signature)] =
+                        self.policy_tactical[exact] + self.policy_tactical[piece_factor];
                 }
             }
         }
@@ -2218,7 +2335,7 @@ impl AzNnue {
         let relative_square = canonical_square_for(perspective, square);
         let rank = relative_square / BOARD_FILES;
         let file = relative_square % BOARD_FILES;
-        for row in [
+        let rows = [
             piece_index * BOARD_SIZE + relative_square,
             POLICY_ACCUMULATOR_PIECE_OFFSET + piece_index,
             POLICY_ACCUMULATOR_RANK_OFFSET + rank,
@@ -2227,9 +2344,18 @@ impl AzNnue {
                 + structural_king_piece_index(0, buckets.0, piece_index),
             POLICY_ACCUMULATOR_KING_PIECE_OFFSET
                 + structural_king_piece_index(1, buckets.1, piece_index),
-        ] {
-            self.add_policy_row(accumulator, row, sign);
-        }
+        ];
+        add_scaled_rows(
+            accumulator,
+            rows.map(|row| {
+                feature_row(
+                    &self.policy_accumulator_features,
+                    POLICY_ACCUMULATOR_RANK,
+                    row,
+                )
+            }),
+            sign as f32,
+        );
     }
 
     pub(crate) fn add_policy_row(

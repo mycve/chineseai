@@ -5,6 +5,11 @@ pub fn inference_simd_backend() -> &'static str {
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512dq")
+            {
+                return "avx512+avx2+fma-4acc";
+            }
             return "avx2+fma-4acc";
         }
         if std::arch::is_x86_feature_detected!("avx2") {
@@ -35,6 +40,15 @@ pub(crate) fn dot_product(left: &[f32], right: &[f32]) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         #[cfg(target_arch = "x86_64")]
+        if left.len() == 64
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: runtime detection above guarantees the required features.
+            return unsafe { dot_product_avx512(left, right) };
+        }
+        #[cfg(target_arch = "x86_64")]
         if left.len() >= 64
             && std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma")
@@ -64,6 +78,48 @@ pub(crate) fn dot_product(left: &[f32], right: &[f32]) -> f32 {
         sum += left[index] * right[index];
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx2")]
+unsafe fn dot_product_avx512(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let chunks = left.len() / 32;
+    let mut first = _mm512_setzero_ps();
+    let mut second = _mm512_setzero_ps();
+    for chunk in 0..chunks {
+        let index = chunk * 32;
+        unsafe {
+            first = _mm512_fmadd_ps(
+                _mm512_loadu_ps(left.as_ptr().add(index)),
+                _mm512_loadu_ps(right.as_ptr().add(index)),
+                first,
+            );
+            second = _mm512_fmadd_ps(
+                _mm512_loadu_ps(left.as_ptr().add(index + 16)),
+                _mm512_loadu_ps(right.as_ptr().add(index + 16)),
+                second,
+            );
+        }
+    }
+    // 保留 AVX2 四路累加和八通道顺序求和，确保推理结果逐位一致。
+    let sum = _mm256_add_ps(
+        _mm256_add_ps(
+            _mm512_castps512_ps256(first),
+            _mm512_extractf32x8_ps::<1>(first),
+        ),
+        _mm256_add_ps(
+            _mm512_castps512_ps256(second),
+            _mm512_extractf32x8_ps::<1>(second),
+        ),
+    );
+    let mut lanes = [0.0; 8];
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+    let mut result = lanes.iter().sum::<f32>();
+    for index in chunks * 32..left.len() {
+        result += left[index] * right[index];
+    }
+    result
 }
 
 pub(crate) fn add_scaled_feature_row(
@@ -105,7 +161,110 @@ pub(crate) fn add_scaled_feature_row(
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// 多个特征行按原顺序更新，每个隐藏向量只读写一次。
+#[inline]
+pub(crate) fn add_scaled_rows<const N: usize>(hidden: &mut [f32], rows: [&[f32]; N], scale: f32) {
+    let width = hidden.len();
+    assert!(rows.iter().all(|row| row.len() == width));
+    #[cfg(target_arch = "x86_64")]
+    if width >= 64
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: dimensions and CPU features are checked above.
+        unsafe { add_scaled_rows_avx512(hidden, rows, scale) };
+        return;
+    }
+    for row in rows {
+        add_scaled_feature_row(hidden, row, width, 0, scale);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma")]
+unsafe fn add_scaled_rows_avx512<const N: usize>(
+    hidden: &mut [f32],
+    rows: [&[f32]; N],
+    scale: f32,
+) {
+    use std::arch::x86_64::*;
+    let scalar = scale;
+    let scale = _mm512_set1_ps(scale);
+    for group in 0..hidden.len() / 64 {
+        let index = group * 64;
+        let mut values = [_mm512_setzero_ps(); 4];
+        unsafe {
+            for block in 0..4 {
+                values[block] = _mm512_loadu_ps(hidden.as_ptr().add(index + block * 16));
+            }
+            for row in rows {
+                for block in 0..4 {
+                    values[block] = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(row.as_ptr().add(index + block * 16)),
+                        scale,
+                        values[block],
+                    );
+                }
+            }
+            for block in 0..4 {
+                _mm512_storeu_ps(hidden.as_mut_ptr().add(index + block * 16), values[block]);
+            }
+        }
+    }
+    let start = hidden.len() / 64 * 64;
+    for chunk in 0..(hidden.len() - start) / 8 {
+        let index = start + chunk * 8;
+        unsafe {
+            let mut value = _mm256_loadu_ps(hidden.as_ptr().add(index));
+            for row in rows {
+                value = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(row.as_ptr().add(index)),
+                    _mm256_set1_ps(scalar),
+                    value,
+                );
+            }
+            _mm256_storeu_ps(hidden.as_mut_ptr().add(index), value);
+        }
+    }
+    for index in hidden.len() / 8 * 8..hidden.len() {
+        for row in rows {
+            hidden[index] += row[index] * scalar;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fused_feature_rows_match_separate_updates_bitwise() {
+    for width in [16, 63, 64, 65, 80, 95, 96, 128, 192] {
+        let rows: [Vec<f32>; 6] = std::array::from_fn(|r| {
+            (0..width)
+                .map(|i| ((i * 17 + r * 13) % 97) as f32 * 0.001 - 0.04)
+                .collect()
+        });
+        for scale in [-1.0, 1.0, 0.37] {
+            let mut expected: Vec<_> = (0..width).map(|i| i as f32 * 0.03).collect();
+            let mut actual = expected.clone();
+            for row in &rows {
+                add_scaled_feature_row(&mut expected, row, width, 0, scale);
+            }
+            add_scaled_rows::<6>(
+                &mut actual,
+                std::array::from_fn(|i| rows[i].as_slice()),
+                scale,
+            );
+            assert!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "width={width} scale={scale}"
+            );
+        }
+    }
+}
+
 pub(crate) fn feature_row(input_hidden: &[f32], hidden_size: usize, feature: usize) -> &[f32] {
     &input_hidden[feature * hidden_size..(feature + 1) * hidden_size]
 }
@@ -445,6 +604,17 @@ pub(crate) fn matrix_dot_into(input: &[f32], weights: &[f32], output: &mut [f32]
     assert_eq!(weights.len(), input.len() * output.len());
     #[cfg(target_arch = "x86_64")]
     if input.len() >= 64
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512dq")
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: matching dimensions and CPU features are checked above.
+        unsafe { matrix_dot_avx512(input, weights, output) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if input.len() >= 64
         && std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("fma")
     {
@@ -456,6 +626,53 @@ pub(crate) fn matrix_dot_into(input: &[f32], weights: &[f32], output: &mut [f32]
     }
     for (row, value) in output.iter_mut().enumerate() {
         *value = dot_product(input, &weights[row * input.len()..(row + 1) * input.len()]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx2,fma")]
+unsafe fn matrix_dot_avx512(input: &[f32], weights: &[f32], output: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let width = input.len();
+    let groups = output.len() / 4;
+    for group in 0..groups {
+        let row = group * 4;
+        let mut first = [_mm512_setzero_ps(); 4];
+        let mut second = [_mm512_setzero_ps(); 4];
+        for chunk in 0..width / 32 {
+            let index = chunk * 32;
+            unsafe {
+                let a = _mm512_loadu_ps(input.as_ptr().add(index));
+                let b = _mm512_loadu_ps(input.as_ptr().add(index + 16));
+                for offset in 0..4 {
+                    let coefficients = weights.as_ptr().add((row + offset) * width + index);
+                    first[offset] =
+                        _mm512_fmadd_ps(a, _mm512_loadu_ps(coefficients), first[offset]);
+                    second[offset] =
+                        _mm512_fmadd_ps(b, _mm512_loadu_ps(coefficients.add(16)), second[offset]);
+                }
+            }
+        }
+        for offset in 0..4 {
+            // 每个半区保留原 AVX2 的一路累加，再按原来的四路顺序归约。
+            let a = first[offset];
+            let b = second[offset];
+            let sum = _mm256_add_ps(
+                _mm256_add_ps(_mm512_castps512_ps256(a), _mm512_extractf32x8_ps::<1>(a)),
+                _mm256_add_ps(_mm512_castps512_ps256(b), _mm512_extractf32x8_ps::<1>(b)),
+            );
+            let mut lanes = [0.0; 8];
+            unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+            let mut value = lanes.iter().sum::<f32>();
+            for index in width / 32 * 32..width {
+                value += input[index] * weights[(row + offset) * width + index];
+            }
+            output[row + offset] = value;
+        }
+    }
+    for row in groups * 4..output.len() {
+        output[row] =
+            unsafe { dot_product_avx2_fma(input, &weights[row * width..(row + 1) * width]) };
     }
 }
 
@@ -507,7 +724,7 @@ unsafe fn matrix_dot_avx2_fma(input: &[f32], weights: &[f32], output: &mut [f32]
 #[cfg(test)]
 #[test]
 fn matrix_dot_matches_existing_dot_bitwise() {
-    for width in [16, 64, 80, 96, 128, 192] {
+    for width in [16, 63, 64, 65, 80, 95, 96, 128, 192] {
         for rows in [1, 2, 3, 16, 96] {
             let input: Vec<f32> = (0..width)
                 .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.013)

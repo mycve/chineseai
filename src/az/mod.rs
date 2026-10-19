@@ -19,6 +19,7 @@ mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
 mod history;
+mod node_threat;
 mod inference;
 mod mate;
 pub mod nnue;

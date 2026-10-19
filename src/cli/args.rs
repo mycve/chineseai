@@ -186,6 +186,12 @@ Examples:
 pub(crate) struct AzBenchArgs {
     /// AZ-NNUE model path.
     pub(crate) model: String,
+    /// 测量实验性的攻击关系增量缓存。
+    #[arg(long)]
+    pub(crate) threat_incremental: bool,
+    /// 关闭 MCTS 节点价值累加器，供同模型全量对照。
+    #[arg(long)]
+    pub(crate) no_node_incremental: bool,
     /// Simulations per search.
     #[arg(default_value_t = 800)]
     pub(crate) simulations: usize,

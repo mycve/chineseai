@@ -6,7 +6,7 @@ use super::{
     AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
     MateSearchLimits, POLICY_ACCUMULATOR_RANK, POLICY_CACHE_PIECE_SIZE,
     POLICY_CAPTURE_RELATION_OFFSET, POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_EXACT_SIZE,
-    POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64,
+    POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64, VALUE_HEAD_SIZE,
     VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB, VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB,
     WDL_HEAD_SIZE, alphazero_search_with_rules, check_context_features, dense_move_index,
     dense_move_squares, evaluate_policy_groups, move_map, policy_cache_capture_index,
@@ -178,6 +178,33 @@ fn tactical_piece_factor_is_folded_into_exact_cpu_table() {
     model.rebuild_policy_tactical();
     let tactical = policy_tactical_indices(0, 0, false, false, false, false, None, false);
     assert_eq!(model.policy_tactical_folded[tactical[0]], 0.75);
+}
+
+#[test]
+fn tactical_cache_preserves_all_logits_bitwise() {
+    let mut model = AzNnue::random(16, 27);
+    for (i, weight) in model.policy_tactical.iter_mut().enumerate() {
+        *weight = ((i % 137) as f32 - 68.0) * 0.003;
+    }
+    model.rebuild_policy_tactical();
+    for mv in 0..DENSE_MOVE_SPACE {
+        for piece in 0..POLICY_CACHE_PIECE_SIZE {
+            for signature in 0..super::POLICY_TACTICAL_SIGNATURE_BUCKETS {
+                let exact = (mv * POLICY_CACHE_PIECE_SIZE + piece)
+                    * super::POLICY_TACTICAL_SIGNATURE_BUCKETS
+                    + signature;
+                let factor = POLICY_TACTICAL_EXACT_SIZE
+                    + piece * super::POLICY_TACTICAL_SIGNATURE_BUCKETS
+                    + signature;
+                assert_eq!(
+                    model.policy_tactical_folded
+                        [super::policy_tactical_cache_index(mv, piece, signature)]
+                    .to_bits(),
+                    (model.policy_tactical[exact] + model.policy_tactical[factor]).to_bits()
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -371,6 +398,36 @@ fn random_initial_value_head_is_neutral() {
     assert!(value.abs() < 1e-6, "initial startpos value={value}");
 }
 
+#[test]
+fn material_bucket_selects_only_its_own_value_output() {
+    let position = Position::startpos();
+    let bucket = super::value_material_bucket(&position, Color::Red);
+    assert_eq!(bucket, 23);
+    let bare = Position::from_fen("4k4/9/9/9/9/9/9/9/9/3K5 w").unwrap();
+    assert_eq!(super::value_material_bucket(&bare, Color::Red), 4);
+    let rook = Position::from_fen("4k4/9/9/9/9/9/9/9/9/R2K5 w").unwrap();
+    assert_eq!(super::value_material_bucket(&rook, Color::Red), 28);
+    assert_eq!(super::value_material_bucket(&rook, Color::Black), 30);
+    let mut model = AzNnue::random(16, 5);
+    model.value_head_bias.fill(1.0);
+    model.value_head_output[bucket * WDL_HEAD_SIZE * VALUE_HEAD_SIZE] = 1.0;
+    let hidden = [0.0; 16];
+    let king = [0.0; VALUE_HEAD_SIZE];
+    let mut scratch = Vec::new();
+    assert!(
+        model
+            .value_wdl_from_hidden_into(bucket, &hidden, &king, &mut scratch, [0.0; 3])
+            .1
+            > 0.0
+    );
+    assert_eq!(
+        model
+            .value_wdl_from_hidden_into(4, &hidden, &king, &mut scratch, [0.0; 3])
+            .1,
+        0.0
+    );
+}
+
 #[cfg(feature = "profile")]
 #[test]
 #[ignore = "manual profile harness"]
@@ -456,6 +513,7 @@ fn scalar_value_head_starts_neutral() {
     let model = AzNnue::random(16, 7);
     let mut scratch = AzEvalScratch::new(model.arch);
     let (_, value) = model.value_wdl_from_hidden_into(
+        0,
         &scratch.hidden,
         &scratch.value_king_piece_accumulator,
         &mut scratch.value_head,

@@ -6,8 +6,8 @@ use super::{
     POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
     POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE,
     STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    VALUE_HEAD_SIZE, VALUE_KING_PIECE_RANK, VALUE_KING_PIECE_VOCAB, VALUE_THREAT_RANK,
-    VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
+    VALUE_BUCKETS, VALUE_HEAD_SIZE, VALUE_KING_PIECE_RANK, VALUE_KING_PIECE_VOCAB,
+    VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
     fused_policy::fused_policy,
@@ -96,7 +96,14 @@ impl AzCandleModel {
             .broadcast_add(&self.value_head_bias)?
             .add(&value_king_piece)?
             .relu()?;
-        let value_logits = value_head.matmul(&self.value_head_output.t()?)?;
+        let selected_value = self
+            .value_head_output
+            .reshape((VALUE_BUCKETS, WDL_HEAD_SIZE * VALUE_HEAD_SIZE))?
+            .index_select(&batch.value_buckets, 0)?
+            .reshape((batch.batch_size, WDL_HEAD_SIZE, VALUE_HEAD_SIZE))?;
+        let value_logits = selected_value
+            .matmul(&value_head.unsqueeze(2)?)?
+            .squeeze(2)?;
         let threat_accumulator = sparse_pool(
             self.value_threat_embedding.as_tensor(),
             &batch.value_threat_indices,
@@ -201,6 +208,7 @@ pub(super) struct ForwardOutput {
 
 pub(super) struct BatchTensors {
     pub(super) batch_size: usize,
+    pub(super) value_buckets: Tensor,
     pub(super) feature_items: Tensor,
     pub(super) value_threat_indices: Tensor,
     pub(super) value_threat_scales: Tensor,
@@ -247,6 +255,7 @@ impl BatchTensors {
         );
         Ok(Self {
             batch_size,
+            value_buckets: Tensor::from_vec(packed.value_buckets, batch_size, device)?,
             feature_items: Tensor::from_vec(
                 packed.feature_items,
                 (batch_size, max_features),
@@ -395,7 +404,7 @@ impl AzCandleModel {
             )?,
             value_head_output: var_from_slice(
                 &model.value_head_output,
-                (WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
+                (VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
             value_history_output: var_from_slice(
@@ -738,6 +747,27 @@ mod tests {
                 .neg()
                 .unwrap();
             let gradients = loss.backward().unwrap();
+            let output_gradient = gradients
+                .get(&candle.value_head_output)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let bucket = crate::az::value_material_bucket(&position, position.side_to_move());
+            for (index, row) in output_gradient
+                .chunks_exact(WDL_HEAD_SIZE * VALUE_HEAD_SIZE)
+                .enumerate()
+            {
+                if index == bucket {
+                    assert!(row.iter().any(|&g| g != 0.0));
+                } else {
+                    assert!(
+                        row.iter().all(|&g| g == 0.0),
+                        "unselected bucket {index} received gradients"
+                    );
+                }
+            }
             let table_gradient = gradients
                 .get(&candle.value_king_piece_hidden)
                 .unwrap()

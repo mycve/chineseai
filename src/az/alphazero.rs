@@ -13,8 +13,7 @@ pub(crate) use uci_search::{AzUciSearchResult, search_uci};
 
 use super::{
     AzEvalAccumulator, AzEvalOutput, AzEvalScratch, AzMovesLeftParams, AzNnue,
-    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, mate,
-    rule_context_features,
+    POLICY_ACCUMULATOR_RANK, SplitMix64, color_index, mate, rule_context_features,
 };
 
 const DEFAULT_CPUCT: f32 = 1.0;
@@ -361,6 +360,7 @@ pub(super) struct AzSearchWorkspace<'a> {
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
+    threat_arena: super::node_threat::NodeThreatArena,
     root_raw_priors: Vec<f32>,
     eval_scratch: Option<AzEvalScratch>,
     rule_history_scratch: Vec<RuleHistoryEntry>,
@@ -376,6 +376,7 @@ impl<'a> AzSearchWorkspace<'a> {
             nodes: Vec::new(),
             children: Vec::new(),
             accumulator_arena: Vec::new(),
+            threat_arena: Default::default(),
             root_raw_priors: Vec::new(),
             eval_scratch: Some(AzEvalScratch::new(model.arch)),
             rule_history_scratch: Vec::new(),
@@ -473,6 +474,7 @@ struct AzTree<'a> {
     nodes: Vec<AzNode>,
     children: Vec<AzChild>,
     accumulator_arena: Vec<f32>,
+    threat_arena: super::node_threat::NodeThreatArena,
     root_policy_accumulators: [[f32; POLICY_ACCUMULATOR_RANK]; 2],
     model: &'a AzNnue,
     root_moves: Option<Vec<Move>>,
@@ -514,6 +516,7 @@ struct AzNode {
     cache_node: u32,
     position: Position,
     accumulator_offset: u32,
+    threat_state: u32,
     policy_accumulator: [f32; POLICY_ACCUMULATOR_RANK],
     parent: u32,
     incoming_move: Option<Move>,
@@ -741,6 +744,8 @@ impl<'a> AzTree<'a> {
                 .unwrap_or_else(|| AzEvalScratch::new(workspace.model.arch)),
             std::mem::take(&mut workspace.rule_history_scratch),
         );
+        tree.threat_arena = std::mem::take(&mut workspace.threat_arena);
+        tree.threat_arena.clear();
         if let Some(cached) = cached {
             tree.nodes[0].cache_node = cached.root as u32;
             tree.eval_cache = Some(cached);
@@ -784,6 +789,7 @@ impl<'a> AzTree<'a> {
             cache_node: NO_CHILD,
             position,
             accumulator_offset: root_accumulator_offset as u32,
+            threat_state: NO_CHILD,
             policy_accumulator: root_policy_accumulator,
             parent: NO_CHILD,
             incoming_move: None,
@@ -805,6 +811,7 @@ impl<'a> AzTree<'a> {
             nodes,
             children,
             accumulator_arena,
+            threat_arena: Default::default(),
             root_policy_accumulators,
             model,
             root_moves,
@@ -867,12 +874,65 @@ impl<'a> AzTree<'a> {
         workspace.nodes = std::mem::take(&mut self.nodes);
         workspace.children = std::mem::take(&mut self.children);
         workspace.accumulator_arena = std::mem::take(&mut self.accumulator_arena);
+        workspace.threat_arena = std::mem::take(&mut self.threat_arena);
         workspace.root_raw_priors = std::mem::take(&mut self.root_raw_priors);
         workspace.eval_scratch = Some(std::mem::replace(
             &mut self.eval_scratch,
             AzEvalScratch::empty(),
         ));
         workspace.rule_history_scratch = std::mem::take(&mut self.rule_history_scratch);
+    }
+
+    fn prepare_node_threat(&mut self, node: usize) {
+        if self.model.node_incremental {
+            let state = self.ensure_node_threat(node);
+            self.eval_scratch.value_king_piece_precomputed = Some(self.threat_arena.king(state));
+            self.eval_scratch.value_threat_precomputed = (self.model.threat_incremental
+                && self.model.value_threat_active)
+                .then(|| self.threat_arena.value(state));
+        } else {
+            self.eval_scratch.value_king_piece_precomputed = None;
+            self.eval_scratch.value_threat_precomputed = None;
+        }
+    }
+
+    fn ensure_node_threat(&mut self, node: usize) -> u32 {
+        if self.nodes[node].threat_state != NO_CHILD {
+            return self.nodes[node].threat_state;
+        }
+        let side = self.nodes[node].position.side_to_move();
+        let state = if node == self.root {
+            self.threat_arena
+                .root(self.model, &self.nodes[node].position, side)
+        } else {
+            let parent = self.nodes[node].parent as usize;
+            let mv = self.nodes[node].incoming_move.unwrap();
+            let mut changed = (1u128 << mv.from) | (1u128 << mv.to);
+            let base_node = if parent == self.root {
+                self.root
+            } else {
+                self.nodes[parent].parent as usize
+            };
+            let base = if parent == self.root {
+                self.threat_arena
+                    .root(self.model, &self.nodes[parent].position, side)
+            } else {
+                let grandparent = self.nodes[parent].parent as usize;
+                let parent_move = self.nodes[parent].incoming_move.unwrap();
+                changed |= (1u128 << parent_move.from) | (1u128 << parent_move.to);
+                self.ensure_node_threat(grandparent)
+            };
+            self.threat_arena.update(
+                self.model,
+                base,
+                &self.nodes[base_node].position,
+                &self.nodes[node].position,
+                side,
+                changed,
+            )
+        };
+        self.nodes[node].threat_state = state;
+        state
     }
 
     fn node_children(&self, node_index: usize) -> &[AzChild] {
@@ -999,6 +1059,7 @@ impl<'a> AzTree<'a> {
         } else {
             let mut eval = {
                 self.nn_evaluations += 1;
+                self.prepare_node_threat(node_index);
                 crate::scope_profile!("az.search.nn_eval");
                 let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
                 let accumulator_end = accumulator_start + self.model.hidden_size;
@@ -1278,6 +1339,7 @@ impl<'a> AzTree<'a> {
                 self.nodes.push(AzNode {
                     cache_node,
                     position: child_position,
+                    threat_state: NO_CHILD,
                     accumulator_offset: u32::try_from(child_accumulator_offset)
                         .expect("MCTS accumulator arena exceeds compact offset range"),
                     policy_accumulator: child_policy_accumulator,
@@ -1369,6 +1431,7 @@ impl<'a> AzTree<'a> {
         }
         let mut eval = {
             self.nn_evaluations += 1;
+            self.prepare_node_threat(node_index);
             crate::scope_profile!("az.search.nn_eval");
             let accumulator_start = self.nodes[node_index].accumulator_offset as usize;
             let accumulator_end = accumulator_start + self.model.hidden_size;
@@ -2871,7 +2934,9 @@ mod tests {
         let position = Position::startpos();
         let mut model = AzNnue::random(4, 7);
         model.value_head_bias[0] = 2.0;
-        model.value_head_output[0] = 1.0;
+        let bucket = crate::az::value_material_bucket(&position, position.side_to_move());
+        model.value_head_output[bucket * crate::az::WDL_HEAD_SIZE * crate::az::VALUE_HEAD_SIZE] =
+            1.0;
 
         let full = alphazero_search(
             &position,
