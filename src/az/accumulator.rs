@@ -16,7 +16,7 @@ pub(crate) struct AzEvalScratch {
     pub priors: Vec<f32>,
     pub policy_gives_check: Vec<f32>,
     pub feature_precomputed: Option<FeatureSums>,
-    pub graph_precomputed: Option<super::features::Graph>,
+    pub graph_precomputed: Option<std::sync::Arc<super::features::Graph>>,
 }
 impl AzEvalScratch {
     pub fn new(arch: AzNnueArch) -> Self {

@@ -427,11 +427,20 @@ impl AzNnue {
     }
     pub(crate) fn feature_sums(&self, graph: &Graph, side: Color) -> FeatureSums {
         let rows = features::extract(graph, side, u128::MAX);
+        self.feature_sums_from_rows(graph, side, rows.relations, rows.motifs)
+    }
+    pub(crate) fn feature_sums_from_rows(
+        &self,
+        graph: &Graph,
+        side: Color,
+        relations: impl IntoIterator<Item = u32>,
+        motifs: impl IntoIterator<Item = u32>,
+    ) -> FeatureSums {
         let mut sums = FeatureSums::default();
         for row in king_piece_rows(&graph.board, side) {
             add_scaled_row(&mut sums.king, &self.king_piece, row as usize, 1.);
         }
-        for row in rows.relations {
+        for row in relations {
             add_scaled_row(
                 &mut sums.relations,
                 &self.relation_embedding,
@@ -439,7 +448,7 @@ impl AzNnue {
                 1.,
             );
         }
-        for row in rows.motifs {
+        for row in motifs {
             add_scaled_row(&mut sums.motifs, &self.motif_embedding, row as usize, 1.);
         }
         sums
@@ -517,10 +526,14 @@ impl AzNnue {
         s: &mut AzEvalScratch,
     ) -> AzEvalOutput {
         let side = p.side_to_move();
-        let graph = s
-            .graph_precomputed
-            .take()
-            .unwrap_or_else(|| Graph::new(Board::new(p)));
+        let shared_graph = s.graph_precomputed.take();
+        let owned_graph;
+        let graph = if let Some(graph) = &shared_graph {
+            graph.as_ref()
+        } else {
+            owned_graph = Graph::new(Board::new(p));
+            &owned_graph
+        };
         let sums = s
             .feature_precomputed
             .take()

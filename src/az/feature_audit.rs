@@ -63,7 +63,7 @@ pub fn write_feature_audit(
         game += 1;
     }
     let mut csv = String::from(
-        "case,fen,pieces,moves,relation_rows,motif_rows,dirty_sources,dirty_roots,graph_ns,king_ns,move_features_ns,full_features_ns,incremental_features_ns,full_eval_ns,cached_eval_ns,search_full_nps,search_incremental_nps,search_full_bytes,search_incremental_bytes\n",
+        "case,fen,pieces,moves,relation_rows,motif_rows,dirty_sources,dirty_roots,graph_ns,king_ns,move_features_ns,full_features_ns,incremental_features_ns,full_eval_ns,cached_eval_ns,search_full_nps,search_incremental_nps,search_full_bytes,search_incremental_bytes,feature_updates,local_updates,feature_refreshes,two_ply_features_ns,two_ply_full_features_ns,direct_move_features_ns,direct_patches_ns\n",
     );
     let mut full_times = Vec::new();
     let mut cached_times = Vec::new();
@@ -129,6 +129,22 @@ pub fn write_feature_audit(
             },
             repeat,
         );
+        let direct_move_ns = measure(
+            || {
+                for &mv in &moves {
+                    black_box(move_features(&graph, mv, p.side_to_move(), None));
+                }
+            },
+            repeat,
+        );
+        let direct_patches_ns = measure(
+            || {
+                for &mv in &moves {
+                    black_box(graph.patch(mv));
+                }
+            },
+            repeat,
+        );
         let mv = moves[0];
         let mut child = p.clone();
         child.make_move(mv);
@@ -152,6 +168,7 @@ pub fn write_feature_audit(
         );
         let mut search_rates = [0.; 2];
         let mut search_bytes = [0; 2];
+        let mut update_stats = (0, 0, 0);
         for (i, incremental) in [false, true].into_iter().enumerate() {
             let mut m = model.clone();
             m.node_incremental = incremental;
@@ -185,11 +202,35 @@ pub fn write_feature_audit(
                 &mut workspace,
             ));
             search_bytes[i] = workspace.retained_bytes();
+            if incremental {
+                update_stats = workspace.feature_update_stats();
+            }
+        }
+        let mut two_ply = [0.; 2];
+        if let Some(&reply) = child.legal_moves().first() {
+            let mut second = child.clone();
+            second.make_move(reply);
+            let changed =
+                (1u128 << mv.from) | (1u128 << mv.to) | (1u128 << reply.from) | (1u128 << reply.to);
+            two_ply[0] = measure(
+                || {
+                    black_box(arena.update(model, base, p, &second, p.side_to_move(), changed));
+                },
+                repeat,
+            );
+            two_ply[1] = measure(
+                || {
+                    black_box(
+                        model.feature_sums(&Graph::new(Board::new(&second)), p.side_to_move()),
+                    );
+                },
+                repeat,
+            );
         }
         full_times.push(full_eval);
         cached_times.push(cached_eval);
         nps_ratios.push(search_rates[1] / search_rates[0]);
-        csv.push_str(&format!("{name},{},{},{},{},{},{},{},{graph_ns:.1},{king_ns:.1},{move_ns:.1},{full_features:.1},{delta_features:.1},{full_eval:.1},{cached_eval:.1},{:.1},{:.1},{},{}\n",p.to_fen(),graph.board.occupied.count_ones(),moves.len(),rows.relations.len(),rows.motifs.len(),sources.count_ones(),(roots&(graph.board.occupied|new_graph.board.occupied)).count_ones(),search_rates[0],search_rates[1],search_bytes[0],search_bytes[1]));
+        csv.push_str(&format!("{name},{},{},{},{},{},{},{},{graph_ns:.1},{king_ns:.1},{move_ns:.1},{full_features:.1},{delta_features:.1},{full_eval:.1},{cached_eval:.1},{:.1},{:.1},{},{},{},{},{},{:.1},{:.1},{direct_move_ns:.1},{direct_patches_ns:.1}\n",p.to_fen(),graph.board.occupied.count_ones(),moves.len(),rows.relations.len(),rows.motifs.len(),sources.count_ones(),(roots&(graph.board.occupied|new_graph.board.occupied)).count_ones(),search_rates[0],search_rates[1],search_bytes[0],search_bytes[1],update_stats.0,update_stats.1,update_stats.2,two_ply[0],two_ply[1]));
     }
     std::fs::write(path, csv)?;
     let table_bytes = (model.input_hidden.len()

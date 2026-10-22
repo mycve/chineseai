@@ -367,6 +367,13 @@ pub(super) struct AzSearchWorkspace<'a> {
 }
 
 impl<'a> AzSearchWorkspace<'a> {
+    pub(super) fn feature_update_stats(&self) -> (usize, usize, usize) {
+        (
+            self.threat_arena.updates,
+            self.threat_arena.cached_updates,
+            self.threat_arena.refreshes,
+        )
+    }
     pub(super) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.nodes.capacity() * std::mem::size_of::<AzNode>()

@@ -98,6 +98,8 @@ struct Geometry {
     rays: [[u128; 4]; 90],
     steps: Vec<Vec<(usize, Option<usize>, usize)>>,
     dependencies: [[u128; 90]; 14],
+    unblocked: [[u128; 90]; 14],
+    gates: Vec<SmallVec<[(u8, u128); 4]>>,
 }
 
 fn geometry() -> &'static Geometry {
@@ -107,6 +109,8 @@ fn geometry() -> &'static Geometry {
             rays: [[0; 4]; 90],
             steps: vec![vec![]; 14 * 90],
             dependencies: [[0; 90]; 14],
+            unblocked: [[0; 90]; 14],
+            gates: vec![SmallVec::new(); 14 * 90],
         };
         for source in 0..90 {
             let (f, r) = ((source % 9) as i32, (source / 9) as i32);
@@ -174,6 +178,17 @@ fn geometry() -> &'static Geometry {
                     g.dependencies[class][source] |= 1u128 << target;
                     if let Some(gate) = gate {
                         g.dependencies[class][source] |= 1u128 << gate;
+                        let gates = &mut g.gates[class * 90 + source];
+                        if let Some((_, targets)) = gates
+                            .iter_mut()
+                            .find(|(square, _)| *square as usize == gate)
+                        {
+                            *targets |= 1u128 << target;
+                        } else {
+                            gates.push((gate as u8, 1u128 << target));
+                        }
+                    } else {
+                        g.unblocked[class][source] |= 1u128 << target;
                     }
                     steps.push((target, gate, ordinal));
                 }
@@ -213,9 +228,26 @@ impl Board {
     }
     pub fn after(mut self, mv: Move) -> Self {
         let piece = self.cells[mv.from as usize].expect("occupied move source");
-        self.put(mv.from as usize, None);
-        self.put(mv.to as usize, Some(piece));
+        let (from, to) = (1u128 << mv.from, 1u128 << mv.to);
+        self.cells[mv.from as usize] = None;
+        self.cells[mv.to as usize] = Some(piece);
+        self.occupied = (self.occupied & !from) | to;
+        let color = color_index(piece.color);
+        self.colors[color] = (self.colors[color] & !from) | to;
+        self.colors[1 - color] &= !to;
+        if piece.kind == PieceKind::General {
+            self.kings[color] = mv.to as usize;
+        }
         self
+    }
+    pub fn changed_contents(&self, other: &Self) -> u128 {
+        bits(self.occupied | other.occupied).fold(0, |mask, source| {
+            if self.cells[source] == other.cells[source] {
+                mask
+            } else {
+                mask | (1u128 << source)
+            }
+        })
     }
     fn class(&self, source: usize) -> usize {
         let piece = self.cells[source].unwrap();
@@ -231,6 +263,60 @@ impl Board {
             127 - mask.leading_zeros() as usize
         }
     }
+    #[inline]
+    fn ray_control(&self, source: usize, direction: usize, cannon: bool) -> u128 {
+        let g = geometry();
+        let ray = g.rays[source][direction];
+        let blockers = self.occupied & ray;
+        if blockers == 0 {
+            return if cannon { 0 } else { ray };
+        }
+        let first = Self::nearest(blockers, direction);
+        let beyond = g.rays[first][direction];
+        if !cannon {
+            return ray & !beyond;
+        }
+        let rest = blockers & beyond;
+        if rest == 0 {
+            beyond
+        } else {
+            beyond & !g.rays[Self::nearest(rest, direction)][direction]
+        }
+    }
+    /// 源棋子未改变时，只修补占位变化涉及的射线或门控；目标换色不改变几何控制。
+    fn controls_changed(&self, source: usize, previous: u128, occupancy_changes: u128) -> u128 {
+        let Some(piece) = self.cells[source] else {
+            return 0;
+        };
+        match piece.kind {
+            PieceKind::Rook | PieceKind::Cannon => {
+                let mut mask = previous;
+                for (direction, &ray) in geometry().rays[source].iter().enumerate() {
+                    if ray & occupancy_changes != 0 {
+                        mask = (mask & !ray)
+                            | self.ray_control(source, direction, piece.kind == PieceKind::Cannon);
+                    }
+                }
+                mask
+            }
+            PieceKind::Horse | PieceKind::Elephant => {
+                let mut mask = previous;
+                for &(gate, targets) in &geometry().gates[self.class(source) * 90 + source] {
+                    if occupancy_changes & (1u128 << gate) != 0 {
+                        if self.occupied & (1u128 << gate) == 0 {
+                            mask |= targets;
+                        } else {
+                            mask &= !targets;
+                        }
+                    }
+                }
+                mask
+            }
+            // 飞将的终点随敌将移动，不能只按占用位是否变化处理。
+            PieceKind::General => self.controls(source),
+            _ => previous,
+        }
+    }
     pub fn controls(&self, source: usize) -> u128 {
         let Some(piece) = self.cells[source] else {
             return 0;
@@ -238,33 +324,15 @@ impl Board {
         let class = self.class(source);
         let kind = class % 7;
         let g = geometry();
-        let mut mask = 0;
-        for &(target, gate, _) in &g.steps[class * 90 + source] {
-            if gate.is_none_or(|gate| self.cells[gate].is_none()) {
-                mask |= 1u128 << target;
+        let mut mask = g.unblocked[class][source];
+        for &(gate, targets) in &g.gates[class * 90 + source] {
+            if self.occupied & (1u128 << gate) == 0 {
+                mask |= targets;
             }
         }
         if kind == 4 || kind == 5 {
             for d in 0..4 {
-                let ray = g.rays[source][d];
-                let blockers = self.occupied & ray;
-                if kind == 4 {
-                    if blockers == 0 {
-                        mask |= ray;
-                    } else {
-                        let first = Self::nearest(blockers, d);
-                        mask |= ray & !g.rays[first][d];
-                    }
-                } else if blockers != 0 {
-                    let first = Self::nearest(blockers, d);
-                    let beyond = g.rays[first][d];
-                    let rest = blockers & beyond;
-                    mask |= if rest == 0 {
-                        beyond
-                    } else {
-                        beyond & !g.rays[Self::nearest(rest, d)][d]
-                    };
-                }
+                mask |= self.ray_control(source, d, kind == 5);
             }
         }
         if kind == 0 {
@@ -278,6 +346,33 @@ impl Board {
             }
         }
         mask
+    }
+    fn constraints(&self, source: usize) -> u128 {
+        let Some(piece) = self.cells[source] else {
+            return 0;
+        };
+        if !matches!(
+            piece.kind,
+            PieceKind::Rook | PieceKind::Cannon | PieceKind::General
+        ) {
+            return 0;
+        }
+        let king = self.kings[color_index(piece.color.opposite())];
+        if source % 9 != king % 9 && (source / 9 != king / 9 || piece.kind == PieceKind::General) {
+            return 0;
+        }
+        let path = between(source, king) & self.occupied;
+        if path.count_ones()
+            == if piece.kind == PieceKind::Cannon {
+                2
+            } else {
+                1
+            }
+        {
+            path & self.colors[color_index(piece.color.opposite())]
+        } else {
+            0
+        }
     }
 }
 
@@ -296,12 +391,27 @@ pub(crate) fn between(a: usize, b: usize) -> u128 {
     mask
 }
 
+fn changed_royals(before: &Board, after: &Board) -> u128 {
+    before
+        .kings
+        .iter()
+        .zip(after.kings)
+        .fold(0, |mask, (&a, b)| {
+            if a == b {
+                mask
+            } else {
+                mask | (1u128 << a) | (1u128 << b)
+            }
+        })
+}
+
 #[derive(Clone)]
 pub(crate) struct Graph {
     pub board: Board,
     pub controls: [u128; 90],
     pub incoming: [u128; 90],
     reverse_dependencies: [u128; 90],
+    constraint_sources: SmallVec<[(u8, u128); 8]>,
     constrained: u128,
 }
 
@@ -312,6 +422,7 @@ impl Graph {
             controls: [0; 90],
             incoming: [0; 90],
             reverse_dependencies: [0; 90],
+            constraint_sources: SmallVec::new(),
             constrained: 0,
         };
         for source in bits(board.occupied) {
@@ -322,30 +433,69 @@ impl Graph {
             for target in bits(geometry().dependencies[board.class(source)][source]) {
                 graph.reverse_dependencies[target] |= 1u128 << source;
             }
-            let piece = board.cells[source].unwrap();
-            if matches!(
-                piece.kind,
-                PieceKind::Rook | PieceKind::Cannon | PieceKind::General
-            ) {
-                let king = board.kings[color_index(piece.color.opposite())];
-                if source % 9 == king % 9
-                    || (source / 9 == king / 9 && piece.kind != PieceKind::General)
-                {
-                    let path = between(source, king) & board.occupied;
-                    if path.count_ones()
-                        == if piece.kind == PieceKind::Cannon {
-                            2
-                        } else {
-                            1
-                        }
-                    {
-                        graph.constrained |=
-                            path & board.colors[color_index(piece.color.opposite())];
-                    }
+            let constraints = board.constraints(source);
+            if constraints != 0 {
+                graph.constraint_sources.push((source as u8, constraints));
+            }
+            graph.constrained |= constraints;
+        }
+        graph
+    }
+    /// 保留未改变的源、入边和逆依赖；根局面、小残局或对照验证可选择完整构建。
+    pub fn updated(&self, board: Board, changed: u128) -> Self {
+        let mut next = self.clone();
+        next.board = board;
+        let occupancy_changes = self.board.occupied ^ board.occupied;
+        let sources = self.estimated_dirty_sources(changed | changed_royals(&self.board, &board))
+            & (self.board.occupied | board.occupied);
+        for source in bits(sources) {
+            let content_changed = self.board.cells[source] != board.cells[source];
+            let controls = if content_changed {
+                board.controls(source)
+            } else {
+                board.controls_changed(source, self.controls[source], occupancy_changes)
+            };
+            for target in bits(self.controls[source] ^ controls) {
+                next.incoming[target] ^= 1u128 << source;
+            }
+            next.controls[source] = controls;
+            let constraints = board.constraints(source);
+            if let Some(index) = next
+                .constraint_sources
+                .iter()
+                .position(|&(s, _)| s as usize == source)
+            {
+                if constraints == 0 {
+                    next.constraint_sources.swap_remove(index);
+                } else {
+                    next.constraint_sources[index].1 = constraints;
+                }
+            } else if constraints != 0 {
+                next.constraint_sources.push((source as u8, constraints));
+            }
+            if content_changed {
+                let old = self.board.cells[source].map_or(0, |_| {
+                    geometry().dependencies[self.board.class(source)][source]
+                });
+                let new = board.cells[source]
+                    .map_or(0, |_| geometry().dependencies[board.class(source)][source]);
+                for target in bits(old ^ new) {
+                    next.reverse_dependencies[target] ^= 1u128 << source;
                 }
             }
         }
-        graph
+        next.constrained = next
+            .constraint_sources
+            .iter()
+            .fold(0, |mask, &(_, part)| mask | part);
+        next
+    }
+    pub fn heap_bytes(&self) -> usize {
+        if self.constraint_sources.spilled() {
+            self.constraint_sources.capacity() * std::mem::size_of::<(u8, u128)>()
+        } else {
+            0
+        }
     }
     pub fn origins(&self, target: usize, color: Color) -> u128 {
         self.incoming[target] & self.board.colors[color_index(color)]
@@ -368,12 +518,23 @@ impl Graph {
     pub fn patch(&self, mv: Move) -> Patch {
         let board = self.board.after(mv);
         let changed = (1u128 << mv.from) | (1u128 << mv.to);
-        let dirty = changed
+        let potential = changed
             | self.reverse_dependencies[mv.from as usize]
             | self.reverse_dependencies[mv.to as usize];
         let mut records = SmallVec::new();
-        for source in bits(dirty & (self.board.occupied | board.occupied | changed)) {
-            records.push((source, board.controls(source)));
+        let occupancy_changes = self.board.occupied ^ board.occupied;
+        let mut dirty = 0;
+        for source in bits(potential & (self.board.occupied | board.occupied | changed)) {
+            let old = self.controls[source];
+            let mask = if changed & (1u128 << source) != 0 {
+                board.controls(source)
+            } else {
+                board.controls_changed(source, old, occupancy_changes)
+            };
+            if changed & (1u128 << source) != 0 || old != mask || old & changed != 0 {
+                records.push((source, mask));
+                dirty |= 1u128 << source;
+            }
         }
         Patch {
             board,
@@ -389,28 +550,51 @@ impl Graph {
     fn vacancy(&self, from: usize) -> Vacancy {
         let mut board = self.board;
         board.put(from, None);
-        let dirty = (1u128 << from) | self.reverse_dependencies[from];
-        let records = bits(dirty & self.board.occupied)
-            .map(|source| (source, board.controls(source)))
-            .collect();
+        let potential = (1u128 << from) | self.reverse_dependencies[from];
+        let mut dirty = 0;
+        let mut records = SmallVec::new();
+        for source in bits(potential & self.board.occupied) {
+            let old = self.controls[source];
+            let mask = if source == from {
+                0
+            } else {
+                board.controls_changed(source, old, 1u128 << from)
+            };
+            if source == from || old != mask || old & (1u128 << from) != 0 {
+                records.push((source, mask));
+                dirty |= 1u128 << source;
+            }
+        }
         Vacancy { dirty, records }
     }
     fn patch_vacancy(&self, mv: Move, vacancy: &Vacancy) -> Patch {
         let board = self.board.after(mv);
         let to = mv.to as usize;
-        let changed = (1u128 << to) | self.reverse_dependencies[to];
+        let potential = (1u128 << to) | self.reverse_dependencies[to];
+        let occupancy_changes = (1u128 << to) & !self.board.occupied;
         let mut records = vacancy.records.clone();
-        for source in bits(changed & (self.board.occupied | board.occupied)) {
-            let mask = board.controls(source);
-            if let Some(record) = records.iter_mut().find(|(s, _)| *s == source) {
-                record.1 = mask;
+        let mut dirty = vacancy.dirty;
+        for source in bits(potential & (self.board.occupied | board.occupied)) {
+            let slot = records.iter().position(|(s, _)| *s == source);
+            let previous = slot.map_or(self.controls[source], |i| records[i].1);
+            let mask = if source == to || source == mv.from as usize {
+                board.controls(source)
             } else {
+                board.controls_changed(source, previous, occupancy_changes)
+            };
+            if let Some(i) = slot {
+                records[i].1 = mask;
+            } else if mask != self.controls[source]
+                || source == to
+                || self.controls[source] & (1u128 << to) != 0
+            {
                 records.push((source, mask));
+                dirty |= 1u128 << source;
             }
         }
         Patch {
             board,
-            dirty: vacancy.dirty | changed,
+            dirty,
             records,
         }
     }
@@ -426,14 +610,17 @@ pub(crate) struct Patch {
     pub records: SmallVec<[(usize, u128); 8]>,
 }
 impl Patch {
-    pub fn origins(&self, graph: &Graph, target: usize, color: Color) -> u128 {
+    fn all_origins(&self, graph: &Graph, target: usize) -> u128 {
         let mut origins = graph.incoming[target] & !self.dirty;
         for &(source, mask) in &self.records {
             if mask & (1u128 << target) != 0 {
                 origins |= 1u128 << source;
             }
         }
-        origins & self.board.colors[color_index(color)]
+        origins
+    }
+    pub fn origins(&self, graph: &Graph, target: usize, color: Color) -> u128 {
+        self.all_origins(graph, target) & self.board.colors[color_index(color)]
     }
     pub fn controls(&self, graph: &Graph, source: usize) -> u128 {
         self.records
@@ -453,10 +640,29 @@ pub(crate) fn relation_rows(graph: &Graph, perspective: Color, sources: u128) ->
     let mut rows =
         Vec::with_capacity(((graph.board.occupied & sources).count_ones() as usize * 6).min(256));
     for source in bits(graph.board.occupied & sources) {
+        append_relations(
+            &mut rows,
+            graph,
+            perspective,
+            source,
+            graph.controls[source] & graph.board.occupied,
+        );
+    }
+    rows
+}
+
+fn append_relations(
+    rows: &mut impl Extend<u32>,
+    graph: &Graph,
+    perspective: Color,
+    source: usize,
+    targets: u128,
+) {
+    if targets != 0 {
         let piece = graph.board.cells[source].unwrap();
         let from = canonical_square(perspective, source);
         let source_class = piece_absolute_feature_index(perspective, piece);
-        for target in bits(graph.controls[source] & graph.board.occupied) {
+        for target in bits(targets) {
             let victim = graph.board.cells[target].unwrap();
             let to = canonical_square(perspective, target);
             let dr = to as i32 / 9 - from as i32 / 9;
@@ -478,7 +684,28 @@ pub(crate) fn relation_rows(graph: &Graph, perspective: Color, sources: u128) ->
             ]);
         }
     }
-    rows
+}
+
+pub(crate) fn relation_changes(
+    before: &Graph,
+    after: &Graph,
+    perspective: Color,
+    sources: u128,
+    changed: u128,
+) -> (SmallVec<[u32; 64]>, SmallVec<[u32; 64]>) {
+    let (mut removed, mut added) = (SmallVec::new(), SmallVec::new());
+    for source in bits(sources) {
+        let old = before.controls[source] & before.board.occupied;
+        let new = after.controls[source] & after.board.occupied;
+        let (old, new) = if before.board.cells[source] == after.board.cells[source] {
+            (old & (!new | changed), new & (!old | changed))
+        } else {
+            (old, new)
+        };
+        append_relations(&mut removed, before, perspective, source, old);
+        append_relations(&mut added, after, perspective, source, new);
+    }
+    (removed, added)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -557,6 +784,9 @@ fn ordered(graph: &Graph, a: usize, b: usize, perspective: Color) -> (usize, usi
 
 /// 先确认参与者共同身份，再编码；只提取指定根，供增量更新复用。
 pub(crate) fn motifs(graph: &Graph, roots: u128, perspective: Color) -> Vec<Motif> {
+    if roots & graph.board.occupied == 0 {
+        return Vec::new();
+    }
     let mut events = Vec::with_capacity(128);
     let board = &graph.board;
     let mut emit = |family: usize, root: usize, b: usize, c: usize, geometry: usize| {
@@ -767,8 +997,15 @@ pub(crate) fn motifs(graph: &Graph, roots: u128, perspective: Color) -> Vec<Moti
             }
         }
     }
-    // M8 以前子为根，后子可能不在本次根集合中，必须独立枚举后子。
-    for rear in bits(board.occupied & !roots) {
+    // M8/M11的根是门控子；只访问与这些根存在潜在几何依赖的同色源。
+    let pivots = if roots & board.occupied == board.occupied {
+        board.occupied
+    } else {
+        board.colors.iter().fold(0, |sources, &color| {
+            sources | (graph.estimated_dirty_sources(roots & color) & color)
+        })
+    };
+    for rear in bits(pivots & !roots) {
         let p = board.cells[rear].unwrap();
         if !matches!(p.kind, PieceKind::Rook | PieceKind::Cannon) {
             continue;
@@ -804,7 +1041,7 @@ pub(crate) fn motifs(graph: &Graph, roots: u128, perspective: Color) -> Vec<Moti
         }
     }
     // M11：同一门控子兼有第二威胁，A/T/B/U 身份均在这里验证。
-    for source in bits(board.occupied) {
+    for source in bits(pivots) {
         let piece = board.cells[source].unwrap();
         let kind = piece_kind_index(piece.kind);
         let mut gates: SmallVec<[(usize, usize, usize); 12]> = SmallVec::new();
@@ -863,6 +1100,19 @@ pub(crate) fn motifs(graph: &Graph, roots: u128, perspective: Color) -> Vec<Moti
 }
 
 pub(crate) fn encode_motifs(graph: &Graph, events: &[Motif], perspective: Color) -> Vec<u32> {
+    let mut rows = Vec::with_capacity(events.len() * 3);
+    emit_motif_rows(graph, events, perspective, |_, factor_rows| {
+        rows.extend(factor_rows)
+    });
+    rows
+}
+
+pub(crate) fn emit_motif_rows(
+    graph: &Graph,
+    events: &[Motif],
+    perspective: Color,
+    mut emit: impl FnMut(usize, [u32; 3]),
+) {
     let mut keys = Vec::with_capacity(events.len());
     for event in events {
         let root = event.root as usize;
@@ -880,17 +1130,16 @@ pub(crate) fn encode_motifs(graph: &Graph, events: &[Motif], perspective: Color)
                 variant |= 1 << i;
             }
         }
-        keys.push((
-            event.family as usize,
-            root,
-            roles[0],
-            roles[1],
-            variant,
-            event.geometry as usize,
-        ));
+        keys.push([
+            event.family,
+            event.root,
+            roles[0] as u8,
+            roles[1] as u8,
+            variant as u8,
+            event.geometry,
+        ]);
     }
     keys.sort_unstable();
-    let mut rows = Vec::with_capacity(keys.len() * 3);
     let mut i = 0;
     while i < keys.len() {
         let key = keys[i];
@@ -898,7 +1147,7 @@ pub(crate) fn encode_motifs(graph: &Graph, events: &[Motif], perspective: Color)
         while end < keys.len() && keys[end] == key {
             end += 1;
         }
-        let (family, root, b, c, variant, geo) = key;
+        let [family, root, b, c, variant, geo] = key.map(usize::from);
         let piece = graph.board.cells[root].unwrap();
         let owner = usize::from(piece.color != perspective);
         let kind = piece_kind_index(piece.kind);
@@ -908,10 +1157,9 @@ pub(crate) fn encode_motifs(graph: &Graph, events: &[Motif], perspective: Color)
             + MOTIF_GEOMETRY_ROWS
             + (family * 2 + owner) * 90
             + canonical_square(perspective, root);
-        rows.extend([core as u32, geometry as u32, anchor as u32]);
+        emit(root, [core as u32, geometry as u32, anchor as u32]);
         i = end;
     }
-    rows
 }
 
 pub(crate) fn extract(graph: &Graph, perspective: Color, roots: u128) -> FeatureRows {
@@ -1039,8 +1287,9 @@ fn move_features_with_patch(
     let side = moved.color;
     let kind = piece_kind_index(moved.kind);
     let captured = graph.board.cells[to].map_or(7, |p| piece_kind_index(p.kind));
-    let hostile = patch.origins(graph, to, side.opposite());
-    let friendly = patch.origins(graph, to, side) & !(1u128 << to);
+    let destination_origins = patch.all_origins(graph, to);
+    let hostile = destination_origins & patch.board.colors[color_index(side.opposite())];
+    let friendly = destination_origins & patch.board.colors[color_index(side)] & !(1u128 << to);
     let king = patch.board.kings[color_index(side.opposite())];
     let checkers = patch.origins(graph, king, side);
     let after_targets =
@@ -1062,32 +1311,52 @@ fn move_features_with_patch(
         f32::from(repetition.unwrap_or(false)),
         f32::from(repetition.is_some()),
     ];
-    let mut events = SmallVec::new();
+    // 同一候选的走子棋种固定，192个局部键即可准确计数，避免排序重复事件。
+    let mut event_counts = [0u16; MOTIF_FAMILIES * 8 * 2];
+    let mut active_events = [0u128; 2];
     let mut emit = |family: usize, target_kind: usize, added: bool| {
-        events.push((((family * 7 + kind) * 8 + target_kind) * 2 + usize::from(added)) as u32)
+        let key = (family * 8 + target_kind) * 2 + usize::from(added);
+        event_counts[key] += 1;
+        active_events[key / 128] |= 1u128 << (key % 128);
     };
     for &(source, new_controls) in &patch.records {
+        let old_piece = graph.board.cells[source];
+        let new_piece = patch.board.cells[source];
+        if !old_piece.is_some_and(|p| p.color == side)
+            && !new_piece.is_some_and(|p| p.color == side)
+        {
+            continue;
+        }
         let old = graph.controls[source];
         let old_targets = old & graph.board.occupied;
         let new_targets = new_controls & patch.board.occupied;
-        let old_piece = graph.board.cells[source];
-        let new_piece = patch.board.cells[source];
+        let changed = (1u128 << from) | (1u128 << to);
+        let (old_changed, new_changed) = if source == from || source == to {
+            (old_targets, new_targets)
+        } else {
+            (
+                old_targets & (!new_targets | changed),
+                new_targets & (!old_targets | changed),
+            )
+        };
+        let new_guarded = new_controls & patch.board.colors[color_index(side)];
+        let old_guarded = old & graph.board.colors[color_index(side)];
+        let after_attacked = if source == to {
+            hostile != 0
+        } else {
+            new_piece.is_some_and(|p| p.color == side)
+                && new_changed & new_guarded != 0
+                && patch.origins(graph, source, side.opposite()) != 0
+        };
         for (active, piece, added) in [
-            (old_targets, old_piece, false),
-            (new_targets, new_piece, true),
+            (old_changed, old_piece, false),
+            (new_changed, new_piece, true),
         ] {
             let Some(piece) = piece else { continue };
             if piece.color != side {
                 continue;
             }
-            let changed = if source == from || source == to {
-                active
-            } else if added {
-                active & (!old_targets | (1u128 << from) | (1u128 << to))
-            } else {
-                active & (!new_targets | (1u128 << from) | (1u128 << to))
-            };
-            for target in bits(changed) {
+            for target in bits(active) {
                 let Some(victim) = (if added {
                     patch.board.cells[target]
                 } else {
@@ -1107,18 +1376,14 @@ fn move_features_with_patch(
                 }
                 if victim.color == side {
                     let attacked = if added {
-                        patch.origins(graph, source, side.opposite()) != 0
+                        after_attacked
                     } else {
                         graph.origins(source, side.opposite()) != 0
                     };
                     if attacked {
                         emit(5, target_kind, added);
                     }
-                    let guarded = if added {
-                        new_controls & patch.board.colors[color_index(side)]
-                    } else {
-                        old & graph.board.colors[color_index(side)]
-                    };
+                    let guarded = if added { new_guarded } else { old_guarded };
                     if guarded.count_ones() >= 2 {
                         emit(6, target_kind, added);
                     }
@@ -1154,7 +1419,14 @@ fn move_features_with_patch(
     } else if old_n >= 2 && new_n < 2 {
         emit(3, 7, false);
     }
-    events.sort_unstable();
+    let mut events = SmallVec::new();
+    for (word, active) in active_events.into_iter().enumerate() {
+        for bit in bits(active) {
+            let key = word * 128 + bit;
+            let row = ((key / 16 * 7 + kind) * 16 + key % 16) as u32;
+            events.extend(std::iter::repeat_n(row, event_counts[key] as usize));
+        }
+    }
     MoveFeatures {
         local,
         joint: ((((kind * 8 + captured) * 4 + enemy_count) * 4 + own_count) * 2
@@ -1172,14 +1444,9 @@ fn move_features_with_patch(
 
 /// 全部依赖源及旧新关系的二跳闭包。潜在门控源先由完整几何依赖定位。
 pub(crate) fn dirty_roots(before: &Graph, after: &Graph, changed: u128) -> (u128, u128) {
-    let mut sources = changed;
-    for graph in [before, after] {
-        for source in bits(graph.board.occupied) {
-            if geometry().dependencies[graph.board.class(source)][source] & changed != 0 {
-                sources |= 1u128 << source;
-            }
-        }
-    }
+    let dependency_changes = changed | changed_royals(&before.board, &after.board);
+    let sources = before.estimated_dirty_sources(dependency_changes)
+        | after.estimated_dirty_sources(dependency_changes);
     let mut roots = changed;
     let mut targets_changed = changed;
     for source in bits(sources) {
@@ -1198,32 +1465,83 @@ pub(crate) fn dirty_roots(before: &Graph, after: &Graph, changed: u128) -> (u128
             let Some(piece) = graph.board.cells[source] else {
                 continue;
             };
-            if matches!(
-                piece.kind,
-                PieceKind::Rook | PieceKind::Cannon | PieceKind::General
-            ) {
-                // 门控模式至多引用前三个挡子，王线计数另保留源为脏根。
-                roots |= 1u128 << source;
+            let source_changed = before.board.cells[source] != after.board.cells[source];
+            if matches!(piece.kind, PieceKind::Rook | PieceKind::Cannon) {
                 for d in 0..4 {
+                    let ray = geometry().rays[source][d];
+                    if !source_changed && ray & changed == 0 {
+                        continue;
+                    }
                     let mut mask = graph.board.blockers(source, d);
+                    let mut blockers = SmallVec::<[usize; 3]>::new();
                     for _ in 0..3 {
                         if mask == 0 {
                             break;
                         }
                         let s = Board::nearest(mask, d);
-                        roots |= 1u128 << s;
+                        blockers.push(s);
                         mask &= !(1u128 << s);
                     }
+                    let observed = if blockers.len() == 3 {
+                        ray & !geometry().rays[blockers[2]][d]
+                    } else {
+                        ray
+                    };
+                    if !source_changed && observed & changed == 0 {
+                        continue;
+                    }
+                    roots |= 1u128 << source;
+                    if blockers.len() >= 2 {
+                        let front = graph.board.cells[blockers[0]].unwrap();
+                        let second = graph.board.cells[blockers[1]].unwrap();
+                        if front.color == piece.color && second.color != piece.color {
+                            if piece.kind == PieceKind::Rook
+                                || matches!(front.kind, PieceKind::Rook | PieceKind::Cannon)
+                            {
+                                // M8以前子为根，M11车线以第一门控子为根。
+                                roots |= 1u128 << blockers[0];
+                            }
+                        }
+                    }
+                    if piece.kind == PieceKind::Cannon
+                        && blockers.len() == 3
+                        && graph.board.cells[blockers[2]].unwrap().color != piece.color
+                    {
+                        for &gate in &blockers[..2] {
+                            if graph.board.cells[gate].unwrap().color == piece.color {
+                                roots |= 1u128 << gate;
+                            }
+                        }
+                    }
                 }
-            } else {
+            } else if matches!(piece.kind, PieceKind::Horse | PieceKind::Elephant) {
                 for &(target, gate, _) in &geometry().steps[graph.board.class(source) * 90 + source]
                 {
                     if let Some(gate) = gate
-                        && changed & ((1u128 << target) | (1u128 << gate)) != 0
+                        && (source_changed || changed & ((1u128 << target) | (1u128 << gate)) != 0)
+                        && graph.board.cells[gate].is_some()
+                        && graph.board.cells[target].is_some()
                     {
                         roots |= 1u128 << source;
-                        roots |= 1u128 << gate;
+                        if graph.board.cells[gate].unwrap().color == piece.color
+                            && graph.board.cells[target].unwrap().color != piece.color
+                        {
+                            roots |= 1u128 << gate;
+                        }
                     }
+                }
+            }
+            if matches!(
+                piece.kind,
+                PieceKind::Rook | PieceKind::Cannon | PieceKind::General
+            ) {
+                let king = graph.board.kings[color_index(piece.color.opposite())];
+                if (source % 9 == king % 9
+                    || (piece.kind != PieceKind::General && source / 9 == king / 9))
+                    && (source_changed
+                        || dependency_changes & (between(source, king) | (1u128 << king)) != 0)
+                {
+                    roots |= 1u128 << source;
                 }
             }
         }

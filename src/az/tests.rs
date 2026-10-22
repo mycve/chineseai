@@ -110,6 +110,57 @@ fn virtual_move_origins_equal_make_move_including_captures_and_kings() {
 }
 
 #[test]
+fn local_graph_updates_equal_full_graph_through_captures_branches_and_two_plies() {
+    fn check(actual: &Graph, expected: &Graph) {
+        assert_eq!(actual.board.cells, expected.board.cells);
+        assert_eq!(actual.board.occupied, expected.board.occupied);
+        assert_eq!(actual.board.colors, expected.board.colors);
+        assert_eq!(actual.board.kings, expected.board.kings);
+        assert_eq!(actual.controls, expected.controls);
+        assert_eq!(actual.incoming, expected.incoming);
+        for square in 0..90 {
+            assert_eq!(actual.constrained(square), expected.constrained(square));
+            assert_eq!(
+                actual.estimated_dirty_sources(1u128 << square),
+                expected.estimated_dirty_sources(1u128 << square)
+            );
+        }
+    }
+    let mut rng = SplitMix64::new(920381);
+    let mut p = Position::startpos();
+    let mut graph = Graph::new(Board::new(&p));
+    for _ in 0..300 {
+        let before = p.clone();
+        let old = graph.clone();
+        let moves = p.legal_moves();
+        if moves.is_empty() {
+            p = Position::startpos();
+            graph = Graph::new(Board::new(&p));
+            continue;
+        }
+        for &mv in moves.iter().step_by((moves.len() / 4).max(1)) {
+            let mut branch = before.clone();
+            branch.make_move(mv);
+            let changed = (1u128 << mv.from) | (1u128 << mv.to);
+            let first = old.updated(Board::new(&branch), changed);
+            check(&first, &Graph::new(Board::new(&branch)));
+            check(&first.updated(Board::new(&before), changed), &old);
+            if let Some(second) = next_position(&mut branch, &mut rng) {
+                let both = changed | (1u128 << second.from) | (1u128 << second.to);
+                check(
+                    &old.updated(Board::new(&branch), both),
+                    &Graph::new(Board::new(&branch)),
+                );
+            }
+        }
+        p.make_move(moves[rng.next_u64() as usize % moves.len()]);
+        let board = Board::new(&p);
+        graph = graph.updated(board, graph.board.changed_contents(&board));
+        check(&graph, &Graph::new(board));
+    }
+}
+
+#[test]
 fn destination_support_excludes_moving_rook_itself() {
     let p = Position::from_fen("4k4/9/9/9/4P4/9/9/9/9/R3K4 w").unwrap();
     let g = Graph::new(Board::new(&p));
@@ -367,6 +418,20 @@ fn dirty_root_integer_deltas_equal_full_extraction_on_both_views() {
                     relation_rows(&new, side, sources)
                 )
             );
+            let (removed, added) = relation_changes(
+                &old,
+                &new,
+                side,
+                sources,
+                (1u128 << mv.from) | (1u128 << mv.to),
+            );
+            assert_eq!(
+                row_difference(
+                    relation_rows(&old, side, u128::MAX),
+                    relation_rows(&new, side, u128::MAX)
+                ),
+                row_difference(removed.into_vec(), added.into_vec())
+            );
             assert_eq!(
                 row_difference(a.motifs, b.motifs),
                 row_difference(x.motifs, y.motifs),
@@ -374,6 +439,58 @@ fn dirty_root_integer_deltas_equal_full_extraction_on_both_views() {
                 before.to_fen(),
                 p.to_fen()
             );
+        }
+    }
+}
+
+#[test]
+fn local_motif_dependencies_cover_every_move_of_tactical_witnesses() {
+    for fen in [
+        "c3k4/9/9/9/R3P4/9/9/9/9/R3K4 w",
+        "3k5/9/9/5r3/4P4/4N4/9/9/9/4K4 w",
+        "3k5/9/9/3r1c3/9/4N4/9/9/9/4K4 w",
+        "r3k4/9/1N7/9/4P4/9/9/9/9/R3K4 w",
+        "3k5/9/9/3P5/9/4Nr3/9/9/9/4K4 w",
+        "3k5/9/9/3P1P3/9/4N4/9/9/9/4K4 w",
+        "r3k4/r8/1N7/9/4P4/9/9/9/9/R3K4 w",
+        "r3k4/9/9/9/C3P4/9/9/9/9/R3K4 w",
+        "3kr4/9/9/9/4P4/9/9/9/9/4K4 w",
+        "3kr4/9/9/9/9/9/9/9/3r5/4K4 w",
+        "c2k5/9/1r7/9/N8/9/9/9/9/R3K4 w",
+    ] {
+        let p = Position::from_fen(fen).unwrap();
+        let old = Graph::new(Board::new(&p));
+        for mv in p.legal_moves() {
+            let mut p = p.clone();
+            p.make_move(mv);
+            if p.general_square(Color::Red).is_none() || p.general_square(Color::Black).is_none() {
+                continue;
+            }
+            let new = Graph::new(Board::new(&p));
+            let changed = (1u128 << mv.from) | (1u128 << mv.to);
+            let (sources, roots) = dirty_roots(&old, &new, changed);
+            for side in [Color::Red, Color::Black] {
+                let (removed, added) = relation_changes(&old, &new, side, sources, changed);
+                assert_eq!(
+                    row_difference(
+                        relation_rows(&old, side, u128::MAX),
+                        relation_rows(&new, side, u128::MAX)
+                    ),
+                    row_difference(removed.into_vec(), added.into_vec()),
+                    "R: {fen} move={mv}"
+                );
+                assert_eq!(
+                    row_difference(
+                        extract(&old, side, u128::MAX).motifs,
+                        extract(&new, side, u128::MAX).motifs
+                    ),
+                    row_difference(
+                        extract(&old, side, roots).motifs,
+                        extract(&new, side, roots).motifs
+                    ),
+                    "M: {fen} move={mv}"
+                );
+            }
         }
     }
 }
