@@ -39,3 +39,7 @@ docs
 !docs/
 docs/*
 !docs/吃子共享关系扩展.md
+# NNUE 本地实验报告与基准输出。
+/NNUE_FEATURE_*.csv
+/NNUE_FEATURE_VALIDATION.md
+/NNUE_FEATURE_LOCAL_*.md
