@@ -15,14 +15,13 @@ mod candle_model;
 #[cfg(all(test, feature = "slow-tests"))]
 mod cuda_test_device;
 mod dataloader;
+pub mod feature_audit;
+mod features;
 mod fused_feature_pool;
-mod fused_policy;
-mod fused_sparse_policy;
-mod history;
-mod node_threat;
 mod inference;
 mod mate;
 pub mod nnue;
+mod node_features;
 mod play;
 mod policy_calibration;
 pub use policy_calibration::{PolicyCalibrationReport, calibrate_policy};
@@ -65,21 +64,19 @@ pub use train::{
 
 // 门面重导出：把拆分到子模块的项保持在 `crate::az::*` 的原路径上。
 pub(crate) use crate::az::nnue::canonical_move;
-pub(crate) use crate::xiangqi::{Color, Move, Position, color_index};
+pub(crate) use crate::xiangqi::{Color, Move, Position};
 // px0_data 的测试模块通过 `use super::*` 使用该名字。
 #[cfg(test)]
 pub(crate) use crate::xiangqi::PieceKind;
 
 pub(crate) use accumulator::*;
 pub(crate) use arch::*;
-pub use history::{history_features, history_features_from_planes};
 pub(crate) use inference::*;
 pub(crate) use simd::*;
 
 pub use arch::{
-    AzMovesLeftParams, AzNnueArch, CHECK_CONTEXT_SIZE, DENSE_MOVE_SPACE, HISTORY_CONTEXT_SIZE,
-    POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_FACTOR_SIZE,
-    RULE_CONTEXT_SIZE, dense_move_index,
+    AzMovesLeftParams, AzNnueArch, CHECK_CONTEXT_SIZE, DENSE_MOVE_SPACE, RULE_CONTEXT_SIZE,
+    dense_move_index,
 };
 pub use inference::{AzNnue, outputs_for_training_sample, position_for_training_sample};
 pub use mate::{

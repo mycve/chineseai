@@ -19,7 +19,7 @@ const MAX_GRAD_NORM: f64 = 10_000.0;
 /// **0.4%**。所以这个旋钮在 Adam 的学习率尺度下几乎不动结果 —— 分组与否不会混淆消融。
 pub(super) const DENSE_WEIGHT_DECAY: f64 = 1e-4;
 /// 调度参数成为恢复契约的一部分；拒绝旧的固定学习率状态。
-pub(super) const STATE_TAG: i64 = 3;
+pub(super) const STATE_TAG: i64 = 4;
 /// `state` 张量的元素个数：tag / 模型格式版本 / 步数 / 下次更新的序号。
 const STATE_LEN: usize = 4;
 /// `hyper` 张量还保存预热步数、衰减时间尺度和最低倍率。
@@ -125,6 +125,10 @@ impl AzAdamW {
         let cpu = candle_core::Device::Cpu;
         let mut tensors = HashMap::new();
         tensors.insert(
+            "feature_schema".to_owned(),
+            Tensor::new(super::features::feature_schema().as_slice(), &cpu)?,
+        );
+        tensors.insert(
             "state".to_owned(),
             Tensor::new(
                 &[
@@ -180,6 +184,9 @@ impl AzAdamW {
                 .ok_or_else(|| candle_core::Error::Msg(format!("missing AdamW tensor {name}")))
         };
         let state = get("state")?.to_vec1::<i64>()?;
+        if get("feature_schema")?.to_vec1::<f32>()? != super::features::feature_schema() {
+            candle_core::bail!("AdamW feature schema mismatch");
+        }
         let hyper = get("hyper")?.to_vec1::<f64>()?;
         let mask = get("decay_mask")?.to_vec1::<i64>()?;
         let expected_mask: Vec<i64> = self.decay.iter().map(|&flag| i64::from(flag)).collect();
@@ -199,7 +206,7 @@ impl AzAdamW {
             || hyper[8] != MIN_LR_RATIO
             || !hyper[1].is_finite()
             || mask != expected_mask
-            || tensors.len() != 3 + self.vars.len() * 3
+            || tensors.len() != 4 + self.vars.len() * 3
         {
             candle_core::bail!(
                 "AdamW state does not match resume metadata: format={:?}/{} next_update={:?}/{next_update} base_lr={:?}/{} decay_mask_match={} tensors={}/{}",
@@ -210,7 +217,7 @@ impl AzAdamW {
                 self.base_lr,
                 mask == expected_mask,
                 tensors.len(),
-                3 + self.vars.len() * 3
+                4 + self.vars.len() * 3
             );
         }
         // 先完整验证；不允许旧 checkpoint 的动量误配到不同权重。

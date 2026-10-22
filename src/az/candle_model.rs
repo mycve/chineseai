@@ -1,195 +1,297 @@
-use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
-
-use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
 use super::{
-    AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE,
-    POLICY_MOVE_CONTEXT_SIZE, POLICY_SPARSE_FACTOR_SIZE, POLICY_SPARSE_TABLE_SIZE,
-    POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE,
-    STRUCTURAL_FILE_SIZE, STRUCTURAL_KING_PIECE_SIZE, STRUCTURAL_PIECE_SIZE, STRUCTURAL_RANK_SIZE,
-    VALUE_BUCKETS, VALUE_HEAD_SIZE, VALUE_KING_PIECE_RANK, VALUE_KING_PIECE_VOCAB,
-    VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
-    dataloader::PackedBatch,
-    fused_feature_pool::{PADDING_ITEM, feature_pool, sparse_pool},
-    fused_policy::fused_policy,
-    fused_sparse_policy::{sparse_policy, tactical_policy},
+    dataloader::PackedBatch, features::*, fused_feature_pool::sparse_pool,
+    nnue::AZ_NNUE_INPUT_SIZE, *,
 };
-use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
-
-const RMS_NORM_EPS: f64 = 1.0e-6;
-
+use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 #[derive(Debug)]
 pub(super) struct AzCandleModel {
     arch: AzNnueArch,
     input_hidden: Var,
-    input_piece_hidden: Var,
-    input_rank_hidden: Var,
-    input_file_hidden: Var,
-    input_king_piece_hidden: Var,
+    hidden_bias: Var,
+    king_piece: Var,
+    king_projection: Var,
+    relation_embedding: Var,
+    relation_projection: Var,
+    motif_embedding: Var,
+    motif_projection: Var,
     rule_context_hidden: Var,
     check_context_hidden: Var,
-    hidden_bias: Var,
-    shared_hidden: Var,
-    shared_bias: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
-    value_king_piece_hidden: Var,
-    value_king_piece_projection: Var,
     value_head_output: Var,
-    value_history_output: Var,
     moves_left_output: Var,
     moves_left_bias: Var,
-    value_threat_embedding: Var,
-    value_threat_output: Var,
-    policy_threat_context: Var,
     policy_move_bias: Var,
-    policy_consequence_output: Var,
+    policy_piece_square: Var,
     policy_context_hidden: Var,
     policy_move_context: Var,
-    policy_accumulator_hidden: Var,
-    policy_accumulator_move: Var,
-    policy_sparse_table: Var,
-    policy_sparse_factor: Var,
-    policy_tactical: Var,
+    policy_move_piece: Var,
+    policy_move_king: Var,
+    policy_move_capture: Var,
+    policy_local: Var,
+    policy_joint: Var,
+    policy_events: Var,
     policy_repetition_hidden: Var,
     policy_repetition_bias: Var,
 }
-
 impl AzCandleModel {
-    pub(super) fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
-        let hidden_size = self.arch.hidden_size;
-        let policy_consequence_size = POLICY_CONSEQUENCE_SIZE.min(hidden_size);
-        let feature_tables = Tensor::cat(
-            &[
-                self.input_hidden.as_tensor(),
-                self.input_piece_hidden.as_tensor(),
-                self.input_rank_hidden.as_tensor(),
-                self.input_file_hidden.as_tensor(),
-                self.input_king_piece_hidden.as_tensor(),
+    pub(super) fn from_model(model: &AzNnue, device: &Device) -> CandleResult<Self> {
+        let h = model.hidden_size;
+        Ok(Self {
+            arch: model.arch,
+            input_hidden: Var::from_slice(&model.input_hidden, &[AZ_NNUE_INPUT_SIZE, h], device)?,
+            hidden_bias: Var::from_slice(&model.hidden_bias, &[h], device)?,
+            king_piece: Var::from_slice(
+                &model.king_piece,
+                &[VALUE_KING_PIECE_VOCAB, VALUE_KING_PIECE_RANK],
+                device,
+            )?,
+            king_projection: Var::from_slice(
+                &model.king_projection,
+                &[VALUE_KING_PIECE_RANK, h],
+                device,
+            )?,
+            relation_embedding: Var::from_slice(
+                &model.relation_embedding,
+                &[RELATION_ROWS, RELATION_RANK],
+                device,
+            )?,
+            relation_projection: Var::from_slice(
+                &model.relation_projection,
+                &[RELATION_RANK, h],
+                device,
+            )?,
+            motif_embedding: Var::from_slice(
+                &model.motif_embedding,
+                &[MOTIF_ROWS, MOTIF_RANK],
+                device,
+            )?,
+            motif_projection: Var::from_slice(&model.motif_projection, &[MOTIF_RANK, h], device)?,
+            rule_context_hidden: Var::from_slice(
+                &model.rule_context_hidden,
+                &[RULE_CONTEXT_SIZE, h],
+                device,
+            )?,
+            check_context_hidden: Var::from_slice(
+                &model.check_context_hidden,
+                &[CHECK_CONTEXT_SIZE, h],
+                device,
+            )?,
+            value_head_hidden: Var::from_slice(
+                &model.value_head_hidden,
+                &[VALUE_HEAD_SIZE, h],
+                device,
+            )?,
+            value_head_bias: Var::from_slice(&model.value_head_bias, &[VALUE_HEAD_SIZE], device)?,
+            value_head_output: Var::from_slice(
+                &model.value_head_output,
+                &[VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE],
+                device,
+            )?,
+            moves_left_output: Var::from_slice(&model.moves_left_output, &[1, h], device)?,
+            moves_left_bias: Var::from_slice(&model.moves_left_bias, &[1], device)?,
+            policy_move_bias: Var::from_slice(
+                &model.policy_move_bias,
+                &[DENSE_MOVE_SPACE],
+                device,
+            )?,
+            policy_piece_square: Var::from_slice(
+                &model.policy_piece_square,
+                &[AZ_NNUE_INPUT_SIZE],
+                device,
+            )?,
+            policy_context_hidden: Var::from_slice(
+                &model.policy_context_hidden,
+                &[POLICY_MOVE_CONTEXT_SIZE, h],
+                device,
+            )?,
+            policy_move_context: Var::from_slice(
+                &model.policy_move_context,
+                &[DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE],
+                device,
+            )?,
+            policy_move_piece: Var::from_slice(
+                &model.policy_move_piece,
+                &[DENSE_MOVE_SPACE, 7],
+                device,
+            )?,
+            policy_move_king: Var::from_slice(
+                &model.policy_move_king,
+                &[2, DENSE_MOVE_SPACE, 9],
+                device,
+            )?,
+            policy_move_capture: Var::from_slice(
+                &model.policy_move_capture,
+                &[DENSE_MOVE_SPACE, 8],
+                device,
+            )?,
+            policy_local: Var::from_slice(&model.policy_local, &[MOVE_LOCAL_SIZE], device)?,
+            policy_joint: Var::from_slice(&model.policy_joint, &[POLICY_JOINT_ROWS], device)?,
+            policy_events: Var::from_slice(&model.policy_events, &[POLICY_EVENT_ROWS], device)?,
+            policy_repetition_hidden: Var::from_slice(
+                &model.policy_repetition_hidden,
+                &[h],
+                device,
+            )?,
+            policy_repetition_bias: Var::from_slice(&model.policy_repetition_bias, &[1], device)?,
+        })
+    }
+    pub(super) fn all_vars(&self) -> Vec<Var> {
+        vec![
+            self.input_hidden.clone(),
+            self.hidden_bias.clone(),
+            self.king_piece.clone(),
+            self.king_projection.clone(),
+            self.relation_embedding.clone(),
+            self.relation_projection.clone(),
+            self.motif_embedding.clone(),
+            self.motif_projection.clone(),
+            self.rule_context_hidden.clone(),
+            self.check_context_hidden.clone(),
+            self.value_head_hidden.clone(),
+            self.value_head_bias.clone(),
+            self.value_head_output.clone(),
+            self.moves_left_output.clone(),
+            self.moves_left_bias.clone(),
+            self.policy_move_bias.clone(),
+            self.policy_piece_square.clone(),
+            self.policy_context_hidden.clone(),
+            self.policy_move_context.clone(),
+            self.policy_move_piece.clone(),
+            self.policy_move_king.clone(),
+            self.policy_move_capture.clone(),
+            self.policy_local.clone(),
+            self.policy_joint.clone(),
+            self.policy_events.clone(),
+            self.policy_repetition_hidden.clone(),
+            self.policy_repetition_bias.clone(),
+        ]
+    }
+    pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
+        (
+            self.all_vars(),
+            vec![
+                false, false, false, true, false, true, false, true, true, true, true, false, true,
+                true, false, false, false, true, false, false, false, false, true, false, false,
+                true, false,
             ],
-            0,
-        )?;
-        let board_pre = feature_pool(&feature_tables, &batch.feature_items)?
-            .broadcast_add(&self.hidden_bias)?;
-        let accumulator_context = board_pre.matmul(&self.policy_accumulator_hidden.t()?)?;
-        let rule_pre = batch.rule_context.matmul(&self.rule_context_hidden)?;
-        let check_pre = batch.check_context.matmul(&self.check_context_hidden)?;
-        let sparse_pre = ((board_pre + rule_pre)? + check_pre)?;
-        let sparse_hidden = sparse_pre.relu()?;
-        let rms = sparse_hidden
-            .sqr()?
-            .mean_keepdim(1)?
-            .affine(1.0, RMS_NORM_EPS)?
-            .sqrt()?;
-        let hidden = sparse_hidden
-            .broadcast_div(&rms)?
-            .matmul(&self.shared_hidden.t()?)?
-            .broadcast_add(&self.shared_bias)?
-            .relu()?;
-        let value_king_piece = sparse_pool(
-            self.value_king_piece_hidden.as_tensor(),
-            &batch.value_king_piece_indices,
-        )?
-        .matmul(self.value_king_piece_projection.as_tensor())?
-        .broadcast_mul(&batch.value_king_piece_scales)?;
-        let value_head = hidden
+        )
+    }
+    pub(super) fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
+        model.input_hidden = self.input_hidden.flatten_all()?.to_vec1::<f32>()?;
+        model.hidden_bias = self.hidden_bias.flatten_all()?.to_vec1::<f32>()?;
+        model.king_piece = self.king_piece.flatten_all()?.to_vec1::<f32>()?;
+        model.king_projection = self.king_projection.flatten_all()?.to_vec1::<f32>()?;
+        model.relation_embedding = self.relation_embedding.flatten_all()?.to_vec1::<f32>()?;
+        model.relation_projection = self.relation_projection.flatten_all()?.to_vec1::<f32>()?;
+        model.motif_embedding = self.motif_embedding.flatten_all()?.to_vec1::<f32>()?;
+        model.motif_projection = self.motif_projection.flatten_all()?.to_vec1::<f32>()?;
+        model.rule_context_hidden = self.rule_context_hidden.flatten_all()?.to_vec1::<f32>()?;
+        model.check_context_hidden = self.check_context_hidden.flatten_all()?.to_vec1::<f32>()?;
+        model.value_head_hidden = self.value_head_hidden.flatten_all()?.to_vec1::<f32>()?;
+        model.value_head_bias = self.value_head_bias.flatten_all()?.to_vec1::<f32>()?;
+        model.value_head_output = self.value_head_output.flatten_all()?.to_vec1::<f32>()?;
+        model.moves_left_output = self.moves_left_output.flatten_all()?.to_vec1::<f32>()?;
+        model.moves_left_bias = self.moves_left_bias.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_move_bias = self.policy_move_bias.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_piece_square = self.policy_piece_square.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_context_hidden = self.policy_context_hidden.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_move_context = self.policy_move_context.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_move_piece = self.policy_move_piece.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_move_king = self.policy_move_king.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_move_capture = self.policy_move_capture.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_local = self.policy_local.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_joint = self.policy_joint.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_events = self.policy_events.flatten_all()?.to_vec1::<f32>()?;
+        model.policy_repetition_hidden = self
+            .policy_repetition_hidden
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        model.policy_repetition_bias = self
+            .policy_repetition_bias
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        model.rebuild_moves_left();
+        Ok(())
+    }
+    pub(super) fn forward(&self, b: &BatchTensors) -> CandleResult<ForwardOutput> {
+        let board = sparse_pool(self.input_hidden.as_tensor(), &b.feature_items)?;
+        let king = sparse_pool(self.king_piece.as_tensor(), &b.king_indices)?
+            .matmul(self.king_projection.as_tensor())?;
+        let relation = sparse_pool(self.relation_embedding.as_tensor(), &b.relation_indices)?
+            .matmul(self.relation_projection.as_tensor())?;
+        let motif = sparse_pool(self.motif_embedding.as_tensor(), &b.motif_indices)?
+            .matmul(self.motif_projection.as_tensor())?;
+        let hidden = ((board + king)? + relation)?;
+        let hidden = (hidden + motif)?;
+        let hidden = (hidden
+            + b.rule_context
+                .matmul(self.rule_context_hidden.as_tensor())?)?;
+        let hidden = (hidden
+            + b.check_context
+                .matmul(self.check_context_hidden.as_tensor())?)?
+        .broadcast_add(&self.hidden_bias)?
+        .relu()?;
+        let head = hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
-            .add(&value_king_piece)?
             .relu()?;
-        let selected_value = self
+        let selected = self
             .value_head_output
-            .reshape((VALUE_BUCKETS, WDL_HEAD_SIZE * VALUE_HEAD_SIZE))?
-            .index_select(&batch.value_buckets, 0)?
-            .reshape((batch.batch_size, WDL_HEAD_SIZE, VALUE_HEAD_SIZE))?;
-        let value_logits = selected_value
-            .matmul(&value_head.unsqueeze(2)?)?
-            .squeeze(2)?;
-        let threat_accumulator = sparse_pool(
-            self.value_threat_embedding.as_tensor(),
-            &batch.value_threat_indices,
-        )?
-        .broadcast_mul(&batch.value_threat_scales)?;
-        let threat_activation = threat_accumulator;
-        let threat_pair = Tensor::cat(&[&threat_activation, &threat_activation.sqr()?], 1)?;
-        let value_logits = ((value_logits
-            + threat_pair.matmul(&self.value_threat_output.t()?)?)?
-            + batch
-                .history_features
-                .matmul(&self.value_history_output.t()?)?)?;
-        let piece_square_policy = self
-            .input_hidden
-            .narrow(1, 0, policy_consequence_size)?
-            .contiguous()?;
-        let piece_square_policy = if policy_consequence_size < POLICY_CONSEQUENCE_SIZE {
-            Tensor::cat(
-                &[
-                    &piece_square_policy,
-                    &Tensor::zeros(
-                        (
-                            AZ_NNUE_INPUT_SIZE,
-                            POLICY_CONSEQUENCE_SIZE - policy_consequence_size,
-                        ),
-                        DType::F32,
-                        self.input_hidden.device(),
-                    )?,
-                ],
-                1,
-            )?
-        } else {
-            piece_square_policy
-        };
-        let piece_square_policy = piece_square_policy.flatten_all()?;
-        let policy_context = (hidden.matmul(&self.policy_context_hidden.t()?)?
-            + threat_pair.matmul(&self.policy_threat_context.t()?)?)?;
-        let policy_context = Tensor::cat(&[&policy_context, &accumulator_context], 1)?;
-        let accumulator_feature = self
-            .input_hidden
-            .matmul(&self.policy_accumulator_hidden.t()?)?
-            .flatten_all()?;
-        let policy_tables = Tensor::cat(
+            .reshape((VALUE_BUCKETS, 3 * VALUE_HEAD_SIZE))?
+            .index_select(&b.value_buckets, 0)?
+            .reshape((b.batch_size, 3, VALUE_HEAD_SIZE))?;
+        let value_logits = selected.matmul(&head.unsqueeze(2)?)?.squeeze(2)?;
+        let context = hidden.matmul(&self.policy_context_hidden.t()?)?;
+        let move_context = self
+            .policy_move_context
+            .index_select(&b.move_indices.flatten_all()?, 0)?
+            .reshape((b.batch_size, b.max_policy_moves, POLICY_MOVE_CONTEXT_SIZE))?;
+        let policy_context = move_context.broadcast_mul(&context.unsqueeze(1)?)?.sum(2)?;
+        let tables = Tensor::cat(
             &[
-                &piece_square_policy,
-                &self.policy_consequence_output.flatten_all()?,
                 &self.policy_move_bias.flatten_all()?,
-                &self.policy_move_context.flatten_all()?,
-                &accumulator_feature,
-                &self.policy_accumulator_move.flatten_all()?,
+                &self.policy_move_piece.flatten_all()?,
+                &self.policy_move_king.flatten_all()?,
+                &self.policy_move_capture.flatten_all()?,
+                &self.policy_joint.flatten_all()?,
+                &self.policy_events.flatten_all()?,
             ],
             0,
-        )?;
-        let policy_logits = fused_policy(&policy_tables, &policy_context, &batch.policy_items)?;
-        let sparse_tables = Tensor::cat(
-            &[
-                self.policy_sparse_table.as_tensor(),
-                self.policy_sparse_factor.as_tensor(),
-            ],
-            0,
-        )?;
-        let sparse_logits = sparse_policy(&sparse_tables, &batch.policy_sparse_indices)?;
-        let tactical_table = Tensor::cat(
-            &[
-                self.policy_tactical.as_tensor(),
-                &Tensor::zeros(1, DType::F32, self.input_hidden.device())?,
-            ],
-            0,
-        )?;
-        let tactical_logits = tactical_policy(&tactical_table, &batch.policy_tactical_indices)?;
-        let repetition_logit = hidden
+        )?
+        .unsqueeze(1)?;
+        let sparse =
+            sparse_pool(&tables, &b.policy_indices)?.reshape((b.batch_size, b.max_policy_moves))?;
+        let zero = Tensor::zeros(1, DType::F32, self.policy_piece_square.device())?;
+        let piece = Tensor::cat(&[self.policy_piece_square.as_tensor(), &zero], 0)?;
+        let from = piece
+            .index_select(&b.policy_from.flatten_all()?, 0)?
+            .reshape((b.batch_size, b.max_policy_moves))?;
+        let to = piece
+            .index_select(&b.policy_to.flatten_all()?, 0)?
+            .reshape((b.batch_size, b.max_policy_moves))?;
+        let capture = piece
+            .index_select(&b.policy_capture.flatten_all()?, 0)?
+            .reshape((b.batch_size, b.max_policy_moves))?;
+        let local = b
+            .policy_local
+            .reshape((b.batch_size * b.max_policy_moves, MOVE_LOCAL_SIZE))?
+            .matmul(&self.policy_local.reshape((MOVE_LOCAL_SIZE, 1))?)?
+            .reshape((b.batch_size, b.max_policy_moves))?;
+        let repetition = hidden
             .matmul(
                 &self
                     .policy_repetition_hidden
-                    .as_tensor()
-                    .reshape((hidden_size, 1))?,
+                    .reshape((self.arch.hidden_size, 1))?,
             )?
             .broadcast_add(&self.policy_repetition_bias)?;
-        let repetition_logits = batch.policy_repetition.broadcast_mul(&repetition_logit)?;
-        let policy_logits =
-            ((policy_logits + sparse_logits + tactical_logits)? + repetition_logits)?;
-
+        let policy_logits = ((((((policy_context + sparse)? + to)? - from)? - capture)? + local)?
+            + b.policy_repetition.broadcast_mul(&repetition)?)?
+        .add(&b.policy_mask)?;
         let moves_left = hidden
             .matmul(&self.moves_left_output.t()?)?
             .broadcast_add(&self.moves_left_bias)?
-            .affine(1.0, 1.0)?
+            .affine(1., 1.)?
             .relu()?;
         Ok(ForwardOutput {
             moves_left,
@@ -198,1195 +300,106 @@ impl AzCandleModel {
         })
     }
 }
-
 pub(super) struct ForwardOutput {
-    /// 已除以 MOVES_LEFT_SCALE 的半回合数。
-    pub(super) moves_left: Tensor,
-    pub(super) value_logits: Tensor,
-    pub(super) policy_logits: Tensor,
+    pub moves_left: Tensor,
+    pub value_logits: Tensor,
+    pub policy_logits: Tensor,
 }
-
 pub(super) struct BatchTensors {
-    pub(super) batch_size: usize,
-    pub(super) value_buckets: Tensor,
-    pub(super) feature_items: Tensor,
-    pub(super) value_threat_indices: Tensor,
-    pub(super) value_threat_scales: Tensor,
-    pub(super) value_king_piece_indices: Tensor,
-    pub(super) value_king_piece_scales: Tensor,
-    pub(super) policy_items: Tensor,
-    pub(super) policy_sparse_indices: Tensor,
-    pub(super) policy_tactical_indices: Tensor,
-    pub(super) policy_targets: Tensor,
-    pub(super) policy_mask: Tensor,
-    pub(super) policy_repetition: Tensor,
-    pub(super) value_wdl: Tensor,
-    pub(super) values: Tensor,
-    pub(super) rule_context: Tensor,
-    pub(super) history_features: Tensor,
-    pub(super) check_context: Tensor,
-    pub(super) policy_weights: Tensor,
-    pub(super) value_weights: Tensor,
-    pub(super) moves_left_targets: Tensor,
-    pub(super) moves_left_weights: Tensor,
-    pub(super) value_phase_masks: Tensor,
-    pub(super) value_source_phase_masks: Tensor,
+    pub batch_size: usize,
+    pub max_policy_moves: usize,
+    pub value_buckets: Tensor,
+    pub feature_items: Tensor,
+    pub king_indices: Tensor,
+    pub relation_indices: Tensor,
+    pub motif_indices: Tensor,
+    pub move_indices: Tensor,
+    pub policy_indices: Tensor,
+    pub policy_from: Tensor,
+    pub policy_to: Tensor,
+    pub policy_capture: Tensor,
+    pub policy_local: Tensor,
+    pub policy_targets: Tensor,
+    pub policy_mask: Tensor,
+    pub policy_repetition: Tensor,
+    pub value_wdl: Tensor,
+    pub values: Tensor,
+    pub rule_context: Tensor,
+    pub check_context: Tensor,
+    pub policy_weights: Tensor,
+    pub value_weights: Tensor,
+    pub moves_left_targets: Tensor,
+    pub moves_left_weights: Tensor,
+    pub value_phase_masks: Tensor,
+    pub value_source_phase_masks: Tensor,
 }
-
 impl BatchTensors {
-    pub(super) fn from_packed(packed: PackedBatch, device: &Device) -> CandleResult<Self> {
-        let batch_size = packed.batch_size;
-        let max_features = packed.max_features;
-        let max_policy_moves = packed.max_policy_moves;
-        let max_value_threats = packed.max_value_threats;
-        let max_value_king_pieces = packed.max_value_king_pieces;
-        assert!(
-            packed
-                .value_threat_indices
-                .iter()
-                .all(|&index| index == PADDING_ITEM || index < VALUE_THREAT_VOCAB as u32),
-            "value threat index exceeds vocabulary"
-        );
-        assert!(
-            packed
-                .value_king_piece_indices
-                .iter()
-                .all(|&index| index == PADDING_ITEM || index < VALUE_KING_PIECE_VOCAB as u32)
-        );
+    pub(super) fn from_packed(p: PackedBatch, device: &Device) -> CandleResult<Self> {
+        let batch_size = p.batch_size;
+        let max_policy_moves = p.max_policy_moves;
         Ok(Self {
             batch_size,
-            value_buckets: Tensor::from_vec(packed.value_buckets, batch_size, device)?,
-            feature_items: Tensor::from_vec(
-                packed.feature_items,
-                (batch_size, max_features),
+            max_policy_moves,
+            value_buckets: Tensor::from_vec(p.value_buckets, batch_size, device)?,
+            feature_items: Tensor::from_vec(p.feature_items, (batch_size, p.max_features), device)?,
+            king_indices: Tensor::from_vec(p.king_indices, (batch_size, p.max_king), device)?,
+            relation_indices: Tensor::from_vec(
+                p.relation_indices,
+                (batch_size, p.max_relations),
                 device,
             )?,
-            value_threat_indices: Tensor::from_vec(
-                packed.value_threat_indices,
-                (batch_size, max_value_threats),
+            motif_indices: Tensor::from_vec(p.motif_indices, (batch_size, p.max_motifs), device)?,
+            move_indices: Tensor::from_vec(p.move_indices, (batch_size, max_policy_moves), device)?,
+            policy_indices: Tensor::from_vec(
+                p.policy_indices,
+                (batch_size * max_policy_moves, p.max_policy_terms),
                 device,
             )?,
-            value_threat_scales: Tensor::from_vec(
-                packed.value_threat_scales,
-                (batch_size, 1),
-                device,
-            )?,
-            value_king_piece_indices: Tensor::from_vec(
-                packed.value_king_piece_indices,
-                (batch_size, max_value_king_pieces),
-                device,
-            )?,
-            value_king_piece_scales: Tensor::from_vec(
-                packed.value_king_piece_scales,
-                (batch_size, 1),
-                device,
-            )?,
-            policy_items: Tensor::from_vec(
-                packed.policy_items,
+            policy_from: Tensor::from_vec(p.policy_from, (batch_size, max_policy_moves), device)?,
+            policy_to: Tensor::from_vec(p.policy_to, (batch_size, max_policy_moves), device)?,
+            policy_capture: Tensor::from_vec(
+                p.policy_capture,
                 (batch_size, max_policy_moves),
                 device,
             )?,
-            policy_sparse_indices: Tensor::from_vec(
-                packed.policy_sparse_indices,
-                (batch_size, max_policy_moves, 7),
-                device,
-            )?,
-            policy_tactical_indices: Tensor::from_vec(
-                packed.policy_tactical_indices,
-                (batch_size, max_policy_moves, POLICY_TACTICAL_TERMS),
+            policy_local: Tensor::from_vec(
+                p.policy_local,
+                (batch_size, max_policy_moves, MOVE_LOCAL_SIZE),
                 device,
             )?,
             policy_targets: Tensor::from_vec(
-                packed.policy_targets,
+                p.policy_targets,
                 (batch_size, max_policy_moves),
                 device,
             )?,
-            policy_mask: Tensor::from_vec(
-                packed.policy_mask,
-                (batch_size, max_policy_moves),
-                device,
-            )?,
+            policy_mask: Tensor::from_vec(p.policy_mask, (batch_size, max_policy_moves), device)?,
             policy_repetition: Tensor::from_vec(
-                packed.policy_repetition,
+                p.policy_repetition,
                 (batch_size, max_policy_moves),
                 device,
             )?,
-            value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
-            values: Tensor::from_vec(packed.values, batch_size, device)?,
+            value_wdl: Tensor::from_vec(p.value_wdl, (batch_size, 3), device)?,
+            values: Tensor::from_vec(p.values, batch_size, device)?,
             rule_context: Tensor::from_vec(
-                packed.rule_context,
+                p.rule_context,
                 (batch_size, RULE_CONTEXT_SIZE),
                 device,
             )?,
-            history_features: Tensor::from_vec(
-                packed.history_features,
-                (batch_size, HISTORY_CONTEXT_SIZE),
-                device,
-            )?,
-            policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
             check_context: Tensor::from_vec(
-                packed.check_context,
+                p.check_context,
                 (batch_size, CHECK_CONTEXT_SIZE),
                 device,
             )?,
-            value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
-            moves_left_targets: Tensor::from_vec(packed.moves_left_targets, batch_size, device)?,
-            moves_left_weights: Tensor::from_vec(packed.moves_left_weights, batch_size, device)?,
-            value_phase_masks: Tensor::from_vec(packed.value_phase_masks, (batch_size, 3), device)?,
+            policy_weights: Tensor::from_vec(p.policy_weights, batch_size, device)?,
+            value_weights: Tensor::from_vec(p.value_weights, batch_size, device)?,
+            moves_left_targets: Tensor::from_vec(p.moves_left_targets, batch_size, device)?,
+            moves_left_weights: Tensor::from_vec(p.moves_left_weights, batch_size, device)?,
+            value_phase_masks: Tensor::from_vec(p.value_phase_masks, (batch_size, 3), device)?,
             value_source_phase_masks: Tensor::from_vec(
-                packed.value_source_phase_masks,
+                p.value_source_phase_masks,
                 (batch_size, 9),
                 device,
             )?,
         })
-    }
-}
-
-impl AzCandleModel {
-    pub(super) fn from_model(model: &AzNnue, device: &Device) -> CandleResult<Self> {
-        let arch = model.arch;
-        let hidden = arch.hidden_size;
-        Ok(Self {
-            arch,
-            input_hidden: var_from_slice(
-                &model.input_hidden,
-                (AZ_NNUE_INPUT_SIZE, hidden),
-                device,
-            )?,
-            input_piece_hidden: var_from_slice(
-                &model.input_piece_hidden,
-                (STRUCTURAL_PIECE_SIZE, hidden),
-                device,
-            )?,
-            input_rank_hidden: var_from_slice(
-                &model.input_rank_hidden,
-                (STRUCTURAL_RANK_SIZE, hidden),
-                device,
-            )?,
-            input_file_hidden: var_from_slice(
-                &model.input_file_hidden,
-                (STRUCTURAL_FILE_SIZE, hidden),
-                device,
-            )?,
-            input_king_piece_hidden: var_from_slice(
-                &model.input_king_piece_hidden,
-                (STRUCTURAL_KING_PIECE_SIZE, hidden),
-                device,
-            )?,
-            rule_context_hidden: var_from_slice(
-                &model.rule_context_hidden,
-                (RULE_CONTEXT_SIZE, hidden),
-                device,
-            )?,
-            hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
-            shared_hidden: var_from_slice(&model.shared_hidden, (hidden, hidden), device)?,
-            shared_bias: var_from_slice(&model.shared_bias, hidden, device)?,
-            check_context_hidden: var_from_slice(
-                &model.check_context_hidden,
-                (CHECK_CONTEXT_SIZE, hidden),
-                device,
-            )?,
-            value_head_hidden: var_from_slice(
-                &model.value_head_hidden,
-                (VALUE_HEAD_SIZE, hidden),
-                device,
-            )?,
-            value_head_bias: var_from_slice(&model.value_head_bias, VALUE_HEAD_SIZE, device)?,
-            value_king_piece_hidden: var_from_slice(
-                &model.value_king_piece_hidden,
-                (VALUE_KING_PIECE_VOCAB, VALUE_KING_PIECE_RANK),
-                device,
-            )?,
-            value_king_piece_projection: var_from_slice(
-                &model.value_king_piece_projection,
-                (VALUE_KING_PIECE_RANK, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            value_head_output: var_from_slice(
-                &model.value_head_output,
-                (VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            value_history_output: var_from_slice(
-                &model.value_history_output,
-                (WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE),
-                device,
-            )?,
-            moves_left_output: var_from_slice(&model.moves_left_output, (1, hidden), device)?,
-            moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
-            value_threat_embedding: var_from_slice(
-                &model.value_threat_embedding,
-                (VALUE_THREAT_VOCAB, VALUE_THREAT_RANK),
-                device,
-            )?,
-            value_threat_output: var_from_slice(
-                &model.value_threat_output,
-                (WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2),
-                device,
-            )?,
-            policy_threat_context: var_from_slice(
-                &model.policy_threat_context,
-                (POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2),
-                device,
-            )?,
-            policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
-            policy_consequence_output: var_from_slice(
-                &model.policy_consequence_output,
-                POLICY_CONSEQUENCE_SIZE,
-                device,
-            )?,
-            policy_context_hidden: var_from_slice(
-                &model.policy_context_hidden,
-                (POLICY_MOVE_CONTEXT_SIZE, hidden),
-                device,
-            )?,
-            policy_move_context: var_from_slice(
-                &model.policy_move_context,
-                (DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE),
-                device,
-            )?,
-            policy_accumulator_hidden: var_from_slice(
-                &model.policy_accumulator_hidden,
-                (POLICY_ACCUMULATOR_RANK, hidden),
-                device,
-            )?,
-            policy_accumulator_move: var_from_slice(
-                &model.policy_accumulator_move,
-                (DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK),
-                device,
-            )?,
-            policy_sparse_table: var_from_slice(
-                &model.policy_sparse_table,
-                POLICY_SPARSE_TABLE_SIZE,
-                device,
-            )?,
-            policy_sparse_factor: var_from_slice(
-                &model.policy_sparse_factor,
-                POLICY_SPARSE_FACTOR_SIZE,
-                device,
-            )?,
-            policy_tactical: var_from_slice(&model.policy_tactical, POLICY_TACTICAL_SIZE, device)?,
-            policy_repetition_hidden: var_from_slice(
-                &model.policy_repetition_hidden,
-                hidden,
-                device,
-            )?,
-            policy_repetition_bias: var_from_slice(&model.policy_repetition_bias, 1, device)?,
-        })
-    }
-
-    pub(super) fn all_vars(&self) -> Vec<Var> {
-        let mut vars = Vec::new();
-        vars.push(self.input_hidden.clone());
-        vars.push(self.input_piece_hidden.clone());
-        vars.push(self.input_rank_hidden.clone());
-        vars.push(self.input_file_hidden.clone());
-        vars.push(self.input_king_piece_hidden.clone());
-        vars.push(self.rule_context_hidden.clone());
-        vars.push(self.check_context_hidden.clone());
-        vars.push(self.hidden_bias.clone());
-        vars.push(self.shared_hidden.clone());
-        vars.push(self.shared_bias.clone());
-        vars.push(self.value_head_hidden.clone());
-        vars.push(self.value_head_bias.clone());
-        vars.push(self.value_king_piece_hidden.clone());
-        vars.push(self.value_king_piece_projection.clone());
-        vars.push(self.value_head_output.clone());
-        vars.push(self.value_threat_embedding.clone());
-        vars.push(self.value_threat_output.clone());
-        vars.push(self.policy_threat_context.clone());
-        vars.push(self.policy_move_bias.clone());
-        vars.push(self.policy_consequence_output.clone());
-        vars.push(self.policy_context_hidden.clone());
-        vars.push(self.policy_move_context.clone());
-        vars.push(self.policy_accumulator_hidden.clone());
-        vars.push(self.policy_accumulator_move.clone());
-        vars.push(self.policy_sparse_table.clone());
-        vars.push(self.policy_sparse_factor.clone());
-        vars.push(self.policy_tactical.clone());
-        vars.push(self.policy_repetition_hidden.clone());
-        vars.push(self.policy_repetition_bias.clone());
-        vars.push(self.moves_left_output.clone());
-        vars.push(self.moves_left_bias.clone());
-        vars.push(self.value_history_output.clone());
-        vars
-    }
-
-    /// 与 [`Self::all_vars`] **同序**：该张量是否施加 weight decay。
-    ///
-    /// 排除两类，只对稠密 matmul 权重施加 decay：
-    /// * **行 gather 型查表** —— 逐样本只激活极少数行（威胁表每位置上限 192/107750 行，
-    ///   即 0.18%），对整表施加 decay 等于持续收缩从未激活的行。这里包括 5 个 feature_pool
-    ///   表、`value_king_piece_hidden`、`value_threat_embedding`、`policy_sparse_*`、
-    ///   `policy_tactical`，以及 `fused_policy` 按走法下标取用的那几张表
-    ///   （`policy_move_bias`/`policy_consequence_output`/`policy_move_context`/
-    ///   `policy_accumulator_move`，见 `fused_policy.rs` 里的固定偏移取址）。
-    /// * **所有 bias**（`hidden_bias`/`value_head_bias`/`policy_repetition_bias`）。
-    ///
-    /// 量级提醒：`lr=4e-4` 时每步衰减因子是 `1 - lr*wd = 1 - 4e-8`，十万步累计只收缩 0.4%，
-    /// 所以这个分组在 Adam 的学习率尺度下几乎不动结果。
-    pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
-        /// 与 `all_vars` 的 push 顺序一一对应。
-        const DECAY: [bool; 32] = [
-            false, // input_hidden
-            false, // input_piece_hidden
-            false, // input_rank_hidden
-            false, // input_file_hidden
-            false, // input_king_piece_hidden
-            true,  // rule_context_hidden
-            true,  // check_context_hidden
-            false, // hidden_bias
-            true,  // shared_hidden
-            false, // shared_bias
-            true,  // value_head_hidden
-            false, // value_head_bias
-            false, // value_king_piece_hidden
-            true,  // value_king_piece_projection
-            true,  // value_head_output
-            false, // value_threat_embedding
-            true,  // value_threat_output
-            true,  // policy_threat_context
-            false, // policy_move_bias
-            false, // policy_consequence_output
-            true,  // policy_context_hidden
-            false, // policy_move_context
-            true,  // policy_accumulator_hidden
-            false, // policy_accumulator_move
-            false, // policy_sparse_table
-            false, // policy_sparse_factor
-            false, // policy_tactical
-            true,  // policy_repetition_hidden
-            false, // policy_repetition_bias
-            true,  // moves_left_output
-            false, // moves_left_bias
-            true,  // value_history_output
-        ];
-        let vars = self.all_vars();
-        debug_assert_eq!(vars.len(), DECAY.len());
-        (vars, DECAY.to_vec())
-    }
-
-    pub(super) fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
-        copy_var(&self.input_hidden, &mut model.input_hidden)?;
-        copy_var(&self.input_piece_hidden, &mut model.input_piece_hidden)?;
-        copy_var(&self.input_rank_hidden, &mut model.input_rank_hidden)?;
-        copy_var(&self.input_file_hidden, &mut model.input_file_hidden)?;
-        copy_var(
-            &self.input_king_piece_hidden,
-            &mut model.input_king_piece_hidden,
-        )?;
-        copy_var(&self.rule_context_hidden, &mut model.rule_context_hidden)?;
-        copy_var(&self.check_context_hidden, &mut model.check_context_hidden)?;
-        copy_var(&self.hidden_bias, &mut model.hidden_bias)?;
-        copy_var(&self.shared_hidden, &mut model.shared_hidden)?;
-        copy_var(&self.shared_bias, &mut model.shared_bias)?;
-        copy_var(&self.value_head_hidden, &mut model.value_head_hidden)?;
-        copy_var(&self.value_head_bias, &mut model.value_head_bias)?;
-        copy_var(
-            &self.value_king_piece_hidden,
-            &mut model.value_king_piece_hidden,
-        )?;
-        copy_var(
-            &self.value_king_piece_projection,
-            &mut model.value_king_piece_projection,
-        )?;
-        copy_var(&self.value_head_output, &mut model.value_head_output)?;
-        copy_var(&self.value_history_output, &mut model.value_history_output)?;
-        copy_var(
-            &self.value_threat_embedding,
-            &mut model.value_threat_embedding,
-        )?;
-        copy_var(&self.value_threat_output, &mut model.value_threat_output)?;
-        copy_var(
-            &self.policy_threat_context,
-            &mut model.policy_threat_context,
-        )?;
-        copy_var(&self.policy_move_bias, &mut model.policy_move_bias)?;
-        copy_var(
-            &self.policy_consequence_output,
-            &mut model.policy_consequence_output,
-        )?;
-        copy_var(
-            &self.policy_context_hidden,
-            &mut model.policy_context_hidden,
-        )?;
-        copy_var(&self.policy_move_context, &mut model.policy_move_context)?;
-        copy_var(
-            &self.policy_accumulator_hidden,
-            &mut model.policy_accumulator_hidden,
-        )?;
-        copy_var(
-            &self.policy_accumulator_move,
-            &mut model.policy_accumulator_move,
-        )?;
-        copy_var(&self.policy_sparse_table, &mut model.policy_sparse_table)?;
-        copy_var(&self.policy_sparse_factor, &mut model.policy_sparse_factor)?;
-        copy_var(&self.policy_tactical, &mut model.policy_tactical)?;
-        copy_var(
-            &self.policy_repetition_hidden,
-            &mut model.policy_repetition_hidden,
-        )?;
-        copy_var(
-            &self.policy_repetition_bias,
-            &mut model.policy_repetition_bias,
-        )?;
-        copy_var(&self.moves_left_output, &mut model.moves_left_output)?;
-        copy_var(&self.moves_left_bias, &mut model.moves_left_bias)?;
-        model.rebuild_moves_left();
-        model.rebuild_value_threat();
-        model.rebuild_value_history();
-        model.rebuild_check_context();
-        model.rebuild_policy_tactical();
-        model.rebuild_policy_cache();
-        Ok(())
-    }
-}
-
-fn var_from_slice<S: Into<candle_core::Shape>>(
-    values: &[f32],
-    shape: S,
-    device: &Device,
-) -> CandleResult<Var> {
-    Var::from_slice(values, shape, device)
-}
-
-fn copy_var(var: &Var, dst: &mut [f32]) -> CandleResult<()> {
-    let values = var.as_detached_tensor().flatten_all()?.to_vec1::<f32>()?;
-    dst.copy_from_slice(&values);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        az::nnue::extract_sparse_features_az,
-        az::{
-            AzEvalScratch, AzSampleMeta, AzTrainingSample, POLICY_SPARSE_TABLE_SIZE,
-            RULE_CONTEXT_SIZE, canonical_buckets_for_perspective, dense_move_index,
-            policy_consequence_features, policy_sparse_capture_index, policy_sparse_factor_indices,
-            policy_sparse_main_index,
-        },
-        xiangqi::Position,
-    };
-
-    #[test]
-    fn king_piece_factorization_initialization_trains_both_factors() {
-        king_piece_factorization_training_matches_cpu(&Device::Cpu);
-    }
-
-    #[cfg(feature = "slow-tests")]
-    #[test]
-    fn king_piece_factorization_cuda_training_matches_cpu() {
-        let device = crate::az::cuda_test_device::shared_cuda_device()
-            .expect("CUDA is required for this test");
-        king_piece_factorization_training_matches_cpu(device);
-    }
-
-    fn king_piece_factorization_training_matches_cpu(device: &Device) {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let sample = AzTrainingSample {
-            features: extract_sparse_features_az(&position),
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
-            history_features: crate::az::history_features(&position, &[]),
-            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
-            repetition_flags: vec![0; moves.len()],
-            policy: vec![1.0 / moves.len() as f32; moves.len()],
-            value_wdl: [0.0, 1.0, 0.0],
-            root_search_wdl: [0.0, 1.0, 0.0],
-            value: 0.0,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            moves_left: 0.0,
-            moves_left_weight: 0.0,
-            search_simulations: 0,
-            meta: Default::default(),
-        };
-        let mut model = AzNnue::random(96, 20261008);
-        assert_eq!(
-            model.value_king_piece_hidden.len(),
-            VALUE_KING_PIECE_VOCAB * VALUE_KING_PIECE_RANK
-        );
-        assert!(model.value_king_piece_hidden.iter().all(|&x| x == 0.0));
-        for channel in 0..VALUE_KING_PIECE_RANK {
-            let row = &model.value_king_piece_projection
-                [channel * VALUE_HEAD_SIZE..(channel + 1) * VALUE_HEAD_SIZE];
-            assert_eq!(row[channel], 1.0);
-            assert_eq!(row.iter().filter(|&&x| x != 0.0).count(), 1);
-        }
-        // 保持每个价值方向的ReLU开放，专门核验两个因子的梯度启动。
-        model.value_head_hidden.fill(0.0);
-        model.value_head_bias.fill(1.0);
-        let initial_projection = model.value_king_piece_projection.clone();
-        let candle = AzCandleModel::from_model(&model, device).unwrap();
-        let (all_vars, decay) = candle.all_vars_with_decay();
-        assert_eq!(all_vars.len(), 32);
-        let index = all_vars
-            .iter()
-            .position(|v| v.id() == candle.value_king_piece_projection.id())
-            .unwrap();
-        assert!(decay[index]);
-        let batch = BatchTensors::from_packed(
-            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
-            device,
-        )
-        .unwrap();
-        let mut optimizer = crate::az::adamw::AzAdamW::new(all_vars, decay, 0.001).unwrap();
-        let mut live_channels = [false; VALUE_KING_PIECE_RANK];
-        let mut projection_live = false;
-        for step in 0..6 {
-            let forward = candle.forward(&batch).unwrap();
-            let loss = candle_nn::ops::log_softmax(&forward.value_logits, 1)
-                .unwrap()
-                .mul(&batch.value_wdl)
-                .unwrap()
-                .sum_all()
-                .unwrap()
-                .neg()
-                .unwrap();
-            let gradients = loss.backward().unwrap();
-            let output_gradient = gradients
-                .get(&candle.value_head_output)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            let bucket = crate::az::value_material_bucket(&position, position.side_to_move());
-            for (index, row) in output_gradient
-                .chunks_exact(WDL_HEAD_SIZE * VALUE_HEAD_SIZE)
-                .enumerate()
-            {
-                if index == bucket {
-                    assert!(row.iter().any(|&g| g != 0.0));
-                } else {
-                    assert!(
-                        row.iter().all(|&g| g == 0.0),
-                        "unselected bucket {index} received gradients"
-                    );
-                }
-            }
-            let table_gradient = gradients
-                .get(&candle.value_king_piece_hidden)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            assert!(table_gradient.iter().all(|x| x.is_finite()));
-            for (channel, live) in live_channels.iter_mut().enumerate() {
-                *live |= table_gradient
-                    .iter()
-                    .skip(channel)
-                    .step_by(VALUE_KING_PIECE_RANK)
-                    .any(|x| x.abs() > 1e-8);
-            }
-            let projection_gradient = gradients
-                .get(&candle.value_king_piece_projection)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            assert!(projection_gradient.iter().all(|x| x.is_finite()));
-            if step == 0 {
-                assert!(projection_gradient.iter().all(|&x| x == 0.0));
-            }
-            projection_live |= projection_gradient.iter().any(|x| x.abs() > 1e-8);
-            optimizer.step(&gradients).unwrap();
-        }
-        assert!(live_channels.into_iter().all(|live| live));
-        assert!(projection_live);
-        candle.copy_to_model(&mut model).unwrap();
-        assert!(model.value_king_piece_hidden.iter().any(|x| x.abs() > 1e-6));
-        assert!(
-            model
-                .value_king_piece_projection
-                .iter()
-                .zip(initial_projection)
-                .any(|(&x, y)| (x - y).abs() > 1e-6)
-        );
-        let wdl = candle_nn::ops::softmax(&candle.forward(&batch).unwrap().value_logits, 1)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-        let (cpu, _) = crate::az::outputs_for_training_sample(&model, &sample).unwrap();
-        assert!(cpu.iter().zip(&wdl[0]).all(|(&x, &y)| (x - y).abs() < 2e-5));
-    }
-
-    #[test]
-    fn history_head_trains_and_matches_cpu_after_two_moves() {
-        let mut position = Position::startpos();
-        let mut history = Vec::new();
-        for _ in 0..2 {
-            let mv = position.legal_moves()[0];
-            let mover = position.side_to_move();
-            let captured = position.piece_at(mv.to as usize);
-            position.make_move(mv);
-            history.push(position.rule_history_entry_after_moved(mover, mv, captured));
-        }
-        let moves = position.legal_moves();
-        let sample = AzTrainingSample {
-            features: extract_sparse_features_az(&position),
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
-            history_features: crate::az::history_features(&position, &history),
-            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
-            repetition_flags: vec![0; moves.len()],
-            policy: vec![1.0 / moves.len() as f32; moves.len()],
-            value_wdl: [1.0, 0.0, 0.0],
-            root_search_wdl: [1.0, 0.0, 0.0],
-            value: 1.0,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            moves_left: 0.0,
-            moves_left_weight: 0.0,
-            search_simulations: 0,
-            meta: Default::default(),
-        };
-        assert!(sample.history_features[48..].iter().any(|x| *x != 0.0));
-        let mut model = AzNnue::random(16, 7);
-        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
-        let (vars, decay) = candle.all_vars_with_decay();
-        assert_eq!(vars.last().unwrap().id(), candle.value_history_output.id());
-        assert!(*decay.last().unwrap());
-        let batch = BatchTensors::from_packed(
-            PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let output = candle.forward(&batch).unwrap();
-        let loss = candle_nn::ops::log_softmax(&output.value_logits, 1)
-            .unwrap()
-            .mul(&batch.value_wdl)
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .neg()
-            .unwrap();
-        let gradients = loss.backward().unwrap();
-        let gradient = gradients
-            .get(&candle.value_history_output)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(gradient.iter().all(|x| x.is_finite()));
-        assert!(gradient.iter().any(|x| x.abs() > 1e-8));
-        let mut optimizer = crate::az::adamw::AzAdamW::new(
-            vec![candle.value_history_output.clone()],
-            vec![true],
-            0.001,
-        )
-        .unwrap();
-        optimizer.step(&gradients).unwrap();
-        candle.copy_to_model(&mut model).unwrap();
-        let candle_wdl = candle_nn::ops::softmax(&candle.forward(&batch).unwrap().value_logits, 1)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-        let (cpu_wdl, _) = crate::az::outputs_for_training_sample(&model, &sample).unwrap();
-        assert!(
-            cpu_wdl
-                .iter()
-                .zip(&candle_wdl[0])
-                .all(|(a, b)| (a - b).abs() < 1e-5)
-        );
-    }
-
-    fn assert_shared_gradients(
-        model: &AzCandleModel,
-        gradients: &candle_core::backprop::GradStore,
-    ) {
-        for var in [&model.shared_hidden, &model.shared_bias] {
-            let values = gradients
-                .get(var)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            assert!(values.iter().all(|g| g.is_finite()));
-            assert!(values.iter().any(|g| g.abs() > 1e-8));
-        }
-    }
-
-    #[test]
-    #[ignore = "需要本地已训练检查点、Px0数据及CUDA；只核对前向"]
-    fn trained_cuda_forward_matches_search_cpu() {
-        let path = std::env::var("CHINESEAI_AUDIT_MODEL")
-            .unwrap_or_else(|_| "tmp/px0-reservoir-131072.epoch-3.safetensors".into());
-        let model = AzNnue::load(path).unwrap();
-        let data_path =
-            std::env::var("CHINESEAI_AUDIT_DATA").unwrap_or_else(|_| "data/data.bin".into());
-        let dataset =
-            crate::az::px0_data::load(std::path::Path::new(&data_path), 1024, 1024).unwrap();
-        let stride = (dataset.train.len() / 128).max(1);
-        let samples: Vec<_> = dataset
-            .train
-            .iter()
-            .step_by(stride)
-            .take(128)
-            .cloned()
-            .collect();
-        assert!(samples.len() >= 64);
-        let device = Device::new_cuda(0).unwrap();
-        let candle = AzCandleModel::from_model(&model, &device).unwrap();
-        let ids: Vec<_> = (0..samples.len()).collect();
-        let batch =
-            BatchTensors::from_packed(PackedBatch::from_indices(&samples, &ids), &device).unwrap();
-        let forward = candle.forward(&batch).unwrap();
-        let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-        let policy = forward.policy_logits.to_vec2::<f32>().unwrap();
-        let mut max_value = 0f32;
-        let mut max_policy = 0f32;
-        let mut max_wdl = 0f32;
-        let mut moves_checked = 0;
-        for (row, sample) in samples.iter().enumerate() {
-            let position = crate::az::position_for_training_sample(sample).unwrap();
-            let moves: Vec<_> = sample
-                .move_indices
-                .iter()
-                .map(|&index| {
-                    let (from, to) = crate::az::dense_move_squares(index).unwrap();
-                    crate::xiangqi::Move::new(from, to)
-                })
-                .collect();
-            let mut scratch = AzEvalScratch::new(model.arch);
-            let cpu = model.evaluate_with_scratch_output_with_repetition_and_history_features(
-                &position,
-                &moves,
-                &sample.repetition_flags,
-                &sample.rule_context,
-                &sample.history_features,
-                &mut scratch,
-            );
-            max_value = max_value.max((cpu.value - (wdl[row][0] - wdl[row][2])).abs());
-            for (a, b) in cpu.value_wdl.iter().zip(&wdl[row]) {
-                max_wdl = max_wdl.max((a - b).abs());
-            }
-            for (a, b) in scratch.logits.iter().zip(&policy[row]) {
-                max_policy = max_policy.max((a - b).abs());
-            }
-            moves_checked += moves.len();
-            assert!(
-                (cpu.value - (wdl[row][0] - wdl[row][2])).abs() < 1e-4,
-                "row={row} fen={}",
-                position.to_fen()
-            );
-        }
-        println!(
-            "trained GPU/CPU audit: samples={} moves={moves_checked} max_value={max_value:.8} max_wdl={max_wdl:.8} max_policy={max_policy:.8}",
-            samples.len()
-        );
-        assert!(max_wdl < 1e-4 && max_policy < 1e-3);
-    }
-
-    #[test]
-    fn candle_and_cpu_policy_consequence_logits_match() {
-        let position =
-            Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
-                .unwrap();
-        let moves = position.legal_moves();
-        let mut model = AzNnue::random(32, 20260730);
-        for (index, weight) in model.policy_consequence_output.iter_mut().enumerate() {
-            *weight = (index as f32 + 1.0) * 0.003;
-        }
-        for (index, weight) in model.policy_move_context.iter_mut().enumerate() {
-            *weight = ((index % POLICY_MOVE_CONTEXT_SIZE) as f32 + 1.0) * 0.002;
-        }
-        for (index, weight) in model.policy_accumulator_move.iter_mut().enumerate() {
-            *weight = ((index % POLICY_ACCUMULATOR_RANK) as f32 + 1.0) * 0.0002;
-        }
-        for (index, weight) in model.value_threat_output.iter_mut().enumerate() {
-            *weight = (index % 17) as f32 * 0.0003 - 0.002;
-        }
-        for (index, weight) in model.value_king_piece_hidden.iter_mut().enumerate() {
-            *weight = (index % 19) as f32 * 0.001 - 0.009;
-        }
-        for (index, weight) in model.value_head_output.iter_mut().enumerate() {
-            *weight = (index % 11) as f32 * 0.003 - 0.015;
-        }
-        for (index, weight) in model.check_context_hidden.iter_mut().enumerate() {
-            *weight = (index % 17) as f32 * 0.01 - 0.08;
-        }
-        model.rebuild_check_context();
-        model.value_head_bias.fill(1.0);
-        for (index, weight) in model.policy_threat_context.iter_mut().enumerate() {
-            *weight = (index % 13) as f32 * 0.0001 - 0.0005;
-        }
-        for (index, weight) in model.policy_tactical.iter_mut().enumerate() {
-            *weight = (index % 11) as f32 * 0.0002 - 0.001;
-        }
-        model.policy_sparse_table[POLICY_SPARSE_TABLE_SIZE - 1] = 0.127;
-        model.policy_repetition_hidden.fill(0.01);
-        model.policy_repetition_bias[0] = 0.25;
-        let side = position.side_to_move();
-        let buckets = canonical_buckets_for_perspective(&position, side);
-        for (index, &mv) in moves.iter().enumerate() {
-            let move_index = dense_move_index(mv);
-            let (from, _, captured) = policy_consequence_features(&position, side, mv).unwrap();
-            let main = policy_sparse_main_index(move_index, from / 90, buckets.0, buckets.1);
-            let capture =
-                policy_sparse_capture_index(move_index, captured.map(|feature| feature / 90));
-            model.policy_sparse_table[main] = (index as f32 % 101.0) * 0.001;
-            model.policy_sparse_table[capture] = -((index as f32 % 53.0) * 0.001);
-            for (factor_offset, factor) in
-                policy_sparse_factor_indices(move_index, from / 90, buckets.0, buckets.1)
-                    .into_iter()
-                    .enumerate()
-            {
-                model.policy_sparse_factor[factor] =
-                    ((index + factor_offset) as f32 % 37.0) * 0.001;
-            }
-        }
-        model.rebuild_policy_cache();
-        model.rebuild_policy_tactical();
-        model.rebuild_moves_left();
-        model.rebuild_value_threat();
-
-        let mut cpu = AzEvalScratch::new(model.arch);
-        let mut repetition_flags = vec![0; moves.len()];
-        repetition_flags[0] = 1;
-        let cpu_output = model.evaluate_with_scratch_output_with_repetition(
-            &position,
-            &moves,
-            &repetition_flags,
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut cpu,
-        );
-
-        let sample = AzTrainingSample {
-            repetition_flags,
-            features: extract_sparse_features_az(&position),
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
-            history_features: crate::az::history_features(&position, &[]),
-            move_indices: moves.iter().map(|&mv| dense_move_index(mv)).collect(),
-            policy: vec![1.0; moves.len()],
-            value_wdl: [0.0, 1.0, 0.0],
-            root_search_wdl: [0.0, 1.0, 0.0],
-            value: 0.0,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            moves_left: 0.0,
-            moves_left_weight: 0.0,
-            search_simulations: 1,
-            meta: AzSampleMeta::default(),
-        };
-        let (sample_wdl, sample_logits) =
-            crate::az::outputs_for_training_sample(&model, &sample).unwrap();
-        assert_eq!(sample_wdl, cpu_output.value_wdl);
-        assert_eq!(sample_logits, cpu.logits);
-        let packed = PackedBatch::from_indices(&[sample], &[0]);
-        let batch = BatchTensors::from_packed(packed, &Device::Cpu).unwrap();
-        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
-        let forward = candle.forward(&batch).unwrap();
-        let legal = forward.policy_logits.to_vec2::<f32>().unwrap();
-        let value_logits = forward.value_logits.to_vec2::<f32>().unwrap();
-        let candle_wdl = crate::az::softmax_fixed3(value_logits[0].clone().try_into().unwrap());
-
-        for (candle_value, cpu_value) in candle_wdl.iter().zip(cpu_output.value_wdl) {
-            assert!(
-                (candle_value - cpu_value).abs() < 2.0e-5,
-                "candle={candle_value} cpu={cpu_value}"
-            );
-        }
-        let gradients = forward.value_logits.sum_all().unwrap().backward().unwrap();
-        let king_gradient = gradients
-            .get(&candle.value_king_piece_hidden)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(king_gradient.iter().any(|&gradient| gradient != 0.0));
-
-        assert_eq!(legal[0].len(), cpu.logits.len());
-        for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
-            assert!(
-                (candle_logit - cpu_logit).abs() < 2.0e-3,
-                "candle={candle_logit} cpu={cpu_logit}"
-            );
-        }
-
-        let mut gradient_model = AzNnue::random(32, 20260731);
-        gradient_model.policy_move_context.fill(0.01);
-        let gradient_candle = AzCandleModel::from_model(&gradient_model, &Device::Cpu).unwrap();
-        let gradient_forward = gradient_candle.forward(&batch).unwrap();
-        let gradients = gradient_forward
-            .policy_logits
-            .sum_all()
-            .unwrap()
-            .backward()
-            .unwrap();
-        assert_shared_gradients(&gradient_candle, &gradients);
-        let tactical_gradient = gradients
-            .get(&gradient_candle.policy_tactical)
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(
-            tactical_gradient[super::super::POLICY_CAPTURE_RELATION_OFFSET..]
-                .iter()
-                .any(|&gradient| gradient != 0.0)
-        );
-        let repetition_gradient = gradients
-            .get(&gradient_candle.policy_repetition_hidden)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(
-            repetition_gradient
-                .iter()
-                .any(|&value| value.abs() > 1.0e-8)
-        );
-        let output_gradient = gradients
-            .get(&gradient_candle.policy_consequence_output)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(
-            output_gradient
-                .iter()
-                .any(|gradient| gradient.abs() > 1.0e-8)
-        );
-        let move_context_gradient = gradients
-            .get(&gradient_candle.policy_move_context)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(
-            move_context_gradient
-                .iter()
-                .any(|gradient| gradient.abs() > 1.0e-8)
-        );
-        let accumulator_move_gradient = gradients
-            .get(&gradient_candle.policy_accumulator_move)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(
-            accumulator_move_gradient
-                .iter()
-                .any(|gradient| gradient.abs() > 1.0e-8)
-        );
-    }
-
-    #[test]
-    fn gpu_and_cpu_weight_tensors_roundtrip() {
-        let mut model = AzNnue::random(16, 12345);
-        model.check_context_hidden.fill(0.125);
-        model.rebuild_check_context();
-        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
-        let mut back = AzNnue::random_with_arch(model.arch, 54321);
-        candle.copy_to_model(&mut back).unwrap();
-
-        macro_rules! assert_weight_parity {
-            ($($field:ident),* $(,)?) => {
-                $(
-                    assert_eq!(
-                        model.$field, back.$field,
-                        "weight tensor `{}` drifted between CPU and GPU paths",
-                        stringify!($field)
-                    );
-                )*
-            };
-        }
-        assert_weight_parity!(
-            input_hidden,
-            input_piece_hidden,
-            input_rank_hidden,
-            input_file_hidden,
-            input_king_piece_hidden,
-            rule_context_hidden,
-            check_context_hidden,
-            hidden_bias,
-            shared_hidden,
-            shared_bias,
-            value_head_hidden,
-            value_head_bias,
-            value_king_piece_hidden,
-            value_king_piece_projection,
-            value_head_output,
-            value_history_output,
-            policy_threat_context,
-            policy_move_bias,
-            policy_consequence_output,
-            policy_context_hidden,
-            policy_move_context,
-            policy_accumulator_hidden,
-            policy_accumulator_move,
-            policy_sparse_table,
-            policy_sparse_factor,
-            policy_tactical,
-        );
-        assert!(back.check_context_active);
-    }
-
-    fn check_context_training_matches_inference(device: &Device) {
-        use crate::az::{adamw::AzAdamW, nnue::canonical_move};
-
-        let positions = [
-            Position::startpos(),
-            Position::from_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR b")
-                .unwrap(),
-            Position::from_fen(
-                "2bakab2/9/5r1c1/p1PRC1p2/4P2nP/6P2/4N1r2/7c1/4A4/2BAK1B1R b - - 0 1",
-            )
-            .unwrap(),
-            Position::from_fen("3k5/9/9/9/9/9/9/4r4/9/4K4 w").unwrap(),
-        ];
-        let positions = positions
-            .iter()
-            .flat_map(|p| [p.clone(), p.mirror_files()])
-            .collect::<Vec<_>>();
-        let samples = positions
-            .iter()
-            .map(|position| {
-                let moves = position.legal_moves();
-                AzTrainingSample {
-                    features: extract_sparse_features_az(position),
-                    move_indices: moves
-                        .iter()
-                        .map(|&mv| dense_move_index(canonical_move(position.side_to_move(), mv)))
-                        .collect(),
-                    policy: vec![1.0 / moves.len() as f32; moves.len()],
-                    repetition_flags: vec![0; moves.len()],
-                    rule_context: [0.0; RULE_CONTEXT_SIZE],
-                    history_features: crate::az::history_features(position, &[]),
-                    value_wdl: [1.0, 0.0, 0.0],
-                    root_search_wdl: [1.0, 0.0, 0.0],
-                    value: 1.0,
-                    side_sign: 1.0,
-                    policy_weight: 1.0,
-                    value_weight: 1.0,
-                    moves_left: 0.0,
-                    moves_left_weight: 0.0,
-                    search_simulations: 1,
-                    meta: AzSampleMeta::default(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let ids = (0..samples.len()).collect::<Vec<_>>();
-        let packed = PackedBatch::from_indices(&samples, &ids);
-        for (row, position) in positions.iter().enumerate() {
-            let moves = position.legal_moves();
-            let checks = moves
-                .iter()
-                .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
-                .collect::<Vec<_>>();
-            let context = crate::az::inference::check_context_features(
-                position,
-                &moves,
-                &checks,
-                position.attacked_squares_masks(),
-            );
-            assert_eq!(
-                &packed.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE],
-                &context
-            );
-        }
-        let batch = BatchTensors::from_packed(packed, device).unwrap();
-        let mut model = AzNnue::random(32, 20261002);
-        model.value_head_bias.fill(1.0);
-        // 新标量权重为零，已有价值头需能把梯度传回主干。
-        for (index, weight) in model.value_head_output.iter_mut().enumerate() {
-            *weight = (index % 11) as f32 * 0.003 - 0.015;
-        }
-        model.moves_left_output.fill(0.02);
-        model.moves_left_bias[0] = 0.1;
-        model.rebuild_moves_left();
-        let candle = AzCandleModel::from_model(&model, device).unwrap();
-        let forward = candle.forward(&batch).unwrap();
-        assert_shared_gradients(
-            &candle,
-            &forward.moves_left.sum_all().unwrap().backward().unwrap(),
-        );
-        let loss = candle_nn::ops::log_softmax(&forward.value_logits, 1)
-            .unwrap()
-            .mul(&batch.value_wdl)
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .neg()
-            .unwrap();
-        let gradients = loss.backward().unwrap();
-        assert_shared_gradients(&candle, &gradients);
-        let gradient = gradients
-            .get(&candle.check_context_hidden)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(gradient.iter().all(|g| g.is_finite()));
-        assert!(gradient.iter().any(|g| g.abs() > 1e-8));
-        let (vars, decay) = candle.all_vars_with_decay();
-        let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
-        optimizer.step(&gradients).unwrap();
-        candle.copy_to_model(&mut model).unwrap();
-        assert!(model.check_context_hidden.iter().any(|&w| w != 0.0));
-        assert!(model.check_context_active);
-        let forward = candle.forward(&batch).unwrap();
-        let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-        let logits = forward.policy_logits.to_vec2::<f32>().unwrap();
-        let moves_left = forward.moves_left.to_vec2::<f32>().unwrap();
-        for (row, sample) in samples.iter().enumerate() {
-            let position = &positions[row];
-            let moves = position.legal_moves();
-            let mut scratch = AzEvalScratch::new(model.arch);
-            let cpu = model.evaluate_with_scratch_output_with_repetition(
-                position,
-                &moves,
-                &sample.repetition_flags,
-                &sample.rule_context,
-                &mut scratch,
-            );
-            let (sample_wdl, sample_logits) =
-                crate::az::outputs_for_training_sample(&model, sample).unwrap();
-            assert!(
-                (cpu.moves_left - moves_left[row][0] * crate::az::MOVES_LEFT_SCALE).abs() < 1e-3
-            );
-            for (a, b) in cpu.value_wdl.iter().zip(&wdl[row]) {
-                assert!((a - b).abs() < 1e-4, "row={row} value {a} != {b}");
-            }
-            for (a, b) in sample_wdl.iter().zip(&wdl[row]) {
-                assert!((a - b).abs() < 1e-4);
-            }
-            for (a, b) in sample_logits.iter().zip(&logits[row]) {
-                assert!((a - b).abs() < 2e-3, "row={row} policy {a} != {b}");
-            }
-        }
-    }
-
-    #[test]
-    fn check_context_training_updates_zero_weights_and_matches_cpu() {
-        check_context_training_matches_inference(&Device::Cpu);
-    }
-
-    #[cfg(feature = "slow-tests")]
-    #[test]
-    fn check_context_training_updates_zero_weights_and_matches_cuda() {
-        let device =
-            crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required");
-        check_context_training_matches_inference(device);
     }
 }

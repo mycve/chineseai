@@ -308,4 +308,3 @@ pub(crate) fn load_pikafish_label_rows(
 pub(crate) fn sqlite_io_error(err: rusqlite::Error) -> io::Error {
     io::Error::other(err.to_string())
 }
-

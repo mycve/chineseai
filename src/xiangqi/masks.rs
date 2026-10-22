@@ -1,8 +1,8 @@
-use super::{
-    BOARD_SIZE, Color, OnceLock, file_of, index, inside_board, inside_palace, rank_of,
-    soldier_crossed_river,
-};
+#[cfg(test)]
+use super::{BOARD_SIZE, Color, OnceLock, file_of, inside_palace, rank_of, soldier_crossed_river};
+use super::{index, inside_board};
 
+#[cfg(test)]
 pub(super) fn orthogonal_ray_masks() -> &'static [[u128; 4]; BOARD_SIZE] {
     static RAYS: OnceLock<[[u128; 4]; BOARD_SIZE]> = OnceLock::new();
     RAYS.get_or_init(|| {
@@ -25,6 +25,7 @@ pub(super) fn orthogonal_ray_masks() -> &'static [[u128; 4]; BOARD_SIZE] {
     })
 }
 
+#[cfg(test)]
 pub(super) fn fixed_attack_masks() -> &'static [[[u128; BOARD_SIZE]; 3]; 2] {
     static MASKS: OnceLock<[[[u128; BOARD_SIZE]; 3]; 2]> = OnceLock::new();
     MASKS.get_or_init(|| {
@@ -62,6 +63,7 @@ pub(super) fn fixed_attack_masks() -> &'static [[[u128; BOARD_SIZE]; 3]; 2] {
 }
 
 #[inline(always)]
+#[cfg(test)]
 pub(crate) fn nearest_on_ray(blockers: u128, increasing: bool) -> usize {
     if increasing {
         blockers.trailing_zeros() as usize
@@ -71,6 +73,7 @@ pub(crate) fn nearest_on_ray(blockers: u128, increasing: bool) -> usize {
 }
 
 #[inline(always)]
+#[cfg(test)]
 pub(super) fn ray_through(ray: u128, square: usize, increasing: bool) -> u128 {
     if increasing {
         ray & ((1u128 << (square + 1)) - 1)

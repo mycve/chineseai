@@ -15,6 +15,7 @@ mod hash;
 mod legality;
 mod make_move;
 mod masks;
+#[cfg(test)]
 mod relations;
 mod rules;
 mod setup;
@@ -32,11 +33,12 @@ use geom::{
     line_between_squares, rank_of, soldier_crossed_river,
 };
 use hash::{SIDE_TO_MOVE_KEY, color_hash_index, zobrist_piece_key};
+#[cfg(test)]
 pub(crate) use masks::nearest_on_ray;
-use masks::{
-    DIAGONAL_STEPS, ELEPHANT_STEPS, HORSE_STEPS, ORTHOGONAL_STEPS, fixed_attack_masks,
-    offset_square, orthogonal_ray_masks, ray_through,
-};
+use masks::{DIAGONAL_STEPS, ELEPHANT_STEPS, HORSE_STEPS, ORTHOGONAL_STEPS, offset_square};
+#[cfg(test)]
+use masks::{fixed_attack_masks, orthogonal_ray_masks, ray_through};
+#[cfg(test)]
 use std::sync::OnceLock;
 use types::{CheckerInfo, MoveGenMode, PositionState};
 

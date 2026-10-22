@@ -16,14 +16,6 @@ impl Position {
         self.visit_piece_relations::<true>(visitor);
     }
 
-    pub(crate) fn visit_occupied_leaper_relations_from(
-        &self,
-        sources: u128,
-        visitor: impl FnMut(usize, Piece, usize, Piece),
-    ) {
-        self.visit_piece_relations_from::<false>(sources, visitor);
-    }
-
     #[cfg(test)]
     fn visit_piece_relations<const SLIDERS: bool>(
         &self,

@@ -824,19 +824,6 @@ fn make_training_sample(
     let side = position.side_to_move();
     let side_sign = if side == Color::Red { 1.0 } else { -1.0 };
     let mut features = extract_sparse_features_az(position);
-    let history_features = if mirror_file {
-        let mirrored_history = rule_history[rule_history.len().saturating_sub(2)..]
-            .iter()
-            .map(|entry| {
-                let mut entry = *entry;
-                entry.mv = entry.mv.map(mirror_file_move);
-                entry
-            })
-            .collect::<Vec<_>>();
-        super::history::history_features(&position.mirror_files(), &mirrored_history)
-    } else {
-        super::history::history_features(position, rule_history)
-    };
     let mut moves = candidates
         .iter()
         .map(|candidate| candidate.mv)
@@ -852,9 +839,15 @@ fn make_training_sample(
         .copied()
         .map(|mv| dense_move_index(canonical_move(side, mv)))
         .collect();
+    let rule_context = rule_context_features(position, rule_history);
     let repetition_flags = candidates
         .iter()
-        .map(|candidate| u8::from(position.move_repeats_history(rule_history, candidate.mv)))
+        .map(|candidate| {
+            super::features::repetition_flag(
+                position.move_repeats_history(rule_history, candidate.mv),
+                rule_context[12] != 0.0,
+            )
+        })
         .collect();
     let mut policy = candidates
         .iter()
@@ -867,8 +860,8 @@ fn make_training_sample(
 
     AzTrainingSample {
         features,
-        rule_context: rule_context_features(position, rule_history),
-        history_features,
+        rule_context,
+
         move_indices,
         repetition_flags,
         policy,
@@ -1813,7 +1806,7 @@ mod tests {
             repetition_flags: Vec::new(),
             features: Vec::new(),
             rule_context: [0.0; crate::az::RULE_CONTEXT_SIZE],
-            history_features: [0.0; crate::az::HISTORY_CONTEXT_SIZE],
+
             move_indices: Vec::new(),
             policy: Vec::new(),
             value_wdl: scalar_value_to_wdl_target(value),
@@ -1890,98 +1883,6 @@ mod tests {
         assert!(samples.iter().all(|sample| sample.value_weight == 1.0));
         assert_eq!(samples[1].value_wdl, [0.0, 0.0, 1.0]);
         assert_eq!(samples[1].value, -1.0);
-    }
-
-    #[test]
-    fn mirrored_training_sample_mirrors_move_indices() {
-        let position =
-            Position::from_fen("3ak4/9/2n1b4/p3p3p/4R4/2P6/P3P3P/2N1C4/4A4/2BAK3c b").unwrap();
-        let moves = position.legal_moves();
-        let candidates = moves
-            .iter()
-            .take(4)
-            .enumerate()
-            .map(|(index, &mv)| candidate(mv, 1.0 / (index + 2) as f32))
-            .collect::<Vec<_>>();
-        let sample = make_training_sample(
-            &position,
-            &position.initial_rule_history(),
-            &candidates,
-            0.0,
-            [0.6, 0.3, 0.1],
-            true,
-            AzSampleMeta::default(),
-            1,
-            1.0,
-        );
-
-        let mirrored_position = position.mirror_files();
-        let mirrored_moves = candidates
-            .iter()
-            .map(|candidate| mirror_file_move(candidate.mv))
-            .collect::<Vec<_>>();
-        let expected = mirrored_moves
-            .iter()
-            .copied()
-            .map(|mv| dense_move_index(canonical_move(mirrored_position.side_to_move(), mv)))
-            .collect::<Vec<_>>();
-
-        assert_eq!(sample.move_indices, expected);
-        let expected_policy = candidates
-            .iter()
-            .map(|candidate| candidate.policy)
-            .collect::<Vec<_>>();
-        let expected_total = expected_policy.iter().sum::<f32>();
-        for (actual, expected) in sample.policy.iter().zip(expected_policy) {
-            assert!((actual - expected / expected_total).abs() < 1e-6);
-        }
-        assert_eq!(sample.root_search_wdl, [0.6, 0.3, 0.1]);
-        assert_eq!(
-            sample.history_features,
-            super::super::history::history_features(&mirrored_position, &[])
-        );
-    }
-
-    #[test]
-    fn mirrored_training_sample_preserves_real_two_move_history() {
-        let mut position = Position::startpos();
-        let mut history = position.initial_rule_history();
-        let mut mirrored_position = position.mirror_files();
-        let mut mirrored_history = mirrored_position.initial_rule_history();
-        for _ in 0..3 {
-            let mv = position.legal_moves()[0];
-            history.push(position.rule_history_entry_after_move(mv));
-            position.make_move(mv);
-            let mirrored_move = mirror_file_move(mv);
-            mirrored_history.push(mirrored_position.rule_history_entry_after_move(mirrored_move));
-            mirrored_position.make_move(mirrored_move);
-        }
-        let candidates = position
-            .legal_moves()
-            .iter()
-            .take(4)
-            .map(|&mv| candidate(mv, 0.25))
-            .collect::<Vec<_>>();
-        let sample = make_training_sample(
-            &position,
-            &history,
-            &candidates,
-            0.0,
-            [0.0, 1.0, 0.0],
-            true,
-            AzSampleMeta::default(),
-            1,
-            1.0,
-        );
-        assert_eq!(
-            sample.history_features,
-            super::super::history::history_features(&mirrored_position, &mirrored_history)
-        );
-        assert!(
-            sample.history_features[48..]
-                .iter()
-                .any(|value| *value != 0.0)
-        );
     }
 
     #[test]

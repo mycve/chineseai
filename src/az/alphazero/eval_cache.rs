@@ -142,10 +142,6 @@ mod tests {
     fn eval_cache_keeps_cold_search_with_noise_kld_mate_and_history() {
         let mut model = AzNnue::random(8, 31);
         model.mate_search_plies = 9;
-        for i in 48..96 {
-            model.value_history_output[i] = 0.7;
-        }
-        model.rebuild_value_history();
         let mut workspace = AzSearchWorkspace::new(&model);
         let mut p = Position::startpos();
         let mut h = p.initial_rule_history();

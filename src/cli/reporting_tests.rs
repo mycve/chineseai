@@ -60,7 +60,7 @@ fn reporting_sample(generation: u32, policy: Vec<f32>) -> AzTrainingSample {
         repetition_flags: Vec::new(),
         features: vec![0],
         rule_context: [0.0; chineseai::az::RULE_CONTEXT_SIZE],
-        history_features: [0.0; chineseai::az::HISTORY_CONTEXT_SIZE],
+
         move_indices: (0..policy.len()).collect(),
         policy,
         value_wdl: [0.0, 1.0, 0.0],

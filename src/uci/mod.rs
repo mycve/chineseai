@@ -416,7 +416,9 @@ fn handle_setoption(line: &str, state: &mut UciState) {
 }
 
 fn apply_rule_options(state: &mut UciState) {
-    state.position.set_repetition_draw_enabled(state.repetition_draw);
+    state
+        .position
+        .set_repetition_draw_enabled(state.repetition_draw);
     state
         .position
         .set_rule60_max_ply(state.sixty_move_rule.then_some(state.rule60_max_ply));

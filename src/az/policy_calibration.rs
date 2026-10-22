@@ -1,4 +1,4 @@
-//! 冻结主网络，用完整候选策略分布校准已有的 448 项战术因子。
+//! 冻结主网络，用完整候选策略分布校准已有的 1792项走后联合因子。
 use std::io;
 
 use candle_core::{DType, Device, Tensor, Var};
@@ -28,7 +28,7 @@ mod tests {
         AzTrainingSample {
             features: nnue::extract_sparse_features_az(&position),
             rule_context: [0.0; RULE_CONTEXT_SIZE],
-            history_features: [0.0; super::HISTORY_CONTEXT_SIZE],
+
             move_indices: moves.iter().map(|mv| dense_move_index(*mv)).collect(),
             repetition_flags: Vec::new(),
             policy,
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn small_batch_calibration_folds_and_preserves_all_other_weights() {
         let mut model = AzNnue::random(8, 17);
-        model.rebuild_policy_tactical();
+
         let sample = fixture();
         let original_wdl = outputs_for_training_sample(&model, &sample).unwrap().0;
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -80,9 +80,9 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-            if name == "policy_tactical" {
-                let start = POLICY_TACTICAL_EXACT_SIZE;
-                let end = start + POLICY_TACTICAL_FACTOR_SIZE;
+            if name == "policy_joint" {
+                let start = 0;
+                let end = start + super::features::POLICY_JOINT_ROWS;
                 assert_eq!(a[..start], b[..start]);
                 assert_eq!(a[end..], b[end..]);
                 assert_ne!(a[start..end], b[start..end]);
@@ -103,14 +103,14 @@ mod tests {
     #[test]
     fn invalid_calibration_inputs_leave_model_unchanged() {
         let mut model = AzNnue::random(8, 19);
-        model.rebuild_policy_tactical();
-        let original = model.policy_tactical.clone();
+
+        let original = model.policy_joint.clone();
         assert!(calibrate_policy(&mut model, &[], 1, 17).is_err());
         let mut sample = fixture();
         assert!(calibrate_policy(&mut model, std::slice::from_ref(&sample), 0, 17).is_err());
         sample.move_indices[0] = DENSE_MOVE_SPACE;
         assert!(calibrate_policy(&mut model, std::slice::from_ref(&sample), 1, 17).is_err());
-        assert_eq!(model.policy_tactical, original);
+        assert_eq!(model.policy_joint, original);
     }
 }
 
@@ -166,7 +166,7 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
         }
         let position = position_for_training_sample(sample).ok_or_else(fail)?;
         let side = position.side_to_move();
-        let masks = position.attacked_squares_masks();
+        let graph = super::features::Graph::new(super::features::Board::new(&position));
         let legal = position.legal_moves();
         let mut seen = vec![false; DENSE_MOVE_SPACE];
         let mut classes = Vec::with_capacity(sample.move_indices.len());
@@ -183,25 +183,7 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
             if !legal.contains(&mv) {
                 return Err(fail());
             }
-            let (source, _, captured) =
-                policy_consequence_features(&position, side, mv).ok_or_else(fail)?;
-            let (sa, da, sd, dd) = policy_move_tactical_flags(
-                mv,
-                masks[1 - color_index(side)],
-                masks[color_index(side)],
-            );
-            classes.push(
-                policy_tactical_indices(
-                    index,
-                    source / BOARD_SIZE,
-                    sa,
-                    da,
-                    sd,
-                    dd,
-                    captured.map(|x| x / BOARD_SIZE),
-                    position.gives_check_after_move_fast(mv),
-                )[1] - POLICY_TACTICAL_EXACT_SIZE,
-            );
+            classes.push(super::features::move_features(&graph, mv, side, None).joint as usize);
         }
         let (wdl, logits) = outputs_for_training_sample(model, sample).ok_or_else(fail)?;
         if logits.iter().chain(wdl.iter()).any(|x| !x.is_finite()) {
@@ -259,8 +241,8 @@ pub fn calibrate_policy(
     model.validate()?;
     let rows = prepare(model, samples)?;
     let device = Device::Cpu;
-    let weight =
-        Var::zeros(POLICY_TACTICAL_FACTOR_SIZE, DType::F32, &device).map_err(candle_io_error)?;
+    let weight = Var::zeros(super::features::POLICY_JOINT_ROWS, DType::F32, &device)
+        .map_err(candle_io_error)?;
     let mut optimizer = AdamW::new(
         vec![weight.clone()],
         ParamsAdamW {
@@ -285,7 +267,7 @@ pub fn calibrate_policy(
         cursor += batch_size;
         let width = batch.iter().map(|&i| rows[i].logits.len()).max().unwrap();
         let weight_sum: f64 = batch.iter().map(|&i| rows[i].weight).sum();
-        let mut indices = vec![POLICY_TACTICAL_FACTOR_SIZE as u32; batch_size * width];
+        let mut indices = vec![super::features::POLICY_JOINT_ROWS as u32; batch_size * width];
         let mut base = vec![-1e9f32; indices.len()];
         let mut target = vec![0.0f32; indices.len()];
         for (b, &i) in batch.iter().enumerate() {
@@ -315,19 +297,18 @@ pub fn calibrate_policy(
     if delta.iter().any(|x| !x.is_finite()) {
         return Err(invalid("策略校准产生非有限参数"));
     }
-    let before_ce = cross_entropy(&rows, &vec![0.0; POLICY_TACTICAL_FACTOR_SIZE]);
+    let before_ce = cross_entropy(&rows, &vec![0.0; super::features::POLICY_JOINT_ROWS]);
     let after_ce = cross_entropy(&rows, &delta);
-    let range =
-        POLICY_TACTICAL_EXACT_SIZE..POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
-    let original = model.policy_tactical[range.clone()].to_vec();
-    for ((value, old), addition) in model.policy_tactical[range.clone()]
+    let range = 0..super::features::POLICY_JOINT_ROWS;
+    let original = model.policy_joint[range.clone()].to_vec();
+    for ((value, old), addition) in model.policy_joint[range.clone()]
         .iter_mut()
         .zip(&original)
         .zip(&delta)
     {
         *value = old + addition;
     }
-    model.rebuild_policy_tactical();
+
     let audit = (|| -> io::Result<f32> {
         let mut error = 0.0f32;
         for row in rows.iter().take(64) {
@@ -361,8 +342,8 @@ pub fn calibrate_policy(
             })
         }
         Err(error) => {
-            model.policy_tactical[range].copy_from_slice(&original);
-            model.rebuild_policy_tactical();
+            model.policy_joint[range].copy_from_slice(&original);
+
             Err(error)
         }
     }

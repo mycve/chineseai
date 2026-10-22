@@ -150,9 +150,9 @@ pub struct AzPhaseValueReport {
 pub struct AzTrainingSample {
     pub features: Vec<usize>,
     pub rule_context: [f32; RULE_CONTEXT_SIZE],
-    /// 当前棋盘摘要与可恢复前两步的空间变化，统一到 Px0 行棋方视角。
-    pub history_features: [f32; super::HISTORY_CONTEXT_SIZE],
+    /// 行棋方规范坐标中的2062类走法索引。
     pub move_indices: Vec<usize>,
+    /// 0=确认不重复，1=重复，2=历史不足；空列表等同全未知。
     pub repetition_flags: Vec<u8>,
     pub policy: Vec<f32>,
     pub value_wdl: [f32; WDL_HEAD_SIZE],
@@ -255,7 +255,9 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
             .zip(&predicted)
             .map(|(&target, &probability)| -target.max(0.0) * probability.max(1.0e-12).ln())
             .sum::<f32>();
-        if sample.repetition_flags.len() == moves.len() {
+        if sample.repetition_flags.len() == moves.len()
+            && sample.repetition_flags.iter().all(|&flag| flag < 2)
+        {
             let entropy = sample
                 .policy
                 .iter()
@@ -330,15 +332,8 @@ pub fn evaluate_policy_groups(model: &AzNnue, samples: &[AzTrainingSample]) -> A
     stats
 }
 
-/// Compress exact rule history into bounded continuous inputs. Values are
-/// perspective-relative to the side to move, so canonical board mirroring
-/// remains valid.
-///
-/// 第 [0] 个分量是 `rule60_count_with_history / rule60_max_ply`，因此它的**尺度依赖
-/// `Position::rule60_max_ply`**。训练数据的两个来源都固定在这个值上：Px0 数据集重建
-/// 时被 `from_fen` 强制成 120（`px0_data.rs`），自博弈侧则由 `AzLoopConfig.rule60_max_ply`
-/// 决定。把自博弈的限着改成 120 以外的值（或 `None`）会让 [0] 与历史数据集不同尺度，
-/// 而没有重训就无法恢复——改这个配置项等于改特征语义。
+/// 9个规则值及其known标记；固定120/32/4的尺度，双方量均相对行棋方。
+/// 从零限着计数或最近吃子起的完整历史才足以确认重复及长将长捉摘要。
 pub fn rule_context_features(
     position: &Position,
     history: &[crate::xiangqi::RuleHistoryEntry],
@@ -377,9 +372,18 @@ pub fn rule_context_features(
     };
     let is_check = |entry: &crate::xiangqi::RuleHistoryEntry| entry.gives_check;
     let is_chase = |entry: &crate::xiangqi::RuleHistoryEntry| entry.chased_mask != 0;
-    [
-        position.rule60_max_ply().map_or(0.0, |max_ply| {
-            position.rule60_count_with_history(history) as f32 / max_ply as f32
+    let count = position.rule60_count_with_history(history);
+    let known = history.first().is_some_and(|e| e.mv.is_none())
+        && (history.first().is_some_and(|e| e.rule60_clock == 0)
+            || history.iter().any(|e| e.captured.is_some()))
+        && history
+            .last()
+            .is_some_and(|e| e.hash == position.hash() && e.side_to_move == side);
+    let values = [
+        f32::from(position.rule60_max_ply().is_some()),
+        (count as f32 / 120.0).min(1.0),
+        position.rule60_max_ply().map_or(0.0, |limit| {
+            (limit.saturating_sub(count) as f32 / 120.0).min(1.0)
         }),
         (prior_matches as f32 / 3.0).min(1.0),
         (cycle_len as f32 / 32.0).min(1.0),
@@ -387,7 +391,20 @@ pub fn rule_context_features(
         (cycle_count(side.opposite(), is_check) as f32 / 4.0).min(1.0),
         (cycle_count(side, is_chase) as f32 / 4.0).min(1.0),
         (cycle_count(side.opposite(), is_chase) as f32 / 4.0).min(1.0),
-    ]
+    ];
+    let mut output = [0.0; RULE_CONTEXT_SIZE];
+    output[..9].copy_from_slice(&values);
+    let clock_known = position.halfmove_clock() <= 20 || known;
+    output[9] = 1.0;
+    output[10] = f32::from(clock_known);
+    output[11] = f32::from(clock_known || position.rule60_max_ply().is_none());
+    output[12..].fill(f32::from(known));
+    for i in 0..9 {
+        if output[9 + i] == 0.0 {
+            output[i] = 0.0;
+        }
+    }
+    output
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

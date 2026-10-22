@@ -91,17 +91,15 @@ pub(crate) struct AzPolicyScaleArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum PolicyComponent {
-    Exact,
     Capture,
-    Factor,
-    Tactical,
-    TacticalExact,
-    TacticalFactor,
-    Accumulator,
+    MovePiece,
+    King,
+    Local,
+    Joint,
+    Events,
     Context,
     Consequence,
     MoveBias,
-    ThreatContext,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -186,9 +184,6 @@ Examples:
 pub(crate) struct AzBenchArgs {
     /// AZ-NNUE model path.
     pub(crate) model: String,
-    /// 测量实验性的攻击关系增量缓存。
-    #[arg(long)]
-    pub(crate) threat_incremental: bool,
     /// 关闭 MCTS 节点价值累加器，供同模型全量对照。
     #[arg(long)]
     pub(crate) no_node_incremental: bool,

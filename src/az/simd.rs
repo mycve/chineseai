@@ -1,5 +1,3 @@
-use super::RMS_NORM_EPS;
-
 pub fn inference_simd_backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
@@ -162,112 +160,6 @@ pub(crate) fn add_scaled_feature_row(
 }
 
 /// 多个特征行按原顺序更新，每个隐藏向量只读写一次。
-#[inline]
-pub(crate) fn add_scaled_rows<const N: usize>(hidden: &mut [f32], rows: [&[f32]; N], scale: f32) {
-    let width = hidden.len();
-    assert!(rows.iter().all(|row| row.len() == width));
-    #[cfg(target_arch = "x86_64")]
-    if width >= 64
-        && std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("fma")
-    {
-        // SAFETY: dimensions and CPU features are checked above.
-        unsafe { add_scaled_rows_avx512(hidden, rows, scale) };
-        return;
-    }
-    for row in rows {
-        add_scaled_feature_row(hidden, row, width, 0, scale);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx2,fma")]
-unsafe fn add_scaled_rows_avx512<const N: usize>(
-    hidden: &mut [f32],
-    rows: [&[f32]; N],
-    scale: f32,
-) {
-    use std::arch::x86_64::*;
-    let scalar = scale;
-    let scale = _mm512_set1_ps(scale);
-    for group in 0..hidden.len() / 64 {
-        let index = group * 64;
-        let mut values = [_mm512_setzero_ps(); 4];
-        unsafe {
-            for block in 0..4 {
-                values[block] = _mm512_loadu_ps(hidden.as_ptr().add(index + block * 16));
-            }
-            for row in rows {
-                for block in 0..4 {
-                    values[block] = _mm512_fmadd_ps(
-                        _mm512_loadu_ps(row.as_ptr().add(index + block * 16)),
-                        scale,
-                        values[block],
-                    );
-                }
-            }
-            for block in 0..4 {
-                _mm512_storeu_ps(hidden.as_mut_ptr().add(index + block * 16), values[block]);
-            }
-        }
-    }
-    let start = hidden.len() / 64 * 64;
-    for chunk in 0..(hidden.len() - start) / 8 {
-        let index = start + chunk * 8;
-        unsafe {
-            let mut value = _mm256_loadu_ps(hidden.as_ptr().add(index));
-            for row in rows {
-                value = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(row.as_ptr().add(index)),
-                    _mm256_set1_ps(scalar),
-                    value,
-                );
-            }
-            _mm256_storeu_ps(hidden.as_mut_ptr().add(index), value);
-        }
-    }
-    for index in hidden.len() / 8 * 8..hidden.len() {
-        for row in rows {
-            hidden[index] += row[index] * scalar;
-        }
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn fused_feature_rows_match_separate_updates_bitwise() {
-    for width in [16, 63, 64, 65, 80, 95, 96, 128, 192] {
-        let rows: [Vec<f32>; 6] = std::array::from_fn(|r| {
-            (0..width)
-                .map(|i| ((i * 17 + r * 13) % 97) as f32 * 0.001 - 0.04)
-                .collect()
-        });
-        for scale in [-1.0, 1.0, 0.37] {
-            let mut expected: Vec<_> = (0..width).map(|i| i as f32 * 0.03).collect();
-            let mut actual = expected.clone();
-            for row in &rows {
-                add_scaled_feature_row(&mut expected, row, width, 0, scale);
-            }
-            add_scaled_rows::<6>(
-                &mut actual,
-                std::array::from_fn(|i| rows[i].as_slice()),
-                scale,
-            );
-            assert!(
-                actual
-                    .iter()
-                    .zip(&expected)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "width={width} scale={scale}"
-            );
-        }
-    }
-}
-
-pub(crate) fn feature_row(input_hidden: &[f32], hidden_size: usize, feature: usize) -> &[f32] {
-    &input_hidden[feature * hidden_size..(feature + 1) * hidden_size]
-}
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
@@ -404,27 +296,6 @@ pub(crate) unsafe fn dot_product_avx2(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-pub(crate) unsafe fn add_feature_row_avx2(hidden: &mut [f32], row: &[f32]) {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-    let chunks = hidden.len() / 8;
-    for chunk in 0..chunks {
-        let index = chunk * 8;
-        unsafe {
-            let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
-            let right = _mm256_loadu_ps(row.as_ptr().add(index));
-            _mm256_storeu_ps(hidden.as_mut_ptr().add(index), _mm256_add_ps(left, right));
-        }
-    }
-    for index in (chunks * 8)..hidden.len() {
-        hidden[index] += row[index];
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn add_scaled_feature_row_avx2_fma(hidden: &mut [f32], row: &[f32], scale: f32) {
@@ -516,35 +387,6 @@ pub(crate) unsafe fn relu_in_place_neon(values: &mut [f32]) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn input_embedding_add_features_avx2(
-    input_hidden: &[f32],
-    hidden_size: usize,
-    features: &[usize],
-    hidden: &mut [f32],
-) {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-    let chunks = hidden_size / 8;
-    for &feature in features {
-        let row = &input_hidden[feature * hidden_size..(feature + 1) * hidden_size];
-        for chunk in 0..chunks {
-            let index = chunk * 8;
-            unsafe {
-                let left = _mm256_loadu_ps(hidden.as_ptr().add(index));
-                let right = _mm256_loadu_ps(row.as_ptr().add(index));
-                _mm256_storeu_ps(hidden.as_mut_ptr().add(index), _mm256_add_ps(left, right));
-            }
-        }
-        for index in (chunks * 8)..hidden_size {
-            hidden[index] += row[index];
-        }
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
 pub(crate) unsafe fn relu_in_place_avx2(values: &mut [f32]) {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
@@ -561,42 +403,6 @@ pub(crate) unsafe fn relu_in_place_avx2(values: &mut [f32]) {
     }
     for value in &mut values[(chunks * 8)..] {
         *value = value.max(0.0);
-    }
-}
-
-pub(crate) fn rms_norm_in_place(values: &mut [f32]) {
-    if values.is_empty() {
-        return;
-    }
-    let sum_squares = dot_product(values, values);
-    let inv_rms = (sum_squares / values.len() as f32 + RMS_NORM_EPS)
-        .sqrt()
-        .recip();
-    #[cfg(target_arch = "aarch64")]
-    if values.len() >= 32 {
-        unsafe { scale_in_place_neon(values, inv_rms) };
-        return;
-    }
-    for value in values {
-        *value *= inv_rms;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-pub(crate) unsafe fn scale_in_place_neon(values: &mut [f32], scale: f32) {
-    use std::arch::aarch64::*;
-    let scale = vdupq_n_f32(scale);
-    let chunks = values.len() / 4;
-    for chunk in 0..chunks {
-        let index = chunk * 4;
-        unsafe {
-            let value = vld1q_f32(values.as_ptr().add(index));
-            vst1q_f32(values.as_mut_ptr().add(index), vmulq_f32(value, scale));
-        }
-    }
-    for value in &mut values[(chunks * 4)..] {
-        *value *= vgetq_lane_f32::<0>(scale);
     }
 }
 

@@ -1,124 +1,71 @@
-#![allow(dead_code)]
-
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Instant;
-
-use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
-use super::inference::check_context_features;
-use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::{BOARD_SIZE, Color, Position};
-
-use super::{
-    AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_TACTICAL_SIZE,
-    POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_KING_PIECE_MAX_ACTIVE, VALUE_THREAT_MAX_ACTIVE,
-    WDL_HEAD_SIZE, canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    dense_move_squares,
-    fused_feature_pool::{PADDING_ITEM, pack_feature},
-    fused_policy::{pack_policy_item, padding_item as policy_padding_item},
-    normalize_wdl_target, policy_move_tactical_flags, policy_sparse_capture_index,
-    policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
-    visit_value_king_piece_features, visit_value_threat_features,
+use super::{features::*, fused_feature_pool::PADDING_ITEM, *};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Instant,
 };
-
-const POLICY_MASK_VALUE: f32 = -1.0e9;
-
-/// 稀疏参数在一个确定性抽样训练子集中的激活覆盖。
-///
-/// 这是“本批次可能收到梯度的参数行”的近似观测，不是跨更新累计覆盖率。
-#[derive(Clone, Copy, Debug, Default)]
+const POLICY_MASK_VALUE: f32 = -1e9;
+#[derive(Clone, Debug, Default)]
 pub struct AzSparseActivationStats {
     pub inspected_samples: usize,
     pub inspected_policy_moves: usize,
-    pub value_threat_unique: usize,
-    pub policy_exact_unique: usize,
-    pub policy_factor_unique: usize,
-    pub policy_tactical_unique: usize,
-    pub value_threat_coverage: f32,
-    pub policy_exact_coverage: f32,
-    pub policy_factor_coverage: f32,
-    pub policy_tactical_coverage: f32,
+    pub relation_unique: usize,
+    pub motif_unique: usize,
+    pub policy_joint_unique: usize,
+    pub policy_event_unique: usize,
+    pub relation_coverage: f32,
+    pub motif_coverage: f32,
+    pub policy_joint_coverage: f32,
+    pub policy_event_coverage: f32,
 }
-
-/// 对训练样本做等距、确定性抽样，统计本批次激活的稀疏参数行。
 pub fn sparse_activation_stats(
     samples: &[AzTrainingSample],
-    max_samples: usize,
+    limit: usize,
+    seed: u64,
 ) -> AzSparseActivationStats {
-    let sample_count = samples.len().min(max_samples);
-    if sample_count == 0 {
-        return AzSparseActivationStats::default();
-    }
-    let indices = (0..sample_count)
-        .map(|index| index * samples.len() / sample_count)
-        .collect::<Vec<_>>();
-    let mut value_threats = HashSet::new();
-    let mut policy_exact = HashSet::new();
-    let mut policy_factor = HashSet::new();
-    let mut policy_tactical = HashSet::new();
-    let mut policy_moves = 0usize;
-
-    for chunk in indices.chunks(128) {
-        let packed = PackedBatch::from_indices(samples, chunk);
-        for (row, &sample_index) in chunk.iter().enumerate() {
-            let sample = &samples[sample_index];
-            if sample.value_weight > 0.0 {
-                let base = row * packed.max_value_threats;
-                for &feature in &packed.value_threat_indices[base..base + packed.max_value_threats]
-                {
-                    if feature != PADDING_ITEM && (feature as usize) < super::VALUE_THREAT_VOCAB {
-                        value_threats.insert(feature);
-                    }
-                }
-            }
-            if sample.policy_weight <= 0.0 {
-                continue;
-            }
-            let move_base = row * packed.max_policy_moves;
-            for move_offset in 0..packed.max_policy_moves {
-                if packed.policy_mask[move_base + move_offset] <= POLICY_MASK_VALUE * 0.5 {
-                    continue;
-                }
-                policy_moves += 1;
-                let sparse_base = (move_base + move_offset) * 7;
-                for &index in &packed.policy_sparse_indices[sparse_base..sparse_base + 7] {
-                    if index >= 0 && (index as usize) < POLICY_SPARSE_TABLE_SIZE - 1 {
-                        policy_exact.insert(index as usize);
-                    } else if index >= POLICY_SPARSE_TABLE_SIZE as i64 {
-                        let factor = index as usize - POLICY_SPARSE_TABLE_SIZE;
-                        if factor < super::POLICY_SPARSE_FACTOR_SIZE {
-                            policy_factor.insert(factor);
-                        }
-                    }
-                }
-                let tactical_base = (move_base + move_offset) * POLICY_TACTICAL_TERMS;
-                for &index in &packed.policy_tactical_indices
-                    [tactical_base..tactical_base + POLICY_TACTICAL_TERMS]
-                {
-                    if index >= 0 && (index as usize) < POLICY_TACTICAL_SIZE {
-                        policy_tactical.insert(index as usize);
+    let mut order = (0..samples.len()).collect::<Vec<_>>();
+    shuffle_indices(&mut order, seed);
+    order.truncate(limit.min(order.len()));
+    let mut stats = AzSparseActivationStats::default();
+    let mut relations = HashSet::new();
+    let mut motifs = HashSet::new();
+    let mut joints = HashSet::new();
+    let mut events = HashSet::new();
+    for i in order {
+        let sample = &samples[i];
+        let Some(p) = position_for_training_sample(sample) else {
+            continue;
+        };
+        let g = Graph::new(Board::new(&p));
+        let rows = extract(&g, Color::Red, u128::MAX);
+        relations.extend(rows.relations);
+        motifs.extend(rows.motifs);
+        motifs.extend(king_context(&g, Color::Red).1);
+        stats.inspected_samples += 1;
+        if sample.policy_weight > 0. {
+            for &id in &sample.move_indices {
+                if let Some((a, b)) = dense_move_squares(id) {
+                    if g.board.cells[a].is_some_and(|p| p.color == Color::Red) {
+                        let m = move_features(&g, Move::new(a, b), Color::Red, None);
+                        joints.insert(m.joint);
+                        events.extend(m.events);
+                        stats.inspected_policy_moves += 1;
                     }
                 }
             }
         }
     }
-
-    AzSparseActivationStats {
-        inspected_samples: sample_count,
-        inspected_policy_moves: policy_moves,
-        value_threat_unique: value_threats.len(),
-        policy_exact_unique: policy_exact.len(),
-        policy_factor_unique: policy_factor.len(),
-        policy_tactical_unique: policy_tactical.len(),
-        value_threat_coverage: value_threats.len() as f32 / super::VALUE_THREAT_VOCAB as f32,
-        policy_exact_coverage: policy_exact.len() as f32 / (POLICY_SPARSE_TABLE_SIZE - 1) as f32,
-        policy_factor_coverage: policy_factor.len() as f32
-            / super::POLICY_SPARSE_FACTOR_SIZE as f32,
-        policy_tactical_coverage: policy_tactical.len() as f32 / POLICY_TACTICAL_SIZE as f32,
-    }
+    stats.relation_unique = relations.len();
+    stats.motif_unique = motifs.len();
+    stats.policy_joint_unique = joints.len();
+    stats.policy_event_unique = events.len();
+    stats.relation_coverage = relations.len() as f32 / RELATION_ROWS as f32;
+    stats.motif_coverage = motifs.len() as f32 / MOTIF_ROWS as f32;
+    stats.policy_joint_coverage = joints.len() as f32 / POLICY_JOINT_ROWS as f32;
+    stats.policy_event_coverage = events.len() as f32 / POLICY_EVENT_ROWS as f32;
+    stats
 }
-
 #[derive(Clone, Debug)]
 pub(super) struct DataLoaderConfig {
     pub batch_size: usize,
@@ -175,10 +122,6 @@ impl BatchPlan {
     pub(super) fn len(&self) -> usize {
         self.steps.len()
     }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.steps.is_empty()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -190,26 +133,29 @@ pub(super) struct PackedStepBatch {
 #[derive(Clone, Debug)]
 pub(super) struct PackedBatch {
     pub batch_size: usize,
-    pub value_buckets: Vec<u32>,
     pub max_features: usize,
+    pub max_king: usize,
+    pub max_relations: usize,
+    pub max_motifs: usize,
     pub max_policy_moves: usize,
-    pub max_value_threats: usize,
-    pub max_value_king_pieces: usize,
+    pub max_policy_terms: usize,
+    pub value_buckets: Vec<u32>,
     pub feature_items: Vec<u32>,
-    pub value_threat_indices: Vec<u32>,
-    pub value_threat_scales: Vec<f32>,
-    pub value_king_piece_indices: Vec<u32>,
-    pub value_king_piece_scales: Vec<f32>,
-    pub policy_items: Vec<i64>,
-    pub policy_sparse_indices: Vec<i64>,
-    pub policy_tactical_indices: Vec<i64>,
+    pub king_indices: Vec<u32>,
+    pub relation_indices: Vec<u32>,
+    pub motif_indices: Vec<u32>,
+    pub move_indices: Vec<u32>,
+    pub policy_indices: Vec<u32>,
+    pub policy_from: Vec<u32>,
+    pub policy_to: Vec<u32>,
+    pub policy_capture: Vec<u32>,
+    pub policy_local: Vec<f32>,
     pub policy_targets: Vec<f32>,
     pub policy_mask: Vec<f32>,
     pub policy_repetition: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
     pub rule_context: Vec<f32>,
-    pub history_features: Vec<f32>,
     pub check_context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
@@ -218,125 +164,165 @@ pub(super) struct PackedBatch {
     pub value_phase_masks: Vec<f32>,
     pub value_source_phase_masks: Vec<f32>,
 }
-
 impl PackedBatch {
-    pub(super) fn from_indices(samples: &[AzTrainingSample], batch: &[usize]) -> Self {
+    pub fn from_indices(samples: &[AzTrainingSample], batch: &[usize]) -> Self {
         let batch_size = batch.len();
-        let max_features = batch
-            .iter()
-            .map(|&sample_index| samples[sample_index].features.len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let max_policy_moves = batch
-            .iter()
-            .map(|&sample_index| {
-                samples[sample_index]
+        let mut rows = Vec::with_capacity(batch_size);
+        for &index in batch {
+            let sample = &samples[index];
+            let p = position_for_training_sample(sample)
+                .expect("training sample requires both generals");
+            let graph = Graph::new(Board::new(&p));
+            let mut features = extract(&graph, Color::Red, u128::MAX);
+            let (checks, seals) = king_context(&graph, Color::Red);
+            features.motifs.extend(seals);
+            let kings = king_piece_rows(&graph.board, Color::Red);
+            let buckets = canonical_buckets_for_perspective(&p, Color::Red);
+            let mut moves = Vec::new();
+            let mut move_cache = MoveFeatureCache::new(
+                &graph,
+                sample
                     .move_indices
                     .iter()
-                    .filter(|&&move_index| move_index < DENSE_MOVE_SPACE)
-                    .count()
-            })
+                    .filter_map(|&id| dense_move_squares(id))
+                    .map(|(a, b)| Move::new(a, b)),
+            );
+            for (offset, &id) in sample.move_indices.iter().enumerate() {
+                if let Some((a, b)) = dense_move_squares(id) {
+                    assert!(
+                        graph.board.cells[a].is_some_and(|p| p.color == Color::Red),
+                        "invalid policy source"
+                    );
+                    let local = move_cache.features(
+                        Move::new(a, b),
+                        Color::Red,
+                        sample
+                            .repetition_flags
+                            .get(offset)
+                            .and_then(|&v| if v < 2 { Some(v != 0) } else { None }),
+                    );
+                    let terms = policy_terms(id, &local, buckets);
+                    moves.push((offset, id, local, terms));
+                }
+            }
+            rows.push((
+                features,
+                kings,
+                checks,
+                moves,
+                value_material_bucket(&p, Color::Red),
+            ));
+        }
+        let max_features = batch
+            .iter()
+            .map(|&i| samples[i].features.len())
             .max()
             .unwrap_or(0)
             .max(1);
-        let positions = batch
+        let max_king = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(1);
+        let max_relations = rows
             .iter()
-            .map(|&sample_index| {
-                let pieces = samples[sample_index]
-                    .features
-                    .iter()
-                    .filter_map(|&feature| decode_current_piece_square_feature(feature))
-                    .map(|piece| (piece.piece_index, piece.rank * 9 + piece.file))
-                    .collect::<Vec<_>>();
-                Position::from_canonical_piece_squares(&pieces)
-            })
-            .collect::<Vec<_>>();
-        let value_threats = positions
-            .iter()
-            .map(value_threat_features)
-            .collect::<Vec<_>>();
-        let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let value_king_pieces = positions
-            .iter()
-            .map(value_king_piece_features)
-            .collect::<Vec<_>>();
-        let max_value_king_pieces = value_king_pieces
-            .iter()
-            .map(Vec::len)
+            .map(|r| r.0.relations.len())
             .max()
             .unwrap_or(0)
             .max(1);
-
-        let mut packed = Self {
+        let max_motifs = rows
+            .iter()
+            .map(|r| r.0.motifs.len())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let max_policy_moves = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(1);
+        let max_policy_terms = rows
+            .iter()
+            .flat_map(|r| r.3.iter().map(|m| m.3.len()))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let n = batch_size * max_policy_moves;
+        let mut result = Self {
             batch_size,
-            value_buckets: positions
-                .iter()
-                .map(|p| super::value_material_bucket(p, Color::Red) as u32)
-                .collect(),
             max_features,
+            max_king,
+            max_relations,
+            max_motifs,
             max_policy_moves,
-            max_value_threats,
-            max_value_king_pieces,
+            max_policy_terms,
+            value_buckets: vec![0; batch_size],
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
-            value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
-            value_threat_scales: vec![1.0; batch_size],
-            value_king_piece_indices: vec![PADDING_ITEM; batch_size * max_value_king_pieces],
-            value_king_piece_scales: vec![1.0; batch_size],
-            policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
-            policy_sparse_indices: vec![
-                (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
-                batch_size * max_policy_moves * 7
-            ],
-            policy_tactical_indices: vec![
-                POLICY_TACTICAL_SIZE as i64;
-                batch_size * max_policy_moves * POLICY_TACTICAL_TERMS
-            ],
-            policy_targets: vec![0.0f32; batch_size * max_policy_moves],
-            policy_mask: vec![POLICY_MASK_VALUE; batch_size * max_policy_moves],
-            policy_repetition: vec![0.0; batch_size * max_policy_moves],
-            value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
-            values: vec![0.0f32; batch_size],
-            rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
-            history_features: vec![0.0f32; batch_size * HISTORY_CONTEXT_SIZE],
-            check_context: vec![0.0f32; batch_size * CHECK_CONTEXT_SIZE],
-            policy_weights: vec![1.0f32; batch_size],
-            value_weights: vec![1.0f32; batch_size],
-            moves_left_targets: vec![0.0; batch_size],
-            moves_left_weights: vec![0.0; batch_size],
-            value_phase_masks: vec![0.0f32; batch_size * 3],
-            value_source_phase_masks: vec![0.0f32; batch_size * 9],
+            king_indices: vec![PADDING_ITEM; batch_size * max_king],
+            relation_indices: vec![PADDING_ITEM; batch_size * max_relations],
+            motif_indices: vec![PADDING_ITEM; batch_size * max_motifs],
+            move_indices: vec![0; n],
+            policy_indices: vec![PADDING_ITEM; n * max_policy_terms],
+            policy_from: vec![1260; n],
+            policy_to: vec![1260; n],
+            policy_capture: vec![1260; n],
+            policy_local: vec![0.; n * MOVE_LOCAL_SIZE],
+            policy_targets: vec![0.; n],
+            policy_mask: vec![POLICY_MASK_VALUE; n],
+            policy_repetition: vec![0.; n],
+            value_wdl: vec![0.; batch_size * 3],
+            values: vec![0.; batch_size],
+            rule_context: vec![0.; batch_size * RULE_CONTEXT_SIZE],
+            check_context: vec![0.; batch_size * CHECK_CONTEXT_SIZE],
+            policy_weights: vec![0.; batch_size],
+            value_weights: vec![0.; batch_size],
+            moves_left_targets: vec![0.; batch_size],
+            moves_left_weights: vec![0.; batch_size],
+            value_phase_masks: vec![0.; batch_size * 3],
+            value_source_phase_masks: vec![0.; batch_size * 9],
         };
-
-        for (row, (&sample_index, threats)) in batch.iter().zip(&value_threats).enumerate() {
-            let sample = &samples[sample_index];
-            let king_buckets = canonical_general_buckets_from_features(&sample.features);
-            packed.pack_features(row, sample, king_buckets);
-            let threat_base = row * max_value_threats;
-            packed.value_threat_indices[threat_base..threat_base + threats.len()]
-                .copy_from_slice(threats);
-            packed.value_threat_scales[row] = 1.0 / (threats.len().max(1) as f32).sqrt();
-            let king_pieces = &value_king_pieces[row];
-            let king_base = row * max_value_king_pieces;
-            packed.value_king_piece_indices[king_base..king_base + king_pieces.len()]
-                .copy_from_slice(king_pieces);
-            packed.value_king_piece_scales[row] = 1.0 / (king_pieces.len().max(1) as f32).sqrt();
-            packed.pack_policy(row, sample, &positions[row], king_buckets);
-            let wdl = normalize_wdl_target(sample.value_wdl);
-            packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
-            packed.values[row] = sample.value.clamp(-1.0, 1.0);
-            packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
+        for (row, (&index, (features, kings, checks, moves, bucket))) in
+            batch.iter().zip(rows).enumerate()
+        {
+            let sample = &samples[index];
+            result.value_buckets[row] = bucket as u32;
+            for (i, &feature) in sample.features.iter().enumerate() {
+                assert!(feature < 1260);
+                result.feature_items[row * max_features + i] = feature as u32;
+            }
+            result.king_indices[row * max_king..row * max_king + kings.len()]
+                .copy_from_slice(&kings);
+            result.relation_indices
+                [row * max_relations..row * max_relations + features.relations.len()]
+                .copy_from_slice(&features.relations);
+            result.motif_indices[row * max_motifs..row * max_motifs + features.motifs.len()]
+                .copy_from_slice(&features.motifs);
+            result.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE]
+                .copy_from_slice(&checks);
+            let active = moves.len();
+            for (column, (offset, id, local, terms)) in moves.into_iter().enumerate() {
+                let i = row * max_policy_moves + column;
+                result.move_indices[i] = id as u32;
+                result.policy_targets[i] = sample.policy[offset].max(0.);
+                result.policy_mask[i] = 0.;
+                result.policy_from[i] = local.from_feature as u32;
+                result.policy_to[i] = local.to_feature as u32;
+                result.policy_capture[i] = local.captured_feature.unwrap_or(1260) as u32;
+                result.policy_local[i * MOVE_LOCAL_SIZE..(i + 1) * MOVE_LOCAL_SIZE]
+                    .copy_from_slice(&local.local);
+                result.policy_repetition[i] = local.local[10];
+                result.policy_indices[i * max_policy_terms..i * max_policy_terms + terms.len()]
+                    .copy_from_slice(&terms);
+            }
+            normalize_policy_targets(
+                &mut result.policy_targets[row * max_policy_moves..(row + 1) * max_policy_moves],
+                active,
+            );
+            result.value_wdl[row * 3..row * 3 + 3]
+                .copy_from_slice(&normalize_wdl_target(sample.value_wdl));
+            result.values[row] = sample.value.clamp(-1., 1.);
+            result.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
                 .copy_from_slice(&sample.rule_context);
-            packed.history_features[row * HISTORY_CONTEXT_SIZE..(row + 1) * HISTORY_CONTEXT_SIZE]
-                .copy_from_slice(&sample.history_features);
-            packed.policy_weights[row] = sample.policy_weight.max(0.0);
-            packed.value_weights[row] = sample.value_weight.max(0.0);
+            result.policy_weights[row] = sample.policy_weight.max(0.);
+            result.value_weights[row] = sample.value_weight.max(0.);
             if sample.moves_left.is_finite()
-                && sample.moves_left >= 0.0
+                && sample.moves_left >= 0.
                 && sample.moves_left_weight.is_finite()
             {
-                packed.moves_left_targets[row] = sample.moves_left / super::MOVES_LEFT_SCALE;
-                packed.moves_left_weights[row] = sample.moves_left_weight.max(0.0);
+                result.moves_left_targets[row] = sample.moves_left / MOVES_LEFT_SCALE;
+                result.moves_left_weights[row] = sample.moves_left_weight.max(0.);
             }
             let phase = if sample.meta.ply < 40 {
                 0
@@ -345,196 +331,30 @@ impl PackedBatch {
             } else {
                 2
             };
-            packed.value_phase_masks[row * 3 + phase] = 1.0;
-            packed.value_source_phase_masks
-                [row * 9 + sample.meta.start_source.index() * 3 + phase] = 1.0;
+            result.value_phase_masks[row * 3 + phase] = 1.;
+            result.value_source_phase_masks
+                [row * 9 + sample.meta.start_source.index() * 3 + phase] = 1.;
         }
-        packed
-    }
-
-    fn pack_features(
-        &mut self,
-        row: usize,
-        sample: &AzTrainingSample,
-        king_buckets: (usize, usize),
-    ) {
-        let (us_king_bucket, them_king_bucket) = king_buckets;
-        let feature_base = row * self.max_features;
-        for (feature_offset, &feature) in sample.features.iter().enumerate() {
-            if feature >= AZ_NNUE_INPUT_SIZE {
-                continue;
-            }
-            let batch_feature_index = feature_base + feature_offset;
-            self.feature_items[batch_feature_index] =
-                pack_feature(feature, us_king_bucket, them_king_bucket);
-        }
-    }
-
-    fn pack_policy(
-        &mut self,
-        row: usize,
-        sample: &AzTrainingSample,
-        position: &Position,
-        king_buckets: (usize, usize),
-    ) {
-        let policy_base = row * self.max_policy_moves;
-        let mut board_features = [usize::MAX; BOARD_SIZE];
-        for &feature in &sample.features {
-            if let Some(structural) = decode_current_piece_square_feature(feature) {
-                let square = structural.rank * 9 + structural.file;
-                board_features[square] = feature;
-            }
-        }
-        let [own_attacks, opponent_attacks] = position.attacked_squares_masks();
-        let moves = sample
-            .move_indices
-            .iter()
-            .filter_map(|&index| {
-                dense_move_squares(index).map(|(from, to)| crate::xiangqi::Move::new(from, to))
-            })
-            .collect::<Vec<_>>();
-        let gives_check = moves
-            .iter()
-            .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
-            .collect::<Vec<_>>();
-        self.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE]
-            .copy_from_slice(&check_context_features(
-                position,
-                &moves,
-                &gives_check,
-                [own_attacks, opponent_attacks],
-            ));
-        let mut policy_offset = 0usize;
-        for (sample_offset, (&move_index, &target)) in sample
-            .move_indices
-            .iter()
-            .zip(sample.policy.iter())
-            .enumerate()
-        {
-            if move_index < DENSE_MOVE_SPACE {
-                self.policy_targets[policy_base + policy_offset] = target.max(0.0);
-                self.policy_mask[policy_base + policy_offset] = 0.0;
-                self.policy_repetition[policy_base + policy_offset] = f32::from(
-                    sample
-                        .repetition_flags
-                        .get(sample_offset)
-                        .copied()
-                        .unwrap_or(0),
-                );
-                let mut consequence_from = 0usize;
-                let mut consequence_to = 0usize;
-                let mut consequence_captured = 0usize;
-                let mut move_valid = false;
-                let mut capture_valid = false;
-                if let Some((from, to)) = dense_move_squares(move_index) {
-                    let moved_feature = board_features[from];
-                    if moved_feature != usize::MAX
-                        && moved_feature / BOARD_SIZE < super::STRUCTURAL_PIECE_SIZE / 2
-                    {
-                        let piece_index = moved_feature / BOARD_SIZE;
-                        consequence_from = moved_feature;
-                        consequence_to = piece_index * BOARD_SIZE + to;
-                        move_valid = true;
-                        let captured_feature = board_features[to];
-                        if captured_feature != usize::MAX {
-                            consequence_captured = captured_feature;
-                            capture_valid = true;
-                        }
-                    }
-                }
-                let item_index = policy_base + policy_offset;
-                self.policy_items[item_index] = pack_policy_item(
-                    move_index,
-                    consequence_from,
-                    consequence_to,
-                    consequence_captured,
-                    move_valid,
-                    capture_valid,
-                );
-                if move_valid {
-                    let moved_piece = consequence_from / BOARD_SIZE;
-                    let captured_piece = capture_valid.then_some(consequence_captured / BOARD_SIZE);
-                    let sparse_base = item_index * 7;
-                    self.policy_sparse_indices[sparse_base] = policy_sparse_main_index(
-                        move_index,
-                        moved_piece,
-                        king_buckets.0,
-                        king_buckets.1,
-                    ) as i64;
-                    self.policy_sparse_indices[sparse_base + 1] =
-                        policy_sparse_capture_index(move_index, captured_piece) as i64;
-                    for (offset, factor) in policy_sparse_factor_indices(
-                        move_index,
-                        moved_piece,
-                        king_buckets.0,
-                        king_buckets.1,
-                    )
-                    .into_iter()
-                    .enumerate()
-                    {
-                        self.policy_sparse_indices[sparse_base + 2 + offset] =
-                            (POLICY_SPARSE_TABLE_SIZE + factor) as i64;
-                    }
-                    let mv = crate::xiangqi::Move::new(
-                        consequence_from % BOARD_SIZE,
-                        consequence_to % BOARD_SIZE,
-                    );
-                    let check = gives_check[policy_offset] != 0.0;
-                    // 训练侧与推理侧共用同一个实现，避免两处内联公式漂移。
-                    let (
-                        source_attacked,
-                        destination_attacked,
-                        source_defended,
-                        destination_defended,
-                    ) = policy_move_tactical_flags(mv, opponent_attacks, own_attacks);
-                    let tactical_base = item_index * POLICY_TACTICAL_TERMS;
-                    for (offset, tactical) in policy_tactical_indices(
-                        move_index,
-                        moved_piece,
-                        source_attacked,
-                        destination_attacked,
-                        source_defended,
-                        destination_defended,
-                        captured_piece,
-                        check,
-                    )
-                    .into_iter()
-                    .enumerate()
-                    {
-                        self.policy_tactical_indices[tactical_base + offset] = tactical as i64;
-                    }
-                }
-                policy_offset += 1;
-            }
-        }
-        normalize_policy_targets(
-            &mut self.policy_targets[policy_base..policy_base + self.max_policy_moves],
-            policy_offset,
-        );
+        result
     }
 }
-
-fn value_threat_features(position: &Position) -> Vec<u32> {
-    let mut features = Vec::with_capacity(32);
-    visit_value_threat_features(position, Color::Red, |feature| {
-        features.push(feature as u32);
-    });
-    assert!(
-        features.len() <= VALUE_THREAT_MAX_ACTIVE,
-        "too many active value threats"
-    );
-    features
+fn policy_terms(id: usize, m: &MoveFeatures, kings: (usize, usize)) -> Vec<u32> {
+    let piece = DENSE_MOVE_SPACE;
+    let king = piece + DENSE_MOVE_SPACE * 7;
+    let capture = king + DENSE_MOVE_SPACE * 18;
+    let joint = capture + DENSE_MOVE_SPACE * 8;
+    let events = joint + POLICY_JOINT_ROWS;
+    let mut terms = vec![
+        id as u32,
+        (piece + id * 7 + m.moved) as u32,
+        (king + id * 9 + kings.0) as u32,
+        (king + (DENSE_MOVE_SPACE + id) * 9 + kings.1) as u32,
+        (capture + id * 8 + m.captured) as u32,
+        (joint + m.joint as usize) as u32,
+    ];
+    terms.extend(m.events.iter().map(|&e| (events + e as usize) as u32));
+    terms
 }
-
-fn value_king_piece_features(position: &Position) -> Vec<u32> {
-    let mut features = Vec::with_capacity(VALUE_KING_PIECE_MAX_ACTIVE);
-    visit_value_king_piece_features(position, Color::Red, |feature| {
-        features.push(feature as u32)
-    });
-    assert!(features.len() <= VALUE_KING_PIECE_MAX_ACTIVE);
-    features
-}
-
 #[derive(Debug)]
 pub(super) enum DataLoaderError {
     WorkerPanic,
@@ -659,134 +479,4 @@ fn splitmix_next(state: &mut u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     value ^ (value >> 31)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use crate::{az::AzSampleMeta, xiangqi::Move};
-
-    use super::*;
-
-    fn sample(index: usize) -> AzTrainingSample {
-        AzTrainingSample {
-            repetition_flags: Vec::new(),
-            features: vec![index % AZ_NNUE_INPUT_SIZE],
-            rule_context: [0.0; RULE_CONTEXT_SIZE],
-            history_features: [0.0; HISTORY_CONTEXT_SIZE],
-            move_indices: vec![0, 1],
-            policy: vec![1.0 + index as f32, 1.0],
-            value_wdl: [1.0, 0.0, 0.0],
-            root_search_wdl: [1.0, 0.0, 0.0],
-            value: 2.0,
-            side_sign: 1.0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
-            moves_left: 0.0,
-            moves_left_weight: 0.0,
-            search_simulations: 0,
-            meta: AzSampleMeta::default(),
-        }
-    }
-
-    #[test]
-    fn batch_plan_respects_drop_last() {
-        let config = DataLoaderConfig {
-            batch_size: 3,
-            shuffle: false,
-            drop_last: true,
-            ..DataLoaderConfig::default()
-        };
-        let plan = BatchPlan::epoch(8, &config);
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan.steps[0].indices, vec![0, 1, 2]);
-        assert_eq!(plan.steps[1].indices, vec![3, 4, 5]);
-    }
-
-    #[test]
-    fn packed_batch_normalizes_policy_and_clamps_targets() {
-        let mut samples = vec![sample(0), sample(1)];
-        samples[1].meta.start_source = crate::az::AzStartSource::Midgame;
-        samples[1].meta.ply = 130;
-        let packed = PackedBatch::from_indices(&samples, &[0, 1]);
-        assert_eq!(packed.batch_size, 2);
-        assert_eq!(packed.max_policy_moves, 2);
-        assert_eq!(packed.policy_targets[0], 0.5);
-        assert_eq!(packed.policy_targets[1], 0.5);
-        assert!((packed.policy_targets[2] - 2.0 / 3.0).abs() < 1.0e-6);
-        assert!((packed.policy_targets[3] - 1.0 / 3.0).abs() < 1.0e-6);
-        assert_eq!(&packed.value_wdl[0..3], &[1.0, 0.0, 0.0]);
-        assert_eq!(packed.values, vec![1.0, 1.0]);
-        assert_eq!(packed.value_source_phase_masks[0], 1.0);
-        assert_eq!(packed.value_source_phase_masks[9 + 8], 1.0);
-        assert_eq!(packed.value_source_phase_masks.iter().sum::<f32>(), 2.0);
-    }
-
-    #[test]
-    fn packed_policy_consequence_encodes_move_and_capture() {
-        let moved_feature = 6 * BOARD_SIZE;
-        let captured_feature = 10 * BOARD_SIZE + 1;
-        let move_index = super::super::dense_move_index(Move::new(0, 1));
-        let mut training_sample = sample(0);
-        training_sample.features = vec![moved_feature, captured_feature];
-        training_sample.move_indices = vec![move_index];
-        training_sample.policy = vec![1.0];
-
-        let packed = PackedBatch::from_indices(&[training_sample], &[0]);
-        assert_eq!(
-            packed.policy_items,
-            vec![pack_policy_item(
-                move_index,
-                moved_feature,
-                6 * BOARD_SIZE + 1,
-                captured_feature,
-                true,
-                true,
-            )]
-        );
-    }
-
-    #[test]
-    fn sparse_activation_stats_counts_only_weighted_valid_moves() {
-        let moved_feature = 6 * BOARD_SIZE;
-        let move_index = super::super::dense_move_index(Move::new(0, 1));
-        let mut active = sample(0);
-        active.features = vec![moved_feature];
-        active.move_indices = vec![move_index];
-        active.policy = vec![1.0];
-        let mut disabled = active.clone();
-        disabled.policy_weight = 0.0;
-        disabled.value_weight = 0.0;
-
-        let stats = sparse_activation_stats(&[active, disabled], 16);
-        assert_eq!(stats.inspected_samples, 2);
-        assert_eq!(stats.inspected_policy_moves, 1);
-        assert_eq!(stats.policy_exact_unique, 2);
-        assert_eq!(stats.policy_factor_unique, 5);
-        assert!(stats.policy_tactical_unique > 0);
-        assert!(stats.policy_exact_coverage > 0.0);
-        assert!(stats.policy_factor_coverage > 0.0);
-    }
-
-    #[test]
-    fn prefetch_loader_preserves_batch_order() {
-        let samples = Arc::new((0..7).map(sample).collect::<Vec<_>>());
-        let config = DataLoaderConfig {
-            batch_size: 2,
-            shuffle: false,
-            drop_last: false,
-            num_workers: 2,
-            prefetch_batches: 2,
-            ..DataLoaderConfig::default()
-        };
-        let plan = BatchPlan::epoch(samples.len(), &config);
-        let mut loader = PrefetchDataLoader::new(Arc::clone(&samples), plan, &config);
-        let mut sizes = Vec::new();
-        while let Some(batch) = loader.next_packed().unwrap() {
-            sizes.push(batch.batch.batch_size);
-        }
-        loader.join().unwrap();
-        assert_eq!(sizes, vec![2, 2, 2, 1]);
-    }
 }

@@ -338,7 +338,7 @@ impl GpuReplica {
             .gt(0.0)?
             .to_dtype(candle_core::DType::F32)?;
         let value_ce = (&value_ce_per_sample * &valid_value)?.sum_all()?;
-        let masked_policy_logits = (&forward.policy_logits + &batch_tensors.policy_mask)?;
+        let masked_policy_logits = forward.policy_logits.clone();
         let log_policy = log_softmax(&masked_policy_logits, 1)?;
         let policy_ce_per_sample = ((&batch_tensors.policy_targets * &log_policy)? * -1.0)?;
         let policy_ce_per_sample = policy_ce_per_sample.sum(1)?;
@@ -547,7 +547,7 @@ mod monitoring_tests {
             repetition_flags: Vec::new(),
             features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
-            history_features: crate::az::history_features(&position, &[]),
+
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))
@@ -625,7 +625,13 @@ mod monitoring_tests {
             let model = AzNnue::random(8, 87);
             let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
             let (vars, decay) = candle.all_vars_with_decay();
-            let partial = AzAdamW::new(vars[..28].to_vec(), decay[..28].to_vec(), lr).unwrap();
+            let partial_len = vars.len() - 1;
+            let partial = AzAdamW::new(
+                vars[..partial_len].to_vec(),
+                decay[..partial_len].to_vec(),
+                lr,
+            )
+            .unwrap();
             let path = std::env::temp_dir().join(format!(
                 "chineseai-partial-{}-{}.safetensors",
                 kind.as_str(),
@@ -646,7 +652,7 @@ mod monitoring_tests {
         let sample = AzTrainingSample {
             features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
-            history_features: crate::az::history_features(&position, &[]),
+
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))
@@ -690,7 +696,7 @@ mod monitoring_tests {
         assert!(final_loss < initial_loss, "{final_loss} >= {initial_loss}");
         replica.model.copy_to_model(&mut model).unwrap();
         assert!(model.moves_left_active);
-        assert_ne!(model.shared_hidden, AzNnue::random(8, 81).shared_hidden);
+        assert_ne!(model.input_hidden, AzNnue::random(8, 81).input_hidden);
         let mut masked = sample;
         masked.moves_left_weight = 0.0;
         let batch =
@@ -709,7 +715,7 @@ mod monitoring_tests {
             repetition_flags: Vec::new(),
             features: crate::az::nnue::extract_sparse_features_az(&position),
             rule_context: Default::default(),
-            history_features: crate::az::history_features(&position, &[]),
+
             move_indices: moves
                 .iter()
                 .map(|&mv| crate::az::dense_move_index(mv))

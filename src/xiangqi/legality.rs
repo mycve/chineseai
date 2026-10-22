@@ -139,7 +139,9 @@ impl Position {
                 let safe_after_move = match fast {
                     // 国王自己走子时不能用这条捷径（走完国王换了格子）。
                     Some((king_sq, unblock)) if from != king_sq => !self
-                        .king_attacked_after_vacating(king_sq, side, enemy, from, to, unblock, &mut work),
+                        .king_attacked_after_vacating(
+                            king_sq, side, enemy, from, to, unblock, &mut work,
+                        ),
                     _ => {
                         let captured = work.make_move_board_only(mv);
                         let ok = !work.in_check(side);

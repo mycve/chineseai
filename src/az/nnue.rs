@@ -4,7 +4,7 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piec
 
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
-/// 主干使用面向行棋方的 canonical 棋子位置；价值头另接最近两步历史特征。
+/// 棋子位置使用行棋方规范坐标；关系和静态战术组合由统一提取器提供。
 /// 重复、长将、长捉等规则由环境精确处理。
 pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
 

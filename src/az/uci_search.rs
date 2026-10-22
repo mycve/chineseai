@@ -277,7 +277,8 @@ mod tests {
                 assert!((node.parent as usize) < index);
             }
             let expected = AzEvalAccumulator::new(&model, &node.position).into_hidden_sum();
-            let perspective = color_index(node.position.side_to_move()) * model.hidden_size;
+            let perspective =
+                crate::xiangqi::color_index(node.position.side_to_move()) * model.hidden_size;
             let offset = node.accumulator_offset as usize;
             for (actual, expected) in tree.accumulator_arena[offset..offset + model.hidden_size]
                 .iter()

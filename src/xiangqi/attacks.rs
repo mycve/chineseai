@@ -1,11 +1,16 @@
+#[cfg(test)]
 use super::{
-    BOARD_FILES, Color, DIAGONAL_STEPS, ELEPHANT_STEPS, HORSE_STEPS, Move, ORTHOGONAL_STEPS,
-    Piece, PieceKind, Position, color_hash_index, elephant_stays_home, file_of, fixed_attack_masks,
-    index, inside_board, inside_palace, nearest_on_ray, orthogonal_ray_masks, rank_of, ray_through,
+    BOARD_FILES, color_hash_index, fixed_attack_masks, nearest_on_ray, orthogonal_ray_masks,
+    ray_through,
+};
+use super::{
+    Color, DIAGONAL_STEPS, ELEPHANT_STEPS, HORSE_STEPS, Move, ORTHOGONAL_STEPS, Piece, PieceKind,
+    Position, elephant_stays_home, file_of, index, inside_board, inside_palace, rank_of,
     soldier_crossed_river,
 };
 
 impl Position {
+    #[cfg(test)]
     pub(crate) fn attacked_squares_masks(&self) -> [u128; 2] {
         let mut masks = [0u128; 2];
         let occupancy = self.occupied;

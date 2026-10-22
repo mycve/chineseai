@@ -100,8 +100,7 @@ impl TrainingConsole {
             self.cycle.set_position(
                 report
                     .training_steps
-                    .saturating_sub((cycle_number - 1) * PX0_CYCLE_STEPS)
-                    as u64,
+                    .saturating_sub((cycle_number - 1) * PX0_CYCLE_STEPS) as u64,
             );
             self.production.set_message(production);
             self.loss.set_message(loss);

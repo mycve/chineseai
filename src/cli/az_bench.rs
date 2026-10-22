@@ -13,7 +13,7 @@ pub(crate) fn run(cmd: AzBenchArgs) {
         panic!("failed to load `{model_path}`: {err}");
     });
     model.mate_search_plies = cmd.mate_search_plies;
-    model.threat_incremental = cmd.threat_incremental;
+
     model.node_incremental = !cmd.no_node_incremental;
     model.mate_search_nodes = cmd.mate_search_nodes.max(1);
 
@@ -45,7 +45,7 @@ pub(crate) fn run(cmd: AzBenchArgs) {
     println!("repeat       : {repeat}");
     println!("search       : alphazero");
     println!("simd         : {}", chineseai::az::inference_simd_backend());
-    println!("threat_cache : {}", model.threat_incremental);
+
     println!("node_cache   : {}", model.node_incremental);
     println!("cpuct        : {cpuct}");
 
