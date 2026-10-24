@@ -1,12 +1,37 @@
 use super::{
-    dataloader::PackedBatch, features::*, fused_feature_pool::sparse_pool,
-    nnue::AZ_NNUE_INPUT_SIZE, *,
+    dataloader::PackedBatch,
+    features::*,
+    fused_feature_pool::{gather_rows, sparse_pool},
+    nnue::AZ_NNUE_INPUT_SIZE,
+    *,
 };
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
+fn fold_input_weights(weights: &mut [f32], factors: &[f32], hidden: usize) {
+    for (feature, row) in weights.chunks_exact_mut(hidden).enumerate() {
+        for (factor, scale) in input_factor_terms(feature) {
+            for (value, shared) in row
+                .iter_mut()
+                .zip(&factors[factor * hidden..(factor + 1) * hidden])
+            {
+                *value += scale * shared;
+            }
+        }
+    }
+}
+fn fold_value_weights(weights: &mut [f32], shared: &[f32]) {
+    for bucket in weights.chunks_exact_mut(WDL_HEAD_SIZE * VALUE_HEAD_SIZE) {
+        for (value, shared) in bucket.iter_mut().zip(shared) {
+            *value += shared;
+        }
+    }
+}
 #[derive(Debug)]
 pub(super) struct AzCandleModel {
     arch: AzNnueArch,
     input_hidden: Var,
+    // 训练专用；同步到 CPU 时折叠，推理不增加查表或矩阵运算。
+    input_factors: Var,
+    value_shared_output: Var,
     hidden_bias: Var,
     king_piece: Var,
     king_projection: Var,
@@ -40,6 +65,8 @@ impl AzCandleModel {
         Ok(Self {
             arch: model.arch,
             input_hidden: Var::from_slice(&model.input_hidden, &[AZ_NNUE_INPUT_SIZE, h], device)?,
+            input_factors: Var::zeros((INPUT_FACTOR_ROWS, h), DType::F32, device)?,
+            value_shared_output: Var::zeros((WDL_HEAD_SIZE, VALUE_HEAD_SIZE), DType::F32, device)?,
             hidden_bias: Var::from_slice(&model.hidden_bias, &[h], device)?,
             king_piece: Var::from_slice(
                 &model.king_piece,
@@ -165,6 +192,8 @@ impl AzCandleModel {
             self.policy_events.clone(),
             self.policy_repetition_hidden.clone(),
             self.policy_repetition_bias.clone(),
+            self.input_factors.clone(),
+            self.value_shared_output.clone(),
         ]
     }
     pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
@@ -173,12 +202,14 @@ impl AzCandleModel {
             vec![
                 false, false, false, true, false, true, false, true, true, true, true, false, true,
                 true, false, false, false, true, false, false, false, false, true, false, false,
-                true, false,
+                true, false, false, true,
             ],
         )
     }
     pub(super) fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {
         model.input_hidden = self.input_hidden.flatten_all()?.to_vec1::<f32>()?;
+        let factors = self.input_factors.flatten_all()?.to_vec1::<f32>()?;
+        fold_input_weights(&mut model.input_hidden, &factors, model.hidden_size);
         model.hidden_bias = self.hidden_bias.flatten_all()?.to_vec1::<f32>()?;
         model.king_piece = self.king_piece.flatten_all()?.to_vec1::<f32>()?;
         model.king_projection = self.king_projection.flatten_all()?.to_vec1::<f32>()?;
@@ -191,6 +222,8 @@ impl AzCandleModel {
         model.value_head_hidden = self.value_head_hidden.flatten_all()?.to_vec1::<f32>()?;
         model.value_head_bias = self.value_head_bias.flatten_all()?.to_vec1::<f32>()?;
         model.value_head_output = self.value_head_output.flatten_all()?.to_vec1::<f32>()?;
+        let shared_output = self.value_shared_output.flatten_all()?.to_vec1::<f32>()?;
+        fold_value_weights(&mut model.value_head_output, &shared_output);
         model.moves_left_output = self.moves_left_output.flatten_all()?.to_vec1::<f32>()?;
         model.moves_left_bias = self.moves_left_bias.flatten_all()?.to_vec1::<f32>()?;
         model.policy_move_bias = self.policy_move_bias.flatten_all()?.to_vec1::<f32>()?;
@@ -214,8 +247,38 @@ impl AzCandleModel {
         model.rebuild_moves_left();
         Ok(())
     }
+    pub(super) fn folded_training_weights(&self, weights: &[Tensor]) -> CandleResult<Vec<Tensor>> {
+        let vars = self.all_vars();
+        let index = |target: &Var| {
+            vars.iter()
+                .position(|var| var.id() == target.id())
+                .expect("trainable tensor")
+        };
+        let input = index(&self.input_hidden);
+        let factors = index(&self.input_factors);
+        let output = index(&self.value_head_output);
+        let shared = index(&self.value_shared_output);
+        let mut result = weights.to_vec();
+        let mut input_weights = weights[input].flatten_all()?.to_vec1::<f32>()?;
+        fold_input_weights(
+            &mut input_weights,
+            &weights[factors].flatten_all()?.to_vec1::<f32>()?,
+            self.arch.hidden_size,
+        );
+        result[input] = Tensor::from_vec(input_weights, weights[input].shape(), &Device::Cpu)?;
+        let mut output_weights = weights[output].flatten_all()?.to_vec1::<f32>()?;
+        fold_value_weights(
+            &mut output_weights,
+            &weights[shared].flatten_all()?.to_vec1::<f32>()?,
+        );
+        result[output] = Tensor::from_vec(output_weights, weights[output].shape(), &Device::Cpu)?;
+        result[factors] = weights[factors].zeros_like()?;
+        result[shared] = weights[shared].zeros_like()?;
+        Ok(result)
+    }
     pub(super) fn forward(&self, b: &BatchTensors) -> CandleResult<ForwardOutput> {
-        let board = sparse_pool(self.input_hidden.as_tensor(), &b.feature_items)?;
+        let board = (sparse_pool(self.input_hidden.as_tensor(), &b.feature_items)?
+            + b.input_factors.matmul(self.input_factors.as_tensor())?)?;
         let king = sparse_pool(self.king_piece.as_tensor(), &b.king_indices)?
             .matmul(self.king_projection.as_tensor())?;
         let relation = sparse_pool(self.relation_embedding.as_tensor(), &b.relation_indices)?
@@ -236,17 +299,21 @@ impl AzCandleModel {
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
             .relu()?;
-        let selected = self
-            .value_head_output
-            .reshape((VALUE_BUCKETS, 3 * VALUE_HEAD_SIZE))?
-            .index_select(&b.value_buckets, 0)?
-            .reshape((b.batch_size, 3, VALUE_HEAD_SIZE))?;
+        let selected = gather_rows(
+            &self
+                .value_head_output
+                .broadcast_add(self.value_shared_output.as_tensor())?
+                .reshape((VALUE_BUCKETS, 3 * VALUE_HEAD_SIZE))?,
+            &b.value_buckets,
+        )?
+        .reshape((b.batch_size, 3, VALUE_HEAD_SIZE))?;
         let value_logits = selected.matmul(&head.unsqueeze(2)?)?.squeeze(2)?;
         let context = hidden.matmul(&self.policy_context_hidden.t()?)?;
-        let move_context = self
-            .policy_move_context
-            .index_select(&b.move_indices.flatten_all()?, 0)?
-            .reshape((b.batch_size, b.max_policy_moves, POLICY_MOVE_CONTEXT_SIZE))?;
+        let move_context = gather_rows(
+            self.policy_move_context.as_tensor(),
+            &b.move_indices.flatten_all()?,
+        )?
+        .reshape((b.batch_size, b.max_policy_moves, POLICY_MOVE_CONTEXT_SIZE))?;
         let policy_context = move_context.broadcast_mul(&context.unsqueeze(1)?)?.sum(2)?;
         let tables = Tensor::cat(
             &[
@@ -264,14 +331,11 @@ impl AzCandleModel {
             sparse_pool(&tables, &b.policy_indices)?.reshape((b.batch_size, b.max_policy_moves))?;
         let zero = Tensor::zeros(1, DType::F32, self.policy_piece_square.device())?;
         let piece = Tensor::cat(&[self.policy_piece_square.as_tensor(), &zero], 0)?;
-        let from = piece
-            .index_select(&b.policy_from.flatten_all()?, 0)?
+        let from = gather_rows(&piece, &b.policy_from.flatten_all()?)?
             .reshape((b.batch_size, b.max_policy_moves))?;
-        let to = piece
-            .index_select(&b.policy_to.flatten_all()?, 0)?
+        let to = gather_rows(&piece, &b.policy_to.flatten_all()?)?
             .reshape((b.batch_size, b.max_policy_moves))?;
-        let capture = piece
-            .index_select(&b.policy_capture.flatten_all()?, 0)?
+        let capture = gather_rows(&piece, &b.policy_capture.flatten_all()?)?
             .reshape((b.batch_size, b.max_policy_moves))?;
         let local = b
             .policy_local
@@ -310,6 +374,7 @@ pub(super) struct BatchTensors {
     pub max_policy_moves: usize,
     pub value_buckets: Tensor,
     pub feature_items: Tensor,
+    pub input_factors: Tensor,
     pub king_indices: Tensor,
     pub relation_indices: Tensor,
     pub motif_indices: Tensor,
@@ -342,6 +407,11 @@ impl BatchTensors {
             max_policy_moves,
             value_buckets: Tensor::from_vec(p.value_buckets, batch_size, device)?,
             feature_items: Tensor::from_vec(p.feature_items, (batch_size, p.max_features), device)?,
+            input_factors: Tensor::from_vec(
+                p.input_factors,
+                (batch_size, INPUT_FACTOR_ROWS),
+                device,
+            )?,
             king_indices: Tensor::from_vec(p.king_indices, (batch_size, p.max_king), device)?,
             relation_indices: Tensor::from_vec(
                 p.relation_indices,

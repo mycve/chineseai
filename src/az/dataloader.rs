@@ -141,6 +141,7 @@ pub(super) struct PackedBatch {
     pub max_policy_terms: usize,
     pub value_buckets: Vec<u32>,
     pub feature_items: Vec<u32>,
+    pub input_factors: Vec<f32>,
     pub king_indices: Vec<u32>,
     pub relation_indices: Vec<u32>,
     pub motif_indices: Vec<u32>,
@@ -250,6 +251,7 @@ impl PackedBatch {
             max_policy_terms,
             value_buckets: vec![0; batch_size],
             feature_items: vec![PADDING_ITEM; batch_size * max_features],
+            input_factors: vec![0.; batch_size * INPUT_FACTOR_ROWS],
             king_indices: vec![PADDING_ITEM; batch_size * max_king],
             relation_indices: vec![PADDING_ITEM; batch_size * max_relations],
             motif_indices: vec![PADDING_ITEM; batch_size * max_motifs],
@@ -281,6 +283,9 @@ impl PackedBatch {
             for (i, &feature) in sample.features.iter().enumerate() {
                 assert!(feature < 1260);
                 result.feature_items[row * max_features + i] = feature as u32;
+                for (factor, value) in input_factor_terms(feature) {
+                    result.input_factors[row * INPUT_FACTOR_ROWS + factor] += value;
+                }
             }
             result.king_indices[row * max_king..row * max_king + kings.len()]
                 .copy_from_slice(&kings);

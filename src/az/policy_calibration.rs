@@ -283,7 +283,8 @@ pub fn calibrate_policy(
             let zero = Tensor::zeros(1, DType::F32, &device)?;
             let padded = Tensor::cat(&[weight.as_tensor(), &zero], 0)?;
             let ids = Tensor::from_vec(indices, batch_size * width, &device)?;
-            let residual = padded.index_select(&ids, 0)?.reshape((batch_size, width))?;
+            let residual = super::fused_feature_pool::gather_rows(&padded, &ids)?
+                .reshape((batch_size, width))?;
             let logits = (Tensor::from_vec(base, (batch_size, width), &device)? + residual)?;
             let targets = Tensor::from_vec(target, (batch_size, width), &device)?;
             let loss = (candle_nn::ops::log_softmax(&logits, 1)? * targets)?

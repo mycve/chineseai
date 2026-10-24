@@ -5,6 +5,23 @@ pub const DENSE_MOVE_SPACE: usize = 2062;
 pub const RULE_CONTEXT_SIZE: usize = 18;
 pub const CHECK_CONTEXT_SIZE: usize = 14;
 pub(crate) const PIECE_SQUARE_INPUT_SIZE: usize = 1260;
+pub(crate) const INPUT_FACTOR_ROWS: usize = 14 * 3;
+
+/// 仅用于训练参数共享；三项都能精确折叠进同一棋子位置行。
+pub(crate) fn input_factor_terms(feature: usize) -> [(usize, f32); 3] {
+    let first = feature / BOARD_SIZE * 3;
+    [
+        (first, 1.),
+        (
+            first + 1,
+            (feature % BOARD_FILES) as f32 / (BOARD_FILES - 1) as f32,
+        ),
+        (
+            first + 2,
+            ((feature % BOARD_SIZE) / BOARD_FILES) as f32 / (BOARD_SIZE / BOARD_FILES - 1) as f32,
+        ),
+    ]
+}
 pub(crate) const VALUE_HEAD_SIZE: usize = 96;
 pub(crate) const VALUE_BUCKETS: usize = 32;
 pub(crate) const VALUE_KING_PIECE_RANK: usize = 16;

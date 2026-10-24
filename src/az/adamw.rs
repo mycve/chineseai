@@ -19,7 +19,8 @@ const MAX_GRAD_NORM: f64 = 10_000.0;
 /// **0.4%**。所以这个旋钮在 Adam 的学习率尺度下几乎不动结果 —— 分组与否不会混淆消融。
 pub(super) const DENSE_WEIGHT_DECAY: f64 = 1e-4;
 /// 调度参数成为恢复契约的一部分；拒绝旧的固定学习率状态。
-pub(super) const STATE_TAG: i64 = 4;
+// 棋种/位置与跨桶共享参数只保存在训练状态，恢复时必须保留其独立动量。
+pub(super) const STATE_TAG: i64 = 5;
 /// `state` 张量的元素个数：tag / 模型格式版本 / 步数 / 下次更新的序号。
 const STATE_LEN: usize = 4;
 /// `hyper` 张量还保存预热步数、衰减时间尺度和最低倍率。
@@ -27,6 +28,31 @@ const HYPER_LEN: usize = 9;
 const WARMUP_STEPS: usize = 250;
 const DECAY_STEPS: usize = 10_000;
 const MIN_LR_RATIO: f64 = 0.1;
+
+#[cfg(test)]
+#[test]
+fn rejects_optimizer_state_before_parameter_sharing() {
+    let device = candle_core::Device::Cpu;
+    let variable = Var::new(&[1f32], &device).unwrap();
+    let mut optimizer = AzAdamW::new(vec![variable], vec![false], 0.001).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "optimizer-sharing-version-{}.safetensors",
+        std::process::id()
+    ));
+    optimizer.save(&path, 1).unwrap();
+    assert_eq!(super::AzNnue::training_state_next_update(&path).unwrap(), 1);
+    let mut tensors = candle_core::safetensors::load(&path, &device).unwrap();
+    let mut state = tensors["state"].to_vec1::<i64>().unwrap();
+    state[0] = 4;
+    tensors.insert(
+        "state".to_owned(),
+        Tensor::new(state.as_slice(), &device).unwrap(),
+    );
+    candle_core::safetensors::save(&tensors, &path).unwrap();
+    assert!(optimizer.restore(&path, 1).is_err());
+    assert!(super::AzNnue::training_state_next_update(&path).is_err());
+    std::fs::remove_file(path).unwrap();
+}
 
 /// steps 为已经完成的更新次数。持续自博弈无需设定总训练步数。
 fn learning_rate(base_lr: f64, steps: usize) -> f64 {
@@ -176,7 +202,18 @@ impl AzAdamW {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn restore(&mut self, path: &Path, next_update: usize) -> Result<()> {
+        self.restore_projected(path, next_update, |weights| Ok(weights.to_vec()))
+    }
+
+    /// 先严格校验推理权重，再恢复原始训练参数及动量。
+    pub fn restore_projected(
+        &mut self,
+        path: &Path,
+        next_update: usize,
+        project: impl Fn(&[Tensor]) -> Result<Vec<Tensor>>,
+    ) -> Result<()> {
         let tensors = candle_core::safetensors::load(path, &candle_core::Device::Cpu)?;
         let get = |name: &str| {
             tensors
@@ -228,25 +265,43 @@ impl AzAdamW {
                 format!("second_moment_{i}"),
             ] {
                 let saved = get(&name)?;
-                if saved.shape() != var.shape()
-                    || saved.dtype() != var.dtype()
-                    || (name.starts_with("weight_")
-                        && saved
-                            .flatten_all()?
-                            .to_vec1::<f32>()?
-                            .iter()
-                            .map(|x| x.to_bits())
-                            .ne(var
-                                .flatten_all()?
-                                .to_vec1::<f32>()?
-                                .iter()
-                                .map(|x| x.to_bits())))
-                {
+                if saved.shape() != var.shape() || saved.dtype() != var.dtype() {
                     candle_core::bail!("AdamW state mismatch at `{name}`");
                 }
             }
         }
+        let saved_weights = (0..self.vars.len())
+            .map(|i| get(&format!("weight_{i}")).cloned())
+            .collect::<Result<Vec<_>>>()?;
+        let current_weights = self
+            .vars
+            .iter()
+            .map(|var| var.to_device(&candle_core::Device::Cpu))
+            .collect::<Result<Vec<_>>>()?;
+        let saved_inference = project(&saved_weights)?;
+        let current_inference = project(&current_weights)?;
+        if saved_inference.len() != self.vars.len() || current_inference.len() != self.vars.len() {
+            candle_core::bail!("invalid optimizer weight projection");
+        }
+        for (i, (saved, current)) in saved_inference.iter().zip(&current_inference).enumerate() {
+            if saved.shape() != current.shape()
+                || saved.dtype() != current.dtype()
+                || saved
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .ne(current
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                        .iter()
+                        .map(|x| x.to_bits()))
+            {
+                candle_core::bail!("AdamW state mismatch at `weight_{i}`");
+            }
+        }
         for i in 0..self.vars.len() {
+            self.vars[i].set(&saved_weights[i].to_device(self.vars[i].device())?)?;
             self.first_moment[i]
                 .set(&get(&format!("first_moment_{i}"))?.to_device(self.vars[i].device())?)?;
             self.second_moment[i]

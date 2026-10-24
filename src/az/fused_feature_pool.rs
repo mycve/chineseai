@@ -57,6 +57,27 @@ pub(super) fn sparse_pool(table: &Tensor, items: &Tensor) -> Result<Tensor> {
     )
 }
 
+/// 训练查表统一走稀疏池化。不要改成 `Tensor::index_select`：Candle 0.10.2
+/// 的反传 index_add 按表列数分配线程，再串行遍历索引；标量表只有一个线程。
+pub(super) fn gather_rows(table: &Tensor, indices: &Tensor) -> Result<Tensor> {
+    let rows = table.dim(0)?;
+    let width = if table.rank() == 1 {
+        1
+    } else {
+        table.dims2()?.1
+    };
+    let count = indices.dims1()?;
+    let output = sparse_pool(
+        &table.reshape((rows, width))?,
+        &indices.reshape((count, 1))?,
+    )?;
+    if table.rank() == 1 {
+        output.squeeze(1)
+    } else {
+        Ok(output)
+    }
+}
+
 impl CustomOp2 for SparsePool {
     fn name(&self) -> &'static str {
         "az-sparse-pool"
@@ -287,4 +308,78 @@ fn cuda_view<'a, T: candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
         candle_core::bail!("{name} must be contiguous")
     };
     Ok(values.slice(start..end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Var};
+
+    fn check_gather(device: &Device) -> Result<()> {
+        for width in [1, 16, 288] {
+            let rows = 37;
+            let count = 8192;
+            let data = (0..rows * width)
+                .map(|i| (i % 29) as f32 / 8.)
+                .collect::<Vec<_>>();
+            // 大量重复同一索引，覆盖 CUDA 原子梯度累加与首尾边界。
+            let ids = (0..count)
+                .map(|i| if i % 3 == 0 { (i % rows) as u32 } else { 0 })
+                .collect::<Vec<_>>();
+            let weights = (0..count * width)
+                .map(|i| (i % 7) as f32 / 16. - 0.1875)
+                .collect::<Vec<_>>();
+            let shape = if width == 1 {
+                vec![rows]
+            } else {
+                vec![rows, width]
+            };
+            let table = Var::from_slice(&data, shape.as_slice(), device)?;
+            let indices = Tensor::new(ids.as_slice(), device)?;
+            let selected = gather_rows(table.as_tensor(), &indices)?;
+            let expected = ids
+                .iter()
+                .flat_map(|&id| {
+                    data[id as usize * width..(id as usize + 1) * width]
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(selected.flatten_all()?.to_vec1::<f32>()?, expected);
+            let weighted = selected
+                .flatten_all()?
+                .mul(&Tensor::new(weights.as_slice(), device)?)?
+                .sum_all()?;
+            let grads = weighted.backward()?;
+            let actual = grads.get(&table).unwrap().flatten_all()?.to_vec1::<f32>()?;
+            let mut expected = vec![0.; rows * width];
+            for (i, &id) in ids.iter().enumerate() {
+                for h in 0..width {
+                    expected[id as usize * width + h] += weights[i * width + h];
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn row_gather_repeated_indices_forward_and_backward() -> Result<()> {
+        check_gather(&Device::Cpu)
+    }
+
+    #[cfg(all(
+        feature = "slow-tests",
+        any(
+            target_os = "windows",
+            all(target_os = "linux", not(target_env = "musl"))
+        )
+    ))]
+    #[test]
+    fn cuda_row_gather_repeated_indices_forward_and_backward() -> Result<()> {
+        if let Some(device) = crate::az::cuda_test_device::shared_cuda_device() {
+            check_gather(device)?;
+        }
+        Ok(())
+    }
 }

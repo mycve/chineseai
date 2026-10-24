@@ -163,7 +163,10 @@ impl GpuTrainer {
         path: &std::path::Path,
         next_update: usize,
     ) -> CandleResult<()> {
-        self.optimizer.restore(path, next_update)
+        self.optimizer
+            .restore_projected(path, next_update, |weights| {
+                self.replica.model.folded_training_weights(weights)
+            })
     }
 
     pub(super) fn steps(&self) -> usize {
@@ -587,6 +590,16 @@ mod monitoring_tests {
                 std::process::id()
             ));
             uninterrupted.save_state(&path, 42).unwrap();
+            for change_input in [true, false] {
+                let mut stale = model.clone();
+                if change_input {
+                    stale.input_hidden[0] += 0.001;
+                } else {
+                    stale.value_head_output[0] += 0.001;
+                }
+                let mut mismatched = GpuTrainer::new(&stale, lr, kind).unwrap();
+                assert!(mismatched.restore_state(&path, 42).is_err());
+            }
             let mut restored = GpuTrainer::new(&model, lr, kind).unwrap();
             restored.restore_state(&path, 42).unwrap();
             std::fs::remove_file(path).unwrap();
