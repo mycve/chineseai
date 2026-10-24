@@ -172,7 +172,11 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         );
         return false;
     }
-    let selfplay_model = model.clone();
+    println!(
+        "publish  : selfplay_weight_average={} (warmup=2048 steps, interval=256, window=5; latest policy)",
+        config.selfplay_weight_average
+    );
+    let selfplay_model = model.selfplay_model(config.selfplay_weight_average);
     let initial_arena_reference_model = {
         if !best_path.exists() {
             save_model(&selfplay_model, &best_path);
@@ -510,7 +514,16 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
                 pool.save_snapshot_lz4(&trainer_snapshot_path)?;
                 cycle_end += chineseai::az::PX0_CYCLE_STEPS;
             }
-            let candidate_model = trainer_model.clone();
+            let candidate_model =
+                trainer_model.selfplay_model(trainer_config.selfplay_weight_average);
+            if trainer_config.checkpoint_interval > 0
+                && train_update.is_multiple_of(trainer_config.checkpoint_interval)
+            {
+                save_model(
+                    &candidate_model,
+                    &Path::new(&trainer_config.model_path).with_extension("selfplay.safetensors"),
+                );
+            }
             publish_selfplay_model(
                 &trainer_shared_model,
                 Arc::new(candidate_model.clone()),
@@ -528,10 +541,15 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
             train_index += 1;
         }
         if train_index > 0 {
+            save_model(&trainer_model, Path::new(&trainer_config.model_path));
             trainer_model.save_training_state(
                 &optimizer_state_path,
                 trainer_start_update.saturating_add(train_index),
             )?;
+            save_model(
+                &trainer_model.selfplay_model(trainer_config.selfplay_weight_average),
+                &Path::new(&trainer_config.model_path).with_extension("selfplay.safetensors"),
+            );
         }
         if let Some(pool) = trainer_pool.as_mut()
             && trainer_stop.load(Ordering::SeqCst)
@@ -1271,8 +1289,7 @@ pub(crate) fn run(cmd: AzLoopArgs) -> bool {
         .unwrap_or_else(|_| panic!("training thread panicked"))
         .unwrap_or_else(|err| panic!("failed to save training state: {err}"));
     if exited_after_ctrl_c || exited_after_target_update {
-        if let Some(model) = interrupt_save_model.as_ref() {
-            save_model(model, Path::new(&config.model_path));
+        if interrupt_save_model.is_some() {
             save_az_loop_progress_pair(
                 &config_path,
                 interrupt_save_next_update,

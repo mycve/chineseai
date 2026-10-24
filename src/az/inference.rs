@@ -392,6 +392,58 @@ impl AzNnue {
             .map_or(0, |trainer| trainer.steps())
     }
 
+    /// 自博弈导出保留最新策略/MLH参数；原始学习器和动量不参与平均。
+    pub fn selfplay_model(&self, weight_average: bool) -> Self {
+        if weight_average && let Some(trainer) = self.gpu_trainer.as_ref() {
+            return trainer.selfplay_model(self);
+        }
+        self.clone()
+    }
+
+    pub(super) fn averaged_weight_count(&self) -> usize {
+        let mut count = 0;
+        macro_rules! count {
+            ($field:ident, $shape:expr) => {
+                if super::weight_average::includes(stringify!($field)) {
+                    count += $shape.iter().product::<usize>();
+                }
+            };
+        }
+        az_weight_tensors!(count, self.hidden_size);
+        count
+    }
+
+    pub(super) fn averaged_weights(&self) -> Vec<f32> {
+        let mut weights = Vec::with_capacity(self.averaged_weight_count());
+        macro_rules! collect {
+            ($field:ident, $shape:expr) => {
+                if super::weight_average::includes(stringify!($field)) {
+                    debug_assert_eq!(self.$field.len(), $shape.iter().product::<usize>());
+                    weights.extend_from_slice(&self.$field);
+                }
+            };
+        }
+        az_weight_tensors!(collect, self.hidden_size);
+        weights
+    }
+
+    pub(super) fn apply_averaged_weights(&mut self, weights: &[f32]) {
+        assert_eq!(weights.len(), self.averaged_weight_count());
+        let mut offset = 0;
+        macro_rules! apply {
+            ($field:ident, $shape:expr) => {
+                if super::weight_average::includes(stringify!($field)) {
+                    debug_assert_eq!(self.$field.len(), $shape.iter().product::<usize>());
+                    let end = offset + self.$field.len();
+                    self.$field.copy_from_slice(&weights[offset..end]);
+                    offset = end;
+                }
+            };
+        }
+        az_weight_tensors!(apply, self.hidden_size);
+        debug_assert_eq!(offset, weights.len());
+    }
+
     pub fn set_training_holdout(
         &mut self,
         samples: Vec<AzTrainingSample>,

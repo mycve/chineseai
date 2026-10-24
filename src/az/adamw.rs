@@ -19,8 +19,8 @@ const MAX_GRAD_NORM: f64 = 10_000.0;
 /// **0.4%**。所以这个旋钮在 Adam 的学习率尺度下几乎不动结果 —— 分组与否不会混淆消融。
 pub(super) const DENSE_WEIGHT_DECAY: f64 = 1e-4;
 /// 调度参数成为恢复契约的一部分；拒绝旧的固定学习率状态。
-// 棋种/位置与跨桶共享参数只保存在训练状态，恢复时必须保留其独立动量。
-pub(super) const STATE_TAG: i64 = 5;
+// 共享参数、独立动量和各张量更新倍率一起构成恢复契约。
+pub(super) const STATE_TAG: i64 = 7;
 /// `state` 张量的元素个数：tag / 模型格式版本 / 步数 / 下次更新的序号。
 const STATE_LEN: usize = 4;
 /// `hyper` 张量还保存预热步数、衰减时间尺度和最低倍率。
@@ -31,10 +31,10 @@ const MIN_LR_RATIO: f64 = 0.1;
 
 #[cfg(test)]
 #[test]
-fn rejects_optimizer_state_before_parameter_sharing() {
+fn rejects_optimizer_state_without_update_groups() {
     let device = candle_core::Device::Cpu;
     let variable = Var::new(&[1f32], &device).unwrap();
-    let mut optimizer = AzAdamW::new(vec![variable], vec![false], 0.001).unwrap();
+    let mut optimizer = AzAdamW::new(vec![variable], vec![false], vec![1.; 1], 0.001).unwrap();
     let path = std::env::temp_dir().join(format!(
         "optimizer-sharing-version-{}.safetensors",
         std::process::id()
@@ -43,14 +43,16 @@ fn rejects_optimizer_state_before_parameter_sharing() {
     assert_eq!(super::AzNnue::training_state_next_update(&path).unwrap(), 1);
     let mut tensors = candle_core::safetensors::load(&path, &device).unwrap();
     let mut state = tensors["state"].to_vec1::<i64>().unwrap();
-    state[0] = 4;
-    tensors.insert(
-        "state".to_owned(),
-        Tensor::new(state.as_slice(), &device).unwrap(),
-    );
-    candle_core::safetensors::save(&tensors, &path).unwrap();
-    assert!(optimizer.restore(&path, 1).is_err());
-    assert!(super::AzNnue::training_state_next_update(&path).is_err());
+    for old_tag in [4, 5, 6] {
+        state[0] = old_tag;
+        tensors.insert(
+            "state".to_owned(),
+            Tensor::new(state.as_slice(), &device).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+        assert!(optimizer.restore(&path, 1).is_err());
+        assert!(super::AzNnue::training_state_next_update(&path).is_err());
+    }
     std::fs::remove_file(path).unwrap();
 }
 
@@ -75,13 +77,20 @@ pub(super) struct AzAdamW {
     second_moment: Vec<Var>,
     /// 与 `vars` 同序：该张量是否施加 weight decay。
     decay: Vec<bool>,
+    /// 在 Adam 归一化后缩放更新量；不改变 decay 系数或梯度动量。
+    update_scale: Vec<f64>,
     pub steps: usize,
     pub last_lr: f64,
     pub base_lr: f64,
 }
 
 impl AzAdamW {
-    pub fn new(vars: Vec<Var>, decay: Vec<bool>, base_lr: f64) -> Result<Self> {
+    pub fn new(
+        vars: Vec<Var>,
+        decay: Vec<bool>,
+        update_scale: Vec<f64>,
+        base_lr: f64,
+    ) -> Result<Self> {
         if !base_lr.is_finite() || base_lr <= 0.0 {
             candle_core::bail!("AdamW peak learning rate must be finite and positive");
         }
@@ -92,6 +101,11 @@ impl AzAdamW {
                 vars.len()
             );
         }
+        if update_scale.len() != vars.len()
+            || update_scale.iter().any(|s| !s.is_finite() || *s <= 0.)
+        {
+            candle_core::bail!("AdamW update scales must match vars and be finite and positive");
+        }
         let first_moment = zeros_like(&vars)?;
         let second_moment = zeros_like(&vars)?;
         Ok(Self {
@@ -99,6 +113,7 @@ impl AzAdamW {
             first_moment,
             second_moment,
             decay,
+            update_scale,
             steps: 0,
             last_lr: 0.0,
             base_lr,
@@ -131,7 +146,8 @@ impl AzAdamW {
             let next_v = ((v.as_tensor() * BETA2)? + (grad.sqr()? * (1.0 - BETA2))?)?;
             let m_hat = (&next_m * scale_m)?;
             let v_hat = (&next_v * scale_v)?;
-            let update = ((m_hat / (v_hat.sqrt()? + EPS)?)? * lr)?;
+            // 缩放须放在 Adam 归一化之后；预先缩放梯度会被一、二阶矩基本抵消。
+            let update = ((m_hat / (v_hat.sqrt()? + EPS)?)? * (lr * self.update_scale[index]))?;
             // Decoupled weight decay：只在该张量被标记为需要 decay、且本步存在梯度时施加，
             // 与 candle 的实现口径一致。
             let next_var = if self.decay[index] {
@@ -147,9 +163,18 @@ impl AzAdamW {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn save(&self, path: &Path, next_update: usize) -> Result<()> {
+        self.save_with_extra(path, next_update, HashMap::new())
+    }
+
+    pub fn save_with_extra(
+        &self,
+        path: &Path,
+        next_update: usize,
+        mut tensors: HashMap<String, Tensor>,
+    ) -> Result<()> {
         let cpu = candle_core::Device::Cpu;
-        let mut tensors = HashMap::new();
         tensors.insert(
             "feature_schema".to_owned(),
             Tensor::new(super::features::feature_schema().as_slice(), &cpu)?,
@@ -185,6 +210,10 @@ impl AzAdamW {
         );
         let mask: Vec<i64> = self.decay.iter().map(|&flag| i64::from(flag)).collect();
         tensors.insert("decay_mask".to_owned(), Tensor::new(mask, &cpu)?);
+        tensors.insert(
+            "update_scale".to_owned(),
+            Tensor::new(self.update_scale.as_slice(), &cpu)?,
+        );
         for (i, ((var, m), v)) in self
             .vars
             .iter()
@@ -204,7 +233,12 @@ impl AzAdamW {
 
     #[cfg(test)]
     pub fn restore(&mut self, path: &Path, next_update: usize) -> Result<()> {
-        self.restore_projected(path, next_update, |weights| Ok(weights.to_vec()))
+        self.restore_projected(
+            path,
+            next_update,
+            |weights| Ok(weights.to_vec()),
+            |_, _| Ok(0),
+        )
     }
 
     /// 先严格校验推理权重，再恢复原始训练参数及动量。
@@ -213,6 +247,7 @@ impl AzAdamW {
         path: &Path,
         next_update: usize,
         project: impl Fn(&[Tensor]) -> Result<Vec<Tensor>>,
+        restore_extra: impl FnOnce(&HashMap<String, Tensor>, usize) -> Result<usize>,
     ) -> Result<()> {
         let tensors = candle_core::safetensors::load(path, &candle_core::Device::Cpu)?;
         let get = |name: &str| {
@@ -226,6 +261,7 @@ impl AzAdamW {
         }
         let hyper = get("hyper")?.to_vec1::<f64>()?;
         let mask = get("decay_mask")?.to_vec1::<i64>()?;
+        let update_scale = get("update_scale")?.to_vec1::<f64>()?;
         let expected_mask: Vec<i64> = self.decay.iter().map(|&flag| i64::from(flag)).collect();
         if state.len() != STATE_LEN
             || state[0] != STATE_TAG
@@ -242,20 +278,25 @@ impl AzAdamW {
             || hyper[7] != DECAY_STEPS as f64
             || hyper[8] != MIN_LR_RATIO
             || !hyper[1].is_finite()
+            || update_scale != self.update_scale
             || mask != expected_mask
-            || tensors.len() != 4 + self.vars.len() * 3
         {
             candle_core::bail!(
-                "AdamW state does not match resume metadata: format={:?}/{} next_update={:?}/{next_update} base_lr={:?}/{} decay_mask_match={} tensors={}/{}",
+                "AdamW state does not match resume metadata: format={:?}/{} next_update={:?}/{next_update} base_lr={:?}/{} decay_mask_match={} update_scale_match={} tensors={}/{}",
                 state.get(1),
                 crate::infra::version::MODEL_FORMAT_VERSION,
                 state.get(3),
                 hyper.first(),
                 self.base_lr,
                 mask == expected_mask,
+                update_scale == self.update_scale,
                 tensors.len(),
-                4 + self.vars.len() * 3
+                5 + self.vars.len() * 3
             );
+        }
+        let extra = restore_extra(&tensors, state[2] as usize)?;
+        if tensors.len() != 5 + self.vars.len() * 3 + extra {
+            candle_core::bail!("unexpected AdamW checkpoint tensors");
         }
         // 先完整验证；不允许旧 checkpoint 的动量误配到不同权重。
         for (i, var) in self.vars.iter().enumerate() {
@@ -385,14 +426,15 @@ mod tests {
         ));
         for steps in [249, 10_249, 990_249] {
             let var = Var::new(&[1f32], &Device::Cpu).unwrap();
-            let mut opt = AzAdamW::new(vec![var.clone()], vec![true], 4e-4).unwrap();
+            let mut opt = AzAdamW::new(vec![var.clone()], vec![true], vec![1.; 1], 4e-4).unwrap();
             step(&mut opt, &[0.5]);
             opt.steps = steps;
             opt.last_lr = learning_rate(opt.base_lr, steps - 1);
             opt.save(&path, 42).unwrap();
             let saved_var =
                 Var::new(var.to_vec1::<f32>().unwrap().as_slice(), &Device::Cpu).unwrap();
-            let mut restored = AzAdamW::new(vec![saved_var.clone()], vec![true], 4e-4).unwrap();
+            let mut restored =
+                AzAdamW::new(vec![saved_var.clone()], vec![true], vec![1.; 1], 4e-4).unwrap();
             restored.restore(&path, 42).unwrap();
             for _ in 0..3 {
                 step(&mut opt, &[0.25]);
@@ -424,7 +466,7 @@ mod tests {
                 &Device::Cpu,
             )
             .unwrap();
-            let mut opt = AzAdamW::new(vec![var], vec![true], 4e-4).unwrap();
+            let mut opt = AzAdamW::new(vec![var], vec![true], vec![1.; 1], 4e-4).unwrap();
             assert!(opt.restore(&path, 42).is_err());
         }
         std::fs::remove_file(path).unwrap();
@@ -436,8 +478,13 @@ mod tests {
         let decayed = Var::new(&[1f32, -2.], &Device::Cpu).unwrap();
         let plain = Var::new(&[3f32, 0.5], &Device::Cpu).unwrap();
         let lr = 4e-4;
-        let mut opt =
-            AzAdamW::new(vec![decayed.clone(), plain.clone()], vec![true, false], lr).unwrap();
+        let mut opt = AzAdamW::new(
+            vec![decayed.clone(), plain.clone()],
+            vec![true, false],
+            vec![1.; 2],
+            lr,
+        )
+        .unwrap();
         let mut reference = [1f64, -2., 3., 0.5];
         let mut m = [0f64; 4];
         let mut v = [0f64; 4];
@@ -497,7 +544,7 @@ mod tests {
     #[test]
     fn decay_group_can_be_disabled_entirely_for_lookup_tables() {
         let table = Var::new(&[0.5f32], &Device::Cpu).unwrap();
-        let mut opt = AzAdamW::new(vec![table.clone()], vec![false], 4e-4).unwrap();
+        let mut opt = AzAdamW::new(vec![table.clone()], vec![false], vec![1.; 1], 4e-4).unwrap();
         // 梯度恒为 0 时，m/v 保持 0，更新量是 0/(0+eps)=0，权重必须一动不动 ——
         // 这正是"查表组 wd=0"想要的行为：没有 decay 就不会慢慢吃掉未激活的行。
         let grads = table
@@ -514,9 +561,40 @@ mod tests {
     }
 
     #[test]
+    fn update_scales_apply_after_adam_normalization() {
+        let normal = Var::new(&[0f32], &Device::Cpu).unwrap();
+        let slow = Var::new(&[0f32], &Device::Cpu).unwrap();
+        let mut opt = AzAdamW::new(
+            vec![normal.clone(), slow.clone()],
+            vec![false, false],
+            vec![1., 0.1],
+            4e-4,
+        )
+        .unwrap();
+        let grads = (normal.as_tensor() + slow.as_tensor())
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        opt.step(&grads).unwrap();
+        let normal_update = normal.to_vec1::<f32>().unwrap()[0];
+        let slow_update = slow.to_vec1::<f32>().unwrap()[0];
+        assert!((slow_update / normal_update - 0.1).abs() < 1e-6);
+        assert_eq!(
+            opt.first_moment[0].to_vec1::<f32>().unwrap(),
+            opt.first_moment[1].to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            opt.second_moment[0].to_vec1::<f32>().unwrap(),
+            opt.second_moment[1].to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
     fn restored_training_matches_uninterrupted_and_rejects_mismatches() {
         let var = Var::new(&[1f32, -2.], &Device::Cpu).unwrap();
-        let mut opt = AzAdamW::new(vec![var.clone()], vec![true], 4e-4).unwrap();
+        let mut opt = AzAdamW::new(vec![var.clone()], vec![true], vec![0.1], 4e-4).unwrap();
         step(&mut opt, &[3., -4.]);
         let dir = std::env::current_dir().unwrap().join("tmp");
         std::fs::create_dir_all(&dir).unwrap();
@@ -527,13 +605,18 @@ mod tests {
         opt.save(&path, 42).unwrap();
         let restored_var =
             Var::new(var.to_vec1::<f32>().unwrap().as_slice(), &Device::Cpu).unwrap();
-        let mut restored = AzAdamW::new(vec![restored_var.clone()], vec![true], 4e-4).unwrap();
+        let mut restored =
+            AzAdamW::new(vec![restored_var.clone()], vec![true], vec![0.1], 4e-4).unwrap();
         for attempts in [43usize, 41] {
             assert!(restored.restore(&path, attempts).is_err());
         }
         // 换一个 decay 分组的优化器不能载入这份状态。
-        let mut wrong_group = AzAdamW::new(vec![restored_var.clone()], vec![false], 4e-4).unwrap();
+        let mut wrong_group =
+            AzAdamW::new(vec![restored_var.clone()], vec![false], vec![1.; 1], 4e-4).unwrap();
         assert!(wrong_group.restore(&path, 42).is_err());
+        let mut wrong_scale =
+            AzAdamW::new(vec![restored_var.clone()], vec![true], vec![1.], 4e-4).unwrap();
+        assert!(wrong_scale.restore(&path, 42).is_err());
         restored.restore(&path, 42).unwrap();
         assert_eq!(restored.steps, opt.steps);
         // 恢复后继续走两步，必须与不中断的优化器逐位一致（步数计数器是状态的一部分，

@@ -70,6 +70,9 @@ impl GpuTrainer {
     pub(super) fn steps(&self) -> usize {
         0
     }
+    pub(super) fn selfplay_model(&self, model: &super::AzNnue) -> super::AzNnue {
+        model.clone()
+    }
     pub(super) fn set_holdout(&mut self, _: Vec<super::AzTrainingSample>) {}
     pub(super) fn take_checks(&mut self) -> Vec<super::AzHoldoutReport> {
         Vec::new()

@@ -42,6 +42,7 @@ mod train_gpu;
 ))]
 #[path = "train_gpu_candle.rs"]
 mod train_gpu_candle;
+mod weight_average;
 
 pub use alphazero::{
     AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,

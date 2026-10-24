@@ -498,6 +498,35 @@ fn local_motif_dependencies_cover_every_move_of_tactical_witnesses() {
 #[test]
 fn nnue_single_and_two_ply_updates_match_full_network() {
     let model = AzNnue::random(16, 19);
+    nnue_updates_match_full_network(&model);
+}
+
+#[test]
+fn averaged_nnue_updates_match_full_network() {
+    let model = averaged_test_model(16, 19);
+    nnue_updates_match_full_network(&model);
+}
+
+fn averaged_test_model(hidden: usize, seed: u64) -> AzNnue {
+    let model = AzNnue::random(hidden, seed);
+    let mut average = super::weight_average::WeightAverage::new(&model);
+    for (i, step) in [1024, 1280, 1536, 1792, 2048].into_iter().enumerate() {
+        average
+            .capture(step, |snapshot| {
+                let values: Vec<_> = model
+                    .averaged_weights()
+                    .into_iter()
+                    .map(|v| v + i as f32 * 1e-4)
+                    .collect();
+                snapshot.apply_averaged_weights(&values);
+                Ok(())
+            })
+            .unwrap();
+    }
+    average.model(&model)
+}
+
+fn nnue_updates_match_full_network(model: &AzNnue) {
     let mut rng = SplitMix64::new(991);
     let mut p = Position::startpos();
     let mut arena = node_features::NodeFeatureArena::default();
@@ -602,6 +631,15 @@ fn unknown_rules_are_distinct_from_known_absence() {
 #[test]
 fn two_ply_feature_deltas_and_branch_restores_are_exact() {
     let model = AzNnue::random(12, 171);
+    assert_two_ply_deltas_and_restores(&model);
+}
+
+#[test]
+fn averaged_two_ply_deltas_and_branch_restores_are_exact() {
+    assert_two_ply_deltas_and_restores(&averaged_test_model(12, 171));
+}
+
+fn assert_two_ply_deltas_and_restores(model: &AzNnue) {
     let mut rng = SplitMix64::new(921);
     let mut p = Position::startpos();
     for _ in 0..80 {
@@ -724,8 +762,8 @@ fn training_parity(device: &candle_core::Device) {
                 + output.value_logits.sqr().unwrap().sum_all().unwrap())
             .unwrap();
             let grads = loss.backward().unwrap();
-            let (vars, decay) = candle.all_vars_with_decay();
-            let mut opt = adamw::AzAdamW::new(vars, decay, 0.01).unwrap();
+            let (vars, decay, scales) = candle.optimizer_parameters();
+            let mut opt = adamw::AzAdamW::new(vars, decay, scales, 0.01).unwrap();
             opt.step(&grads).unwrap();
             let before = model.clone();
             candle.copy_to_model(&mut model).unwrap();

@@ -72,6 +72,8 @@ pub struct AzLoopFileConfig {
     pub train_samples_per_update: usize,
     /// 统一使用 AdamW，lr 是预热结束时的峰值学习率。
     pub train_optimizer: AzTrainOptimizer,
+    /// 自博弈发布最近五个晚期快照的主干/价值头平均；策略参数取最新值。
+    pub selfplay_weight_average: bool,
     pub mirror_probability: f32,
     pub train_value_weight: f32,
     pub train_policy_weight: f32,
@@ -152,6 +154,7 @@ impl Default for AzLoopFileConfig {
             train_warmup_samples: 600000,
             train_samples_per_update: 120000,
             train_optimizer: AzTrainOptimizer::default(),
+            selfplay_weight_average: true,
             mirror_probability: 0.5,
             train_value_weight: 1.0,
             train_policy_weight: 1.0,
@@ -267,6 +270,7 @@ impl AzLoopFileConfig {
         line!("train_warmup_samples", self.train_warmup_samples);
         line!("train_samples_per_update", self.train_samples_per_update);
         line!("train_optimizer", q(self.train_optimizer.as_str()));
+        line!("selfplay_weight_average", self.selfplay_weight_average);
         line!("mirror_probability", f(self.mirror_probability));
         line!("train_value_weight", f(self.train_value_weight));
         line!("train_policy_weight", f(self.train_policy_weight));
@@ -591,6 +595,7 @@ mod tests {
         assert!(text.contains("hidden_size = 96\n"));
         assert!(text.contains("replay_capacity = 2400000\n"));
         assert!(text.contains("train_samples_per_update = 120000\n"));
+        assert!(text.contains("selfplay_weight_average = true\n"));
         assert!(text.contains("train_warmup_samples = 600000\n"));
         assert!(text.contains("replay_recent_games = 7500\n"));
         assert_eq!(

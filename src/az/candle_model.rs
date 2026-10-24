@@ -196,14 +196,32 @@ impl AzCandleModel {
             self.value_shared_output.clone(),
         ]
     }
-    pub(super) fn all_vars_with_decay(&self) -> (Vec<Var>, Vec<bool>) {
+    pub(super) fn optimizer_parameters(&self) -> (Vec<Var>, Vec<bool>, Vec<f64>) {
+        let vars = self.all_vars();
+        // K/M 条件表及其投影容易在小样本中共同过拟合；保留前向和全部特征，
+        // 只降低这些张量的 Adam 更新幅度，weight decay 仍沿用原分组。
+        let scales = vars
+            .iter()
+            .map(|var| {
+                if var.id() == self.king_piece.id()
+                    || var.id() == self.king_projection.id()
+                    || var.id() == self.motif_embedding.id()
+                    || var.id() == self.motif_projection.id()
+                {
+                    0.1
+                } else {
+                    1.
+                }
+            })
+            .collect();
         (
-            self.all_vars(),
+            vars,
             vec![
                 false, false, false, true, false, true, false, true, true, true, true, false, true,
                 true, false, false, false, true, false, false, false, false, true, false, false,
                 true, false, false, true,
             ],
+            scales,
         )
     }
     pub(super) fn copy_to_model(&self, model: &mut AzNnue) -> CandleResult<()> {

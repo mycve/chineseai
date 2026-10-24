@@ -16,6 +16,7 @@ pub(super) struct GpuTrainer {
     optimizer_kind: AzTrainOptimizer,
     replica: GpuReplica,
     optimizer: AzAdamW,
+    weight_average: super::weight_average::WeightAverage,
     holdout: Option<Arc<Vec<AzTrainingSample>>>,
     checks: Vec<super::AzHoldoutReport>,
 }
@@ -129,14 +130,15 @@ impl GpuTrainer {
                 GpuReplica::new_cpu(model)?
             }
         };
-        let (vars, decay) = replica.model.all_vars_with_decay();
-        let optimizer = AzAdamW::new(vars, decay, lr as f64)?;
+        let (vars, decay, scales) = replica.model.optimizer_parameters();
+        let optimizer = AzAdamW::new(vars, decay, scales, lr as f64)?;
 
         Ok(Self {
             arch: model.arch,
             optimizer_kind,
             replica,
             optimizer,
+            weight_average: super::weight_average::WeightAverage::new(model),
             holdout: None,
             checks: Vec::new(),
         })
@@ -155,7 +157,8 @@ impl GpuTrainer {
         path: &std::path::Path,
         next_update: usize,
     ) -> CandleResult<()> {
-        self.optimizer.save(path, next_update)
+        self.optimizer
+            .save_with_extra(path, next_update, self.weight_average.state()?)
     }
 
     pub(super) fn restore_state(
@@ -163,14 +166,20 @@ impl GpuTrainer {
         path: &std::path::Path,
         next_update: usize,
     ) -> CandleResult<()> {
-        self.optimizer
-            .restore_projected(path, next_update, |weights| {
-                self.replica.model.folded_training_weights(weights)
-            })
+        self.optimizer.restore_projected(
+            path,
+            next_update,
+            |weights| self.replica.model.folded_training_weights(weights),
+            |tensors, step| self.weight_average.restore(tensors, step),
+        )
     }
 
     pub(super) fn steps(&self) -> usize {
         self.optimizer.steps
+    }
+
+    pub(super) fn selfplay_model(&self, raw: &AzNnue) -> AzNnue {
+        self.weight_average.model(raw)
     }
 
     pub(super) fn set_holdout(&mut self, samples: Vec<AzTrainingSample>) {
@@ -252,6 +261,9 @@ impl GpuTrainer {
         self.optimizer.step(&output.grads)?;
         profile_sync(&self.replica.device)?;
         profile.optimizer_seconds += optimizer_started.elapsed().as_secs_f64();
+        self.weight_average.capture(self.optimizer.steps, |model| {
+            self.replica.model.copy_to_model(model)
+        })?;
         Ok((output.stats, profile))
     }
 
@@ -572,7 +584,10 @@ mod monitoring_tests {
             value: 1.0,
             policy: 1.0,
         };
-        for (kind, lr) in [(AzTrainOptimizer::AdamW, 4e-4f32)] {
+        for (kind, lr, average_ready) in [
+            (AzTrainOptimizer::AdamW, 4e-4f32, false),
+            (AzTrainOptimizer::AdamW, 4e-4f32, true),
+        ] {
             let mut model = AzNnue::random(16, 20260927);
             let mut uninterrupted = GpuTrainer::new(&model, lr, kind).unwrap();
             eprintln!(
@@ -581,6 +596,13 @@ mod monitoring_tests {
             );
             let (stats, _) = uninterrupted.train_batch_single(batch(), weights).unwrap();
             assert!(stats.loss.is_finite());
+            if average_ready {
+                // 只跳过非取样步，用真实更新覆盖五个快照边界。
+                for step in [1024, 1280, 1536, 1792, 2048] {
+                    uninterrupted.optimizer.steps = step - 1;
+                    uninterrupted.train_batch_single(batch(), weights).unwrap();
+                }
+            }
             uninterrupted.copy_to_model(&mut model).unwrap();
             let dir = std::env::current_dir().unwrap().join("tmp");
             std::fs::create_dir_all(&dir).unwrap();
@@ -590,6 +612,12 @@ mod monitoring_tests {
                 std::process::id()
             ));
             uninterrupted.save_state(&path, 42).unwrap();
+            if average_ready {
+                let published = uninterrupted.selfplay_model(&model);
+                assert_ne!(published.averaged_weights(), model.averaged_weights());
+                let mut wrong = GpuTrainer::new(&published, lr, kind).unwrap();
+                assert!(wrong.restore_state(&path, 42).is_err());
+            }
             for change_input in [true, false] {
                 let mut stale = model.clone();
                 if change_input {
@@ -602,9 +630,20 @@ mod monitoring_tests {
             }
             let mut restored = GpuTrainer::new(&model, lr, kind).unwrap();
             restored.restore_state(&path, 42).unwrap();
+            assert_eq!(
+                restored.selfplay_model(&model).averaged_weights(),
+                uninterrupted.selfplay_model(&model).averaged_weights()
+            );
             std::fs::remove_file(path).unwrap();
+            if average_ready {
+                uninterrupted.optimizer.steps = 2303;
+                restored.optimizer.steps = 2303;
+            }
             uninterrupted.train_batch_single(batch(), weights).unwrap();
             restored.train_batch_single(batch(), weights).unwrap();
+            let a = uninterrupted.selfplay_model(&model).averaged_weights();
+            let b = restored.selfplay_model(&model).averaged_weights();
+            assert!(a.iter().zip(b).all(|(a, b)| (*a - b).abs() < 1e-6));
             assert_eq!(restored.optimizer.steps, uninterrupted.optimizer.steps);
             assert_eq!(
                 restored.last_learning_rate(),
@@ -637,11 +676,12 @@ mod monitoring_tests {
         for (kind, lr) in [(AzTrainOptimizer::AdamW, 4e-4)] {
             let model = AzNnue::random(8, 87);
             let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
-            let (vars, decay) = candle.all_vars_with_decay();
+            let (vars, decay, scales) = candle.optimizer_parameters();
             let partial_len = vars.len() - 1;
             let partial = AzAdamW::new(
                 vars[..partial_len].to_vec(),
                 decay[..partial_len].to_vec(),
+                scales[..partial_len].to_vec(),
                 lr,
             )
             .unwrap();
@@ -652,7 +692,7 @@ mod monitoring_tests {
             ));
             partial.save(&path, 44109).unwrap();
             assert_eq!(AzNnue::training_state_next_update(&path).unwrap(), 44109);
-            let mut restored = AzAdamW::new(vars, decay, lr).unwrap();
+            let mut restored = AzAdamW::new(vars, decay, scales, lr).unwrap();
             assert!(restored.restore(&path, 44109).is_err());
             std::fs::remove_file(path).unwrap();
         }
@@ -693,8 +733,8 @@ mod monitoring_tests {
         let initial = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
         assert_eq!(initial.stats.moves_left_samples, 1);
         let initial_loss = initial.stats.moves_left_loss;
-        let (vars, decay) = replica.model.all_vars_with_decay();
-        let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
+        let (vars, decay, scales) = replica.model.optimizer_parameters();
+        let mut optimizer = AzAdamW::new(vars, decay, scales, 4e-4).unwrap();
         for _ in 0..5 {
             let loss = replica.compute_batch_loss(&batch, 1, 0.0, 0.0).unwrap();
             optimizer
@@ -750,7 +790,8 @@ mod monitoring_tests {
         masked.value_wdl = [1.0, 0.0, 0.0];
         masked.value_weight = 0.0;
         masked.policy_weight = 0.0;
-        let replica = GpuReplica::new_cpu(&AzNnue::random(16, 20260907)).unwrap();
+        let model = AzNnue::random(16, 20260907);
+        let replica = GpuReplica::new_cpu(&model).unwrap();
         let evaluate = |samples: &[AzTrainingSample]| {
             let ids: Vec<_> = (0..samples.len()).collect();
             let batch =
@@ -807,6 +848,7 @@ mod monitoring_tests {
         let optimizer = AzAdamW::new(
             replica.model.all_vars(),
             vec![true; replica.model.all_vars().len()],
+            vec![1.; replica.model.all_vars().len()],
             4e-4,
         )
         .unwrap();
@@ -815,6 +857,7 @@ mod monitoring_tests {
             optimizer_kind: AzTrainOptimizer::AdamW,
             replica,
             optimizer,
+            weight_average: super::super::weight_average::WeightAverage::new(&model),
             holdout: None,
             checks: Vec::new(),
         };
