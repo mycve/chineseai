@@ -201,7 +201,8 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
                     dd,
                     captured,
                     position.gives_check_after_move_fast(mv),
-                )[0] % CALIBRATION_CLASSES,
+                )[0] % POLICY_TACTICAL_SIGNATURE_BUCKETS
+                    + moved * POLICY_TACTICAL_SIGNATURE_BUCKETS,
             );
         }
         let (wdl, logits) = outputs_for_training_sample(model, sample).ok_or_else(fail)?;
@@ -319,12 +320,18 @@ pub fn calibrate_policy(
     let after_ce = cross_entropy(&rows, &delta);
     let range = 0..POLICY_TACTICAL_EXACT_SIZE;
     let original = model.policy_tactical[range.clone()].to_vec();
-    for ((value, old), addition) in model.policy_tactical[range.clone()]
-        .iter_mut()
-        .zip(&original)
-        .zip(delta.iter().cycle())
-    {
-        *value = old + addition;
+    for move_index in 0..DENSE_MOVE_SPACE {
+        for piece in 0..POLICY_PIECE_SIZE {
+            let Some(pair) = policy_move_piece_index(move_index, piece) else {
+                continue;
+            };
+            let start = pair * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+            let class = piece * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+            for signature in 0..POLICY_TACTICAL_SIGNATURE_BUCKETS {
+                model.policy_tactical[start + signature] =
+                    original[start + signature] + delta[class + signature];
+            }
+        }
     }
     model.rebuild_policy_tactical();
     let audit = (|| -> io::Result<f32> {

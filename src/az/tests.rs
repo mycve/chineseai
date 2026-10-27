@@ -14,6 +14,13 @@ use super::{
     visit_value_threat_features,
 };
 
+fn geometric_move_index(piece: usize, ordinal: usize) -> usize {
+    (0..DENSE_MOVE_SPACE)
+        .filter(|&mv| super::policy_move_piece_index(mv, piece).is_some())
+        .nth(ordinal)
+        .unwrap()
+}
+
 // 下面这三个测试只在 slow-tests 下编译，它们独占的导入也一并门控，避免默认构建出现 unused import。
 #[cfg(feature = "slow-tests")]
 use super::{AzTrainLossWeights, train_samples, train_samples_weighted};
@@ -250,7 +257,16 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
     assert_eq!(quiet[1], POLICY_TACTICAL_SIZE);
     let pawn = policy_tactical_indices(0, 4, true, false, true, false, Some(7), false);
     let rook = policy_tactical_indices(0, 4, true, false, true, false, Some(11), false);
-    let elsewhere = policy_tactical_indices(100, 4, true, false, true, false, Some(11), false);
+    let elsewhere = policy_tactical_indices(
+        geometric_move_index(4, 1),
+        4,
+        true,
+        false,
+        true,
+        false,
+        Some(11),
+        false,
+    );
     assert_ne!(pawn[1], rook[1]);
     assert_eq!(rook[1], elsewhere[1]);
     let mut seen = std::collections::HashSet::new();
@@ -258,7 +274,7 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
         for victim in 7..14 {
             for state in 0..32 {
                 let indices = policy_tactical_indices(
-                    0,
+                    geometric_move_index(mover, 0),
                     mover,
                     state & 1 != 0,
                     state & 2 != 0,
@@ -292,6 +308,86 @@ fn tactical_policy_terms_distinguish_move_state() {
 use std::fs;
 
 #[test]
+fn compact_policy_rows_are_unique_and_cover_both_tables() {
+    let mut pairs = vec![false; super::POLICY_MOVE_PIECE_COUNT];
+    let mut sparse = vec![false; super::POLICY_SPARSE_MAIN_SIZE];
+    let mut tactical = vec![false; super::POLICY_TACTICAL_EXACT_SIZE];
+    let mut counts = [0usize; 7];
+    for mv in 0..DENSE_MOVE_SPACE {
+        for piece in 0..7 {
+            let Some(pair) = super::policy_move_piece_index(mv, piece) else {
+                continue;
+            };
+            assert!(!pairs[pair], "重复的紧凑编号 {pair}");
+            pairs[pair] = true;
+            counts[piece] += 1;
+            for us in 0..9 {
+                for them in 0..9 {
+                    let row = super::policy_sparse_main_index(mv, piece, us, them);
+                    assert!(!sparse[row]);
+                    sparse[row] = true;
+                }
+            }
+            for signature in 0..64 {
+                let row = policy_tactical_indices(
+                    mv,
+                    piece,
+                    signature & 1 != 0,
+                    signature & 2 != 0,
+                    signature & 4 != 0,
+                    signature & 8 != 0,
+                    (signature & 16 != 0).then_some(7),
+                    signature & 32 != 0,
+                )[0];
+                assert!(!tactical[row]);
+                tactical[row] = true;
+            }
+        }
+    }
+    assert_eq!(counts, [24, 8, 16, 508, 1530, 1530, 126]);
+    assert!(pairs.into_iter().all(|used| used));
+    assert!(sparse.into_iter().all(|used| used));
+    assert!(tactical.into_iter().all(|used| used));
+}
+
+#[test]
+fn compact_policy_rejects_impossible_piece_geometry() {
+    let mapped = |uci: &str, piece| {
+        let mv = Move::from_uci(uci).unwrap();
+        let dense = move_map().sparse_to_dense[mv.from as usize * BOARD_SIZE + mv.to as usize];
+        dense != u16::MAX && super::policy_move_piece_index(dense as usize, piece).is_some()
+    };
+    for (uci, piece) in [
+        ("e0e1", 0),
+        ("d0e1", 1),
+        ("c0e2", 2),
+        ("b0c2", 3),
+        ("a0a9", 4),
+        ("a0a9", 5),
+        ("a3a4", 6),
+        ("a5b5", 6),
+    ] {
+        assert!(mapped(uci, piece), "合法几何组合被丢弃: {uci}, {piece}");
+    }
+    for (uci, piece) in [
+        ("a0a1", 0),
+        ("e0e1", 1),
+        ("g4e6", 2),
+        ("a0a1", 3),
+        ("b0c2", 4),
+        ("b0c2", 5),
+        ("a3b3", 6),
+        ("b3b4", 6),
+        ("a4a3", 6),
+    ] {
+        assert!(
+            !mapped(uci, piece),
+            "不可能的几何组合仍有参数行: {uci}, {piece}"
+        );
+    }
+}
+
+#[test]
 fn px0_policy_indices_cover_both_sides_of_legal_selfplay() {
     assert_eq!(dense_move_index(Move::new(81, 72)), 0); // Px0 a0a1
     assert_eq!(dense_move_index(Move::new(81, 63)), 1); // Px0 a0a2
@@ -308,6 +404,16 @@ fn px0_policy_indices_cover_both_sides_of_legal_selfplay() {
             let normalized = canonical_move(position.side_to_move(), mv);
             let index = dense_move_index(normalized);
             assert!(index < 2062);
+            let piece = crate::az::nnue::piece_absolute_feature_index(
+                position.side_to_move(),
+                position.piece_at(mv.from as usize).unwrap(),
+            );
+            assert!(
+                super::policy_move_piece_index(index, piece).is_some(),
+                "合法走法没有紧凑策略行: {} {}",
+                position.to_fen(),
+                mv.to_uci()
+            );
             assert_eq!(
                 dense_move_squares(index),
                 Some((normalized.from as usize, normalized.to as usize))
@@ -1353,7 +1459,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[41.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[42.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());

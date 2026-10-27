@@ -15,6 +15,44 @@ pub(crate) const fn opposite_feature(feature: usize) -> usize {
     ((piece + 7) % 14) * BOARD_SIZE + (BOARD_SIZE - 1 - feature % BOARD_SIZE)
 }
 
+/// 面向当前视角的棋子位置几何约束，不考虑占用、蹩马腿或塞象眼。
+pub(crate) fn canonical_piece_square_reachable(piece: usize, square: usize) -> bool {
+    let rank = square / BOARD_FILES;
+    let file = square % BOARD_FILES;
+    let ours = piece < 7;
+    match piece % 7 {
+        0 => (3..=5).contains(&file) && if ours { rank >= 7 } else { rank <= 2 },
+        1 => {
+            if ours {
+                matches!((rank, file), (7, 3) | (7, 5) | (8, 4) | (9, 3) | (9, 5))
+            } else {
+                matches!((rank, file), (0, 3) | (0, 5) | (1, 4) | (2, 3) | (2, 5))
+            }
+        }
+        2 => {
+            if ours {
+                matches!(
+                    (rank, file),
+                    (5, 2) | (5, 6) | (7, 0) | (7, 4) | (7, 8) | (9, 2) | (9, 6)
+                )
+            } else {
+                matches!(
+                    (rank, file),
+                    (0, 2) | (0, 6) | (2, 0) | (2, 4) | (2, 8) | (4, 2) | (4, 6)
+                )
+            }
+        }
+        6 => {
+            if ours {
+                rank <= 4 || (rank == 5 || rank == 6) && file.is_multiple_of(2)
+            } else {
+                rank >= 5 || (rank == 3 || rank == 4) && file.is_multiple_of(2)
+            }
+        }
+        _ => true,
+    }
+}
+
 pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {
     let mut features = Vec::with_capacity(96);
     fill_sparse_features_az(position, &mut features);

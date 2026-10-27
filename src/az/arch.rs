@@ -4,7 +4,7 @@
 //! 策略由非线性局面上下文、线性局面累加器、将位走法表、战术表和重复项组成。
 //! 精确表已覆盖的因子不再单独参数化，训练与推理共用表布局。
 
-use crate::az::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS};
+use crate::az::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_piece_square_reachable};
 use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move};
 
 use super::px0_policy_map;
@@ -17,8 +17,10 @@ pub(crate) const POLICY_THREAT_CONTEXT_SIZE: usize = POLICY_MOVE_CONTEXT_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_RANK: usize = 64;
 pub(crate) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
 pub(crate) const POLICY_TACTICAL_TERMS: usize = 2;
+/// 几何可行的走法×棋种组合：将24、士8、象16、马508、车1530、炮1530、兵126。
+pub(crate) const POLICY_MOVE_PIECE_COUNT: usize = 3_742;
 pub const POLICY_TACTICAL_EXACT_SIZE: usize =
-    DENSE_MOVE_SPACE * POLICY_PIECE_SIZE * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+    POLICY_MOVE_PIECE_COUNT * POLICY_TACTICAL_SIGNATURE_BUCKETS;
 pub(crate) const POLICY_CAPTURE_RELATION_OFFSET: usize = POLICY_TACTICAL_EXACT_SIZE;
 pub(crate) const POLICY_CAPTURE_RELATION_BUCKETS: usize = 32;
 pub(crate) const POLICY_CAPTURE_RELATION_SIZE: usize = 7 * 7 * POLICY_CAPTURE_RELATION_BUCKETS;
@@ -28,7 +30,7 @@ pub(crate) const POLICY_TACTICAL_SIZE: usize =
 pub(crate) const POLICY_PIECE_SIZE: usize = 7;
 pub(crate) const POLICY_CAPTURE_CLASSES: usize = POLICY_PIECE_SIZE + 1;
 pub const POLICY_SPARSE_MAIN_SIZE: usize =
-    DENSE_MOVE_SPACE * POLICY_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
+    POLICY_MOVE_PIECE_COUNT * V2_KING_BUCKETS * V2_KING_BUCKETS;
 pub(crate) const POLICY_SPARSE_TABLE_SIZE: usize =
     POLICY_SPARSE_MAIN_SIZE + DENSE_MOVE_SPACE * POLICY_CAPTURE_CLASSES + 1;
 pub(crate) const POLICY_SPARSE_TERMS: usize = 2;
@@ -156,6 +158,7 @@ pub(crate) struct MoveMap {
     pub(crate) sparse_to_dense: [u16; SPARSE_MOVE_SPACE],
     #[allow(dead_code)]
     pub(crate) dense_to_sparse: [u16; DENSE_MOVE_SPACE],
+    pub(crate) move_piece_to_compact: [[u16; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE],
 }
 
 pub(crate) fn move_map() -> &'static MoveMap {
@@ -164,15 +167,56 @@ pub(crate) fn move_map() -> &'static MoveMap {
     MAP.get_or_init(|| {
         let mut sparse_to_dense = [u16::MAX; SPARSE_MOVE_SPACE];
         let dense_to_sparse = px0_policy_map::PX0_MOVES;
+        let mut move_piece_to_compact = [[u16::MAX; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE];
+        let mut pair_count = 0;
         for (index, &sparse) in dense_to_sparse.iter().enumerate() {
             assert_eq!(sparse_to_dense[sparse as usize], u16::MAX);
             sparse_to_dense[sparse as usize] = index as u16;
+            let from = sparse as usize / BOARD_SIZE;
+            let to = sparse as usize % BOARD_SIZE;
+            for piece in 0..POLICY_PIECE_SIZE {
+                if policy_move_piece_is_geometric(from, to, piece) {
+                    move_piece_to_compact[index][piece] = pair_count as u16;
+                    pair_count += 1;
+                }
+            }
         }
+        assert_eq!(pair_count, POLICY_MOVE_PIECE_COUNT);
         MoveMap {
             sparse_to_dense,
             dense_to_sparse,
+            move_piece_to_compact,
         }
     })
+}
+
+/// 不可能的走法×棋种没有参数行；训练与推理共用同一紧凑编号。
+#[inline]
+pub(crate) fn policy_move_piece_index(move_index: usize, piece: usize) -> Option<usize> {
+    let compact = move_map().move_piece_to_compact[move_index][piece];
+    (compact != u16::MAX).then_some(compact as usize)
+}
+
+fn policy_move_piece_is_geometric(from: usize, to: usize, piece: usize) -> bool {
+    if from == to
+        || !canonical_piece_square_reachable(piece, from)
+        || !canonical_piece_square_reachable(piece, to)
+    {
+        return false;
+    }
+    let rank = from / BOARD_FILES;
+    let target_rank = to / BOARD_FILES;
+    let dr = rank.abs_diff(target_rank);
+    let df = (from % BOARD_FILES).abs_diff(to % BOARD_FILES);
+    match piece {
+        0 => dr + df == 1,
+        1 => dr == 1 && df == 1,
+        2 => dr == 2 && df == 2,
+        3 => matches!((dr, df), (1, 2) | (2, 1)),
+        4 | 5 => dr == 0 || df == 0,
+        6 => (rank == target_rank + 1 && df == 0) || (rank <= 4 && dr == 0 && df == 1),
+        _ => unreachable!(),
+    }
 }
 
 pub(crate) fn dense_move_squares(move_index: usize) -> Option<(usize, usize)> {

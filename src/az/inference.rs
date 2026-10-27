@@ -5,8 +5,8 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 
 use crate::az::nnue::{
-    AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, canonical_square, fill_sparse_features_az,
-    piece_absolute_feature_index,
+    AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS, canonical_move, canonical_piece_square_reachable,
+    canonical_square, fill_sparse_features_az, piece_absolute_feature_index,
 };
 use crate::infra::version::MODEL_FORMAT_VERSION;
 use crate::xiangqi::{
@@ -129,7 +129,7 @@ pub(crate) fn threat_relation_map() -> &'static [u16] {
                 continue;
             }
             for source in 0..BOARD_SIZE {
-                if !threat_reachable_square(attacker, source) {
+                if !canonical_piece_square_reachable(attacker, source) {
                     continue;
                 }
                 let rank = source / BOARD_FILES;
@@ -188,7 +188,7 @@ pub(crate) fn threat_relation_map() -> &'static [u16] {
                     let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
                     map[relation] = next;
                     next += (0..STRUCTURAL_PIECE_SIZE)
-                        .filter(|&piece| threat_reachable_square(piece, target))
+                        .filter(|&piece| canonical_piece_square_reachable(piece, target))
                         .count() as u16;
                 }
             }
@@ -196,43 +196,6 @@ pub(crate) fn threat_relation_map() -> &'static [u16] {
         assert_eq!(next as usize, VALUE_THREAT_PAIR_VOCAB);
         map
     })
-}
-
-pub(crate) fn threat_reachable_square(piece: usize, square: usize) -> bool {
-    let rank = square / BOARD_FILES;
-    let file = square % BOARD_FILES;
-    let ours = piece < 7;
-    match piece % 7 {
-        0 => (3..=5).contains(&file) && if ours { rank >= 7 } else { rank <= 2 },
-        1 => {
-            if ours {
-                matches!((rank, file), (7, 3) | (7, 5) | (8, 4) | (9, 3) | (9, 5))
-            } else {
-                matches!((rank, file), (0, 3) | (0, 5) | (1, 4) | (2, 3) | (2, 5))
-            }
-        }
-        2 => {
-            if ours {
-                matches!(
-                    (rank, file),
-                    (5, 2) | (5, 6) | (7, 0) | (7, 4) | (7, 8) | (9, 2) | (9, 6)
-                )
-            } else {
-                matches!(
-                    (rank, file),
-                    (0, 2) | (0, 6) | (2, 0) | (2, 4) | (2, 8) | (4, 2) | (4, 6)
-                )
-            }
-        }
-        6 => {
-            if ours {
-                rank <= 4 || (rank == 5 || rank == 6) && file.is_multiple_of(2)
-            } else {
-                rank >= 5 || (rank == 3 || rank == 4) && file.is_multiple_of(2)
-            }
-        }
-        _ => true,
-    }
 }
 
 pub(crate) fn threat_attacked_offsets() -> &'static [u8] {
@@ -243,7 +206,7 @@ pub(crate) fn threat_attacked_offsets() -> &'static [u8] {
         for square in 0..BOARD_SIZE {
             let mut next = 0u8;
             for piece in 0..STRUCTURAL_PIECE_SIZE {
-                if threat_reachable_square(piece, square) {
+                if canonical_piece_square_reachable(piece, square) {
                     offsets[square * STRUCTURAL_PIECE_SIZE + piece] = next;
                     next += 1;
                 }
@@ -437,7 +400,7 @@ pub(crate) fn policy_move_pieces(
 }
 
 #[inline]
-pub(crate) const fn policy_sparse_main_index(
+pub(crate) fn policy_sparse_main_index(
     move_index: usize,
     moved_piece: usize,
     us_king_bucket: usize,
@@ -445,7 +408,9 @@ pub(crate) const fn policy_sparse_main_index(
 ) -> usize {
     debug_assert!(move_index < DENSE_MOVE_SPACE && moved_piece < POLICY_PIECE_SIZE);
     debug_assert!(us_king_bucket < V2_KING_BUCKETS && them_king_bucket < V2_KING_BUCKETS);
-    (((move_index * POLICY_PIECE_SIZE + moved_piece) * V2_KING_BUCKETS + us_king_bucket)
+    ((policy_move_piece_index(move_index, moved_piece).expect("策略表不支持该走法与棋种组合")
+        * V2_KING_BUCKETS
+        + us_king_bucket)
         * V2_KING_BUCKETS)
         + them_king_bucket
 }
@@ -484,7 +449,8 @@ pub(crate) fn policy_tactical_indices(
         | usize::from(destination_defended) << 3
         | usize::from(captured_piece.is_some()) << 4
         | usize::from(check) << 5;
-    let exact = (move_index * (STRUCTURAL_PIECE_SIZE / 2) + moved_piece)
+    let exact = policy_move_piece_index(move_index, moved_piece)
+        .expect("战术表不支持该走法与棋种组合")
         * POLICY_TACTICAL_SIGNATURE_BUCKETS
         + signature;
     let relation = captured_piece.map_or(POLICY_TACTICAL_SIZE, |victim| {
