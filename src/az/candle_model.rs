@@ -36,7 +36,6 @@ pub(super) struct AzCandleModel {
     value_threat_embedding: Var,
     value_threat_output: Var,
     policy_threat_context: Var,
-    policy_move_bias: Var,
     policy_context_hidden: Var,
     policy_move_context: Var,
     policy_accumulator_hidden: Var,
@@ -113,9 +112,7 @@ impl AzCandleModel {
             1,
         )?
         .flatten_all()?;
-        let policy_tables =
-            Tensor::cat(&[&self.policy_move_bias.flatten_all()?, &move_context], 0)?;
-        let policy_logits = fused_policy(&policy_tables, &policy_context, &batch.policy_items)?;
+        let policy_logits = fused_policy(&move_context, &policy_context, &batch.policy_items)?;
         let sparse_logits = sparse_policy(
             self.policy_sparse_table.as_tensor(),
             &batch.policy_sparse_indices,
@@ -363,7 +360,6 @@ impl AzCandleModel {
                 (POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2),
                 device,
             )?,
-            policy_move_bias: var_from_slice(&model.policy_move_bias, DENSE_MOVE_SPACE, device)?,
             policy_context_hidden: var_from_slice(
                 &model.policy_context_hidden,
                 (POLICY_MOVE_CONTEXT_SIZE, hidden),
@@ -1043,7 +1039,6 @@ mod tests {
             value_head_output,
             value_history_output,
             policy_threat_context,
-            policy_move_bias,
             policy_context_hidden,
             policy_move_context,
             policy_accumulator_hidden,

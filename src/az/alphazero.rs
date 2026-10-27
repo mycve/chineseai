@@ -2036,10 +2036,12 @@ mod tests {
         let position = Position::from_fen(HIDDEN_MATE_FEN).unwrap();
         let mut model = AzNnue::random(16, 7);
         let mate = position.parse_uci_move("d6d9").unwrap();
-        model.policy_move_bias[super::super::dense_move_index(crate::az::nnue::canonical_move(
+        let index = super::super::dense_move_index(crate::az::nnue::canonical_move(
             position.side_to_move(),
             mate,
-        ))] = -100.0;
+        ));
+        let start = crate::az::POLICY_SPARSE_MAIN_SIZE + index * crate::az::POLICY_CAPTURE_CLASSES;
+        model.policy_sparse_table[start..start + crate::az::POLICY_CAPTURE_CLASSES].fill(-100.0);
         let mut tree = AzTree::new(
             position.clone(),
             position.initial_rule_history(),
@@ -2786,8 +2788,12 @@ mod tests {
     #[test]
     fn raw_prior_is_network_policy_before_temperature_and_noise() {
         let mut model = AzNnue::random(32, 83);
-        for (index, bias) in model.policy_move_bias.iter_mut().enumerate() {
-            *bias = (index % 17) as f32 * 0.1;
+        let end = model.policy_sparse_table.len() - 1;
+        for (index, weights) in model.policy_sparse_table[crate::az::POLICY_SPARSE_MAIN_SIZE..end]
+            .chunks_exact_mut(crate::az::POLICY_CAPTURE_CLASSES)
+            .enumerate()
+        {
+            weights.fill((index % 17) as f32 * 0.1);
         }
         let position = Position::startpos();
         let normal = alphazero_search(

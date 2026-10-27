@@ -118,6 +118,47 @@ fn policy_accumulator_scores_current_position_without_move_deltas() {
 }
 
 #[test]
+fn capture_table_supplies_move_baseline_in_both_perspectives() {
+    let position =
+        Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w").unwrap();
+    let mut black = position.clone();
+    black.make_move(black.legal_moves()[0]);
+    let mut model = AzNnue::random(96, 20261027);
+    let mut scratch = AzEvalScratch::new(model.arch);
+    let baseline = model.evaluate_with_scratch_output(
+        &position,
+        &position.legal_moves(),
+        &[0.0; RULE_CONTEXT_SIZE],
+        &mut scratch,
+    );
+    let score = |mv: usize| ((mv % 31) as f32 - 15.0) / 32.0;
+    let end = model.policy_sparse_table.len() - 1;
+    for (mv, classes) in model.policy_sparse_table[super::POLICY_SPARSE_MAIN_SIZE..end]
+        .chunks_exact_mut(super::POLICY_CAPTURE_CLASSES)
+        .enumerate()
+    {
+        classes.fill(score(mv));
+    }
+    let mut kinds = [false; 2];
+    for position in [position, black] {
+        let side = position.side_to_move();
+        let moves = position.legal_moves();
+        let output = model.evaluate_with_scratch_output(
+            &position,
+            &moves,
+            &[0.0; RULE_CONTEXT_SIZE],
+            &mut scratch,
+        );
+        assert_eq!(output.value_wdl, baseline.value_wdl);
+        for (&mv, &logit) in moves.iter().zip(&scratch.logits) {
+            kinds[usize::from(position.piece_at(mv.to as usize).is_some())] = true;
+            assert_eq!(logit, score(dense_move_index(canonical_move(side, mv))));
+        }
+    }
+    assert!(kinds.into_iter().all(|x| x));
+}
+
+#[test]
 fn repetition_policy_metrics_separate_opportunities_and_model_mass() {
     let position = Position::startpos();
     let moves = position.legal_moves();
@@ -261,17 +302,17 @@ fn capture_relation_changes_only_capture_policy_not_value() {
 
 #[test]
 fn capture_relation_is_shared_and_excludes_quiet_moves() {
-    let quiet = policy_tactical_indices(0, 4, true, false, true, false, None, false);
+    let quiet = policy_tactical_indices(0, 4, true, false, true, true, None, false);
     assert_eq!(quiet[1], POLICY_TACTICAL_SIZE);
-    let pawn = policy_tactical_indices(0, 4, true, false, true, false, Some(7), false);
-    let rook = policy_tactical_indices(0, 4, true, false, true, false, Some(11), false);
+    let pawn = policy_tactical_indices(0, 4, true, false, true, true, Some(13), false);
+    let rook = policy_tactical_indices(0, 4, true, false, true, true, Some(11), false);
     let elsewhere = policy_tactical_indices(
         geometric_move_index(4, 1),
         4,
         true,
         false,
         true,
-        false,
+        true,
         Some(11),
         false,
     );
@@ -279,17 +320,17 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
     assert_eq!(rook[1], elsewhere[1]);
     let mut seen = std::collections::HashSet::new();
     for mover in 0..7 {
-        for victim in 7..14 {
-            for state in 0..32 {
+        for victim in 8..14 {
+            for state in 0..16 {
                 let indices = policy_tactical_indices(
                     geometric_move_index(mover, 0),
                     mover,
                     state & 1 != 0,
                     state & 2 != 0,
                     state & 4 != 0,
-                    state & 8 != 0,
+                    true,
                     Some(victim),
-                    state & 16 != 0,
+                    state & 8 != 0,
                 );
                 assert!(
                     (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE).contains(&indices[1])
@@ -303,8 +344,8 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
 
 #[test]
 fn tactical_policy_terms_distinguish_move_state() {
-    let base = policy_tactical_indices(0, 4, true, true, false, true, Some(7), false);
-    let changed = policy_tactical_indices(0, 4, false, true, false, true, Some(7), false);
+    let base = policy_tactical_indices(0, 4, true, true, false, true, Some(13), false);
+    let changed = policy_tactical_indices(0, 4, false, true, false, true, Some(13), false);
     assert_ne!(base, changed);
     assert!(base.into_iter().all(|index| index < POLICY_TACTICAL_SIZE));
     assert!(
@@ -337,6 +378,11 @@ fn compact_policy_rows_are_unique_and_cover_both_tables() {
                 }
             }
             for signature in 0..64 {
+                let Some(expected) = super::policy_tactical_exact_index(mv, piece, signature)
+                else {
+                    assert!((piece != 5 || signature & 16 != 0) && signature & 8 == 0);
+                    continue;
+                };
                 let row = policy_tactical_indices(
                     mv,
                     piece,
@@ -344,9 +390,10 @@ fn compact_policy_rows_are_unique_and_cover_both_tables() {
                     signature & 2 != 0,
                     signature & 4 != 0,
                     signature & 8 != 0,
-                    (signature & 16 != 0).then_some(7),
+                    (signature & 16 != 0).then_some(13),
                     signature & 32 != 0,
                 )[0];
+                assert_eq!(row, expected);
                 assert!(!tactical[row]);
                 tactical[row] = true;
             }
@@ -953,7 +1000,6 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     assert_eq!(model.moves_left_output, loaded.moves_left_output);
     assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
     assert!(loaded.moves_left_active);
-    assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
     assert_eq!(model.policy_context_hidden, loaded.policy_context_hidden);
     assert_eq!(model.policy_move_context, loaded.policy_move_context);
     assert_eq!(
@@ -1452,6 +1498,9 @@ fn model_rejects_old_format_and_missing_tensors() {
     let path = std::env::temp_dir().join("chineseai_test_strict_model.safetensors");
     model.save(&path).unwrap();
     let tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu).unwrap();
+    assert_eq!(tensors["input_hidden"].dims(), &[692, 16]);
+    assert_eq!(tensors["policy_tactical"].elem_count(), 144_896);
+    assert!(!tensors.contains_key("policy_move_bias"));
     for name in [
         "check_context_hidden",
         "moves_left_output",
@@ -1467,7 +1516,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[43.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[44.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());
@@ -1531,11 +1580,25 @@ fn tactical_flags_are_pre_move_and_the_gap_is_audited() {
                 let mv = moves[(next() as usize) % moves.len()];
                 let to = mv.to as usize;
                 let (pre_attacked, pre_defended) = {
-                    let (_, attacked, _, defended) = policy_move_tactical_flags(
+                    let (sa, attacked, sd, defended) = policy_move_tactical_flags(
                         mv,
                         masks[color_index(side.opposite())],
                         masks[color_index(side)],
                     );
+                    let (moved, captured) = policy_move_pieces(&position, side, mv).unwrap();
+                    let dense = dense_move_index(canonical_move(side, mv));
+                    let indices = policy_tactical_indices(
+                        dense,
+                        moved,
+                        sa,
+                        attacked,
+                        sd,
+                        defended,
+                        captured,
+                        position.gives_check_after_move_fast(mv),
+                    );
+                    assert!(indices[0] < super::POLICY_TACTICAL_EXACT_SIZE);
+                    assert!(indices[1] <= POLICY_TACTICAL_SIZE);
                     (attacked, defended)
                 };
                 let post_attacked = position.is_square_attacked_after_move(to, side.opposite(), mv);

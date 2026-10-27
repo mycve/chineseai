@@ -399,6 +399,9 @@ pub(crate) unsafe fn input_embedding_add_features_avx2(
     use std::arch::x86_64::*;
     let chunks = hidden_size / 8;
     for &feature in features {
+        let Some(feature) = crate::az::nnue::input_feature_index(feature) else {
+            continue;
+        };
         let row = &input_hidden[feature * hidden_size..(feature + 1) * hidden_size];
         for chunk in 0..chunks {
             let index = chunk * 8;

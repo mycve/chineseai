@@ -21,7 +21,6 @@ pub(crate) fn run(cmd: AzPolicyScaleArgs) {
         }
         PolicyComponent::Accumulator => &mut model.policy_accumulator_move,
         PolicyComponent::Context => &mut model.policy_move_context,
-        PolicyComponent::MoveBias => &mut model.policy_move_bias,
         PolicyComponent::ThreatContext => &mut model.policy_threat_context,
     };
     let (rows, nonzero, before_l2) = {

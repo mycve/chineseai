@@ -6,11 +6,10 @@ use std::sync::OnceLock;
 const MOVE_BITS: u32 = 12;
 const MOVE_MASK: i64 = (1 << MOVE_BITS) - 1;
 const CONTEXT_FLAG: i64 = 1 << MOVE_BITS;
-const CONTEXT_OFFSET: usize = DENSE_MOVE_SPACE;
 const POLICY_CONTEXT_TOTAL: usize = POLICY_MOVE_CONTEXT_SIZE + POLICY_ACCUMULATOR_RANK;
-const TABLE_LEN: usize = CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_CONTEXT_TOTAL;
+const TABLE_LEN: usize = DENSE_MOVE_SPACE * POLICY_CONTEXT_TOTAL;
 const _: () = assert!(POLICY_MOVE_CONTEXT_SIZE == 32 && POLICY_ACCUMULATOR_RANK == 64);
-const _: () = assert!(CONTEXT_OFFSET == 2062 && POLICY_CONTEXT_TOTAL == 96 && TABLE_LEN == 200014);
+const _: () = assert!(POLICY_CONTEXT_TOTAL == 96 && TABLE_LEN == 197952);
 
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void fused_policy_fwd(
@@ -22,11 +21,11 @@ extern "C" __global__ void fused_policy_fwd(
     unsigned long long packed = (unsigned long long)items[index];
     if (packed == 0u) { output[index] = 0.0f; return; }
     unsigned int move_index = (packed & 0xfffu) - 1u;
-    float value = tables[move_index];
+    float value = 0.0f;
     if ((packed & 0x1000u) != 0u) {
         for (unsigned int h = 0; h < 96u; ++h) {
             value += context[(index / moves) * 96u + h]
-                   * tables[2062u + move_index * 96u + h];
+                   * tables[move_index * 96u + h];
         }
     }
     output[index] = value;
@@ -44,13 +43,12 @@ extern "C" __global__ void fused_policy_grad(
     const float* context = context_grad;
     const float* grad_output = context_grad + batch * 96u;
     float* grad_tables = output;
-    float* grad_context = output + 200014u;
+    float* grad_context = output + 197952u;
     float g = grad_output[index];
-    atomicAdd(grad_tables + move_index, g);
     if ((packed & 0x1000u) == 0u) return;
     unsigned int b = index / moves;
     for (unsigned int h = 0; h < 96u; ++h) {
-        unsigned int weight = 2062u + move_index * 96u + h;
+        unsigned int weight = move_index * 96u + h;
         unsigned int activation = b * 96u + h;
         atomicAdd(grad_tables + weight, g * context[activation]);
         atomicAdd(grad_context + activation, g * tables[weight]);
@@ -118,12 +116,12 @@ impl CustomOp3 for FusedPolicy {
                 continue;
             }
             let mv = (packed & MOVE_MASK) as usize - 1;
-            let mut value = tables[mv];
+            let mut value = 0.0;
             if packed & CONTEXT_FLAG != 0 {
                 let b = index / self.moves;
                 for h in 0..POLICY_CONTEXT_TOTAL {
                     value += context[b * POLICY_CONTEXT_TOTAL + h]
-                        * tables[CONTEXT_OFFSET + mv * POLICY_CONTEXT_TOTAL + h];
+                        * tables[mv * POLICY_CONTEXT_TOTAL + h];
                 }
             }
             output[index] = value;
@@ -211,13 +209,12 @@ impl CustomOp3 for FusedPolicyGrad {
             }
             let mv = (packed & MOVE_MASK) as usize - 1;
             let g = grad_output[index];
-            grad_tables[mv] += g;
             if packed & CONTEXT_FLAG == 0 {
                 continue;
             }
             let b = index / op.moves;
             for h in 0..POLICY_CONTEXT_TOTAL {
-                let weight = CONTEXT_OFFSET + mv * POLICY_CONTEXT_TOTAL + h;
+                let weight = mv * POLICY_CONTEXT_TOTAL + h;
                 let activation = b * POLICY_CONTEXT_TOTAL + h;
                 grad_tables[weight] += g * context[activation];
                 grad_context[activation] += g * tables[weight];
@@ -389,12 +386,9 @@ fn cuda_view<'a, T: candle_core::cuda_backend::cudarc::driver::DeviceRepr>(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "slow-tests")]
     use super::*;
-    #[cfg(feature = "slow-tests")]
     use candle_core::{Device, Var};
 
-    #[cfg(feature = "slow-tests")]
     fn output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let table_values = (0..TABLE_LEN)
             .map(|index| ((index % 97) as f32 - 48.0) * 0.001)
@@ -415,19 +409,54 @@ mod tests {
         let items = Tensor::from_slice(&items, (2, 3), device)?;
         let output = fused_policy(&tables, &context, &items)?;
         let grads = output.sum_all()?.backward()?;
-        Ok((
+        let actual = (
             output.flatten_all()?.to_vec1()?,
             grads.get(&tables).unwrap().flatten_all()?.to_vec1()?,
             grads.get(&context).unwrap().flatten_all()?.to_vec1()?,
-        ))
+        );
+        // 用通用张量算子作独立参照，核对无偏置布局、无效项和重复走法梯度累加。
+        let indices = Tensor::new(&[3u32, 7, 0, 3, 100, 7], device)?;
+        let valid = Tensor::new(&[[1f32, 1., 0.], [0., 1., 1.]], device)?;
+        let selected = tables
+            .reshape((DENSE_MOVE_SPACE, POLICY_CONTEXT_TOTAL))?
+            .index_select(&indices, 0)?
+            .reshape((2, 3, POLICY_CONTEXT_TOTAL))?;
+        let reference = selected
+            .broadcast_mul(&context.unsqueeze(1)?)?
+            .sum(2)?
+            .mul(&valid)?;
+        let reference_grads = reference.sum_all()?.backward()?;
+        assert_close(&actual.0, &reference.flatten_all()?.to_vec1()?);
+        assert_close(
+            &actual.1,
+            &reference_grads
+                .get(&tables)
+                .unwrap()
+                .flatten_all()?
+                .to_vec1()?,
+        );
+        assert_close(
+            &actual.2,
+            &reference_grads
+                .get(&context)
+                .unwrap()
+                .flatten_all()?
+                .to_vec1()?,
+        );
+        Ok(actual)
     }
 
-    #[cfg(feature = "slow-tests")]
     fn assert_close(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
         for (&left, &right) in left.iter().zip(right) {
             assert!((left - right).abs() < 3.0e-5, "left={left} right={right}");
         }
+    }
+
+    #[test]
+    fn fused_policy_cpu_matches_unfused_forward_and_gradients() -> Result<()> {
+        output_and_grad(&Device::Cpu)?;
+        Ok(())
     }
 
     #[cfg(feature = "slow-tests")]

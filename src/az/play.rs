@@ -1655,8 +1655,11 @@ mod tests {
         position.make_move(mv);
         let mate = position.parse_uci_move("f4f9").unwrap();
         let mate_index = dense_move_index(canonical_move(position.side_to_move(), mate));
-        model.policy_move_bias.fill(-100.0);
-        model.policy_move_bias[mate_index] = 100.0;
+        let end = model.policy_sparse_table.len() - 1;
+        model.policy_sparse_table[crate::az::POLICY_SPARSE_MAIN_SIZE..end].fill(-100.0);
+        let start =
+            crate::az::POLICY_SPARSE_MAIN_SIZE + mate_index * crate::az::POLICY_CAPTURE_CLASSES;
+        model.policy_sparse_table[start..start + crate::az::POLICY_CAPTURE_CLASSES].fill(100.0);
         let mut config = selfplay_test_config(1);
         config.max_plies = 1;
         config.simulations = 2;

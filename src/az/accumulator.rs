@@ -300,6 +300,9 @@ pub(crate) fn add_canonical_piece_contribution(
     let piece_index = relative_color + piece_kind_index(piece.kind);
     let relative_square = canonical_square_for(perspective, sq);
     let feature = piece_index * BOARD_SIZE + relative_square;
+    let Some(feature) = crate::az::nnue::input_feature_index(feature) else {
+        return;
+    };
     add_scaled_feature_row(
         hidden,
         &model.input_hidden,

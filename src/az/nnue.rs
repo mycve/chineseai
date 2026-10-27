@@ -4,9 +4,30 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piec
 
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
-/// 每份视角使用1260维棋子位置；网络同时读取行棋方与对方两份累加器。
+/// 棋盘事实仍以棋种×90编码，参数表只为692种可达位置分配行。
+/// 网络同时读取行棋方与对方两份累加器。
 /// 重复、长将、长捉等规则由环境精确处理。
-pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
+pub const AZ_NNUE_INPUT_SIZE: usize = 692;
+
+/// 将棋盘事实编号映射到紧凑嵌入行；不可达位置没有参数。
+#[inline]
+pub(crate) fn input_feature_index(feature: usize) -> Option<usize> {
+    static MAP: std::sync::OnceLock<[u16; CANONICAL_PIECE_INPUT_SIZE]> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let mut map = [u16::MAX; CANONICAL_PIECE_INPUT_SIZE];
+        let mut next = 0;
+        for (feature, index) in map.iter_mut().enumerate() {
+            if canonical_piece_square_reachable(feature / BOARD_SIZE, feature % BOARD_SIZE) {
+                *index = next;
+                next += 1;
+            }
+        }
+        assert_eq!(usize::from(next), AZ_NNUE_INPUT_SIZE);
+        map
+    });
+    let &index = map.get(feature)?;
+    (index != u16::MAX).then_some(usize::from(index))
+}
 
 /// 同一棋子位置在另一份视角中的索引；变换两次回到原特征。
 #[inline]
@@ -133,8 +154,12 @@ mod tests {
 
     #[test]
     fn opposite_view_matches_board_and_is_reversible() {
-        for feature in 0..AZ_NNUE_INPUT_SIZE {
+        for feature in 0..CANONICAL_PIECE_INPUT_SIZE {
             assert_eq!(opposite_feature(opposite_feature(feature)), feature);
+            assert_eq!(
+                input_feature_index(feature).is_some(),
+                input_feature_index(opposite_feature(feature)).is_some()
+            );
         }
         let position = Position::from_fen("4k4/9/9/9/4p4/9/9/9/9/4K4 b - - 0 1").unwrap();
         let mut derived = extract_sparse_features_az(&position)
@@ -189,8 +214,30 @@ mod tests {
     fn az_features_use_only_current_board() {
         let position = Position::startpos();
         let features = extract_sparse_features_az(&position);
-        assert_eq!(AZ_NNUE_INPUT_SIZE, 1_260);
-        assert!(features.iter().all(|&feature| feature < AZ_NNUE_INPUT_SIZE));
+        assert_eq!(AZ_NNUE_INPUT_SIZE, 692);
+        assert!(
+            features
+                .iter()
+                .all(|&feature| input_feature_index(feature).is_some())
+        );
         assert_eq!(features.len(), 32);
+    }
+
+    #[test]
+    fn compact_input_covers_reachable_squares_without_aliases() {
+        let mut seen = [false; AZ_NNUE_INPUT_SIZE];
+        for feature in 0..CANONICAL_PIECE_INPUT_SIZE {
+            let index = input_feature_index(feature);
+            assert_eq!(
+                index.is_some(),
+                canonical_piece_square_reachable(feature / 90, feature % 90)
+            );
+            if let Some(index) = index {
+                assert!(!seen[index]);
+                seen[index] = true;
+            }
+        }
+        assert!(seen.into_iter().all(|x| x));
+        assert!(input_feature_index(CANONICAL_PIECE_INPUT_SIZE).is_none());
     }
 }

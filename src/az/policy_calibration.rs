@@ -7,7 +7,7 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use super::*;
 use crate::xiangqi::BOARD_SIZE;
 
-const CALIBRATION_CLASSES: usize = POLICY_PIECE_SIZE * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+const CALIBRATION_CLASSES: usize = POLICY_PIECE_SIZE * POLICY_TACTICAL_SIGNATURES;
 
 /// 交叉熵均在提供的训练样本上计算，不代表独立验证集收益。
 #[derive(Debug)]
@@ -153,7 +153,7 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
         let mut occupied = [false; BOARD_SIZE];
         let mut kings = [0; 2];
         for &feature in &sample.features {
-            if feature >= nnue::AZ_NNUE_INPUT_SIZE || occupied[feature % BOARD_SIZE] {
+            if nnue::input_feature_index(feature).is_none() || occupied[feature % BOARD_SIZE] {
                 return Err(fail());
             }
             occupied[feature % BOARD_SIZE] = true;
@@ -192,17 +192,14 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
                 masks[color_index(side)],
             );
             classes.push(
-                policy_tactical_indices(
-                    index,
-                    moved,
+                policy_tactical_signature(
                     sa,
                     da,
                     sd,
                     dd,
-                    captured,
+                    captured.is_some(),
                     position.gives_check_after_move_fast(mv),
-                )[0] % POLICY_TACTICAL_SIGNATURE_BUCKETS
-                    + moved * POLICY_TACTICAL_SIGNATURE_BUCKETS,
+                ) + moved * POLICY_TACTICAL_SIGNATURES,
             );
         }
         let (wdl, logits) = outputs_for_training_sample(model, sample).ok_or_else(fail)?;
@@ -322,14 +319,11 @@ pub fn calibrate_policy(
     let original = model.policy_tactical[range.clone()].to_vec();
     for move_index in 0..DENSE_MOVE_SPACE {
         for piece in 0..POLICY_PIECE_SIZE {
-            let Some(pair) = policy_move_piece_index(move_index, piece) else {
-                continue;
-            };
-            let start = pair * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-            let class = piece * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-            for signature in 0..POLICY_TACTICAL_SIGNATURE_BUCKETS {
-                model.policy_tactical[start + signature] =
-                    original[start + signature] + delta[class + signature];
+            let class = piece * POLICY_TACTICAL_SIGNATURES;
+            for signature in 0..POLICY_TACTICAL_SIGNATURES {
+                if let Some(row) = policy_tactical_exact_index(move_index, piece, signature) {
+                    model.policy_tactical[row] = original[row] + delta[class + signature];
+                }
             }
         }
     }

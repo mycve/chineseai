@@ -15,15 +15,16 @@ pub const HISTORY_CONTEXT_SIZE: usize = 96;
 pub(crate) const POLICY_MOVE_CONTEXT_SIZE: usize = 32;
 pub(crate) const POLICY_THREAT_CONTEXT_SIZE: usize = POLICY_MOVE_CONTEXT_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_RANK: usize = 64;
-pub(crate) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
+/// 原始六位战术签名的取值数，不是紧凑表的行跨度。
+pub(crate) const POLICY_TACTICAL_SIGNATURES: usize = 64;
 pub(crate) const POLICY_TACTICAL_TERMS: usize = 2;
 /// 几何可行的走法×棋种组合：将24、士8、象16、马508、车1530、炮1530、兵126。
 pub(crate) const POLICY_MOVE_PIECE_COUNT: usize = 3_742;
-pub const POLICY_TACTICAL_EXACT_SIZE: usize =
-    POLICY_MOVE_PIECE_COUNT * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+/// 非炮每组32行；炮的非吃子32行、吃子16行。
+pub const POLICY_TACTICAL_EXACT_SIZE: usize = 144_224;
 pub(crate) const POLICY_CAPTURE_RELATION_OFFSET: usize = POLICY_TACTICAL_EXACT_SIZE;
-pub(crate) const POLICY_CAPTURE_RELATION_BUCKETS: usize = 32;
-pub(crate) const POLICY_CAPTURE_RELATION_SIZE: usize = 7 * 7 * POLICY_CAPTURE_RELATION_BUCKETS;
+pub(crate) const POLICY_CAPTURE_RELATION_BUCKETS: usize = 16;
+pub(crate) const POLICY_CAPTURE_RELATION_SIZE: usize = 7 * 6 * POLICY_CAPTURE_RELATION_BUCKETS;
 pub(crate) const POLICY_TACTICAL_SIZE: usize =
     POLICY_CAPTURE_RELATION_OFFSET + POLICY_CAPTURE_RELATION_SIZE;
 // 策略只编码己方走子和敌方被吃子，训练与推理使用同一布局。
@@ -161,6 +162,7 @@ pub(crate) struct MoveMap {
     #[allow(dead_code)]
     pub(crate) dense_to_sparse: [u16; DENSE_MOVE_SPACE],
     pub(crate) move_piece_to_compact: [[u16; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE],
+    tactical_offsets: [[u32; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE],
 }
 
 pub(crate) fn move_map() -> &'static MoveMap {
@@ -170,7 +172,9 @@ pub(crate) fn move_map() -> &'static MoveMap {
         let mut sparse_to_dense = [u16::MAX; SPARSE_MOVE_SPACE];
         let dense_to_sparse = px0_policy_map::PX0_MOVES;
         let mut move_piece_to_compact = [[u16::MAX; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE];
+        let mut tactical_offsets = [[u32::MAX; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE];
         let mut pair_count = 0;
+        let mut tactical_count = 0;
         for (index, &sparse) in dense_to_sparse.iter().enumerate() {
             assert_eq!(sparse_to_dense[sparse as usize], u16::MAX);
             sparse_to_dense[sparse as usize] = index as u16;
@@ -180,16 +184,44 @@ pub(crate) fn move_map() -> &'static MoveMap {
                 if policy_move_piece_is_geometric(from, to, piece) {
                     move_piece_to_compact[index][piece] = pair_count as u16;
                     pair_count += 1;
+                    tactical_offsets[index][piece] = tactical_count;
+                    tactical_count += if piece == 5 { 48 } else { 32 };
                 }
             }
         }
         assert_eq!(pair_count, POLICY_MOVE_PIECE_COUNT);
+        assert_eq!(tactical_count as usize, POLICY_TACTICAL_EXACT_SIZE);
         MoveMap {
             sparse_to_dense,
             dense_to_sparse,
             move_piece_to_compact,
+            tactical_offsets,
         }
     })
+}
+
+/// 仅编码走前攻击位板下可能出现的签名：非炮及炮吃子必然控制目标格。
+pub(crate) fn policy_tactical_exact_index(
+    move_index: usize,
+    piece: usize,
+    signature: usize,
+) -> Option<usize> {
+    let offset = move_map().tactical_offsets[move_index][piece];
+    if offset == u32::MAX || signature >= POLICY_TACTICAL_SIGNATURES {
+        return None;
+    }
+    let capture = signature & 16 != 0;
+    if (piece != 5 || capture) && signature & 8 == 0 {
+        return None;
+    }
+    let state = if piece != 5 {
+        (signature & 7) | ((signature >> 4) << 3)
+    } else if capture {
+        32 + (signature & 7) + ((signature >> 5) << 3)
+    } else {
+        (signature & 15) | ((signature >> 5) << 4)
+    };
+    Some(offset as usize + state)
 }
 
 /// 不可能的走法×棋种没有参数行；训练与推理共用同一紧凑编号。
@@ -336,7 +368,6 @@ macro_rules! az_weight_tensors {
             [POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2],
             true
         );
-        $visit!(policy_move_bias, [DENSE_MOVE_SPACE], false);
         $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h], true);
         $visit!(
             policy_move_context,

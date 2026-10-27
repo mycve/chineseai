@@ -98,7 +98,6 @@ pub(crate) enum PolicyComponent {
     CaptureRelation,
     Accumulator,
     Context,
-    MoveBias,
     ThreatContext,
 }
 

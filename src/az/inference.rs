@@ -451,25 +451,41 @@ pub(crate) fn policy_tactical_indices(
     check: bool,
 ) -> [usize; POLICY_TACTICAL_TERMS] {
     debug_assert!(moved_piece < STRUCTURAL_PIECE_SIZE / 2);
-    let signature = usize::from(source_attacked)
-        | usize::from(destination_attacked) << 1
-        | usize::from(source_defended) << 2
-        | usize::from(destination_defended) << 3
-        | usize::from(captured_piece.is_some()) << 4
-        | usize::from(check) << 5;
-    let exact = policy_move_piece_index(move_index, moved_piece)
-        .expect("战术表不支持该走法与棋种组合")
-        * POLICY_TACTICAL_SIGNATURE_BUCKETS
-        + signature;
+    let signature = policy_tactical_signature(
+        source_attacked,
+        destination_attacked,
+        source_defended,
+        destination_defended,
+        captured_piece.is_some(),
+        check,
+    );
+    let exact = policy_tactical_exact_index(move_index, moved_piece, signature)
+        .expect("战术签名不满足走前攻击位板约束");
     let relation = captured_piece.map_or(POLICY_TACTICAL_SIZE, |victim| {
-        debug_assert!((7..14).contains(&victim));
-        // 吃子位恒为 1，去掉它；其余五位沿用已有战术状态。
-        let state = (signature & 15) | ((signature >> 5) << 4);
+        debug_assert!((8..14).contains(&victim));
+        // 合法吃子不含将，吃子位和目标格己方控制位恒为1。
+        let state = (signature & 7) | ((signature >> 5) << 3);
         POLICY_CAPTURE_RELATION_OFFSET
-            + (moved_piece * 7 + victim - 7) * POLICY_CAPTURE_RELATION_BUCKETS
+            + (moved_piece * 6 + victim - 8) * POLICY_CAPTURE_RELATION_BUCKETS
             + state
     });
     [exact, relation]
+}
+
+pub(crate) fn policy_tactical_signature(
+    source_attacked: bool,
+    destination_attacked: bool,
+    source_defended: bool,
+    destination_defended: bool,
+    capture: bool,
+    check: bool,
+) -> usize {
+    usize::from(source_attacked)
+        | usize::from(destination_attacked) << 1
+        | usize::from(source_defended) << 2
+        | usize::from(destination_defended) << 3
+        | usize::from(capture) << 4
+        | usize::from(check) << 5
 }
 
 /// 策略头战术签名用到的 4 个布尔量，返回顺序与 `policy_tactical_indices` 的入参一致：
@@ -537,7 +553,6 @@ pub struct AzNnue {
     pub value_threat_embedding: Vec<f32>,
     pub value_threat_output: Vec<f32>,
     pub policy_threat_context: Vec<f32>,
-    pub policy_move_bias: Vec<f32>,
     pub policy_context_hidden: Vec<f32>,
     pub policy_move_context: Vec<f32>,
     pub policy_accumulator_hidden: Vec<f32>,
@@ -610,7 +625,6 @@ impl Clone for AzNnue {
             value_threat_embedding: self.value_threat_embedding.clone(),
             value_threat_output: self.value_threat_output.clone(),
             policy_threat_context: self.policy_threat_context.clone(),
-            policy_move_bias: self.policy_move_bias.clone(),
             policy_context_hidden: self.policy_context_hidden.clone(),
             policy_move_context: self.policy_move_context.clone(),
             policy_accumulator_hidden: self.policy_accumulator_hidden.clone(),
@@ -783,7 +797,6 @@ impl AzNnue {
             .collect();
         let value_threat_output = vec![0.0; WDL_HEAD_SIZE * VALUE_THREAT_RANK * 2];
         let policy_threat_context = vec![0.0; POLICY_THREAT_CONTEXT_SIZE * VALUE_THREAT_RANK * 2];
-        let policy_move_bias = vec![0.0; DENSE_MOVE_SPACE];
         // Zero output preserves the exact policy distribution until this branch is trained.
         // One factor starts random and the other at zero: the new branch is
         // exactly policy-neutral at initialization, while gradients can update
@@ -826,7 +839,6 @@ impl AzNnue {
             value_threat_embedding,
             value_threat_output,
             policy_threat_context,
-            policy_move_bias,
             policy_context_hidden,
             policy_move_context,
             policy_accumulator_hidden,
@@ -1030,7 +1042,6 @@ impl AzNnue {
             value_threat_embedding: load_candle_f32_tensor(&tensors, "value_threat_embedding")?,
             value_threat_output: load_candle_f32_tensor(&tensors, "value_threat_output")?,
             policy_threat_context: load_candle_f32_tensor(&tensors, "policy_threat_context")?,
-            policy_move_bias: load_candle_f32_tensor(&tensors, "policy_move_bias")?,
             policy_context_hidden: load_candle_f32_tensor(&tensors, "policy_context_hidden")?,
             policy_move_context: load_candle_f32_tensor(&tensors, "policy_move_context")?,
             policy_accumulator_hidden,
@@ -1496,13 +1507,11 @@ impl AzNnue {
                     } else {
                         0.0
                     };
-                    scratch.logits[index] = self.policy_move_bias[move_index]
-                        + dot_product(
-                            &scratch.policy_context,
-                            &self.policy_move_context
-                                [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
-                        )
-                        + accumulator_logit
+                    scratch.logits[index] = dot_product(
+                        &scratch.policy_context,
+                        &self.policy_move_context
+                            [context_start..context_start + POLICY_MOVE_CONTEXT_SIZE],
+                    ) + accumulator_logit
                         + sparse_logit
                         + tactical_logit
                         + f32::from(repetition_flags.get(index).copied().unwrap_or(0))
@@ -1599,6 +1608,9 @@ impl AzNnue {
             }
         }
         for &feature in features {
+            let Some(feature) = nnue::input_feature_index(feature) else {
+                continue;
+            };
             let row =
                 &self.input_hidden[feature * self.hidden_size..(feature + 1) * self.hidden_size];
             for (left, &right) in hidden.iter_mut().zip(row) {
@@ -1849,11 +1861,10 @@ impl AzNnue {
         let relative_color = if piece.color == perspective { 0 } else { 7 };
         let piece_index = relative_color + piece_kind_index(piece.kind);
         let relative_square = canonical_square_for(perspective, square);
-        self.add_policy_row(
-            accumulator,
-            piece_index * BOARD_SIZE + relative_square,
-            sign,
-        );
+        if let Some(feature) = nnue::input_feature_index(piece_index * BOARD_SIZE + relative_square)
+        {
+            self.add_policy_row(accumulator, feature, sign);
+        }
     }
 
     pub(crate) fn add_policy_row(

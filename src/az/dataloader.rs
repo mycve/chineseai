@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
 use super::inference::check_context_features;
-use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
+#[cfg(test)]
+use crate::az::nnue::CANONICAL_PIECE_INPUT_SIZE;
+use crate::az::nnue::input_feature_index;
 #[cfg(test)]
 use crate::xiangqi::BOARD_SIZE;
 use crate::xiangqi::{Color, Position};
@@ -348,10 +350,11 @@ impl PackedBatch {
     fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
         let feature_base = row * 2 * self.max_features;
         for (offset, &feature) in sample.features.iter().enumerate() {
-            if feature < AZ_NNUE_INPUT_SIZE {
-                self.feature_items[feature_base + offset] = feature as u32;
+            if let Some(compact) = input_feature_index(feature) {
+                self.feature_items[feature_base + offset] = compact as u32;
                 self.feature_items[feature_base + self.max_features + offset] =
-                    super::nnue::opposite_feature(feature) as u32;
+                    input_feature_index(super::nnue::opposite_feature(feature))
+                        .expect("opposite view must remain reachable") as u32;
             }
         }
     }
@@ -610,23 +613,23 @@ mod tests {
     #[test]
     fn packed_features_keep_both_views_and_padding_per_sample() {
         let mut first = sample(0);
-        first.features = vec![0, 90, 1259];
+        first.features = vec![85, 369, 1259];
         let mut second = sample(1);
-        second.features = vec![611];
+        second.features = vec![567];
         let packed = PackedBatch::from_indices(&[first, second], &[0, 1]);
         assert_eq!(
             packed.feature_items,
             [
-                0,
-                90,
-                1259,
-                719,
-                809,
-                540,
-                611,
+                7,
+                120,
+                691,
+                347,
+                537,
+                291,
+                318,
                 PADDING_ITEM,
                 PADDING_ITEM,
-                1188,
+                664,
                 PADDING_ITEM,
                 PADDING_ITEM
             ]
@@ -636,7 +639,7 @@ mod tests {
     fn sample(index: usize) -> AzTrainingSample {
         AzTrainingSample {
             repetition_flags: Vec::new(),
-            features: vec![index % AZ_NNUE_INPUT_SIZE],
+            features: vec![index % CANONICAL_PIECE_INPUT_SIZE],
             rule_context: [0.0; RULE_CONTEXT_SIZE],
             history_features: [0.0; HISTORY_CONTEXT_SIZE],
             move_indices: vec![0, 1],
