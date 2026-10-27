@@ -5,13 +5,13 @@ use super::{
     AzArenaReport, AzEvalAccumulator, AzEvalScratch, AzExperiencePool, AzNnue, AzNnueArch,
     AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
     MateSearchLimits, POLICY_ACCUMULATOR_RANK, POLICY_CAPTURE_RELATION_OFFSET,
-    POLICY_CAPTURE_RELATION_SIZE, POLICY_PIECE_SIZE, POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE,
-    SplitMix64, VALUE_HEAD_SIZE, VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB, VALUE_THREAT_PAIR_VOCAB,
+    POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, SplitMix64,
+    VALUE_HEAD_SIZE, VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB, VALUE_THREAT_PAIR_VOCAB,
     VALUE_THREAT_VOCAB, WDL_HEAD_SIZE, alphazero_search_with_rules, check_context_features,
-    dense_move_index, dense_move_squares, evaluate_policy_groups, move_map,
-    policy_consequence_features, policy_move_tactical_flags, policy_tactical_indices,
-    rule_context_features, scalar_value_to_wdl_target, search_root_mate,
-    visit_value_king_piece_features, visit_value_threat_features,
+    dense_move_index, dense_move_squares, evaluate_policy_groups, move_map, policy_move_pieces,
+    policy_move_tactical_flags, policy_tactical_indices, rule_context_features,
+    scalar_value_to_wdl_target, search_root_mate, visit_value_king_piece_features,
+    visit_value_threat_features,
 };
 
 // 下面这三个测试只在 slow-tests 下编译，它们独占的导入也一并门控，避免默认构建出现 unused import。
@@ -62,43 +62,52 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 
 #[test]
 fn policy_accumulator_cache_matches_direct_projection() {
-    let mut model = AzNnue::random(32, 20260928);
-    for (i, w) in model.policy_sparse_table.iter_mut().enumerate() {
-        *w = (i % 101) as f32 * 0.003;
-    }
-    for (i, w) in model.policy_accumulator_hidden.iter_mut().enumerate() {
-        *w = (i % 13) as f32 * 0.001;
-    }
-    for (i, w) in model.policy_accumulator_move.iter_mut().enumerate() {
-        *w = (i % 17) as f32 * -0.002;
-    }
-    model.rebuild_policy_cache();
-    for mv in 0..DENSE_MOVE_SPACE {
-        for piece in 0..POLICY_PIECE_SIZE {
-            let sparse = move_map().dense_to_sparse[mv] as usize;
-            let from = (piece * BOARD_SIZE + sparse / BOARD_SIZE) * POLICY_ACCUMULATOR_RANK;
-            let to = (piece * BOARD_SIZE + sparse % BOARD_SIZE) * POLICY_ACCUMULATOR_RANK;
-            let victim = ((piece + POLICY_PIECE_SIZE) * BOARD_SIZE + sparse % BOARD_SIZE)
-                * POLICY_ACCUMULATOR_RANK;
-            let mut delta = 0.0f32;
-            let mut capture = 0.0f32;
-            for rank in 0..POLICY_ACCUMULATOR_RANK {
-                let w = model.policy_accumulator_move[mv * POLICY_ACCUMULATOR_RANK + rank];
-                delta += (model.policy_accumulator_features[to + rank]
-                    - model.policy_accumulator_features[from + rank])
-                    * w;
-                capture += model.policy_accumulator_features[victim + rank] * w;
-            }
+    let model = AzNnue::random(32, 20260928);
+    for feature in 0..super::POLICY_ACCUMULATOR_ROWS {
+        let row = if feature == super::POLICY_ACCUMULATOR_BIAS_ROW {
+            &model.hidden_bias[..]
+        } else {
+            &model.input_hidden[feature * model.hidden_size..(feature + 1) * model.hidden_size]
+        };
+        for channel in 0..POLICY_ACCUMULATOR_RANK {
+            let projection = &model.policy_accumulator_hidden
+                [channel * model.hidden_size..(channel + 1) * model.hidden_size];
             assert_eq!(
-                model.policy_accumulator_moved_delta[mv * POLICY_PIECE_SIZE + piece].to_bits(),
-                delta.to_bits()
-            );
-            assert_eq!(
-                model.policy_accumulator_capture[mv * POLICY_PIECE_SIZE + piece].to_bits(),
-                capture.to_bits()
+                model.policy_accumulator_features[feature * POLICY_ACCUMULATOR_RANK + channel]
+                    .to_bits(),
+                super::dot_product(row, projection).to_bits()
             );
         }
     }
+}
+
+#[test]
+fn policy_accumulator_scores_current_position_without_move_deltas() {
+    let position =
+        Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w").unwrap();
+    let moves = position.legal_moves();
+    assert!(
+        moves
+            .iter()
+            .any(|mv| position.piece_at(mv.to as usize).is_some())
+    );
+    assert!(
+        moves
+            .iter()
+            .any(|mv| position.piece_at(mv.to as usize).is_none())
+    );
+    let mut model = AzNnue::random(32, 20261027);
+    model.policy_accumulator_move.fill(0.03);
+    let mut scratch = AzEvalScratch::new(model.arch);
+    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut scratch);
+    assert!(scratch.logits[0].abs() > 1e-8);
+    // 走法向量相同时，线性局面分支对吃子、非吃子和不同棋种必须给出同一分数。
+    assert!(
+        scratch
+            .logits
+            .iter()
+            .all(|value| value.to_bits() == scratch.logits[0].to_bits())
+    );
 }
 
 #[test]
@@ -217,8 +226,7 @@ fn capture_relation_changes_only_capture_policy_not_value() {
     let mut captures = 0;
     let mut quiet = 0;
     for (index, mv) in moves.iter().enumerate() {
-        let (_, _, victim) =
-            policy_consequence_features(&position, position.side_to_move(), *mv).unwrap();
+        let (_, victim) = policy_move_pieces(&position, position.side_to_move(), *mv).unwrap();
         if victim.is_some() {
             assert_eq!(
                 after.logits[index].to_bits(),
@@ -1345,7 +1353,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[40.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[41.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());

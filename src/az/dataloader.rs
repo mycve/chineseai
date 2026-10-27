@@ -8,7 +8,9 @@ use std::time::Instant;
 use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
 use super::inference::check_context_features;
 use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
-use crate::xiangqi::{BOARD_SIZE, Color, Position};
+#[cfg(test)]
+use crate::xiangqi::BOARD_SIZE;
+use crate::xiangqi::{Color, Position};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_SPARSE_TERMS,
@@ -16,8 +18,8 @@ use super::{
     VALUE_THREAT_MAX_ACTIVE, WDL_HEAD_SIZE, canonical_general_buckets_from_features,
     decode_current_piece_square_feature, dense_move_squares,
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
-    normalize_wdl_target, policy_move_tactical_flags, policy_sparse_capture_index,
-    policy_sparse_main_index, policy_tactical_indices,
+    normalize_wdl_target, policy_move_pieces, policy_move_tactical_flags,
+    policy_sparse_capture_index, policy_sparse_main_index, policy_tactical_indices,
     sparse_pool::PADDING_ITEM,
     visit_value_king_piece_features, visit_value_threat_features,
 };
@@ -362,13 +364,6 @@ impl PackedBatch {
         king_buckets: (usize, usize),
     ) {
         let policy_base = row * self.max_policy_moves;
-        let mut board_features = [usize::MAX; BOARD_SIZE];
-        for &feature in &sample.features {
-            if let Some(structural) = decode_current_piece_square_feature(feature) {
-                let square = structural.rank * 9 + structural.file;
-                board_features[square] = feature;
-            }
-        }
         let [own_attacks, opponent_attacks] = position.attacked_squares_masks();
         let moves = sample
             .move_indices
@@ -405,39 +400,14 @@ impl PackedBatch {
                         .copied()
                         .unwrap_or(0),
                 );
-                let mut consequence_from = 0usize;
-                let mut consequence_to = 0usize;
-                let mut consequence_captured = 0usize;
-                let mut move_valid = false;
-                let mut capture_valid = false;
-                if let Some((from, to)) = dense_move_squares(move_index) {
-                    let moved_feature = board_features[from];
-                    if moved_feature != usize::MAX
-                        && moved_feature / BOARD_SIZE < super::STRUCTURAL_PIECE_SIZE / 2
-                    {
-                        let piece_index = moved_feature / BOARD_SIZE;
-                        consequence_from = moved_feature;
-                        consequence_to = piece_index * BOARD_SIZE + to;
-                        move_valid = true;
-                        let captured_feature = board_features[to];
-                        if captured_feature != usize::MAX {
-                            consequence_captured = captured_feature;
-                            capture_valid = true;
-                        }
-                    }
-                }
+                let pieces = dense_move_squares(move_index).and_then(|(from, to)| {
+                    let mv = crate::xiangqi::Move::new(from, to);
+                    let (moved, captured) = policy_move_pieces(position, Color::Red, mv)?;
+                    (moved < super::POLICY_PIECE_SIZE).then_some((mv, moved, captured))
+                });
                 let item_index = policy_base + policy_offset;
-                self.policy_items[item_index] = pack_policy_item(
-                    move_index,
-                    consequence_from,
-                    consequence_to,
-                    consequence_captured,
-                    move_valid,
-                    capture_valid,
-                );
-                if move_valid {
-                    let moved_piece = consequence_from / BOARD_SIZE;
-                    let captured_piece = capture_valid.then_some(consequence_captured / BOARD_SIZE);
+                self.policy_items[item_index] = pack_policy_item(move_index, pieces.is_some());
+                if let Some((mv, moved_piece, captured_piece)) = pieces {
                     let sparse_base = item_index * POLICY_SPARSE_TERMS;
                     self.policy_sparse_indices[sparse_base] = policy_sparse_main_index(
                         move_index,
@@ -447,10 +417,6 @@ impl PackedBatch {
                     ) as i64;
                     self.policy_sparse_indices[sparse_base + 1] =
                         policy_sparse_capture_index(move_index, captured_piece) as i64;
-                    let mv = crate::xiangqi::Move::new(
-                        consequence_from % BOARD_SIZE,
-                        consequence_to % BOARD_SIZE,
-                    );
                     let check = gives_check[policy_offset] != 0.0;
                     // 训练侧与推理侧共用同一个实现，避免两处内联公式漂移。
                     let (
@@ -722,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_policy_consequence_encodes_move_and_capture() {
+    fn packed_policy_keeps_move_id_and_routes_capture_to_sparse_table() {
         let moved_feature = 6 * BOARD_SIZE;
         let captured_feature = 10 * BOARD_SIZE + 1;
         let move_index = super::super::dense_move_index(Move::new(0, 1));
@@ -734,14 +700,14 @@ mod tests {
         let packed = PackedBatch::from_indices(&[training_sample], &[0]);
         assert_eq!(
             packed.policy_items,
-            vec![pack_policy_item(
-                move_index,
-                moved_feature,
-                6 * BOARD_SIZE + 1,
-                captured_feature,
-                true,
-                true,
-            )]
+            vec![pack_policy_item(move_index, true)]
+        );
+        assert_eq!(
+            packed.policy_sparse_indices,
+            [
+                policy_sparse_main_index(move_index, 6, 4, 4) as i64,
+                policy_sparse_capture_index(move_index, Some(10)) as i64,
+            ]
         );
     }
 

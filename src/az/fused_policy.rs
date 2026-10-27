@@ -1,29 +1,16 @@
+//! 仅对候选走法计算全局上下文点积；走子、吃子增量已经并入策略表。
+use super::{DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_MOVE_CONTEXT_SIZE};
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 use std::sync::OnceLock;
 
-use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
-
-use super::{DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_MOVE_CONTEXT_SIZE};
-use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
-
 const MOVE_BITS: u32 = 12;
-const FEATURE_BITS: u32 = 11;
-const FEATURE_MASK: u64 = (1 << FEATURE_BITS) - 1;
-const MOVE_VALID_BIT: u32 = MOVE_BITS + FEATURE_BITS * 3;
-const CAPTURE_VALID_BIT: u32 = MOVE_VALID_BIT + 1;
-const POLICY_VALID_BIT: u32 = CAPTURE_VALID_BIT + 1;
-const BIAS_OFFSET: usize = 0;
+const MOVE_MASK: i64 = (1 << MOVE_BITS) - 1;
+const CONTEXT_FLAG: i64 = 1 << MOVE_BITS;
 const CONTEXT_OFFSET: usize = DENSE_MOVE_SPACE;
-const ACCUMULATOR_FEATURE_OFFSET: usize =
-    CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE;
-const ACCUMULATOR_MOVE_OFFSET: usize =
-    ACCUMULATOR_FEATURE_OFFSET + AZ_NNUE_INPUT_SIZE * POLICY_ACCUMULATOR_RANK;
-const TABLE_LEN: usize = ACCUMULATOR_MOVE_OFFSET + DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK;
 const POLICY_CONTEXT_TOTAL: usize = POLICY_MOVE_CONTEXT_SIZE + POLICY_ACCUMULATOR_RANK;
-const _: () = assert!(AZ_NNUE_INPUT_SIZE == 1260);
-const _: () = assert!(POLICY_MOVE_CONTEXT_SIZE == 16 && POLICY_ACCUMULATOR_RANK == 64);
-const _: () = assert!(DENSE_MOVE_SPACE == 2062);
-const _: () = assert!(CONTEXT_OFFSET == 2062 && ACCUMULATOR_FEATURE_OFFSET == 35054);
-const _: () = assert!(ACCUMULATOR_MOVE_OFFSET == 115694 && TABLE_LEN == 247662);
+const TABLE_LEN: usize = CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_CONTEXT_TOTAL;
+const _: () = assert!(POLICY_MOVE_CONTEXT_SIZE == 32 && POLICY_ACCUMULATOR_RANK == 64);
+const _: () = assert!(CONTEXT_OFFSET == 2062 && POLICY_CONTEXT_TOTAL == 96 && TABLE_LEN == 200014);
 
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void fused_policy_fwd(
@@ -33,24 +20,13 @@ extern "C" __global__ void fused_policy_fwd(
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= batch * moves) return;
     unsigned long long packed = (unsigned long long)items[index];
-    if (((packed >> 47) & 1u) == 0u) { output[index] = 0.0f; return; }
-    unsigned int move_index = packed & 0xfffu;
-    float value = tables[0u + move_index];
-    if (((packed >> 45) & 1u) != 0u) {
-        unsigned int from = (packed >> 12) & 0x7ffu;
-        unsigned int to = (packed >> 23) & 0x7ffu;
-        unsigned int captured = (packed >> 34) & 0x7ffu;
-        bool has_capture = ((packed >> 46) & 1u) != 0u;
-        for (unsigned int h = 0; h < 16u; ++h) {
-            value += context[(index / moves) * 80u + h]
-                   * tables[2062u + move_index * 16u + h];
-        }
-        for (unsigned int h = 0; h < 64u; ++h) {
-            float after = context[(index / moves) * 80u + 16u + h]
-                        + tables[35054u + to * 64u + h]
-                        - tables[35054u + from * 64u + h];
-            if (has_capture) after -= tables[35054u + captured * 64u + h];
-            value += after * tables[115694u + move_index * 64u + h];
+    if (packed == 0u) { output[index] = 0.0f; return; }
+    unsigned int move_index = (packed & 0xfffu) - 1u;
+    float value = tables[move_index];
+    if ((packed & 0x1000u) != 0u) {
+        for (unsigned int h = 0; h < 96u; ++h) {
+            value += context[(index / moves) * 96u + h]
+                   * tables[2062u + move_index * 96u + h];
         }
     }
     output[index] = value;
@@ -58,45 +34,26 @@ extern "C" __global__ void fused_policy_fwd(
 
 extern "C" __global__ void fused_policy_grad(
     const float* tables, const long long* items, const float* context_grad,
-    float* output,
-    unsigned int batch, unsigned int moves
+    float* output, unsigned int batch, unsigned int moves
 ) {
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= batch * moves) return;
     unsigned long long packed = (unsigned long long)items[index];
-    if (((packed >> 47) & 1u) == 0u) return;
-    unsigned int move_index = packed & 0xfffu;
+    if (packed == 0u) return;
+    unsigned int move_index = (packed & 0xfffu) - 1u;
     const float* context = context_grad;
-    const float* grad_output = context_grad + batch * 80u;
+    const float* grad_output = context_grad + batch * 96u;
     float* grad_tables = output;
-    float* grad_context = output + 247662u;
+    float* grad_context = output + 200014u;
     float g = grad_output[index];
-    atomicAdd(grad_tables + 0u + move_index, g);
-    if (((packed >> 45) & 1u) == 0u) return;
+    atomicAdd(grad_tables + move_index, g);
+    if ((packed & 0x1000u) == 0u) return;
     unsigned int b = index / moves;
-    unsigned int from = (packed >> 12) & 0x7ffu;
-    unsigned int to = (packed >> 23) & 0x7ffu;
-    unsigned int captured = (packed >> 34) & 0x7ffu;
-    bool has_capture = ((packed >> 46) & 1u) != 0u;
-    for (unsigned int h = 0; h < 16u; ++h) {
-        unsigned int context_index = 2062u + move_index * 16u + h;
-        atomicAdd(grad_tables + context_index, g * context[b * 80u + h]);
-        atomicAdd(grad_context + b * 80u + h, g * tables[context_index]);
-    }
-    for (unsigned int h = 0; h < 64u; ++h) {
-        unsigned int move_factor = 115694u + move_index * 64u + h;
-        float w = tables[move_factor];
-        float after = context[b * 80u + 16u + h]
-                    + tables[35054u + to * 64u + h]
-                    - tables[35054u + from * 64u + h];
-        atomicAdd(grad_context + b * 80u + 16u + h, g * w);
-        atomicAdd(grad_tables + 35054u + to * 64u + h, g * w);
-        atomicAdd(grad_tables + 35054u + from * 64u + h, -g * w);
-        if (has_capture) {
-            after -= tables[35054u + captured * 64u + h];
-            atomicAdd(grad_tables + 35054u + captured * 64u + h, -g * w);
-        }
-        atomicAdd(grad_tables + move_factor, g * after);
+    for (unsigned int h = 0; h < 96u; ++h) {
+        unsigned int weight = 2062u + move_index * 96u + h;
+        unsigned int activation = b * 96u + h;
+        atomicAdd(grad_tables + weight, g * context[activation]);
+        atomicAdd(grad_context + activation, g * tables[weight]);
     }
 }
 "#;
@@ -106,7 +63,6 @@ struct FusedPolicy {
     batch: usize,
     moves: usize,
 }
-
 #[derive(Clone, Debug)]
 struct FusedPolicyGrad(FusedPolicy);
 
@@ -114,21 +70,10 @@ pub(super) const fn padding_item() -> i64 {
     0
 }
 
-pub(super) const fn pack_policy_item(
-    move_index: usize,
-    from: usize,
-    to: usize,
-    captured: usize,
-    move_valid: bool,
-    capture_valid: bool,
-) -> i64 {
-    (move_index as u64
-        | (from as u64) << MOVE_BITS
-        | (to as u64) << (MOVE_BITS + FEATURE_BITS)
-        | (captured as u64) << (MOVE_BITS + FEATURE_BITS * 2)
-        | (move_valid as u64) << MOVE_VALID_BIT
-        | (capture_valid as u64) << CAPTURE_VALID_BIT
-        | 1u64 << POLICY_VALID_BIT) as i64
+/// 低12位存走法编号加一，额外一位标记该走法是否有合法走子。
+pub(super) const fn pack_policy_item(move_index: usize, move_valid: bool) -> i64 {
+    assert!(move_index < DENSE_MOVE_SPACE);
+    (move_index as i64 + 1) | ((move_valid as i64) << MOVE_BITS)
 }
 
 pub(super) fn fused_policy(tables: &Tensor, context: &Tensor, items: &Tensor) -> Result<Tensor> {
@@ -168,34 +113,17 @@ impl CustomOp3 for FusedPolicy {
         let context = contiguous_slice(context, context_layout, "policy context")?;
         let items = contiguous_slice(items, item_layout, "policy items")?;
         let mut output = vec![0.0f32; self.batch * self.moves];
-        for index in 0..output.len() {
-            let packed = items[index] as u64;
-            if !flag(packed, POLICY_VALID_BIT) {
+        for (index, &packed) in items.iter().enumerate() {
+            if packed == padding_item() {
                 continue;
             }
-            let move_index = (packed & ((1 << MOVE_BITS) - 1)) as usize;
-            let mut value = tables[BIAS_OFFSET + move_index];
-            if flag(packed, MOVE_VALID_BIT) {
-                let from = feature(packed, MOVE_BITS);
-                let to = feature(packed, MOVE_BITS + FEATURE_BITS);
-                let captured = feature(packed, MOVE_BITS + FEATURE_BITS * 2);
+            let mv = (packed & MOVE_MASK) as usize - 1;
+            let mut value = tables[mv];
+            if packed & CONTEXT_FLAG != 0 {
                 let b = index / self.moves;
-                for h in 0..POLICY_MOVE_CONTEXT_SIZE {
+                for h in 0..POLICY_CONTEXT_TOTAL {
                     value += context[b * POLICY_CONTEXT_TOTAL + h]
-                        * tables[CONTEXT_OFFSET + move_index * POLICY_MOVE_CONTEXT_SIZE + h];
-                }
-                for h in 0..POLICY_ACCUMULATOR_RANK {
-                    let mut after = context
-                        [b * POLICY_CONTEXT_TOTAL + POLICY_MOVE_CONTEXT_SIZE + h]
-                        + tables[ACCUMULATOR_FEATURE_OFFSET + to * POLICY_ACCUMULATOR_RANK + h]
-                        - tables[ACCUMULATOR_FEATURE_OFFSET + from * POLICY_ACCUMULATOR_RANK + h];
-                    if flag(packed, CAPTURE_VALID_BIT) {
-                        after -= tables
-                            [ACCUMULATOR_FEATURE_OFFSET + captured * POLICY_ACCUMULATOR_RANK + h];
-                    }
-                    value += after
-                        * tables
-                            [ACCUMULATOR_MOVE_OFFSET + move_index * POLICY_ACCUMULATOR_RANK + h];
+                        * tables[CONTEXT_OFFSET + mv * POLICY_CONTEXT_TOTAL + h];
                 }
             }
             output[index] = value;
@@ -277,44 +205,22 @@ impl CustomOp3 for FusedPolicyGrad {
         let (context, grad_output) = context_grad.split_at(context_len);
         let mut output = vec![0.0f32; TABLE_LEN + context_len];
         let (grad_tables, grad_context) = output.split_at_mut(TABLE_LEN);
-        for index in 0..items.len() {
-            let packed = items[index] as u64;
-            if !flag(packed, POLICY_VALID_BIT) {
+        for (index, &packed) in items.iter().enumerate() {
+            if packed == padding_item() {
                 continue;
             }
-            let move_index = (packed & ((1 << MOVE_BITS) - 1)) as usize;
+            let mv = (packed & MOVE_MASK) as usize - 1;
             let g = grad_output[index];
-            grad_tables[BIAS_OFFSET + move_index] += g;
-            if !flag(packed, MOVE_VALID_BIT) {
+            grad_tables[mv] += g;
+            if packed & CONTEXT_FLAG == 0 {
                 continue;
             }
             let b = index / op.moves;
-            let from = feature(packed, MOVE_BITS);
-            let to = feature(packed, MOVE_BITS + FEATURE_BITS);
-            let captured = feature(packed, MOVE_BITS + FEATURE_BITS * 2);
-            for h in 0..POLICY_MOVE_CONTEXT_SIZE {
-                let context_index = CONTEXT_OFFSET + move_index * POLICY_MOVE_CONTEXT_SIZE + h;
-                grad_tables[context_index] += g * context[b * POLICY_CONTEXT_TOTAL + h];
-                grad_context[b * POLICY_CONTEXT_TOTAL + h] += g * tables[context_index];
-            }
-            for h in 0..POLICY_ACCUMULATOR_RANK {
-                let move_factor =
-                    ACCUMULATOR_MOVE_OFFSET + move_index * POLICY_ACCUMULATOR_RANK + h;
-                let w = tables[move_factor];
-                let context_index = b * POLICY_CONTEXT_TOTAL + POLICY_MOVE_CONTEXT_SIZE + h;
-                let to_index = ACCUMULATOR_FEATURE_OFFSET + to * POLICY_ACCUMULATOR_RANK + h;
-                let from_index = ACCUMULATOR_FEATURE_OFFSET + from * POLICY_ACCUMULATOR_RANK + h;
-                let mut after = context[context_index] + tables[to_index] - tables[from_index];
-                grad_context[context_index] += g * w;
-                grad_tables[to_index] += g * w;
-                grad_tables[from_index] -= g * w;
-                if flag(packed, CAPTURE_VALID_BIT) {
-                    let captured_index =
-                        ACCUMULATOR_FEATURE_OFFSET + captured * POLICY_ACCUMULATOR_RANK + h;
-                    after -= tables[captured_index];
-                    grad_tables[captured_index] -= g * w;
-                }
-                grad_tables[move_factor] += g * after;
+            for h in 0..POLICY_CONTEXT_TOTAL {
+                let weight = CONTEXT_OFFSET + mv * POLICY_CONTEXT_TOTAL + h;
+                let activation = b * POLICY_CONTEXT_TOTAL + h;
+                grad_tables[weight] += g * context[activation];
+                grad_context[activation] += g * tables[weight];
             }
         }
         Ok((CpuStorage::F32(output), (TABLE_LEN + context_len).into()))
@@ -343,14 +249,6 @@ impl CustomOp3 for FusedPolicyGrad {
             &self.0,
         )
     }
-}
-
-fn feature(packed: u64, shift: u32) -> usize {
-    ((packed >> shift) & FEATURE_MASK) as usize
-}
-
-fn flag(packed: u64, bit: u32) -> bool {
-    ((packed >> bit) & 1) != 0
 }
 
 fn contiguous_slice<'a, T>(values: &'a [T], layout: &Layout, name: &str) -> Result<&'a [T]> {
@@ -405,7 +303,7 @@ fn cuda_forward(
     let output = unsafe { device.alloc::<f32>(op.batch * op.moves)? };
     let function = device.get_or_load_custom_func(
         "fused_policy_fwd",
-        "chineseai_fused_policy_v2",
+        "chineseai_fused_policy_v3",
         policy_ptx()?,
     )?;
     let mut builder = function.builder();
@@ -452,7 +350,7 @@ fn cuda_gradient(
     let output = device.alloc_zeros::<f32>(output_len)?;
     let function = device.get_or_load_custom_func(
         "fused_policy_grad",
-        "chineseai_fused_policy_v2",
+        "chineseai_fused_policy_v3",
         policy_ptx()?,
     )?;
     let mut builder = function.builder();
@@ -507,12 +405,12 @@ mod tests {
         let tables = Var::from_slice(&table_values, TABLE_LEN, device)?;
         let context = Var::from_slice(&context_values, (2, POLICY_CONTEXT_TOTAL), device)?;
         let items = [
-            pack_policy_item(3, 10, 11, 20, true, true),
-            pack_policy_item(7, 30, 40, 0, true, false),
+            pack_policy_item(3, true),
+            pack_policy_item(7, true),
             padding_item(),
-            pack_policy_item(3, 0, 0, 0, false, false),
-            pack_policy_item(100, 500, 501, 0, true, false),
-            pack_policy_item(7, 30, 40, 20, true, true),
+            pack_policy_item(3, false),
+            pack_policy_item(100, true),
+            pack_policy_item(7, true),
         ];
         let items = Tensor::from_slice(&items, (2, 3), device)?;
         let output = fused_policy(&tables, &context, &items)?;

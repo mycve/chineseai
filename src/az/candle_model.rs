@@ -105,19 +105,16 @@ impl AzCandleModel {
         let policy_context = (hidden.matmul(&self.policy_context_hidden.t()?)?
             + threat_pair.matmul(&self.policy_threat_context.t()?)?)?;
         let policy_context = Tensor::cat(&[&policy_context, &accumulator_context], 1)?;
-        let accumulator_feature = self
-            .input_hidden
-            .matmul(&self.policy_accumulator_hidden.t()?)?
-            .flatten_all()?;
-        let policy_tables = Tensor::cat(
+        let move_context = Tensor::cat(
             &[
-                &self.policy_move_bias.flatten_all()?,
-                &self.policy_move_context.flatten_all()?,
-                &accumulator_feature,
-                &self.policy_accumulator_move.flatten_all()?,
+                self.policy_move_context.as_tensor(),
+                self.policy_accumulator_move.as_tensor(),
             ],
-            0,
-        )?;
+            1,
+        )?
+        .flatten_all()?;
+        let policy_tables =
+            Tensor::cat(&[&self.policy_move_bias.flatten_all()?, &move_context], 0)?;
         let policy_logits = fused_policy(&policy_tables, &policy_context, &batch.policy_items)?;
         let sparse_logits = sparse_policy(
             self.policy_sparse_table.as_tensor(),
@@ -460,7 +457,7 @@ mod tests {
         az::{
             AzEvalScratch, AzSampleMeta, AzTrainingSample, POLICY_SPARSE_TABLE_SIZE,
             RULE_CONTEXT_SIZE, canonical_buckets_for_perspective, dense_move_index,
-            policy_consequence_features, policy_sparse_capture_index, policy_sparse_main_index,
+            policy_move_pieces, policy_sparse_capture_index, policy_sparse_main_index,
         },
         xiangqi::Position,
     };
@@ -729,20 +726,19 @@ mod tests {
     #[ignore = "需要本地已训练检查点、Px0数据及CUDA；只核对前向"]
     fn trained_cuda_forward_matches_search_cpu() {
         let path = std::env::var("CHINESEAI_AUDIT_MODEL")
-            .unwrap_or_else(|_| "tmp/px0-reservoir-131072.epoch-3.safetensors".into());
+            .unwrap_or_else(|_| "best-v42.safetensors".into());
         let model = AzNnue::load(path).unwrap();
         let data_path =
             std::env::var("CHINESEAI_AUDIT_DATA").unwrap_or_else(|_| "data/data.bin".into());
-        let dataset =
-            crate::az::px0_data::load(std::path::Path::new(&data_path), 1024, 1024).unwrap();
-        let stride = (dataset.train.len() / 128).max(1);
-        let samples: Vec<_> = dataset
-            .train
-            .iter()
+        // 前16个有效训练对局足够检查前向，避免扫描大型数据集。
+        let training =
+            crate::az::px0_data::load_training(std::path::Path::new(&data_path), 16).unwrap();
+        let stride = (training.len() / 128).max(1);
+        let samples = training
+            .into_iter()
             .step_by(stride)
             .take(128)
-            .cloned()
-            .collect();
+            .collect::<Vec<_>>();
         assert!(samples.len() >= 64);
         let device = Device::new_cuda(0).unwrap();
         let candle = AzCandleModel::from_model(&model, &device).unwrap();
@@ -839,10 +835,9 @@ mod tests {
         let buckets = canonical_buckets_for_perspective(&position, side);
         for (index, &mv) in moves.iter().enumerate() {
             let move_index = dense_move_index(mv);
-            let (from, _, captured) = policy_consequence_features(&position, side, mv).unwrap();
-            let main = policy_sparse_main_index(move_index, from / 90, buckets.0, buckets.1);
-            let capture =
-                policy_sparse_capture_index(move_index, captured.map(|feature| feature / 90));
+            let (moved_piece, captured_piece) = policy_move_pieces(&position, side, mv).unwrap();
+            let main = policy_sparse_main_index(move_index, moved_piece, buckets.0, buckets.1);
+            let capture = policy_sparse_capture_index(move_index, captured_piece);
             model.policy_sparse_table[main] = (index as f32 % 101.0) * 0.001;
             model.policy_sparse_table[capture] = -((index as f32 % 53.0) * 0.001);
         }
@@ -918,6 +913,12 @@ mod tests {
 
         let mut gradient_model = AzNnue::random(32, 20260731);
         gradient_model.policy_move_context.fill(0.01);
+        for row in gradient_model
+            .policy_move_context
+            .chunks_exact_mut(POLICY_MOVE_CONTEXT_SIZE)
+        {
+            row[16..].fill(0.0);
+        }
         let gradient_candle = AzCandleModel::from_model(&gradient_model, &Device::Cpu).unwrap();
         let gradient_forward = gradient_candle.forward(&batch).unwrap();
         let gradients = gradient_forward
@@ -960,6 +961,12 @@ mod tests {
             move_context_gradient
                 .iter()
                 .any(|gradient| gradient.abs() > 1.0e-8)
+        );
+        assert!(
+            move_context_gradient
+                .chunks_exact(POLICY_MOVE_CONTEXT_SIZE)
+                .any(|row| row[16..].iter().any(|gradient| gradient.abs() > 1.0e-8)),
+            "扩宽通道即使初始输出为零，也必须能收到梯度"
         );
         let accumulator_move_gradient = gradients
             .get(&gradient_candle.policy_accumulator_move)

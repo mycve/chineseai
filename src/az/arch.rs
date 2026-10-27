@@ -1,7 +1,7 @@
 //! 双视角NNUE：红黑各维护一份棋子位置累加器，按行棋方、对方拼接后进入共享主干。
 //! 两份视角共用特征表；规则与将军标量作用于拼接表示。
 //! 价值头负责子力分桶、将位空间关系与历史；威胁嵌入同时服务价值和策略。
-//! 策略由非线性局面上下文、线性走后累加器、将位走法表、战术表和重复项组成。
+//! 策略由非线性局面上下文、线性局面累加器、将位走法表、战术表和重复项组成。
 //! 精确表已覆盖的因子不再单独参数化，训练与推理共用表布局。
 
 use crate::az::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS};
@@ -12,8 +12,8 @@ use super::px0_policy_map;
 pub(crate) const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = 2062;
 pub const HISTORY_CONTEXT_SIZE: usize = 96;
-pub(crate) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
-pub(crate) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
+pub(crate) const POLICY_MOVE_CONTEXT_SIZE: usize = 32;
+pub(crate) const POLICY_THREAT_CONTEXT_SIZE: usize = POLICY_MOVE_CONTEXT_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_RANK: usize = 64;
 pub(crate) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
 pub(crate) const POLICY_TACTICAL_TERMS: usize = 2;

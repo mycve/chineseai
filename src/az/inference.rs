@@ -424,22 +424,16 @@ pub(crate) fn visit_value_threat_entries_from(
 }
 
 #[inline]
-pub(crate) fn policy_consequence_features(
+pub(crate) fn policy_move_pieces(
     position: &Position,
     side: Color,
     mv: Move,
-) -> Option<(usize, usize, Option<usize>)> {
-    let moved = position.piece_at(mv.from as usize)?;
-    let canonical = canonical_move(side, mv);
-    let moved_piece_index =
-        (if moved.color == side { 0 } else { 7 }) + piece_kind_index(moved.kind);
-    let from = moved_piece_index * BOARD_SIZE + canonical.from as usize;
-    let to = moved_piece_index * BOARD_SIZE + canonical.to as usize;
-    let captured = position.piece_at(mv.to as usize).map(|piece| {
-        let piece_index = (if piece.color == side { 0 } else { 7 }) + piece_kind_index(piece.kind);
-        piece_index * BOARD_SIZE + canonical.to as usize
-    });
-    Some((from, to, captured))
+) -> Option<(usize, Option<usize>)> {
+    let moved = piece_absolute_feature_index(side, position.piece_at(mv.from as usize)?);
+    let captured = position
+        .piece_at(mv.to as usize)
+        .map(|piece| piece_absolute_feature_index(side, piece));
+    Some((moved, captured))
 }
 
 #[inline]
@@ -579,8 +573,6 @@ pub struct AzNnue {
     pub policy_repetition_hidden: Vec<f32>,
     pub policy_repetition_bias: Vec<f32>,
     pub(crate) policy_accumulator_features: Vec<f32>,
-    pub(crate) policy_accumulator_moved_delta: Vec<f32>,
-    pub(crate) policy_accumulator_capture: Vec<f32>,
     pub(crate) value_threat_active: bool,
     pub(crate) policy_tactical_active: bool,
     /// `check_context_hidden` 是否非零（全零时跳过）。
@@ -654,8 +646,6 @@ impl Clone for AzNnue {
             policy_repetition_hidden: self.policy_repetition_hidden.clone(),
             policy_repetition_bias: self.policy_repetition_bias.clone(),
             policy_accumulator_features: self.policy_accumulator_features.clone(),
-            policy_accumulator_moved_delta: self.policy_accumulator_moved_delta.clone(),
-            policy_accumulator_capture: self.policy_accumulator_capture.clone(),
             value_threat_active: self.value_threat_active,
             policy_tactical_active: self.policy_tactical_active,
             check_context_active: self.check_context_active,
@@ -872,8 +862,6 @@ impl AzNnue {
             policy_repetition_hidden,
             policy_repetition_bias,
             policy_accumulator_features: Vec::new(),
-            policy_accumulator_moved_delta: Vec::new(),
-            policy_accumulator_capture: Vec::new(),
             value_threat_active: false,
             policy_tactical_active: false,
             check_context_active: false,
@@ -1078,8 +1066,6 @@ impl AzNnue {
             policy_repetition_bias: load_candle_f32_tensor(&tensors, "policy_repetition_bias")?,
             policy_tactical: load_candle_f32_tensor(&tensors, "policy_tactical")?,
             policy_accumulator_features: Vec::new(),
-            policy_accumulator_moved_delta: Vec::new(),
-            policy_accumulator_capture: Vec::new(),
             value_threat_active: false,
             policy_tactical_active: false,
             check_context_active: false,
@@ -1495,25 +1481,11 @@ impl AzNnue {
                     let accumulator_start = move_index * POLICY_ACCUMULATOR_RANK;
                     let accumulator_move = &self.policy_accumulator_move
                         [accumulator_start..accumulator_start + POLICY_ACCUMULATOR_RANK];
-                    let consequence = policy_consequence_features(position, side, *mv);
-                    let accumulator_logit = if let Some((from, to, captured)) = consequence {
-                        debug_assert_eq!(from / BOARD_SIZE, to / BOARD_SIZE);
-                        let cache_start = move_index * POLICY_PIECE_SIZE;
-                        let mut value =
-                            dot_product(&scratch.policy_accumulator_context, accumulator_move)
-                                + self.policy_accumulator_moved_delta
-                                    [cache_start + from / BOARD_SIZE];
-                        if let Some(captured) = captured {
-                            value -= self.policy_accumulator_capture
-                                [cache_start + captured / BOARD_SIZE - POLICY_PIECE_SIZE];
-                        }
-                        value
-                    } else {
-                        0.0
-                    };
-                    let sparse_logit = consequence.map_or(0.0, |(from, _, captured)| {
-                        let moved_piece = from / BOARD_SIZE;
-                        let captured_piece = captured.map(|feature| feature / BOARD_SIZE);
+                    let pieces = policy_move_pieces(position, side, *mv);
+                    let accumulator_logit = pieces.map_or(0.0, |_| {
+                        dot_product(&scratch.policy_accumulator_context, accumulator_move)
+                    });
+                    let sparse_logit = pieces.map_or(0.0, |(moved_piece, captured_piece)| {
                         let main = policy_sparse_main_index(
                             move_index,
                             moved_piece,
@@ -1525,8 +1497,7 @@ impl AzNnue {
                     });
                     let tactical_logit = if self.policy_tactical_active {
                         crate::scope_profile!("az.eval.policy.tactical");
-                        consequence.map_or(0.0, |(from, _, captured)| {
-                            let moved_piece = from / BOARD_SIZE;
+                        pieces.map_or(0.0, |(moved_piece, captured_piece)| {
                             let check = scratch.policy_gives_check[index];
                             let (
                                 source_attacked,
@@ -1541,11 +1512,12 @@ impl AzNnue {
                                 destination_attacked,
                                 source_defended,
                                 destination_defended,
-                                captured.map(|feature| feature / BOARD_SIZE),
+                                captured_piece,
                                 check != 0.0,
                             );
                             let base = self.policy_tactical[tactical[0]];
-                            captured.map_or(base, |_| base + self.policy_tactical[tactical[1]])
+                            captured_piece
+                                .map_or(base, |_| base + self.policy_tactical[tactical[1]])
                         })
                     } else {
                         0.0
@@ -1860,36 +1832,6 @@ impl AzNnue {
             POLICY_ACCUMULATOR_ROWS * POLICY_ACCUMULATOR_RANK
         );
         self.policy_accumulator_features = projected;
-
-        let cache_size = DENSE_MOVE_SPACE * POLICY_PIECE_SIZE;
-        self.policy_accumulator_moved_delta = vec![0.0; cache_size];
-        self.policy_accumulator_capture = vec![0.0; cache_size];
-        for (move_index, &sparse) in move_map().dense_to_sparse.iter().enumerate() {
-            let sparse = sparse as usize;
-            let from_square = sparse / BOARD_SIZE;
-            let to_square = sparse % BOARD_SIZE;
-            let move_start = move_index * POLICY_ACCUMULATOR_RANK;
-            let move_weights =
-                &self.policy_accumulator_move[move_start..move_start + POLICY_ACCUMULATOR_RANK];
-            for piece_index in 0..POLICY_PIECE_SIZE {
-                let from_start = (piece_index * BOARD_SIZE + from_square) * POLICY_ACCUMULATOR_RANK;
-                let to_start = (piece_index * BOARD_SIZE + to_square) * POLICY_ACCUMULATOR_RANK;
-                let capture_start = ((piece_index + POLICY_PIECE_SIZE) * BOARD_SIZE + to_square)
-                    * POLICY_ACCUMULATOR_RANK;
-                let mut moved_delta = 0.0;
-                let mut capture = 0.0;
-                for rank in 0..POLICY_ACCUMULATOR_RANK {
-                    let weight = move_weights[rank];
-                    let to = self.policy_accumulator_features[to_start + rank];
-                    let from = self.policy_accumulator_features[from_start + rank];
-                    moved_delta += (to - from) * weight;
-                    capture += self.policy_accumulator_features[capture_start + rank] * weight;
-                }
-                let cache_index = move_index * POLICY_PIECE_SIZE + piece_index;
-                self.policy_accumulator_moved_delta[cache_index] = moved_delta;
-                self.policy_accumulator_capture[cache_index] = capture;
-            }
-        }
     }
 
     pub(crate) fn policy_accumulator(
@@ -2007,8 +1949,6 @@ impl AzNnue {
         if self.policy_accumulator_features.len()
             != POLICY_ACCUMULATOR_ROWS * POLICY_ACCUMULATOR_RANK
             || self.policy_accumulator_move.len() != DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK
-            || self.policy_accumulator_moved_delta.len() != DENSE_MOVE_SPACE * POLICY_PIECE_SIZE
-            || self.policy_accumulator_capture.len() != DENSE_MOVE_SPACE * POLICY_PIECE_SIZE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -185,8 +185,7 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
             if !legal.contains(&mv) {
                 return Err(fail());
             }
-            let (source, _, captured) =
-                policy_consequence_features(&position, side, mv).ok_or_else(fail)?;
+            let (moved, captured) = policy_move_pieces(&position, side, mv).ok_or_else(fail)?;
             let (sa, da, sd, dd) = policy_move_tactical_flags(
                 mv,
                 masks[1 - color_index(side)],
@@ -195,12 +194,12 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
             classes.push(
                 policy_tactical_indices(
                     index,
-                    source / BOARD_SIZE,
+                    moved,
                     sa,
                     da,
                     sd,
                     dd,
-                    captured.map(|x| x / BOARD_SIZE),
+                    captured,
                     position.gives_check_after_move_fast(mv),
                 )[0] % CALIBRATION_CLASSES,
             );
