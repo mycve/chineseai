@@ -2,8 +2,7 @@ use std::sync::OnceLock;
 
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, Layout, Result, Shape, Tensor};
 
-const TERMS: usize = 7;
-const TACTICAL_TERMS: usize = super::POLICY_TACTICAL_TERMS;
+const TERMS: usize = super::POLICY_SPARSE_TERMS;
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void sparse_policy_fwd(
     const float* tables, const long long* indices, float* output, unsigned int outputs
@@ -12,7 +11,7 @@ extern "C" __global__ void sparse_policy_fwd(
     if (index >= outputs) return;
     float sum = 0.0f;
     #pragma unroll
-    for (unsigned int i = 0; i < 7u; ++i) sum += tables[(unsigned long long)indices[index * 7u + i]];
+    for (unsigned int i = 0; i < 2u; ++i) sum += tables[(unsigned long long)indices[index * 2u + i]];
     output[index] = sum;
 }
 
@@ -21,26 +20,9 @@ extern "C" __global__ void sparse_policy_grad(
 ) {
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= entries) return;
-    atomicAdd(grad_tables + (unsigned long long)indices[index], grad_output[index / 7u]);
+    atomicAdd(grad_tables + (unsigned long long)indices[index], grad_output[index / 2u]);
 }
 
-extern "C" __global__ void tactical_policy_fwd(
-    const float* tables, const long long* indices, float* output, unsigned int outputs
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= outputs) return;
-    output[index] = tables[(unsigned long long)indices[index * 3u]]
-                  + tables[(unsigned long long)indices[index * 3u + 1u]]
-                  + tables[(unsigned long long)indices[index * 3u + 2u]];
-}
-
-extern "C" __global__ void tactical_policy_grad(
-    const long long* indices, const float* grad_output, float* grad_tables, unsigned int entries
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= entries) return;
-    atomicAdd(grad_tables + (unsigned long long)indices[index], grad_output[index / 3u]);
-}
 "#;
 
 #[derive(Clone, Debug)]
@@ -55,18 +37,10 @@ struct SparsePolicy {
 struct SparsePolicyGrad(SparsePolicy);
 
 pub(super) fn sparse_policy(tables: &Tensor, indices: &Tensor) -> Result<Tensor> {
-    sparse_table_policy(tables, indices, TERMS)
-}
-
-pub(super) fn tactical_policy(tables: &Tensor, indices: &Tensor) -> Result<Tensor> {
-    sparse_table_policy(tables, indices, TACTICAL_TERMS)
-}
-
-fn sparse_table_policy(tables: &Tensor, indices: &Tensor, expected_terms: usize) -> Result<Tensor> {
     let table_len = tables.dims1()?;
     let (batch, moves, terms) = indices.dims3()?;
-    if terms != expected_terms {
-        candle_core::bail!("sparse policy expects {expected_terms} indices per move, got {terms}")
+    if terms != TERMS {
+        candle_core::bail!("sparse policy expects {TERMS} indices per move, got {terms}")
     }
     tables.apply_op2(
         indices,
@@ -221,11 +195,7 @@ fn cuda_forward(
     let device = &table_storage.device;
     let outputs = op.batch * op.moves;
     let output = unsafe { device.alloc::<f32>(outputs)? };
-    let name = if op.terms == TERMS {
-        "sparse_policy_fwd"
-    } else {
-        "tactical_policy_fwd"
-    };
+    let name = "sparse_policy_fwd";
     let function = device.get_or_load_custom_func(name, "chineseai_sparse_policy_v2", ptx()?)?;
     let mut builder = function.builder();
     builder.arg(&tables).arg(&indices).arg(&output);
@@ -265,11 +235,7 @@ fn cuda_gradient(
     let device = &index_storage.device;
     let output = device.alloc_zeros::<f32>(op.table_len)?;
     let entries = op.batch * op.moves * op.terms;
-    let name = if op.terms == TERMS {
-        "sparse_policy_grad"
-    } else {
-        "tactical_policy_grad"
-    };
+    let name = "sparse_policy_grad";
     let function = device.get_or_load_custom_func(name, "chineseai_sparse_policy_v2", ptx()?)?;
     let mut builder = function.builder();
     builder.arg(&indices).arg(&grad).arg(&output);
@@ -311,11 +277,7 @@ mod tests {
     #[cfg(feature = "slow-tests")]
     fn output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
         let tables = Var::from_slice(&[0.5f32, -1.0, 2.0, 3.0, -0.25], 5, device)?;
-        let indices = Tensor::from_slice(
-            &[0i64, 1, 2, 2, 3, 4, 0, 4, 4, 4, 1, 1, 0, 3],
-            (1, 2, TERMS),
-            device,
-        )?;
+        let indices = Tensor::from_slice(&[0i64, 2, 1, 3], (1, 2, TERMS), device)?;
         let output = sparse_policy(&tables, &indices)?;
         let weights = Tensor::from_slice(&[2.0f32, -0.5], (1, 2), device)?;
         let grads = output.broadcast_mul(&weights)?.sum_all()?.backward()?;
@@ -334,40 +296,13 @@ mod tests {
     }
 
     #[cfg(feature = "slow-tests")]
-    fn tactical_output_and_grad(device: &Device) -> Result<(Vec<f32>, Vec<f32>)> {
-        let tables = Var::from_slice(&[0.5f32, -1.0, 2.0, 3.0, -0.25], 5, device)?;
-        let indices = Tensor::from_slice(&[0i64, 2, 1, 3, 4, 2], (1, 2, TACTICAL_TERMS), device)?;
-        let output = tactical_policy(&tables, &indices)?;
-        let weights = Tensor::from_slice(&[2.0f32, -0.5], (1, 2), device)?;
-        let grads = output.broadcast_mul(&weights)?.sum_all()?.backward()?;
-        Ok((
-            output.flatten_all()?.to_vec1()?,
-            grads.get(&tables).unwrap().flatten_all()?.to_vec1()?,
-        ))
-    }
-
-    #[cfg(feature = "slow-tests")]
     #[test]
     fn fused_sparse_policy_matches_expected_and_cuda() -> Result<()> {
         let cpu = output_and_grad(&Device::Cpu)?;
-        assert_close(&cpu.0, &[6.75, 0.75]);
-        assert_close(&cpu.1, &[3.5, 1.0, 4.0, 1.5, 0.5]);
+        assert_close(&cpu.0, &[2.5, 2.0]);
+        assert_close(&cpu.1, &[2.0, -0.5, 2.0, -0.5, 0.0]);
         if let Some(device) = crate::az::cuda_test_device::shared_cuda_device() {
             let cuda = output_and_grad(device)?;
-            assert_close(&cpu.0, &cuda.0);
-            assert_close(&cpu.1, &cuda.1);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "slow-tests")]
-    #[test]
-    fn fused_tactical_policy_matches_expected_and_cuda() -> Result<()> {
-        let cpu = tactical_output_and_grad(&Device::Cpu)?;
-        assert_close(&cpu.0, &[1.5, 4.75]);
-        assert_close(&cpu.1, &[2.0, 2.0, 1.5, -0.5, -0.5]);
-        if let Some(device) = crate::az::cuda_test_device::shared_cuda_device() {
-            let cuda = tactical_output_and_grad(device)?;
             assert_close(&cpu.0, &cuda.0);
             assert_close(&cpu.1, &cuda.1);
         }

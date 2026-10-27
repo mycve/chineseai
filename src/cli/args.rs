@@ -93,13 +93,11 @@ pub(crate) struct AzPolicyScaleArgs {
 pub(crate) enum PolicyComponent {
     Exact,
     Capture,
-    Factor,
     Tactical,
     TacticalExact,
-    TacticalFactor,
+    CaptureRelation,
     Accumulator,
     Context,
-    Consequence,
     MoveBias,
     ThreatContext,
 }

@@ -11,14 +11,14 @@ use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 use crate::xiangqi::{BOARD_SIZE, Color, Position};
 
 use super::{
-    AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_TACTICAL_SIZE,
-    POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_KING_PIECE_MAX_ACTIVE, VALUE_THREAT_MAX_ACTIVE,
-    WDL_HEAD_SIZE, canonical_general_buckets_from_features, decode_current_piece_square_feature,
-    dense_move_squares,
-    fused_feature_pool::{PADDING_ITEM, pack_feature},
+    AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_SPARSE_TERMS,
+    POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_KING_PIECE_MAX_ACTIVE,
+    VALUE_THREAT_MAX_ACTIVE, WDL_HEAD_SIZE, canonical_general_buckets_from_features,
+    decode_current_piece_square_feature, dense_move_squares,
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
     normalize_wdl_target, policy_move_tactical_flags, policy_sparse_capture_index,
-    policy_sparse_factor_indices, policy_sparse_main_index, policy_tactical_indices,
+    policy_sparse_main_index, policy_tactical_indices,
+    sparse_pool::PADDING_ITEM,
     visit_value_king_piece_features, visit_value_threat_features,
 };
 
@@ -33,11 +33,9 @@ pub struct AzSparseActivationStats {
     pub inspected_policy_moves: usize,
     pub value_threat_unique: usize,
     pub policy_exact_unique: usize,
-    pub policy_factor_unique: usize,
     pub policy_tactical_unique: usize,
     pub value_threat_coverage: f32,
     pub policy_exact_coverage: f32,
-    pub policy_factor_coverage: f32,
     pub policy_tactical_coverage: f32,
 }
 
@@ -55,7 +53,6 @@ pub fn sparse_activation_stats(
         .collect::<Vec<_>>();
     let mut value_threats = HashSet::new();
     let mut policy_exact = HashSet::new();
-    let mut policy_factor = HashSet::new();
     let mut policy_tactical = HashSet::new();
     let mut policy_moves = 0usize;
 
@@ -81,15 +78,12 @@ pub fn sparse_activation_stats(
                     continue;
                 }
                 policy_moves += 1;
-                let sparse_base = (move_base + move_offset) * 7;
-                for &index in &packed.policy_sparse_indices[sparse_base..sparse_base + 7] {
+                let sparse_base = (move_base + move_offset) * POLICY_SPARSE_TERMS;
+                for &index in
+                    &packed.policy_sparse_indices[sparse_base..sparse_base + POLICY_SPARSE_TERMS]
+                {
                     if index >= 0 && (index as usize) < POLICY_SPARSE_TABLE_SIZE - 1 {
                         policy_exact.insert(index as usize);
-                    } else if index >= POLICY_SPARSE_TABLE_SIZE as i64 {
-                        let factor = index as usize - POLICY_SPARSE_TABLE_SIZE;
-                        if factor < super::POLICY_SPARSE_FACTOR_SIZE {
-                            policy_factor.insert(factor);
-                        }
                     }
                 }
                 let tactical_base = (move_base + move_offset) * POLICY_TACTICAL_TERMS;
@@ -109,12 +103,9 @@ pub fn sparse_activation_stats(
         inspected_policy_moves: policy_moves,
         value_threat_unique: value_threats.len(),
         policy_exact_unique: policy_exact.len(),
-        policy_factor_unique: policy_factor.len(),
         policy_tactical_unique: policy_tactical.len(),
         value_threat_coverage: value_threats.len() as f32 / super::VALUE_THREAT_VOCAB as f32,
         policy_exact_coverage: policy_exact.len() as f32 / (POLICY_SPARSE_TABLE_SIZE - 1) as f32,
-        policy_factor_coverage: policy_factor.len() as f32
-            / super::POLICY_SPARSE_FACTOR_SIZE as f32,
         policy_tactical_coverage: policy_tactical.len() as f32 / POLICY_TACTICAL_SIZE as f32,
     }
 }
@@ -278,7 +269,7 @@ impl PackedBatch {
             max_policy_moves,
             max_value_threats,
             max_value_king_pieces,
-            feature_items: vec![PADDING_ITEM; batch_size * max_features],
+            feature_items: vec![PADDING_ITEM; batch_size * 2 * max_features],
             value_threat_indices: vec![PADDING_ITEM; batch_size * max_value_threats],
             value_threat_scales: vec![1.0; batch_size],
             value_king_piece_indices: vec![PADDING_ITEM; batch_size * max_value_king_pieces],
@@ -286,7 +277,7 @@ impl PackedBatch {
             policy_items: vec![policy_padding_item(); batch_size * max_policy_moves],
             policy_sparse_indices: vec![
                 (POLICY_SPARSE_TABLE_SIZE - 1) as i64;
-                batch_size * max_policy_moves * 7
+                batch_size * max_policy_moves * POLICY_SPARSE_TERMS
             ],
             policy_tactical_indices: vec![
                 POLICY_TACTICAL_SIZE as i64;
@@ -311,7 +302,7 @@ impl PackedBatch {
         for (row, (&sample_index, threats)) in batch.iter().zip(&value_threats).enumerate() {
             let sample = &samples[sample_index];
             let king_buckets = canonical_general_buckets_from_features(&sample.features);
-            packed.pack_features(row, sample, king_buckets);
+            packed.pack_features(row, sample);
             let threat_base = row * max_value_threats;
             packed.value_threat_indices[threat_base..threat_base + threats.len()]
                 .copy_from_slice(threats);
@@ -352,21 +343,14 @@ impl PackedBatch {
         packed
     }
 
-    fn pack_features(
-        &mut self,
-        row: usize,
-        sample: &AzTrainingSample,
-        king_buckets: (usize, usize),
-    ) {
-        let (us_king_bucket, them_king_bucket) = king_buckets;
-        let feature_base = row * self.max_features;
-        for (feature_offset, &feature) in sample.features.iter().enumerate() {
-            if feature >= AZ_NNUE_INPUT_SIZE {
-                continue;
+    fn pack_features(&mut self, row: usize, sample: &AzTrainingSample) {
+        let feature_base = row * 2 * self.max_features;
+        for (offset, &feature) in sample.features.iter().enumerate() {
+            if feature < AZ_NNUE_INPUT_SIZE {
+                self.feature_items[feature_base + offset] = feature as u32;
+                self.feature_items[feature_base + self.max_features + offset] =
+                    super::nnue::opposite_feature(feature) as u32;
             }
-            let batch_feature_index = feature_base + feature_offset;
-            self.feature_items[batch_feature_index] =
-                pack_feature(feature, us_king_bucket, them_king_bucket);
         }
     }
 
@@ -454,7 +438,7 @@ impl PackedBatch {
                 if move_valid {
                     let moved_piece = consequence_from / BOARD_SIZE;
                     let captured_piece = capture_valid.then_some(consequence_captured / BOARD_SIZE);
-                    let sparse_base = item_index * 7;
+                    let sparse_base = item_index * POLICY_SPARSE_TERMS;
                     self.policy_sparse_indices[sparse_base] = policy_sparse_main_index(
                         move_index,
                         moved_piece,
@@ -463,18 +447,6 @@ impl PackedBatch {
                     ) as i64;
                     self.policy_sparse_indices[sparse_base + 1] =
                         policy_sparse_capture_index(move_index, captured_piece) as i64;
-                    for (offset, factor) in policy_sparse_factor_indices(
-                        move_index,
-                        moved_piece,
-                        king_buckets.0,
-                        king_buckets.1,
-                    )
-                    .into_iter()
-                    .enumerate()
-                    {
-                        self.policy_sparse_indices[sparse_base + 2 + offset] =
-                            (POLICY_SPARSE_TABLE_SIZE + factor) as i64;
-                    }
                     let mv = crate::xiangqi::Move::new(
                         consequence_from % BOARD_SIZE,
                         consequence_to % BOARD_SIZE,
@@ -669,6 +641,32 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn packed_features_keep_both_views_and_padding_per_sample() {
+        let mut first = sample(0);
+        first.features = vec![0, 90, 1259];
+        let mut second = sample(1);
+        second.features = vec![611];
+        let packed = PackedBatch::from_indices(&[first, second], &[0, 1]);
+        assert_eq!(
+            packed.feature_items,
+            [
+                0,
+                90,
+                1259,
+                719,
+                809,
+                540,
+                611,
+                PADDING_ITEM,
+                PADDING_ITEM,
+                1188,
+                PADDING_ITEM,
+                PADDING_ITEM
+            ]
+        );
+    }
+
     fn sample(index: usize) -> AzTrainingSample {
         AzTrainingSample {
             repetition_flags: Vec::new(),
@@ -763,10 +761,8 @@ mod tests {
         assert_eq!(stats.inspected_samples, 2);
         assert_eq!(stats.inspected_policy_moves, 1);
         assert_eq!(stats.policy_exact_unique, 2);
-        assert_eq!(stats.policy_factor_unique, 5);
         assert!(stats.policy_tactical_unique > 0);
         assert!(stats.policy_exact_coverage > 0.0);
-        assert!(stats.policy_factor_coverage > 0.0);
     }
 
     #[test]

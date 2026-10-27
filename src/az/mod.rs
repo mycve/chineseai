@@ -15,16 +15,16 @@ mod candle_model;
 #[cfg(all(test, feature = "slow-tests"))]
 mod cuda_test_device;
 mod dataloader;
-mod fused_feature_pool;
 mod fused_policy;
 mod fused_sparse_policy;
 mod history;
-mod node_threat;
 mod inference;
 mod mate;
 pub mod nnue;
+mod node_threat;
 mod play;
 mod policy_calibration;
+mod sparse_pool;
 pub use policy_calibration::{PolicyCalibrationReport, calibrate_policy};
 pub mod px0_data;
 mod px0_policy_map;
@@ -78,8 +78,7 @@ pub(crate) use simd::*;
 
 pub use arch::{
     AzMovesLeftParams, AzNnueArch, CHECK_CONTEXT_SIZE, DENSE_MOVE_SPACE, HISTORY_CONTEXT_SIZE,
-    POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, POLICY_TACTICAL_FACTOR_SIZE,
-    RULE_CONTEXT_SIZE, dense_move_index,
+    POLICY_SPARSE_MAIN_SIZE, POLICY_TACTICAL_EXACT_SIZE, RULE_CONTEXT_SIZE, dense_move_index,
 };
 pub use inference::{AzNnue, outputs_for_training_sample, position_for_training_sample};
 pub use mate::{

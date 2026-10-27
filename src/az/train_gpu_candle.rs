@@ -625,7 +625,13 @@ mod monitoring_tests {
             let model = AzNnue::random(8, 87);
             let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
             let (vars, decay) = candle.all_vars_with_decay();
-            let partial = AzAdamW::new(vars[..28].to_vec(), decay[..28].to_vec(), lr).unwrap();
+            let partial_count = vars.len() - 1;
+            let partial = AzAdamW::new(
+                vars[..partial_count].to_vec(),
+                decay[..partial_count].to_vec(),
+                lr,
+            )
+            .unwrap();
             let path = std::env::temp_dir().join(format!(
                 "chineseai-partial-{}-{}.safetensors",
                 kind.as_str(),

@@ -1,66 +1,38 @@
+//! 双视角NNUE：红黑各维护一份棋子位置累加器，按行棋方、对方拼接后进入共享主干。
+//! 两份视角共用特征表；规则与将军标量作用于拼接表示。
+//! 价值头负责子力分桶、将位空间关系与历史；威胁嵌入同时服务价值和策略。
+//! 策略由非线性局面上下文、线性走后累加器、将位走法表、战术表和重复项组成。
+//! 精确表已覆盖的因子不再单独参数化，训练与推理共用表布局。
+
 use crate::az::nnue::{AZ_NNUE_INPUT_SIZE, V2_KING_BUCKETS};
-use crate::xiangqi::{BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, Move};
+use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move};
 
 use super::px0_policy_map;
 
 pub(crate) const SPARSE_MOVE_SPACE: usize = BOARD_SIZE * BOARD_SIZE;
 pub const DENSE_MOVE_SPACE: usize = 2062;
-pub(crate) const POLICY_CONSEQUENCE_SIZE: usize = 32;
 pub const HISTORY_CONTEXT_SIZE: usize = 96;
 pub(crate) const POLICY_MOVE_CONTEXT_SIZE: usize = 16;
 pub(crate) const POLICY_THREAT_CONTEXT_SIZE: usize = 16;
 pub(crate) const POLICY_ACCUMULATOR_RANK: usize = 64;
 pub(crate) const POLICY_TACTICAL_SIGNATURE_BUCKETS: usize = 64;
-pub(crate) const POLICY_TACTICAL_TERMS: usize = 3;
+pub(crate) const POLICY_TACTICAL_TERMS: usize = 2;
 pub const POLICY_TACTICAL_EXACT_SIZE: usize =
-    DENSE_MOVE_SPACE * (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-pub const POLICY_TACTICAL_FACTOR_SIZE: usize =
-    (STRUCTURAL_PIECE_SIZE / 2) * POLICY_TACTICAL_SIGNATURE_BUCKETS;
-pub(crate) const POLICY_CAPTURE_RELATION_OFFSET: usize =
-    POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
+    DENSE_MOVE_SPACE * POLICY_PIECE_SIZE * POLICY_TACTICAL_SIGNATURE_BUCKETS;
+pub(crate) const POLICY_CAPTURE_RELATION_OFFSET: usize = POLICY_TACTICAL_EXACT_SIZE;
 pub(crate) const POLICY_CAPTURE_RELATION_BUCKETS: usize = 32;
 pub(crate) const POLICY_CAPTURE_RELATION_SIZE: usize = 7 * 7 * POLICY_CAPTURE_RELATION_BUCKETS;
 pub(crate) const POLICY_TACTICAL_SIZE: usize =
     POLICY_CAPTURE_RELATION_OFFSET + POLICY_CAPTURE_RELATION_SIZE;
-// 推理只访问己方走子和敌方被吃子；训练张量保持原布局。
-pub(crate) const POLICY_CACHE_PIECE_SIZE: usize = STRUCTURAL_PIECE_SIZE / 2;
-pub(crate) const POLICY_CACHE_CAPTURE_CLASSES: usize = POLICY_CACHE_PIECE_SIZE + 1;
-pub(crate) const POLICY_CACHE_MAIN_SIZE: usize =
-    DENSE_MOVE_SPACE * POLICY_CACHE_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
-pub(crate) const POLICY_CACHE_TABLE_SIZE: usize =
-    POLICY_CACHE_MAIN_SIZE + DENSE_MOVE_SPACE * POLICY_CACHE_CAPTURE_CLASSES;
-pub(crate) const POLICY_SPARSE_CAPTURE_CLASSES: usize = STRUCTURAL_PIECE_SIZE + 1;
+// 策略只编码己方走子和敌方被吃子，训练与推理使用同一布局。
+pub(crate) const POLICY_PIECE_SIZE: usize = 7;
+pub(crate) const POLICY_CAPTURE_CLASSES: usize = POLICY_PIECE_SIZE + 1;
 pub const POLICY_SPARSE_MAIN_SIZE: usize =
-    DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
-pub(crate) const POLICY_SPARSE_CAPTURE_SIZE: usize =
-    DENSE_MOVE_SPACE * POLICY_SPARSE_CAPTURE_CLASSES;
+    DENSE_MOVE_SPACE * POLICY_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
 pub(crate) const POLICY_SPARSE_TABLE_SIZE: usize =
-    POLICY_SPARSE_MAIN_SIZE + POLICY_SPARSE_CAPTURE_SIZE + 1;
-pub(crate) const POLICY_SPARSE_MOVE_PIECE_SIZE: usize = DENSE_MOVE_SPACE * STRUCTURAL_PIECE_SIZE;
-pub(crate) const POLICY_SPARSE_MOVE_KING_SIZE: usize =
-    DENSE_MOVE_SPACE * V2_KING_BUCKETS * V2_KING_BUCKETS;
-pub(crate) const POLICY_SPARSE_PIECE_KING_SIZE: usize =
-    STRUCTURAL_PIECE_SIZE * V2_KING_BUCKETS * V2_KING_BUCKETS;
-pub(crate) const POLICY_KING_DISTANCE_BUCKETS: usize = 6;
-pub(crate) const POLICY_KING_APPROACH_BUCKETS: usize = 5;
-pub(crate) const POLICY_SPARSE_DISTANCE_SIZE: usize =
-    STRUCTURAL_PIECE_SIZE * POLICY_KING_DISTANCE_BUCKETS;
-pub(crate) const POLICY_SPARSE_APPROACH_SIZE: usize =
-    STRUCTURAL_PIECE_SIZE * POLICY_KING_APPROACH_BUCKETS;
-pub(crate) const POLICY_SPARSE_FACTOR_SIZE: usize = POLICY_SPARSE_MOVE_PIECE_SIZE
-    + POLICY_SPARSE_MOVE_KING_SIZE
-    + POLICY_SPARSE_PIECE_KING_SIZE
-    + POLICY_SPARSE_DISTANCE_SIZE
-    + POLICY_SPARSE_APPROACH_SIZE;
-pub(crate) const POLICY_ACCUMULATOR_PIECE_OFFSET: usize = AZ_NNUE_INPUT_SIZE;
-pub(crate) const POLICY_ACCUMULATOR_RANK_OFFSET: usize =
-    POLICY_ACCUMULATOR_PIECE_OFFSET + STRUCTURAL_PIECE_SIZE;
-pub(crate) const POLICY_ACCUMULATOR_FILE_OFFSET: usize =
-    POLICY_ACCUMULATOR_RANK_OFFSET + STRUCTURAL_RANK_SIZE;
-pub(crate) const POLICY_ACCUMULATOR_KING_PIECE_OFFSET: usize =
-    POLICY_ACCUMULATOR_FILE_OFFSET + STRUCTURAL_FILE_SIZE;
-pub(crate) const POLICY_ACCUMULATOR_BIAS_ROW: usize =
-    POLICY_ACCUMULATOR_KING_PIECE_OFFSET + STRUCTURAL_KING_PIECE_SIZE;
+    POLICY_SPARSE_MAIN_SIZE + DENSE_MOVE_SPACE * POLICY_CAPTURE_CLASSES + 1;
+pub(crate) const POLICY_SPARSE_TERMS: usize = 2;
+pub(crate) const POLICY_ACCUMULATOR_BIAS_ROW: usize = AZ_NNUE_INPUT_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
 pub(crate) const VALUE_HEAD_SIZE: usize = 96;
 pub(crate) const VALUE_BUCKETS: usize = 32;
@@ -91,9 +63,6 @@ pub const CHECK_CONTEXT_SIZE: usize = 8;
 pub(crate) const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(crate) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub(crate) const STRUCTURAL_PIECE_SIZE: usize = 14;
-pub(crate) const STRUCTURAL_RANK_SIZE: usize = BOARD_RANKS;
-pub(crate) const STRUCTURAL_FILE_SIZE: usize = BOARD_FILES;
-pub(crate) const STRUCTURAL_KING_PIECE_SIZE: usize = 2 * V2_KING_BUCKETS * 14;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StructuralPieceSquare {
@@ -131,14 +100,6 @@ pub(crate) fn canonical_general_buckets_from_features(features: &[usize]) -> (us
         }
     }
     (us, them)
-}
-
-pub(crate) fn structural_king_piece_index(
-    perspective: usize,
-    king_bucket: usize,
-    piece_index: usize,
-) -> usize {
-    ((perspective * V2_KING_BUCKETS + king_bucket.min(V2_KING_BUCKETS - 1)) * 14) + piece_index
 }
 
 pub(crate) fn canonical_general_bucket(piece_index: usize, sq: usize) -> usize {
@@ -280,3 +241,77 @@ impl AzMovesLeftParams {
         self
     }
 }
+
+// 参数形状及是否施加稠密权重衰减的唯一清单。
+macro_rules! az_weight_tensors {
+    ($visit:ident, $h:expr) => {
+        $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h], false);
+        $visit!(rule_context_hidden, [RULE_CONTEXT_SIZE, 2 * $h], true);
+        $visit!(check_context_hidden, [CHECK_CONTEXT_SIZE, 2 * $h], true);
+        $visit!(hidden_bias, [$h], false);
+        $visit!(shared_hidden, [$h, 2 * $h], true);
+        $visit!(shared_bias, [$h], false);
+        $visit!(value_head_hidden, [VALUE_HEAD_SIZE, $h], true);
+        $visit!(value_head_bias, [VALUE_HEAD_SIZE], false);
+        $visit!(
+            value_king_piece_hidden,
+            [VALUE_KING_PIECE_VOCAB, VALUE_KING_PIECE_RANK],
+            false
+        );
+        $visit!(
+            value_king_piece_projection,
+            [VALUE_KING_PIECE_RANK, VALUE_HEAD_SIZE],
+            true
+        );
+        $visit!(
+            value_head_output,
+            [VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE],
+            true
+        );
+        $visit!(
+            value_history_output,
+            [WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE],
+            true
+        );
+        $visit!(moves_left_output, [1, $h], true);
+        $visit!(moves_left_bias, [1], false);
+        $visit!(
+            value_threat_embedding,
+            [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK],
+            false
+        );
+        $visit!(
+            value_threat_output,
+            [WDL_HEAD_SIZE, VALUE_THREAT_RANK * 2],
+            true
+        );
+        $visit!(
+            policy_threat_context,
+            [POLICY_THREAT_CONTEXT_SIZE, VALUE_THREAT_RANK * 2],
+            true
+        );
+        $visit!(policy_move_bias, [DENSE_MOVE_SPACE], false);
+        $visit!(policy_context_hidden, [POLICY_MOVE_CONTEXT_SIZE, $h], true);
+        $visit!(
+            policy_move_context,
+            [DENSE_MOVE_SPACE, POLICY_MOVE_CONTEXT_SIZE],
+            false
+        );
+        $visit!(
+            policy_accumulator_hidden,
+            [POLICY_ACCUMULATOR_RANK, $h],
+            true
+        );
+        $visit!(
+            policy_accumulator_move,
+            [DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK],
+            false
+        );
+        $visit!(policy_sparse_table, [POLICY_SPARSE_TABLE_SIZE], false);
+        $visit!(policy_tactical, [POLICY_TACTICAL_SIZE], false);
+        $visit!(policy_repetition_hidden, [$h], true);
+        $visit!(policy_repetition_bias, [1], false);
+    };
+}
+
+pub(crate) use az_weight_tensors;

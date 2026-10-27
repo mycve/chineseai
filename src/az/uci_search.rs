@@ -55,8 +55,9 @@ impl AzTree<'_> {
             if new_index > 0 {
                 let start = node.accumulator_offset as usize;
                 node.accumulator_offset = self.accumulator_arena.len() as u32;
-                self.accumulator_arena
-                    .extend_from_slice(&old_accumulators[start..start + self.model.hidden_size]);
+                self.accumulator_arena.extend_from_slice(
+                    &old_accumulators[start..start + 2 * self.model.hidden_size],
+                );
             }
             let start = node.children_offset as usize;
             node.children_offset = self.children.len() as u32;
@@ -277,11 +278,10 @@ mod tests {
                 assert!((node.parent as usize) < index);
             }
             let expected = AzEvalAccumulator::new(&model, &node.position).into_hidden_sum();
-            let perspective = color_index(node.position.side_to_move()) * model.hidden_size;
             let offset = node.accumulator_offset as usize;
-            for (actual, expected) in tree.accumulator_arena[offset..offset + model.hidden_size]
+            for (actual, expected) in tree.accumulator_arena[offset..offset + 2 * model.hidden_size]
                 .iter()
-                .zip(&expected[perspective..perspective + model.hidden_size])
+                .zip(&expected)
             {
                 assert!((actual - expected).abs() < 1e-5);
             }

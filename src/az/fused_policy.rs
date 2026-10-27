@@ -2,9 +2,7 @@ use std::sync::OnceLock;
 
 use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
-use super::{
-    DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_CONSEQUENCE_SIZE, POLICY_MOVE_CONTEXT_SIZE,
-};
+use super::{DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_MOVE_CONTEXT_SIZE};
 use crate::az::nnue::AZ_NNUE_INPUT_SIZE;
 
 const MOVE_BITS: u32 = 12;
@@ -13,10 +11,8 @@ const FEATURE_MASK: u64 = (1 << FEATURE_BITS) - 1;
 const MOVE_VALID_BIT: u32 = MOVE_BITS + FEATURE_BITS * 3;
 const CAPTURE_VALID_BIT: u32 = MOVE_VALID_BIT + 1;
 const POLICY_VALID_BIT: u32 = CAPTURE_VALID_BIT + 1;
-const INPUT_LEN: usize = AZ_NNUE_INPUT_SIZE * POLICY_CONSEQUENCE_SIZE;
-const CONSEQUENCE_OFFSET: usize = INPUT_LEN;
-const BIAS_OFFSET: usize = CONSEQUENCE_OFFSET + POLICY_CONSEQUENCE_SIZE;
-const CONTEXT_OFFSET: usize = BIAS_OFFSET + DENSE_MOVE_SPACE;
+const BIAS_OFFSET: usize = 0;
+const CONTEXT_OFFSET: usize = DENSE_MOVE_SPACE;
 const ACCUMULATOR_FEATURE_OFFSET: usize =
     CONTEXT_OFFSET + DENSE_MOVE_SPACE * POLICY_MOVE_CONTEXT_SIZE;
 const ACCUMULATOR_MOVE_OFFSET: usize =
@@ -24,15 +20,10 @@ const ACCUMULATOR_MOVE_OFFSET: usize =
 const TABLE_LEN: usize = ACCUMULATOR_MOVE_OFFSET + DENSE_MOVE_SPACE * POLICY_ACCUMULATOR_RANK;
 const POLICY_CONTEXT_TOTAL: usize = POLICY_MOVE_CONTEXT_SIZE + POLICY_ACCUMULATOR_RANK;
 const _: () = assert!(AZ_NNUE_INPUT_SIZE == 1260);
-const _: () = assert!(
-    POLICY_CONSEQUENCE_SIZE == 32
-        && POLICY_MOVE_CONTEXT_SIZE == 16
-        && POLICY_ACCUMULATOR_RANK == 64
-);
+const _: () = assert!(POLICY_MOVE_CONTEXT_SIZE == 16 && POLICY_ACCUMULATOR_RANK == 64);
 const _: () = assert!(DENSE_MOVE_SPACE == 2062);
-const _: () = assert!(CONSEQUENCE_OFFSET == 40320 && BIAS_OFFSET == 40352);
-const _: () = assert!(CONTEXT_OFFSET == 42414 && ACCUMULATOR_FEATURE_OFFSET == 75406);
-const _: () = assert!(ACCUMULATOR_MOVE_OFFSET == 156046 && TABLE_LEN == 288014);
+const _: () = assert!(CONTEXT_OFFSET == 2062 && ACCUMULATOR_FEATURE_OFFSET == 35054);
+const _: () = assert!(ACCUMULATOR_MOVE_OFFSET == 115694 && TABLE_LEN == 247662);
 
 const CUDA_SOURCE: &str = r#"
 extern "C" __global__ void fused_policy_fwd(
@@ -44,27 +35,22 @@ extern "C" __global__ void fused_policy_fwd(
     unsigned long long packed = (unsigned long long)items[index];
     if (((packed >> 47) & 1u) == 0u) { output[index] = 0.0f; return; }
     unsigned int move_index = packed & 0xfffu;
-    float value = tables[40352u + move_index];
+    float value = tables[0u + move_index];
     if (((packed >> 45) & 1u) != 0u) {
         unsigned int from = (packed >> 12) & 0x7ffu;
         unsigned int to = (packed >> 23) & 0x7ffu;
         unsigned int captured = (packed >> 34) & 0x7ffu;
         bool has_capture = ((packed >> 46) & 1u) != 0u;
-        for (unsigned int h = 0; h < 32u; ++h) {
-            float delta = tables[to * 32u + h] - tables[from * 32u + h];
-            if (has_capture) delta -= tables[captured * 32u + h];
-            value += delta * tables[40320u + h];
-        }
         for (unsigned int h = 0; h < 16u; ++h) {
             value += context[(index / moves) * 80u + h]
-                   * tables[42414u + move_index * 16u + h];
+                   * tables[2062u + move_index * 16u + h];
         }
         for (unsigned int h = 0; h < 64u; ++h) {
             float after = context[(index / moves) * 80u + 16u + h]
-                        + tables[75406u + to * 64u + h]
-                        - tables[75406u + from * 64u + h];
-            if (has_capture) after -= tables[75406u + captured * 64u + h];
-            value += after * tables[156046u + move_index * 64u + h];
+                        + tables[35054u + to * 64u + h]
+                        - tables[35054u + from * 64u + h];
+            if (has_capture) after -= tables[35054u + captured * 64u + h];
+            value += after * tables[115694u + move_index * 64u + h];
         }
     }
     output[index] = value;
@@ -83,43 +69,32 @@ extern "C" __global__ void fused_policy_grad(
     const float* context = context_grad;
     const float* grad_output = context_grad + batch * 80u;
     float* grad_tables = output;
-    float* grad_context = output + 288014u;
+    float* grad_context = output + 247662u;
     float g = grad_output[index];
-    atomicAdd(grad_tables + 40352u + move_index, g);
+    atomicAdd(grad_tables + 0u + move_index, g);
     if (((packed >> 45) & 1u) == 0u) return;
     unsigned int b = index / moves;
     unsigned int from = (packed >> 12) & 0x7ffu;
     unsigned int to = (packed >> 23) & 0x7ffu;
     unsigned int captured = (packed >> 34) & 0x7ffu;
     bool has_capture = ((packed >> 46) & 1u) != 0u;
-    for (unsigned int h = 0; h < 32u; ++h) {
-        float w = tables[40320u + h];
-        float delta = tables[to * 32u + h] - tables[from * 32u + h];
-        atomicAdd(grad_tables + to * 32u + h, g * w);
-        atomicAdd(grad_tables + from * 32u + h, -g * w);
-        if (has_capture) {
-            delta -= tables[captured * 32u + h];
-            atomicAdd(grad_tables + captured * 32u + h, -g * w);
-        }
-        atomicAdd(grad_tables + 40320u + h, g * delta);
-    }
     for (unsigned int h = 0; h < 16u; ++h) {
-        unsigned int context_index = 42414u + move_index * 16u + h;
+        unsigned int context_index = 2062u + move_index * 16u + h;
         atomicAdd(grad_tables + context_index, g * context[b * 80u + h]);
         atomicAdd(grad_context + b * 80u + h, g * tables[context_index]);
     }
     for (unsigned int h = 0; h < 64u; ++h) {
-        unsigned int move_factor = 156046u + move_index * 64u + h;
+        unsigned int move_factor = 115694u + move_index * 64u + h;
         float w = tables[move_factor];
         float after = context[b * 80u + 16u + h]
-                    + tables[75406u + to * 64u + h]
-                    - tables[75406u + from * 64u + h];
+                    + tables[35054u + to * 64u + h]
+                    - tables[35054u + from * 64u + h];
         atomicAdd(grad_context + b * 80u + 16u + h, g * w);
-        atomicAdd(grad_tables + 75406u + to * 64u + h, g * w);
-        atomicAdd(grad_tables + 75406u + from * 64u + h, -g * w);
+        atomicAdd(grad_tables + 35054u + to * 64u + h, g * w);
+        atomicAdd(grad_tables + 35054u + from * 64u + h, -g * w);
         if (has_capture) {
-            after -= tables[75406u + captured * 64u + h];
-            atomicAdd(grad_tables + 75406u + captured * 64u + h, -g * w);
+            after -= tables[35054u + captured * 64u + h];
+            atomicAdd(grad_tables + 35054u + captured * 64u + h, -g * w);
         }
         atomicAdd(grad_tables + move_factor, g * after);
     }
@@ -205,14 +180,6 @@ impl CustomOp3 for FusedPolicy {
                 let to = feature(packed, MOVE_BITS + FEATURE_BITS);
                 let captured = feature(packed, MOVE_BITS + FEATURE_BITS * 2);
                 let b = index / self.moves;
-                for h in 0..POLICY_CONSEQUENCE_SIZE {
-                    let mut delta = tables[to * POLICY_CONSEQUENCE_SIZE + h]
-                        - tables[from * POLICY_CONSEQUENCE_SIZE + h];
-                    if flag(packed, CAPTURE_VALID_BIT) {
-                        delta -= tables[captured * POLICY_CONSEQUENCE_SIZE + h];
-                    }
-                    value += delta * tables[CONSEQUENCE_OFFSET + h];
-                }
                 for h in 0..POLICY_MOVE_CONTEXT_SIZE {
                     value += context[b * POLICY_CONTEXT_TOTAL + h]
                         * tables[CONTEXT_OFFSET + move_index * POLICY_MOVE_CONTEXT_SIZE + h];
@@ -325,18 +292,6 @@ impl CustomOp3 for FusedPolicyGrad {
             let from = feature(packed, MOVE_BITS);
             let to = feature(packed, MOVE_BITS + FEATURE_BITS);
             let captured = feature(packed, MOVE_BITS + FEATURE_BITS * 2);
-            for h in 0..POLICY_CONSEQUENCE_SIZE {
-                let w = tables[CONSEQUENCE_OFFSET + h];
-                let mut delta = tables[to * POLICY_CONSEQUENCE_SIZE + h]
-                    - tables[from * POLICY_CONSEQUENCE_SIZE + h];
-                grad_tables[to * POLICY_CONSEQUENCE_SIZE + h] += g * w;
-                grad_tables[from * POLICY_CONSEQUENCE_SIZE + h] -= g * w;
-                if flag(packed, CAPTURE_VALID_BIT) {
-                    delta -= tables[captured * POLICY_CONSEQUENCE_SIZE + h];
-                    grad_tables[captured * POLICY_CONSEQUENCE_SIZE + h] -= g * w;
-                }
-                grad_tables[CONSEQUENCE_OFFSET + h] += g * delta;
-            }
             for h in 0..POLICY_MOVE_CONTEXT_SIZE {
                 let context_index = CONTEXT_OFFSET + move_index * POLICY_MOVE_CONTEXT_SIZE + h;
                 grad_tables[context_index] += g * context[b * POLICY_CONTEXT_TOTAL + h];

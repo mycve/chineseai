@@ -4,9 +4,16 @@ use crate::xiangqi::{BOARD_FILES, BOARD_SIZE, Color, Move, Piece, Position, piec
 
 pub const CANONICAL_PIECE_INPUT_SIZE: usize = BOARD_SIZE * 14;
 pub const V2_KING_BUCKETS: usize = 9;
-/// 主干使用面向行棋方的 canonical 棋子位置；价值头另接最近两步历史特征。
+/// 每份视角使用1260维棋子位置；网络同时读取行棋方与对方两份累加器。
 /// 重复、长将、长捉等规则由环境精确处理。
 pub const AZ_NNUE_INPUT_SIZE: usize = CANONICAL_PIECE_INPUT_SIZE;
+
+/// 同一棋子位置在另一份视角中的索引；变换两次回到原特征。
+#[inline]
+pub(crate) const fn opposite_feature(feature: usize) -> usize {
+    let piece = feature / BOARD_SIZE;
+    ((piece + 7) % 14) * BOARD_SIZE + (BOARD_SIZE - 1 - feature % BOARD_SIZE)
+}
 
 pub fn extract_sparse_features_az(position: &Position) -> Vec<usize> {
     let mut features = Vec::with_capacity(96);
@@ -85,6 +92,29 @@ fn orient_square(side: Color, sq: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opposite_view_matches_board_and_is_reversible() {
+        for feature in 0..AZ_NNUE_INPUT_SIZE {
+            assert_eq!(opposite_feature(opposite_feature(feature)), feature);
+        }
+        let position = Position::from_fen("4k4/9/9/9/4p4/9/9/9/9/4K4 b - - 0 1").unwrap();
+        let mut derived = extract_sparse_features_az(&position)
+            .into_iter()
+            .map(opposite_feature)
+            .collect::<Vec<_>>();
+        let other = position.side_to_move().opposite();
+        let mut expected = position
+            .occupied_squares()
+            .map(|square| {
+                piece_absolute_feature_index(other, position.piece_at(square).unwrap()) * BOARD_SIZE
+                    + canonical_square(other, square)
+            })
+            .collect::<Vec<_>>();
+        derived.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(derived, expected);
+    }
 
     #[test]
     fn mirror_file_move_flips_left_and_right() {

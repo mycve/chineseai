@@ -1,4 +1,4 @@
-//! 冻结主网络，用完整候选策略分布校准已有的 448 项战术因子。
+//! 冻结主网络，拟合棋种与战术签名的临时残差并折叠进精确战术表。
 use std::io;
 
 use candle_core::{DType, Device, Tensor, Var};
@@ -6,6 +6,8 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 
 use super::*;
 use crate::xiangqi::BOARD_SIZE;
+
+const CALIBRATION_CLASSES: usize = POLICY_PIECE_SIZE * POLICY_TACTICAL_SIGNATURE_BUCKETS;
 
 /// 交叉熵均在提供的训练样本上计算，不代表独立验证集收益。
 #[derive(Debug)]
@@ -81,8 +83,8 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             if name == "policy_tactical" {
-                let start = POLICY_TACTICAL_EXACT_SIZE;
-                let end = start + POLICY_TACTICAL_FACTOR_SIZE;
+                let start = 0;
+                let end = POLICY_TACTICAL_EXACT_SIZE;
                 assert_eq!(a[..start], b[..start]);
                 assert_eq!(a[end..], b[end..]);
                 assert_ne!(a[start..end], b[start..end]);
@@ -200,7 +202,7 @@ fn prepare(model: &AzNnue, samples: &[AzTrainingSample]) -> io::Result<Vec<Row>>
                     dd,
                     captured.map(|x| x / BOARD_SIZE),
                     position.gives_check_after_move_fast(mv),
-                )[1] - POLICY_TACTICAL_EXACT_SIZE,
+                )[0] % CALIBRATION_CLASSES,
             );
         }
         let (wdl, logits) = outputs_for_training_sample(model, sample).ok_or_else(fail)?;
@@ -245,7 +247,7 @@ fn cross_entropy(rows: &[Row], delta: &[f32]) -> f64 {
     total / weights
 }
 
-/// 只更新战术因子；其余参数与 WDL 输出保持不变。失败时保留原模型。
+/// 将棋种与战术签名残差合并进精确战术表；其余参数与 WDL 保持不变。
 /// 使用 CPU AdamW，学习率与权重衰减均为 0.01，批大小上限为 256。
 pub fn calibrate_policy(
     model: &mut AzNnue,
@@ -259,8 +261,7 @@ pub fn calibrate_policy(
     model.validate()?;
     let rows = prepare(model, samples)?;
     let device = Device::Cpu;
-    let weight =
-        Var::zeros(POLICY_TACTICAL_FACTOR_SIZE, DType::F32, &device).map_err(candle_io_error)?;
+    let weight = Var::zeros(CALIBRATION_CLASSES, DType::F32, &device).map_err(candle_io_error)?;
     let mut optimizer = AdamW::new(
         vec![weight.clone()],
         ParamsAdamW {
@@ -285,7 +286,7 @@ pub fn calibrate_policy(
         cursor += batch_size;
         let width = batch.iter().map(|&i| rows[i].logits.len()).max().unwrap();
         let weight_sum: f64 = batch.iter().map(|&i| rows[i].weight).sum();
-        let mut indices = vec![POLICY_TACTICAL_FACTOR_SIZE as u32; batch_size * width];
+        let mut indices = vec![CALIBRATION_CLASSES as u32; batch_size * width];
         let mut base = vec![-1e9f32; indices.len()];
         let mut target = vec![0.0f32; indices.len()];
         for (b, &i) in batch.iter().enumerate() {
@@ -315,15 +316,14 @@ pub fn calibrate_policy(
     if delta.iter().any(|x| !x.is_finite()) {
         return Err(invalid("策略校准产生非有限参数"));
     }
-    let before_ce = cross_entropy(&rows, &vec![0.0; POLICY_TACTICAL_FACTOR_SIZE]);
+    let before_ce = cross_entropy(&rows, &vec![0.0; CALIBRATION_CLASSES]);
     let after_ce = cross_entropy(&rows, &delta);
-    let range =
-        POLICY_TACTICAL_EXACT_SIZE..POLICY_TACTICAL_EXACT_SIZE + POLICY_TACTICAL_FACTOR_SIZE;
+    let range = 0..POLICY_TACTICAL_EXACT_SIZE;
     let original = model.policy_tactical[range.clone()].to_vec();
     for ((value, old), addition) in model.policy_tactical[range.clone()]
         .iter_mut()
         .zip(&original)
-        .zip(&delta)
+        .zip(delta.iter().cycle())
     {
         *value = old + addition;
     }

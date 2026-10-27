@@ -1,18 +1,16 @@
-use crate::az::nnue::{V2_KING_BUCKETS, canonical_move};
+use crate::az::nnue::canonical_move;
 use crate::xiangqi::{BOARD_SIZE, Color, Move, Position, color_index};
 
 use super::{
     AzArenaReport, AzEvalAccumulator, AzEvalScratch, AzExperiencePool, AzNnue, AzNnueArch,
     AzSampleMeta, AzSearchLimits, AzStartSource, AzTrainingSample, DENSE_MOVE_SPACE,
-    MateSearchLimits, POLICY_ACCUMULATOR_RANK, POLICY_CACHE_PIECE_SIZE,
-    POLICY_CAPTURE_RELATION_OFFSET, POLICY_CAPTURE_RELATION_SIZE, POLICY_TACTICAL_EXACT_SIZE,
-    POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE, STRUCTURAL_PIECE_SIZE, SplitMix64, VALUE_HEAD_SIZE,
-    VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB, VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB,
-    WDL_HEAD_SIZE, alphazero_search_with_rules, check_context_features, dense_move_index,
-    dense_move_squares, evaluate_policy_groups, move_map, policy_cache_capture_index,
-    policy_cache_main_index, policy_consequence_features, policy_move_tactical_flags,
-    policy_sparse_capture_index, policy_sparse_factor_indices, policy_sparse_main_index,
-    policy_tactical_indices, rule_context_features, scalar_value_to_wdl_target, search_root_mate,
+    MateSearchLimits, POLICY_ACCUMULATOR_RANK, POLICY_CAPTURE_RELATION_OFFSET,
+    POLICY_CAPTURE_RELATION_SIZE, POLICY_PIECE_SIZE, POLICY_TACTICAL_SIZE, RULE_CONTEXT_SIZE,
+    SplitMix64, VALUE_HEAD_SIZE, VALUE_KING_PIECE_VOCAB, VALUE_RAY_VOCAB, VALUE_THREAT_PAIR_VOCAB,
+    VALUE_THREAT_VOCAB, WDL_HEAD_SIZE, alphazero_search_with_rules, check_context_features,
+    dense_move_index, dense_move_squares, evaluate_policy_groups, move_map,
+    policy_consequence_features, policy_move_tactical_flags, policy_tactical_indices,
+    rule_context_features, scalar_value_to_wdl_target, search_root_mate,
     visit_value_king_piece_features, visit_value_threat_features,
 };
 
@@ -63,13 +61,10 @@ fn replay_pool_test_fixture() -> AzExperiencePool {
 }
 
 #[test]
-fn packed_policy_cache_matches_original_formulas() {
+fn policy_accumulator_cache_matches_direct_projection() {
     let mut model = AzNnue::random(32, 20260928);
     for (i, w) in model.policy_sparse_table.iter_mut().enumerate() {
         *w = (i % 101) as f32 * 0.003;
-    }
-    for (i, w) in model.policy_sparse_factor.iter_mut().enumerate() {
-        *w = (i % 71) as f32 * -0.007;
     }
     for (i, w) in model.policy_accumulator_hidden.iter_mut().enumerate() {
         *w = (i % 13) as f32 * 0.001;
@@ -79,26 +74,11 @@ fn packed_policy_cache_matches_original_formulas() {
     }
     model.rebuild_policy_cache();
     for mv in 0..DENSE_MOVE_SPACE {
-        for piece in 0..POLICY_CACHE_PIECE_SIZE {
-            for us in 0..V2_KING_BUCKETS {
-                for them in 0..V2_KING_BUCKETS {
-                    let mut expected =
-                        model.policy_sparse_table[policy_sparse_main_index(mv, piece, us, them)];
-                    for factor in policy_sparse_factor_indices(mv, piece, us, them) {
-                        expected += model.policy_sparse_factor[factor];
-                    }
-                    assert_eq!(
-                        model.policy_sparse_table_folded
-                            [policy_cache_main_index(mv, piece, us, them)]
-                        .to_bits(),
-                        expected.to_bits()
-                    );
-                }
-            }
+        for piece in 0..POLICY_PIECE_SIZE {
             let sparse = move_map().dense_to_sparse[mv] as usize;
             let from = (piece * BOARD_SIZE + sparse / BOARD_SIZE) * POLICY_ACCUMULATOR_RANK;
             let to = (piece * BOARD_SIZE + sparse % BOARD_SIZE) * POLICY_ACCUMULATOR_RANK;
-            let victim = ((piece + POLICY_CACHE_PIECE_SIZE) * BOARD_SIZE + sparse % BOARD_SIZE)
+            let victim = ((piece + POLICY_PIECE_SIZE) * BOARD_SIZE + sparse % BOARD_SIZE)
                 * POLICY_ACCUMULATOR_RANK;
             let mut delta = 0.0f32;
             let mut capture = 0.0f32;
@@ -110,23 +90,12 @@ fn packed_policy_cache_matches_original_formulas() {
                 capture += model.policy_accumulator_features[victim + rank] * w;
             }
             assert_eq!(
-                model.policy_accumulator_moved_delta[mv * POLICY_CACHE_PIECE_SIZE + piece]
-                    .to_bits(),
+                model.policy_accumulator_moved_delta[mv * POLICY_PIECE_SIZE + piece].to_bits(),
                 delta.to_bits()
             );
             assert_eq!(
-                model.policy_accumulator_capture[mv * POLICY_CACHE_PIECE_SIZE + piece].to_bits(),
+                model.policy_accumulator_capture[mv * POLICY_PIECE_SIZE + piece].to_bits(),
                 capture.to_bits()
-            );
-        }
-        for captured in (POLICY_CACHE_PIECE_SIZE..STRUCTURAL_PIECE_SIZE)
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
-            assert_eq!(
-                model.policy_sparse_table_folded[policy_cache_capture_index(mv, captured)]
-                    .to_bits(),
-                model.policy_sparse_table[policy_sparse_capture_index(mv, captured)].to_bits()
             );
         }
     }
@@ -168,43 +137,6 @@ fn repetition_policy_metrics_separate_opportunities_and_model_mass() {
     let changed = evaluate_policy_groups(&favored, &[sample]);
     assert!(changed.repetition_predicted_mass > baseline.repetition_predicted_mass);
     assert!(changed.repetition_kl < baseline.repetition_kl);
-}
-
-#[test]
-fn tactical_piece_factor_is_folded_into_exact_cpu_table() {
-    let mut model = AzNnue::random(16, 20260922);
-    model.policy_tactical.fill(0.0);
-    model.policy_tactical[POLICY_TACTICAL_EXACT_SIZE] = 0.75;
-    model.rebuild_policy_tactical();
-    let tactical = policy_tactical_indices(0, 0, false, false, false, false, None, false);
-    assert_eq!(model.policy_tactical_folded[tactical[0]], 0.75);
-}
-
-#[test]
-fn tactical_cache_preserves_all_logits_bitwise() {
-    let mut model = AzNnue::random(16, 27);
-    for (i, weight) in model.policy_tactical.iter_mut().enumerate() {
-        *weight = ((i % 137) as f32 - 68.0) * 0.003;
-    }
-    model.rebuild_policy_tactical();
-    for mv in 0..DENSE_MOVE_SPACE {
-        for piece in 0..POLICY_CACHE_PIECE_SIZE {
-            for signature in 0..super::POLICY_TACTICAL_SIGNATURE_BUCKETS {
-                let exact = (mv * POLICY_CACHE_PIECE_SIZE + piece)
-                    * super::POLICY_TACTICAL_SIGNATURE_BUCKETS
-                    + signature;
-                let factor = POLICY_TACTICAL_EXACT_SIZE
-                    + piece * super::POLICY_TACTICAL_SIGNATURE_BUCKETS
-                    + signature;
-                assert_eq!(
-                    model.policy_tactical_folded
-                        [super::policy_tactical_cache_index(mv, piece, signature)]
-                    .to_bits(),
-                    (model.policy_tactical[exact] + model.policy_tactical[factor]).to_bits()
-                );
-            }
-        }
-    }
 }
 
 #[test]
@@ -307,12 +239,12 @@ fn capture_relation_changes_only_capture_policy_not_value() {
 #[test]
 fn capture_relation_is_shared_and_excludes_quiet_moves() {
     let quiet = policy_tactical_indices(0, 4, true, false, true, false, None, false);
-    assert_eq!(quiet[2], POLICY_TACTICAL_SIZE);
+    assert_eq!(quiet[1], POLICY_TACTICAL_SIZE);
     let pawn = policy_tactical_indices(0, 4, true, false, true, false, Some(7), false);
     let rook = policy_tactical_indices(0, 4, true, false, true, false, Some(11), false);
     let elsewhere = policy_tactical_indices(100, 4, true, false, true, false, Some(11), false);
-    assert_ne!(pawn[2], rook[2]);
-    assert_eq!(rook[2], elsewhere[2]);
+    assert_ne!(pawn[1], rook[1]);
+    assert_eq!(rook[1], elsewhere[1]);
     let mut seen = std::collections::HashSet::new();
     for mover in 0..7 {
         for victim in 7..14 {
@@ -328,9 +260,9 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
                     state & 16 != 0,
                 );
                 assert!(
-                    (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE).contains(&indices[2])
+                    (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE).contains(&indices[1])
                 );
-                assert!(seen.insert(indices[2]));
+                assert!(seen.insert(indices[1]));
             }
         }
     }
@@ -452,34 +384,6 @@ fn manual_profile_policy_head() {
 }
 
 #[test]
-fn zero_initialized_consequence_branch_preserves_policy_logits() {
-    let position = Position::startpos();
-    let moves = position.legal_moves();
-    let model = AzNnue::random(32, 20260729);
-    assert!(
-        model
-            .policy_consequence_output
-            .iter()
-            .all(|&weight| weight == 0.0)
-    );
-
-    let mut baseline = AzEvalScratch::new(model.arch);
-    model.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut baseline);
-
-    let mut active = model.clone();
-    active.policy_consequence_output.fill(0.1);
-    let mut changed = AzEvalScratch::new(model.arch);
-    active.evaluate_with_scratch_output(&position, &moves, &[0.0; RULE_CONTEXT_SIZE], &mut changed);
-    assert!(
-        baseline
-            .logits
-            .iter()
-            .zip(&changed.logits)
-            .any(|(left, right)| left != right)
-    );
-}
-
-#[test]
 fn zero_initialized_policy_accumulator_is_neutral_and_trainable() {
     let position = Position::startpos();
     let moves = position.legal_moves();
@@ -532,17 +436,8 @@ fn incremental_accumulator_matches_full_refresh() {
         let mv = position.legal_moves()[0];
         let moved = position.piece_at(mv.from as usize).unwrap();
         let captured = position.piece_at(mv.to as usize);
-        let before = position.clone();
         position.make_move(mv);
-        AzEvalAccumulator::apply_transition_to_hidden(
-            &model,
-            &before,
-            &position,
-            mv,
-            moved,
-            captured,
-            &mut hidden,
-        );
+        AzEvalAccumulator::apply_transition_to_hidden(&model, mv, moved, captured, &mut hidden);
         let refreshed = AzEvalAccumulator::new(&model, &position).into_hidden_sum();
         for (&incremental, &full) in hidden.iter().zip(&refreshed) {
             assert!((incremental - full).abs() < 2.0e-5);
@@ -562,12 +457,9 @@ fn policy_accumulator_matches_full_refresh() {
         let mv = position.legal_moves()[0];
         let moved = position.piece_at(mv.from as usize).unwrap();
         let captured = position.piece_at(mv.to as usize);
-        let before = position.clone();
         position.make_move(mv);
         for perspective in [Color::Red, Color::Black] {
             model.apply_policy_transition(
-                &before,
-                &position,
                 mv,
                 moved,
                 captured,
@@ -922,13 +814,6 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     let _ = fs::remove_file(&path);
     assert_eq!(model.hidden_size, loaded.hidden_size);
     assert_eq!(model.input_hidden, loaded.input_hidden);
-    assert_eq!(model.input_piece_hidden, loaded.input_piece_hidden);
-    assert_eq!(model.input_rank_hidden, loaded.input_rank_hidden);
-    assert_eq!(model.input_file_hidden, loaded.input_file_hidden);
-    assert_eq!(
-        model.input_king_piece_hidden,
-        loaded.input_king_piece_hidden
-    );
     assert_eq!(model.hidden_bias, loaded.hidden_bias);
     assert_eq!(model.shared_hidden, loaded.shared_hidden);
     assert_eq!(model.shared_bias, loaded.shared_bias);
@@ -947,10 +832,6 @@ fn aznnue_safetensors_roundtrip_matches_weights() {
     assert_eq!(model.moves_left_bias, loaded.moves_left_bias);
     assert!(loaded.moves_left_active);
     assert_eq!(model.policy_move_bias, loaded.policy_move_bias);
-    assert_eq!(
-        model.policy_consequence_output,
-        loaded.policy_consequence_output
-    );
     assert_eq!(model.policy_context_hidden, loaded.policy_context_hidden);
     assert_eq!(model.policy_move_context, loaded.policy_move_context);
     assert_eq!(
@@ -1464,7 +1345,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[36.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[40.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());

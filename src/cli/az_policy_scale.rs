@@ -14,17 +14,13 @@ pub(crate) fn run(cmd: AzPolicyScaleArgs) {
         PolicyComponent::Capture => {
             &mut model.policy_sparse_table[POLICY_SPARSE_MAIN_SIZE..sparse_len - 1]
         }
-        PolicyComponent::Factor => &mut model.policy_sparse_factor,
         PolicyComponent::Tactical => &mut model.policy_tactical,
-        PolicyComponent::TacticalExact => {
-            &mut model.policy_tactical[..POLICY_TACTICAL_EXACT_SIZE]
-        }
-        PolicyComponent::TacticalFactor => {
+        PolicyComponent::TacticalExact => &mut model.policy_tactical[..POLICY_TACTICAL_EXACT_SIZE],
+        PolicyComponent::CaptureRelation => {
             &mut model.policy_tactical[POLICY_TACTICAL_EXACT_SIZE..]
         }
         PolicyComponent::Accumulator => &mut model.policy_accumulator_move,
         PolicyComponent::Context => &mut model.policy_move_context,
-        PolicyComponent::Consequence => &mut model.policy_consequence_output,
         PolicyComponent::MoveBias => &mut model.policy_move_bias,
         PolicyComponent::ThreatContext => &mut model.policy_threat_context,
     };

@@ -1,6 +1,6 @@
 use crate::az::nnue::{canonical_square, piece_absolute_feature_index};
 use crate::xiangqi::{
-    BOARD_FILES, BOARD_SIZE, Color, Move, Piece, PieceKind, Position, color_index, piece_kind_index,
+    BOARD_SIZE, Color, Move, Piece, PieceKind, Position, color_index, piece_kind_index,
 };
 
 use super::*;
@@ -12,7 +12,6 @@ pub(crate) struct AzEvalScratch {
     pub(crate) shared_hidden: Vec<f32>,
     pub(crate) policy_context: Vec<f32>,
     pub(crate) policy_accumulator_context: [f32; POLICY_ACCUMULATOR_RANK],
-    pub(crate) policy_piece_square_scores: Vec<f32>,
     pub(crate) value_head: Vec<f32>,
     pub(crate) value_king_piece_accumulator: Vec<f32>,
     pub(crate) value_king_piece_precomputed: Option<ValueKingState>,
@@ -39,7 +38,6 @@ impl AzEvalScratch {
             shared_hidden: vec![0.0; hidden_size],
             policy_context: vec![0.0; POLICY_MOVE_CONTEXT_SIZE],
             policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
-            policy_piece_square_scores: Vec::new(),
             value_head: vec![0.0; VALUE_HEAD_SIZE],
             value_king_piece_accumulator: vec![0.0; VALUE_HEAD_SIZE],
             value_king_piece_precomputed: None,
@@ -61,7 +59,6 @@ impl AzEvalScratch {
             shared_hidden: Vec::new(),
             policy_context: Vec::new(),
             policy_accumulator_context: [0.0; POLICY_ACCUMULATOR_RANK],
-            policy_piece_square_scores: Vec::new(),
             value_head: Vec::new(),
             value_king_piece_accumulator: Vec::new(),
             value_king_piece_precomputed: None,
@@ -221,8 +218,6 @@ impl AzEvalAccumulator {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn apply_transition_to_hidden(
         model: &AzNnue,
-        before: &Position,
-        after: &Position,
         mv: Move,
         moved: Piece,
         captured: Option<Piece>,
@@ -233,8 +228,6 @@ impl AzEvalAccumulator {
             let start = color_index(perspective) * model.hidden_size;
             Self::apply_transition_for_perspective(
                 model,
-                before,
-                after,
                 mv,
                 moved,
                 captured,
@@ -246,53 +239,28 @@ impl AzEvalAccumulator {
 
     pub(crate) fn apply_transition_for_perspective(
         model: &AzNnue,
-        before: &Position,
-        after: &Position,
         mv: Move,
         moved: Piece,
         captured: Option<Piece>,
         perspective: Color,
         hidden: &mut [f32],
     ) {
-        let before_buckets = canonical_buckets_for_perspective(before, perspective);
-        let after_buckets = canonical_buckets_for_perspective(after, perspective);
-        if before_buckets != after_buckets {
-            // 将帅移动会改变所有棋子的王桶结构项，少见且必须完整刷新。
-            Self::refresh_perspective(model, after, perspective, hidden);
-            return;
-        }
-        add_canonical_piece_contribution(
-            model,
-            hidden,
-            perspective,
-            before_buckets,
-            mv.from as usize,
-            moved,
-            -1.0,
-        );
+        add_canonical_piece_contribution(model, hidden, perspective, mv.from as usize, moved, -1.0);
         if let Some(captured) = captured {
             add_canonical_piece_contribution(
                 model,
                 hidden,
                 perspective,
-                before_buckets,
                 mv.to as usize,
                 captured,
                 -1.0,
             );
         }
-        add_canonical_piece_contribution(
-            model,
-            hidden,
-            perspective,
-            after_buckets,
-            mv.to as usize,
-            moved,
-            1.0,
-        );
+        add_canonical_piece_contribution(model, hidden, perspective, mv.to as usize, moved, 1.0);
     }
 
     pub(crate) fn hidden_for_slice(hidden_sum: &[f32], hidden_size: usize, side: Color) -> &[f32] {
+        debug_assert_eq!(hidden_sum.len(), 2 * hidden_size);
         let start = color_index(side) * hidden_size;
         &hidden_sum[start..start + hidden_size]
     }
@@ -321,7 +289,6 @@ pub(crate) fn add_canonical_piece_contribution(
     model: &AzNnue,
     hidden: &mut [f32],
     perspective: Color,
-    buckets: (usize, usize),
     sq: usize,
     piece: Piece,
     scale: f32,
@@ -330,28 +297,11 @@ pub(crate) fn add_canonical_piece_contribution(
     let piece_index = relative_color + piece_kind_index(piece.kind);
     let relative_square = canonical_square_for(perspective, sq);
     let feature = piece_index * BOARD_SIZE + relative_square;
-    let rank = relative_square / BOARD_FILES;
-    let file = relative_square % BOARD_FILES;
-    let h = model.hidden_size;
-
-    add_scaled_rows(
+    add_scaled_feature_row(
         hidden,
-        [
-            super::simd::feature_row(&model.input_hidden, h, feature),
-            super::simd::feature_row(&model.input_piece_hidden, h, piece_index),
-            super::simd::feature_row(&model.input_rank_hidden, h, rank),
-            super::simd::feature_row(&model.input_file_hidden, h, file),
-            super::simd::feature_row(
-                &model.input_king_piece_hidden,
-                h,
-                structural_king_piece_index(0, buckets.0, piece_index),
-            ),
-            super::simd::feature_row(
-                &model.input_king_piece_hidden,
-                h,
-                structural_king_piece_index(1, buckets.1, piece_index),
-            ),
-        ],
+        &model.input_hidden,
+        model.hidden_size,
+        feature,
         scale,
     );
 }
