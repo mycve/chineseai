@@ -184,12 +184,20 @@ fn value_king_piece_features_change_with_king_bucket() {
     let rook_first = first_features
         .iter()
         .copied()
-        .filter(|&feature| feature % BOARD_SIZE == 54)
+        .filter(|&feature| {
+            [(0, 7), (1, 7)].into_iter().any(|(side, bucket)| {
+                super::feature_map::value_king_piece_index(side, bucket, 4, 54) == Some(feature)
+            })
+        })
         .collect::<Vec<_>>();
     let rook_second = second_features
         .iter()
         .copied()
-        .filter(|&feature| feature % BOARD_SIZE == 54)
+        .filter(|&feature| {
+            [(0, 8), (1, 7)].into_iter().any(|(side, bucket)| {
+                super::feature_map::value_king_piece_index(side, bucket, 4, 54) == Some(feature)
+            })
+        })
         .collect::<Vec<_>>();
     assert_eq!(rook_first.len(), 2);
     assert_ne!(rook_first, rook_second);
@@ -1459,7 +1467,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[42.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[43.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());

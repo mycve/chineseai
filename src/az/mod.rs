@@ -15,6 +15,7 @@ mod candle_model;
 #[cfg(all(test, feature = "slow-tests"))]
 mod cuda_test_device;
 mod dataloader;
+mod feature_map;
 mod fused_policy;
 mod fused_sparse_policy;
 mod history;

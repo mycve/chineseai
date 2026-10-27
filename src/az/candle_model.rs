@@ -797,6 +797,18 @@ mod tests {
 
     #[test]
     fn candle_and_cpu_policy_heads_and_gradients_match() {
+        policy_heads_and_gradients_match(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn compact_feature_heads_and_gradients_match_cuda() {
+        let device = crate::az::cuda_test_device::shared_cuda_device()
+            .expect("CUDA is required for this test");
+        policy_heads_and_gradients_match(device);
+    }
+
+    fn policy_heads_and_gradients_match(device: &Device) {
         let position =
             Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
                 .unwrap();
@@ -880,8 +892,8 @@ mod tests {
         assert_eq!(sample_wdl, cpu_output.value_wdl);
         assert_eq!(sample_logits, cpu.logits);
         let packed = PackedBatch::from_indices(&[sample], &[0]);
-        let batch = BatchTensors::from_packed(packed, &Device::Cpu).unwrap();
-        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        let batch = BatchTensors::from_packed(packed, device).unwrap();
+        let candle = AzCandleModel::from_model(&model, device).unwrap();
         let forward = candle.forward(&batch).unwrap();
         let legal = forward.policy_logits.to_vec2::<f32>().unwrap();
         let value_logits = forward.value_logits.to_vec2::<f32>().unwrap();
@@ -902,6 +914,21 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(king_gradient.iter().any(|&gradient| gradient != 0.0));
+        let threat_gradient = gradients
+            .get(&candle.value_threat_embedding)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let ray_start = crate::az::VALUE_THREAT_PAIR_VOCAB * VALUE_THREAT_RANK;
+        let cannon_start = ray_start + crate::az::VALUE_RAY_VOCAB * VALUE_THREAT_RANK;
+        assert!(
+            threat_gradient[ray_start..cannon_start]
+                .iter()
+                .any(|&g| g != 0.0)
+        );
+        assert!(threat_gradient[cannon_start..].iter().any(|&g| g != 0.0));
 
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {
@@ -919,7 +946,7 @@ mod tests {
         {
             row[16..].fill(0.0);
         }
-        let gradient_candle = AzCandleModel::from_model(&gradient_model, &Device::Cpu).unwrap();
+        let gradient_candle = AzCandleModel::from_model(&gradient_model, device).unwrap();
         let gradient_forward = gradient_candle.forward(&batch).unwrap();
         let gradients = gradient_forward
             .policy_logits

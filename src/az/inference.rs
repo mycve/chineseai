@@ -15,6 +15,7 @@ use crate::xiangqi::{
 };
 
 use super::arch::az_weight_tensors;
+use super::feature_map::{value_king_piece_index, value_ray_index};
 use super::*;
 
 pub(crate) fn candle_io_error(err: impl std::fmt::Display) -> io::Error {
@@ -106,10 +107,10 @@ pub(crate) fn visit_value_king_piece_features(
         let piece_index = piece_absolute_feature_index(perspective, piece);
         let canonical = canonical_square_for(perspective, square);
         for (king_side, bucket) in [(0, buckets.0), (1, buckets.1)] {
-            visitor(
-                ((king_side * V2_KING_BUCKETS + bucket) * 14 + piece_index) * BOARD_SIZE
-                    + canonical,
-            );
+            if let Some(feature) = value_king_piece_index(king_side, bucket, piece_index, canonical)
+            {
+                visitor(feature);
+            }
         }
     }
     value_material_bucket_counts(rooks, minors)
@@ -317,7 +318,8 @@ pub(crate) fn visit_value_threat_entries_from(
                 } else {
                     2 + usize::from(canonical_df > 0)
                 };
-                let ray = ((((attacker_class * 2) * 4 + direction) * 9) * 15 + 14) * 4;
+                let ray = value_ray_index(attacker_class, 0, direction, 0, 14, 0)
+                    .expect("empty ray must have a feature");
                 visitor(
                     (1 << 23) | ((source as u32) << 16) | (VALUE_THREAT_PAIR_VOCAB + ray) as u32,
                 );
@@ -339,14 +341,20 @@ pub(crate) fn visit_value_threat_entries_from(
                 let distance = sf.abs_diff(tf).max(sr.abs_diff(tr)) - 1;
                 let blocked_class = (if blocked.color == perspective { 0 } else { 7 })
                     + piece_kind_index(blocked.kind);
-                let ray = (((((attacker_class * 2 + ordinal) * 4 + direction) * 9 + distance)
-                    * 15
-                    + blocked_class)
-                    * 4)
-                    + ray_state;
-                visitor(
-                    (1 << 23) | ((source as u32) << 16) | (VALUE_THREAT_PAIR_VOCAB + ray) as u32,
-                );
+                if let Some(ray) = value_ray_index(
+                    attacker_class,
+                    ordinal,
+                    direction,
+                    distance,
+                    blocked_class,
+                    ray_state,
+                ) {
+                    visitor(
+                        (1 << 23)
+                            | ((source as u32) << 16)
+                            | (VALUE_THREAT_PAIR_VOCAB + ray) as u32,
+                    );
+                }
 
                 if attacker.kind == PieceKind::Cannon && ordinal == 1 {
                     let (screen_source, screen) = first.expect("second blocker requires first");

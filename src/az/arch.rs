@@ -40,11 +40,13 @@ pub(crate) const VALUE_HEAD_SIZE: usize = 96;
 pub(crate) const VALUE_BUCKETS: usize = 32;
 /// 王棋子价值表先在16维累加，再投影到价值隐藏层。
 pub(crate) const VALUE_KING_PIECE_RANK: usize = 16;
-pub(crate) const VALUE_KING_PIECE_VOCAB: usize = 2 * V2_KING_BUCKETS * 14 * BOARD_SIZE;
+/// 仅保留棋子可达且与对应王位不冲突的组合。
+pub(crate) const VALUE_KING_PIECE_VOCAB: usize = 12_174;
 pub(crate) const VALUE_KING_PIECE_MAX_ACTIVE: usize = 64;
 pub(crate) const VALUE_THREAT_RANK: usize = 64;
 pub(crate) const VALUE_THREAT_PAIR_VOCAB: usize = 10_646;
-pub(crate) const VALUE_RAY_VOCAB: usize = 4 * 2 * 4 * 9 * 15 * 4;
+/// 仅保留方向、距离、阻挡次序及数量可同时满足的射线组合。
+pub(crate) const VALUE_RAY_VOCAB: usize = 7_040;
 pub(crate) const VALUE_CANNON_TRIPLE_VOCAB: usize = 32_768;
 pub(crate) const VALUE_THREAT_VOCAB: usize =
     VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + VALUE_CANNON_TRIPLE_VOCAB;

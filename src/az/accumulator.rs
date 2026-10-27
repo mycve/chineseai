@@ -3,6 +3,7 @@ use crate::xiangqi::{
     BOARD_SIZE, Color, Move, Piece, PieceKind, Position, color_index, piece_kind_index,
 };
 
+use super::feature_map::value_king_piece_index;
 use super::*;
 
 pub(crate) struct AzEvalScratch {
@@ -79,7 +80,7 @@ pub(crate) struct ValueKingState {
     pub(crate) pool: [f32; VALUE_KING_PIECE_RANK],
     rooks: [u8; 2],
     minors: [u8; 2],
-    pieces: u8,
+    features: u8,
 }
 
 impl ValueKingState {
@@ -88,9 +89,10 @@ impl ValueKingState {
             pool: [0.0; VALUE_KING_PIECE_RANK],
             rooks: [0; 2],
             minors: [0; 2],
-            pieces: 0,
+            features: 0,
         };
         visit_value_king_piece_features(position, side, |feature| {
+            state.features += 1;
             let start = feature * VALUE_KING_PIECE_RANK;
             for (sum, &weight) in state
                 .pool
@@ -129,9 +131,11 @@ impl ValueKingState {
                 let index = piece_absolute_feature_index(side, piece);
                 let canonical = canonical_square(side, square);
                 for (king, bucket) in [(0, buckets.0), (1, buckets.1)] {
-                    let feature = ((king * crate::az::nnue::V2_KING_BUCKETS + bucket) * 14 + index)
-                        * BOARD_SIZE
-                        + canonical;
+                    let Some(feature) = value_king_piece_index(king, bucket, index, canonical)
+                    else {
+                        continue;
+                    };
+                    self.features = (i16::from(self.features) + i16::from(sign)) as u8;
                     let start = feature * VALUE_KING_PIECE_RANK;
                     for (sum, &weight) in self
                         .pool
@@ -148,7 +152,6 @@ impl ValueKingState {
 
     fn material(&mut self, piece: Piece, side: Color, delta: i8) {
         let index = usize::from(piece.color != side);
-        self.pieces = (self.pieces as i16 + i16::from(delta)) as u8;
         match piece.kind {
             PieceKind::Rook => {
                 self.rooks[index] = (self.rooks[index] as i16 + i16::from(delta)) as u8
@@ -167,7 +170,7 @@ impl ValueKingState {
         )
     }
     pub(crate) fn active(&self) -> usize {
-        usize::from(self.pieces) * 2
+        usize::from(self.features)
     }
 }
 
