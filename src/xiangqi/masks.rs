@@ -95,7 +95,7 @@ pub(super) const ELEPHANT_STEPS: [((i32, i32), (i32, i32)); 4] = [
     ((-1, 1), (-2, 2)),
     ((-1, -1), (-2, -2)),
 ];
-pub(super) const HORSE_STEPS: [((i32, i32), (i32, i32)); 8] = [
+pub(crate) const HORSE_STEPS: [((i32, i32), (i32, i32)); 8] = [
     ((0, -1), (-1, -2)),
     ((0, -1), (1, -2)),
     ((0, 1), (-1, 2)),

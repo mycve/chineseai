@@ -20,6 +20,7 @@ mod feature_map;
 mod fused_policy;
 mod fused_sparse_policy;
 mod history;
+mod horse;
 mod inference;
 mod mate;
 pub mod nnue;

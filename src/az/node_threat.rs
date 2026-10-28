@@ -187,9 +187,9 @@ fn apply_difference(
     previous: &[u32],
     next: &[u32],
 ) {
-    // 每个来源最多 12 项：四条车炮射线各两个阻挡项加一个炮架项。
-    let mut a = [0u16; 12];
-    let mut b = [0u16; 12];
+    // 同时容纳车炮射线及马的两跳终点、堵腿关系，保留重复特征的次数。
+    let mut a = [0u16; super::THREAT_SOURCE_MAX_ACTIVE];
+    let mut b = [0u16; super::THREAT_SOURCE_MAX_ACTIVE];
     for (dst, &src) in a[..previous.len()].iter_mut().zip(previous) {
         *dst = src as u16;
     }
@@ -232,6 +232,9 @@ fn dependency_masks() -> &'static [[(u128, u128); BOARD_SIZE]; 14] {
     MASKS.get_or_init(|| {
         std::array::from_fn(|class| {
             std::array::from_fn(|source| {
+                if class % 7 == 3 {
+                    return super::horse::horse_dependency_masks(source);
+                }
                 let color = if class / 7 == color_index(Color::Red) {
                     Color::Red
                 } else {
@@ -246,7 +249,6 @@ fn dependency_masks() -> &'static [[(u128, u128); BOARD_SIZE]; 14] {
                         0 => (f + r == 1, false),
                         1 => (f == 1 && r == 1, false),
                         2 => (f == 2 && r == 2, f == 1 && r == 1),
-                        3 => ((f == 1 && r == 2) || (f == 2 && r == 1), f + r == 1),
                         4 | 5 => (f == 0 || r == 0, false),
                         6 => (
                             df == 0 && dr == color.forward_step()
@@ -278,6 +280,40 @@ fn dependency_masks() -> &'static [[(u128, u128); BOARD_SIZE]; 14] {
 mod tests {
     use super::*;
     use crate::az::SplitMix64;
+
+    #[test]
+    fn horse_incremental_tracks_second_legs_middle_colors_and_blocker_identity() {
+        let mut model = AzNnue::random(16, 48);
+        model.threat_incremental = true;
+        for (old, new, changed) in [
+            ((4, 12), (4, 13), (1u128 << 12) | (1u128 << 13)),
+            ((4, 21), (11, 21), 1u128 << 21),
+            ((4, 31), (12, 31), 1u128 << 31),
+        ] {
+            let before = Position::from_canonical_piece_squares(&[(0, 85), (7, 4), (3, 40), old]);
+            let after = Position::from_canonical_piece_squares(&[(0, 85), (7, 4), (3, 40), new]);
+            for side in [Color::Red, Color::Black] {
+                let mut arena = NodeThreatArena::default();
+                let base = arena.root(&model, &before, side);
+                let updated = arena.update(&model, base, &before, &after, side, changed);
+                let state = &arena.states[updated as usize];
+                let actual =
+                    &arena.entries[state.start as usize..state.start as usize + state.len as usize];
+                let mut expected = Vec::new();
+                let mut sum = [0.0; VALUE_THREAT_RANK];
+                visit_value_threat_entries_from(&after, side, u128::MAX, |e| {
+                    expected.push(e);
+                    add(&mut sum, &model, e, 1.0);
+                });
+                assert_eq!(actual, expected);
+                let (cached, count) = arena.value(updated);
+                assert_eq!(count, expected.len());
+                for (a, b) in cached.iter().zip(sum) {
+                    assert!((a - b).abs() < 2e-5);
+                }
+            }
+        }
+    }
 
     #[test]
     fn persistent_states_match_full_features_across_branches_and_refreshes() {

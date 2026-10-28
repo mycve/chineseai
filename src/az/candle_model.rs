@@ -939,7 +939,19 @@ mod tests {
                 .iter()
                 .any(|&g| g != 0.0)
         );
-        assert!(threat_gradient[cannon_start..].iter().any(|&g| g != 0.0));
+        let horse_start = crate::az::HORSE_TWO_HOP_OFFSET * VALUE_THREAT_RANK;
+        let leg_start = crate::az::HORSE_LEG_OFFSET * VALUE_THREAT_RANK;
+        assert!(
+            threat_gradient[cannon_start..horse_start]
+                .iter()
+                .any(|&g| g != 0.0)
+        );
+        assert!(
+            threat_gradient[horse_start..leg_start]
+                .iter()
+                .any(|&g| g != 0.0)
+        );
+        assert!(threat_gradient[leg_start..].iter().any(|&g| g != 0.0));
 
         assert_eq!(legal[0].len(), cpu.logits.len());
         for (candle_logit, cpu_logit) in legal[0].iter().zip(&cpu.logits) {

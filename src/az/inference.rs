@@ -435,6 +435,7 @@ pub(crate) fn visit_value_threat_entries_from(
             }
         }
     }
+    super::horse::visit_horse_threat_entries_from(position, perspective, sources, visitor);
 }
 
 #[derive(Debug)]

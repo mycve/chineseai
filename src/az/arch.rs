@@ -50,9 +50,16 @@ pub(crate) const VALUE_THREAT_PAIR_VOCAB: usize = 10_443;
 /// 仅保留方向、距离、阻挡次序及数量可同时满足的射线组合。
 pub(crate) const VALUE_RAY_VOCAB: usize = 7_040;
 pub(crate) const VALUE_CANNON_TRIPLE_VOCAB: usize = 32_768;
-pub(crate) const VALUE_THREAT_VOCAB: usize =
+pub(crate) const HORSE_TWO_HOP_OFFSET: usize =
     VALUE_THREAT_PAIR_VOCAB + VALUE_RAY_VOCAB + VALUE_CANNON_TRIPLE_VOCAB;
-pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 192;
+/// 双方马 × 1708个两跳起终点组合 × 空格/敌子。
+pub(crate) const HORSE_TWO_HOP_VOCAB: usize = 6_832;
+pub(crate) const HORSE_LEG_OFFSET: usize = HORSE_TWO_HOP_OFFSET + HORSE_TWO_HOP_VOCAB;
+/// 仅保留棋盘内有效马腿及堵腿棋子可达的组合。
+pub(crate) const HORSE_LEG_VOCAB: usize = 4_368;
+pub(crate) const VALUE_THREAT_VOCAB: usize = HORSE_LEG_OFFSET + HORSE_LEG_VOCAB;
+pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 336;
+pub(crate) const THREAT_SOURCE_MAX_ACTIVE: usize = 44;
 pub(crate) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old
 /// high-dimensional history planes: rules stay in the environment, while the
