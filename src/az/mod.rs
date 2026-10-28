@@ -23,6 +23,7 @@ mod history;
 mod horse;
 mod inference;
 mod mate;
+mod mobility;
 pub mod nnue;
 mod node_threat;
 mod play;

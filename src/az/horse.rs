@@ -189,6 +189,20 @@ pub(crate) fn horse_dependency_masks(source: usize) -> (u128, u128) {
     geometry().dependencies[source]
 }
 
+pub(crate) fn horse_move_targets(position: &Position, source: usize, color: Color) -> u128 {
+    geometry().jumps[source].iter().fold(0, |targets, jump| {
+        if position.piece_at(jump.leg).is_none()
+            && position
+                .piece_at(jump.to)
+                .is_none_or(|p| p.color != color && p.kind != PieceKind::General)
+        {
+            targets | 1u128 << jump.to
+        } else {
+            targets
+        }
+    })
+}
+
 pub(crate) fn visit_horse_threat_entries_from(
     position: &Position,
     perspective: Color,
@@ -373,8 +387,10 @@ mod tests {
             ((owner * 997 + s * 17 + l * 13 + p * 7) % 37) as f64 - 18.0
         };
         let mut groups = vec![(0.0, 0usize); VALUE_THREAT_VOCAB];
-        for (row, group) in groups[..HORSE_LEG_OFFSET].iter_mut().enumerate() {
-            *group = (base_weight(row), 1);
+        for (row, group) in groups.iter_mut().enumerate() {
+            if row < HORSE_LEG_OFFSET || row >= crate::az::MOBILITY_OFFSET {
+                *group = (base_weight(row), 1);
+            }
         }
         for owner in 0..2 {
             for s in 0..BOARD_SIZE {

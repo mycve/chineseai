@@ -57,8 +57,11 @@ pub(crate) const HORSE_TWO_HOP_VOCAB: usize = 6_832;
 pub(crate) const HORSE_LEG_OFFSET: usize = HORSE_TWO_HOP_OFFSET + HORSE_TWO_HOP_VOCAB;
 /// 4368种堵腿关系：548行复用旧配对，492对互反共享，其余分配新行。
 pub(crate) const HORSE_LEG_VOCAB: usize = 3_328;
-pub(crate) const VALUE_THREAT_VOCAB: usize = HORSE_LEG_OFFSET + HORSE_LEG_VOCAB;
-pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 336;
+pub(crate) const MOBILITY_OFFSET: usize = HORSE_LEG_OFFSET + HORSE_LEG_VOCAB;
+/// 双方×车马炮×未受控落点档×受控落点档，每档为0、1、2～3、4以上。
+pub(crate) const MOBILITY_VOCAB: usize = 2 * 3 * 4 * 4;
+pub(crate) const VALUE_THREAT_VOCAB: usize = MOBILITY_OFFSET + MOBILITY_VOCAB;
+pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 348;
 pub(crate) const THREAT_SOURCE_MAX_ACTIVE: usize = 44;
 pub(crate) const WDL_HEAD_SIZE: usize = 3;
 /// Small, exact-history-derived signals.  These deliberately replace the old

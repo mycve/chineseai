@@ -1,16 +1,30 @@
 //! 每个已评估的 MCTS 节点保存当前视角的威胁状态，由同视角祖先更新。
+//! 局部关系按脏源更新，受控机动组全量刷新，攻击位板随缓存编码复用。
+#[cfg(test)]
+use super::inference::visit_value_threat_entries_from;
 use super::{
-    AzNnue, VALUE_THREAT_RANK, ValueKingState, inference::visit_value_threat_entries_from,
+    AzNnue, VALUE_THREAT_RANK, ValueKingState, inference::visit_threat_entries_with_masks,
 };
 use crate::xiangqi::{BOARD_SIZE, Color, Position, color_index, piece_kind_index};
 
 const NONE: u32 = u32::MAX;
 const _: () = assert!(super::VALUE_THREAT_VOCAB <= u16::MAX as usize + 1);
 
+pub(crate) struct ThreatEncoding {
+    pub(crate) sum: [f32; VALUE_THREAT_RANK],
+    pub(crate) active: usize,
+    pub(crate) attacks: [u128; 2],
+}
+
+struct ThreatSum {
+    sum: [f32; VALUE_THREAT_RANK],
+    attacks: [u128; 2],
+}
+
 #[derive(Default)]
 pub(crate) struct NodeThreatArena {
     states: Vec<ThreatState>,
-    sums: Vec<[f32; VALUE_THREAT_RANK]>,
+    sums: Vec<ThreatSum>,
     entries: Vec<u32>,
     pending: Vec<u32>,
     merged: Vec<u32>,
@@ -38,15 +52,28 @@ impl NodeThreatArena {
             return index;
         }
         self.merged.clear();
+        let attacks = if model.threat_incremental {
+            position.attacked_squares_masks()
+        } else {
+            [0; 2]
+        };
         if model.threat_incremental {
-            visit_value_threat_entries_from(position, side, u128::MAX, |e| self.merged.push(e));
+            visit_threat_entries_with_masks(position, side, u128::MAX, u128::MAX, attacks, |e| {
+                self.merged.push(e)
+            });
         }
         let mut sum = [0.0; VALUE_THREAT_RANK];
         for &entry in &self.merged {
             add(&mut sum, model, entry, 1.0);
         }
         let king = ValueKingState::new(model, position, side);
-        let index = self.store(model.threat_incremental.then_some(sum), 0, king);
+        let index = self.store(
+            model
+                .threat_incremental
+                .then_some(ThreatSum { sum, attacks }),
+            0,
+            king,
+        );
         self.roots[color_index(side)] = Some(index);
         index
     }
@@ -71,7 +98,7 @@ impl NodeThreatArena {
             self.merged.clear();
             return self.store(None, if age >= 32 { 0 } else { age }, king);
         }
-        let mut sum = self.sums[base.sum as usize];
+        let mut sum = self.sums[base.sum as usize].sum;
         let previous = &self.entries[base.start as usize..base.start as usize + base.len as usize];
         let mut dirty = changed;
         let mut occupancy_changed = 0;
@@ -92,7 +119,11 @@ impl NodeThreatArena {
             }
         }
         self.pending.clear();
-        visit_value_threat_entries_from(after, side, dirty, |e| self.pending.push(e));
+        let attacks = after.attacked_squares_masks();
+        // 敌控依赖远程攻击变化，联合机动特征每次全量刷新，其余关系仍按局部脏格更新。
+        visit_threat_entries_with_masks(after, side, dirty, u128::MAX, attacks, |e| {
+            self.pending.push(e)
+        });
         self.merged.clear();
         let (mut old, mut new) = (0, 0);
         while old < previous.len() || new < self.pending.len() {
@@ -136,15 +167,10 @@ impl NodeThreatArena {
             }
             age = 0;
         }
-        self.store(Some(sum), age, king)
+        self.store(Some(ThreatSum { sum, attacks }), age, king)
     }
 
-    fn store(
-        &mut self,
-        sum: Option<[f32; VALUE_THREAT_RANK]>,
-        age: u8,
-        king: ValueKingState,
-    ) -> u32 {
+    fn store(&mut self, sum: Option<ThreatSum>, age: u8, king: ValueKingState) -> u32 {
         let sum = sum.map_or(NONE, |sum| {
             let index = u32::try_from(self.sums.len()).expect("threat sum index overflow");
             self.sums.push(sum);
@@ -166,9 +192,14 @@ impl NodeThreatArena {
         self.states[state as usize].king
     }
 
-    pub(crate) fn value(&self, state: u32) -> ([f32; VALUE_THREAT_RANK], usize) {
+    pub(crate) fn value(&self, state: u32) -> ThreatEncoding {
         let state = &self.states[state as usize];
-        (self.sums[state.sum as usize], state.len as usize)
+        let cached = &self.sums[state.sum as usize];
+        ThreatEncoding {
+            sum: cached.sum,
+            active: state.len as usize,
+            attacks: cached.attacks,
+        }
     }
 }
 
@@ -282,6 +313,52 @@ mod tests {
     use crate::az::SplitMix64;
 
     #[test]
+    fn distant_rook_attack_changes_refresh_mobility_outside_local_horse_dependencies() {
+        let before = Position::from_canonical_piece_squares(&[(0, 85), (7, 4), (3, 40), (11, 1)]);
+        let after = Position::from_canonical_piece_squares(&[(0, 85), (7, 4), (3, 40), (11, 3)]);
+        let changed = (1u128 << 1) | (1u128 << 3);
+        let (targets, blockers) = super::super::horse::horse_dependency_masks(40);
+        assert_eq!(changed & (targets | blockers), 0);
+        let mut model = AzNnue::random(16, 50);
+        model.threat_incremental = true;
+        for side in [Color::Red, Color::Black] {
+            let mut arena = NodeThreatArena::default();
+            let base = arena.root(&model, &before, side);
+            let original = arena.states[base as usize].start as usize;
+            let old_horse = *arena.entries[original..]
+                .iter()
+                .find(|&&e| e >> 23 == 4 && ((e >> 16) & 127) == 40)
+                .unwrap();
+            let updated = arena.update(&model, base, &before, &after, side, changed);
+            let state = &arena.states[updated as usize];
+            let actual =
+                &arena.entries[state.start as usize..state.start as usize + state.len as usize];
+            let new_horse = *actual
+                .iter()
+                .find(|&&e| e >> 23 == 4 && ((e >> 16) & 127) == 40)
+                .unwrap();
+            assert_ne!(old_horse, new_horse);
+            let mut expected = Vec::new();
+            let mut sum = [0.0; VALUE_THREAT_RANK];
+            visit_value_threat_entries_from(&after, side, u128::MAX, |e| {
+                expected.push(e);
+                add(&mut sum, &model, e, 1.0);
+            });
+            assert_eq!(actual, expected);
+            let cached = arena.value(updated);
+            assert_eq!(cached.active, expected.len());
+            assert_eq!(cached.attacks, after.attacked_squares_masks());
+            assert!(
+                cached
+                    .sum
+                    .iter()
+                    .zip(sum)
+                    .all(|(a, b)| (a - b).abs() < 2e-5)
+            );
+        }
+    }
+
+    #[test]
     fn horse_incremental_tracks_second_legs_middle_colors_and_blocker_identity() {
         let mut model = AzNnue::random(16, 48);
         model.threat_incremental = true;
@@ -306,9 +383,10 @@ mod tests {
                     add(&mut sum, &model, e, 1.0);
                 });
                 assert_eq!(actual, expected);
-                let (cached, count) = arena.value(updated);
-                assert_eq!(count, expected.len());
-                for (a, b) in cached.iter().zip(sum) {
+                let cached = arena.value(updated);
+                assert_eq!(cached.active, expected.len());
+                assert_eq!(cached.attacks, after.attacked_squares_masks());
+                for (a, b) in cached.sum.iter().zip(sum) {
                     assert!((a - b).abs() < 2e-5);
                 }
             }
@@ -385,7 +463,11 @@ mod tests {
                     &arena.entries[saved.start as usize..saved.start as usize + saved.len as usize],
                     expected_entries
                 );
-                for (a, b) in arena.sums[saved.sum as usize].iter().zip(expected_sum) {
+                assert_eq!(
+                    arena.sums[saved.sum as usize].attacks,
+                    after.attacked_squares_masks()
+                );
+                for (a, b) in arena.sums[saved.sum as usize].sum.iter().zip(expected_sum) {
                     assert!(
                         (a - b).abs() < 2e-5,
                         "step={step} error={} fen={}",

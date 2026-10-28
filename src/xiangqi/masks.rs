@@ -3,7 +3,7 @@ use super::{
     soldier_crossed_river,
 };
 
-pub(super) fn orthogonal_ray_masks() -> &'static [[u128; 4]; BOARD_SIZE] {
+pub(crate) fn orthogonal_ray_masks() -> &'static [[u128; 4]; BOARD_SIZE] {
     static RAYS: OnceLock<[[u128; 4]; BOARD_SIZE]> = OnceLock::new();
     RAYS.get_or_init(|| {
         let mut rays = [[0u128; 4]; BOARD_SIZE];
@@ -71,7 +71,7 @@ pub(crate) fn nearest_on_ray(blockers: u128, increasing: bool) -> usize {
 }
 
 #[inline(always)]
-pub(super) fn ray_through(ray: u128, square: usize, increasing: bool) -> u128 {
+pub(crate) fn ray_through(ray: u128, square: usize, increasing: bool) -> u128 {
     if increasing {
         ray & ((1u128 << (square + 1)) - 1)
     } else {

@@ -293,6 +293,7 @@ pub(crate) fn value_threat_index(
         .unwrap_or(VALUE_THREAT_PAIR_VOCAB)
 }
 
+#[cfg(test)]
 pub(crate) fn visit_value_threat_features(
     position: &Position,
     perspective: Color,
@@ -301,6 +302,7 @@ pub(crate) fn visit_value_threat_features(
     visit_value_threat_features_from(position, perspective, u128::MAX, visitor);
 }
 
+#[cfg(test)]
 pub(crate) fn visit_value_threat_features_from(
     position: &Position,
     perspective: Color,
@@ -312,10 +314,29 @@ pub(crate) fn visit_value_threat_features_from(
     });
 }
 
+#[cfg(test)]
 pub(crate) fn visit_value_threat_entries_from(
     position: &Position,
     perspective: Color,
     sources: u128,
+    visitor: impl FnMut(u32),
+) {
+    visit_threat_entries_with_masks(
+        position,
+        perspective,
+        sources,
+        sources,
+        position.attacked_squares_masks(),
+        visitor,
+    );
+}
+
+pub(crate) fn visit_threat_entries_with_masks(
+    position: &Position,
+    perspective: Color,
+    sources: u128,
+    mobility_sources: u128,
+    attacks: [u128; 2],
     mut visitor: impl FnMut(u32),
 ) {
     position.visit_occupied_leaper_relations_from(sources, |source, attacker, target, attacked| {
@@ -442,7 +463,14 @@ pub(crate) fn visit_value_threat_entries_from(
             }
         }
     }
-    super::horse::visit_horse_threat_entries_from(position, perspective, sources, visitor);
+    super::horse::visit_horse_threat_entries_from(position, perspective, sources, &mut visitor);
+    super::mobility::visit_mobility_entries_from(
+        position,
+        perspective,
+        mobility_sources,
+        attacks,
+        visitor,
+    );
 }
 
 #[derive(Debug)]

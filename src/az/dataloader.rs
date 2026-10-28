@@ -24,7 +24,7 @@ use super::{
     normalize_wdl_target, policy_move_pieces, policy_move_tactical_flags,
     policy_sparse_capture_index, policy_sparse_main_index, policy_tactical_indices,
     sparse_pool::PADDING_ITEM,
-    visit_value_king_piece_features, visit_value_threat_features,
+    visit_threat_entries_with_masks, visit_value_king_piece_features,
 };
 
 const POLICY_MASK_VALUE: f32 = -1.0e9;
@@ -246,9 +246,14 @@ impl PackedBatch {
                 Position::from_canonical_piece_squares(&pieces)
             })
             .collect::<Vec<_>>();
+        let attack_masks = positions
+            .iter()
+            .map(Position::attacked_squares_masks)
+            .collect::<Vec<_>>();
         let value_threats = positions
             .iter()
-            .map(value_threat_features)
+            .zip(&attack_masks)
+            .map(|(p, masks)| value_threat_features(p, *masks))
             .collect::<Vec<_>>();
         let max_value_threats = value_threats.iter().map(Vec::len).max().unwrap_or(0).max(1);
         let value_king_pieces = positions
@@ -313,7 +318,13 @@ impl PackedBatch {
             packed.value_king_piece_indices[king_base..king_base + king_pieces.len()]
                 .copy_from_slice(king_pieces);
             packed.value_king_piece_scales[row] = 1.0 / (king_pieces.len().max(1) as f32).sqrt();
-            packed.pack_policy(row, sample, &positions[row], king_buckets);
+            packed.pack_policy(
+                row,
+                sample,
+                &positions[row],
+                king_buckets,
+                attack_masks[row],
+            );
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
@@ -358,9 +369,10 @@ impl PackedBatch {
         sample: &AzTrainingSample,
         position: &Position,
         king_buckets: (usize, usize),
+        attacks: [u128; 2],
     ) {
         let policy_base = row * self.max_policy_moves;
-        let [own_attacks, opponent_attacks] = position.attacked_squares_masks();
+        let [own_attacks, opponent_attacks] = attacks;
         let moves = sample
             .move_indices
             .iter()
@@ -453,11 +465,18 @@ impl PackedBatch {
     }
 }
 
-fn value_threat_features(position: &Position) -> Vec<u32> {
+fn value_threat_features(position: &Position, attacks: [u128; 2]) -> Vec<u32> {
     let mut features = Vec::with_capacity(32);
-    visit_value_threat_features(position, Color::Red, |feature| {
-        features.push(feature as u32);
-    });
+    visit_threat_entries_with_masks(
+        position,
+        Color::Red,
+        u128::MAX,
+        u128::MAX,
+        attacks,
+        |entry| {
+            features.push(entry as u16 as u32);
+        },
+    );
     assert!(
         features.len() <= VALUE_THREAT_MAX_ACTIVE,
         "too many active value threats"

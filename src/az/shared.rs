@@ -12,8 +12,10 @@ impl AzNnue {
         scratch: &mut AzEvalScratch,
     ) {
         scratch.policy_inputs_ready = false;
-        if self.context_active {
+        if self.context_active || self.threat_active {
             self.fill_policy_inputs(position, moves, scratch, true);
+        }
+        if self.context_active {
             let checks = check_context_features(
                 position,
                 moves,
@@ -32,6 +34,7 @@ impl AzNnue {
             &mut scratch.threat_accumulator,
             &mut scratch.threat_activation,
             scratch.threat_precomputed.take(),
+            scratch.attack_masks,
         );
     }
 
@@ -40,7 +43,8 @@ impl AzNnue {
         position: &Position,
         accumulator: &mut Vec<f32>,
         activation: &mut Vec<f32>,
-        precomputed: Option<([f32; VALUE_THREAT_RANK], usize)>,
+        precomputed: Option<super::node_threat::ThreatEncoding>,
+        attacks: [u128; 2],
     ) {
         activation.resize(VALUE_THREAT_RANK * 2, 0.0);
         if !self.threat_active {
@@ -54,18 +58,26 @@ impl AzNnue {
         {
             crate::scope_profile!("az.eval.shared_threat.accumulate");
             let mut active = 0usize;
-            if let Some((sum, count)) = precomputed {
-                accumulator.copy_from_slice(&sum);
-                active = count;
+            if let Some(cached) = precomputed {
+                accumulator.copy_from_slice(&cached.sum);
+                active = cached.active;
             } else {
-                visit_value_threat_features(position, perspective, |feature| {
-                    active += 1;
-                    let row = &self.threat_embedding
-                        [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
-                    for (sum, weight) in accumulator.iter_mut().zip(row) {
-                        *sum += weight;
-                    }
-                });
+                visit_threat_entries_with_masks(
+                    position,
+                    perspective,
+                    u128::MAX,
+                    u128::MAX,
+                    attacks,
+                    |entry| {
+                        let feature = entry as u16 as usize;
+                        active += 1;
+                        let row = &self.threat_embedding
+                            [feature * VALUE_THREAT_RANK..(feature + 1) * VALUE_THREAT_RANK];
+                        for (sum, weight) in accumulator.iter_mut().zip(row) {
+                            *sum += weight;
+                        }
+                    },
+                );
             }
             let scale = 1.0 / (active.max(1) as f32).sqrt();
             for value in accumulator.iter_mut() {

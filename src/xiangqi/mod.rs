@@ -33,11 +33,8 @@ use geom::{
 };
 use hash::{SIDE_TO_MOVE_KEY, color_hash_index, zobrist_piece_key};
 pub(crate) use masks::HORSE_STEPS;
-pub(crate) use masks::nearest_on_ray;
-use masks::{
-    DIAGONAL_STEPS, ELEPHANT_STEPS, ORTHOGONAL_STEPS, fixed_attack_masks, offset_square,
-    orthogonal_ray_masks, ray_through,
-};
+use masks::{DIAGONAL_STEPS, ELEPHANT_STEPS, ORTHOGONAL_STEPS, fixed_attack_masks, offset_square};
+pub(crate) use masks::{nearest_on_ray, orthogonal_ray_masks, ray_through};
 use std::sync::OnceLock;
 use types::{CheckerInfo, MoveGenMode, PositionState};
 
