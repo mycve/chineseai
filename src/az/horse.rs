@@ -5,6 +5,7 @@ use super::arch::{
     HORSE_LEG_OFFSET, HORSE_LEG_VOCAB, HORSE_TWO_HOP_OFFSET, HORSE_TWO_HOP_VOCAB,
     canonical_square_for,
 };
+use super::inference::canonical_threat_pair_index;
 use super::nnue::{canonical_piece_square_reachable, piece_absolute_feature_index};
 use crate::xiangqi::{
     BOARD_FILES, BOARD_RANKS, BOARD_SIZE, Color, HORSE_STEPS, PieceKind, Position,
@@ -88,6 +89,8 @@ fn geometry() -> &'static HorseGeometry {
         assert_eq!(usize::from(count), TWO_HOP_PAIRS);
         let mut blockers = vec![u16::MAX; 2 * BOARD_SIZE * 4 * 14];
         let mut count = 0;
+        let mut pair_shares = 0;
+        let mut reciprocal_shares = 0;
         for owner in 0..2 {
             for (source, &mask) in legs.iter().enumerate() {
                 let mut mask = mask;
@@ -96,16 +99,40 @@ fn geometry() -> &'static HorseGeometry {
                     mask &= mask - 1;
                     for blocker in 0..14 {
                         if canonical_piece_square_reachable(blocker, leg) {
-                            blockers
-                                [blocker_key(owner, source, leg_direction(source, leg), blocker)] =
-                                count;
-                            count += 1;
+                            let key =
+                                blocker_key(owner, source, leg_direction(source, leg), blocker);
+                            // 将/兵攻击马与对应的堵腿关系同激活，直接引用既有配对行。
+                            let pair =
+                                canonical_threat_pair_index(blocker, leg, source, owner * 7 + 3);
+                            let reverse = if blocker % 7 == 3 {
+                                blockers[blocker_key(
+                                    blocker / 7,
+                                    leg,
+                                    leg_direction(leg, source),
+                                    owner * 7 + 3,
+                                )]
+                            } else {
+                                u16::MAX
+                            };
+                            blockers[key] = if let Some(pair) = pair {
+                                pair_shares += 1;
+                                pair as u16
+                            } else if reverse != u16::MAX {
+                                reciprocal_shares += 1;
+                                reverse
+                            } else {
+                                let row = HORSE_LEG_OFFSET + count;
+                                count += 1;
+                                row as u16
+                            };
                         }
                     }
                 }
             }
         }
-        assert_eq!(usize::from(count), HORSE_LEG_VOCAB);
+        assert_eq!(count, HORSE_LEG_VOCAB);
+        assert_eq!(pair_shares, 548);
+        assert_eq!(reciprocal_shares, 492);
         assert_eq!(TWO_HOP_PAIRS * 2 * 2, HORSE_TWO_HOP_VOCAB);
         HorseGeometry {
             jumps,
@@ -128,7 +155,7 @@ fn two_hop_index(owner: usize, source: usize, target: usize, capture: bool) -> O
 
 fn leg_index(owner: usize, source: usize, direction: usize, blocker: usize) -> Option<usize> {
     let row = geometry().blockers[blocker_key(owner, source, direction, blocker)];
-    (row != u16::MAX).then(|| HORSE_LEG_OFFSET + usize::from(row))
+    (row != u16::MAX).then_some(usize::from(row))
 }
 
 /// 其他棋子静止时的两次马跳；允许第一跳吃敌子，排除取将、回原位和己方占用落点。
@@ -256,9 +283,10 @@ mod tests {
     }
 
     #[test]
-    fn horse_tables_have_only_geometric_rows_and_no_aliases() {
+    fn horse_tables_only_share_matching_pairs_and_reciprocal_legs() {
         let mut hops = vec![false; HORSE_TWO_HOP_VOCAB];
-        let mut legs = vec![false; HORSE_LEG_VOCAB];
+        let mut legs =
+            std::collections::BTreeMap::<usize, Vec<(usize, usize, usize, usize)>>::new();
         for source in 0..BOARD_SIZE {
             for target in 0..BOARD_SIZE {
                 let possible = target != source
@@ -291,16 +319,157 @@ mod tests {
                         let row = leg_index(owner, source, direction, blocker);
                         assert_eq!(row.is_some(), possible);
                         if let Some(row) = row {
-                            let row = row - HORSE_LEG_OFFSET;
-                            assert!(!legs[row]);
-                            legs[row] = true;
+                            legs.entry(row).or_default().push((
+                                owner,
+                                source,
+                                (r * 9 + f) as usize,
+                                blocker,
+                            ));
                         }
                     }
                 }
             }
         }
         assert!(hops.into_iter().all(|x| x));
-        assert!(legs.into_iter().all(|x| x));
+        let mut seen = vec![false; HORSE_LEG_VOCAB];
+        let mut pair_shares = 0;
+        let mut reciprocal_shares = 0;
+        for (row, keys) in legs {
+            if row < HORSE_LEG_OFFSET {
+                assert!(row < crate::az::VALUE_THREAT_PAIR_VOCAB);
+                assert_eq!(keys.len(), 1);
+                let (owner, s, l, p) = keys[0];
+                assert!(matches!(p % 7, 0 | 6));
+                assert_eq!(
+                    canonical_threat_pair_index(p, l, s, owner * 7 + 3),
+                    Some(row)
+                );
+                pair_shares += 1;
+            } else {
+                assert!(!seen[row - HORSE_LEG_OFFSET]);
+                seen[row - HORSE_LEG_OFFSET] = true;
+                match keys.as_slice() {
+                    [_] => {}
+                    &[(owner, s, l, p), (other, t, m, q)] => {
+                        assert_eq!(p % 7, 3);
+                        assert_eq!((other, t, m, q), (p / 7, l, s, owner * 7 + 3));
+                        reciprocal_shares += 1;
+                    }
+                    _ => panic!("非预期堵腿别名 {keys:?}"),
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|x| x));
+        assert_eq!(pair_shares, 548);
+        assert_eq!(reciprocal_shares, 492);
+    }
+
+    #[test]
+    fn shared_leg_rows_preserve_pool_sum_activation_count_and_normalization() {
+        use crate::az::{VALUE_THREAT_PAIR_VOCAB, VALUE_THREAT_VOCAB};
+        // 合成每个逻辑特征的独立系数，检验共享前后代数等价；不读取任何权重文件。
+        let base_weight = |row: usize| (row % 43) as f64 - 21.0;
+        let leg_weight = |owner: usize, s: usize, l: usize, p: usize| {
+            ((owner * 997 + s * 17 + l * 13 + p * 7) % 37) as f64 - 18.0
+        };
+        let mut groups = vec![(0.0, 0usize); VALUE_THREAT_VOCAB];
+        for (row, group) in groups[..HORSE_LEG_OFFSET].iter_mut().enumerate() {
+            *group = (base_weight(row), 1);
+        }
+        for owner in 0..2 {
+            for s in 0..BOARD_SIZE {
+                for &l in &legs_for(s) {
+                    for p in 0..14 {
+                        if let Some(row) = leg_index(owner, s, leg_direction(s, l), p) {
+                            groups[row].0 += leg_weight(owner, s, l, p);
+                            groups[row].1 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(groups.iter().all(|&(_, n)| n > 0));
+        let weights: Vec<_> = groups.iter().map(|&(sum, n)| sum / n as f64).collect();
+        let mut rng = SplitMix64::new(49);
+        let mut active_shared = 0;
+        for _ in 0..3 {
+            let mut position = Position::startpos();
+            for _ in 0..120 {
+                for perspective in [Color::Red, Color::Black] {
+                    let mut compact_sum = 0.0;
+                    let mut original_sum = 0.0;
+                    let mut counts = std::collections::BTreeMap::<usize, usize>::new();
+                    let mut active = 0;
+                    let mut logical_active = 0;
+                    visit_value_threat_entries_from(&position, perspective, u128::MAX, |e| {
+                        let row = e as u16 as usize;
+                        compact_sum += weights[row];
+                        active += 1;
+                        *counts.entry(row).or_default() += 1;
+                        // 马标签下的堵腿访问可能已经引用旧配对行；保留其独立逻辑贡献。
+                        let leg = e >> 23 == 2
+                            && (row < VALUE_THREAT_PAIR_VOCAB || row >= HORSE_LEG_OFFSET);
+                        if !leg {
+                            original_sum += base_weight(row);
+                            logical_active += 1;
+                        }
+                    });
+                    for s in position.occupied_squares() {
+                        let horse = position.piece_at(s).unwrap();
+                        if horse.kind != PieceKind::Horse {
+                            continue;
+                        }
+                        let owner = usize::from(horse.color != perspective);
+                        let source = canonical_square_for(perspective, s);
+                        for l in legs_for(s) {
+                            if let Some(p) = position.piece_at(l) {
+                                original_sum += leg_weight(
+                                    owner,
+                                    source,
+                                    canonical_square_for(perspective, l),
+                                    piece_absolute_feature_index(perspective, p),
+                                );
+                                logical_active += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(active, logical_active);
+                    assert_eq!(
+                        compact_sum,
+                        original_sum,
+                        "{} {perspective:?}",
+                        position.to_fen()
+                    );
+                    let normalized = compact_sum / (active.max(1) as f64).sqrt();
+                    let original = original_sum / (logical_active.max(1) as f64).sqrt();
+                    assert_eq!(
+                        [normalized, normalized * normalized],
+                        [original, original * original]
+                    );
+                    for (row, n) in counts {
+                        if groups[row].1 == 2 {
+                            assert_eq!(n, 2, "共享行丢失激活次数 {row}");
+                            active_shared += 1;
+                        }
+                    }
+                }
+                let moves = position.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                position.make_move(moves[rng.next_u64() as usize % moves.len()]);
+            }
+        }
+        assert!(active_shared > 100);
+    }
+
+    fn legs_for(source: usize) -> Vec<usize> {
+        let mask = (0..BOARD_SIZE)
+            .filter_map(|t| slow_leg(source, t))
+            .fold(0u128, |m, l| m | 1 << l);
+        (0..BOARD_SIZE)
+            .filter(|&l| mask & (1u128 << l) != 0)
+            .collect()
     }
 
     #[test]

@@ -255,6 +255,27 @@ pub(crate) fn threat_attacked_offsets() -> &'static [u8] {
 }
 
 #[inline]
+pub(crate) fn canonical_threat_pair_index(
+    attacker: usize,
+    source: usize,
+    target: usize,
+    attacked: usize,
+) -> Option<usize> {
+    let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
+    let map = threat_relation_map();
+    let base = map.bases[relation];
+    if base == u16::MAX {
+        return None;
+    }
+    let offset = threat_attacked_offsets()[target * STRUCTURAL_PIECE_SIZE + attacked];
+    if offset == u8::MAX {
+        return None;
+    }
+    let compact = map.compact[base as usize + usize::from(offset)];
+    (compact != u16::MAX).then_some(usize::from(compact))
+}
+
+#[inline]
 pub(crate) fn value_threat_index(
     perspective: Color,
     source: usize,
@@ -268,22 +289,8 @@ pub(crate) fn value_threat_index(
         (if attacked.color == perspective { 0 } else { 7 }) + piece_kind_index(attacked.kind);
     let source = canonical_square_for(perspective, source);
     let target = canonical_square_for(perspective, target);
-    let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
-    let map = threat_relation_map();
-    let base = map.bases[relation];
-    if base == u16::MAX {
-        return VALUE_THREAT_PAIR_VOCAB;
-    }
-    let offset = threat_attacked_offsets()[target * STRUCTURAL_PIECE_SIZE + attacked];
-    if offset == u8::MAX {
-        return VALUE_THREAT_PAIR_VOCAB;
-    }
-    let compact = map.compact[base as usize + usize::from(offset)];
-    if compact == u16::MAX {
-        VALUE_THREAT_PAIR_VOCAB
-    } else {
-        usize::from(compact)
-    }
+    canonical_threat_pair_index(attacker, source, target, attacked)
+        .unwrap_or(VALUE_THREAT_PAIR_VOCAB)
 }
 
 pub(crate) fn visit_value_threat_features(
@@ -1354,7 +1361,7 @@ mod pair_compaction_tests {
                     );
                     let mut actual = Vec::new();
                     visit_value_threat_entries_from(&position, side, u128::MAX, |entry| {
-                        if (entry as u16 as usize) < VALUE_THREAT_PAIR_VOCAB {
+                        if entry >> 23 == 0 {
                             actual.push(entry);
                         }
                     });

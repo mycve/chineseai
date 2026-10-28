@@ -1575,7 +1575,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     assert!(!tensors.contains_key("value_history_output"));
     assert_eq!(tensors["policy_tactical"].elem_count(), 120_704);
     assert_eq!(tensors["policy_sparse_table"].elem_count(), 289_403);
-    assert_eq!(tensors["threat_embedding"].dims(), &[61_451, 64]);
+    assert_eq!(tensors["threat_embedding"].dims(), &[60_411, 64]);
     assert!(!tensors.contains_key("policy_move_bias"));
     for name in [
         "context_hidden",
@@ -1592,7 +1592,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[47.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[48.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());

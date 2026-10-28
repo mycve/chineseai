@@ -55,8 +55,8 @@ pub(crate) const HORSE_TWO_HOP_OFFSET: usize =
 /// 双方马 × 1708个两跳起终点组合 × 空格/敌子。
 pub(crate) const HORSE_TWO_HOP_VOCAB: usize = 6_832;
 pub(crate) const HORSE_LEG_OFFSET: usize = HORSE_TWO_HOP_OFFSET + HORSE_TWO_HOP_VOCAB;
-/// 仅保留棋盘内有效马腿及堵腿棋子可达的组合。
-pub(crate) const HORSE_LEG_VOCAB: usize = 4_368;
+/// 4368种堵腿关系：548行复用旧配对，492对互反共享，其余分配新行。
+pub(crate) const HORSE_LEG_VOCAB: usize = 3_328;
 pub(crate) const VALUE_THREAT_VOCAB: usize = HORSE_LEG_OFFSET + HORSE_LEG_VOCAB;
 pub(crate) const VALUE_THREAT_MAX_ACTIVE: usize = 336;
 pub(crate) const THREAT_SOURCE_MAX_ACTIVE: usize = 44;

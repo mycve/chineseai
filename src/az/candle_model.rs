@@ -821,7 +821,7 @@ mod tests {
 
     fn policy_heads_and_gradients_match(device: &Device) {
         let position =
-            Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2c1pN1/P1P6/4B2C1/4A4/1RBAK3R w")
+            Position::from_fen("1rbakab1r/9/4c3n/p3p3P/2p6/1C2p1cN1/P1P6/4B2C1/4A4/1RBAK3R w")
                 .unwrap();
         let moves = position.legal_moves();
         let mut model = AzNnue::random(32, 20260730);
