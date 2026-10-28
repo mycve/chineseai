@@ -20,20 +20,20 @@ pub(crate) const POLICY_TACTICAL_SIGNATURES: usize = 64;
 pub(crate) const POLICY_TACTICAL_TERMS: usize = 2;
 /// 几何可行的走法×棋种组合：将24、士8、象16、马508、车1530、炮1530、兵126。
 pub(crate) const POLICY_MOVE_PIECE_COUNT: usize = 3_742;
-/// 非炮每组32行；炮的非吃子32行、吃子16行。
-pub const POLICY_TACTICAL_EXACT_SIZE: usize = 144_224;
+/// 去除恒定控制位、相邻炮吃子和不可能将军的签名。
+pub const POLICY_TACTICAL_EXACT_SIZE: usize = 120_128;
 pub(crate) const POLICY_CAPTURE_RELATION_OFFSET: usize = POLICY_TACTICAL_EXACT_SIZE;
 pub(crate) const POLICY_CAPTURE_RELATION_BUCKETS: usize = 16;
-pub(crate) const POLICY_CAPTURE_RELATION_SIZE: usize = 7 * 6 * POLICY_CAPTURE_RELATION_BUCKETS;
+pub(crate) const POLICY_CAPTURE_RELATION_SIZE: usize = 36 * POLICY_CAPTURE_RELATION_BUCKETS;
 pub(crate) const POLICY_TACTICAL_SIZE: usize =
     POLICY_CAPTURE_RELATION_OFFSET + POLICY_CAPTURE_RELATION_SIZE;
 // 策略只编码己方走子和敌方被吃子，训练与推理使用同一布局。
 pub(crate) const POLICY_PIECE_SIZE: usize = 7;
-pub(crate) const POLICY_CAPTURE_CLASSES: usize = POLICY_PIECE_SIZE + 1;
-pub const POLICY_SPARSE_MAIN_SIZE: usize =
-    POLICY_MOVE_PIECE_COUNT * V2_KING_BUCKETS * V2_KING_BUCKETS;
+const POLICY_CAPTURE_CLASSES: usize = POLICY_PIECE_SIZE + 1;
+pub const POLICY_SPARSE_MAIN_SIZE: usize = 279_603;
+pub(crate) const POLICY_SPARSE_CAPTURE_SIZE: usize = 9_799;
 pub(crate) const POLICY_SPARSE_TABLE_SIZE: usize =
-    POLICY_SPARSE_MAIN_SIZE + DENSE_MOVE_SPACE * POLICY_CAPTURE_CLASSES + 1;
+    POLICY_SPARSE_MAIN_SIZE + POLICY_SPARSE_CAPTURE_SIZE + 1;
 pub(crate) const POLICY_SPARSE_TERMS: usize = 2;
 pub(crate) const POLICY_ACCUMULATOR_BIAS_ROW: usize = AZ_NNUE_INPUT_SIZE;
 pub(crate) const POLICY_ACCUMULATOR_ROWS: usize = POLICY_ACCUMULATOR_BIAS_ROW + 1;
@@ -45,7 +45,8 @@ pub(crate) const VALUE_KING_PIECE_RANK: usize = 16;
 pub(crate) const VALUE_KING_PIECE_VOCAB: usize = 12_174;
 pub(crate) const VALUE_KING_PIECE_MAX_ACTIVE: usize = 64;
 pub(crate) const VALUE_THREAT_RANK: usize = 64;
-pub(crate) const VALUE_THREAT_PAIR_VOCAB: usize = 10_646;
+/// 去除同色双将死槽，并共享155组严格互反关系；访问次数仍各自保留。
+pub(crate) const VALUE_THREAT_PAIR_VOCAB: usize = 10_443;
 /// 仅保留方向、距离、阻挡次序及数量可同时满足的射线组合。
 pub(crate) const VALUE_RAY_VOCAB: usize = 7_040;
 pub(crate) const VALUE_CANNON_TRIPLE_VOCAB: usize = 32_768;
@@ -162,7 +163,12 @@ pub(crate) struct MoveMap {
     #[allow(dead_code)]
     pub(crate) dense_to_sparse: [u16; DENSE_MOVE_SPACE],
     pub(crate) move_piece_to_compact: [[u16; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE],
-    tactical_offsets: [[u32; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE],
+    tactical_offsets: Vec<u32>,
+    tactical_masks: Vec<u64>,
+    king_offsets: Vec<u32>,
+    king_masks: Vec<u128>,
+    capture_offsets: [u16; DENSE_MOVE_SPACE],
+    capture_masks: [u8; DENSE_MOVE_SPACE],
 }
 
 pub(crate) fn move_map() -> &'static MoveMap {
@@ -172,30 +178,78 @@ pub(crate) fn move_map() -> &'static MoveMap {
         let mut sparse_to_dense = [u16::MAX; SPARSE_MOVE_SPACE];
         let dense_to_sparse = px0_policy_map::PX0_MOVES;
         let mut move_piece_to_compact = [[u16::MAX; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE];
-        let mut tactical_offsets = [[u32::MAX; POLICY_PIECE_SIZE]; DENSE_MOVE_SPACE];
+        let mut tactical_offsets = Vec::with_capacity(POLICY_MOVE_PIECE_COUNT);
+        let mut tactical_masks = Vec::with_capacity(POLICY_MOVE_PIECE_COUNT);
+        let mut king_offsets = Vec::with_capacity(POLICY_MOVE_PIECE_COUNT);
+        let mut king_masks = Vec::with_capacity(POLICY_MOVE_PIECE_COUNT);
+        let mut capture_offsets = [0; DENSE_MOVE_SPACE];
+        let mut capture_masks = [0; DENSE_MOVE_SPACE];
         let mut pair_count = 0;
         let mut tactical_count = 0;
+        let mut king_count = 0;
+        let mut capture_count = 0;
         for (index, &sparse) in dense_to_sparse.iter().enumerate() {
             assert_eq!(sparse_to_dense[sparse as usize], u16::MAX);
             sparse_to_dense[sparse as usize] = index as u16;
             let from = sparse as usize / BOARD_SIZE;
             let to = sparse as usize % BOARD_SIZE;
+            capture_offsets[index] = capture_count;
+            for class in 0..POLICY_CAPTURE_CLASSES {
+                if class == 7 || (class != 0 && canonical_piece_square_reachable(class + 7, to)) {
+                    capture_masks[index] |= 1 << class;
+                    capture_count += 1;
+                }
+            }
             for piece in 0..POLICY_PIECE_SIZE {
                 if policy_move_piece_is_geometric(from, to, piece) {
                     move_piece_to_compact[index][piece] = pair_count as u16;
                     pair_count += 1;
-                    tactical_offsets[index][piece] = tactical_count;
-                    tactical_count += if piece == 5 { 48 } else { 32 };
+                    tactical_offsets.push(tactical_count);
+                    let can_check = policy_check_dependency_possible(from, to, piece);
+                    let adjacent = (from / BOARD_FILES).abs_diff(to / BOARD_FILES)
+                        + (from % BOARD_FILES).abs_diff(to % BOARD_FILES)
+                        == 1;
+                    let mut mask = 0u64;
+                    for signature in 0..POLICY_TACTICAL_SIGNATURES {
+                        let capture = signature & 16 != 0;
+                        if ((piece != 5 || capture) && signature & 8 == 0)
+                            || (piece == 5 && adjacent && capture)
+                            || (signature & 32 != 0 && !can_check)
+                        {
+                            continue;
+                        }
+                        mask |= 1 << signature;
+                    }
+                    tactical_count += mask.count_ones();
+                    tactical_masks.push(mask);
+                    let mut mask = 0u128;
+                    for us in 0..V2_KING_BUCKETS {
+                        for them in 0..V2_KING_BUCKETS {
+                            if policy_kings_possible(from, to, piece, us, them) {
+                                mask |= 1 << (us * V2_KING_BUCKETS + them);
+                            }
+                        }
+                    }
+                    king_offsets.push(king_count);
+                    king_count += mask.count_ones();
+                    king_masks.push(mask);
                 }
             }
         }
         assert_eq!(pair_count, POLICY_MOVE_PIECE_COUNT);
         assert_eq!(tactical_count as usize, POLICY_TACTICAL_EXACT_SIZE);
+        assert_eq!(king_count as usize, POLICY_SPARSE_MAIN_SIZE);
+        assert_eq!(capture_count as usize, POLICY_SPARSE_CAPTURE_SIZE);
         MoveMap {
             sparse_to_dense,
             dense_to_sparse,
             move_piece_to_compact,
             tactical_offsets,
+            tactical_masks,
+            king_offsets,
+            king_masks,
+            capture_offsets,
+            capture_masks,
         }
     })
 }
@@ -206,22 +260,122 @@ pub(crate) fn policy_tactical_exact_index(
     piece: usize,
     signature: usize,
 ) -> Option<usize> {
-    let offset = move_map().tactical_offsets[move_index][piece];
-    if offset == u32::MAX || signature >= POLICY_TACTICAL_SIGNATURES {
+    let map = move_map();
+    let pair = policy_move_piece_index(move_index, piece)?;
+    if signature >= POLICY_TACTICAL_SIGNATURES {
         return None;
     }
-    let capture = signature & 16 != 0;
-    if (piece != 5 || capture) && signature & 8 == 0 {
+    let mask = map.tactical_masks[pair];
+    let bit = 1u64 << signature;
+    (mask & bit != 0)
+        .then(|| map.tactical_offsets[pair] as usize + (mask & (bit - 1)).count_ones() as usize)
+}
+
+/// 位掩码与前缀计数避免维护完整的走法×棋种×双将位索引大表。
+pub(crate) fn policy_main_compact_index(
+    mv: usize,
+    piece: usize,
+    us: usize,
+    them: usize,
+) -> Option<usize> {
+    let pair = policy_move_piece_index(mv, piece)?;
+    let map = move_map();
+    let bit = 1u128 << (us * V2_KING_BUCKETS + them);
+    let mask = map.king_masks[pair];
+    (mask & bit != 0)
+        .then(|| map.king_offsets[pair] as usize + (mask & (bit - 1)).count_ones() as usize)
+}
+
+pub(crate) fn policy_capture_compact_index(mv: usize, victim: Option<usize>) -> Option<usize> {
+    debug_assert!(victim.is_none_or(|piece| (7..14).contains(&piece)));
+    let class = victim.map_or(7, |p| p - 7);
+    let map = move_map();
+    let bit = 1u8 << class;
+    let mask = map.capture_masks[mv];
+    (mask & bit != 0).then(|| {
+        POLICY_SPARSE_MAIN_SIZE
+            + map.capture_offsets[mv] as usize
+            + (mask & (bit - 1)).count_ones() as usize
+    })
+}
+
+pub(crate) fn policy_capture_relation_index(
+    piece: usize,
+    victim: usize,
+    signature: usize,
+) -> Option<usize> {
+    debug_assert!(piece < POLICY_PIECE_SIZE && signature < POLICY_TACTICAL_SIGNATURES);
+    if !(8..14).contains(&victim) || (piece < 3 && victim < 10) {
         return None;
     }
-    let state = if piece != 5 {
-        (signature & 7) | ((signature >> 4) << 3)
-    } else if capture {
-        32 + (signature & 7) + ((signature >> 5) << 3)
+    let pair = if piece < 3 {
+        piece * 4 + victim - 10
     } else {
-        (signature & 15) | ((signature >> 5) << 4)
+        12 + (piece - 3) * 6 + victim - 8
     };
-    Some(offset as usize + state)
+    Some(
+        POLICY_CAPTURE_RELATION_OFFSET
+            + pair * POLICY_CAPTURE_RELATION_BUCKETS
+            + (signature & 7)
+            + ((signature >> 5) << 3),
+    )
+}
+
+fn king_square(bucket: usize) -> usize {
+    (7 + bucket / 3) * BOARD_FILES + 3 + bucket % 3
+}
+
+fn policy_kings_possible(from: usize, to: usize, piece: usize, us: usize, them: usize) -> bool {
+    let us = king_square(us);
+    let them = BOARD_SIZE - 1 - king_square(them);
+    if (piece == 0 && from != us)
+        || (piece != 0 && (us == from || us == to))
+        || them == from
+        || them == to
+    {
+        return false;
+    }
+    let (sr, sf) = (from / BOARD_FILES, from % BOARD_FILES);
+    let (tr, tf) = (to / BOARD_FILES, to % BOARD_FILES);
+    if piece == 4 || piece == 5 {
+        let blockers = [us, them]
+            .into_iter()
+            .filter(|&k| {
+                let (kr, kf) = (k / BOARD_FILES, k % BOARD_FILES);
+                (sr == tr && tr == kr && sf.min(tf) < kf && kf < sf.max(tf))
+                    || (sf == tf && tf == kf && sr.min(tr) < kr && kr < sr.max(tr))
+            })
+            .count();
+        return blockers <= usize::from(piece == 5);
+    }
+    let block = match piece {
+        2 => Some((sr + tr) / 2 * BOARD_FILES + (sf + tf) / 2),
+        3 if sr.abs_diff(tr) == 2 => Some((sr + tr) / 2 * BOARD_FILES + sf),
+        3 => Some(sr * BOARD_FILES + (sf + tf) / 2),
+        _ => None,
+    };
+    !block.is_some_and(|sq| sq == us || sq == them)
+}
+
+/// 必要条件：将位附近的射线/马腿占用变化，或移动马兵直接将军。
+fn policy_check_dependency_possible(from: usize, to: usize, piece: usize) -> bool {
+    let (sr, sf) = (from / BOARD_FILES, from % BOARD_FILES);
+    let (tr, tf) = (to / BOARD_FILES, to % BOARD_FILES);
+    (0..V2_KING_BUCKETS).any(|bucket| {
+        let king = BOARD_SIZE - 1 - king_square(bucket);
+        if king == from || king == to {
+            return false;
+        }
+        let (kr, kf) = (king / BOARD_FILES, king % BOARD_FILES);
+        sr == kr
+            || sf == kf
+            || tr == kr
+            || tf == kf
+            || (sr.abs_diff(kr) == 1 && sf.abs_diff(kf) == 1)
+            || (piece == 3 && matches!((tr.abs_diff(kr), tf.abs_diff(kf)), (1, 2) | (2, 1)))
+            || (piece == 6
+                && ((tr == kr + 1 && tf == kf) || (tr <= 4 && tr == kr && tf.abs_diff(kf) == 1)))
+    })
 }
 
 /// 不可能的走法×棋种没有参数行；训练与推理共用同一紧凑编号。

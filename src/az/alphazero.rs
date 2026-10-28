@@ -2040,8 +2040,11 @@ mod tests {
             position.side_to_move(),
             mate,
         ));
-        let start = crate::az::POLICY_SPARSE_MAIN_SIZE + index * crate::az::POLICY_CAPTURE_CLASSES;
-        model.policy_sparse_table[start..start + crate::az::POLICY_CAPTURE_CLASSES].fill(-100.0);
+        for victim in (7..14).map(Some).chain([None]) {
+            if let Some(row) = crate::az::policy_capture_compact_index(index, victim) {
+                model.policy_sparse_table[row] = -100.0;
+            }
+        }
         let mut tree = AzTree::new(
             position.clone(),
             position.initial_rule_history(),
@@ -2788,12 +2791,12 @@ mod tests {
     #[test]
     fn raw_prior_is_network_policy_before_temperature_and_noise() {
         let mut model = AzNnue::random(32, 83);
-        let end = model.policy_sparse_table.len() - 1;
-        for (index, weights) in model.policy_sparse_table[crate::az::POLICY_SPARSE_MAIN_SIZE..end]
-            .chunks_exact_mut(crate::az::POLICY_CAPTURE_CLASSES)
-            .enumerate()
-        {
-            weights.fill((index % 17) as f32 * 0.1);
+        for index in 0..crate::az::DENSE_MOVE_SPACE {
+            for victim in (7..14).map(Some).chain([None]) {
+                if let Some(row) = crate::az::policy_capture_compact_index(index, victim) {
+                    model.policy_sparse_table[row] = (index % 17) as f32 * 0.1;
+                }
+            }
         }
         let position = Position::startpos();
         let normal = alphazero_search(

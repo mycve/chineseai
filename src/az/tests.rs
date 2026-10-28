@@ -132,12 +132,12 @@ fn capture_table_supplies_move_baseline_in_both_perspectives() {
         &mut scratch,
     );
     let score = |mv: usize| ((mv % 31) as f32 - 15.0) / 32.0;
-    let end = model.policy_sparse_table.len() - 1;
-    for (mv, classes) in model.policy_sparse_table[super::POLICY_SPARSE_MAIN_SIZE..end]
-        .chunks_exact_mut(super::POLICY_CAPTURE_CLASSES)
-        .enumerate()
-    {
-        classes.fill(score(mv));
+    for mv in 0..DENSE_MOVE_SPACE {
+        for victim in (7..14).map(Some).chain([None]) {
+            if let Some(row) = super::policy_capture_compact_index(mv, victim) {
+                model.policy_sparse_table[row] = score(mv);
+            }
+        }
     }
     let mut kinds = [false; 2];
     for position in [position, black] {
@@ -322,20 +322,14 @@ fn capture_relation_is_shared_and_excludes_quiet_moves() {
     for mover in 0..7 {
         for victim in 8..14 {
             for state in 0..16 {
-                let indices = policy_tactical_indices(
-                    geometric_move_index(mover, 0),
-                    mover,
-                    state & 1 != 0,
-                    state & 2 != 0,
-                    state & 4 != 0,
-                    true,
-                    Some(victim),
-                    state & 8 != 0,
-                );
-                assert!(
-                    (POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE).contains(&indices[1])
-                );
-                assert!(seen.insert(indices[1]));
+                let signature = (state & 7) | 24 | ((state >> 3) << 5);
+                let Some(row) = super::policy_capture_relation_index(mover, victim, signature)
+                else {
+                    assert!(mover < 3 && victim < 10);
+                    continue;
+                };
+                assert!((POLICY_CAPTURE_RELATION_OFFSET..POLICY_TACTICAL_SIZE).contains(&row));
+                assert!(seen.insert(row));
             }
         }
     }
@@ -361,8 +355,23 @@ fn compact_policy_rows_are_unique_and_cover_both_tables() {
     let mut pairs = vec![false; super::POLICY_MOVE_PIECE_COUNT];
     let mut sparse = vec![false; super::POLICY_SPARSE_MAIN_SIZE];
     let mut tactical = vec![false; super::POLICY_TACTICAL_EXACT_SIZE];
+    let mut captures = vec![false; super::POLICY_SPARSE_CAPTURE_SIZE];
     let mut counts = [0usize; 7];
     for mv in 0..DENSE_MOVE_SPACE {
+        let (_, to) = dense_move_squares(mv).unwrap();
+        for victim in (7..14).map(Some).chain([None]) {
+            let row = super::policy_capture_compact_index(mv, victim);
+            assert_eq!(
+                row.is_some(),
+                victim
+                    .is_none_or(|p| p != 7 && super::nnue::canonical_piece_square_reachable(p, to))
+            );
+            if let Some(row) = row {
+                let row = row - super::POLICY_SPARSE_MAIN_SIZE;
+                assert!(!captures[row]);
+                captures[row] = true;
+            }
+        }
         for piece in 0..7 {
             let Some(pair) = super::policy_move_piece_index(mv, piece) else {
                 continue;
@@ -372,7 +381,10 @@ fn compact_policy_rows_are_unique_and_cover_both_tables() {
             counts[piece] += 1;
             for us in 0..9 {
                 for them in 0..9 {
-                    let row = super::policy_sparse_main_index(mv, piece, us, them);
+                    let Some(row) = super::policy_main_compact_index(mv, piece, us, them) else {
+                        continue;
+                    };
+                    assert_eq!(super::policy_sparse_main_index(mv, piece, us, them), row);
                     assert!(!sparse[row]);
                     sparse[row] = true;
                 }
@@ -380,7 +392,6 @@ fn compact_policy_rows_are_unique_and_cover_both_tables() {
             for signature in 0..64 {
                 let Some(expected) = super::policy_tactical_exact_index(mv, piece, signature)
                 else {
-                    assert!((piece != 5 || signature & 16 != 0) && signature & 8 == 0);
                     continue;
                 };
                 let row = policy_tactical_indices(
@@ -403,6 +414,55 @@ fn compact_policy_rows_are_unique_and_cover_both_tables() {
     assert!(pairs.into_iter().all(|used| used));
     assert!(sparse.into_iter().all(|used| used));
     assert!(tactical.into_iter().all(|used| used));
+    assert!(captures.into_iter().all(|used| used));
+}
+
+#[test]
+fn compact_policy_preserves_legal_candidates_and_check_signatures() {
+    let mut rng = SplitMix64::new(20261028);
+    let mut checked = 0;
+    for _ in 0..8 {
+        let mut position = Position::startpos();
+        for _ in 0..200 {
+            let moves = position.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            let side = position.side_to_move();
+            let kings = super::canonical_buckets_for_perspective(&position, side);
+            let masks = position.attacked_squares_masks();
+            for &mv in &moves {
+                let dense = dense_move_index(canonical_move(side, mv));
+                let (piece, victim) = policy_move_pieces(&position, side, mv).unwrap();
+                assert!(
+                    super::policy_main_compact_index(dense, piece, kings.0, kings.1).is_some(),
+                    "{} {mv:?}",
+                    position.to_fen()
+                );
+                assert!(super::policy_capture_compact_index(dense, victim).is_some());
+                let (sa, da, sd, dd) = policy_move_tactical_flags(
+                    mv,
+                    masks[color_index(side.opposite())],
+                    masks[color_index(side)],
+                );
+                let indices = policy_tactical_indices(
+                    dense,
+                    piece,
+                    sa,
+                    da,
+                    sd,
+                    dd,
+                    victim,
+                    position.gives_check_after_move_fast(mv),
+                );
+                assert!(indices[0] < super::POLICY_TACTICAL_EXACT_SIZE);
+                assert!(indices[1] <= POLICY_TACTICAL_SIZE);
+                checked += 1;
+            }
+            position.make_move(moves[rng.next_u64() as usize % moves.len()]);
+        }
+    }
+    assert!(checked > 20_000);
 }
 
 #[test]
@@ -1499,7 +1559,9 @@ fn model_rejects_old_format_and_missing_tensors() {
     model.save(&path).unwrap();
     let tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu).unwrap();
     assert_eq!(tensors["input_hidden"].dims(), &[692, 16]);
-    assert_eq!(tensors["policy_tactical"].elem_count(), 144_896);
+    assert_eq!(tensors["policy_tactical"].elem_count(), 120_704);
+    assert_eq!(tensors["policy_sparse_table"].elem_count(), 289_403);
+    assert_eq!(tensors["value_threat_embedding"].dims(), &[50_251, 64]);
     assert!(!tensors.contains_key("policy_move_bias"));
     for name in [
         "check_context_hidden",

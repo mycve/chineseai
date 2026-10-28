@@ -116,12 +116,18 @@ pub(crate) fn visit_value_king_piece_features(
     value_material_bucket_counts(rooks, minors)
 }
 
-pub(crate) fn threat_relation_map() -> &'static [u16] {
+struct ThreatRelationMap {
+    bases: Vec<u16>,
+    compact: Vec<u16>,
+}
+
+fn threat_relation_map() -> &'static ThreatRelationMap {
     use std::sync::OnceLock;
-    static MAP: OnceLock<Vec<u16>> = OnceLock::new();
+    static MAP: OnceLock<ThreatRelationMap> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut map = vec![u16::MAX; STRUCTURAL_PIECE_SIZE * BOARD_SIZE * BOARD_SIZE];
         let mut next = 0u16;
+        let mut keys = Vec::new();
         for attacker in 0..STRUCTURAL_PIECE_SIZE {
             let ours = attacker < 7;
             let kind = attacker % 7;
@@ -188,14 +194,45 @@ pub(crate) fn threat_relation_map() -> &'static [u16] {
                 for target in targets {
                     let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
                     map[relation] = next;
-                    next += (0..STRUCTURAL_PIECE_SIZE)
-                        .filter(|&piece| canonical_piece_square_reachable(piece, target))
-                        .count() as u16;
+                    for victim in 0..STRUCTURAL_PIECE_SIZE {
+                        if canonical_piece_square_reachable(victim, target) {
+                            keys.push((attacker, source, target, victim));
+                            next += 1;
+                        }
+                    }
                 }
             }
         }
-        assert_eq!(next as usize, VALUE_THREAT_PAIR_VOCAB);
-        map
+        let mut compact = vec![u16::MAX; keys.len()];
+        let mut count = 0;
+        for (raw, &(attacker, source, target, victim)) in keys.iter().enumerate() {
+            // 同色同将配对需要两个己方将，不可能出现在标准棋局中。
+            if attacker == victim && attacker % 7 == 0 {
+                continue;
+            }
+            // 马的往返腿格不同，不能共享；其他互反关系的阻挡条件相同。
+            let reverse_base = map[(victim * BOARD_SIZE + target) * BOARD_SIZE + source];
+            let reverse_offset =
+                threat_attacked_offsets()[source * STRUCTURAL_PIECE_SIZE + attacker];
+            let reverse = usize::from(reverse_base) + usize::from(reverse_offset);
+            compact[raw] = if attacker % 7 != 3
+                && victim % 7 != 3
+                && reverse_base != u16::MAX
+                && reverse_offset != u8::MAX
+                && reverse < raw
+            {
+                compact[reverse]
+            } else {
+                let index = count;
+                count += 1;
+                index
+            };
+        }
+        assert_eq!(count as usize, VALUE_THREAT_PAIR_VOCAB);
+        ThreatRelationMap {
+            bases: map,
+            compact,
+        }
     })
 }
 
@@ -232,7 +269,8 @@ pub(crate) fn value_threat_index(
     let source = canonical_square_for(perspective, source);
     let target = canonical_square_for(perspective, target);
     let relation = (attacker * BOARD_SIZE + source) * BOARD_SIZE + target;
-    let base = threat_relation_map()[relation];
+    let map = threat_relation_map();
+    let base = map.bases[relation];
     if base == u16::MAX {
         return VALUE_THREAT_PAIR_VOCAB;
     }
@@ -240,7 +278,12 @@ pub(crate) fn value_threat_index(
     if offset == u8::MAX {
         return VALUE_THREAT_PAIR_VOCAB;
     }
-    base as usize + usize::from(offset)
+    let compact = map.compact[base as usize + usize::from(offset)];
+    if compact == u16::MAX {
+        VALUE_THREAT_PAIR_VOCAB
+    } else {
+        usize::from(compact)
+    }
 }
 
 pub(crate) fn visit_value_threat_features(
@@ -416,27 +459,17 @@ pub(crate) fn policy_sparse_main_index(
 ) -> usize {
     debug_assert!(move_index < DENSE_MOVE_SPACE && moved_piece < POLICY_PIECE_SIZE);
     debug_assert!(us_king_bucket < V2_KING_BUCKETS && them_king_bucket < V2_KING_BUCKETS);
-    ((policy_move_piece_index(move_index, moved_piece).expect("策略表不支持该走法与棋种组合")
-        * V2_KING_BUCKETS
-        + us_king_bucket)
-        * V2_KING_BUCKETS)
-        + them_king_bucket
+    policy_main_compact_index(move_index, moved_piece, us_king_bucket, them_king_bucket)
+        .expect("策略表不支持该走法、棋种与双将位组合")
 }
 
 #[inline]
-pub(crate) const fn policy_sparse_capture_index(
+pub(crate) fn policy_sparse_capture_index(
     move_index: usize,
     captured_piece: Option<usize>,
 ) -> usize {
-    POLICY_SPARSE_MAIN_SIZE
-        + move_index * POLICY_CAPTURE_CLASSES
-        + match captured_piece {
-            Some(piece) => {
-                debug_assert!(piece >= POLICY_PIECE_SIZE && piece < STRUCTURAL_PIECE_SIZE);
-                piece - POLICY_PIECE_SIZE
-            }
-            None => POLICY_PIECE_SIZE,
-        }
+    policy_capture_compact_index(move_index, captured_piece)
+        .expect("吃子表不支持该走法与被吃棋种组合")
 }
 
 #[inline]
@@ -462,12 +495,8 @@ pub(crate) fn policy_tactical_indices(
     let exact = policy_tactical_exact_index(move_index, moved_piece, signature)
         .expect("战术签名不满足走前攻击位板约束");
     let relation = captured_piece.map_or(POLICY_TACTICAL_SIZE, |victim| {
-        debug_assert!((8..14).contains(&victim));
-        // 合法吃子不含将，吃子位和目标格己方控制位恒为1。
-        let state = (signature & 7) | ((signature >> 5) << 3);
-        POLICY_CAPTURE_RELATION_OFFSET
-            + (moved_piece * 6 + victim - 8) * POLICY_CAPTURE_RELATION_BUCKETS
-            + state
+        policy_capture_relation_index(moved_piece, victim, signature)
+            .expect("吃子关系表不支持该棋种配对")
     });
     [exact, relation]
 }
@@ -2016,5 +2045,134 @@ pub(crate) fn normalize_wdl_target(mut wdl: [f32; WDL_HEAD_SIZE]) -> [f32; WDL_H
         wdl
     } else {
         [0.0, 1.0, 0.0]
+    }
+}
+
+#[cfg(test)]
+mod pair_compaction_tests {
+    use super::*;
+
+    #[test]
+    fn pair_rows_only_share_strict_reciprocals_and_exclude_duplicate_generals() {
+        let map = threat_relation_map();
+        let mut keys = vec![Vec::new(); VALUE_THREAT_PAIR_VOCAB];
+        let mut dead = 0;
+        for attacker in 0..14 {
+            for source in 0..BOARD_SIZE {
+                for target in 0..BOARD_SIZE {
+                    let base = map.bases[(attacker * BOARD_SIZE + source) * BOARD_SIZE + target];
+                    if base == u16::MAX {
+                        continue;
+                    }
+                    for victim in 0..14 {
+                        let offset = threat_attacked_offsets()[target * 14 + victim];
+                        if offset == u8::MAX {
+                            continue;
+                        }
+                        let index = map.compact[usize::from(base) + usize::from(offset)];
+                        if index == u16::MAX {
+                            assert_eq!(attacker, victim);
+                            assert_eq!(attacker % 7, 0);
+                            dead += 1;
+                        } else {
+                            keys[index as usize].push((attacker, source, target, victim));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(dead, 48);
+        let mut shared = 0;
+        for group in keys {
+            match group.as_slice() {
+                [_] => {}
+                &[(a, s, t, v), (b, u, w, p)] => {
+                    assert_eq!((a, s, t, v), (p, w, u, b));
+                    assert_ne!(a % 7, 3);
+                    assert_ne!(v % 7, 3);
+                    shared += 1;
+                }
+                _ => panic!("配对表有空行或非互反别名: {group:?}"),
+            }
+        }
+        assert_eq!(shared, 155);
+    }
+
+    #[test]
+    fn shared_pairs_preserve_pool_sum_multiplicity_and_source_tags() {
+        let map = threat_relation_map();
+        // 合成未共享表，再取各共享组的平均。仅用于检验代数等价，不涉及权重文件。
+        let original: Vec<_> = (0..map.compact.len())
+            .map(|i| (i % 41) as f64 - 20.0)
+            .collect();
+        let mut merged = vec![(0.0, 0); VALUE_THREAT_PAIR_VOCAB];
+        for (&weight, &row) in original.iter().zip(&map.compact) {
+            if row != u16::MAX {
+                merged[row as usize].0 += weight;
+                merged[row as usize].1 += 1;
+            }
+        }
+        let weights: Vec<_> = merged
+            .iter()
+            .map(|&(sum, count)| sum / f64::from(count))
+            .collect();
+        let mut rng = SplitMix64::new(20261028);
+        let mut duplicated = 0;
+        let horse =
+            Position::from_fen("2baka3/4n4/4b4/p2np3p/6P2/2B6/2r1P3P/C3BA3/4N4/4KAR2 w - - 0 1")
+                .unwrap();
+        for mut position in [Position::startpos(), horse] {
+            for _ in 0..200 {
+                for side in [Color::Red, Color::Black] {
+                    let mut expected = Vec::new();
+                    let mut sum = 0.0;
+                    position.visit_occupied_leaper_relations_from(
+                        u128::MAX,
+                        |source, attacker, target, victim| {
+                            let a = piece_absolute_feature_index(side, attacker);
+                            let v = piece_absolute_feature_index(side, victim);
+                            let s = canonical_square_for(side, source);
+                            let t = canonical_square_for(side, target);
+                            let base = map.bases[(a * BOARD_SIZE + s) * BOARD_SIZE + t];
+                            assert_ne!(base, u16::MAX);
+                            let raw = usize::from(base)
+                                + usize::from(threat_attacked_offsets()[t * 14 + v]);
+                            let row = map.compact[raw];
+                            assert_ne!(row, u16::MAX);
+                            expected.push(((source as u32) << 16) | u32::from(row));
+                            sum += original[raw];
+                        },
+                    );
+                    let mut actual = Vec::new();
+                    visit_value_threat_entries_from(&position, side, u128::MAX, |entry| {
+                        if (entry as u16 as usize) < VALUE_THREAT_PAIR_VOCAB {
+                            actual.push(entry);
+                        }
+                    });
+                    assert_eq!(actual, expected);
+                    let mut count = vec![0; VALUE_THREAT_PAIR_VOCAB];
+                    let mut compact_sum = 0.0;
+                    for entry in &actual {
+                        let row = *entry as u16 as usize;
+                        count[row] += 1;
+                        compact_sum += weights[row];
+                    }
+                    for (row, &(.., group_size)) in merged.iter().enumerate() {
+                        if group_size == 2 {
+                            assert!(count[row] == 0 || count[row] == 2);
+                            duplicated += usize::from(count[row] == 2);
+                        }
+                    }
+                    // 和与数量都相同，因此 /sqrt(N) 及后续平方特征也相同。
+                    assert_eq!(compact_sum, sum, "{} {side:?}", position.to_fen());
+                }
+                let moves = position.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                position.make_move(moves[rng.next_u64() as usize % moves.len()]);
+            }
+        }
+        assert!(duplicated > 100);
     }
 }

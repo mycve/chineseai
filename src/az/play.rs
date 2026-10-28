@@ -1657,9 +1657,11 @@ mod tests {
         let mate_index = dense_move_index(canonical_move(position.side_to_move(), mate));
         let end = model.policy_sparse_table.len() - 1;
         model.policy_sparse_table[crate::az::POLICY_SPARSE_MAIN_SIZE..end].fill(-100.0);
-        let start =
-            crate::az::POLICY_SPARSE_MAIN_SIZE + mate_index * crate::az::POLICY_CAPTURE_CLASSES;
-        model.policy_sparse_table[start..start + crate::az::POLICY_CAPTURE_CLASSES].fill(100.0);
+        for victim in (7..14).map(Some).chain([None]) {
+            if let Some(row) = crate::az::policy_capture_compact_index(mate_index, victim) {
+                model.policy_sparse_table[row] = 100.0;
+            }
+        }
         let mut config = selfplay_test_config(1);
         config.max_plies = 1;
         config.simulations = 2;
