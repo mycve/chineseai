@@ -1,12 +1,11 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 
-use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE, az_weight_tensors};
+use super::arch::{POSITION_CONTEXT_SIZE, az_weight_tensors};
 use super::{
     AzNnue, AzNnueArch, DENSE_MOVE_SPACE, POLICY_ACCUMULATOR_RANK, POLICY_MOVE_CONTEXT_SIZE,
     POLICY_SPARSE_TABLE_SIZE, POLICY_SPARSE_TERMS, POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS,
-    POLICY_THREAT_CONTEXT_SIZE, RULE_CONTEXT_SIZE, VALUE_BUCKETS, VALUE_HEAD_SIZE,
-    VALUE_KING_PIECE_RANK, VALUE_KING_PIECE_VOCAB, VALUE_THREAT_RANK, VALUE_THREAT_VOCAB,
-    WDL_HEAD_SIZE,
+    POLICY_THREAT_CONTEXT_SIZE, VALUE_BUCKETS, VALUE_HEAD_SIZE, VALUE_KING_PIECE_RANK,
+    VALUE_KING_PIECE_VOCAB, VALUE_THREAT_RANK, VALUE_THREAT_VOCAB, WDL_HEAD_SIZE,
     dataloader::PackedBatch,
     fused_policy::fused_policy,
     fused_sparse_policy::sparse_policy,
@@ -20,8 +19,7 @@ const RMS_NORM_EPS: f64 = 1.0e-6;
 pub(super) struct AzCandleModel {
     arch: AzNnueArch,
     input_hidden: Var,
-    rule_context_hidden: Var,
-    check_context_hidden: Var,
+    context_hidden: Var,
     hidden_bias: Var,
     shared_hidden: Var,
     shared_bias: Var,
@@ -30,10 +28,9 @@ pub(super) struct AzCandleModel {
     value_king_piece_hidden: Var,
     value_king_piece_projection: Var,
     value_head_output: Var,
-    value_history_output: Var,
     moves_left_output: Var,
     moves_left_bias: Var,
-    value_threat_embedding: Var,
+    threat_embedding: Var,
     value_threat_output: Var,
     policy_threat_context: Var,
     policy_context_hidden: Var,
@@ -46,20 +43,38 @@ pub(super) struct AzCandleModel {
     policy_repetition_bias: Var,
 }
 
+/// 两个输出头消费同一份局面编码，策略头自行投影线性棋子表示。
+struct SharedEncoding {
+    hidden: Tensor,
+    board: Tensor,
+    threat: Tensor,
+}
+
 impl AzCandleModel {
     pub(super) fn forward(&self, batch: &BatchTensors) -> CandleResult<ForwardOutput> {
+        let encoded = self.encode_shared(batch)?;
+        let value_logits = self.value_head(batch, &encoded)?;
+        let policy_logits = self.policy_head(batch, &encoded)?;
+        let moves_left = encoded
+            .hidden
+            .matmul(&self.moves_left_output.t()?)?
+            .broadcast_add(&self.moves_left_bias)?
+            .affine(1.0, 1.0)?
+            .relu()?;
+        Ok(ForwardOutput {
+            moves_left,
+            value_logits,
+            policy_logits,
+        })
+    }
+
+    fn encode_shared(&self, batch: &BatchTensors) -> CandleResult<SharedEncoding> {
         let hidden_size = self.arch.hidden_size;
         let board_pre = sparse_pool(self.input_hidden.as_tensor(), &batch.feature_items)?
             .broadcast_add(&self.hidden_bias)?
             .reshape((batch.batch_size, 2 * hidden_size))?;
-        let accumulator_context = board_pre
-            .narrow(1, 0, hidden_size)?
-            .contiguous()?
-            .matmul(&self.policy_accumulator_hidden.t()?)?;
-        let rule_pre = batch.rule_context.matmul(&self.rule_context_hidden)?;
-        let check_pre = batch.check_context.matmul(&self.check_context_hidden)?;
-        let sparse_pre = ((board_pre + rule_pre)? + check_pre)?;
-        let sparse_hidden = sparse_pre.relu()?;
+        let board = board_pre.narrow(1, 0, hidden_size)?.contiguous()?;
+        let sparse_hidden = (board_pre + batch.context.matmul(&self.context_hidden)?)?.relu()?;
         let rms = sparse_hidden
             .sqr()?
             .mean_keepdim(1)?
@@ -70,41 +85,47 @@ impl AzCandleModel {
             .matmul(&self.shared_hidden.t()?)?
             .broadcast_add(&self.shared_bias)?
             .relu()?;
-        let value_king_piece = sparse_pool(
+        let threat = sparse_pool(
+            self.threat_embedding.as_tensor(),
+            &batch.value_threat_indices,
+        )?
+        .broadcast_mul(&batch.value_threat_scales)?;
+        let threat = Tensor::cat(&[&threat, &threat.sqr()?], 1)?;
+        Ok(SharedEncoding {
+            hidden,
+            board,
+            threat,
+        })
+    }
+
+    fn value_head(&self, batch: &BatchTensors, encoded: &SharedEncoding) -> CandleResult<Tensor> {
+        let king_piece = sparse_pool(
             self.value_king_piece_hidden.as_tensor(),
             &batch.value_king_piece_indices,
         )?
         .matmul(self.value_king_piece_projection.as_tensor())?
         .broadcast_mul(&batch.value_king_piece_scales)?;
-        let value_head = hidden
+        let value = encoded
+            .hidden
             .matmul(&self.value_head_hidden.t()?)?
             .broadcast_add(&self.value_head_bias)?
-            .add(&value_king_piece)?
+            .add(&king_piece)?
             .relu()?;
-        let selected_value = self
+        let selected = self
             .value_head_output
             .reshape((VALUE_BUCKETS, WDL_HEAD_SIZE * VALUE_HEAD_SIZE))?
             .index_select(&batch.value_buckets, 0)?
             .reshape((batch.batch_size, WDL_HEAD_SIZE, VALUE_HEAD_SIZE))?;
-        let value_logits = selected_value
-            .matmul(&value_head.unsqueeze(2)?)?
-            .squeeze(2)?;
-        let threat_accumulator = sparse_pool(
-            self.value_threat_embedding.as_tensor(),
-            &batch.value_threat_indices,
-        )?
-        .broadcast_mul(&batch.value_threat_scales)?;
-        let threat_activation = threat_accumulator;
-        let threat_pair = Tensor::cat(&[&threat_activation, &threat_activation.sqr()?], 1)?;
-        let value_logits = ((value_logits
-            + threat_pair.matmul(&self.value_threat_output.t()?)?)?
-            + batch
-                .history_features
-                .matmul(&self.value_history_output.t()?)?)?;
-        let policy_context = (hidden.matmul(&self.policy_context_hidden.t()?)?
-            + threat_pair.matmul(&self.policy_threat_context.t()?)?)?;
-        let policy_context = Tensor::cat(&[&policy_context, &accumulator_context], 1)?;
-        let move_context = Tensor::cat(
+        let logits = selected.matmul(&value.unsqueeze(2)?)?.squeeze(2)?;
+        logits + encoded.threat.matmul(&self.value_threat_output.t()?)?
+    }
+
+    fn policy_head(&self, batch: &BatchTensors, encoded: &SharedEncoding) -> CandleResult<Tensor> {
+        let context = (encoded.hidden.matmul(&self.policy_context_hidden.t()?)?
+            + encoded.threat.matmul(&self.policy_threat_context.t()?)?)?;
+        let linear = encoded.board.matmul(&self.policy_accumulator_hidden.t()?)?;
+        let context = Tensor::cat(&[&context, &linear], 1)?;
+        let moves = Tensor::cat(
             &[
                 self.policy_move_context.as_tensor(),
                 self.policy_accumulator_move.as_tensor(),
@@ -112,8 +133,23 @@ impl AzCandleModel {
             1,
         )?
         .flatten_all()?;
-        let policy_logits = fused_policy(&move_context, &policy_context, &batch.policy_items)?;
-        let sparse_logits = sparse_policy(
+        let dynamic = fused_policy(&moves, &context, &batch.policy_items)?;
+        let repetition = encoded
+            .hidden
+            .matmul(
+                &self
+                    .policy_repetition_hidden
+                    .as_tensor()
+                    .reshape((self.arch.hidden_size, 1))?,
+            )?
+            .broadcast_add(&self.policy_repetition_bias)?;
+        (dynamic + self.policy_prior(batch)?)?
+            + batch.policy_repetition.broadcast_mul(&repetition)?
+    }
+
+    /// 几何、将位、吃子和战术表共同组成候选走法先验。
+    fn policy_prior(&self, batch: &BatchTensors) -> CandleResult<Tensor> {
+        let sparse = sparse_policy(
             self.policy_sparse_table.as_tensor(),
             &batch.policy_sparse_indices,
         )?;
@@ -124,29 +160,7 @@ impl AzCandleModel {
             ],
             0,
         )?;
-        let tactical_logits = sparse_policy(&tactical_table, &batch.policy_tactical_indices)?;
-        let repetition_logit = hidden
-            .matmul(
-                &self
-                    .policy_repetition_hidden
-                    .as_tensor()
-                    .reshape((hidden_size, 1))?,
-            )?
-            .broadcast_add(&self.policy_repetition_bias)?;
-        let repetition_logits = batch.policy_repetition.broadcast_mul(&repetition_logit)?;
-        let policy_logits =
-            ((policy_logits + sparse_logits + tactical_logits)? + repetition_logits)?;
-
-        let moves_left = hidden
-            .matmul(&self.moves_left_output.t()?)?
-            .broadcast_add(&self.moves_left_bias)?
-            .affine(1.0, 1.0)?
-            .relu()?;
-        Ok(ForwardOutput {
-            moves_left,
-            value_logits,
-            policy_logits,
-        })
+        sparse + sparse_policy(&tactical_table, &batch.policy_tactical_indices)?
     }
 }
 
@@ -173,9 +187,7 @@ pub(super) struct BatchTensors {
     pub(super) policy_repetition: Tensor,
     pub(super) value_wdl: Tensor,
     pub(super) values: Tensor,
-    pub(super) rule_context: Tensor,
-    pub(super) history_features: Tensor,
-    pub(super) check_context: Tensor,
+    pub(super) context: Tensor,
     pub(super) policy_weights: Tensor,
     pub(super) value_weights: Tensor,
     pub(super) moves_left_targets: Tensor,
@@ -264,22 +276,8 @@ impl BatchTensors {
             )?,
             value_wdl: Tensor::from_vec(packed.value_wdl, (batch_size, WDL_HEAD_SIZE), device)?,
             values: Tensor::from_vec(packed.values, batch_size, device)?,
-            rule_context: Tensor::from_vec(
-                packed.rule_context,
-                (batch_size, RULE_CONTEXT_SIZE),
-                device,
-            )?,
-            history_features: Tensor::from_vec(
-                packed.history_features,
-                (batch_size, HISTORY_CONTEXT_SIZE),
-                device,
-            )?,
+            context: Tensor::from_vec(packed.context, (batch_size, POSITION_CONTEXT_SIZE), device)?,
             policy_weights: Tensor::from_vec(packed.policy_weights, batch_size, device)?,
-            check_context: Tensor::from_vec(
-                packed.check_context,
-                (batch_size, CHECK_CONTEXT_SIZE),
-                device,
-            )?,
             value_weights: Tensor::from_vec(packed.value_weights, batch_size, device)?,
             moves_left_targets: Tensor::from_vec(packed.moves_left_targets, batch_size, device)?,
             moves_left_weights: Tensor::from_vec(packed.moves_left_weights, batch_size, device)?,
@@ -304,19 +302,14 @@ impl AzCandleModel {
                 (AZ_NNUE_INPUT_SIZE, hidden),
                 device,
             )?,
-            rule_context_hidden: var_from_slice(
-                &model.rule_context_hidden,
-                (RULE_CONTEXT_SIZE, 2 * hidden),
+            context_hidden: var_from_slice(
+                &model.context_hidden,
+                (POSITION_CONTEXT_SIZE, 2 * hidden),
                 device,
             )?,
             hidden_bias: var_from_slice(&model.hidden_bias, hidden, device)?,
             shared_hidden: var_from_slice(&model.shared_hidden, (hidden, 2 * hidden), device)?,
             shared_bias: var_from_slice(&model.shared_bias, hidden, device)?,
-            check_context_hidden: var_from_slice(
-                &model.check_context_hidden,
-                (CHECK_CONTEXT_SIZE, 2 * hidden),
-                device,
-            )?,
             value_head_hidden: var_from_slice(
                 &model.value_head_hidden,
                 (VALUE_HEAD_SIZE, hidden),
@@ -338,15 +331,10 @@ impl AzCandleModel {
                 (VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
-            value_history_output: var_from_slice(
-                &model.value_history_output,
-                (WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE),
-                device,
-            )?,
             moves_left_output: var_from_slice(&model.moves_left_output, (1, hidden), device)?,
             moves_left_bias: var_from_slice(&model.moves_left_bias, 1, device)?,
-            value_threat_embedding: var_from_slice(
-                &model.value_threat_embedding,
+            threat_embedding: var_from_slice(
+                &model.threat_embedding,
                 (VALUE_THREAT_VOCAB, VALUE_THREAT_RANK),
                 device,
             )?,
@@ -422,9 +410,8 @@ impl AzCandleModel {
         }
         az_weight_tensors!(copy, self.arch.hidden_size);
         model.rebuild_moves_left();
-        model.rebuild_value_threat();
-        model.rebuild_value_history();
-        model.rebuild_check_context();
+        model.rebuild_threat();
+        model.rebuild_context();
         model.rebuild_policy_tactical();
         model.rebuild_policy_cache();
         Ok(())
@@ -604,16 +591,13 @@ mod tests {
         assert!(cpu.iter().zip(&wdl[0]).all(|(&x, &y)| (x - y).abs() < 2e-5));
     }
 
-    #[test]
-    fn history_head_trains_and_matches_cpu_after_two_moves() {
+    fn history_context_training_matches(device: &Device) {
         let mut position = Position::startpos();
-        let mut history = Vec::new();
+        let mut history = position.initial_rule_history();
         for _ in 0..2 {
             let mv = position.legal_moves()[0];
-            let mover = position.side_to_move();
-            let captured = position.piece_at(mv.to as usize);
+            history.push(position.rule_history_entry_after_move(mv));
             position.make_move(mv);
-            history.push(position.rule_history_entry_after_moved(mover, mv, captured));
         }
         let moves = position.legal_moves();
         let sample = AzTrainingSample {
@@ -636,20 +620,27 @@ mod tests {
         };
         assert!(sample.history_features[48..].iter().any(|x| *x != 0.0));
         let mut model = AzNnue::random(16, 7);
-        let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
+        model.value_head_bias.fill(1.0);
+        for (i, w) in model.value_head_output.iter_mut().enumerate() {
+            *w = (i % 17) as f32 * 0.005 - 0.04;
+        }
+        for (i, w) in model.policy_move_context.iter_mut().enumerate() {
+            *w = (i % 23) as f32 * 0.003 - 0.03;
+        }
+        let candle = AzCandleModel::from_model(&model, device).unwrap();
         let (vars, decay) = candle.all_vars_with_decay();
-        let history_index = vars
+        let context_index = vars
             .iter()
-            .position(|var| var.id() == candle.value_history_output.id())
+            .position(|var| var.id() == candle.context_hidden.id())
             .unwrap();
-        assert!(decay[history_index]);
+        assert!(decay[context_index]);
         let batch = BatchTensors::from_packed(
             PackedBatch::from_indices(std::slice::from_ref(&sample), &[0]),
-            &Device::Cpu,
+            device,
         )
         .unwrap();
         let output = candle.forward(&batch).unwrap();
-        let loss = candle_nn::ops::log_softmax(&output.value_logits, 1)
+        let value_loss = candle_nn::ops::log_softmax(&output.value_logits, 1)
             .unwrap()
             .mul(&batch.value_wdl)
             .unwrap()
@@ -657,35 +648,59 @@ mod tests {
             .unwrap()
             .neg()
             .unwrap();
-        let gradients = loss.backward().unwrap();
-        let gradient = gradients
-            .get(&candle.value_history_output)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(gradient.iter().all(|x| x.is_finite()));
-        assert!(gradient.iter().any(|x| x.abs() > 1e-8));
-        let mut optimizer = crate::az::adamw::AzAdamW::new(
-            vec![candle.value_history_output.clone()],
-            vec![true],
-            0.001,
-        )
-        .unwrap();
-        optimizer.step(&gradients).unwrap();
+        let policy_loss = output.policy_logits.sqr().unwrap().sum_all().unwrap();
+        let value_grads = value_loss.backward().unwrap();
+        let policy_grads = policy_loss.backward().unwrap();
+        let past_offset = (crate::az::HISTORY_CONTEXT_OFFSET + 48) * 2 * model.hidden_size;
+        for grads in [&value_grads, &policy_grads] {
+            let gradient = grads
+                .get(&candle.context_hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(gradient.iter().all(|x| x.is_finite()));
+            assert!(gradient[past_offset..].iter().any(|x| x.abs() > 1e-8));
+        }
+        let mut optimizer =
+            crate::az::adamw::AzAdamW::new(vec![candle.context_hidden.clone()], vec![true], 0.001)
+                .unwrap();
+        optimizer.step(&value_grads).unwrap();
         candle.copy_to_model(&mut model).unwrap();
-        let candle_wdl = candle_nn::ops::softmax(&candle.forward(&batch).unwrap().value_logits, 1)
+        let forward = candle.forward(&batch).unwrap();
+        let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
             .unwrap()
             .to_vec2::<f32>()
             .unwrap();
-        let (cpu_wdl, _) = crate::az::outputs_for_training_sample(&model, &sample).unwrap();
+        let logits = forward.policy_logits.to_vec2::<f32>().unwrap();
+        let (cpu_wdl, cpu_logits) =
+            crate::az::outputs_for_training_sample(&model, &sample).unwrap();
         assert!(
             cpu_wdl
                 .iter()
-                .zip(&candle_wdl[0])
+                .zip(&wdl[0])
                 .all(|(a, b)| (a - b).abs() < 1e-5)
         );
+        assert!(
+            cpu_logits
+                .iter()
+                .zip(&logits[0])
+                .all(|(a, b)| (a - b).abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn history_context_training_matches_cpu() {
+        history_context_training_matches(&Device::Cpu);
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn history_context_training_matches_cuda() {
+        let device =
+            crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required");
+        history_context_training_matches(device);
     }
 
     fn assert_shared_gradients(
@@ -825,10 +840,10 @@ mod tests {
         for (index, weight) in model.value_head_output.iter_mut().enumerate() {
             *weight = (index % 11) as f32 * 0.003 - 0.015;
         }
-        for (index, weight) in model.check_context_hidden.iter_mut().enumerate() {
+        for (index, weight) in model.context_hidden.iter_mut().enumerate() {
             *weight = (index % 17) as f32 * 0.01 - 0.08;
         }
-        model.rebuild_check_context();
+        model.rebuild_context();
         model.value_head_bias.fill(1.0);
         for (index, weight) in model.policy_threat_context.iter_mut().enumerate() {
             *weight = (index % 13) as f32 * 0.0001 - 0.0005;
@@ -852,7 +867,7 @@ mod tests {
         model.rebuild_policy_cache();
         model.rebuild_policy_tactical();
         model.rebuild_moves_left();
-        model.rebuild_value_threat();
+        model.rebuild_threat();
 
         let mut cpu = AzEvalScratch::new(model.arch);
         let mut repetition_flags = vec![0; moves.len()];
@@ -911,7 +926,7 @@ mod tests {
             .unwrap();
         assert!(king_gradient.iter().any(|&gradient| gradient != 0.0));
         let threat_gradient = gradients
-            .get(&candle.value_threat_embedding)
+            .get(&candle.threat_embedding)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -1008,8 +1023,8 @@ mod tests {
     #[test]
     fn gpu_and_cpu_weight_tensors_roundtrip() {
         let mut model = AzNnue::random(16, 12345);
-        model.check_context_hidden.fill(0.125);
-        model.rebuild_check_context();
+        model.context_hidden.fill(0.125);
+        model.rebuild_context();
         let candle = AzCandleModel::from_model(&model, &Device::Cpu).unwrap();
         let mut back = AzNnue::random_with_arch(model.arch, 54321);
         candle.copy_to_model(&mut back).unwrap();
@@ -1027,8 +1042,7 @@ mod tests {
         }
         assert_weight_parity!(
             input_hidden,
-            rule_context_hidden,
-            check_context_hidden,
+            context_hidden,
             hidden_bias,
             shared_hidden,
             shared_bias,
@@ -1037,7 +1051,6 @@ mod tests {
             value_king_piece_hidden,
             value_king_piece_projection,
             value_head_output,
-            value_history_output,
             policy_threat_context,
             policy_context_hidden,
             policy_move_context,
@@ -1046,10 +1059,10 @@ mod tests {
             policy_sparse_table,
             policy_tactical,
         );
-        assert!(back.check_context_active);
+        assert!(back.context_active);
     }
 
-    fn check_context_training_matches_inference(device: &Device) {
+    fn position_context_training_matches_inference(device: &Device) {
         use crate::az::{adamw::AzAdamW, nnue::canonical_move};
 
         let positions = [
@@ -1101,14 +1114,15 @@ mod tests {
                 .iter()
                 .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
                 .collect::<Vec<_>>();
-            let context = crate::az::inference::check_context_features(
+            let context = crate::az::context::check_context_features(
                 position,
                 &moves,
                 &checks,
                 position.attacked_squares_masks(),
             );
             assert_eq!(
-                &packed.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE],
+                &packed.context[row * POSITION_CONTEXT_SIZE + crate::az::CHECK_CONTEXT_OFFSET
+                    ..row * POSITION_CONTEXT_SIZE + crate::az::HISTORY_CONTEXT_OFFSET],
                 &context
             );
         }
@@ -1139,7 +1153,7 @@ mod tests {
         let gradients = loss.backward().unwrap();
         assert_shared_gradients(&candle, &gradients);
         let gradient = gradients
-            .get(&candle.check_context_hidden)
+            .get(&candle.context_hidden)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -1151,8 +1165,8 @@ mod tests {
         let mut optimizer = AzAdamW::new(vars, decay, 4e-4).unwrap();
         optimizer.step(&gradients).unwrap();
         candle.copy_to_model(&mut model).unwrap();
-        assert!(model.check_context_hidden.iter().any(|&w| w != 0.0));
-        assert!(model.check_context_active);
+        assert!(model.context_hidden.iter().any(|&w| w != 0.0));
+        assert!(model.context_active);
         let forward = candle.forward(&batch).unwrap();
         let wdl = candle_nn::ops::softmax(&forward.value_logits, 1)
             .unwrap()
@@ -1189,15 +1203,15 @@ mod tests {
     }
 
     #[test]
-    fn check_context_training_updates_zero_weights_and_matches_cpu() {
-        check_context_training_matches_inference(&Device::Cpu);
+    fn position_context_training_updates_zero_weights_and_matches_cpu() {
+        position_context_training_matches_inference(&Device::Cpu);
     }
 
     #[cfg(feature = "slow-tests")]
     #[test]
-    fn check_context_training_updates_zero_weights_and_matches_cuda() {
+    fn position_context_training_updates_zero_weights_and_matches_cuda() {
         let device =
             crate::az::cuda_test_device::shared_cuda_device().expect("CUDA device required");
-        check_context_training_matches_inference(device);
+        position_context_training_matches_inference(device);
     }
 }

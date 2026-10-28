@@ -143,9 +143,17 @@ mod tests {
         let mut model = AzNnue::random(8, 31);
         model.mate_search_plies = 9;
         for i in 48..96 {
-            model.value_history_output[i] = 0.7;
+            model.context_hidden[(crate::az::HISTORY_CONTEXT_OFFSET + i) * 2 * model.hidden_size] =
+                0.7;
         }
-        model.rebuild_value_history();
+        model.value_head_bias.fill(1.0);
+        for (i, weight) in model.value_head_output.iter_mut().enumerate() {
+            *weight = (i % 17) as f32 * 0.003 - 0.024;
+        }
+        for (i, weight) in model.policy_move_context.iter_mut().enumerate() {
+            *weight = (i % 23) as f32 * 0.003 - 0.033;
+        }
+        model.rebuild_context();
         let mut workspace = AzSearchWorkspace::new(&model);
         let mut p = Position::startpos();
         let mut h = p.initial_rule_history();

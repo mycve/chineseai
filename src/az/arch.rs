@@ -1,6 +1,6 @@
 //! 双视角NNUE：红黑各维护一份棋子位置累加器，按行棋方、对方拼接后进入共享主干。
-//! 两份视角共用特征表；规则与将军标量作用于拼接表示。
-//! 价值头负责子力分桶、将位空间关系与历史；威胁嵌入同时服务价值和策略。
+//! 两份视角共用特征表；规则、将军态势与历史通过统一上下文进入共享主干。
+//! 共享编码提供主干与威胁关系；价值头负责子力分桶与将位空间关系。
 //! 策略由非线性局面上下文、线性局面累加器、将位走法表、战术表和重复项组成。
 //! 精确表已覆盖的因子不再单独参数化，训练与推理共用表布局。
 
@@ -65,6 +65,9 @@ pub const RULE_CONTEXT_SIZE: usize = 7;
 /// （都只是对已经算好的 `attacked_squares_masks` 做几次位测 + popcount）、机动性。
 /// 归一化后作为标量块加到主干上，用来给"杀势"这类整体态势一个直接入口。
 pub const CHECK_CONTEXT_SIZE: usize = 8;
+pub(crate) const CHECK_CONTEXT_OFFSET: usize = RULE_CONTEXT_SIZE;
+pub(crate) const HISTORY_CONTEXT_OFFSET: usize = RULE_CONTEXT_SIZE + CHECK_CONTEXT_SIZE;
+pub(crate) const POSITION_CONTEXT_SIZE: usize = HISTORY_CONTEXT_OFFSET + HISTORY_CONTEXT_SIZE;
 #[cfg_attr(not(feature = "gpu-train"), allow(dead_code))]
 pub(crate) const RMS_NORM_EPS: f32 = 1.0e-6;
 pub(crate) const PIECE_SQUARE_INPUT_SIZE: usize = BOARD_SIZE * 14;
@@ -478,8 +481,7 @@ impl AzMovesLeftParams {
 macro_rules! az_weight_tensors {
     ($visit:ident, $h:expr) => {
         $visit!(input_hidden, [AZ_NNUE_INPUT_SIZE, $h], false);
-        $visit!(rule_context_hidden, [RULE_CONTEXT_SIZE, 2 * $h], true);
-        $visit!(check_context_hidden, [CHECK_CONTEXT_SIZE, 2 * $h], true);
+        $visit!(context_hidden, [POSITION_CONTEXT_SIZE, 2 * $h], true);
         $visit!(hidden_bias, [$h], false);
         $visit!(shared_hidden, [$h, 2 * $h], true);
         $visit!(shared_bias, [$h], false);
@@ -500,15 +502,10 @@ macro_rules! az_weight_tensors {
             [VALUE_BUCKETS, WDL_HEAD_SIZE, VALUE_HEAD_SIZE],
             true
         );
-        $visit!(
-            value_history_output,
-            [WDL_HEAD_SIZE, HISTORY_CONTEXT_SIZE],
-            true
-        );
         $visit!(moves_left_output, [1, $h], true);
         $visit!(moves_left_bias, [1], false);
         $visit!(
-            value_threat_embedding,
+            threat_embedding,
             [VALUE_THREAT_VOCAB, VALUE_THREAT_RANK],
             false
         );

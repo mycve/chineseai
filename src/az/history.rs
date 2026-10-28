@@ -3,7 +3,6 @@ use super::arch::HISTORY_CONTEXT_SIZE;
 use crate::xiangqi::{Color, Piece, PieceKind, Position, RuleHistoryEntry};
 
 const BASIS: usize = HISTORY_CONTEXT_SIZE / 2;
-const PIECE_SQUARES: usize = 14 * 90;
 
 // Px0 input1：racpnbk，当前方在前；只翻rank，不翻file。
 fn orient_square(square: usize, side: Color) -> usize {
@@ -125,111 +124,9 @@ pub fn history_features(
     history_features_from_planes(&planes, available)
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ValueHistoryCache {
-    current: Vec<[f32; 3]>,
-    second: Vec<[f32; 3]>,
-    active: bool,
-}
-
-impl ValueHistoryCache {
-    pub(crate) fn new(weights: &[f32]) -> Self {
-        assert_eq!(weights.len(), 3 * HISTORY_CONTEXT_SIZE);
-        let mut current = vec![[0.0; 3]; PIECE_SQUARES];
-        let mut second = vec![[0.0; 3]; PIECE_SQUARES];
-        for index in 0..PIECE_SQUARES {
-            let (a, b) = contribution(index);
-            for output in 0..3 {
-                for (i, value) in a {
-                    current[index][output] += value * weights[output * HISTORY_CONTEXT_SIZE + i];
-                }
-                for (i, value) in b {
-                    second[index][output] +=
-                        value * weights[output * HISTORY_CONTEXT_SIZE + BASIS + i];
-                }
-            }
-        }
-        Self {
-            current,
-            second,
-            active: weights.iter().any(|&w| w != 0.0),
-        }
-    }
-
-    pub(crate) fn valid(&self) -> bool {
-        self.current.len() == PIECE_SQUARES && self.second.len() == PIECE_SQUARES
-    }
-
-    fn delta(&self, moved: Piece, entry: &RuleHistoryEntry, side: Color) -> [f32; 3] {
-        let mv = entry.mv.unwrap();
-        let from = self.second[piece_square(moved, mv.from as usize, side)];
-        let to = self.second[piece_square(moved, mv.to as usize, side)];
-        let captured = entry
-            .captured
-            .map(|p| self.second[piece_square(p, mv.to as usize, side)])
-            .unwrap_or([0.0; 3]);
-        std::array::from_fn(|j| to[j] - from[j] - captured[j])
-    }
-
-    pub(crate) fn logits(&self, position: &Position, history: &[RuleHistoryEntry]) -> [f32; 3] {
-        if !self.active {
-            return [0.0; 3];
-        }
-        let side = position.side_to_move();
-        let mut result = [0.0; 3];
-        for square in position.occupied_squares() {
-            let piece = position
-                .piece_at(square)
-                .expect("occupancy and board must agree");
-            let value = self.current[piece_square(piece, square, side)];
-            for j in 0..3 {
-                result[j] += value[j];
-            }
-        }
-        let Some(last) = history
-            .last()
-            .filter(|e| e.mv.is_some() && e.mover.is_some())
-        else {
-            return result;
-        };
-        let mv = last.mv.unwrap();
-        let Some(moved) = position.piece_at(mv.to as usize) else {
-            return result;
-        };
-        let d1 = self.delta(moved, last, side);
-        for j in 0..3 {
-            result[j] += d1[j];
-        }
-        let Some(previous) = history
-            .len()
-            .checked_sub(2)
-            .and_then(|i| history.get(i))
-            .filter(|e| e.mv.is_some() && e.mover.is_some())
-        else {
-            return result;
-        };
-        let previous_to = previous.mv.unwrap().to as usize;
-        let previous_moved = if previous_to == mv.from as usize {
-            Some(moved)
-        } else if previous_to == mv.to as usize {
-            last.captured
-        } else {
-            position.piece_at(previous_to)
-        };
-        if let Some(moved) = previous_moved {
-            let d2 = self.delta(moved, previous, side);
-            for j in 0..3 {
-                result[j] += (d1[j] + d2[j]) * 0.5;
-            }
-        }
-        result
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::az::{AzEvalAccumulator, AzEvalScratch, AzNnue, RULE_CONTEXT_SIZE};
     use crate::xiangqi::Move;
 
     fn planes(position: &Position, side: Color) -> [u128; 14] {
@@ -251,10 +148,6 @@ mod tests {
         .unwrap();
         let mut history = position.initial_rule_history();
         let mut positions = vec![position.clone()];
-        let weights: Vec<f32> = (0..3 * HISTORY_CONTEXT_SIZE)
-            .map(|i| (i % 37) as f32 * 0.003 - 0.05)
-            .collect();
-        let cache = ValueHistoryCache::new(&weights);
         // 最后一步吃掉上一步的移动子，验证虚拟逆走时恢复 captured。
         for mv in [
             Move::new(67, 31),
@@ -275,94 +168,11 @@ mod tests {
             let expected = history_features_from_planes(&raw, available);
             let actual = history_features(&position, &history);
             assert_eq!(actual, expected);
-            let dense: [f32; 3] = std::array::from_fn(|j| {
-                actual
-                    .iter()
-                    .zip(&weights[j * HISTORY_CONTEXT_SIZE..(j + 1) * HISTORY_CONTEXT_SIZE])
-                    .map(|(f, w)| f * w)
-                    .sum()
-            });
-            let projected = cache.logits(&position, &history);
-            for j in 0..3 {
-                assert!((projected[j] - dense[j]).abs() < 1e-6);
-            }
             let missing = history_features(&position, &position.initial_rule_history());
             assert_eq!(missing[..48], actual[..48]);
             assert!(missing[48..].iter().all(|&v| v == 0.0));
         }
         assert_eq!(orient_square(8, Color::Red), 89);
         assert_eq!(orient_square(8, Color::Black), 8);
-    }
-
-    #[test]
-    fn history_raw_logits_match_full_incremental_and_reload_without_changing_policy() {
-        let position = Position::startpos();
-        let moves = position.legal_moves();
-        let mut model = AzNnue::random(8, 17);
-        model.rebuild_policy_tactical();
-        let mut before = AzEvalScratch::new(model.arch);
-        let original = model.evaluate_with_scratch_output_with_repetition(
-            &position,
-            &moves,
-            &[],
-            &[0.0; RULE_CONTEXT_SIZE],
-            &mut before,
-        );
-        for (i, weight) in model.value_history_output.iter_mut().enumerate() {
-            *weight = (i % 13) as f32 * 0.01 - 0.04;
-        }
-        model.rebuild_value_history();
-        let history = position.initial_rule_history();
-        let features = history_features(&position, &history);
-        let mut full_scratch = AzEvalScratch::new(model.arch);
-        let full = model.evaluate_with_scratch_output_with_repetition_and_history_features(
-            &position,
-            &moves,
-            &[],
-            &[0.0; RULE_CONTEXT_SIZE],
-            &features,
-            &mut full_scratch,
-        );
-        assert_eq!(before.logits, full_scratch.logits);
-        let residual = model.value_history_logits_from_features(&features);
-        let expected = crate::az::softmax_fixed3(std::array::from_fn(|j| {
-            original.value_wdl[j].ln() + residual[j]
-        }));
-        for j in 0..3 {
-            assert!((expected[j] - full.value_wdl[j]).abs() < 1e-6);
-        }
-        assert_eq!(full.value, full.value_wdl[0] - full.value_wdl[2]);
-        let accumulator = AzEvalAccumulator::new(&model, &position);
-        let policy = model.policy_accumulator(&position, position.side_to_move());
-        let mut incremental_scratch = AzEvalScratch::new(model.arch);
-        let incremental = model.evaluate_incremental_with_scratch_output_with_history(
-            &position,
-            &accumulator.into_hidden_sum(),
-            &policy,
-            &moves,
-            &[],
-            &[0.0; RULE_CONTEXT_SIZE],
-            &history,
-            &mut incremental_scratch,
-        );
-        for j in 0..3 {
-            assert!((incremental.value_wdl[j] - full.value_wdl[j]).abs() < 1e-6);
-        }
-        assert_eq!(incremental_scratch.logits, full_scratch.logits);
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tmp")
-            .join(format!("history-test-{}.safetensors", std::process::id()));
-        model.save(&path).unwrap();
-        let loaded = AzNnue::load(&path).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(loaded.value_history_output, model.value_history_output);
-        assert_eq!(
-            loaded.value_history_logits(&position, &history),
-            model.value_history_logits(&position, &history)
-        );
-        assert_eq!(
-            model.clone().value_history_logits(&position, &history),
-            model.value_history_logits(&position, &history)
-        );
     }
 }

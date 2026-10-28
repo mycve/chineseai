@@ -11,6 +11,7 @@ mod arch;
 ))]
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 mod candle_model;
+mod context;
 // slow-tests 的 CUDA 对照测试共用同一个设备，避免每个测试重复 JIT 编译 kernel。
 #[cfg(all(test, feature = "slow-tests"))]
 mod cuda_test_device;
@@ -24,6 +25,7 @@ mod mate;
 pub mod nnue;
 mod node_threat;
 mod play;
+mod policy;
 mod policy_calibration;
 mod sparse_pool;
 pub use policy_calibration::{PolicyCalibrationReport, calibrate_policy};
@@ -31,6 +33,7 @@ pub mod px0_data;
 mod px0_policy_map;
 mod replay;
 mod sample;
+mod shared;
 mod simd;
 mod start;
 #[cfg(test)]
@@ -44,6 +47,7 @@ mod train_gpu;
 ))]
 #[path = "train_gpu_candle.rs"]
 mod train_gpu_candle;
+mod value;
 
 pub use alphazero::{
     AzCandidate, AzSearchControl, AzSearchLimits, AzSearchResult, AzSearchTraceStep,
@@ -73,8 +77,10 @@ pub(crate) use crate::xiangqi::PieceKind;
 
 pub(crate) use accumulator::*;
 pub(crate) use arch::*;
+pub(crate) use context::*;
 pub use history::{history_features, history_features_from_planes};
 pub(crate) use inference::*;
+pub(crate) use policy::*;
 pub(crate) use simd::*;
 
 pub use arch::{

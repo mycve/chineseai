@@ -875,12 +875,12 @@ impl<'a> AzTree<'a> {
         if self.model.node_incremental {
             let state = self.ensure_node_threat(node);
             self.eval_scratch.value_king_piece_precomputed = Some(self.threat_arena.king(state));
-            self.eval_scratch.value_threat_precomputed = (self.model.threat_incremental
-                && self.model.value_threat_active)
+            self.eval_scratch.threat_precomputed = (self.model.threat_incremental
+                && self.model.threat_active)
                 .then(|| self.threat_arena.value(state));
         } else {
             self.eval_scratch.value_king_piece_precomputed = None;
-            self.eval_scratch.value_threat_precomputed = None;
+            self.eval_scratch.threat_precomputed = None;
         }
     }
 
@@ -3130,12 +3130,11 @@ mod tests {
             &mut model.value_head_output,
             &mut model.value_king_piece_hidden,
             &mut model.value_threat_output,
-            &mut model.value_history_output,
             &mut model.policy_threat_context,
             &mut model.policy_move_context,
             &mut model.policy_accumulator_move,
             &mut model.policy_tactical,
-            &mut model.check_context_hidden,
+            &mut model.context_hidden,
         ] {
             for (index, weight) in weights.iter_mut().enumerate() {
                 *weight = (index as f32 % 17.0 - 8.0) * 0.001;
@@ -3143,9 +3142,8 @@ mod tests {
         }
         model.rebuild_policy_cache();
         model.rebuild_policy_tactical();
-        model.rebuild_value_threat();
-        model.rebuild_value_history();
-        model.rebuild_check_context();
+        model.rebuild_threat();
+        model.rebuild_context();
         let mut rng = SplitMix64::new(20260928);
         let mut checked = 0;
         let mut captures = 0;

@@ -599,7 +599,7 @@ fn manual_profile_policy_head() {
     model.policy_tactical[0] = 1.0e-6;
     model.value_threat_output[0] = 1.0e-6;
     model.rebuild_policy_tactical();
-    model.rebuild_value_threat();
+    model.rebuild_threat();
     let mut scratch = AzEvalScratch::new(model.arch);
     for _ in 0..2_000 {
         model.evaluate_with_scratch_output(
@@ -1305,7 +1305,7 @@ fn evaluate_wdl_with_rules_returns_normalized_distribution() {
     assert!((wdl.iter().sum::<f32>() - 1.0).abs() < 1e-4, "{wdl:?}");
 
     // 随机初始化的 `value_head_output` 恒为 0（刻意保持价值中性），此时 softmax 恒为均匀
-    // 分布、任何输入变化都观察不到。先把它打开，再比较"只差 rule_context_hidden"的两个
+    // 分布、任何输入变化都观察不到。先把它打开，再比较"只差 context_hidden"的两个
     // 模型：唯一变量就是 context 有没有进主干。
     let mut base = model.clone();
     for (index, weight) in base.value_head_output.iter_mut().enumerate() {
@@ -1314,9 +1314,14 @@ fn evaluate_wdl_with_rules_returns_normalized_distribution() {
     let without_context = base.evaluate_wdl_with_rules(&position, &history, &moves);
 
     let mut with_context = base.clone();
-    for (index, weight) in with_context.rule_context_hidden.iter_mut().enumerate() {
+    let rule_end = RULE_CONTEXT_SIZE * 2 * with_context.hidden_size;
+    for (index, weight) in with_context.context_hidden[..rule_end]
+        .iter_mut()
+        .enumerate()
+    {
         *weight = ((index % 17) as f32 + 1.0) * 1.0e-3;
     }
+    with_context.rebuild_context();
     let shifted = with_context.evaluate_wdl_with_rules(&position, &history, &moves);
     assert!(
         shifted
@@ -1517,7 +1522,7 @@ fn check_context_features_describe_check_and_mate_net() {
     assert_eq!(checked_context[0], 1.0, "红方被黑车 d9 沿 d 线将军");
 }
 
-/// 标量块必须真的进到主干：只差 `check_context_hidden` 的两个模型，价值头的输出必须不同。
+/// 标量块必须真的进到主干：只差 `context_hidden` 的两个模型，价值头的输出必须不同。
 #[test]
 fn check_context_block_reaches_the_trunk_when_active() {
     let position = Position::startpos();
@@ -1531,15 +1536,20 @@ fn check_context_block_reaches_the_trunk_when_active() {
         *weight = ((index % 11) as f32 + 1.0) * 1.0e-2;
     }
     // 全零 ⇒ 未激活 ⇒ 评估路径整段跳过它（新模型初始也应保持中性）。
-    assert!(!base.check_context_active);
+    assert!(!base.context_active);
     let without_block = base.evaluate_wdl_with_rules(&position, &history, &moves);
 
     let mut active = base.clone();
-    for (index, weight) in active.check_context_hidden.iter_mut().enumerate() {
+    let check_start = super::CHECK_CONTEXT_OFFSET * 2 * active.hidden_size;
+    let check_end = super::HISTORY_CONTEXT_OFFSET * 2 * active.hidden_size;
+    for (index, weight) in active.context_hidden[check_start..check_end]
+        .iter_mut()
+        .enumerate()
+    {
         *weight = ((index % 17) as f32 + 1.0) * 1.0e-3;
     }
-    active.rebuild_check_context();
-    assert!(active.check_context_active);
+    active.rebuild_context();
+    assert!(active.context_active);
     let with_block = active.evaluate_wdl_with_rules(&position, &history, &moves);
 
     assert!(
@@ -1559,12 +1569,16 @@ fn model_rejects_old_format_and_missing_tensors() {
     model.save(&path).unwrap();
     let tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu).unwrap();
     assert_eq!(tensors["input_hidden"].dims(), &[692, 16]);
+    assert_eq!(tensors["context_hidden"].dims(), &[111, 32]);
+    assert!(!tensors.contains_key("rule_context_hidden"));
+    assert!(!tensors.contains_key("check_context_hidden"));
+    assert!(!tensors.contains_key("value_history_output"));
     assert_eq!(tensors["policy_tactical"].elem_count(), 120_704);
     assert_eq!(tensors["policy_sparse_table"].elem_count(), 289_403);
-    assert_eq!(tensors["value_threat_embedding"].dims(), &[50_251, 64]);
+    assert_eq!(tensors["threat_embedding"].dims(), &[50_251, 64]);
     assert!(!tensors.contains_key("policy_move_bias"));
     for name in [
-        "check_context_hidden",
+        "context_hidden",
         "moves_left_output",
         "moves_left_bias",
         "shared_hidden",
@@ -1578,7 +1592,7 @@ fn model_rejects_old_format_and_missing_tensors() {
     let mut old = tensors;
     old.insert(
         "az_model_format_version".into(),
-        candle_core::Tensor::new(&[44.0f32], &candle_core::Device::Cpu).unwrap(),
+        candle_core::Tensor::new(&[46.0f32], &candle_core::Device::Cpu).unwrap(),
     );
     candle_core::safetensors::save(&old, &path).unwrap();
     assert!(AzNnue::load(&path).is_err());

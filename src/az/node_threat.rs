@@ -220,7 +220,7 @@ fn add(sum: &mut [f32; VALUE_THREAT_RANK], model: &AzNnue, entry: u32, sign: f32
     let start = (entry as u16 as usize) * VALUE_THREAT_RANK;
     for (sum, &weight) in sum
         .iter_mut()
-        .zip(&model.value_threat_embedding[start..start + VALUE_THREAT_RANK])
+        .zip(&model.threat_embedding[start..start + VALUE_THREAT_RANK])
     {
         *sum += sign * weight;
     }

@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
-use super::arch::{CHECK_CONTEXT_SIZE, HISTORY_CONTEXT_SIZE};
-use super::inference::check_context_features;
+use super::arch::POSITION_CONTEXT_SIZE;
+use super::context::check_context_features;
+use super::context::position_context_features;
 #[cfg(test)]
 use crate::az::nnue::CANONICAL_PIECE_INPUT_SIZE;
 use crate::az::nnue::input_feature_index;
@@ -16,7 +17,7 @@ use crate::xiangqi::{Color, Position};
 
 use super::{
     AzTrainingSample, DENSE_MOVE_SPACE, POLICY_SPARSE_TABLE_SIZE, POLICY_SPARSE_TERMS,
-    POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, RULE_CONTEXT_SIZE, VALUE_KING_PIECE_MAX_ACTIVE,
+    POLICY_TACTICAL_SIZE, POLICY_TACTICAL_TERMS, VALUE_KING_PIECE_MAX_ACTIVE,
     VALUE_THREAT_MAX_ACTIVE, WDL_HEAD_SIZE, canonical_general_buckets_from_features,
     decode_current_piece_square_feature, dense_move_squares,
     fused_policy::{pack_policy_item, padding_item as policy_padding_item},
@@ -203,9 +204,7 @@ pub(super) struct PackedBatch {
     pub policy_repetition: Vec<f32>,
     pub value_wdl: Vec<f32>,
     pub values: Vec<f32>,
-    pub rule_context: Vec<f32>,
-    pub history_features: Vec<f32>,
-    pub check_context: Vec<f32>,
+    pub context: Vec<f32>,
     pub policy_weights: Vec<f32>,
     pub value_weights: Vec<f32>,
     pub moves_left_targets: Vec<f32>,
@@ -292,9 +291,7 @@ impl PackedBatch {
             policy_repetition: vec![0.0; batch_size * max_policy_moves],
             value_wdl: vec![0.0f32; batch_size * WDL_HEAD_SIZE],
             values: vec![0.0f32; batch_size],
-            rule_context: vec![0.0f32; batch_size * RULE_CONTEXT_SIZE],
-            history_features: vec![0.0f32; batch_size * HISTORY_CONTEXT_SIZE],
-            check_context: vec![0.0f32; batch_size * CHECK_CONTEXT_SIZE],
+            context: vec![0.0f32; batch_size * POSITION_CONTEXT_SIZE],
             policy_weights: vec![1.0f32; batch_size],
             value_weights: vec![1.0f32; batch_size],
             moves_left_targets: vec![0.0; batch_size],
@@ -320,10 +317,6 @@ impl PackedBatch {
             let wdl = normalize_wdl_target(sample.value_wdl);
             packed.value_wdl[row * WDL_HEAD_SIZE..(row + 1) * WDL_HEAD_SIZE].copy_from_slice(&wdl);
             packed.values[row] = sample.value.clamp(-1.0, 1.0);
-            packed.rule_context[row * RULE_CONTEXT_SIZE..(row + 1) * RULE_CONTEXT_SIZE]
-                .copy_from_slice(&sample.rule_context);
-            packed.history_features[row * HISTORY_CONTEXT_SIZE..(row + 1) * HISTORY_CONTEXT_SIZE]
-                .copy_from_slice(&sample.history_features);
             packed.policy_weights[row] = sample.policy_weight.max(0.0);
             packed.value_weights[row] = sample.value_weight.max(0.0);
             if sample.moves_left.is_finite()
@@ -379,13 +372,18 @@ impl PackedBatch {
             .iter()
             .map(|&mv| f32::from(position.gives_check_after_move_fast(mv)))
             .collect::<Vec<_>>();
-        self.check_context[row * CHECK_CONTEXT_SIZE..(row + 1) * CHECK_CONTEXT_SIZE]
-            .copy_from_slice(&check_context_features(
+        let context = position_context_features(
+            &sample.rule_context,
+            &check_context_features(
                 position,
                 &moves,
                 &gives_check,
                 [own_attacks, opponent_attacks],
-            ));
+            ),
+            &sample.history_features,
+        );
+        self.context[row * POSITION_CONTEXT_SIZE..(row + 1) * POSITION_CONTEXT_SIZE]
+            .copy_from_slice(&context);
         let mut policy_offset = 0usize;
         for (sample_offset, (&move_index, &target)) in sample
             .move_indices
@@ -604,6 +602,7 @@ fn splitmix_next(state: &mut u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::az::{HISTORY_CONTEXT_SIZE, RULE_CONTEXT_SIZE};
     use std::sync::Arc;
 
     use crate::{az::AzSampleMeta, xiangqi::Move};
